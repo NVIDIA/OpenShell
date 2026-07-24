@@ -83,9 +83,13 @@ impl Inference for InferenceService {
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found(format!("sandbox '{sandbox_id}' not found")))?;
         let workspace = sandbox.object_workspace();
-        resolve_inference_bundle(self.state.store.as_ref(), workspace)
-            .await
-            .map(Response::new)
+        resolve_inference_bundle_with_credentials(
+            self.state.store.as_ref(),
+            Some(&self.state.credentials),
+            workspace,
+        )
+        .await
+        .map(Response::new)
     }
 
     #[rpc_auth(auth = "bearer", scope = "inference:write", role = "admin")]
@@ -100,8 +104,9 @@ impl Inference for InferenceService {
                 .ensure_active()?;
         let route_name = effective_route_name(&req.route_name)?;
         let verify = !req.no_verify;
-        let route = upsert_inference_route(
+        let route = upsert_inference_route_with_credentials(
             self.state.store.as_ref(),
+            Some(&self.state.credentials),
             &workspace,
             route_name,
             &req.provider_name,
@@ -194,8 +199,25 @@ impl Inference for InferenceService {
     }
 }
 
+#[cfg(test)]
 async fn upsert_inference_route(
     store: &Store,
+    workspace: &str,
+    route_name: &str,
+    provider_name: &str,
+    model_id: &str,
+    timeout_secs: u64,
+    verify: bool,
+) -> Result<UpsertedInferenceRoute, Status> {
+    upsert_inference_route_with_credentials(
+        store, None, workspace, route_name, provider_name, model_id, timeout_secs, verify,
+    )
+    .await
+}
+
+async fn upsert_inference_route_with_credentials(
+    store: &Store,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
     workspace: &str,
     route_name: &str,
     provider_name: &str,
@@ -219,6 +241,7 @@ async fn upsert_inference_route(
                 "provider '{provider_name}' not found in workspace '{workspace}'"
             ))
         })?;
+    let provider = resolve_provider_credentials(provider, credentials).await?;
 
     let resolved = resolve_provider_route(&provider, model_id)?;
     let validation = if verify {
@@ -940,15 +963,30 @@ fn authorize_inference_bundle(
 }
 
 /// Resolve the inference bundle for a workspace (all managed routes + revision hash).
+#[cfg(test)]
 async fn resolve_inference_bundle(
     store: &Store,
     workspace: &str,
 ) -> Result<GetInferenceBundleResponse, Status> {
+    resolve_inference_bundle_with_credentials(store, None, workspace).await
+}
+
+async fn resolve_inference_bundle_with_credentials(
+    store: &Store,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    workspace: &str,
+) -> Result<GetInferenceBundleResponse, Status> {
     let mut routes = Vec::new();
-    if let Some(r) = resolve_route_by_name(store, workspace, CLUSTER_INFERENCE_ROUTE_NAME).await? {
+    if let Some(r) =
+        resolve_route_by_name_with_credentials(store, credentials, workspace, CLUSTER_INFERENCE_ROUTE_NAME)
+            .await?
+    {
         routes.push(r);
     }
-    if let Some(r) = resolve_route_by_name(store, workspace, SANDBOX_SYSTEM_ROUTE_NAME).await? {
+    if let Some(r) =
+        resolve_route_by_name_with_credentials(store, credentials, workspace, SANDBOX_SYSTEM_ROUTE_NAME)
+            .await?
+    {
         routes.push(r);
     }
 
@@ -985,8 +1023,18 @@ async fn resolve_inference_bundle(
     })
 }
 
+#[cfg(test)]
 async fn resolve_route_by_name(
     store: &Store,
+    workspace: &str,
+    route_name: &str,
+) -> Result<Option<ResolvedRoute>, Status> {
+    resolve_route_by_name_with_credentials(store, None, workspace, route_name).await
+}
+
+async fn resolve_route_by_name_with_credentials(
+    store: &Store,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
     workspace: &str,
     route_name: &str,
 ) -> Result<Option<ResolvedRoute>, Status> {
@@ -1026,6 +1074,8 @@ async fn resolve_route_by_name(
             ))
         })?;
 
+    let provider = resolve_provider_credentials(provider, credentials).await?;
+
     let resolved = resolve_provider_route(&provider, &config.model_id)?;
 
     Ok(Some(ResolvedRoute {
@@ -1039,6 +1089,30 @@ async fn resolve_route_by_name(
         model_in_path: resolved.route.model_in_path,
         request_path_override: resolved.route.request_path_override,
     }))
+}
+
+async fn resolve_provider_credentials(
+    mut provider: Provider,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+) -> Result<Provider, Status> {
+    if provider.credential_handles.is_empty() {
+        return Ok(provider);
+    }
+
+    let credentials = credentials.ok_or_else(|| {
+        Status::failed_precondition(format!(
+            "provider '{}' stores credentials as handles, but credential storage is unavailable",
+            provider.object_name()
+        ))
+    })?;
+    let resolved = credentials
+        .resolve_provider_handles(&provider, current_time_ms())
+        .await?;
+    provider.credentials.extend(resolved.values);
+    provider
+        .credential_expires_at_ms
+        .extend(resolved.expires_at_ms);
+    Ok(provider)
 }
 
 #[cfg(test)]
@@ -1640,6 +1714,80 @@ mod tests {
                 "model_discovery".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn managed_route_resolves_default_credential_handles() {
+        let store = test_store().await;
+        let credentials = crate::credentials::CredentialRuntime::from_config_with_store(
+            &openshell_core::Config::new(None),
+            Arc::new(store.clone()),
+        )
+        .expect("credential runtime should connect to default encrypted store");
+        let handles = credentials
+            .store_provider_credentials(
+                "openai-dev",
+                &HashMap::from([(
+                    "OPENAI_API_KEY".to_string(),
+                    "sk-encrypted".to_string(),
+                )]),
+                &HashMap::new(),
+            )
+            .await
+            .expect("credential should be stored");
+
+        let provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "provider-1".to_string(),
+                name: "openai-dev".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            r#type: "openai".to_string(),
+            credentials: HashMap::new(),
+            config: std::iter::once((
+                "OPENAI_BASE_URL".to_string(),
+                "https://station.example.com/v1".to_string(),
+            ))
+            .collect(),
+            credential_expires_at_ms: HashMap::new(),
+            credential_handles: handles,
+            profile_workspace: String::new(),
+        };
+        store
+            .put_message(&provider)
+            .await
+            .expect("provider should persist");
+
+        upsert_inference_route_with_credentials(
+            &store,
+            Some(&credentials),
+            "default",
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            "openai-dev",
+            "test/model",
+            0,
+            false,
+        )
+        .await
+        .expect("route should be created from handle-backed provider");
+
+        let managed = resolve_route_by_name_with_credentials(
+            &store,
+            Some(&credentials),
+            "default",
+            CLUSTER_INFERENCE_ROUTE_NAME,
+        )
+        .await
+        .expect("route should resolve")
+        .expect("managed route should exist");
+
+        assert_eq!(managed.base_url, "https://station.example.com/v1");
+        assert_eq!(managed.api_key, "sk-encrypted");
     }
 
     #[tokio::test]

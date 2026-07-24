@@ -3124,6 +3124,7 @@ pub(super) async fn handle_rotate_provider_credential(
     }
     let refresh_state = crate::provider_refresh::refresh_provider_credential(
         state.store.as_ref(),
+        Some(&state.credentials),
         &workspace,
         provider_name,
         credential_key,
