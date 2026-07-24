@@ -91,6 +91,7 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 base64 = "0.22"
 
 # Crypto / Auth
+ring = "0.17"
 sha2 = "0.10"
 rand = "0.9"
 jsonwebtoken = "9"
