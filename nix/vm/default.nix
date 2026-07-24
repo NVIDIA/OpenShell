@@ -16,6 +16,7 @@ let
   distros = {
     ubuntu = import ./distros/ubuntu.nix { inherit pkgs architecture; };
     centos = import ./distros/centos.nix { inherit pkgs architecture; };
+    fedora = import ./distros/fedora.nix { inherit pkgs architecture; };
     rocky = import ./distros/rocky.nix { inherit pkgs architecture; };
   };
 

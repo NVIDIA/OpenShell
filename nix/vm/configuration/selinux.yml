@@ -15,7 +15,7 @@
         that:
           - ansible_facts.os_family == "RedHat"
         fail_msg: >-
-          SELinux configuration is supported only on CentOS and Rocky,
+          SELinux configuration is supported only on CentOS, Fedora, and Rocky,
           not {{ ansible_facts.distribution }}.
 
     - name: Install SELinux tools

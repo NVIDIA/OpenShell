@@ -12,7 +12,7 @@ Usage:
   nix run .#test-vm -- --distro DISTRO [OPTIONS] [-- COMMAND...]
 
 Options:
-  --distro NAME       Base distro: ubuntu, centos, or rocky
+  --distro NAME       Base distro: ubuntu, centos, fedora, or rocky
   --with NAME         Apply a configuration; repeatable (docker, podman, selinux)
   --install PATH      Install a .deb or .rpm package; repeatable
   --copy SRC:DEST     Copy an executable to an absolute guest path; repeatable
@@ -166,11 +166,14 @@ for copy_spec in "${copies[@]}"; do
 	esac
 done
 
-if [ "${TEST_VM_ACCELERATOR}" = kvm ]; then
-	if [ ! -c /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-		echo "KVM requires a readable and writable /dev/kvm" >&2
-		exit 1
-	fi
+test_vm_cpu=host
+ssh_wait_seconds=180
+if [ "${TEST_VM_ACCELERATOR}" = kvm ] &&
+	{ [ ! -c /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+	echo "==> /dev/kvm is unavailable; falling back to QEMU/TCG"
+	TEST_VM_ACCELERATOR=tcg
+	test_vm_cpu=max
+	ssh_wait_seconds=600
 fi
 
 echo "==> Realizing the pinned ${distro} cloud image"
@@ -266,7 +269,7 @@ for attempt in $(seq 1 5); do
 	"${TEST_VM_QEMU}" \
 		-name "openshell-test-${distro}" \
 		-machine "${TEST_VM_MACHINE},accel=${TEST_VM_ACCELERATOR}" \
-		-cpu host \
+		-cpu "${test_vm_cpu}" \
 		-smp 4 \
 		-m 4096 \
 		-drive "if=pflash,format=raw,readonly=on,file=${TEST_VM_FIRMWARE_CODE}" \
@@ -324,9 +327,9 @@ scp_args=(
 	-o UserKnownHostsFile=/dev/null
 )
 
-echo "==> Waiting up to 180 seconds for SSH on 127.0.0.1:${ssh_port}"
+echo "==> Waiting up to ${ssh_wait_seconds} seconds for SSH on 127.0.0.1:${ssh_port}"
 ssh_ready=0
-for _ in $(seq 1 90); do
+for _ in $(seq 1 "$((ssh_wait_seconds / 2))"); do
 	if ! kill -0 "${qemu_pid}" 2>/dev/null; then
 		wait "${qemu_pid}" || true
 		qemu_pid=
@@ -340,7 +343,7 @@ for _ in $(seq 1 90); do
 	sleep 2
 done
 if [ "${ssh_ready}" -ne 1 ]; then
-	echo "SSH did not become ready within 180 seconds" >&2
+	echo "SSH did not become ready within ${ssh_wait_seconds} seconds" >&2
 	exit 1
 fi
 
@@ -349,7 +352,11 @@ echo "==> Validating ${distro}"
 # shellcheck disable=SC2029
 ssh "${ssh_args[@]}" openshell@127.0.0.1 \
 	"set -eu; . /etc/os-release; test \"\${ID}\" = '${TEST_VM_OS_ID}'; case \"\${VERSION_ID}\" in '${TEST_VM_OS_VERSION}'*) ;; *) exit 1 ;; esac; test \"\$(uname -m)\" = '${TEST_VM_ARCHITECTURE}'"
-ssh "${ssh_args[@]}" openshell@127.0.0.1 'sudo cloud-init status --wait >/dev/null'
+# cloud-init returns 2 when it completes with recoverable errors. Fedora can
+# report that status for an initial transient-hostname warning even though the
+# requested user and SSH configuration were applied successfully.
+ssh "${ssh_args[@]}" openshell@127.0.0.1 \
+	'sudo cloud-init status --wait >/dev/null; status=$?; [ "$status" -eq 0 ] || [ "$status" -eq 2 ]'
 
 cat >"${ansible_config}" <<EOF
 [defaults]

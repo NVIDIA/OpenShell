@@ -13,7 +13,7 @@
     - name: Validate Podman support
       ansible.builtin.assert:
         that:
-          - ansible_facts.distribution in ["Ubuntu", "CentOS", "Rocky"]
+          - ansible_facts.distribution in ["Ubuntu", "CentOS", "Fedora", "Rocky"]
         fail_msg: >-
           Podman is unsupported on {{ ansible_facts.distribution }}.
 

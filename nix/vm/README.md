@@ -5,14 +5,14 @@ SPDX-License-Identifier: Apache-2.0
 
 # Test VMs
 
-This prototype uses Nix, QEMU, and Ansible to boot and configure disposable Linux VMs for testing OpenShell packages and binaries. It supports HVF on Apple Silicon macOS and KVM on native-architecture Linux hosts.
+This prototype uses Nix, QEMU, and Ansible to boot and configure disposable Linux VMs for testing OpenShell packages and binaries. It supports HVF on Apple Silicon macOS, KVM on native-architecture Linux hosts, and a slower TCG fallback on Linux when KVM is unavailable.
 
 ## Requirements
 
 - Nix with flakes enabled.
-- Apple Silicon macOS with HVF, or Linux with readable and writable `/dev/kvm`.
+- Apple Silicon macOS with HVF, or a native-architecture Linux host. Linux uses KVM when `/dev/kvm` is available and falls back to QEMU TCG otherwise.
 - Enough local capacity for a four-vCPU, 4 GiB guest and a disposable disk overlay.
-- Native-architecture artifacts. The runner does not use software emulation.
+- Native-architecture artifacts. TCG emulates the guest CPU on Linux but does not enable cross-architecture guests.
 
 The first run downloads the selected cloud image and VM runtime. Nix reuses those immutable inputs on later runs, while each guest starts from a fresh writable overlay.
 
@@ -26,6 +26,7 @@ nix/vm/
 ├── distros/
 │   ├── ubuntu.nix
 │   ├── centos.nix
+│   ├── fedora.nix
 │   └── rocky.nix
 └── configuration/
     ├── docker.yml
@@ -47,6 +48,7 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-vm` 
 | --- | --- | --- | --- | --- |
 | Ubuntu 24.04 | Yes | Yes | No | `.deb` |
 | CentOS Stream 10 | No | Yes | Yes | `.rpm` |
+| Fedora 44 | No | Yes | Yes | `.rpm` |
 | Rocky Linux 9 | Yes | Yes | Yes | `.rpm` |
 
 List the available distros and configurations:
@@ -74,6 +76,7 @@ Other combinations use the same interface:
 ```shell
 nix run .#test-vm -- --distro rocky --with docker
 nix run .#test-vm -- --distro centos --with podman
+nix run .#test-vm -- --distro fedora --with podman
 ```
 
 Configurations are repeatable:
@@ -85,7 +88,7 @@ nix run .#test-vm -- \
   --with podman
 ```
 
-Ensure SELinux is enforcing on CentOS or Rocky:
+Ensure SELinux is enforcing on CentOS, Fedora, or Rocky:
 
 ```shell
 nix run .#test-vm -- \
@@ -128,7 +131,7 @@ nix run .#test-vm -- \
 
 For an x86_64 Linux guest, supply x86_64 binaries and use `package:deb:amd64`. The package architecture must match the host and guest architecture.
 
-`--install` is repeatable. Debian packages are accepted by Ubuntu; RPM packages are accepted by CentOS and Rocky Linux. This prototype can install an existing RPM but does not build one.
+`--install` is repeatable. Debian packages are accepted by Ubuntu; RPM packages are accepted by CentOS, Fedora, and Rocky Linux. This prototype can install an existing RPM but does not build one.
 
 ## Copy binaries directly
 
@@ -146,7 +149,7 @@ The destination must be an absolute guest path. Copied files are installed with 
 ## Runner options
 
 ```text
---distro NAME       Base distro: ubuntu, centos, or rocky
+--distro NAME       Base distro: ubuntu, centos, fedora, or rocky
 --with NAME         Apply docker, podman, or selinux; repeatable
 --install PATH      Install a .deb or .rpm package; repeatable
 --copy SRC:DEST     Copy an executable into the guest; repeatable
@@ -162,7 +165,7 @@ Arguments after `--` are executed inside the guest. Without a command, the runne
 Nix downloads and caches the selected, hash-pinned cloud image. Each invocation then:
 
 1. Creates a temporary QCOW2 overlay.
-2. Boots QEMU with HVF or KVM acceleration.
+2. Boots QEMU with HVF, KVM, or the Linux TCG fallback.
 3. Creates an ephemeral `openshell` user and SSH key through cloud-init.
 4. Applies the selected Ansible configurations.
 5. Installs or copies the supplied artifacts.
@@ -174,7 +177,7 @@ Use `--keep` to preserve the overlay, cloud-init seed, SSH key, and serial log f
 ## Current limitations
 
 - Host and guest architectures must match.
-- Software emulation without HVF or KVM is not supported.
+- TCG is slower than hardware virtualization and uses a longer SSH readiness timeout.
 - Configurations are applied fresh on every run; prepared VM caching is not implemented.
 - Only loopback SSH is forwarded to the host; guest gateway ports are not exposed.
 - The runner does not build OpenShell, configure a gateway, or select an E2E test suite.
