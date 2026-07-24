@@ -488,6 +488,6 @@ cargo build --release -p openshell-server --bin openshell-gateway --no-default-f
 This build carries no built-in driver code. `compute_drivers` must name an
 extension driver with a matching `[openshell.drivers.<name>].socket_path`.
 Configuring a driver in `gateway.toml` that this gateway was not built with fails at startup with a
-message naming both the driver and the Cargo flag that re-enables it.
+message naming the unsupported driver.
 Extension drivers reached via `--compute-driver-socket` do not depend on any
 driver feature and work regardless.

@@ -208,10 +208,10 @@ carries no in-tree driver code and speaks `compute_driver.proto` only to
 out-of-tree drivers named in `compute_drivers` with a matching
 `[openshell.drivers.<name>].socket_path`. A driver named in
 `gateway.toml` that this binary was not built with fails at startup with
-a message naming both the driver and the Cargo flag that re-enables it;
-auto-detection skips drivers that were compiled out and falls through to
-a "no suitable driver" error rather than silently picking a
-different backend. Extension drivers reached via
+a message naming the unsupported driver. Auto-detection skips detected
+drivers that were compiled out and falls through to the next detected
+compiled-in backend; if none remain, startup fails with the standard "no
+suitable driver" error. Extension drivers reached via
 `--compute-driver-socket` are always available regardless of driver
 features — they run out-of-process and the gateway only needs to speak
 `compute_driver.proto`.

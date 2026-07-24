@@ -757,7 +757,7 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs, matches: &ArgMatches
 
 fn effective_single_driver(args: &RunArgs) -> Option<ComputeDriverKind> {
     match args.drivers.as_slice() {
-        [] => openshell_core::config::detect_driver(),
+        [] => crate::first_compiled_driver(openshell_core::config::detect_drivers()),
         [driver] => driver.parse().ok(),
         _ => None,
     }

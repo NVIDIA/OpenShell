@@ -983,7 +983,7 @@ fn resolve_configured_compute_driver(
 ///
 /// Third-party drivers reached via `--compute-driver-socket` are handled
 /// through the remote path and are always available regardless of features.
-const fn driver_compiled_in(kind: ComputeDriverKind) -> bool {
+pub(crate) const fn driver_compiled_in(kind: ComputeDriverKind) -> bool {
     match kind {
         ComputeDriverKind::Kubernetes => cfg!(feature = "driver-kubernetes"),
         ComputeDriverKind::Docker => cfg!(feature = "driver-docker"),
@@ -992,15 +992,19 @@ const fn driver_compiled_in(kind: ComputeDriverKind) -> bool {
     }
 }
 
+pub(crate) fn first_compiled_driver(
+    detected: impl IntoIterator<Item = ComputeDriverKind>,
+) -> Option<ComputeDriverKind> {
+    detected.into_iter().find(|kind| driver_compiled_in(*kind))
+}
+
 /// Auto-detect a driver, ignoring any that were compiled out.
 ///
-/// Wraps [`openshell_core::config::detect_driver`]; if the environment's
-/// preferred driver is not compiled in, the caller falls back to the
-/// standard "no driver configured" error rather than silently starting a
-/// different backend.
+/// Walks [`openshell_core::config::detect_drivers`] in priority order so
+/// a compiled-out driver detected first does not hide a later compiled-in
+/// backend from automatic startup.
 fn filtered_detect_driver() -> Option<ComputeDriverKind> {
-    let kind = openshell_core::config::detect_driver()?;
-    driver_compiled_in(kind).then_some(kind)
+    first_compiled_driver(openshell_core::config::detect_drivers())
 }
 
 fn builtin_compute_driver(name: &str) -> Option<ComputeDriverKind> {
@@ -1090,7 +1094,8 @@ mod tests {
     use super::{
         ConfiguredComputeDriver, ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
         allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
-        gateway_listener_addresses, is_benign_tls_handshake_failure, serve_gateway_listener,
+        first_compiled_driver, gateway_listener_addresses, is_benign_tls_handshake_failure,
+        serve_gateway_listener,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -1660,5 +1665,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn first_compiled_driver_skips_detected_drivers_not_in_this_build() {
+        let detected = [
+            ComputeDriverKind::Kubernetes,
+            ComputeDriverKind::Podman,
+            ComputeDriverKind::Docker,
+        ];
+        let expected = detected
+            .into_iter()
+            .find(|kind| super::driver_compiled_in(*kind));
+
+        assert_eq!(first_compiled_driver(detected), expected);
     }
 }
