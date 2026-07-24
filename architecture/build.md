@@ -177,6 +177,12 @@ The high-level CI model:
 5. Gate jobs verify that the mirror branch matches the PR head, or that the merge-group workflow ran for the queued SHA, and that the expected non-gate workflow actually ran.
 6. Release workflows rebuild and publish binaries, wheels, images, and docs.
 
+After each successful Release Dev run, the release canary smoke-tests published
+artifacts. Linux package installs run in native-architecture Ubuntu and Fedora
+QEMU guests on public AMD64 and ARM64 GitHub runners. The VM harness uses KVM
+when available and falls back to TCG otherwise. Separate jobs retain macOS
+Homebrew, Ubuntu Snap, and kind-based Helm coverage.
+
 See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 
 ## Docs Site

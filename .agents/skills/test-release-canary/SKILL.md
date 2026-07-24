@@ -12,11 +12,14 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 | Job | Runner | Verifies |
 |---|---|---|
 | `macos` | `macos-latest-xlarge` | `install.sh` resolves the Homebrew formula, brew installs the cask, and `openshell status` reaches the brew-services–backed local gateway with the VM driver. |
-| `ubuntu` | `ubuntu-latest` | `install.sh` installs the Debian package, the post-install systemd user service starts, and `openshell status` reaches the local gateway with the Docker driver. |
-| `fedora` | `fedora:latest` container | `install.sh` installs the RPM packages, the local gateway starts under Podman, and `openshell status` succeeds. |
+| `linux-vm` (Ubuntu) | `ubuntu-24.04` / `ubuntu-24.04-arm` | The Nix VM harness boots Ubuntu 24.04 on AMD64 and ARM64, configures Docker, installs the rolling `dev` Debian packages, and verifies the local gateway. |
+| `linux-vm` (Fedora) | `ubuntu-24.04` / `ubuntu-24.04-arm` | The Nix VM harness boots Fedora 44 on AMD64 and ARM64, configures rootless Podman with enforcing SELinux, installs the rolling `dev` RPM packages, and verifies the local gateway. |
+| `ubuntu-snap` | `ubuntu-latest` | The Snap produced by the triggering Release Dev run installs with its required interfaces and reaches the Docker-backed gateway. |
 | `kubernetes` | `ubuntu-latest` + kind | `helm install oci://ghcr.io/nvidia/openshell/helm-chart --version 0.0.0-dev` succeeds in a kind cluster, the gateway pod becomes Ready, port-forward exposes 8080, and the released CLI registers the in-cluster gateway and runs `openshell status` against it. |
 
-`install.sh` defaults to the *latest tagged* release — the canary is therefore checking that the most recent public release still installs, not the just-published `dev` build. The `kubernetes` job is the exception: it pins to `0.0.0-dev` chart + `:dev` images.
+The Linux VM matrix sets `OPENSHELL_VERSION=dev`, so it tests the packages published by Release Dev. The Snap job downloads artifacts from the triggering run, and Kubernetes pins the `0.0.0-dev` chart and `:dev` images. The macOS job retains the installer's default latest-tagged release behavior.
+
+On Linux, the VM harness uses KVM when `/dev/kvm` is readable and writable. It falls back automatically to native-architecture QEMU TCG when KVM is unavailable, which is expected on public ARM64 runners. The workflow does not cross-emulate architectures.
 
 ## Trigger paths
 
@@ -31,7 +34,7 @@ on:
 ```
 
 - **Automatic.** Every successful `Release Dev` run (on `main` or a manual dispatch of Release Dev) fires the canary. Each job gates on `github.event.workflow_run.conclusion == 'success'` so a failed Release Dev does not run the canary.
-- **Manual.** `workflow_dispatch` lets you run the canary on demand against any branch's workflow definition.
+- **Manual.** `workflow_dispatch` lets you run the canary on demand against any branch's workflow definition. The Snap job is skipped because a manual run has no triggering Release Dev artifact.
 
 When dispatched manually, `github.event.workflow_run.head_sha` is empty and the workflow falls back to `github.sha` (the branch tip) for the `install.sh` URL.
 
@@ -59,9 +62,36 @@ gh run view <run-id> --log-failed
 
 ## Iterating on the canary itself
 
-When you change `release-canary.yml` on a branch, a manual dispatch on that branch tests *your branch's workflow logic* against *main's published artifacts* (`0.0.0-dev` chart, `:dev` images, latest tagged install.sh assets). This is what you want for iterating on the canary — you're validating that the canary still works against known-good artifacts.
+When you change `release-canary.yml` on a branch, a manual dispatch on that branch tests *your branch's workflow logic* against the floating published artifacts (`dev` Linux packages, `0.0.0-dev` chart, and `:dev` images). The macOS job continues to exercise the latest tagged Homebrew release.
 
-Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${head_sha}/install.sh`, so changes to `install.sh` on your branch *are* exercised even though the binaries it downloads are from the latest public tag.
+Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${head_sha}/install.sh`, so changes to `install.sh` on your branch are exercised. The selected binary release follows the per-job behavior described above.
+
+## Local Linux VM reproduction
+
+Reproduce each native-architecture Linux canary with the same VM app:
+
+```shell
+nix run .#test-vm -- \
+  --distro ubuntu \
+  --with docker \
+  -- env \
+    OPENSHELL_CANARY_DRIVER=docker \
+    OPENSHELL_CANARY_INSTALL_SH_URL="https://raw.githubusercontent.com/NVIDIA/OpenShell/$(git rev-parse HEAD)/install.sh" \
+  bash -lc '
+    set -euo pipefail
+    mkdir -p "${HOME}/.config/openshell"
+    printf "OPENSHELL_DRIVERS=%s\n" "${OPENSHELL_CANARY_DRIVER}" \
+      > "${HOME}/.config/openshell/gateway.env"
+    curl -LsSf "${OPENSHELL_CANARY_INSTALL_SH_URL}" |
+      OPENSHELL_VERSION=dev sh
+    openshell --version
+    openshell status
+  '
+```
+
+For the RPM path, replace `--distro ubuntu --with docker` with
+`--distro fedora --with podman --with selinux` and set
+`OPENSHELL_CANARY_DRIVER=podman`.
 
 ## Testing artifacts from a specific SHA
 
@@ -107,8 +137,9 @@ Loopback registration auto-derives the gateway name to `openshell` if `--name` i
 
 | Symptom | Likely cause | Where to look |
 |---|---|---|
-| `macos`/`ubuntu`/`fedora` job fails on `install.sh` | Latest tagged release missing an asset, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
-| `macos`/`ubuntu`/`fedora` job fails on `openshell status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `OPENSHELL_DRIVERS` env in the "Ensure …" step. |
+| `macos`/`linux-vm` job fails on `install.sh` | Published release asset missing, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
+| `linux-vm` fails before SSH | Cloud-image download, QEMU startup, or guest boot failure. | The runner prints its QEMU and serial logs automatically on failure; check whether it selected KVM or TCG. |
+| `macos`/`linux-vm` job fails on `openshell status` | Local gateway service did not start (systemd/brew/Docker/Podman). Often a driver issue. | Installer diagnostics and the configured `OPENSHELL_DRIVERS` value in the job log. |
 | `kubernetes` job fails on `helm install --wait` | Chart did not deploy in 5 min — usually image pull failure or readiness probe failing. | "Diagnostics on failure" step dumps `helm status`, manifest, pod describe, pod logs. |
 | `kubernetes` job fails on `kubectl wait` | Gateway pod stuck `CrashLoopBackOff` or `ImagePullBackOff`. | Diagnostics dump; check `:dev` image existence at `ghcr.io/nvidia/openshell/gateway`. |
 | `kubernetes` job fails on `openshell gateway add` or `status` | Port-forward not reachable, or CLI/gateway proto mismatch. | `port-forward.log` and `openshell gateway list` in the diagnostics dump. |
