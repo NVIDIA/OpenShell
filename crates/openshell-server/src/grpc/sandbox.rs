@@ -1522,7 +1522,10 @@ pub(super) async fn handle_create_ssh_session(
     let token = uuid::Uuid::new_v4().to_string();
     let now_ms = current_time_ms();
     let expires_at_ms = if state.config.ssh_session_ttl_secs > 0 {
-        now_ms + (state.config.ssh_session_ttl_secs as i64 * 1000)
+        let ttl_ms = i64::try_from(state.config.ssh_session_ttl_secs)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000);
+        now_ms.saturating_add(ttl_ms)
     } else {
         0
     };
