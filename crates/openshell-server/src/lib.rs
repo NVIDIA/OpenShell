@@ -28,6 +28,7 @@ pub mod certgen;
 pub mod cli;
 mod compute;
 pub mod config_file;
+pub mod credentials;
 mod defaults;
 mod grpc;
 mod http;
@@ -71,6 +72,7 @@ use tracing::{debug, error, info, warn};
 pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 use compute::ComputeRuntime;
+use credentials::CredentialRuntime;
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
@@ -97,6 +99,9 @@ pub struct ServerState {
 
     /// Compute orchestration over the configured driver.
     pub compute: ComputeRuntime,
+
+    /// Credential driver runtime for provider credential storage and resolution.
+    pub credentials: CredentialRuntime,
 
     /// In-memory sandbox correlation index.
     pub sandbox_index: SandboxIndex,
@@ -187,6 +192,7 @@ impl ServerState {
         config: Config,
         store: Arc<Store>,
         compute: ComputeRuntime,
+        credentials: CredentialRuntime,
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
@@ -198,6 +204,7 @@ impl ServerState {
             config,
             store,
             compute,
+            credentials,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
@@ -301,6 +308,13 @@ pub(crate) async fn run_server(
         supervisor_sessions.clone(),
     )
     .await?;
+    let credentials = CredentialRuntime::from_config_file_with_store(
+        &config,
+        config_file.as_ref(),
+        store.clone(),
+    )
+    .await?;
+
     let gateway_interceptors =
         openshell_gateway_interceptors::initialize(config.gateway_interceptors.clone())
             .await
@@ -324,6 +338,7 @@ pub(crate) async fn run_server(
         config.clone(),
         store.clone(),
         compute,
+        credentials,
         sandbox_index,
         sandbox_watch_bus,
         tracing_log_bus,
@@ -1078,15 +1093,22 @@ mod tests {
                 .await
                 .expect("failed to create test store"),
         );
+        let config = Config::new(None)
+            .with_database_url("sqlite::memory:?cache=shared")
+            .with_bind_address(bind_addr)
+            .with_server_sans(["*.dev.openshell.localhost"])
+            .with_loopback_service_http(enable_loopback_service_http);
         let compute = crate::compute::new_test_runtime(store.clone()).await;
+        let credentials = crate::credentials::CredentialRuntime::from_config_with_store(
+            &config,
+            store.clone(),
+        )
+        .expect("test credential runtime");
         Arc::new(ServerState::new(
-            Config::new(None)
-                .with_database_url("sqlite::memory:?cache=shared")
-                .with_bind_address(bind_addr)
-                .with_server_sans(["*.dev.openshell.localhost"])
-                .with_loopback_service_http(enable_loopback_service_http),
+            config,
             store,
             compute,
+            credentials,
             crate::sandbox_index::SandboxIndex::new(),
             crate::sandbox_watch::SandboxWatchBus::new(),
             crate::tracing_bus::TracingLogBus::new(),

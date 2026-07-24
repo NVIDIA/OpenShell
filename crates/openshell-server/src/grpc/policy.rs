@@ -5124,6 +5124,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         }
     }
 

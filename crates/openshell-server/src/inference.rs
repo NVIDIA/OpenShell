@@ -1116,6 +1116,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         }
     }
 
@@ -1230,6 +1231,7 @@ mod tests {
             .collect(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&provider)
@@ -1305,6 +1307,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&provider)
@@ -1357,6 +1360,7 @@ mod tests {
             .collect(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&provider)
@@ -1588,6 +1592,7 @@ mod tests {
             .collect(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&provider)
@@ -1667,6 +1672,7 @@ mod tests {
             config: provider.config.clone(),
             credential_expires_at_ms: provider.credential_expires_at_ms.clone(),
             profile_workspace: provider.profile_workspace.clone(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&rotated_provider)
@@ -1738,6 +1744,7 @@ mod tests {
             .collect(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&provider)
@@ -2073,6 +2080,7 @@ mod tests {
             config,
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         }
     }
 
@@ -3157,6 +3165,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&alpha_provider)
@@ -3183,6 +3192,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         store
             .put_message(&beta_provider)

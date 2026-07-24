@@ -3770,6 +3770,7 @@ async fn auto_create_provider(
                 config: discovered.config.clone(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: workspace.to_string(),
+                credential_handles: HashMap::new(),
             }),
             workspace: workspace.to_string(),
         };
@@ -3817,6 +3818,7 @@ async fn auto_create_provider(
                     config: discovered.config.clone(),
                     credential_expires_at_ms: HashMap::new(),
                     profile_workspace: workspace.to_string(),
+                    credential_handles: HashMap::new(),
                 }),
                 workspace: workspace.to_string(),
             };
@@ -4579,6 +4581,7 @@ pub async fn provider_create_with_options(
                 config: config_map,
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: profile_workspace.to_string(),
+                credential_handles: HashMap::new(),
             }),
             workspace: workspace.to_string(),
         })
@@ -5652,6 +5655,7 @@ pub async fn provider_update(
                 config: config_map,
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: String::new(),
+                credential_handles: HashMap::new(),
             }),
             credential_expires_at_ms,
             workspace: workspace.to_string(),
@@ -8498,6 +8502,7 @@ mod tests {
                 .collect(),
                 credential_expires_at_ms: std::collections::HashMap::new(),
                 profile_workspace: String::new(),
+                credential_handles: std::collections::HashMap::new(),
             }],
             false,
         );
@@ -10030,6 +10035,7 @@ mod tests {
             config: std::collections::HashMap::new(),
             credential_expires_at_ms: std::collections::HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);
@@ -10053,6 +10059,7 @@ mod tests {
             config: std::collections::HashMap::new(),
             credential_expires_at_ms: std::collections::HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);
@@ -10091,6 +10098,7 @@ mod tests {
             config,
             credential_expires_at_ms: std::collections::HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);
@@ -10122,6 +10130,7 @@ mod tests {
             config: std::collections::HashMap::new(), // Empty config
             credential_expires_at_ms: std::collections::HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);
@@ -10155,6 +10164,7 @@ mod tests {
             config: std::collections::HashMap::new(),
             credential_expires_at_ms: std::collections::HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);
@@ -10181,6 +10191,7 @@ mod tests {
             config: std::collections::HashMap::new(),
             credential_expires_at_ms: std::collections::HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);
@@ -10211,6 +10222,7 @@ mod tests {
             config: std::collections::HashMap::new(),
             credential_expires_at_ms,
             profile_workspace: String::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);
@@ -10237,6 +10249,7 @@ mod tests {
             config: std::collections::HashMap::new(),
             credential_expires_at_ms: std::collections::HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);

@@ -167,11 +167,18 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        let config = Config::new(None).with_database_url("sqlite::memory:?cache=shared");
         let compute = new_test_runtime(store.clone()).await;
+        let credentials = crate::credentials::CredentialRuntime::from_config_with_store(
+            &config,
+            store.clone(),
+        )
+        .expect("test credential runtime");
         let mut state = ServerState::new(
-            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
+            config,
             store,
             compute,
+            credentials,
             SandboxIndex::new(),
             SandboxWatchBus::new(),
             TracingLogBus::new(),
@@ -346,11 +353,18 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        let config = Config::new(None).with_database_url("sqlite::memory:?cache=shared");
         let compute = new_test_runtime(store.clone()).await;
+        let credentials = crate::credentials::CredentialRuntime::from_config_with_store(
+            &config,
+            store.clone(),
+        )
+        .expect("test credential runtime");
         let state = Arc::new(ServerState::new(
-            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
+            config,
             store,
             compute,
+            credentials,
             SandboxIndex::new(),
             SandboxWatchBus::new(),
             TracingLogBus::new(),

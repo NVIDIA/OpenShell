@@ -68,6 +68,11 @@ pub struct OpenShellRoot {
     /// independently of this crate.
     #[serde(default)]
     pub drivers: BTreeMap<String, toml::Value>,
+
+    /// `[openshell.credential_drivers.<name>]` tables — passed verbatim to
+    /// credential driver implementations after gateway-level selection.
+    #[serde(default)]
+    pub credential_drivers: BTreeMap<String, toml::Value>,
 }
 
 /// `[openshell.gateway]` section.
@@ -95,6 +100,12 @@ pub struct GatewayFileSection {
     // ── Drivers ──────────────────────────────────────────────────────────
     #[serde(default)]
     pub compute_drivers: Option<Vec<String>>,
+    #[serde(default)]
+    pub credential_drivers: Option<Vec<String>>,
+    #[serde(default)]
+    pub default_credential_driver: Option<String>,
+    #[serde(default)]
+    pub credential_storage: Option<toml::Table>,
 
     // ── Sandbox / SSH ────────────────────────────────────────────────────
     #[serde(default)]
@@ -225,6 +236,11 @@ pub enum ConfigFileError {
         "unsupported gateway config version {version}; this build only supports version {SCHEMA_VERSION}"
     )]
     UnsupportedVersion { version: u32 },
+    #[error("invalid gateway config field `{field}`: {message}")]
+    InvalidValue {
+        field: &'static str,
+        message: &'static str,
+    },
     #[error(
         "`{field}` is not allowed in the gateway config file — set the {env} env var or pass {cli} on the command line"
     )]
@@ -256,6 +272,19 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
         && version > SCHEMA_VERSION
     {
         return Err(ConfigFileError::UnsupportedVersion { version });
+    }
+
+    if file
+        .openshell
+        .gateway
+        .credential_drivers
+        .as_ref()
+        .is_some_and(Vec::is_empty)
+    {
+        return Err(ConfigFileError::InvalidValue {
+            field: "openshell.gateway.credential_drivers",
+            message: "omit the field to use default encrypted gateway credential storage, or specify exactly one external credential driver",
+        });
     }
 
     if file.openshell.gateway.database_url.is_some() {

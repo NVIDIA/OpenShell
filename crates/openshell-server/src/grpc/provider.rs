@@ -2688,6 +2688,7 @@ pub(super) async fn handle_configure_provider_refresh(
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::from([(credential_key.to_string(), expires_at_ms)]),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         update_provider_record_with_catalog(state.store.as_ref(), &catalog, &workspace, updated)
             .await?;
@@ -3116,6 +3117,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -3602,6 +3604,7 @@ mod tests {
             .collect(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         }
     }
 
@@ -4358,6 +4361,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4541,6 +4545,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::from([("REFRESH_TOKEN".to_string(), expires_at_ms)]),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         };
         let catalog = state
             .provider_profile_sources
@@ -4622,6 +4627,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4691,6 +4697,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4739,6 +4746,7 @@ mod tests {
                     manual_expires_at_ms,
                 )]),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4803,6 +4811,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4853,6 +4862,7 @@ mod tests {
                     ("AWS_SESSION_TOKEN".to_string(), independent_expires_at_ms),
                 ]),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4923,6 +4933,7 @@ mod tests {
                 ("AWS_SESSION_TOKEN".to_string(), concurrently_changed),
             ]),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         };
         let owned_keys = vec![
             "AWS_ACCESS_KEY_ID".to_string(),
@@ -4975,6 +4986,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4999,6 +5011,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5077,6 +5090,7 @@ mod tests {
                     config: HashMap::new(),
                     credential_expires_at_ms: HashMap::new(),
                     profile_workspace: "default".to_string(),
+                    credential_handles: HashMap::new(),
                 },
             )
             .await
@@ -5176,6 +5190,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5250,6 +5265,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5418,6 +5434,7 @@ mod tests {
                     .collect(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5600,6 +5617,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5634,6 +5652,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5669,6 +5688,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5694,6 +5714,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5778,6 +5799,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5820,6 +5842,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5862,6 +5885,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5887,6 +5911,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5920,6 +5945,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5955,6 +5981,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6009,6 +6036,7 @@ mod tests {
                 config: std::iter::once(("region".to_string(), String::new())).collect(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6067,6 +6095,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6103,6 +6132,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6141,6 +6171,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6173,6 +6204,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         };
         store.put_message(&legacy).await.unwrap();
 
@@ -6196,6 +6228,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6241,6 +6274,7 @@ mod tests {
             .collect(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         };
         create_provider_record(&store, "default", provider)
             .await
@@ -6304,6 +6338,7 @@ mod tests {
             .into_iter()
             .collect(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         };
         create_provider_record(&store, "default", provider)
             .await
@@ -6356,6 +6391,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         };
         create_provider_record(&store, "default", provider)
             .await
@@ -6396,6 +6432,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6420,6 +6457,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6459,6 +6497,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6486,6 +6525,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6538,6 +6578,7 @@ mod tests {
                 .collect(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6616,6 +6657,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6659,6 +6701,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6723,6 +6766,7 @@ mod tests {
                 .collect(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6763,6 +6807,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6809,6 +6854,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6836,6 +6882,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6882,6 +6929,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -6921,6 +6969,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -7031,6 +7080,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         };
 
         // Attempt to update with an oversized credential key (exceeds MAX_MAP_KEY_LEN)
@@ -7403,6 +7453,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -7474,6 +7525,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -7546,6 +7598,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -7637,6 +7690,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -7701,6 +7755,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -7773,6 +7828,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -7867,6 +7923,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -7933,6 +7990,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -7995,6 +8053,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -8084,6 +8143,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -8169,6 +8229,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         };
         existing_provider.credentials.insert(
             "AWS_SECRET_ACCESS_KEY".to_string(),
@@ -8198,6 +8259,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         };
         create_provider_record(state.store.as_ref(), "default", new_provider)
             .await
@@ -8283,6 +8345,7 @@ mod tests {
                     config: HashMap::new(),
                     credential_expires_at_ms: HashMap::new(),
                     profile_workspace: "default".to_string(),
+                    credential_handles: HashMap::new(),
                 },
             )
             .await
@@ -8367,6 +8430,7 @@ mod tests {
             config,
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         }
     }
 
@@ -8473,6 +8537,7 @@ mod tests {
             config: HashMap::from([("project_id".to_string(), "should-be-ignored".to_string())]),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         };
         let mut env = HashMap::new();
         openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
@@ -8510,6 +8575,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
 
         let created_default = handle_create_provider(
@@ -8742,6 +8808,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "other-workspace".to_string(),
+            credential_handles: HashMap::new(),
         };
         let err = create_provider_record(&store, "default", provider)
             .await
@@ -8769,6 +8836,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
+            credential_handles: HashMap::new(),
         };
         let created = create_provider_record(&store, "default", provider)
             .await
@@ -8795,6 +8863,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         };
         let created = create_provider_record(&store, "default", provider)
             .await
@@ -8821,6 +8890,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         };
         create_provider_record(&store, "default", provider)
             .await
@@ -8842,6 +8912,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "other".to_string(),
+            credential_handles: HashMap::new(),
         };
         let err = update_provider_record(&store, "default", update)
             .await
@@ -8924,6 +8995,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
