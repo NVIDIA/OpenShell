@@ -1,388 +1,332 @@
 ---
 name: build-openshell-mxc-windows
-description: Auto-executable build skill that forks OpenShell into a sibling directory and produces Windows-native x64 (x86_64-pc-windows-msvc) and ARM64 (aarch64-pc-windows-msvc) binaries on a Windows 11 26100+ host. Scope is build-only — cross-compilation, minimal Windows compatibility shims, and ARM64 CI scaffolding. Does not implement an MXC compute driver, policy translation, an MSI installer, or a supervisor port. Trigger keywords - build openshell mxc windows, openshell windows build, x64 build, arm64 build, windows msvc, openshell-mxc fork, native windows openshell, MXC build.
+description: Maintain and validate OpenShell's build-only Windows MSVC lane for x64 and ARM64. Use when working on Windows compilation, `windows:*` mise tasks, unsupported Windows compute-driver contracts, or Windows build reports. This skill does not implement Docker, Kubernetes, Podman, VM, MXC driver, policy translation, MSI, service, or supervisor runtime support on Windows.
 ---
 
-# Build OpenShell-MXC for Windows (x64 + ARM64)
+# Build OpenShell-MXC for Windows
 
-Auto-executable skill. Forks the OpenShell repository into a sibling directory, applies the minimum Windows compatibility shims required to compile, and produces native binaries for `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`.
+This skill maintains the existing native Windows MSVC build lane in the
+OpenShell repository. The Windows lane is already present in `main`; do not
+treat this skill as a first-time porting recipe unless the user explicitly asks
+for a new fork or a from-scratch bring-up.
 
-This skill covers only the build slice. It does **not** implement the MXC compute driver, policy translation, AppContainer wiring, supervisor port, MSI installer, or Windows Service registration. Those are handled by sibling skills (to be created).
+The lane is build-only. It validates that OpenShell can compile and test on
+Windows MSVC for the supported deliverables:
+
+- `openshell-gateway.exe`
+- `openshell.exe`
+
+It intentionally does not make Windows a Docker, Kubernetes, Podman, or VM
+runtime host.
+
+## Current Repository Shape
+
+The Windows build lane is implemented by these tracked files:
+
+| Path | Purpose |
+|---|---|
+| `tasks/windows.toml` | Mise task entry points for `windows:*` commands. |
+| `tasks/rust.toml`, `tasks/test.toml`, and `tasks/markdown.toml` | Windows routing for compiler-bearing checks, explicit Unix-only test skips, and Markdown dependency setup. |
+| `tasks/scripts/windows-msvc.ps1` | PowerShell wrapper that enters the Visual Studio developer environment and invokes Cargo. |
+| `.github/workflows/windows-msvc.yml` | GitHub Actions scaffold for x64 and future ARM64 Windows validation. |
+| `architecture/windows-msvc-build.md` | Design notes and validation contract. |
+| `.agents/skills/build-openshell-mxc-windows/` | This skill and companion reference material. |
+
+Use the code that is already in the repo. Do not generate a parallel Windows
+build system, duplicate the wrapper, or add repository automation that the user
+did not request.
 
 ## Scope
 
 In scope:
 
-- `x86_64-pc-windows-msvc` compilation
-- `aarch64-pc-windows-msvc` compilation
-- Audit and cfg-gate Unix-only dependencies in `openshell-server` and shared crates so the workspace compiles to Windows MSVC
-- Keep Docker, Kubernetes, Podman, and VM compute crates in the Windows build graph as stubs that return "unsupported" at runtime
-- Add a Windows-specific mise task lane (`windows:*`) that wraps MSVC builds without changing the Linux `mise run ci` path
-- `cargo test` compiles and passes on a native x64 or ARM64 Windows host for non-Linux-gated tests
-- Scaffold an ARM64 CI workflow (job definition only; runner provisioning is operator work)
+- Refreshing a local checkout to the latest GitLab `main`.
+- Maintaining `tasks/windows.toml` and `tasks/scripts/windows-msvc.ps1`.
+- Running x64 and ARM64 MSVC checks.
+- Building x64 and ARM64 release binaries for `openshell-gateway` and
+  `openshell`.
+- Running workspace tests on a native x64 or ARM64 host.
+- Running focused unsupported-driver contract tests.
+- Reporting test counts, skipped/gated areas, warnings, artifacts, and logs.
+- Keeping Linux and macOS build paths unchanged.
+- Keeping unsupported Windows compute drivers explicit and testable.
 
-Out of scope (defer to follow-on skills):
+Out of scope:
 
-- New MXC compute driver crate
-- OpenShell → MXC policy translation
-- Windows network and credential integration
-- Sandbox supervisor Windows port
-- Docker, Kubernetes, Podman, or VM runtime support on Windows
-- MSI installer, Windows Service registration, WinGet manifest
+- Docker Desktop support on Windows.
+- Kubernetes support on Windows.
+- Podman, Podman machine, or Podman Desktop support on Windows.
+- VM, Hyper-V, WSL, libkrun, or VM-backed sandbox execution on Windows.
+- New MXC compute driver crate.
+- OpenShell to MXC policy translation.
+- Windows named-pipe driver IPC.
+- Windows Credential Manager or DPAPI integration.
+- MSI, WinGet, Windows service registration, or installer work.
+- Windows supervisor runtime port.
 
-The Linux build must remain green at every commit. All Windows-specific code must be behind `#[cfg(target_os = "windows")]` and Linux-only code behind `#[cfg(target_os = "linux")]` or `#[cfg(unix)]`.
+## Hard Rules
+
+- Do not enable Docker, Kubernetes, Podman, or VM runtimes on Windows.
+- Do not build, package, ship, or smoke-test standalone Windows binaries for
+  unsupported compute drivers.
+- Keep unsupported drivers in the Windows build graph only as library/config
+  stubs when needed by the gateway.
+- Unsupported Windows runtime entry points must return a clear unsupported
+  error.
+- Keep Windows-specific code behind `#[cfg(target_os = "windows")]`.
+- Keep Unix/Linux-only code behind `#[cfg(unix)]` or
+  `#[cfg(target_os = "linux")]`.
+- Do not modify the default Linux `mise run ci` path unless the user explicitly
+  asks for it.
+- Use `mise run --skip-tools windows:*` for Windows validation. The Windows
+  toolchain is rustup plus Visual Studio Build Tools, not mise-provisioned Rust.
+- Keep Unix `run` bodies unchanged when adding `run_windows` behavior to shared
+  pre-commit tasks.
+
+## Recommended Checkout Flow
+
+From the OpenShell checkout root, use:
+
+```powershell
+git fetch gitlab main
+git switch main
+git merge --ff-only gitlab/main
+git branch --set-upstream-to=gitlab/main main
+git status --short --branch
+```
+
+If there are local changes, preserve or resolve them before refreshing. Do not
+discard user work unless the user explicitly asks to clean the checkout.
+
+For automated GitHub-to-GitLab sync work, use a dedicated sync checkout outside
+the user's active working repo. Accept the checkout path from the user or an
+environment variable instead of hardcoding a local machine path, for example:
+
+```text
+<sync-checkout>
+```
 
 ## Prerequisites
 
-The skill targets a **Windows 11 host with CurrentBuild ≥ 26100**. Because the scope is compilation only, the skill warns rather than aborts when any of the items below is missing — a `cargo check` attempt can still surface useful information on a less-than-ideal host. Recommended:
+The lane targets a Windows host with Visual Studio Build Tools and rustup.
 
-| Requirement | Check | Install hint |
+| Requirement | Check | Notes |
 |---|---|---|
-| Windows 11 build ≥ 26100 | `[System.Environment]::OSVersion.Version` | OS update |
-| Visual Studio 2022 or newer with **MSVC v143** + **Windows 11 SDK** | `where.exe cl.exe` from a VS Developer PowerShell | Include the x64/x86 and ARM64 C++ tools. The wrapper discovers installed release directories such as `18` and `2022`. |
-| Visual C++ ARM64 Spectre-mitigated libraries | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre -property installationPath` | Required by ARM64 dependencies that select the Spectre runtime. |
-| Visual C++ Clang and CMake tools | `where.exe clang-cl.exe`; `where.exe cmake.exe` | `bindgen` needs host-native `libclang.dll`; ARM64 crypto crates use `clang-cl`; bundled Z3 uses CMake's Visual Studio generator with native MSVC for x64-to-ARM64 builds. |
-| Rust ≥ 1.88 via rustup with MSVC targets | `rustc --version` | `winget install Rustlang.Rustup` |
-| mise CLI for task orchestration only | `mise --version` | https://mise.jdx.dev/installing-mise.html |
-| Git ≥ 2.40 | `git --version` | `winget install Git.Git` |
-| Windows PowerShell 5.1+ or PowerShell 7+ | `$PSVersionTable.PSVersion` | Built into Windows; PowerShell 7 optional |
+| Windows 11 | `[System.Environment]::OSVersion.Version` | Build 26100+ is recommended for MXC-adjacent validation, but compilation can still surface useful errors on older hosts. |
+| Visual Studio 2022 or newer | `where.exe cl.exe` from a Developer PowerShell | Build Tools, Community, Professional, and Enterprise editions work when the target C++ components are installed. The wrapper discovers `VsDevCmd.bat` through `OPENSHELL_VSDEVCMD`, `vswhere`, or installed release directories such as `18` and `2022`. |
+| Visual C++ ARM64 tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath` | Required for native ARM64 check, build, and tests and for x64-to-ARM64 check/build. Tests always require a native runner. |
+| Visual C++ ARM64 Spectre-mitigated libraries | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre -property installationPath` | Required by `regorus` through `msvc_spectre_libs`; the build fails when the selected MSVC toolset lacks `lib\spectre\arm64`. |
+| Visual C++ Clang tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath` | Provides host-native `libclang.dll` for `bindgen` and `clang-cl.exe` for ARM64 crypto dependencies such as `ring` and `aws-lc-sys`. On ARM64, the wrapper uses `VC\Tools\Llvm\Arm64\bin`. |
+| Visual C++ CMake tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath` | Required for bundled Z3. The x64-to-ARM64 path uses CMake's Visual Studio ARM64 generator with native MSVC `cl.exe` so Z3 does not inherit the crypto crates' `clang-cl` requirement. |
+| Windows SDK | `where.exe rc.exe` from a Developer PowerShell | Install an SDK containing target libraries and ARM64 tools. |
+| Rust via rustup | `rustc --version` | Add each target being validated: `x86_64-pc-windows-msvc` and/or `aarch64-pc-windows-msvc`. The wrapper also adds the selected target. |
+| mise | `mise --version` | Used as a task runner only. |
+| Git | `git --version` | Needed for checkout and sync work. |
+| PowerShell | `$PSVersionTable.PSVersion` | Windows PowerShell 5.1 works; PowerShell 7 is quieter with mise shell hooks. |
 
-The Windows mise lane shells into Visual Studio's developer environment before invoking Cargo, so commands can run from an ordinary PowerShell session if Visual Studio Build Tools are discoverable. Use rustup for the Rust toolchain and MSVC targets; mise is only the task runner for the Windows lane. In CI, prefer `mise run --skip-tools windows:*` so Linux tool installation remains untouched.
+Do not install Visual Studio, Rust, Docker, Kubernetes, Podman, WSL, or Hyper-V
+from this skill.
 
-## Inputs
-
-The skill reads these environment variables (PowerShell syntax):
+## Environment Variables
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `$env:OPENSHELL_UPSTREAM` | `https://github.com/NVIDIA/OpenShell.git` | Upstream Git remote to fork from. Override to use a local path or GitLab mirror. |
-| `$env:OPENSHELL_MXC_FORK_DIR` | `C:\Users\$env:USERNAME\openshell-mxc` | Sibling directory for the fork. Must not exist. |
-| `$env:OPENSHELL_WXC_EXEC_PATH` | unset | Optional path to `wxc-exec.exe`. Validated for existence and architecture match only. Not used in this build-only skill. |
-| `$env:OPENSHELL_MXC_SKIP_ARM64` | `0` | Set to `1` to skip aarch64 build (e.g., for fast x64-only iterations). |
-| `$env:OPENSHELL_MXC_FORK_BRANCH` | `windows-mxc-build` | Branch name created in the fork. |
-| `$env:Z3_SYS_BUNDLED_DIR_OVERRIDE` | pinned source cached under `CARGO_TARGET_DIR` when explicit, otherwise `%LOCALAPPDATA%\OpenShell\cache\z3` | Reuse an existing Z3 source tree containing `src/api/z3.h`; otherwise the wrapper fetches and caches the pinned revision automatically. |
+| `OPENSHELL_VSDEVCMD` | unset | Optional explicit path to `VsDevCmd.bat`. |
+| `OPENSHELL_MXC_SKIP_ARM64` | `0` | Set to `1` to skip ARM64 when using `all` tasks. |
+| `OPENSHELL_WINDOWS_BUILD_JOBS` | `CARGO_BUILD_JOBS`, then `4` | Positive Cargo job limit used by the wrapper. |
+| `CARGO_TARGET_DIR` | `target` under repo root | Override Cargo output location. Use a short absolute path when x64-to-ARM64 builds approach Windows path-length limits. |
+| `Z3_LIBRARY_PATH_OVERRIDE` | unset | Directory containing an x64 system `libz3.lib`; not valid for ARM64. |
+| `Z3_SYS_Z3_HEADER` | unset | Full `z3.h` path required with a system Z3 library. |
+| `Z3_SYS_BUNDLED_DIR_OVERRIDE` | pinned cached source | Existing Z3 source tree containing `src/api/z3.h`. |
+| `RUSTC_WRAPPER` | cleared by wrapper | The wrapper clears inherited values because `--skip-tools` does not provision `sccache`. |
 
-## Workflow
+Legacy fork variables such as `OPENSHELL_UPSTREAM`,
+`OPENSHELL_MXC_FORK_DIR`, and `OPENSHELL_MXC_FORK_BRANCH` are no longer part
+of the normal maintenance workflow. Use them only if the user explicitly asks
+for a new disposable fork.
 
-The skill runs the following checklist top-to-bottom. Each step is idempotent; re-running the skill is safe once the fork exists.
+## Validation Workflow
 
-```
-[ ] Step 1: Verify host preconditions
-[ ] Step 2: Install Windows MSVC Rust targets
-[ ] Step 3: Fork OpenShell into the sibling directory
-[ ] Step 4: Apply minimum Windows compatibility shims (cfg gating)
-[ ] Step 5: Add Windows mise task lane
-[ ] Step 6: mise check on x86_64-pc-windows-msvc
-[ ] Step 7: mise check on aarch64-pc-windows-msvc
-[ ] Step 8: mise build --release (both targets)
-[ ] Step 9: mise test on the host's native MSVC target
-[ ] Step 10: Validate $env:OPENSHELL_WXC_EXEC_PATH (informational)
-[ ] Step 11: Scaffold ARM64 CI workflow
-[ ] Step 12: Commit and report artifacts
-```
-
-### Step 1: Verify host preconditions
-
-This step is **advisory**. It records what is and isn't available on the host, but the skill continues regardless — compilation may still succeed (or produce useful errors) on a less-than-ideal host.
+Run the smallest useful slice first, then broaden:
 
 ```powershell
-$warnings = @()
-
-$os = [System.Environment]::OSVersion.Version
-if ($os.Build -lt 26100) {
-    $warnings += "Windows build $($os.Build) < 26100 (recommended for MXC runtime; not required for compilation)."
-}
-
-# MSVC toolchain (must be a VS 2022 Developer PowerShell to be on PATH)
-foreach ($tool in 'cl.exe', 'link.exe') {
-    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-        $warnings += "$tool not found on PATH — open a VS 2022 Developer PowerShell, or expect link failures in Step 5+."
-    }
-}
-
-# Rust + git
-foreach ($tool in 'rustup', 'cargo', 'rustc', 'git') {
-    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-        $warnings += "$tool not found on PATH — Step $(if ($tool -eq 'git') { '3' } else { '2+' }) will fail."
-    }
-}
-
-if (Get-Command rustc -ErrorAction SilentlyContinue) { rustc --version }
-
-if ($warnings.Count -gt 0) {
-    Write-Warning "Host preconditions not fully met:"
-    $warnings | ForEach-Object { Write-Warning "  - $_" }
-    Write-Warning "Continuing anyway — re-evaluate after the next failing step."
-} else {
-    Write-Host "Host preconditions OK."
-}
-```
-
-Record the warning list so it can be included in the final report (Step 12). Do not attempt to install Visual Studio Build Tools or rustup automatically.
-
-### Step 2: Install Windows MSVC Rust targets
-
-```powershell
-rustup target add x86_64-pc-windows-msvc
-if ($env:OPENSHELL_MXC_SKIP_ARM64 -ne "1") {
-    rustup target add aarch64-pc-windows-msvc
-}
-```
-
-### Step 3: Fork OpenShell into the sibling directory
-
-This is the only step that creates a new on-disk repo. Confirm `$env:OPENSHELL_MXC_FORK_DIR` does not exist before cloning.
-
-```powershell
-$fork = if ($env:OPENSHELL_MXC_FORK_DIR) { $env:OPENSHELL_MXC_FORK_DIR } else { "C:\Users\$env:USERNAME\openshell-mxc" }
-$upstream = if ($env:OPENSHELL_UPSTREAM) { $env:OPENSHELL_UPSTREAM } else { "https://github.com/NVIDIA/OpenShell.git" }
-$branch = if ($env:OPENSHELL_MXC_FORK_BRANCH) { $env:OPENSHELL_MXC_FORK_BRANCH } else { "windows-mxc-build" }
-
-if (Test-Path $fork) { throw "Fork dir already exists: $fork. Remove or set OPENSHELL_MXC_FORK_DIR." }
-
-git clone $upstream $fork
-Set-Location $fork
-git checkout -b $branch
-
-# Copy this skill into the fork so it can self-iterate.
-New-Item -ItemType Directory -Force -Path "$fork\.claude\skills\build-openshell-mxc-windows" | Out-Null
-New-Item -ItemType Directory -Force -Path "$fork\.agents\skills\build-openshell-mxc-windows" | Out-Null
-Copy-Item "$PSScriptRoot\*" "$fork\.claude\skills\build-openshell-mxc-windows\" -Recurse -Force
-Copy-Item "$PSScriptRoot\*" "$fork\.agents\skills\build-openshell-mxc-windows\" -Recurse -Force
-```
-
-From this point forward, `Set-Location $fork`. All edits land in the fork, not in the source OpenShell repo.
-
-### Step 4: Apply minimum Windows compatibility shims
-
-The goal is **the smallest patchset that makes `cargo check --target x86_64-pc-windows-msvc` succeed**, not a full Windows port. Strategy:
-
-1. **Cfg-gate Linux-only crates and modules.** Any module that imports `nix`, `landlock`, `libseccomp`, `caps`, or constructs Unix-domain sockets without conditional compilation must be wrapped in `#[cfg(target_os = "linux")]` or `#[cfg(unix)]`.
-2. **Stub Windows-side gateway entry points.** Where Linux uses Unix domain sockets for driver IPC (gateway ↔ compute driver), provide a `#[cfg(target_os = "windows")]` stub that returns `Err(unimplemented!("Windows named-pipe transport — follow-on skill"))`. The build must compile; runtime behavior is not in scope.
-3. **Disable Linux-only crates from the Windows build graph.** In each crate's `Cargo.toml`, gate platform-specific dependencies with `[target.'cfg(target_os = "linux")'.dependencies]`. Common offenders: `nix`, `landlock`, `libseccomp`, `caps`, `procfs`.
-4. **Default storage paths.** Where Linux code uses `~/.local/share/openshell` or `/var/lib/openshell`, add a `#[cfg(target_os = "windows")]` branch returning `%APPDATA%\OpenShell`.
-
-See [reference.md](reference.md) for the concrete dependency audit (which crates and modules need gating, and the exact patterns to apply).
-
-Driver crates that are not supported on Windows (`openshell-driver-docker`, `openshell-driver-podman`, `openshell-driver-vm`, `openshell-driver-kubernetes`) must compile as minimal Windows library stubs. Preserve their configuration structs so existing config parsing keeps working, and make every Windows runtime entry point or constructor return an "unsupported on Windows" error. Do not build, package, ship, or smoke-test standalone driver binaries as Windows deliverables. Do not enable Docker, Kubernetes, Podman, VM, Docker Desktop, WSL, Hyper-V, Podman machine, Podman Desktop, or any VM-backed runtime in this build-only skill.
-
-### Step 5: Add Windows mise task lane
-
-Create a Windows-only task file at `tasks/windows.toml` and a PowerShell wrapper at `tasks/scripts/windows-msvc.ps1`. This lane is additive: do not change the existing Linux `build`, `test`, or `ci` tasks. The Linux build procedure remains the repo's default mise/Cargo path.
-
-The task file must expose these commands:
-
-| Task | Purpose |
-|---|---|
-| `windows:check:x64` | `cargo check --workspace --target x86_64-pc-windows-msvc` |
-| `windows:check:arm64` | `cargo check --workspace --target aarch64-pc-windows-msvc` |
-| `windows:build:x64` | Release-build `openshell-gateway` and `openshell` for x64 |
-| `windows:build:arm64` | Release-build `openshell-gateway` and `openshell` for ARM64 |
-| `windows:test:x64` | Native x64 `cargo test --workspace --no-fail-fast`, excluding unsupported driver packages as top-level workspace targets |
-| `windows:test:arm64` | Native ARM64 `cargo test --workspace --no-fail-fast` with the same exclusions |
-| `windows:test:unsupported:x64` | Focused server/runtime tests that assert unsupported Windows driver contracts without building standalone driver binaries |
-| `windows:test:unsupported:arm64` | The same focused contracts on a native ARM64 host |
-| `windows:ci` | Ordered Windows check/build/test/unsupported-contract/artifact lane |
-
-The PowerShell wrapper must:
-
-1. Discover `VsDevCmd.bat` through `$env:OPENSHELL_VSDEVCMD`, `vswhere`, or standard Visual Studio install paths.
-2. Add the requested rustup target before invoking Cargo.
-3. Set `CARGO_INCREMENTAL=0` and keep `CARGO_TARGET_DIR` inside the fork unless the caller overrides it.
-4. Clear inherited `RUSTC_WRAPPER` for this lane, because `mise run --skip-tools` intentionally does not provision `sccache`.
-5. Exclude Docker, Kubernetes, Podman, and VM driver packages as top-level Windows workspace targets for check/test while still allowing their library stubs to compile as dependencies.
-6. Emit logs for x64/ARM64 checks, builds, tests, and unsupported-contract tests.
-7. Fail fast if a Windows-only task is invoked on a non-Windows host.
-
-Use `mise run --skip-tools windows:*` in GitHub Actions and local Windows automation. `--skip-tools` is intentional: this repo should not ask mise to install Rust on Windows because the MSVC flow relies on rustup plus Visual Studio Build Tools.
-
-For bundled Z3, the wrapper fetches the revision pinned by `z3-sys` through
-Git and sets `Z3_SYS_BUNDLED_DIR_OVERRIDE`. It caches under an explicitly
-configured `CARGO_TARGET_DIR`, or under the current user's local application
-data directory when Cargo uses its default target tree. Concurrent commands
-publish the validated source through an atomic directory rename so x64 and
-ARM64 validation can share the cache safely. This bypasses the unauthenticated
-GitHub Contents API lookup that can fail with HTTP 403 on shared networks.
-
-The repository-wide `mise run pre-commit` task is supported on Windows.
-`tasks/rust.toml` and `tasks/test.toml` route compiler-bearing checks through
-the wrapper for the native host target, while `tasks/markdown.toml` provides a
-Windows-safe dependency setup command. Keep existing Unix `run` bodies
-unchanged when adding `run_windows` behavior. Linux installer,
-build-environment shell-helper, and packaging asset tests skip explicitly;
-cross-platform checks continue to run. The wrapper serializes its Cargo
-commands and limits Cargo compilation to four jobs by default so
-concurrent pre-commit tasks do not exhaust Windows process resources. Set
-`OPENSHELL_WINDOWS_BUILD_JOBS` to a positive integer to override the limit.
-It deliberately leaves `CL` and `_CL_` unset because `clang-cl` consumes those
-variables too. Injecting MSVC-only options such as `/MP` can make ARM64 crypto
-dependency builds treat the option as an input file.
-
-### Step 6: mise check on x86_64-pc-windows-msvc
-
-```powershell
-$env:CARGO_TARGET_DIR = "$fork\target"
 mise run --skip-tools windows:check:x64
-```
-
-This wraps `cargo check --workspace --target x86_64-pc-windows-msvc`. If it fails, the error log is the audit list. Iterate Step 4 through Step 6 until x64 succeeds. Common error patterns and their fixes are in [reference.md](reference.md#common-errors).
-
-### Step 7: mise check on aarch64-pc-windows-msvc
-
-```powershell
-if ($env:OPENSHELL_MXC_SKIP_ARM64 -ne "1") {
-    mise run --skip-tools windows:check:arm64
-}
-```
-
-ARM64 typically surfaces the same dependency issues as x64. If x64 passes but ARM64 fails, the fault is almost always a native dependency (a `*-sys` crate without ARM64 prebuilds) or an inline-asm block lacking aarch64 paths. Either find a pure-Rust replacement or add ARM64 to the existing cfg gate.
-
-On an x64 host this is a cross-build. The wrapper validates the ARM64 compiler
-and Spectre libraries, adds host-native LLVM to `PATH`, lets ARM64 crypto crates
-select `clang-cl`, and keeps bundled Z3 on native MSVC `cl.exe` through the
-Visual Studio generator.
-Use a short absolute `CARGO_TARGET_DIR` if Windows path-length limits are hit.
-
-### Step 8: mise build --release (both targets)
-
-```powershell
+mise run --skip-tools windows:check:arm64
 mise run --skip-tools windows:build:x64
-if ($env:OPENSHELL_MXC_SKIP_ARM64 -ne "1") {
-    mise run --skip-tools windows:build:arm64
-}
+mise run --skip-tools windows:build:arm64
+mise run --skip-tools windows:test:x64
+mise run --skip-tools windows:test:unsupported:x64
 ```
 
-Build only the binaries needed for build validation: `openshell-gateway` and `openshell` CLI. Skip `openshell-sandbox` — the supervisor Windows port is a follow-on skill.
-
-Verify the binaries exist and report their architecture:
-
-```powershell
-Get-Item "$fork\target\x86_64-pc-windows-msvc\release\openshell-gateway.exe"
-Get-Item "$fork\target\aarch64-pc-windows-msvc\release\openshell-gateway.exe" -ErrorAction SilentlyContinue
-dumpbin /HEADERS "$fork\target\x86_64-pc-windows-msvc\release\openshell-gateway.exe" | Select-String "machine"
-```
-
-Expected machine values: `x64` for `x86_64-pc-windows-msvc`, `ARM64` for `aarch64-pc-windows-msvc`.
-
-### Step 9: mise test on the native Windows architecture
+For full validation, detect the Windows host architecture first and choose the
+native lane dynamically:
 
 ```powershell
 $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-if ($arch -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
-    mise run --skip-tools windows:test:arm64
-    mise run --skip-tools windows:test:unsupported:arm64
-} else {
-    mise run --skip-tools windows:test:x64
-    mise run --skip-tools windows:test:unsupported:x64
-}
-```
-
-The wrapper rejects test targets that do not match the host architecture. This
-keeps ARM64 results native and avoids reporting x64 emulation as ARM64 coverage.
-
-Failures fall into three buckets:
-
-1. **Linux-only test** — gate with `#[cfg(not(target_os = "windows"))]` and add a short comment describing the Windows-equivalent test that will eventually replace it.
-2. **Path or environment assumption** — fix with conditional `%APPDATA%` paths.
-3. **Genuine bug** — fix or open a follow-on issue and gate.
-
-ARM64 tests are not run locally — they require a native ARM64 runner and are scaffolded in Step 11.
-
-### Step 10: Validate `$env:OPENSHELL_WXC_EXEC_PATH` (informational)
-
-This skill does **not** invoke `wxc-exec.exe`. The validation here is a forward-compatibility check so the follow-on MXC driver skill can rely on a known-good path.
-
-```powershell
-if ($env:OPENSHELL_WXC_EXEC_PATH) {
-    if (-not (Test-Path $env:OPENSHELL_WXC_EXEC_PATH)) {
-        Write-Warning "OPENSHELL_WXC_EXEC_PATH set but file missing: $env:OPENSHELL_WXC_EXEC_PATH"
-    } else {
-        $arch = (dumpbin /HEADERS $env:OPENSHELL_WXC_EXEC_PATH | Select-String "machine").Line
-        Write-Host "wxc-exec.exe found: $env:OPENSHELL_WXC_EXEC_PATH ($arch)"
+switch ($arch.ToString()) {
+    "X64" {
+        mise run --skip-tools windows:ci
     }
-} else {
-    Write-Host "OPENSHELL_WXC_EXEC_PATH unset — MXC driver wiring is out of scope for this skill."
+    "Arm64" {
+        mise run --skip-tools windows:check:arm64
+        mise run --skip-tools windows:build:arm64
+        mise run --skip-tools windows:test:arm64
+        mise run --skip-tools windows:test:unsupported:arm64
+        mise run --skip-tools windows:artifacts
+    }
+    default {
+        throw "Unsupported Windows host architecture for OpenShell MSVC validation: $arch"
+    }
 }
 ```
 
-### Step 11: Scaffold ARM64 CI workflow
+On x64 hosts, `windows:ci` is the full current CI contract and runs in this
+order:
 
-Add `.github/workflows/windows-msvc.yml` (or its GitLab equivalent for the fork) with two jobs: `x64` and `arm64`. The x64 job runs on `windows-2025`; the arm64 job runs on a self-hosted runner labelled `windows-arm64`. Do not provision the runner from the skill — emit a TODO comment in the workflow file noting that runner setup is operator work.
+1. x64 check.
+2. ARM64 check, unless `OPENSHELL_MXC_SKIP_ARM64=1`.
+3. x64 release build.
+4. ARM64 release build, unless skipped.
+5. Native x64 workspace tests.
+6. Focused unsupported-driver contract tests.
+7. Artifact reporting.
 
-Template (skill writes this verbatim to `.github/workflows/windows-msvc.yml` in the fork):
+The ARM64 check/build steps in this x64-host contract are cross-builds. The
+wrapper adds host-native LLVM to `PATH`, requires the ARM64 compiler and
+Spectre-mitigated libraries, lets ARM64 crypto crates select `clang-cl`, and
+keeps bundled Z3 on native MSVC `cl.exe` with CMake's Visual Studio ARM64
+generator. Do not substitute Ninja: `z3-sys 0.10.9` passes the MSBuild-only
+`-m` argument.
 
-```yaml
-name: Windows MSVC (build-only)
-on:
-  push:
-    branches: [windows-mxc-build]
-  pull_request:
-jobs:
-  x64:
-    runs-on: windows-2025
-    steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v3
-        with:
-          install: false
-          experimental: true
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-      - run: mise run --skip-tools windows:check:x64
-      - run: mise run --skip-tools windows:build:x64
-      - run: mise run --skip-tools windows:test:x64
-      - run: mise run --skip-tools windows:test:unsupported:x64
-  arm64:
-    # TODO: provision a windows-arm64 self-hosted runner
-    runs-on: [self-hosted, windows-arm64]
-    if: false  # flip to true once the runner is online
-    steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v3
-        with:
-          install: false
-          experimental: true
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-pc-windows-msvc
-      - run: mise run --skip-tools windows:check:arm64
-      - run: mise run --skip-tools windows:build:arm64
-```
+On ARM64 hosts, validate the native ARM64 check, build, and test path. The
+wrapper rejects test targets that do not match the host architecture, so x64
+compatibility under emulation is not part of these tasks. The aggregate
+`windows:ci` task remains the x64-host CI contract; run the explicit ARM64
+commands above on an ARM64 host.
 
-### Step 12: Commit and report
+The repository-wide `mise run pre-commit` task is also supported on Windows.
+Its Rust check, Clippy, and test dependencies enter the same MSVC environment
+for the native host target and clear inherited `RUSTC_WRAPPER`. Linux glibc
+installer tests and Linux service/RPM packaging-asset tests skip explicitly;
+the Linux build-environment shell-helper test also skips; cross-platform checks
+continue to run. The blocking Windows Clippy pass excludes unsupported
+Windows runtime packages as top-level targets. It allows only unused imports,
+dead code, and unused async functions that result from cfg-gated Windows stubs;
+other warnings remain errors.
 
-Commit each logical change as a Conventional Commit (per AGENTS.md). Suggested commit sequence:
+The wrapper limits Cargo to four jobs by default and serializes wrapper-owned
+Cargo commands with a host-local mutex. It deliberately does not set `CL` or
+`_CL_`: those variables are also consumed by `clang-cl`, where a global MSVC
+option such as `/MP4` can be interpreted as an input file and break ARM64
+crypto dependency builds.
 
-```powershell
-git add Cargo.toml Cargo.lock
-git commit -m "chore(windows): platform-gate Linux-only dependencies"
+## Expected Task Behavior
 
-git add crates/
-git commit -m "feat(windows): cfg-gate Linux-only modules for MSVC target"
-
-git add .github/workflows/windows-msvc.yml
-git commit -m "ci(windows): scaffold x64 + arm64 MSVC workflow"
-
-git add tasks/windows.toml tasks/scripts/windows-msvc.ps1
-git commit -m "chore(windows): add mise MSVC task lane"
-```
-
-Final report should include:
-
-| Item | Value |
+| Task | Expected behavior |
 |---|---|
-| Host preconditions | "OK" or the warning list captured in Step 1 |
-| Fork directory | `$env:OPENSHELL_MXC_FORK_DIR` |
-| Branch | `$env:OPENSHELL_MXC_FORK_BRANCH` |
-| x64 binary | `target\x86_64-pc-windows-msvc\release\openshell-gateway.exe` (size, sha256) |
-| ARM64 binary | `target\aarch64-pc-windows-msvc\release\openshell-gateway.exe` (size, sha256) or "skipped" |
-| Test summary | passed / failed / gated-out from `test-x64.log` |
-| Windows mise lane | status of `windows:check:*`, `windows:build:*`, `windows:test:x64`, and `windows:test:unsupported:x64` |
-| Gated modules | list of crates and modules with new `#[cfg(...)]` guards |
-| `wxc-exec.exe` | path and architecture, or "unset" |
-| Next skills to run | follow-on driver and policy-translation skills |
+| `windows:check:x64` | `cargo check --workspace` for `x86_64-pc-windows-msvc`, excluding unsupported Windows packages as top-level workspace targets. |
+| `windows:check:arm64` | `cargo check --workspace` for `aarch64-pc-windows-msvc`, with the same top-level exclusions. |
+| `windows:build:x64` | Release-builds `openshell-gateway.exe` and `openshell.exe` for x64. |
+| `windows:build:arm64` | Release-builds `openshell-gateway.exe` and `openshell.exe` for ARM64. |
+| `windows:test:x64` | Runs native x64 workspace tests with `--no-fail-fast`, excluding unsupported Windows packages as top-level workspace targets. |
+| `windows:test:arm64` | Runs native ARM64 workspace tests with `--no-fail-fast` and the same package exclusions. Rejects non-ARM64 hosts. |
+| `windows:test:unsupported:x64` | Re-runs focused `openshell-server` tests for unsupported Windows driver behavior. |
+| `windows:test:unsupported:arm64` | Re-runs the same focused contracts natively on ARM64. Rejects non-ARM64 hosts. |
+| `windows:artifacts` | Reports size and SHA256 for release artifacts that exist. |
+| `windows:ci` | Runs the full ordered x64-host Windows CI lane, plus ARM64 check/build when not skipped. |
 
-## Additional resources
+The unsupported driver package excludes are intentional. They prevent standalone
+driver crates from being top-level Windows check/test targets while still
+allowing Windows stubs to compile through gateway dependencies.
 
-- [reference.md](reference.md) — Unix dependency audit, common cargo errors and fixes, cfg gating patterns
+## Unsupported Driver Contract
+
+Windows must continue to reject unsupported compute drivers clearly.
+
+| Driver | Windows build behavior | Runtime behavior |
+|---|---|---|
+| Docker | Config/library stub may compile as a gateway dependency. | Gateway construction returns unsupported. |
+| Kubernetes | Config/library stub may compile as a gateway dependency. | Gateway construction returns unsupported. |
+| Podman | Config/library stub may compile as a gateway dependency. | Gateway construction returns unsupported. |
+| VM | Server-side VM path compiles. | VM spawn returns unsupported. |
+
+The focused contract tasks for either native architecture run:
+
+```text
+windows_compute_driver_stubs_report_unsupported
+windows_spawn_reports_unsupported
+```
+
+These tests are also included in the full x64 workspace test run; the focused
+task intentionally re-runs them so unsupported Windows behavior is visible in
+the CI report.
+
+## Test Accounting Guidance
+
+When reporting `windows:ci`, distinguish these categories:
+
+- Passed tests from the full x64 workspace test log.
+- Passed tests from the full ARM64 workspace test log when run on a native
+  ARM64 host.
+- The two focused unsupported-contract re-runs.
+- Explicit Cargo ignored tests, usually ignored doc examples.
+- Tests hidden by `#[cfg(not(target_os = "windows"))]`; these often appear as
+  `running 0 tests`, not as ignored tests.
+- Test-name `filtered out` counts from focused `cargo test` invocations.
+- Package-level exclusions for unsupported Windows crates; Cargo does not report
+  those as ignored tests.
+
+Useful log files:
+
+| Log | Meaning |
+|---|---|
+| `build-x86_64-pc-windows-msvc-check.log` | x64 check output. |
+| `build-aarch64-pc-windows-msvc-check.log` | ARM64 check output. |
+| `build-x86_64-pc-windows-msvc-release.log` | x64 release build output. |
+| `build-aarch64-pc-windows-msvc-release.log` | ARM64 release build output. |
+| `test-x86_64-pc-windows-msvc.log` | Full native x64 workspace test output. |
+| `test-aarch64-pc-windows-msvc.log` | Full native ARM64 workspace test output. |
+| `test-x86_64-pc-windows-msvc-unsupported-*.log` | Focused unsupported-driver contract output. |
+| `test-aarch64-pc-windows-msvc-unsupported-*.log` | Focused native ARM64 contract output. |
+
+The first bundled-Z3 check or test can spend several minutes in CMake/MSBuild
+without much console output because Cargo output is redirected to the log. Look
+for native `MSBuild.exe` workers before treating the process as stalled. The
+artifact report computes SHA256 through .NET directly and does not rely on the
+`Get-FileHash` module being available inside the mise-launched Windows
+PowerShell process.
+
+## Common Fix Patterns
+
+When Windows validation fails:
+
+1. Identify whether the error is from a top-level Windows deliverable, a
+   gateway dependency stub, or a Unix-only module leaking into the Windows build.
+2. Prefer existing local patterns in the same crate.
+3. Gate Unix imports and modules with `#[cfg(unix)]` or
+   `#[cfg(target_os = "linux")]`.
+4. Add or preserve Windows stubs that return unsupported errors.
+5. Keep Linux behavior unchanged.
+6. Run `cargo fmt --all`, `git diff --check`, and the relevant `windows:*`
+   tasks after changes.
+
+Do not add broad abstractions or new Windows runtime support to satisfy a build
+error. If a missing runtime feature is required, stop and propose a follow-on
+skill or design doc.
+
+## Final Report Checklist
+
+Every substantial Windows build run should report:
+
+| Item | Required detail |
+|---|---|
+| Git state | Branch, latest GitLab commit, and whether local changes existed. |
+| Host preconditions | OS, Rust, MSVC discovery, and notable warnings. |
+| Commands run | Exact `mise run --skip-tools windows:*` commands. |
+| x64 check/build | Pass/fail and log path. |
+| ARM64 check/build | Pass/fail/skipped and log path. |
+| Native tests | Passed/failed/ignored/filtered counts and log path for the host architecture. |
+| Unsupported contracts | Which focused tests ran and their result. |
+| Artifacts | Binary paths, size, and SHA256 when available. |
+| Skips | Explicitly explain tests not run for a non-native architecture, unsupported driver package exclusions, and Windows cfg-gated tests. |
+| Follow-ups | Only concrete follow-ups tied to failures or requested scope. |

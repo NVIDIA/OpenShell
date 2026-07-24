@@ -106,9 +106,9 @@ The wrapper defaults Cargo compilation to four jobs. Set
 `OPENSHELL_WINDOWS_BUILD_JOBS` to a positive integer to override that limit.
 A host-local mutex serializes wrapper-owned Cargo commands so concurrent
 pre-commit tasks do not multiply the process count while bundled Z3 compiles.
-The wrapper deliberately leaves `CL` and `_CL_` unset because `clang-cl`
-consumes those variables too. Injecting MSVC-only options such as `/MP` can
-make ARM64 crypto dependency builds treat the option as an input file.
+The wrapper does not set `CL` or `_CL_`: those variables are also consumed by
+`clang-cl`, where MSVC's `/MP` option can be interpreted as an input file and
+break ARM64 crypto dependency builds.
 
 ## CI Shape
 
