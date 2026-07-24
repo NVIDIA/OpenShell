@@ -824,8 +824,12 @@ fn build_backend_url(endpoint: &str, path: &str) -> String {
             let base_path = &base[path_start..];
             base_path.starts_with("/v1/") || base_path.ends_with("/v1")
         });
-    if base_path_has_v1_edge_segment && (path == "/v1" || path.starts_with("/v1/")) {
-        return format!("{base}{}", &path[3..]);
+    if base_path_has_v1_edge_segment
+        && let Some(rest) = path
+            .strip_prefix("/v1")
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+    {
+        return format!("{base}{rest}");
     }
 
     format!("{base}{path}")
