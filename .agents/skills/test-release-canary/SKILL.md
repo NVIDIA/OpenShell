@@ -19,7 +19,7 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 
 The Linux VM matrix sets `OPENSHELL_VERSION=dev`, so it tests the packages published by Release Dev. The Snap job downloads artifacts from the triggering run, and Kubernetes pins the `0.0.0-dev` chart and `:dev` images. The macOS job retains the installer's default latest-tagged release behavior.
 
-On Linux, the VM harness uses KVM when `/dev/kvm` is readable and writable. It falls back automatically to native-architecture QEMU TCG when KVM is unavailable, which is expected on public ARM64 runners. The workflow does not cross-emulate architectures.
+On Linux, the VM harness uses KVM when `/dev/kvm` is readable and writable. It falls back automatically to native-architecture QEMU TCG when KVM is unavailable, which is expected on public ARM64 runners. Normal canaries do not cross-emulate architectures. The manual `arm64_tcg_benchmark` mode is the exception: it boots the same pinned ARM64 Ubuntu image with TCG on x86_64 and ARM64 Linux hosts.
 
 ## Trigger paths
 
@@ -28,6 +28,10 @@ The workflow has two triggers:
 ```yaml
 on:
   workflow_dispatch:
+    inputs:
+      arm64_tcg_benchmark:
+        type: boolean
+        default: false
   workflow_run:
     workflows: ["Release Dev"]
     types: [completed]
@@ -35,6 +39,7 @@ on:
 
 - **Automatic.** Every successful `Release Dev` run (on `main` or a manual dispatch of Release Dev) fires the canary. Each job gates on `github.event.workflow_run.conclusion == 'success'` so a failed Release Dev does not run the canary.
 - **Manual.** `workflow_dispatch` lets you run the canary on demand against any branch's workflow definition. The Snap job is skipped because a manual run has no triggering Release Dev artifact.
+- **ARM64 TCG benchmark.** A manual dispatch with `arm64_tcg_benchmark=true` skips the artifact canaries and boots the pinned ARM64 Ubuntu guest on both public Linux host architectures. Use it to compare QEMU/TCG startup without involving macOS.
 
 When dispatched manually, `github.event.workflow_run.head_sha` is empty and the workflow falls back to `github.sha` (the branch tip) for the `install.sh` URL.
 
@@ -44,6 +49,14 @@ Run the canary as-is on the current branch:
 
 ```shell
 gh workflow run release-canary.yml --ref "$(git branch --show-current)"
+```
+
+Run only the ARM64 TCG boot benchmark:
+
+```shell
+gh workflow run release-canary.yml \
+  --ref "$(git branch --show-current)" \
+  -f arm64_tcg_benchmark=true
 ```
 
 Watch the run that starts:

@@ -376,6 +376,7 @@ fi
 cp "${TEST_GUEST_FIRMWARE_VARS}" "${vars}"
 chmod 0600 "${vars}"
 
+boot_started_seconds=${SECONDS}
 for attempt in $(seq 1 5); do
 	if [ -n "${requested_ssh_port}" ]; then
 		ssh_port=${requested_ssh_port}
@@ -485,6 +486,7 @@ if [ "${ssh_ready}" -ne 1 ]; then
 	echo "SSH did not become ready within ${ssh_wait_seconds} seconds" >&2
 	exit 1
 fi
+echo "==> SSH ready after $((SECONDS - boot_started_seconds)) seconds"
 
 echo "==> Validating ${distro}"
 # Profile values come from the trusted Nix-generated catalog.

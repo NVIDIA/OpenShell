@@ -2,6 +2,12 @@ name: Release Canary
 
 on:
   workflow_dispatch:
+    inputs:
+      arm64_tcg_benchmark:
+        description: Boot the same ARM64 Ubuntu guest with TCG on x86_64 and ARM64 Linux hosts
+        required: false
+        default: false
+        type: boolean
   workflow_run:
     workflows: ["Release Dev"]
     types: [completed]
@@ -17,7 +23,7 @@ defaults:
 jobs:
   macos:
     name: macOS Homebrew
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && !inputs.arm64_tcg_benchmark) || github.event.workflow_run.conclusion == 'success' }}
     runs-on: macos-latest-xlarge
     timeout-minutes: 20
     steps:
@@ -32,7 +38,7 @@ jobs:
 
   linux-vm:
     name: Linux VM (${{ matrix.distro }}, ${{ matrix.architecture }})
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && !inputs.arm64_tcg_benchmark) || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -86,6 +92,8 @@ jobs:
             configuration_args+=(--with "${configuration}")
           done
 
+          # The variables in the single-quoted script expand inside the guest.
+          # shellcheck disable=SC2016
           nix run .#test-vm -- \
             --distro "${TEST_VM_DISTRO}" \
             "${configuration_args[@]}" \
@@ -103,6 +111,44 @@ jobs:
               openshell --version
               openshell status
             '
+
+  arm64-tcg-benchmark:
+    name: ARM64 TCG boot (${{ matrix.host_architecture }} host)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.arm64_tcg_benchmark }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            host_architecture: x86_64
+          - runner: ubuntu-24.04-arm
+            host_architecture: aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          enable_kvm: false
+          github_access_token: ${{ github.token }}
+
+      - name: Report host
+        run: |
+          set -euo pipefail
+          uname -a
+          lscpu
+
+      - name: Boot pinned ARM64 Ubuntu guest with TCG
+        run: |
+          set -euo pipefail
+          nix run .#test-vm-arm64-tcg -- \
+            --distro ubuntu \
+            -- true
 
   ubuntu-snap:
     name: Ubuntu Snap
@@ -156,7 +202,7 @@ jobs:
 
   kubernetes:
     name: Kubernetes Helm (kind)
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && !inputs.arm64_tcg_benchmark) || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:

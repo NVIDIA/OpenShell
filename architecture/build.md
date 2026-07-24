@@ -183,6 +183,11 @@ QEMU guests on public AMD64 and ARM64 GitHub runners. The VM harness uses KVM
 when available and falls back to TCG otherwise. Separate jobs retain macOS
 Homebrew, Ubuntu Snap, and kind-based Helm coverage.
 
+A manual `arm64_tcg_benchmark` dispatch mode skips the artifact canaries and
+boots the same pinned ARM64 Ubuntu cloud image under QEMU TCG on public x86_64
+and ARM64 Linux runners. This isolates host-dependent TCG boot behavior before
+the production ARM64 canary strategy changes.
+
 See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 
 ## Docs Site

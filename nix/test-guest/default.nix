@@ -3,15 +3,37 @@
 
 # PROTOTYPE: Composable distro VMs for installing and exercising artifacts.
 
-{ pkgs }:
+{
+  pkgs,
+  architecture ? if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64",
+  accelerator ? null,
+  useQemuFirmware ? false,
+}:
 
 let
-  isAarch64 = pkgs.stdenv.hostPlatform.isAarch64;
+  hostArchitecture = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
+  isAarch64 = architecture == "aarch64";
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
-  architecture = if isAarch64 then "aarch64" else "x86_64";
-  qemu = pkgs.qemu.override { hostCpuOnly = true; };
+  guestMatchesHost = architecture == hostArchitecture;
+  qemu = pkgs.qemu.override { hostCpuOnly = guestMatchesHost; };
   qemuBinary =
     if isAarch64 then "${qemu}/bin/qemu-system-aarch64" else "${qemu}/bin/qemu-system-x86_64";
+  selectedAccelerator =
+    if accelerator != null then
+      accelerator
+    else if isDarwin then
+      if guestMatchesHost then "hvf" else "tcg"
+    else if guestMatchesHost then
+      "kvm"
+    else
+      "tcg";
+  firmwareCode =
+    if useQemuFirmware && isAarch64 then
+      "${qemu}/share/qemu/edk2-aarch64-code.fd"
+    else
+      pkgs.OVMF.firmware;
+  firmwareVars =
+    if useQemuFirmware && isAarch64 then "${qemu}/share/qemu/edk2-arm-vars.fd" else pkgs.OVMF.variables;
 
   distros = {
     ubuntu = import ./distros/ubuntu.nix { inherit pkgs architecture; };
