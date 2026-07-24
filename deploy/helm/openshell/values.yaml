@@ -240,6 +240,12 @@ server:
   # default encrypted database credential storage with a retained Kubernetes
   # Secret for the shared key-encryption key.
   credentialDrivers:
+    # -- Pre-generated key-encryption key for the default encrypted credential
+    # storage (base64-encoded, 32 bytes). When set, this value is used instead
+    # of auto-generating one via lookup/randBytes. Required for GitOps workflows
+    # using `helm template` where `lookup` is unavailable.
+    # Generate with: openssl rand -base64 32
+    defaultKeyEncryptionKey: ""
     kubernetesSecrets:
       # -- Enable the in-tree Kubernetes Secret credential driver.
       enabled: false
