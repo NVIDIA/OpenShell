@@ -30,9 +30,16 @@ const DEFAULT_TIMEOUT_SECS: u64 = 10;
 const HANDLE_VERSION: &str = "v1";
 const STORED_VALUE_KEY: &str = "value";
 
+#[derive(Debug, Clone)]
+struct CachedToken {
+    token: String,
+    valid_until: std::time::Instant,
+}
+
 pub struct VaultCredentialDriver {
     client: reqwest::Client,
     settings: VaultDriverSettings,
+    cached_token: tokio::sync::RwLock<Option<CachedToken>>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +115,8 @@ struct KubernetesLoginResponse {
 #[derive(Debug, Deserialize)]
 struct KubernetesLoginAuth {
     client_token: String,
+    #[serde(default)]
+    lease_duration: u64,
 }
 
 impl VaultCredentialDriver {
@@ -124,7 +133,11 @@ impl VaultCredentialDriver {
                     "failed to configure vault credential driver: {err}"
                 ))
             })?;
-        Ok(Self { client, settings })
+        Ok(Self {
+            client,
+            settings,
+            cached_token: tokio::sync::RwLock::new(None),
+        })
     }
 
     pub async fn store_credential(
@@ -237,9 +250,33 @@ impl VaultCredentialDriver {
     }
 
     async fn auth_token(&self) -> Result<String, Status> {
+        {
+            let cache = self.cached_token.read().await;
+            if let Some(cached) = cache.as_ref()
+                && std::time::Instant::now() < cached.valid_until
+            {
+                return Ok(cached.token.clone());
+            }
+        }
+        let mut cache = self.cached_token.write().await;
+        if let Some(cached) = cache.as_ref()
+            && std::time::Instant::now() < cached.valid_until
+        {
+            return Ok(cached.token.clone());
+        }
+        let (token, ttl) = self.fetch_auth_token().await?;
+        *cache = Some(CachedToken {
+            token: token.clone(),
+            valid_until: std::time::Instant::now() + ttl,
+        });
+        Ok(token)
+    }
+
+    async fn fetch_auth_token(&self) -> Result<(String, Duration), Status> {
         match &self.settings.auth {
             VaultAuthSettings::TokenFile { token_path } => {
-                read_secret_file(token_path, "Vault token file").await
+                let token = read_secret_file(token_path, "Vault token file").await?;
+                Ok((token, Duration::from_secs(30)))
             }
             VaultAuthSettings::Kubernetes {
                 role,
@@ -261,7 +298,7 @@ impl VaultCredentialDriver {
         role: &str,
         auth_mount: &str,
         jwt: &str,
-    ) -> Result<String, Status> {
+    ) -> Result<(String, Duration), Status> {
         let path = format!("auth/{auth_mount}/login");
         let url = self.url_for_path(&path)?;
         let response = self
@@ -284,6 +321,12 @@ impl VaultCredentialDriver {
             .map_err(|_| {
                 Status::failed_precondition("Vault Kubernetes auth returned invalid JSON")
             })?;
+        let lease_secs = body.auth.as_ref().map_or(0, |a| a.lease_duration);
+        let ttl = if lease_secs > 30 {
+            Duration::from_secs(lease_secs - 30)
+        } else {
+            Duration::from_secs(30)
+        };
         let token = body
             .auth
             .map(|auth| auth.client_token)
@@ -295,7 +338,7 @@ impl VaultCredentialDriver {
                 "Vault Kubernetes auth returned an empty client token",
             ));
         }
-        Ok(token)
+        Ok((token, ttl))
     }
 
     async fn resolve_secret_value(
@@ -404,6 +447,7 @@ impl Clone for VaultCredentialDriver {
         Self {
             client: self.client.clone(),
             settings: self.settings.clone(),
+            cached_token: tokio::sync::RwLock::new(None),
         }
     }
 }
