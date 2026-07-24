@@ -196,7 +196,13 @@ pub async fn gateway_status(
                     |http| {
                         let hs = Some(http.to_string());
                         if http.is_success() {
-                            ("connected_http", None, Some(e.to_string()), hs, auth.clone())
+                            (
+                                "connected_http",
+                                None,
+                                Some(e.to_string()),
+                                hs,
+                                auth.clone(),
+                            )
                         } else {
                             ("error", None, Some(e.to_string()), hs, auth.clone())
                         }
@@ -230,13 +236,7 @@ pub async fn gateway_status(
                             auth.clone(),
                         )
                     } else {
-                        (
-                            "disconnected",
-                            None,
-                            Some(e.to_string()),
-                            hs,
-                            auth.clone(),
-                        )
+                        ("disconnected", None, Some(e.to_string()), hs, auth.clone())
                     }
                 },
             )
@@ -10578,8 +10578,7 @@ mod tests {
 
     #[test]
     fn status_to_json_disconnected_with_error() {
-        let auth =
-            GatewayAuthenticationState::Unverified("gateway unreachable".to_string());
+        let auth = GatewayAuthenticationState::Unverified("gateway unreachable".to_string());
         let json = super::status_to_json(
             "broken-gw",
             "http://10.0.0.1:8090",

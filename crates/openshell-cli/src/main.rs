@@ -1439,7 +1439,7 @@ enum SandboxCommands {
         approval_mode: String,
 
         /// Output format.
-        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["editor", "command", "no_keep"])]
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["editor", "command", "no_keep", "forward"])]
         output: OutputFormat,
 
         /// Command to run after "--" (defaults to an interactive shell).
@@ -2286,7 +2286,14 @@ async fn main() -> Result<()> {
             if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 let auth_error = apply_auth_with_status(&mut tls, &ctx.name);
-                run::gateway_status(&ctx.name, &ctx.endpoint, output.as_str(), &tls, auth_error.as_deref()).await?;
+                run::gateway_status(
+                    &ctx.name,
+                    &ctx.endpoint,
+                    output.as_str(),
+                    &tls,
+                    auth_error.as_deref(),
+                )
+                .await?;
             } else if openshell_cli::output::print_output_single(
                 output.as_str(),
                 &(),
@@ -5054,6 +5061,25 @@ mod tests {
             result.is_err(),
             "--approval-mode auto_on_low_risk should be rejected until added to the value parser"
         );
+    }
+
+    #[test]
+    fn sandbox_create_output_conflicts_with_side_effect_args() {
+        for (label, extra_args) in [
+            ("--editor", &["--editor", "code"][..]),
+            ("trailing command", &["--", "claude"][..]),
+            ("--no-keep", &["--no-keep"][..]),
+            ("--forward", &["--forward", "8080"][..]),
+        ] {
+            let args = ["openshell", "sandbox", "create", "--output", "json"]
+                .into_iter()
+                .chain(extra_args.iter().copied());
+            let result = Cli::try_parse_from(args);
+            assert!(
+                result.is_err(),
+                "structured output should conflict with {label}"
+            );
+        }
     }
 
     #[test]
