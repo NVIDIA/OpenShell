@@ -25,14 +25,12 @@ With no COMMAND, the runner opens an interactive SSH session.
 EOF
 }
 
-if [ "${OPENSHELL_TEST_VM_RUNTIME:-}" != 1 ] || [ ! -r "${OPENSHELL_TEST_VM_CATALOG:-}" ]; then
+if [ "${OPENSHELL_TEST_VM_RUNTIME:-}" != 1 ] ||
+	[ ! -d "${OPENSHELL_TEST_VM_DISTROS:-}" ] ||
+	[ ! -d "${OPENSHELL_TEST_VM_CONFIGURATIONS:-}" ]; then
 	echo "run this script through 'nix run .#test-vm -- ...'" >&2
 	exit 2
 fi
-
-# The generated catalog contains only trusted Nix store paths and profile data.
-# shellcheck disable=SC1090
-. "${OPENSHELL_TEST_VM_CATALOG}"
 
 distro=
 requested_ssh_port=
@@ -92,9 +90,13 @@ done
 
 if [ "${list}" -eq 1 ]; then
 	echo "Distros:"
-	test_vm_list_distros | sed 's/^/  /'
+	for entry in "${OPENSHELL_TEST_VM_DISTROS}"/*; do
+		printf '  %s\n' "${entry##*/}"
+	done
 	echo "Configurations:"
-	test_vm_list_configurations | sed 's/^/  /'
+	for entry in "${OPENSHELL_TEST_VM_CONFIGURATIONS}"/*; do
+		printf '  %s\n' "${entry##*/}"
+	done
 	exit 0
 fi
 
@@ -103,13 +105,18 @@ if [ -z "${distro}" ]; then
 	usage >&2
 	exit 2
 fi
-if ! test_vm_load_distro "${distro}"; then
+if [[ ! ${distro} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+	[ ! -r "${OPENSHELL_TEST_VM_DISTROS}/${distro}" ]; then
 	echo "unknown distro: ${distro}" >&2
 	exit 2
 fi
+# Distro profiles contain only trusted values generated into the Nix store.
+# shellcheck disable=SC1090
+. "${OPENSHELL_TEST_VM_DISTROS}/${distro}"
 
 for item in "${configurations[@]}"; do
-	if [ -z "${item}" ] || ! test_vm_load_configuration "${item}"; then
+	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+		[ ! -r "${OPENSHELL_TEST_VM_CONFIGURATIONS}/${item}" ]; then
 		echo "unknown configuration: ${item:-<empty>}" >&2
 		exit 2
 	fi
@@ -360,10 +367,9 @@ guest ansible_host=127.0.0.1 ansible_port=${ssh_port} ansible_user=openshell ans
 EOF
 
 for item in "${configurations[@]}"; do
-	test_vm_load_configuration "${item}"
 	echo "==> Applying configuration: ${item}"
 	ANSIBLE_CONFIG="${ansible_config}" ANSIBLE_NOCOLOR=1 \
-		ansible-playbook "${TEST_VM_CONFIGURATION_PLAYBOOK}"
+		ansible-playbook "${OPENSHELL_TEST_VM_CONFIGURATIONS}/${item}"
 done
 
 for package in "${packages[@]}"; do

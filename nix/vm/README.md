@@ -33,7 +33,7 @@ nix/vm/
     └── selinux.yml
 ```
 
-- `default.nix` assembles the VM flake app. It selects host architecture and acceleration, supplies QEMU and Ansible through the Nix runtime closure, imports the distro catalog, and maps `--with` names to playbooks.
+- `default.nix` assembles the VM flake app. It selects host architecture and acceleration, supplies QEMU and Ansible through the Nix runtime closure, and exposes distro profiles and configuration playbooks as Nix-store catalogs.
 - `run.sh` owns the disposable VM lifecycle: argument validation, cloud-image realization, cloud-init seed creation, QEMU startup, SSH readiness, Ansible execution, artifact installation, guest command execution, and cleanup.
 - `distros/*.nix` define the immutable base-image catalog. Each record pins the image URL and hash and declares the expected OS ID, version, and package family. Distro definitions do not provision extra software.
 - `configuration/*.yml` are host-executed Ansible playbooks that layer optional capabilities onto a base guest. Configurations remain independent and run in the order supplied with repeated `--with` arguments.
