@@ -19,7 +19,7 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 
 The Linux VM matrix sets `OPENSHELL_VERSION=dev`, so it tests the packages published by Release Dev. The Snap job downloads artifacts from the triggering run, and Kubernetes pins the `0.0.0-dev` chart and `:dev` images. The macOS job retains the installer's default latest-tagged release behavior.
 
-On Linux, the VM harness uses KVM when `/dev/kvm` is readable and writable. It falls back automatically to native-architecture QEMU TCG when KVM is unavailable, which is expected on public ARM64 runners. Normal canaries do not cross-emulate architectures. The manual `arm64_tcg_benchmark` mode is the exception: it boots the same pinned ARM64 Ubuntu image with TCG on x86_64 and ARM64 Linux hosts.
+On Linux, the VM harness uses KVM when `/dev/kvm` is readable and writable. It falls back automatically to native-architecture QEMU TCG when KVM is unavailable, which is expected on public ARM64 runners. The ARM64 fallback switches from the default firmware to QEMU's bundled EDK2 firmware, which is validated under TCG. Normal canaries do not cross-emulate architectures. The manual `arm64_tcg_benchmark` mode is the exception: it boots the same pinned ARM64 Ubuntu image with TCG on x86_64 and ARM64 Linux hosts.
 
 ## Trigger paths
 

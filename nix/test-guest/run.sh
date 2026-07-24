@@ -245,6 +245,13 @@ if [ "${TEST_GUEST_ACCELERATOR}" = kvm ] &&
 	TEST_GUEST_ACCELERATOR=tcg
 	test_vm_cpu=max
 	ssh_wait_seconds=600
+	if [ "${TEST_VM_ARCHITECTURE}" = aarch64 ]; then
+		: "${TEST_VM_TCG_FIRMWARE_CODE:?missing QEMU ARM TCG firmware code}"
+		: "${TEST_VM_TCG_FIRMWARE_VARS:?missing QEMU ARM TCG firmware variables}"
+		TEST_VM_FIRMWARE_CODE=${TEST_VM_TCG_FIRMWARE_CODE}
+		TEST_VM_FIRMWARE_VARS=${TEST_VM_TCG_FIRMWARE_VARS}
+		echo "==> Using QEMU-bundled ARM firmware for TCG fallback"
+	fi
 fi
 
 # shellcheck disable=SC1090

@@ -180,13 +180,15 @@ The high-level CI model:
 After each successful Release Dev run, the release canary smoke-tests published
 artifacts. Linux package installs run in native-architecture Ubuntu and Fedora
 QEMU guests on public AMD64 and ARM64 GitHub runners. The VM harness uses KVM
-when available and falls back to TCG otherwise. Separate jobs retain macOS
-Homebrew, Ubuntu Snap, and kind-based Helm coverage.
+when available and falls back to TCG otherwise. The ARM64 fallback uses QEMU's
+bundled EDK2 firmware, which is validated under TCG on both public Linux host
+architectures. Separate jobs retain macOS Homebrew, Ubuntu Snap, and kind-based
+Helm coverage.
 
 A manual `arm64_tcg_benchmark` dispatch mode skips the artifact canaries and
 boots the same pinned ARM64 Ubuntu cloud image under QEMU TCG on public x86_64
-and ARM64 Linux runners. This isolates host-dependent TCG boot behavior before
-the production ARM64 canary strategy changes.
+and ARM64 Linux runners. The comparison keeps the native ARM64 runner as the
+production host while verifying that x86_64 TCG remains a viable fallback.
 
 See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 
