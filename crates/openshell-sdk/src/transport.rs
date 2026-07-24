@@ -10,6 +10,7 @@
 use crate::config::{AuthConfig, ClientConfig};
 use crate::edge_tunnel;
 use crate::error::{Result, SdkError};
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, ServerName, UnixTime},
@@ -232,6 +233,7 @@ impl tower::Service<hyper::Uri> for InsecureTlsConnector {
             let port = uri.port_u16().unwrap_or(443);
             let addr = format!("{host}:{port}");
             let tcp = tokio::net::TcpStream::connect(addr).await?;
+            set_tcp_nodelay_best_effort(&tcp);
             let server_name = ServerName::try_from(host)?;
             let tls_stream = tls_connector.connect(server_name, tcp).await?;
             Ok(hyper_util::rt::TokioIo::new(tls_stream))
