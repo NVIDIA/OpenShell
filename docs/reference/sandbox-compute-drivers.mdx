@@ -355,6 +355,31 @@ OpenShell workspace. Set
 `openshell.drivers.kubernetes.warm_pooling.enabled = false` to force direct
 `Sandbox` creation.
 
+When `openshell.drivers.kubernetes.warm_pooling.profiles.enabled = true`, the
+driver reconciles labelled ConfigMaps into generated `SandboxTemplate` and
+`SandboxWarmPool` resources. This is enabled by default with the Helm chart.
+Each profile ConfigMap must contain
+`data["warm-pool.toml"]` with a narrow CLI-shaped schema:
+
+```toml
+version = 1
+workspace = "default"
+replicas = 3
+image = "ghcr.io/acme/agent-python:latest"
+runtime_class_name = "nvidia"
+
+[environment]
+FOO = "bar"
+
+[resources]
+cpu = "4"
+memory = "8Gi"
+gpu_count = 1
+```
+
+The generated warm pools carry `openshell.ai/enabled=true`, so the existing
+matching path discovers them like any externally managed warm pool.
+
 If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the controller and CRD rollout completes so the gateway can detect the served API versions again.
 
 <Note>

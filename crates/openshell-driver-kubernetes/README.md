@@ -46,6 +46,15 @@ The extension CRDs are intentionally v1beta1-only. The core
 `agents.x-k8s.io/Sandbox` CRD still supports the existing v1beta1-to-v1alpha1
 fallback.
 
+The driver can also reconcile admin-authored warm-pool profiles from labelled
+ConfigMaps when `warm_pooling.profiles.enabled` is true. Profiles live in the
+configured profile namespace, use the `warm-pool.toml` data key, and expose a
+narrow CLI-shaped schema: `workspace`, `replicas`, `image`,
+`runtime_class_name`, `[environment]`, and `[resources]` with `cpu`, `memory`,
+and `gpu_count`. The reconciler generates ordinary `SandboxTemplate` and
+`SandboxWarmPool` resources labelled `openshell.ai/enabled=true`; the existing
+matching cache then handles allocation unchanged.
+
 ## Workspace Persistence
 
 Sandbox pods use a PVC-backed `/sandbox` workspace. An init container seeds the

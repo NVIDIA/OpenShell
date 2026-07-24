@@ -228,7 +228,11 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead). |
 | server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | K8s secret mounted into sandbox pods for mTLS to the server. |
-| server.warmPooling | object | `{"enabled":true}` | Enable transparent Kubernetes warm-pool allocation through Agent Sandbox v1beta1 SandboxClaim resources when a compatible OpenShell-enabled SandboxWarmPool exists in the target namespace. |
+| server.warmPooling | object | `{"enabled":true,"profiles":{"enabled":true,"labelSelector":"openshell.ai/warm-pool-profile=true","maxReplicas":100,"namespace":""}}` | Enable transparent Kubernetes warm-pool allocation through Agent Sandbox v1beta1 SandboxClaim resources when a compatible OpenShell-enabled SandboxWarmPool exists in the target namespace. |
+| server.warmPooling.profiles | object | `{"enabled":true,"labelSelector":"openshell.ai/warm-pool-profile=true","maxReplicas":100,"namespace":""}` | Reconcile labelled ConfigMap warm-pool profiles into generated SandboxTemplate and SandboxWarmPool resources. Admins can still create warm pools by any other mechanism. |
+| server.warmPooling.profiles.labelSelector | string | `"openshell.ai/warm-pool-profile=true"` | Label selector used to select warm-pool profile ConfigMaps. |
+| server.warmPooling.profiles.maxReplicas | int | `100` | Maximum replicas accepted from a single warm-pool profile. |
+| server.warmPooling.profiles.namespace | string | `""` | Namespace containing warm-pool profile ConfigMaps. Empty defaults to the Helm release namespace. |
 | server.workspaceDefaultStorageSize | string | `""` | Default storage size for the workspace PVC in sandbox pods. Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi"). Empty = built-in default (2Gi). |
 | server.workspaceStorageClass | string | `""` | Kubernetes StorageClass for the workspace PVC in sandbox pods. Empty (default) = omit storageClassName, using the cluster's default StorageClass. Set this on clusters with no default StorageClass, otherwise the workspace PVC stays Pending and the sandbox never starts. |
 | service.healthPort | int | `8081` | Gateway health service port. |

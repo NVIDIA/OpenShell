@@ -203,6 +203,18 @@ server:
   # SandboxWarmPool exists in the target namespace.
   warmPooling:
     enabled: true
+    # -- Reconcile labelled ConfigMap warm-pool profiles into generated
+    # SandboxTemplate and SandboxWarmPool resources. Admins can still create
+    # warm pools by any other mechanism.
+    profiles:
+      enabled: true
+      # -- Namespace containing warm-pool profile ConfigMaps. Empty defaults to
+      # the Helm release namespace.
+      namespace: ""
+      # -- Label selector used to select warm-pool profile ConfigMaps.
+      labelSelector: "openshell.ai/warm-pool-profile=true"
+      # -- Maximum replicas accepted from a single warm-pool profile.
+      maxReplicas: 100
   # -- gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
   # it from the chart fullname, release namespace, service port, and
   # disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080.

@@ -53,3 +53,9 @@ rules:
       - get
       - list
       - watch
+      {{- if .Values.server.warmPooling.profiles.enabled }}
+      - create
+      - patch
+      - update
+      - delete
+      {{- end }}

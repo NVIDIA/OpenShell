@@ -18,6 +18,12 @@ pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 /// Default non-root UID for relaxed Kubernetes network supervisor sidecars.
 pub const DEFAULT_PROXY_UID: u32 = 1337;
 
+/// Label selector for ConfigMap-backed warm-pool profiles.
+pub const DEFAULT_WARM_POOL_PROFILE_LABEL_SELECTOR: &str = "openshell.ai/warm-pool-profile=true";
+
+/// Conservative upper bound for profile-declared warm-pool replicas.
+pub const DEFAULT_WARM_POOL_PROFILE_MAX_REPLICAS: u32 = 100;
+
 /// How the supervisor binary is delivered into sandbox pods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -131,11 +137,73 @@ pub struct KubernetesWarmPoolingConfig {
     /// Allow the Kubernetes driver to satisfy compatible create requests by
     /// creating v1beta1 Agent Sandbox `SandboxClaim` resources.
     pub enabled: bool,
+    /// Optional ConfigMap-backed warm-pool profile reconciler.
+    pub profiles: KubernetesWarmPoolProfilesConfig,
 }
 
 impl Default for KubernetesWarmPoolingConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            profiles: KubernetesWarmPoolProfilesConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesWarmPoolProfilesConfig {
+    /// Watch labelled `ConfigMap` resources and reconcile generated
+    /// `SandboxTemplate` and `SandboxWarmPool` resources from their TOML
+    /// profiles.
+    pub enabled: bool,
+    /// Namespace containing admin-authored warm-pool profile `ConfigMap`
+    /// resources. When empty, the driver uses its configured Kubernetes
+    /// namespace.
+    pub namespace: String,
+    /// Label selector used to select warm-pool profile `ConfigMap` resources.
+    pub label_selector: String,
+    /// Maximum allowed `replicas` value in a profile.
+    pub max_replicas: u32,
+}
+
+impl Default for KubernetesWarmPoolProfilesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            namespace: String::new(),
+            label_selector: DEFAULT_WARM_POOL_PROFILE_LABEL_SELECTOR.to_string(),
+            max_replicas: DEFAULT_WARM_POOL_PROFILE_MAX_REPLICAS,
+        }
+    }
+}
+
+impl KubernetesWarmPoolProfilesConfig {
+    #[must_use]
+    pub fn effective_namespace<'a>(&'a self, fallback_namespace: &'a str) -> &'a str {
+        if self.namespace.trim().is_empty() {
+            fallback_namespace
+        } else {
+            self.namespace.as_str()
+        }
+    }
+
+    #[must_use]
+    pub fn effective_label_selector(&self) -> &str {
+        if self.label_selector.trim().is_empty() {
+            DEFAULT_WARM_POOL_PROFILE_LABEL_SELECTOR
+        } else {
+            self.label_selector.as_str()
+        }
+    }
+
+    #[must_use]
+    pub fn effective_max_replicas(&self) -> u32 {
+        if self.max_replicas == 0 {
+            DEFAULT_WARM_POOL_PROFILE_MAX_REPLICAS
+        } else {
+            self.max_replicas
+        }
     }
 }
 
@@ -567,6 +635,7 @@ mod tests {
     fn default_warm_pooling_is_enabled() {
         let cfg = KubernetesComputeConfig::default();
         assert!(cfg.warm_pooling.enabled);
+        assert!(cfg.warm_pooling.profiles.enabled);
     }
 
     #[test]
@@ -578,6 +647,28 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert!(!cfg.warm_pooling.enabled);
+    }
+
+    #[test]
+    fn serde_override_warm_pool_profile_reconciliation() {
+        let json = serde_json::json!({
+            "warm_pooling": {
+                "profiles": {
+                    "enabled": false,
+                    "namespace": "profiles",
+                    "label_selector": "openshell.ai/warm-pool-profile=true,tier=gpu",
+                    "max_replicas": 7
+                }
+            }
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert!(!cfg.warm_pooling.profiles.enabled);
+        assert_eq!(cfg.warm_pooling.profiles.namespace, "profiles");
+        assert_eq!(
+            cfg.warm_pooling.profiles.label_selector,
+            "openshell.ai/warm-pool-profile=true,tier=gpu"
+        );
+        assert_eq!(cfg.warm_pooling.profiles.max_replicas, 7);
     }
 
     #[test]

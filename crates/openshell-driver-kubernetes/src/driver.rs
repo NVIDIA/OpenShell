@@ -11,9 +11,12 @@ use crate::config::{
 };
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Volume, VolumeMount,
+    ConfigMap, Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Volume,
+    VolumeMount,
 };
-use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams, Preconditions};
+use kube::api::{
+    Api, ApiResource, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions,
+};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
@@ -30,11 +33,11 @@ use openshell_core::progress::{
 };
 use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
-    DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
+    DriverResourceRequirements, DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
     DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
-    GetCapabilitiesResponse, GpuResourceRequirements, WatchSandboxesDeletedEvent,
-    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent,
-    watch_sandboxes_event,
+    GetCapabilitiesResponse, GpuResourceRequirements, ResourceRequirements,
+    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
+    WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
 use serde::Deserialize;
@@ -103,7 +106,28 @@ const SANDBOX_TEMPLATE_KIND: &str = "SandboxTemplate";
 const LABEL_WARM_POOL_ENABLED: &str = "openshell.ai/enabled";
 const LABEL_ALLOCATION: &str = "openshell.ai/allocation";
 const LABEL_ALLOCATION_SANDBOX_CLAIM: &str = "sandbox-claim";
+const LABEL_WARM_POOL_PROFILE: &str = "openshell.ai/warm-pool-profile";
+const LABEL_WARM_POOL_PROFILE_UID: &str = "openshell.ai/warm-pool-profile-uid";
+const LABEL_WARM_POOL_MANAGED_BY: &str = "openshell.ai/managed-by";
+const LABEL_WARM_POOL_MANAGED_BY_VALUE: &str = "openshell-kubernetes-driver";
+const ANNOTATION_WARM_POOL_PROFILE_NAMESPACE: &str = "openshell.ai/warm-pool-profile-namespace";
+const ANNOTATION_WARM_POOL_PROFILE_NAME: &str = "openshell.ai/warm-pool-profile-name";
+const ANNOTATION_WARM_POOL_PROFILE_UID: &str = "openshell.ai/warm-pool-profile-uid";
+const ANNOTATION_WARM_POOL_SOURCE_RESOURCE_VERSION: &str = "openshell.ai/source-resource-version";
+const ANNOTATION_WARM_POOL_TEMPLATE_FINGERPRINT: &str = "openshell.ai/template-fingerprint";
+const ANNOTATION_WARM_POOL_STATUS: &str = "openshell.ai/warm-pool-status";
+const ANNOTATION_WARM_POOL_OBSERVED_RESOURCE_VERSION: &str =
+    "openshell.ai/warm-pool-observed-resource-version";
+const ANNOTATION_WARM_POOL_TARGET_NAMESPACE: &str = "openshell.ai/warm-pool-target-namespace";
+const ANNOTATION_WARM_POOL_TEMPLATE: &str = "openshell.ai/warm-pool-template";
+const ANNOTATION_WARM_POOL_FINGERPRINT: &str = "openshell.ai/warm-pool-fingerprint";
+const ANNOTATION_WARM_POOL_LAST_ERROR: &str = "openshell.ai/warm-pool-last-error";
 const POD_ANNOTATION_SANDBOX_ID: &str = "openshell.io/sandbox-id";
+const WARM_POOL_PROFILE_DATA_KEY: &str = "warm-pool.toml";
+const WARM_POOL_PROFILE_VERSION: u32 = 1;
+const WARM_POOL_PROFILE_REQUEUE_DELAY: Duration = Duration::from_secs(10);
+const WARM_POOL_PROFILE_RESYNC_DELAY: Duration = Duration::from_secs(300);
+const WARM_POOL_PROFILE_NAME_PREFIX: &str = "openshell-wp";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const SPIFFE_WORKLOAD_API_VOLUME_NAME: &str = "spiffe-workload-api";
@@ -133,6 +157,56 @@ struct WarmPoolCacheEntry {
     template_namespace: String,
     template_name: String,
     template_fingerprint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WarmPoolProfile {
+    version: u32,
+    workspace: String,
+    #[serde(default = "default_warm_pool_profile_replicas")]
+    replicas: u32,
+    #[serde(default)]
+    image: String,
+    #[serde(default)]
+    runtime_class_name: String,
+    #[serde(default)]
+    environment: BTreeMap<String, String>,
+    #[serde(default)]
+    resources: WarmPoolProfileResources,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WarmPoolProfileResources {
+    #[serde(default)]
+    cpu: String,
+    #[serde(default)]
+    memory: String,
+    gpu_count: Option<u32>,
+}
+
+fn default_warm_pool_profile_replicas() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone)]
+struct WarmPoolProfileSource {
+    namespace: String,
+    name: String,
+    uid: String,
+    resource_version: String,
+}
+
+#[derive(Debug, Clone)]
+struct RenderedWarmPoolProfile {
+    source: WarmPoolProfileSource,
+    workspace: String,
+    target_namespace: String,
+    generated_name: String,
+    replicas: u32,
+    template_spec: serde_json::Value,
+    fingerprint: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -592,6 +666,9 @@ impl KubernetesComputeDriver {
         };
         if driver.config.warm_pooling.enabled {
             driver.spawn_warm_pool_cache_controller();
+            if driver.config.warm_pooling.profiles.enabled {
+                driver.spawn_warm_pool_profile_reconciler();
+            }
         }
         Ok(driver)
     }
@@ -685,6 +762,16 @@ impl KubernetesComputeDriver {
         });
     }
 
+    fn spawn_warm_pool_profile_reconciler(&self) {
+        let client = self.client.clone();
+        let watch_client = self.watch_client.clone();
+        let config = self.config.clone();
+
+        tokio::spawn(async move {
+            run_warm_pool_profile_reconciler(client, watch_client, config).await;
+        });
+    }
+
     async fn supported_agent_sandbox_api(&self, client: Client) -> Result<AgentSandboxApi, String> {
         let sandbox_api_version = self.supported_sandbox_api_version(client.clone()).await?;
         Ok(self.agent_sandbox_api(client, sandbox_api_version))
@@ -751,66 +838,12 @@ impl KubernetesComputeDriver {
     ///   annotations.
     /// - If neither config nor `OpenShift` is found, returns `(1000, 1000, {})` as defaults.
     async fn resolve_sandbox_identity(&self) -> (u32, u32, BTreeMap<String, String>) {
-        // Explicit config takes priority — skip namespace lookup entirely.
-        if self.config.sandbox_uid.is_some() {
-            let uid = self.config.resolve_sandbox_uid(None);
-            let gid = self.config.resolve_sandbox_gid(uid, None);
-            return (uid, gid, BTreeMap::new());
-        }
-
-        // Try to read namespace annotations for OpenShift SCC.
-        // Namespace is namespaced so Api::all works (it's cluster-scoped but
-        // can list all namespaces) and we filter by name, or use Api::namespaced.
-        let ns_api: Api<Namespace> = Api::all(self.client.clone());
-        match tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.get(self.config.namespace.as_str()))
-            .await
-        {
-            Ok(Ok(ns)) => {
-                let anns = ns.metadata.annotations.unwrap_or_default();
-                tracing::info!(
-                    namespace = %self.config.namespace,
-                    uid_range = ?anns.get(crate::config::ANNOTATION_SCC_UID_RANGE),
-                    sup_groups = ?anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS),
-                    "Resolved namespace annotations for sandbox identity"
-                );
-                let uid = self.config.resolve_sandbox_uid(Some(&anns));
-                // Explicit sandbox_gid config wins; SCC annotation only applies when not set.
-                let baseline_gid = self.config.resolve_sandbox_gid(uid, None);
-                let gid = self.config.sandbox_gid.map_or_else(
-                    || {
-                        anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS)
-                            .and_then(|sup_range| {
-                                KubernetesComputeConfig::from_open_shift_supplemental_groups(
-                                    sup_range,
-                                )
-                            })
-                            .unwrap_or(baseline_gid)
-                    },
-                    |_| baseline_gid,
-                );
-                tracing::info!(uid, gid, "Resolved sandbox identity");
-                (uid, gid, anns)
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    namespace = %self.config.namespace,
-                    error = %e,
-                    "Failed to fetch namespace for SCC annotations, falling back to defaults"
-                );
-                let uid = DEFAULT_SANDBOX_UID;
-                let gid = self.config.resolve_sandbox_gid(uid, None);
-                (uid, gid, BTreeMap::new())
-            }
-            Err(_) => {
-                tracing::warn!(
-                    namespace = %self.config.namespace,
-                    "Namespace fetch timed out, falling back to defaults"
-                );
-                let uid = DEFAULT_SANDBOX_UID;
-                let gid = self.config.resolve_sandbox_gid(uid, None);
-                (uid, gid, BTreeMap::new())
-            }
-        }
+        resolve_sandbox_identity_for_config(
+            self.client.clone(),
+            &self.config,
+            self.config.namespace.as_str(),
+        )
+        .await
     }
 
     async fn has_gpu_capacity(&self) -> Result<bool, KubeError> {
@@ -2027,6 +2060,938 @@ async fn refresh_warm_pool_cache(cache: &WarmPoolCache, client: Client, fallback
         count,
         "Warm-pool cache refreshed"
     );
+}
+
+async fn run_warm_pool_profile_reconciler(
+    client: Client,
+    watch_client: Client,
+    config: KubernetesComputeConfig,
+) {
+    let profile_namespace = config
+        .warm_pooling
+        .profiles
+        .effective_namespace(&config.namespace)
+        .to_string();
+    let label_selector = config
+        .warm_pooling
+        .profiles
+        .effective_label_selector()
+        .to_string();
+
+    loop {
+        reconcile_existing_warm_pool_profiles(
+            client.clone(),
+            &config,
+            &profile_namespace,
+            &label_selector,
+        )
+        .await;
+
+        let api: Api<ConfigMap> = Api::namespaced(watch_client.clone(), &profile_namespace);
+        let watcher_config = watcher::Config::default().labels(&label_selector);
+        let mut stream = watcher::watcher(api, watcher_config).boxed();
+
+        loop {
+            tokio::select! {
+                event = stream.try_next() => {
+                    match event {
+                        Ok(Some(Event::Applied(config_map))) => {
+                            reconcile_warm_pool_profile_config_map(client.clone(), &config, config_map).await;
+                        }
+                        Ok(Some(Event::Deleted(config_map))) => {
+                            garbage_collect_warm_pool_profile(client.clone(), &config, &config_map).await;
+                        }
+                        Ok(Some(Event::Restarted(config_maps))) => {
+                            for config_map in config_maps {
+                                reconcile_warm_pool_profile_config_map(client.clone(), &config, config_map).await;
+                            }
+                        }
+                        Ok(None) => {
+                            warn!(
+                                namespace = %profile_namespace,
+                                "Warm-pool profile watch stream ended; retrying"
+                            );
+                            break;
+                        }
+                        Err(err) => {
+                            warn!(
+                                namespace = %profile_namespace,
+                                error = %err,
+                                "Warm-pool profile watch failed; retrying"
+                            );
+                            break;
+                        }
+                    }
+                }
+                () = tokio::time::sleep(WARM_POOL_PROFILE_RESYNC_DELAY) => {
+                    reconcile_existing_warm_pool_profiles(
+                        client.clone(),
+                        &config,
+                        &profile_namespace,
+                        &label_selector,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        tokio::time::sleep(WARM_POOL_PROFILE_REQUEUE_DELAY).await;
+    }
+}
+
+async fn resolve_sandbox_identity_for_config(
+    client: Client,
+    config: &KubernetesComputeConfig,
+    namespace: &str,
+) -> (u32, u32, BTreeMap<String, String>) {
+    // Explicit config takes priority — skip namespace lookup entirely.
+    if config.sandbox_uid.is_some() {
+        let uid = config.resolve_sandbox_uid(None);
+        let gid = config.resolve_sandbox_gid(uid, None);
+        return (uid, gid, BTreeMap::new());
+    }
+
+    let ns_api: Api<Namespace> = Api::all(client);
+    match tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.get(namespace)).await {
+        Ok(Ok(ns)) => {
+            let anns = ns.metadata.annotations.unwrap_or_default();
+            tracing::info!(
+                namespace,
+                uid_range = ?anns.get(crate::config::ANNOTATION_SCC_UID_RANGE),
+                sup_groups = ?anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS),
+                "Resolved namespace annotations for sandbox identity"
+            );
+            let uid = config.resolve_sandbox_uid(Some(&anns));
+            let baseline_gid = config.resolve_sandbox_gid(uid, None);
+            let gid = config.sandbox_gid.map_or_else(
+                || {
+                    anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS)
+                        .and_then(|sup_range| {
+                            KubernetesComputeConfig::from_open_shift_supplemental_groups(sup_range)
+                        })
+                        .unwrap_or(baseline_gid)
+                },
+                |_| baseline_gid,
+            );
+            tracing::info!(uid, gid, "Resolved sandbox identity");
+            (uid, gid, anns)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                namespace,
+                error = %e,
+                "Failed to fetch namespace for SCC annotations, falling back to defaults"
+            );
+            let uid = DEFAULT_SANDBOX_UID;
+            let gid = config.resolve_sandbox_gid(uid, None);
+            (uid, gid, BTreeMap::new())
+        }
+        Err(_) => {
+            tracing::warn!(
+                namespace,
+                "Namespace fetch timed out, falling back to defaults"
+            );
+            let uid = DEFAULT_SANDBOX_UID;
+            let gid = config.resolve_sandbox_gid(uid, None);
+            (uid, gid, BTreeMap::new())
+        }
+    }
+}
+
+async fn reconcile_existing_warm_pool_profiles(
+    client: Client,
+    config: &KubernetesComputeConfig,
+    profile_namespace: &str,
+    label_selector: &str,
+) {
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), profile_namespace);
+    match tokio::time::timeout(
+        KUBE_API_TIMEOUT,
+        api.list(&ListParams::default().labels(label_selector)),
+    )
+    .await
+    {
+        Ok(Ok(list)) => {
+            let active_source_uids = list
+                .items
+                .iter()
+                .filter_map(|config_map| config_map.metadata.uid.clone())
+                .collect::<HashSet<_>>();
+            for config_map in list.items {
+                reconcile_warm_pool_profile_config_map(client.clone(), config, config_map).await;
+            }
+            if let Err(err) = garbage_collect_orphaned_warm_pool_profile_resources(
+                client,
+                &config.namespace,
+                &active_source_uids,
+            )
+            .await
+            {
+                warn!(
+                    namespace = %config.namespace,
+                    error = %err,
+                    "Failed to garbage-collect orphaned warm-pool profile resources"
+                );
+            }
+        }
+        Ok(Err(err)) => {
+            warn!(
+                namespace = %profile_namespace,
+                error = %err,
+                "Failed to list warm-pool profile ConfigMaps"
+            );
+        }
+        Err(_) => {
+            warn!(
+                namespace = %profile_namespace,
+                "Timed out listing warm-pool profile ConfigMaps"
+            );
+        }
+    }
+}
+
+async fn reconcile_warm_pool_profile_config_map(
+    client: Client,
+    config: &KubernetesComputeConfig,
+    config_map: ConfigMap,
+) {
+    match render_warm_pool_profile(client.clone(), config, &config_map).await {
+        Ok(rendered) => {
+            if let Err(err) = apply_rendered_warm_pool_profile(client.clone(), &rendered).await {
+                warn!(
+                    namespace = %rendered.source.namespace,
+                    config_map = %rendered.source.name,
+                    error = %err,
+                    "Failed to apply warm-pool profile"
+                );
+                patch_warm_pool_profile_status(
+                    client,
+                    &rendered.source.namespace,
+                    &rendered.source.name,
+                    "Error",
+                    Some(&rendered),
+                    &err,
+                )
+                .await;
+                return;
+            }
+            if let Err(err) =
+                garbage_collect_superseded_warm_pool_profile_resources(client.clone(), &rendered)
+                    .await
+            {
+                warn!(
+                    namespace = %rendered.source.namespace,
+                    config_map = %rendered.source.name,
+                    error = %err,
+                    "Failed to garbage-collect superseded warm-pool profile resources"
+                );
+            }
+            patch_warm_pool_profile_status(
+                client,
+                &rendered.source.namespace,
+                &rendered.source.name,
+                "Ready",
+                Some(&rendered),
+                "",
+            )
+            .await;
+        }
+        Err(err) => {
+            let namespace = config_map
+                .metadata
+                .namespace
+                .as_deref()
+                .unwrap_or_else(|| {
+                    config
+                        .warm_pooling
+                        .profiles
+                        .effective_namespace(&config.namespace)
+                })
+                .to_string();
+            let Some(name) = config_map.metadata.name.as_deref() else {
+                warn!(error = %err, "Warm-pool profile ConfigMap is missing a name");
+                return;
+            };
+            warn!(
+                namespace = %namespace,
+                config_map = %name,
+                error = %err,
+                "Warm-pool profile is invalid"
+            );
+            patch_warm_pool_profile_status(client, &namespace, name, "Error", None, &err).await;
+        }
+    }
+}
+
+async fn render_warm_pool_profile(
+    client: Client,
+    config: &KubernetesComputeConfig,
+    config_map: &ConfigMap,
+) -> Result<RenderedWarmPoolProfile, String> {
+    let source = warm_pool_profile_source(config, config_map)?;
+    let data = config_map
+        .data
+        .as_ref()
+        .and_then(|data| data.get(WARM_POOL_PROFILE_DATA_KEY))
+        .ok_or_else(|| format!("missing data key '{WARM_POOL_PROFILE_DATA_KEY}'"))?;
+    let profile = parse_warm_pool_profile(data)?;
+    validate_warm_pool_profile(
+        &profile,
+        config.warm_pooling.profiles.effective_max_replicas(),
+    )?;
+
+    let target_namespace = config.namespace.clone();
+    let spec = warm_pool_profile_to_sandbox_spec(&profile);
+    let (profile_user_id, profile_group_id, _) =
+        resolve_sandbox_identity_for_config(client, config, &target_namespace).await;
+    let params = SandboxPodParams {
+        default_image: &config.default_image,
+        image_pull_policy: &config.image_pull_policy,
+        image_pull_secrets: &config.image_pull_secrets,
+        supervisor_image: &config.supervisor_image,
+        supervisor_image_pull_policy: &config.supervisor_image_pull_policy,
+        supervisor_sideload_method: config.supervisor_sideload_method,
+        topology: config.topology,
+        proxy_uid: config.sidecar.proxy_uid,
+        process_binary_aware_network_policy: config.sidecar.process_binary_aware_network_policy,
+        service_account_name: &config.service_account_name,
+        sandbox_id: "",
+        sandbox_name: "",
+        grpc_endpoint: &config.grpc_endpoint,
+        ssh_socket_path: &config.ssh_socket_path,
+        client_tls_secret_name: &config.client_tls_secret_name,
+        host_gateway_ip: &config.host_gateway_ip,
+        enable_user_namespaces: config.enable_user_namespaces,
+        app_armor_profile: config.app_armor_profile.as_ref(),
+        workspace_default_storage_size: &config.workspace_default_storage_size,
+        workspace_storage_class: &config.workspace_storage_class,
+        default_runtime_class_name: &config.default_runtime_class_name,
+        sa_token_ttl_secs: config.effective_sa_token_ttl_secs(),
+        provider_spiffe_enabled: config.provider_spiffe_enabled(),
+        provider_spiffe_workload_api_socket_path: &config.provider_spiffe_workload_api_socket_path,
+        sandbox_uid: profile_user_id,
+        sandbox_gid: profile_group_id,
+    };
+    validate_sidecar_proxy_identity(&params).map_err(|err| err.to_string())?;
+
+    let mut rendered = sandbox_to_k8s_spec(Some(&spec), &params)?;
+    remove_warm_pool_template_identity_env(&mut rendered);
+    ensure_pod_dns_policy(&mut rendered);
+    let fingerprint = sandbox_spec_fingerprint(&rendered)?;
+    let generated_name = generated_warm_pool_profile_name(&source.name, &fingerprint);
+    validate_kubernetes_dns1123_label(&generated_name, "generated warm-pool resource name")?;
+    let template_spec = rendered
+        .get("spec")
+        .cloned()
+        .ok_or_else(|| "rendered sandbox spec is missing spec".to_string())?;
+
+    Ok(RenderedWarmPoolProfile {
+        source,
+        workspace: profile.workspace,
+        target_namespace,
+        generated_name,
+        replicas: profile.replicas,
+        template_spec,
+        fingerprint,
+    })
+}
+
+fn warm_pool_profile_source(
+    config: &KubernetesComputeConfig,
+    config_map: &ConfigMap,
+) -> Result<WarmPoolProfileSource, String> {
+    let namespace = config_map.metadata.namespace.clone().unwrap_or_else(|| {
+        config
+            .warm_pooling
+            .profiles
+            .effective_namespace(&config.namespace)
+            .to_string()
+    });
+    let name = config_map
+        .metadata
+        .name
+        .clone()
+        .ok_or_else(|| "ConfigMap metadata.name is required".to_string())?;
+    let uid = config_map
+        .metadata
+        .uid
+        .clone()
+        .ok_or_else(|| "ConfigMap metadata.uid is required".to_string())?;
+    let resource_version = config_map
+        .metadata
+        .resource_version
+        .clone()
+        .unwrap_or_default();
+    Ok(WarmPoolProfileSource {
+        namespace,
+        name,
+        uid,
+        resource_version,
+    })
+}
+
+fn parse_warm_pool_profile(data: &str) -> Result<WarmPoolProfile, String> {
+    toml::from_str::<WarmPoolProfile>(data)
+        .map_err(|err| format!("failed to parse {WARM_POOL_PROFILE_DATA_KEY}: {err}"))
+}
+
+fn validate_warm_pool_profile(profile: &WarmPoolProfile, max_replicas: u32) -> Result<(), String> {
+    if profile.version != WARM_POOL_PROFILE_VERSION {
+        return Err(format!(
+            "unsupported warm-pool profile version {}; expected {WARM_POOL_PROFILE_VERSION}",
+            profile.version
+        ));
+    }
+    if profile.workspace.trim().is_empty() {
+        return Err("workspace must not be empty".to_string());
+    }
+    if profile.workspace.chars().any(char::is_control) {
+        return Err("workspace must not contain control characters".to_string());
+    }
+    if profile.replicas == 0 {
+        return Err("replicas must be greater than 0".to_string());
+    }
+    if profile.replicas > max_replicas {
+        return Err(format!(
+            "replicas exceeds maximum ({} > {max_replicas})",
+            profile.replicas
+        ));
+    }
+    validate_warm_pool_profile_environment(&profile.environment)?;
+    if let Some(count) = profile.resources.gpu_count
+        && count == 0
+    {
+        return Err("resources.gpu_count must be greater than 0".to_string());
+    }
+    Ok(())
+}
+
+fn validate_warm_pool_profile_environment(env: &BTreeMap<String, String>) -> Result<(), String> {
+    for (key, value) in env {
+        if !is_valid_env_key(key) {
+            return Err(format!(
+                "environment keys must match ^[A-Za-z_][A-Za-z0-9_]*$; got '{key}'"
+            ));
+        }
+        if key.starts_with("OPENSHELL_") {
+            return Err(format!(
+                "environment keys starting with OPENSHELL_ are reserved; got '{key}'"
+            ));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(format!(
+                "environment value for '{key}' must not contain control characters"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn warm_pool_profile_to_sandbox_spec(profile: &WarmPoolProfile) -> SandboxSpec {
+    let resources = (!profile.resources.cpu.is_empty() || !profile.resources.memory.is_empty())
+        .then(|| DriverResourceRequirements {
+            cpu_limit: profile.resources.cpu.clone(),
+            memory_limit: profile.resources.memory.clone(),
+            ..Default::default()
+        });
+
+    SandboxSpec {
+        environment: profile.environment.clone().into_iter().collect(),
+        template: Some(SandboxTemplate {
+            image: profile.image.clone(),
+            platform_config: platform_config_for_warm_pool_profile(profile),
+            resources,
+            ..Default::default()
+        }),
+        resource_requirements: profile
+            .resources
+            .gpu_count
+            .map(|count| ResourceRequirements {
+                gpu: Some(GpuResourceRequirements { count: Some(count) }),
+            }),
+        ..Default::default()
+    }
+}
+
+fn platform_config_for_warm_pool_profile(profile: &WarmPoolProfile) -> Option<prost_types::Struct> {
+    use prost_types::{Struct, Value, value::Kind};
+
+    if profile.runtime_class_name.is_empty() {
+        return None;
+    }
+
+    Some(Struct {
+        fields: BTreeMap::from([(
+            "runtime_class_name".to_string(),
+            Value {
+                kind: Some(Kind::StringValue(profile.runtime_class_name.clone())),
+            },
+        )]),
+    })
+}
+
+fn ensure_pod_dns_policy(rendered: &mut serde_json::Value) {
+    if let Some(spec) = rendered
+        .pointer_mut("/spec/podTemplate/spec")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        spec.entry("dnsPolicy".to_string())
+            .or_insert_with(|| serde_json::json!("ClusterFirst"));
+    }
+}
+
+fn remove_warm_pool_template_identity_env(rendered: &mut serde_json::Value) {
+    if let Some(containers) = rendered
+        .pointer_mut("/spec/podTemplate/spec/containers")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for container in containers {
+            remove_sandbox_identity_env(container);
+        }
+    }
+}
+
+fn generated_warm_pool_profile_name(profile_name: &str, fingerprint: &str) -> String {
+    let hash = fingerprint
+        .strip_prefix("sha256:")
+        .unwrap_or(fingerprint)
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let suffix = if hash.is_empty() {
+        "00000000".to_string()
+    } else {
+        hash
+    };
+    let prefix = sanitize_dns_label_segment(profile_name);
+    let reserved = WARM_POOL_PROFILE_NAME_PREFIX.len() + 1 + 1 + suffix.len();
+    let max_prefix_len = MAX_KUBE_NAME_LEN.saturating_sub(reserved);
+    let mut trimmed = prefix.chars().take(max_prefix_len).collect::<String>();
+    trimmed = trimmed.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        trimmed = "profile".to_string();
+    }
+    format!("{WARM_POOL_PROFILE_NAME_PREFIX}-{trimmed}-{suffix}")
+}
+
+fn sanitize_dns_label_segment(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for byte in value.bytes() {
+        let ch = if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
+            byte as char
+        } else if byte.is_ascii_uppercase() {
+            (byte as char).to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if ch == '-' {
+            if !last_dash {
+                out.push(ch);
+            }
+            last_dash = true;
+        } else {
+            out.push(ch);
+            last_dash = false;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "profile".to_string()
+    } else {
+        trimmed
+    }
+}
+
+async fn apply_rendered_warm_pool_profile(
+    client: Client,
+    rendered: &RenderedWarmPoolProfile,
+) -> Result<(), String> {
+    let template_api =
+        KubernetesComputeDriver::sandbox_template_api(client.clone(), &rendered.target_namespace);
+    let warm_pool_api =
+        KubernetesComputeDriver::sandbox_warm_pool_api(client.clone(), &rendered.target_namespace);
+    let template = rendered_warm_pool_template_object(rendered, &template_api.resource);
+    let warm_pool = rendered_warm_pool_object(rendered, &warm_pool_api.resource);
+    apply_dynamic_object(&template_api.api, &rendered.generated_name, &template).await?;
+    apply_dynamic_object(&warm_pool_api.api, &rendered.generated_name, &warm_pool).await?;
+    Ok(())
+}
+
+async fn apply_dynamic_object(
+    api: &Api<DynamicObject>,
+    name: &str,
+    obj: &DynamicObject,
+) -> Result<(), String> {
+    match tokio::time::timeout(KUBE_API_TIMEOUT, api.create(&PostParams::default(), obj)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(KubeError::Api(err))) if err.code == 409 => {
+            let patch = dynamic_object_merge_patch(obj);
+            match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                api.patch(name, &PatchParams::default(), &Patch::Merge(&patch)),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(err)) => Err(err.to_string()),
+                Err(_) => Err(format!(
+                    "timed out after {}s waiting for Kubernetes API",
+                    KUBE_API_TIMEOUT.as_secs()
+                )),
+            }
+        }
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(format!(
+            "timed out after {}s waiting for Kubernetes API",
+            KUBE_API_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+fn dynamic_object_merge_patch(obj: &DynamicObject) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": {
+            "labels": obj.metadata.labels,
+            "annotations": obj.metadata.annotations,
+        },
+        "spec": obj.data.get("spec").cloned().unwrap_or_else(|| serde_json::json!({})),
+    })
+}
+
+fn rendered_warm_pool_template_object(
+    rendered: &RenderedWarmPoolProfile,
+    resource: &ApiResource,
+) -> DynamicObject {
+    let mut obj = DynamicObject::new(&rendered.generated_name, resource);
+    obj.metadata = ObjectMeta {
+        name: Some(rendered.generated_name.clone()),
+        namespace: Some(rendered.target_namespace.clone()),
+        labels: Some(warm_pool_profile_generated_labels(rendered)),
+        annotations: Some(warm_pool_profile_generated_annotations(rendered)),
+        ..Default::default()
+    };
+    obj.data = serde_json::json!({
+        "spec": rendered.template_spec,
+    });
+    obj
+}
+
+fn rendered_warm_pool_object(
+    rendered: &RenderedWarmPoolProfile,
+    resource: &ApiResource,
+) -> DynamicObject {
+    let mut obj = DynamicObject::new(&rendered.generated_name, resource);
+    obj.metadata = ObjectMeta {
+        name: Some(rendered.generated_name.clone()),
+        namespace: Some(rendered.target_namespace.clone()),
+        labels: Some(warm_pool_profile_generated_labels(rendered)),
+        annotations: Some(warm_pool_profile_generated_annotations(rendered)),
+        ..Default::default()
+    };
+    obj.data = serde_json::json!({
+        "spec": {
+            "replicas": rendered.replicas,
+            "sandboxTemplateRef": {
+                "name": rendered.generated_name
+            }
+        }
+    });
+    obj
+}
+
+fn warm_pool_profile_generated_labels(
+    rendered: &RenderedWarmPoolProfile,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (LABEL_WARM_POOL_ENABLED.to_string(), "true".to_string()),
+        (
+            LABEL_WARM_POOL_MANAGED_BY.to_string(),
+            LABEL_WARM_POOL_MANAGED_BY_VALUE.to_string(),
+        ),
+        (
+            LABEL_WARM_POOL_PROFILE.to_string(),
+            label_value_for_profile_name(&rendered.source.name),
+        ),
+        (
+            LABEL_WARM_POOL_PROFILE_UID.to_string(),
+            rendered.source.uid.clone(),
+        ),
+    ])
+}
+
+fn label_value_for_profile_name(name: &str) -> String {
+    let sanitized = sanitize_dns_label_segment(name);
+    let mut value = sanitized.chars().take(63).collect::<String>();
+    value = value.trim_matches('-').to_string();
+    if value.is_empty() {
+        "profile".to_string()
+    } else {
+        value
+    }
+}
+
+fn warm_pool_profile_generated_annotations(
+    rendered: &RenderedWarmPoolProfile,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            ANNOTATION_WARM_POOL_PROFILE_NAMESPACE.to_string(),
+            rendered.source.namespace.clone(),
+        ),
+        (
+            ANNOTATION_WARM_POOL_PROFILE_NAME.to_string(),
+            rendered.source.name.clone(),
+        ),
+        (
+            ANNOTATION_WARM_POOL_PROFILE_UID.to_string(),
+            rendered.source.uid.clone(),
+        ),
+        (
+            ANNOTATION_WARM_POOL_SOURCE_RESOURCE_VERSION.to_string(),
+            rendered.source.resource_version.clone(),
+        ),
+        (
+            ANNOTATION_WARM_POOL_TEMPLATE_FINGERPRINT.to_string(),
+            rendered.fingerprint.clone(),
+        ),
+        (
+            LABEL_SANDBOX_WORKSPACE.to_string(),
+            rendered.workspace.clone(),
+        ),
+    ])
+}
+
+async fn garbage_collect_superseded_warm_pool_profile_resources(
+    client: Client,
+    rendered: &RenderedWarmPoolProfile,
+) -> Result<(), String> {
+    garbage_collect_warm_pool_profile_resources(
+        client,
+        &rendered.target_namespace,
+        &rendered.source.uid,
+        Some(&rendered.generated_name),
+    )
+    .await
+}
+
+async fn garbage_collect_warm_pool_profile(
+    client: Client,
+    config: &KubernetesComputeConfig,
+    cm: &ConfigMap,
+) {
+    let Some(uid) = cm.metadata.uid.as_deref() else {
+        return;
+    };
+    let namespace = config.namespace.clone();
+    if let Err(err) =
+        garbage_collect_warm_pool_profile_resources(client, &namespace, uid, None).await
+    {
+        warn!(
+            namespace = %namespace,
+            config_map_uid = %uid,
+            error = %err,
+            "Failed to garbage-collect deleted warm-pool profile resources"
+        );
+    }
+}
+
+async fn garbage_collect_warm_pool_profile_resources(
+    client: Client,
+    target_namespace: &str,
+    source_uid: &str,
+    keep_name: Option<&str>,
+) -> Result<(), String> {
+    let selector = format!(
+        "{LABEL_WARM_POOL_MANAGED_BY}={LABEL_WARM_POOL_MANAGED_BY_VALUE},{LABEL_WARM_POOL_PROFILE_UID}={source_uid}"
+    );
+    let lp = ListParams::default().labels(&selector);
+    let warm_pool_api =
+        KubernetesComputeDriver::sandbox_warm_pool_api(client.clone(), target_namespace);
+    delete_matching_dynamic_objects(&warm_pool_api.api, &lp, keep_name).await?;
+    let template_api = KubernetesComputeDriver::sandbox_template_api(client, target_namespace);
+    delete_matching_dynamic_objects(&template_api.api, &lp, keep_name).await?;
+    Ok(())
+}
+
+async fn garbage_collect_orphaned_warm_pool_profile_resources(
+    client: Client,
+    target_namespace: &str,
+    active_source_uids: &HashSet<String>,
+) -> Result<(), String> {
+    let selector = format!("{LABEL_WARM_POOL_MANAGED_BY}={LABEL_WARM_POOL_MANAGED_BY_VALUE}");
+    let lp = ListParams::default().labels(&selector);
+    let warm_pool_api =
+        KubernetesComputeDriver::sandbox_warm_pool_api(client.clone(), target_namespace);
+    delete_orphaned_dynamic_objects(&warm_pool_api.api, &lp, active_source_uids).await?;
+    let template_api = KubernetesComputeDriver::sandbox_template_api(client, target_namespace);
+    delete_orphaned_dynamic_objects(&template_api.api, &lp, active_source_uids).await?;
+    Ok(())
+}
+
+async fn delete_orphaned_dynamic_objects(
+    api: &Api<DynamicObject>,
+    lp: &ListParams,
+    active_source_uids: &HashSet<String>,
+) -> Result<(), String> {
+    let list = match tokio::time::timeout(KUBE_API_TIMEOUT, api.list(lp)).await {
+        Ok(Ok(list)) => list,
+        Ok(Err(err)) => return Err(err.to_string()),
+        Err(_) => {
+            return Err(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            ));
+        }
+    };
+    for obj in list.items {
+        if !warm_pool_profile_generated_resource_is_orphaned(&obj, active_source_uids) {
+            continue;
+        }
+        let Some(name) = obj.metadata.name.as_deref() else {
+            continue;
+        };
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.delete(name, &DeleteParams::default()))
+            .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => {}
+            Ok(Err(err)) => return Err(err.to_string()),
+            Err(_) => {
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes API",
+                    KUBE_API_TIMEOUT.as_secs()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn warm_pool_profile_generated_resource_is_orphaned(
+    obj: &DynamicObject,
+    active_source_uids: &HashSet<String>,
+) -> bool {
+    let labels = obj.metadata.labels.as_ref();
+    let managed_by_driver = labels
+        .and_then(|labels| labels.get(LABEL_WARM_POOL_MANAGED_BY))
+        .is_some_and(|value| value == LABEL_WARM_POOL_MANAGED_BY_VALUE);
+    let Some(source_uid) = labels.and_then(|labels| labels.get(LABEL_WARM_POOL_PROFILE_UID)) else {
+        return false;
+    };
+    managed_by_driver && !active_source_uids.contains(source_uid)
+}
+
+async fn delete_matching_dynamic_objects(
+    api: &Api<DynamicObject>,
+    lp: &ListParams,
+    keep_name: Option<&str>,
+) -> Result<(), String> {
+    let list = match tokio::time::timeout(KUBE_API_TIMEOUT, api.list(lp)).await {
+        Ok(Ok(list)) => list,
+        Ok(Err(err)) => return Err(err.to_string()),
+        Err(_) => {
+            return Err(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            ));
+        }
+    };
+    for obj in list.items {
+        let Some(name) = obj.metadata.name.as_deref() else {
+            continue;
+        };
+        if keep_name == Some(name) {
+            continue;
+        }
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.delete(name, &DeleteParams::default()))
+            .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => {}
+            Ok(Err(err)) => return Err(err.to_string()),
+            Err(_) => {
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes API",
+                    KUBE_API_TIMEOUT.as_secs()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn patch_warm_pool_profile_status(
+    client: Client,
+    namespace: &str,
+    name: &str,
+    status: &str,
+    rendered: Option<&RenderedWarmPoolProfile>,
+    error: &str,
+) {
+    let api: Api<ConfigMap> = Api::namespaced(client, namespace);
+    let mut annotations = serde_json::Map::new();
+    annotations.insert(
+        ANNOTATION_WARM_POOL_STATUS.to_string(),
+        serde_json::json!(status),
+    );
+    annotations.insert(
+        ANNOTATION_WARM_POOL_LAST_ERROR.to_string(),
+        serde_json::json!(error),
+    );
+    if let Some(rendered) = rendered {
+        annotations.insert(
+            ANNOTATION_WARM_POOL_OBSERVED_RESOURCE_VERSION.to_string(),
+            serde_json::json!(rendered.source.resource_version),
+        );
+        annotations.insert(
+            ANNOTATION_WARM_POOL_TARGET_NAMESPACE.to_string(),
+            serde_json::json!(rendered.target_namespace),
+        );
+        annotations.insert(
+            ANNOTATION_WARM_POOL_TEMPLATE.to_string(),
+            serde_json::json!(rendered.generated_name),
+        );
+        annotations.insert(
+            ANNOTATION_WARM_POOL_FINGERPRINT.to_string(),
+            serde_json::json!(rendered.fingerprint),
+        );
+    }
+    let patch = serde_json::json!({
+        "metadata": {
+            "annotations": annotations
+        }
+    });
+    match tokio::time::timeout(
+        KUBE_API_TIMEOUT,
+        api.patch(name, &PatchParams::default(), &Patch::Merge(&patch)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => warn!(
+            namespace,
+            config_map = name,
+            error = %err,
+            "Failed to patch warm-pool profile status annotations"
+        ),
+        Err(_) => warn!(
+            namespace,
+            config_map = name,
+            "Timed out patching warm-pool profile status annotations"
+        ),
+    }
 }
 
 fn should_try_next_sandbox_api_version(err: &KubeError) -> bool {
@@ -7742,6 +8707,93 @@ mod tests {
     }
 
     #[test]
+    fn warm_pool_profile_parses_cli_shaped_schema() {
+        let profile = parse_warm_pool_profile(
+            r#"
+version = 1
+workspace = "research"
+replicas = 3
+image = "ghcr.io/acme/agent-python:latest"
+runtime_class_name = "nvidia"
+
+[environment]
+FOO = "bar"
+
+[resources]
+cpu = "4"
+memory = "8Gi"
+gpu_count = 1
+"#,
+        )
+        .expect("profile should parse");
+
+        assert_eq!(profile.version, 1);
+        assert_eq!(profile.workspace, "research");
+        assert_eq!(profile.replicas, 3);
+        assert_eq!(profile.image, "ghcr.io/acme/agent-python:latest");
+        assert_eq!(profile.runtime_class_name, "nvidia");
+        assert_eq!(profile.environment.get("FOO").unwrap(), "bar");
+        assert_eq!(profile.resources.cpu, "4");
+        assert_eq!(profile.resources.memory, "8Gi");
+        assert_eq!(profile.resources.gpu_count, Some(1));
+    }
+
+    #[test]
+    fn warm_pool_profile_rejects_unknown_fields() {
+        let err = parse_warm_pool_profile(
+            r#"
+version = 1
+workspace = "research"
+replicas = 1
+agent_socket = "/tmp/agent.sock"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("unknown field"));
+    }
+
+    #[test]
+    fn warm_pool_profile_converts_resources_to_driver_spec() {
+        let profile = parse_warm_pool_profile(
+            r#"
+version = 1
+workspace = "research"
+image = "ghcr.io/acme/agent-python:latest"
+runtime_class_name = "kata"
+
+[environment]
+FOO = "bar"
+
+[resources]
+cpu = "500m"
+memory = "2Gi"
+gpu_count = 2
+"#,
+        )
+        .expect("profile should parse");
+
+        let spec = warm_pool_profile_to_sandbox_spec(&profile);
+        assert_eq!(spec.environment.get("FOO").unwrap(), "bar");
+        let template = spec.template.as_ref().unwrap();
+        assert_eq!(template.image, "ghcr.io/acme/agent-python:latest");
+        let resources = template.resources.as_ref().unwrap();
+        assert_eq!(resources.cpu_limit, "500m");
+        assert_eq!(resources.memory_limit, "2Gi");
+        assert_eq!(
+            platform_config_string(template, "runtime_class_name").as_deref(),
+            Some("kata")
+        );
+        assert_eq!(
+            spec.resource_requirements
+                .as_ref()
+                .and_then(|requirements| requirements.gpu.as_ref())
+                .and_then(|gpu| gpu.count),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn workspace_storage_class_omitted_from_cr_spec_when_empty() {
         let cr = sandbox_to_k8s_spec_for_test(
             Some(&SandboxSpec::default()),
@@ -7752,5 +8804,113 @@ mod tests {
                 .get("storageClassName")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn ensure_pod_dns_policy_sets_cluster_first() {
+        let mut rendered = serde_json::json!({
+            "spec": {
+                "podTemplate": {
+                    "spec": {
+                        "containers": []
+                    }
+                }
+            }
+        });
+
+        ensure_pod_dns_policy(&mut rendered);
+
+        assert_eq!(
+            rendered.pointer("/spec/podTemplate/spec/dnsPolicy"),
+            Some(&serde_json::json!("ClusterFirst"))
+        );
+    }
+
+    #[test]
+    fn warm_pool_template_identity_env_is_removed() {
+        let mut rendered = serde_json::json!({
+            "spec": {
+                "podTemplate": {
+                    "spec": {
+                        "containers": [{
+                            "name": "agent",
+                            "env": [
+                                {"name": openshell_core::sandbox_env::SANDBOX_ID, "value": ""},
+                                {"name": openshell_core::sandbox_env::SANDBOX, "value": ""},
+                                {"name": openshell_core::sandbox_env::ENDPOINT, "value": "http://gateway"}
+                            ]
+                        }]
+                    }
+                }
+            }
+        });
+
+        remove_warm_pool_template_identity_env(&mut rendered);
+
+        let env = rendered
+            .pointer("/spec/podTemplate/spec/containers/0/env")
+            .and_then(serde_json::Value::as_array)
+            .expect("env should exist");
+        let names = env
+            .iter()
+            .filter_map(|entry| entry.get("name").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![openshell_core::sandbox_env::ENDPOINT]);
+    }
+
+    #[test]
+    fn orphan_gc_only_selects_driver_managed_inactive_profile_resources() {
+        let resource = KubernetesComputeDriver::extension_resource(SANDBOX_WARM_POOL_KIND);
+        let mut active = HashSet::new();
+        active.insert("active-uid".to_string());
+
+        let mut orphan = DynamicObject::new("orphan", &resource);
+        orphan.metadata.labels = Some(BTreeMap::from([
+            (
+                LABEL_WARM_POOL_MANAGED_BY.to_string(),
+                LABEL_WARM_POOL_MANAGED_BY_VALUE.to_string(),
+            ),
+            (
+                LABEL_WARM_POOL_PROFILE_UID.to_string(),
+                "deleted-uid".to_string(),
+            ),
+        ]));
+        assert!(warm_pool_profile_generated_resource_is_orphaned(
+            &orphan, &active
+        ));
+
+        let mut still_active = DynamicObject::new("active", &resource);
+        still_active.metadata.labels = Some(BTreeMap::from([
+            (
+                LABEL_WARM_POOL_MANAGED_BY.to_string(),
+                LABEL_WARM_POOL_MANAGED_BY_VALUE.to_string(),
+            ),
+            (
+                LABEL_WARM_POOL_PROFILE_UID.to_string(),
+                "active-uid".to_string(),
+            ),
+        ]));
+        assert!(!warm_pool_profile_generated_resource_is_orphaned(
+            &still_active,
+            &active
+        ));
+
+        let mut external = DynamicObject::new("external", &resource);
+        external.metadata.labels = Some(BTreeMap::from([(
+            LABEL_WARM_POOL_PROFILE_UID.to_string(),
+            "deleted-uid".to_string(),
+        )]));
+        assert!(!warm_pool_profile_generated_resource_is_orphaned(
+            &external, &active
+        ));
+    }
+
+    #[test]
+    fn generated_warm_pool_profile_name_is_stable_dns_label() {
+        let name =
+            generated_warm_pool_profile_name("GPU_Python.Profile", "sha256:abcdef1234567890");
+
+        assert_eq!(name, "openshell-wp-gpu-python-profile-abcdef12");
+        assert!(is_dns_label(&name));
     }
 }

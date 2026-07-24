@@ -168,6 +168,27 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\.warm_pooling\].*?enabled\s*=\s*false'
 
+  - it: renders warm pool profile config under [openshell.drivers.kubernetes.warm_pooling.profiles]
+    template: templates/gateway-config.yaml
+    set:
+      server.warmPooling.profiles.enabled: true
+      server.warmPooling.profiles.namespace: warm-profile-ns
+      server.warmPooling.profiles.labelSelector: openshell.ai/warm-pool-profile=true,tier=gpu
+      server.warmPooling.profiles.maxReplicas: 7
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.warm_pooling\.profiles\].*?enabled\s*=\s*true'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.warm_pooling\.profiles\].*?namespace\s*=\s*"warm-profile-ns"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.warm_pooling\.profiles\].*?label_selector\s*=\s*"openshell.ai/warm-pool-profile=true,tier=gpu"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.warm_pooling\.profiles\].*?max_replicas\s*=\s*7'
+
   - it: renders sandbox image pull secrets under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     set:

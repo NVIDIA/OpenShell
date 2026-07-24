@@ -303,6 +303,13 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # backed by the driver's cache of OpenShell-enabled SandboxWarmPool resources.
 enabled = true
 
+[openshell.drivers.kubernetes.warm_pooling.profiles]
+# Optional ConfigMap-backed reconciler for admin-declared warm pools.
+enabled = true
+namespace = "openshell"
+label_selector = "openshell.ai/warm-pool-profile=true"
+max_replicas = 100
+
 [openshell.drivers.kubernetes.sidecar]
 # UID used by relaxed long-running network sidecars. Strict process/binary-aware
 # sidecars run as UID 0 so Kubernetes grants the required /proc inspection
