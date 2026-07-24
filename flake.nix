@@ -37,11 +37,16 @@
           projectRootFile = "flake.nix";
           programs.nixfmt.enable = true;
         };
+        testVm = import ./nix/vm { inherit pkgs; };
       in
       {
+        apps.test-vm = testVm.app;
+
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rustToolchain
+            # Assemble Debian artifacts on macOS and Linux.
+            dpkg
             # Required to find packages
             pkg-config
             # Required for bindgen generation.
