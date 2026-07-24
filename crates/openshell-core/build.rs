@@ -4,16 +4,20 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+#[path = "build_support/git.rs"]
+mod git;
+
 const PROTO_REL: &str = "../../proto";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+
     // --- Git-derived version ---
     // Compute a version from `git describe` for local builds. In Docker/CI
     // builds where .git is absent, this silently does nothing and the binary
     // falls back to CARGO_PKG_VERSION (which is already sed-patched by the
     // build pipeline).
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/refs/tags");
+    git::emit_rerun_if_changed(&manifest_dir);
 
     if let Some(version) = git_version() {
         println!("cargo:rustc-env=OPENSHELL_GIT_VERSION={version}");
@@ -33,7 +37,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::set_var("PROTOC", protobuf_src::protoc());
     }
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let proto_root = manifest_dir.join(PROTO_REL);
 
     let mut proto_files = Vec::new();
