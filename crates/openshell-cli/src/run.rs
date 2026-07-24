@@ -6574,7 +6574,7 @@ pub async fn sandbox_logs(
                 .as_millis(),
         )
         .into_diagnostic()?;
-        now_ms - dur_ms
+        now_ms.saturating_sub(dur_ms)
     } else {
         0
     };
