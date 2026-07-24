@@ -302,11 +302,24 @@ impl tower::Service<hyper::Uri> for InsecureTlsConnector {
     }
 }
 
-pub fn build_insecure_rustls_config() -> Result<rustls::ClientConfig> {
-    let config = rustls::ClientConfig::builder()
+pub fn build_insecure_rustls_config(
+    materials: Option<&TlsMaterials>,
+) -> Result<rustls::ClientConfig> {
+    let dangerous = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(std::sync::Arc::new(InsecureServerCertVerifier))
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(std::sync::Arc::new(InsecureServerCertVerifier));
+    let config = if let Some(m) = materials {
+        let mut cert_cursor = Cursor::new(&m.cert);
+        let cert_chain = rustls_pemfile::certs(&mut cert_cursor)
+            .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+            .into_diagnostic()?;
+        let key = load_private_key(&m.key)?;
+        dangerous
+            .with_client_auth_cert(cert_chain, key)
+            .into_diagnostic()?
+    } else {
+        dangerous.with_no_client_auth()
+    };
     Ok(config)
 }
 
@@ -372,7 +385,8 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
 
     if tls.gateway_insecure && server.starts_with("https://") {
         tracing::warn!("TLS certificate verification is disabled — do not use in production");
-        let rustls_config = build_insecure_rustls_config()?;
+        let materials = require_tls_materials(server, tls).ok();
+        let rustls_config = build_insecure_rustls_config(materials.as_ref())?;
         let tls_connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(rustls_config));
         let connector = InsecureTlsConnector { tls_connector };
         // Use http:// so tonic does not layer its own TLS on top — our
@@ -448,4 +462,58 @@ pub async fn grpc_inference_client(server: &str, tls: &TlsOptions) -> Result<Grp
     let channel = build_channel(server, tls).await?;
     let interceptor = interceptor_from_tls(tls)?;
     Ok(InferenceClient::with_interceptor(channel, interceptor))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn install_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    fn generate_test_materials() -> TlsMaterials {
+        use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let client_key = KeyPair::generate().unwrap();
+        let mut client_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client_cert = client_params
+            .signed_by(&client_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        TlsMaterials {
+            ca: ca_cert.pem().into_bytes(),
+            cert: client_cert.pem().into_bytes(),
+            key: client_key.serialize_pem().into_bytes(),
+        }
+    }
+
+    #[test]
+    fn insecure_config_without_materials_succeeds() {
+        install_provider();
+        build_insecure_rustls_config(None).expect("should build without client materials");
+    }
+
+    #[test]
+    fn insecure_config_with_materials_succeeds() {
+        install_provider();
+        let materials = generate_test_materials();
+        build_insecure_rustls_config(Some(&materials)).expect("should build with client materials");
+    }
+
+    #[test]
+    fn insecure_config_with_invalid_cert_fails() {
+        install_provider();
+        let materials = TlsMaterials {
+            ca: b"not a cert".to_vec(),
+            cert: b"not a cert".to_vec(),
+            key: b"not a key".to_vec(),
+        };
+        assert!(build_insecure_rustls_config(Some(&materials)).is_err());
+    }
 }

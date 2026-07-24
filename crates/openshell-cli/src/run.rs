@@ -1454,7 +1454,8 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
 
     let scheme = uri.scheme_str().unwrap_or("https");
     let https = if tls.gateway_insecure && scheme.eq_ignore_ascii_case("https") {
-        let insecure_config = build_insecure_rustls_config()?;
+        let materials = require_tls_materials(server, tls).ok();
+        let insecure_config = build_insecure_rustls_config(materials.as_ref())?;
         HttpsConnectorBuilder::new()
             .with_tls_config(insecure_config)
             .https_or_http()
