@@ -6,11 +6,11 @@
 #![allow(clippy::result_large_err)]
 
 use crate::persistence::{ObjectType, PersistenceError, Store, WriteCondition, current_time_ms};
-use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use openshell_core::proto::{
     Provider, ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
     StoredProviderCredentialRefreshState,
 };
+use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -445,8 +445,15 @@ pub async fn refresh_provider_credential(
             };
 
             // Generation is ours; write the minted credentials into the provider.
-            if let Err(err) =
-                apply_minted_credential(store, credentials, workspace, &provider, credential_key, &minted).await
+            if let Err(err) = apply_minted_credential(
+                store,
+                credentials,
+                workspace,
+                &provider,
+                credential_key,
+                &minted,
+            )
+            .await
             {
                 state.status = "error".to_string();
                 state.last_error = err.message().to_string();
@@ -1216,10 +1223,15 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let refreshed =
-            refresh_provider_credential(&store, None, "default", "my-graph", "MS_GRAPH_ACCESS_TOKEN")
-                .await
-                .unwrap();
+        let refreshed = refresh_provider_credential(
+            &store,
+            None,
+            "default",
+            "my-graph",
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap();
         assert_eq!(refreshed.status, "refreshed");
         assert!(refreshed.expires_at_ms > 0);
         assert!(refreshed.next_refresh_at_ms > 0);
@@ -1558,10 +1570,15 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let refreshed =
-            refresh_provider_credential(&store, None, "default", "my-drive", "GOOGLE_DRIVE_ACCESS_TOKEN")
-                .await
-                .unwrap();
+        let refreshed = refresh_provider_credential(
+            &store,
+            None,
+            "default",
+            "my-drive",
+            "GOOGLE_DRIVE_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap();
         assert_eq!(refreshed.status, "refreshed");
         assert!(refreshed.expires_at_ms > 0);
 
@@ -1710,10 +1727,15 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let refreshed =
-            refresh_provider_credential(&store, None, "default", "aws-sts-test", "AWS_ACCESS_KEY_ID")
-                .await
-                .unwrap();
+        let refreshed = refresh_provider_credential(
+            &store,
+            None,
+            "default",
+            "aws-sts-test",
+            "AWS_ACCESS_KEY_ID",
+        )
+        .await
+        .unwrap();
         assert_eq!(refreshed.status, "refreshed");
         assert!(refreshed.expires_at_ms > 0);
 
@@ -1802,9 +1824,15 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        refresh_provider_credential(&store, None, "default", "aws-sts-custom", "AWS_ACCESS_KEY_ID")
-            .await
-            .unwrap();
+        refresh_provider_credential(
+            &store,
+            None,
+            "default",
+            "aws-sts-custom",
+            "AWS_ACCESS_KEY_ID",
+        )
+        .await
+        .unwrap();
 
         let stored = store
             .get_message_by_name::<Provider>("default", "aws-sts-custom")
@@ -1872,10 +1900,15 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let err =
-            refresh_provider_credential(&store, None, "default", "aws-sts-partial", "AWS_ACCESS_KEY_ID")
-                .await
-                .unwrap_err();
+        let err = refresh_provider_credential(
+            &store,
+            None,
+            "default",
+            "aws-sts-partial",
+            "AWS_ACCESS_KEY_ID",
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("both be set or both omitted"));
 
@@ -2105,10 +2138,15 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let refreshed =
-            refresh_provider_credential(&store, None, "default", "aws-sts-session", "AWS_ACCESS_KEY_ID")
-                .await
-                .unwrap();
+        let refreshed = refresh_provider_credential(
+            &store,
+            None,
+            "default",
+            "aws-sts-session",
+            "AWS_ACCESS_KEY_ID",
+        )
+        .await
+        .unwrap();
         assert_eq!(refreshed.status, "refreshed");
         let stored = store
             .get_message_by_name::<Provider>("default", "aws-sts-session")
@@ -2369,8 +2407,13 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let rotate =
-            refresh_provider_credential(&store, None, "default", "aws-superseded", "AWS_ACCESS_KEY_ID");
+        let rotate = refresh_provider_credential(
+            &store,
+            None,
+            "default",
+            "aws-superseded",
+            "AWS_ACCESS_KEY_ID",
+        );
         let interfere = async {
             if tokio::time::timeout(std::time::Duration::from_secs(15), hit_rx)
                 .await

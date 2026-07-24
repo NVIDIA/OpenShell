@@ -807,11 +807,9 @@ pub mod test_support {
         crate::ensure_default_workspace(&store).await.unwrap();
         let config = Config::new(None).with_database_url("sqlite::memory:?cache=shared");
         let compute = new_test_runtime(store.clone()).await;
-        let credentials = crate::credentials::CredentialRuntime::from_config_with_store(
-            &config,
-            store.clone(),
-        )
-        .expect("test credential runtime");
+        let credentials =
+            crate::credentials::CredentialRuntime::from_config_with_store(&config, store.clone())
+                .expect("test credential runtime");
         Arc::new(ServerState::new(
             config,
             store,

@@ -1099,11 +1099,9 @@ mod tests {
             .with_server_sans(["*.dev.openshell.localhost"])
             .with_loopback_service_http(enable_loopback_service_http);
         let compute = crate::compute::new_test_runtime(store.clone()).await;
-        let credentials = crate::credentials::CredentialRuntime::from_config_with_store(
-            &config,
-            store.clone(),
-        )
-        .expect("test credential runtime");
+        let credentials =
+            crate::credentials::CredentialRuntime::from_config_with_store(&config, store.clone())
+                .expect("test credential runtime");
         Arc::new(ServerState::new(
             config,
             store,

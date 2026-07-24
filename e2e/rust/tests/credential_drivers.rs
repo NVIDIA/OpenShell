@@ -119,7 +119,9 @@ async fn bao(args: &[&str]) -> Result<String, String> {
     let token = vault_token();
     let token_env = format!("BAO_TOKEN={token}");
     let mut command = kubectl_command();
-    command.args(["-n", &namespace, "exec", &pod, "--", "env", &token_env, "bao"]);
+    command.args([
+        "-n", &namespace, "exec", &pod, "--", "env", &token_env, "bao",
+    ]);
     command.args(args);
     let output = command
         .stdout(Stdio::piped())
@@ -208,7 +210,9 @@ async fn create_provider(name: &str, secret_value: &str) -> Result<String, Strin
     .await;
     let clean = strip_ansi(&output);
     if code != 0 {
-        return Err(format!("provider create {name} failed (exit {code}):\n{clean}"));
+        return Err(format!(
+            "provider create {name} failed (exit {code}):\n{clean}"
+        ));
     }
     Ok(clean)
 }
@@ -330,10 +334,7 @@ async fn assert_kubernetes_secret_deleted(provider_name: &str) -> Result<(), Str
     }
 }
 
-async fn assert_vault_secret_stored(
-    provider_name: &str,
-    secret_value: &str,
-) -> Result<(), String> {
+async fn assert_vault_secret_stored(provider_name: &str, secret_value: &str) -> Result<(), String> {
     let logical_path = managed_vault_path(provider_name);
     let output = bao(&[
         "kv",

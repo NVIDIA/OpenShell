@@ -210,11 +210,19 @@ async fn upsert_inference_route(
     verify: bool,
 ) -> Result<UpsertedInferenceRoute, Status> {
     upsert_inference_route_with_credentials(
-        store, None, workspace, route_name, provider_name, model_id, timeout_secs, verify,
+        store,
+        None,
+        workspace,
+        route_name,
+        provider_name,
+        model_id,
+        timeout_secs,
+        verify,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upsert_inference_route_with_credentials(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
@@ -977,15 +985,23 @@ async fn resolve_inference_bundle_with_credentials(
     workspace: &str,
 ) -> Result<GetInferenceBundleResponse, Status> {
     let mut routes = Vec::new();
-    if let Some(r) =
-        resolve_route_by_name_with_credentials(store, credentials, workspace, CLUSTER_INFERENCE_ROUTE_NAME)
-            .await?
+    if let Some(r) = resolve_route_by_name_with_credentials(
+        store,
+        credentials,
+        workspace,
+        CLUSTER_INFERENCE_ROUTE_NAME,
+    )
+    .await?
     {
         routes.push(r);
     }
-    if let Some(r) =
-        resolve_route_by_name_with_credentials(store, credentials, workspace, SANDBOX_SYSTEM_ROUTE_NAME)
-            .await?
+    if let Some(r) = resolve_route_by_name_with_credentials(
+        store,
+        credentials,
+        workspace,
+        SANDBOX_SYSTEM_ROUTE_NAME,
+    )
+    .await?
     {
         routes.push(r);
     }
@@ -1727,10 +1743,7 @@ mod tests {
         let handles = credentials
             .store_provider_credentials(
                 "openai-dev",
-                &HashMap::from([(
-                    "OPENAI_API_KEY".to_string(),
-                    "sk-encrypted".to_string(),
-                )]),
+                &HashMap::from([("OPENAI_API_KEY".to_string(), "sk-encrypted".to_string())]),
                 &HashMap::new(),
             )
             .await

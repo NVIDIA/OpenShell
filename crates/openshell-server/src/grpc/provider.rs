@@ -6085,9 +6085,13 @@ mod tests {
             .await
             .unwrap();
 
-        create_provider_record(&store, "default", provider_with_values("legacy-provider", "openai"))
-            .await
-            .unwrap();
+        create_provider_record(
+            &store,
+            "default",
+            provider_with_values("legacy-provider", "openai"),
+        )
+        .await
+        .unwrap();
 
         let updated = update_provider_record_validating(
             &store,
@@ -6148,9 +6152,13 @@ mod tests {
             .await
             .unwrap();
 
-        create_provider_record(&store, "default", provider_with_values("legacy-provider", "openai"))
-            .await
-            .unwrap();
+        create_provider_record(
+            &store,
+            "default",
+            provider_with_values("legacy-provider", "openai"),
+        )
+        .await
+        .unwrap();
 
         update_provider_record_validating(
             &store,
@@ -8187,8 +8195,10 @@ mod tests {
             .unwrap();
         let current_version = current.metadata.as_ref().unwrap().resource_version;
 
-        // Prepare an update with the correct resource_version
+        // Prepare an update with the correct resource_version.
+        // Clear credential_handles since real clients receive redacted providers.
         let mut updated_provider = current.clone();
+        updated_provider.credential_handles.clear();
         updated_provider
             .credentials
             .insert("NEW_KEY".to_string(), "new-value".to_string());
@@ -8257,8 +8267,11 @@ mod tests {
             .unwrap();
         let current_version = current.metadata.as_ref().unwrap().resource_version;
 
-        // Prepare an update with a stale resource_version
+        // Prepare an update with a stale resource_version.
+        // Clear credential_handles since real clients receive redacted
+        // providers where handles have been cleared.
         let mut stale_provider = current.clone();
+        stale_provider.credential_handles.clear();
         stale_provider
             .credentials
             .insert("NEW_KEY".to_string(), "new-value".to_string());
@@ -8398,6 +8411,7 @@ mod tests {
         for i in 0..3 {
             let state_clone = Arc::clone(&state);
             let mut updated = initial.clone();
+            updated.credential_handles.clear();
             updated
                 .credentials
                 .insert(format!("KEY_{i}"), format!("value-{i}"));
@@ -8452,8 +8466,13 @@ mod tests {
         );
 
         // Exactly one of KEY_0, KEY_1, or KEY_2 should be present
+        // (may be in credentials or credential_handles depending on driver config)
         let new_keys_count = (0..3)
-            .filter(|i| final_provider.credentials.contains_key(&format!("KEY_{i}")))
+            .filter(|i| {
+                let key = format!("KEY_{i}");
+                final_provider.credentials.contains_key(&key)
+                    || final_provider.credential_handles.contains_key(&key)
+            })
             .count();
         assert_eq!(new_keys_count, 1);
     }
