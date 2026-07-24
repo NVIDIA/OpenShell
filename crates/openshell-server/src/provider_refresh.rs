@@ -769,6 +769,7 @@ async fn mint_aws_sts_assume_role(
         DEFAULT_MAX_LIFETIME_SECONDS
     };
     let max_lifetime = i32::try_from(max_lifetime_i64.min(i64::from(i32::MAX))).unwrap_or(i32::MAX);
+    let max_lifetime_ms = i64::from(max_lifetime).saturating_mul(1000);
 
     let mut req = client
         .assume_role()
@@ -797,8 +798,8 @@ async fn mint_aws_sts_assume_role(
     let expires_at_ms = creds
         .expiration()
         .to_millis()
-        .unwrap_or_else(|_| now_ms + max_lifetime_i64 * 1000);
-    let max_expires = now_ms + max_lifetime_i64 * 1000;
+        .unwrap_or_else(|_| now_ms + max_lifetime_ms);
+    let max_expires = now_ms + max_lifetime_ms;
     let expires_at_ms = expires_at_ms.min(max_expires);
 
     // Map STS response fields to the env keys the profile bound to each semantic
