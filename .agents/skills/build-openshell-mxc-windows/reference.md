@@ -167,10 +167,14 @@ The Windows build path is additive. Keep the repository's Linux `mise run ci`, d
 
 On Windows, `mise run pre-commit` routes `rust:check`, `rust:lint`, and
 `test:rust` through the same wrapper for the host-native target. Shared task
-definitions retain their Unix commands. Only Linux installer and
-service/RPM-packaging tests skip. The Windows Clippy command allows unused
-imports, dead code, and unused async functions caused by cfg-gated stubs; other
-warnings remain errors.
+definitions retain their Unix commands. Only Linux installer,
+build-environment shell-helper, and service/RPM-packaging tests skip. The
+Windows Clippy command allows unused imports, dead code, and unused async
+functions caused by cfg-gated stubs; other warnings remain errors.
+Wrapper-owned Cargo commands are serialized across processes and default to
+four Cargo/MSVC jobs to avoid multiplying bundled-Z3 compilation across
+parallel pre-commit tasks. Override the limit with a positive integer in
+`OPENSHELL_WINDOWS_BUILD_JOBS`.
 
 | Task | Expected behavior |
 |---|---|
@@ -188,11 +192,12 @@ Use `--skip-tools` for Windows CI and automation. Rust must come from rustup wit
 
 ARM64 validation requires the Visual Studio ARM64 C++ tools, ARM64
 Spectre-mitigated libraries, host-native `libclang.dll` and `clang-cl.exe`,
-CMake tools, Ninja, and an ARM64-capable Windows SDK. During x64-to-ARM64
-check/build, ARM64 crypto crates use `clang-cl` while bundled Z3 stays on
-native MSVC `cl.exe` with Ninja. Use a short `CARGO_TARGET_DIR` if Windows
-path-length limits are reached. Test tasks reject a target that does not match
-the Windows host architecture.
+CMake tools, and an ARM64-capable Windows SDK. During x64-to-ARM64 check/build,
+ARM64 crypto crates use `clang-cl` while bundled Z3 stays on native MSVC
+`cl.exe` through CMake's Visual Studio generator. The generator must accept the
+MSBuild `-m` argument emitted by `z3-sys`. Use a short `CARGO_TARGET_DIR` if
+Windows path-length limits are reached. Test tasks reject a target that does
+not match the Windows host architecture.
 
 Bundled Z3 source is pinned by revision, fetched through Git, and cached under
 `CARGO_TARGET_DIR`. The wrapper sets `Z3_SYS_BUNDLED_DIR_OVERRIDE` so `z3-sys`

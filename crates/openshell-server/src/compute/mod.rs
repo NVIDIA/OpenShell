@@ -23,6 +23,7 @@ use crate::sandbox_watch::SandboxWatchBus;
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
+#[cfg(unix)]
 use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
@@ -44,19 +45,12 @@ use openshell_core::proto::{
 use openshell_core::{ObjectLabels, ObjectWorkspace};
 #[cfg(not(target_os = "windows"))]
 use openshell_driver_docker::DockerComputeDriver;
-#[cfg(target_os = "windows")]
-use openshell_driver_kubernetes::KubernetesComputeConfig;
 #[cfg(not(target_os = "windows"))]
 use openshell_driver_kubernetes::{
-    ComputeDriverService as KubernetesDriverService, KubernetesComputeConfig,
-    KubernetesComputeDriver,
+    ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
 };
-#[cfg(target_os = "windows")]
-use openshell_driver_podman::PodmanComputeConfig;
 #[cfg(not(target_os = "windows"))]
-use openshell_driver_podman::{
-    ComputeDriverService as PodmanDriverService, PodmanComputeConfig, PodmanComputeDriver,
-};
+use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
 use std::collections::HashMap;
 use std::fmt;
@@ -68,8 +62,11 @@ use std::time::Duration;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, watch};
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
+#[cfg(unix)]
+use tonic::transport::Endpoint;
 use tonic::{Code, Request, Status};
+#[cfg(unix)]
 use tower::service_fn;
 use tracing::{Instrument as _, debug, info, warn};
 

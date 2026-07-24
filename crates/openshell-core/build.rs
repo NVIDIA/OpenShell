@@ -36,10 +36,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let proto_root = manifest_dir.join(PROTO_REL);
     let proto_includes = proto_include_dirs(&proto_root)?;
-    let proto_include_refs = proto_includes
-        .iter()
-        .map(PathBuf::as_path)
-        .collect::<Vec<_>>();
 
     let mut proto_files = Vec::new();
     collect_proto_files(&proto_root, &mut proto_files)?;
@@ -56,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Emit a binary FileDescriptorSet so the server can enumerate every
         // RPC at runtime (used by the per-handler auth exhaustiveness test).
         .file_descriptor_set_path(&descriptor_path)
-        .compile_protos(&proto_files, &proto_include_refs)?;
+        .compile_protos(&proto_files, &proto_includes)?;
 
     println!(
         "cargo:rustc-env=OPENSHELL_DESCRIPTOR_PATH={}",

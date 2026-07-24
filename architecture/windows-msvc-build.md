@@ -67,7 +67,8 @@ Unix Cargo commands on Linux and macOS, excludes unsupported Windows runtime
 packages, and runs the server test-support suite separately. Windows Clippy
 continues to deny all warnings except unused imports, dead code, and unused
 async functions caused by cfg-gated Windows stubs. Repository-wide pre-commit
-skips only Linux-specific installer and packaging-asset tests; its
+skips only Linux-specific installer, build-environment shell-helper, and
+packaging-asset tests; its
 cross-platform Python, Markdown, license, and documentation checks still run.
 Test tasks require the Rust target architecture to match the Windows host, so
 an ARM64 test result is native coverage rather than x64 emulation coverage.
@@ -90,10 +91,17 @@ ARM64 validation requires the Visual Studio ARM64 MSVC tools, ARM64
 Spectre-mitigated libraries, host-native Clang tools, CMake tools, and an
 ARM64-capable Windows SDK. Clang provides `libclang.dll` for `bindgen` and
 `clang-cl.exe` for ARM64 crypto dependencies. During x64-to-ARM64 check/build,
-the wrapper uses Ninja with native MSVC `cl.exe` for bundled Z3 so the Z3 build
-does not inherit the crypto crates' compiler requirement. Artifact hashing uses
+the wrapper lets `cmake-rs` select the Visual Studio ARM64 generator with native
+MSVC `cl.exe` for bundled Z3 so the Z3 build does not inherit the crypto crates'
+compiler requirement. The Visual Studio generator is also compatible with the
+MSBuild `-m` argument emitted by `z3-sys`; Ninja is not. Artifact hashing uses
 .NET SHA256 directly because module autoloading in the mise-launched Windows
 PowerShell process is not guaranteed.
+
+The wrapper defaults Cargo and MSVC compilation to four jobs. Set
+`OPENSHELL_WINDOWS_BUILD_JOBS` to a positive integer to override that limit.
+A host-local mutex serializes wrapper-owned Cargo commands so concurrent
+pre-commit tasks do not multiply the process count while bundled Z3 compiles.
 
 ## CI Shape
 

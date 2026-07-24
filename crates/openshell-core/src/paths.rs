@@ -145,7 +145,8 @@ pub fn is_file_permissions_too_open(path: &Path) -> bool {
 ///
 /// This is a lexical normalization only — it does NOT resolve symlinks or
 /// check the filesystem. `..` components are preserved verbatim; callers that
-/// need to reject parent traversal must validate separately.
+/// need to reject parent traversal must validate separately. The normalized
+/// representation always uses `/` so sandbox policy paths are host-independent.
 pub fn normalize_path(path: &str) -> String {
     use std::path::Component;
 
@@ -164,7 +165,15 @@ pub fn normalize_path(path: &str) -> String {
             Component::Normal(c) => normalized.push(c),
         }
     }
-    normalized.to_string_lossy().to_string()
+    let normalized = normalized.to_string_lossy();
+    #[cfg(windows)]
+    {
+        normalized.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        normalized.into_owned()
+    }
 }
 
 #[cfg(test)]

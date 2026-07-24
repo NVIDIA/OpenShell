@@ -38,10 +38,12 @@ use crate::otel_tracing::TraceContextInterceptor;
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
 #[cfg(unix)]
+use openshell_core::ComputeDriverKind;
+#[cfg(unix)]
 use openshell_core::proto::compute::v1::{
     GetCapabilitiesRequest, compute_driver_client::ComputeDriverClient,
 };
-use openshell_core::{ComputeDriverKind, Config, Error, Result};
+use openshell_core::{Config, Error, Result};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
@@ -53,6 +55,7 @@ use std::{io::ErrorKind, process::Stdio, sync::Arc, time::Duration};
 use tokio::net::UnixStream;
 #[cfg(unix)]
 use tokio::process::Command;
+#[cfg(unix)]
 use tonic::transport::Channel;
 #[cfg(unix)]
 use tonic::transport::Endpoint;

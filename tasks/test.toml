@@ -27,6 +27,7 @@ hide = true
 ["test:build-env"]
 description = "Run build-env.sh helper shell tests"
 run = "tasks/scripts/test-build-env.sh"
+run_windows = "echo Skipping test:build-env: the Unix build-env.sh helper does not apply on Windows."
 hide = true
 
 ["test:packaging-assets"]

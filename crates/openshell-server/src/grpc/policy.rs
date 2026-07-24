@@ -945,6 +945,7 @@ struct AutoApproveChunkContext<'a> {
     source: &'a str,
     resolved_from: &'a str,
     current_policy: &'a ProtoSandboxPolicy,
+    #[cfg(not(target_os = "windows"))]
     credential_set: &'a CredentialSet,
 }
 
@@ -983,11 +984,18 @@ async fn auto_approve_chunk(
     // stored rule instead of trusting the incoming proposal's verdict.
     let rule = decode_draft_chunk_rule(&chunk)?
         .ok_or_else(|| Status::failed_precondition("draft chunk has no proposed rule"))?;
+    #[cfg(not(target_os = "windows"))]
     let validation_result = validation_result_for_agent_proposal(
         context.current_policy.clone(),
         &chunk.rule_name,
         &rule,
         context.credential_set,
+    );
+    #[cfg(target_os = "windows")]
+    let validation_result = validation_result_for_agent_proposal(
+        context.current_policy.clone(),
+        &chunk.rule_name,
+        &rule,
     );
     if validation_result != "prover: no new findings" {
         info!(
@@ -3124,6 +3132,7 @@ pub(super) async fn handle_submit_policy_analysis(
                     source: &req.analysis_mode,
                     resolved_from,
                     current_policy: &current_policy,
+                    #[cfg(not(target_os = "windows"))]
                     credential_set: &credential_set,
                 },
             )

@@ -1889,9 +1889,7 @@ async fn sandbox_exec_interactive_grpc(
                 Ok(n) => {
                     if stdin_tx
                         .blocking_send(ExecSandboxInput {
-                            payload: Some(exec_sandbox_input::Payload::Stdin(
-                                buf[..n].to_vec(),
-                            )),
+                            payload: Some(exec_sandbox_input::Payload::Stdin(buf[..n].to_vec())),
                         })
                         .is_err()
                     {

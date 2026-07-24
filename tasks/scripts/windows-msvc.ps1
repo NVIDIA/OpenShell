@@ -37,6 +37,20 @@ if ([string]::IsNullOrWhiteSpace($TargetDir)) {
     $TargetDir = Join-Path $RepoRoot "target"
 }
 
+$BuildJobsValue = $env:OPENSHELL_WINDOWS_BUILD_JOBS
+if ([string]::IsNullOrWhiteSpace($BuildJobsValue)) {
+    $BuildJobsValue = $env:CARGO_BUILD_JOBS
+}
+if ([string]::IsNullOrWhiteSpace($BuildJobsValue)) {
+    $BuildJobsValue = "4"
+}
+[int] $WindowsBuildJobs = 0
+if (-not [int]::TryParse($BuildJobsValue, [ref] $WindowsBuildJobs) -or $WindowsBuildJobs -lt 1) {
+    throw "OPENSHELL_WINDOWS_BUILD_JOBS or CARGO_BUILD_JOBS must be a positive integer."
+}
+$ClOptions = "$($env:_CL_) /MP$WindowsBuildJobs".Trim()
+$WindowsCargoMutex = [System.Threading.Mutex]::new($false, "Local\OpenShellWindowsMsvcCargo")
+
 $UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-podman --exclude openshell-driver-vm --exclude openshell-supervisor-process"
 $WindowsClippyPackageExcludes = $UnsupportedDriverPackageExcludes
 $WindowsClippyLintArgs = "-D warnings -A dead-code -A unused-imports -A clippy::unused-async"
@@ -231,35 +245,6 @@ function Resolve-LibclangPath {
     throw "Could not find libclang.dll. Install Visual Studio C++ Clang tools, or set LIBCLANG_PATH to the directory containing libclang.dll."
 }
 
-function Resolve-NinjaPath {
-    $fromPath = Get-Command ninja.exe -ErrorAction SilentlyContinue
-    if ($fromPath) {
-        return $fromPath.Source
-    }
-
-    $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
-    if ($programFilesX86) {
-        $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
-    } else {
-        $vswhere = $null
-    }
-    if ($vswhere -and (Test-Path $vswhere)) {
-        $found = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -find "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe" | Select-Object -First 1
-        if ($found -and (Test-Path $found -PathType Leaf)) {
-            return (Resolve-Path $found).Path
-        }
-    }
-
-    foreach ($installRoot in Get-VsInstallRoots) {
-        $candidate = Join-Path $installRoot "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
-        if (Test-Path $candidate -PathType Leaf) {
-            return (Resolve-Path $candidate).Path
-        }
-    }
-
-    throw "Could not find ninja.exe. Install Microsoft.VisualStudio.Component.VC.CMake.Project."
-}
-
 function Add-PathEntry([string] $Directory) {
     if (($env:PATH -split ";") -notcontains $Directory) {
         $env:PATH = "$Directory;$env:PATH"
@@ -277,14 +262,9 @@ function Configure-Arm64CrossBuild([string[]] $RustTargets) {
     }
     Add-PathEntry $env:LIBCLANG_PATH
 
-    $ninja = Resolve-NinjaPath
-    Add-PathEntry (Split-Path -Parent $ninja)
-    [Environment]::SetEnvironmentVariable("CMAKE_GENERATOR_aarch64_pc_windows_msvc", "Ninja", "Process")
-
     Write-Host "==> ARM64 cross-build toolchain"
     Write-Host "    clang-cl: $clangCl"
-    Write-Host "    ninja:    $ninja"
-    Write-Host "    Z3:       MSVC cl.exe with Ninja"
+    Write-Host "    Z3:       MSVC cl.exe with the Visual Studio generator"
 }
 
 function Get-HostArch {
@@ -474,7 +454,9 @@ function Invoke-VsCargo {
     $logPath = Join-Path $LogDir $LogName
     $environmentSetup = @(
         "set `"CARGO_TARGET_DIR=$TargetDir`"",
+        "set `"CARGO_BUILD_JOBS=$WindowsBuildJobs`"",
         "set `"CARGO_INCREMENTAL=0`"",
+        "set `"_CL_=$ClOptions`"",
         "set `"RUSTC_WRAPPER=`""
     )
     if ($hostArch -eq "amd64" -and $RustTarget -eq "aarch64-pc-windows-msvc") {
@@ -495,14 +477,34 @@ function Invoke-VsCargo {
     Write-Host "    target: $RustTarget"
     Write-Host "    log:    $logPath"
 
-    $cmdWithLog = "$cmd > `"$logPath`" 2>&1"
-    & cmd /v:on /d /c $cmdWithLog
-    $exitCode = $LASTEXITCODE
-    if (Test-Path $logPath) {
-        Get-Content $logPath
-    }
-    if ($exitCode -ne 0) {
-        throw "Command failed with exit code $exitCode. See $logPath"
+    $lockAcquired = $false
+    try {
+        try {
+            $lockAcquired = $WindowsCargoMutex.WaitOne(0)
+            if (-not $lockAcquired) {
+                Write-Host "    waiting for another Windows Cargo task"
+                $lockAcquired = $WindowsCargoMutex.WaitOne([TimeSpan]::FromHours(2))
+            }
+        } catch [System.Threading.AbandonedMutexException] {
+            $lockAcquired = $true
+        }
+        if (-not $lockAcquired) {
+            throw "Timed out waiting for another Windows Cargo task to finish."
+        }
+
+        $cmdWithLog = "$cmd > `"$logPath`" 2>&1"
+        & cmd /v:on /d /c $cmdWithLog
+        $exitCode = $LASTEXITCODE
+        if (Test-Path $logPath) {
+            Get-Content $logPath
+        }
+        if ($exitCode -ne 0) {
+            throw "Command failed with exit code $exitCode. See $logPath"
+        }
+    } finally {
+        if ($lockAcquired) {
+            $WindowsCargoMutex.ReleaseMutex()
+        }
     }
 }
 
