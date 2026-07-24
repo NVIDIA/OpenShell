@@ -208,42 +208,58 @@ impl CredentialRuntime {
         }
         let driver_name = self.registry.storage_owner_name();
         let driver = self.connected_driver(&driver_name)?;
+
+        let store_futures: Vec<_> = credentials
+            .iter()
+            .map(|(credential_key, value)| {
+                let existing_handle = existing_handles
+                    .get(credential_key)
+                    .filter(|handle| normalize_driver_name(&handle.driver) == driver_name)
+                    .cloned();
+                let replaced_handle = existing_handles
+                    .get(credential_key)
+                    .filter(|handle| normalize_driver_name(&handle.driver) != driver_name)
+                    .cloned();
+                let driver = Arc::clone(driver);
+                let provider_name = provider_name.to_string();
+                let credential_key = credential_key.clone();
+                let value = value.clone();
+                let driver_name = driver_name.clone();
+                async move {
+                    let mut handle = driver
+                        .store_credential(StoreCredentialRequest {
+                            provider_name,
+                            credential_key: credential_key.clone(),
+                            value,
+                            existing_handle,
+                        })
+                        .await?;
+                    handle.driver.clone_from(&driver_name);
+                    if handle.handle.trim().is_empty() {
+                        return Err(Status::internal(format!(
+                            "credential driver '{driver_name}' returned an empty handle \
+                             for provider credential '{credential_key}'"
+                        )));
+                    }
+                    Ok((credential_key, handle, replaced_handle))
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(store_futures).await;
         let mut handles = HashMap::with_capacity(credentials.len());
-
-        for (credential_key, value) in credentials {
-            let existing_handle = existing_handles
-                .get(credential_key)
-                .filter(|handle| normalize_driver_name(&handle.driver) == driver_name)
-                .cloned();
-            let replaced_handle = existing_handles
-                .get(credential_key)
-                .filter(|handle| normalize_driver_name(&handle.driver) != driver_name)
-                .cloned();
-            let mut handle = driver
-                .store_credential(StoreCredentialRequest {
-                    provider_name: provider_name.to_string(),
-                    credential_key: credential_key.clone(),
-                    value: value.clone(),
-                    existing_handle,
-                })
-                .await?;
-            handle.driver.clone_from(&driver_name);
-            if handle.handle.trim().is_empty() {
-                return Err(Status::internal(format!(
-                    "credential driver '{driver_name}' returned an empty handle for provider credential '{credential_key}'"
-                )));
-            }
-            if let Some(replaced_handle) = replaced_handle {
-                self.delete_provider_credential_handle(
-                    provider_name,
-                    credential_key,
-                    replaced_handle,
-                )
-                .await?;
-            }
+        let mut replaced = Vec::new();
+        for result in results {
+            let (credential_key, handle, replaced_handle) = result?;
             handles.insert(credential_key.clone(), handle);
+            if let Some(old) = replaced_handle {
+                replaced.push((credential_key, old));
+            }
         }
-
+        for (credential_key, old_handle) in replaced {
+            self.delete_provider_credential_handle(provider_name, &credential_key, old_handle)
+                .await?;
+        }
         Ok(handles)
     }
 
@@ -252,9 +268,19 @@ impl CredentialRuntime {
         provider_name: &str,
         handles: &HashMap<String, CredentialHandle>,
     ) -> Result<(), Status> {
-        for (credential_key, handle) in handles {
-            self.delete_provider_credential_handle(provider_name, credential_key, handle.clone())
-                .await?;
+        let futs: Vec<_> = handles
+            .iter()
+            .map(|(credential_key, handle)| {
+                self.delete_provider_credential_handle(
+                    provider_name,
+                    credential_key,
+                    handle.clone(),
+                )
+            })
+            .collect();
+        let results = futures::future::join_all(futs).await;
+        for result in results {
+            result?;
         }
         Ok(())
     }
