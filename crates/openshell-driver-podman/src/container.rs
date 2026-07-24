@@ -73,8 +73,10 @@ pub struct PodmanSandboxDriverConfig {
     pub cdi_devices: Option<Vec<String>>,
     /// Optional per-sandbox user namespace mode.
     ///
-    /// Accepts the same values as `podman run --userns`, e.g. `"keep-id"`,
-    /// `"keep-id:uid=200,gid=210"`, `"auto"`, `"nomap"`, or `"host"`.
+    /// Accepted values when `allow_userns = true` in gateway config:
+    /// `"keep-id"`, `"keep-id:uid=N,gid=N"`, `"auto"`, or `"nomap"`.
+    /// Escape modes such as `"host"` and `"ns:..."` are always rejected.
+    /// Requests are rejected when `allow_userns` is `false` (the default).
     #[serde(default)]
     pub userns_mode: String,
     mounts: Vec<PodmanDriverMountConfig>,
@@ -317,7 +319,7 @@ struct NetNS {
 /// string holding the mode-specific options (e.g. `"uid=200,gid=210"` for
 /// `keep-id`). The CLI `--userns keep-id:uid=200,gid=210` is split on the
 /// first colon: `nsmode = "keep-id"`, `value = "uid=200,gid=210"`.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct UserNS {
     nsmode: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -999,7 +1001,8 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
-        userns: build_userns(&sandbox_driver_config.userns_mode),
+        userns: validated_userns(&sandbox_driver_config.userns_mode, config.allow_userns)
+            .map_err(ComputeDriverError::InvalidArgument)?,
         networks,
         devices,
         // Mount a tmpfs at /run/netns so the sandbox supervisor can create
@@ -1079,30 +1082,80 @@ pub fn build_container_spec_with_token_and_gpu_devices(
     Ok(serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail"))
 }
 
-/// Parse a `--userns` style string (e.g. `"keep-id:uid=200,gid=210"`)
-/// into a libpod `Namespace` object.
+/// Safe user-namespace modes a sandbox may request when `allow_userns` is
+/// enabled. Escape modes (`host`, `ns:`, `private`) are never permitted even
+/// if the operator enables the feature.
+const ALLOWED_USERNS_MODES: &[&str] = &["keep-id", "auto", "nomap"];
+
+/// Parse and validate a sandbox-supplied `userns_mode` string.
 ///
-/// Splits on the first colon: the left side becomes `nsmode`, the right
-/// side becomes `value`. If there is no colon, the entire string is the
-/// `nsmode` and `value` is empty.
-///
-/// Returns `None` when the input is empty, so the `userns` field is
-/// omitted from the JSON and Podman uses its default (host namespace).
-fn build_userns(userns_mode: &str) -> Option<UserNS> {
+/// Returns:
+/// - `Ok(None)` when the string is empty — the `userns` field is omitted
+///   from the JSON and Podman uses its default behavior.
+/// - `Ok(Some(UserNS))` when the mode is in [`ALLOWED_USERNS_MODES`] and
+///   any `uid`/`gid` options are numeric.
+/// - `Err(String)` when:
+///   - `allow_userns` is `false` and a non-empty mode was requested.
+///   - the mode is not in [`ALLOWED_USERNS_MODES`] (e.g. `"host"`, `"ns:…"`).
+///   - a `keep-id` value contains a non-numeric `uid` or `gid`.
+fn validated_userns(userns_mode: &str, allow_userns: bool) -> Result<Option<UserNS>, String> {
     let userns_mode = userns_mode.trim();
     if userns_mode.is_empty() {
-        return None;
+        return Ok(None);
     }
-    match userns_mode.split_once(':') {
-        Some((nsmode, value)) => Some(UserNS {
-            nsmode: nsmode.to_string(),
-            value: value.to_string(),
-        }),
-        None => Some(UserNS {
-            nsmode: userns_mode.to_string(),
-            value: String::new(),
-        }),
+    if !allow_userns {
+        return Err(
+            "userns_mode is not permitted; set allow_userns = true in gateway config to enable \
+             per-sandbox user namespace selection"
+                .to_string(),
+        );
     }
+    let (nsmode, value) = match userns_mode.split_once(':') {
+        Some((m, v)) => (m, v),
+        None => (userns_mode, ""),
+    };
+    if !ALLOWED_USERNS_MODES.contains(&nsmode) {
+        return Err(format!(
+            "userns_mode '{nsmode}' is not permitted; allowed modes are: {}",
+            ALLOWED_USERNS_MODES.join(", ")
+        ));
+    }
+    if nsmode == "keep-id" && !value.is_empty() {
+        validate_keep_id_value(value)?;
+    }
+    Ok(Some(UserNS {
+        nsmode: nsmode.to_string(),
+        value: value.to_string(),
+    }))
+}
+
+/// Validate the options string for `keep-id`, e.g. `"uid=200,gid=210"`.
+///
+/// Each comma-separated segment must be `uid=N` or `gid=N` where N is a
+/// non-negative integer. Unknown keys and non-numeric values are rejected
+/// to prevent unexpected Podman behaviour or injection via the option string.
+fn validate_keep_id_value(value: &str) -> Result<(), String> {
+    for part in value.split(',') {
+        let part = part.trim();
+        let Some((key, val)) = part.split_once('=') else {
+            return Err(format!(
+                "keep-id option '{part}' is not in 'key=N' form; expected 'uid=N' or 'gid=N'"
+            ));
+        };
+        match key {
+            "uid" | "gid" => {
+                val.parse::<u32>().map_err(|_| {
+                    format!("keep-id {key} value '{val}' must be a non-negative integer")
+                })?;
+            }
+            other => {
+                return Err(format!(
+                    "keep-id option '{other}' is not recognised; only 'uid' and 'gid' are allowed"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn hostadd_entries(config: &PodmanComputeConfig) -> Vec<String> {
@@ -2419,9 +2472,21 @@ mod tests {
 
     // ── userns tests ─────────────────────────────────────────────────────
 
+    /// Helper: `test_config()` with `allow_userns` enabled so tests that
+    /// exercise valid userns modes don't have to repeat the override.
+    fn userns_config() -> PodmanComputeConfig {
+        PodmanComputeConfig {
+            allow_userns: true,
+            ..test_config()
+        }
+    }
+
+    // -- empty / whitespace (no gate needed, trimmed to empty before gate) ---
+
     #[test]
     fn container_spec_omits_userns_when_unset() {
         let sandbox = test_sandbox("test-id", "test-name");
+        // allow_userns = false in test_config(); empty mode is always a no-op.
         let config = test_config();
         let spec = build_container_spec(&sandbox, &config);
 
@@ -2435,8 +2500,7 @@ mod tests {
     fn container_spec_omits_userns_when_whitespace_only() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
-        let sandbox = test_sandbox("test-id", "test-name");
-        let mut sandbox = sandbox;
+        let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
             template: Some(DriverSandboxTemplate {
                 driver_config: Some(json_struct(serde_json::json!({
@@ -2446,6 +2510,7 @@ mod tests {
             }),
             ..Default::default()
         });
+        // Whitespace trims to empty — gate is never reached.
         let config = test_config();
         let spec = build_container_spec(&sandbox, &config);
 
@@ -2454,6 +2519,8 @@ mod tests {
             "userns should be omitted when userns_mode is whitespace only"
         );
     }
+
+    // -- allowed modes (require allow_userns = true) ----------------------
 
     #[test]
     fn container_spec_userns_keep_id_without_options_from_driver_config() {
@@ -2469,7 +2536,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let config = test_config();
+        let config = userns_config();
         let spec = build_container_spec(&sandbox, &config);
 
         let userns = spec.get("userns").expect("userns should be present");
@@ -2494,7 +2561,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let config = test_config();
+        let config = userns_config();
         let spec = build_container_spec(&sandbox, &config);
 
         let userns = spec.get("userns").expect("userns should be present");
@@ -2516,7 +2583,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let config = test_config();
+        let config = userns_config();
         let spec = build_container_spec(&sandbox, &config);
 
         let userns = spec.get("userns").expect("userns should be present");
@@ -2537,7 +2604,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let config = test_config();
+        let config = userns_config();
         let spec = build_container_spec(&sandbox, &config);
 
         let userns = spec.get("userns").expect("userns should be present");
@@ -2563,30 +2630,107 @@ mod tests {
             }),
             ..Default::default()
         });
-        let config = test_config();
+        let config = userns_config();
         let spec = build_container_spec(&sandbox, &config);
 
         assert_eq!(spec["userns"]["nsmode"].as_str(), Some("nomap"));
     }
 
+    // -- validated_userns unit tests --------------------------------------
+
     #[test]
-    fn build_userns_splits_on_first_colon() {
-        // Single colon: left = nsmode, right = value
-        let result = build_userns("keep-id:uid=200,gid=210").unwrap();
+    fn validated_userns_empty_returns_none_regardless_of_gate() {
+        assert!(validated_userns("", false).unwrap().is_none());
+        assert!(validated_userns("   ", false).unwrap().is_none());
+        assert!(validated_userns("", true).unwrap().is_none());
+    }
+
+    #[test]
+    fn validated_userns_splits_on_first_colon() {
+        let result = validated_userns("keep-id:uid=200,gid=210", true)
+            .unwrap()
+            .unwrap();
         assert_eq!(result.nsmode, "keep-id");
         assert_eq!(result.value, "uid=200,gid=210");
     }
 
     #[test]
-    fn build_userns_no_colon_returns_nsmode_only() {
-        let result = build_userns("auto").unwrap();
+    fn validated_userns_no_colon_returns_nsmode_only() {
+        let result = validated_userns("auto", true).unwrap().unwrap();
         assert_eq!(result.nsmode, "auto");
         assert!(result.value.is_empty());
     }
 
+    // -- security gate tests ----------------------------------------------
+
     #[test]
-    fn build_userns_empty_returns_none() {
-        assert!(build_userns("").is_none());
-        assert!(build_userns("   ").is_none());
+    fn validated_userns_gate_blocks_non_empty_mode_when_disabled() {
+        for mode in &["keep-id", "auto", "nomap", "host"] {
+            let err = validated_userns(mode, false).unwrap_err();
+            assert!(
+                err.contains("allow_userns"),
+                "gate error should mention allow_userns, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validated_userns_rejects_host_even_when_gate_open() {
+        let err = validated_userns("host", true).unwrap_err();
+        assert!(
+            err.contains("not permitted"),
+            "host mode should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validated_userns_rejects_ns_mode_even_when_gate_open() {
+        for mode in &["ns:/proc/1/ns/user", "ns:/container:other"] {
+            let err = validated_userns(mode, true).unwrap_err();
+            assert!(
+                err.contains("not permitted"),
+                "ns: mode should be rejected: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validated_userns_rejects_unknown_modes() {
+        let err = validated_userns("private", true).unwrap_err();
+        assert!(err.contains("not permitted"), "got: {err}");
+    }
+
+    #[test]
+    fn validated_userns_rejects_keep_id_with_non_numeric_uid() {
+        let err = validated_userns("keep-id:uid=root,gid=0", true).unwrap_err();
+        assert!(
+            err.contains("non-negative integer"),
+            "non-numeric uid should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validated_userns_rejects_keep_id_with_unknown_option_key() {
+        let err = validated_userns("keep-id:size=100", true).unwrap_err();
+        assert!(
+            err.contains("not recognised"),
+            "unknown option key should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validated_userns_rejects_keep_id_value_without_equals() {
+        let err = validated_userns("keep-id:uid200", true).unwrap_err();
+        assert!(
+            err.contains("key=N"),
+            "malformed option should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validated_userns_accepts_keep_id_uid_only() {
+        let result = validated_userns("keep-id:uid=500", true).unwrap().unwrap();
+        assert_eq!(result.nsmode, "keep-id");
+        assert_eq!(result.value, "uid=500");
     }
 }

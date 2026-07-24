@@ -55,9 +55,12 @@ The restricted agent child does not retain these supervisor privileges.
 The gateway forwards the `podman` block from `--driver-config-json` to this
 driver.
 
-`userns_mode`: optional per-sandbox user namespace mode. Accepts the same
-values as `podman run --userns`, such as `keep-id`,
-`keep-id:uid=998,gid=998`, `auto`, `nomap`, or `host`.
+`userns_mode`: optional per-sandbox user namespace mode. Requires
+`allow_userns = true` in the gateway config (analogous to
+`enable_bind_mounts`). Permitted modes are `keep-id`,
+`keep-id:uid=N,gid=N`, `auto`, and `nomap`. Escape modes (`host`,
+`ns:…`) are rejected unconditionally. For `keep-id`, uid/gid option
+values must be non-negative integers.
 
 The driver also accepts user-supplied `mounts` entries with these Podman mount
 types:
