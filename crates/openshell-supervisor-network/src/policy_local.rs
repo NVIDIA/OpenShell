@@ -1104,6 +1104,7 @@ fn network_endpoint_from_json(
     }
 
     let mut ports = endpoint.ports;
+    ports.retain(|p| *p > 0);
     if ports.is_empty() && endpoint.port > 0 {
         ports.push(endpoint.port);
     }
