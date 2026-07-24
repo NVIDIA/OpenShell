@@ -53,7 +53,10 @@ fn accept_fd_exhaustion_child() {
         rlim_cur: 32,
         rlim_max: 32,
     };
-    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, std::ptr::from_ref(&limit)) },
+        0,
+    );
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap();
@@ -62,12 +65,10 @@ fn accept_fd_exhaustion_child() {
     let backlog_conn = std::net::TcpStream::connect(addr).expect("backlog connect");
 
     // Exhaust remaining FDs.
+    #[allow(clippy::collection_is_never_read)]
     let mut held_fds = Vec::new();
-    loop {
-        match std::fs::File::open("/dev/null") {
-            Ok(f) => held_fds.push(f),
-            Err(_) => break,
-        }
+    while let Ok(f) = std::fs::File::open("/dev/null") {
+        held_fds.push(f);
     }
 
     // accept() should fail with EMFILE: there's a connection in the
@@ -82,23 +83,32 @@ fn accept_fd_exhaustion_child() {
         }
     }
 
-    // Release FDs.
-    held_fds.clear();
+    // Release FDs and close the backlog connection.
+    drop(held_fds);
     drop(backlog_conn);
 
     // Make a fresh connection now that FDs are available.
     let client = std::net::TcpStream::connect(addr).expect("connect after FD release");
 
-    // Retry: accept should now succeed, proving that an accept loop
-    // retrying on EMFILE (like the proxy does) will recover once FDs
-    // are available again.
+    // Accept should succeed, proving that an accept loop retrying on
+    // EMFILE (like the proxy does) will recover once FDs are available.
+    // On Linux the closed backlog connection may still be queued ahead
+    // of the fresh client (EMFILE fires before dequeue), so use a read
+    // timeout to detect and drain it.
     let (accepted, _peer) = listener
         .accept()
         .expect("accept should succeed after FD release");
 
     // Verify the connection is functional.
     (&client).write_all(b"ping").expect("write");
+    accepted
+        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .expect("set timeout");
     let mut buf = [0u8; 4];
-    (&accepted).read_exact(&mut buf).expect("read");
+    if (&accepted).read_exact(&mut buf).is_err() {
+        // Got the stale backlog socket; accept the fresh connection.
+        let (fresh, _) = listener.accept().expect("accept fresh connection");
+        (&fresh).read_exact(&mut buf).expect("read");
+    }
     assert_eq!(&buf, b"ping");
 }
