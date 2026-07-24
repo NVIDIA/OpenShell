@@ -128,9 +128,15 @@ Namespace where Kubernetes Secret-backed provider credentials live.
 
 {{/*
 Name of the Secret holding the default credential storage key-encryption key.
+When server.credentialStorage.existingSecret is set, returns that name instead
+of the chart-generated name (for GitOps / helm-template workflows).
 */}}
 {{- define "openshell.credentialStorageKeyEncryptionKeySecretName" -}}
+{{- if .Values.server.credentialStorage.existingSecret -}}
+{{- .Values.server.credentialStorage.existingSecret -}}
+{{- else -}}
 {{- printf "%s-credential-storage-key-encryption-key" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
 {{- end }}
 
 {{/*

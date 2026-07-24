@@ -260,8 +260,7 @@ impl DbCredstoreCredentialDriver {
         &self,
         requests: Vec<ResolveCredentialRequest>,
     ) -> Result<Vec<ResolvedCredential>, Status> {
-        let mut responses = Vec::with_capacity(requests.len());
-        for request in requests {
+        let futures = requests.into_iter().map(|request| async move {
             let handle = EncryptedGatewayCredentialStoreCrypto::handle_from_request(
                 &request.request_id,
                 request.handle,
@@ -286,14 +285,13 @@ impl DbCredstoreCredentialDriver {
                 )?,
             )?;
             let value = self.crypto.decrypt_envelope(&envelope)?;
-            responses.push(ResolvedCredential {
+            Ok::<_, Status>(ResolvedCredential {
                 request_id: request.request_id,
                 value,
                 expires_at_ms: 0,
-            });
-        }
-
-        Ok(responses)
+            })
+        });
+        futures::future::try_join_all(futures).await
     }
 
     async fn write_envelope(

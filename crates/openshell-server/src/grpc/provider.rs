@@ -795,6 +795,11 @@ async fn finish_provider_credential_update(
     Ok(())
 }
 
+// TODO(credential-drivers): A gateway crash between CAS success and
+// finish_provider_credential_update leaves replaced/removed credential handles
+// orphaned in the backing store. This best-effort cleanup only covers pre-CAS
+// failures. A background reconciliation loop should be added to detect and
+// reclaim orphaned handles.
 async fn cleanup_pre_stored_provider_credentials(
     credentials: Option<&crate::credentials::CredentialRuntime>,
     provider_name: &str,

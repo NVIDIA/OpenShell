@@ -4,7 +4,8 @@
 //! Credential driver backed by a Vault-compatible HTTP API.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use openshell_core::VERSION;
 use openshell_core::proto::CredentialHandle;
@@ -33,6 +34,12 @@ const STORED_VALUE_KEY: &str = "value";
 pub struct VaultCredentialDriver {
     client: reqwest::Client,
     settings: VaultDriverSettings,
+    cached_token: Arc<tokio::sync::RwLock<Option<CachedVaultToken>>>,
+}
+
+struct CachedVaultToken {
+    token: String,
+    valid_until: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +115,8 @@ struct KubernetesLoginResponse {
 #[derive(Debug, Deserialize)]
 struct KubernetesLoginAuth {
     client_token: String,
+    #[serde(default)]
+    lease_duration: u64,
 }
 
 impl VaultCredentialDriver {
@@ -124,7 +133,11 @@ impl VaultCredentialDriver {
                     "failed to configure vault credential driver: {err}"
                 ))
             })?;
-        Ok(Self { client, settings })
+        Ok(Self {
+            client,
+            settings,
+            cached_token: Arc::new(tokio::sync::RwLock::new(None)),
+        })
     }
 
     pub async fn store_credential(
@@ -182,7 +195,6 @@ impl VaultCredentialDriver {
         &self,
         requests: Vec<ResolveCredentialRequest>,
     ) -> Result<Vec<ResolvedCredential>, Status> {
-        let mut responses = Vec::with_capacity(requests.len());
         let mut resolved_requests = Vec::with_capacity(requests.len());
         for request in requests {
             let handle = Self::handle_from_request(&request.request_id, request.handle)?;
@@ -205,15 +217,20 @@ impl VaultCredentialDriver {
         }
 
         let token = self.auth_token().await?;
-        for (request_id, reference) in resolved_requests {
-            let value = self.resolve_secret_value(&reference, &token).await?;
-            responses.push(ResolvedCredential {
-                request_id,
-                value,
-                expires_at_ms: 0,
+        let futures = resolved_requests
+            .into_iter()
+            .map(|(request_id, reference)| {
+                let token = token.clone();
+                async move {
+                    let value = self.resolve_secret_value(&reference, &token).await?;
+                    Ok::<_, Status>(ResolvedCredential {
+                        request_id,
+                        value,
+                        expires_at_ms: 0,
+                    })
+                }
             });
-        }
-        Ok(responses)
+        futures::future::try_join_all(futures).await
     }
 
     fn handle_from_request(
@@ -246,12 +263,29 @@ impl VaultCredentialDriver {
                 auth_mount,
                 service_account_token_path,
             } => {
+                {
+                    let cache = self.cached_token.read().await;
+                    if let Some(cached) = cache.as_ref()
+                        && Instant::now() < cached.valid_until
+                    {
+                        return Ok(cached.token.clone());
+                    }
+                }
                 let jwt = read_secret_file(
                     service_account_token_path,
                     "Kubernetes service account token",
                 )
                 .await?;
-                self.login_kubernetes(role, auth_mount, &jwt).await
+                let (token, lease_duration) = self.login_kubernetes(role, auth_mount, &jwt).await?;
+                if lease_duration > Duration::ZERO {
+                    let ttl = lease_duration.mul_f64(0.8);
+                    let mut cache = self.cached_token.write().await;
+                    *cache = Some(CachedVaultToken {
+                        token: token.clone(),
+                        valid_until: Instant::now() + ttl,
+                    });
+                }
+                Ok(token)
             }
         }
     }
@@ -261,7 +295,7 @@ impl VaultCredentialDriver {
         role: &str,
         auth_mount: &str,
         jwt: &str,
-    ) -> Result<String, Status> {
+    ) -> Result<(String, Duration), Status> {
         let path = format!("auth/{auth_mount}/login");
         let url = self.url_for_path(&path)?;
         let response = self
@@ -284,18 +318,17 @@ impl VaultCredentialDriver {
             .map_err(|_| {
                 Status::failed_precondition("Vault Kubernetes auth returned invalid JSON")
             })?;
-        let token = body
+        let (token, lease_duration) = body
             .auth
-            .map(|auth| auth.client_token)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+            .map(|auth| (auth.client_token, auth.lease_duration))
+            .unwrap_or_default();
+        let token = token.trim().to_string();
         if token.is_empty() {
             return Err(Status::failed_precondition(
                 "Vault Kubernetes auth returned an empty client token",
             ));
         }
-        Ok(token)
+        Ok((token, Duration::from_secs(lease_duration)))
     }
 
     async fn resolve_secret_value(
@@ -404,6 +437,7 @@ impl Clone for VaultCredentialDriver {
         Self {
             client: self.client.clone(),
             settings: self.settings.clone(),
+            cached_token: self.cached_token.clone(),
         }
     }
 }

@@ -90,7 +90,7 @@ impl KubernetesSecretsCredentialDriver {
         })
     }
 
-    fn resolve_handle(
+    fn parse_handle(
         handle: &CredentialHandle,
         credential_key: &str,
     ) -> Result<KubernetesSecretReference, Status> {
@@ -126,13 +126,32 @@ impl KubernetesSecretsCredentialDriver {
         })
     }
 
+    fn resolve_handle(
+        &self,
+        handle: &CredentialHandle,
+        credential_key: &str,
+    ) -> Result<KubernetesSecretReference, Status> {
+        let reference = Self::parse_handle(handle, credential_key)?;
+        if reference.namespace != self.settings.namespace
+            && !self.settings.allow_reference_namespace
+        {
+            return Err(Status::permission_denied(format!(
+                "kubernetes-secrets credential handle references namespace '{}' but the driver is \
+                 configured for namespace '{}'; set allow_reference_namespace = true to allow \
+                 cross-namespace references",
+                reference.namespace, self.settings.namespace
+            )));
+        }
+        Ok(reference)
+    }
+
     pub async fn store_credential(
         &self,
         request: StoreCredentialRequest,
     ) -> Result<CredentialHandle, Status> {
         let owner_id = credential_owner_id(&request.provider_name, &request.credential_key);
         let reference = if let Some(existing_handle) = request.existing_handle.as_ref() {
-            let reference = Self::resolve_handle(existing_handle, &request.credential_key)?;
+            let reference = self.resolve_handle(existing_handle, &request.credential_key)?;
             validate_expected_secret_name(
                 &request.provider_name,
                 &request.credential_key,
@@ -171,7 +190,7 @@ impl KubernetesSecretsCredentialDriver {
 
     pub async fn delete_credential(&self, request: DeleteCredentialRequest) -> Result<(), Status> {
         let handle = Self::handle_from_request("delete", request.handle)?;
-        let reference = Self::resolve_handle(&handle, &request.credential_key)?;
+        let reference = self.resolve_handle(&handle, &request.credential_key)?;
         validate_expected_secret_name(
             &request.provider_name,
             &request.credential_key,
@@ -214,10 +233,9 @@ impl KubernetesSecretsCredentialDriver {
         &self,
         requests: Vec<ResolveCredentialRequest>,
     ) -> Result<Vec<ResolvedCredential>, Status> {
-        let mut responses = Vec::with_capacity(requests.len());
-        for request in requests {
+        let futures = requests.into_iter().map(|request| async move {
             let handle = Self::handle_from_request(&request.request_id, request.handle)?;
-            let reference = Self::resolve_handle(&handle, &request.credential_key)?;
+            let reference = self.resolve_handle(&handle, &request.credential_key)?;
             validate_expected_secret_name(
                 &request.provider_name,
                 &request.credential_key,
@@ -225,13 +243,13 @@ impl KubernetesSecretsCredentialDriver {
             )?;
             let owner_id = credential_owner_id(&request.provider_name, &request.credential_key);
             let value = self.resolve_secret_value(&reference, &owner_id).await?;
-            responses.push(ResolvedCredential {
+            Ok::<_, Status>(ResolvedCredential {
                 request_id: request.request_id,
                 value,
                 expires_at_ms: 0,
-            });
-        }
-        Ok(responses)
+            })
+        });
+        futures::future::try_join_all(futures).await
     }
 
     async fn create_secret_value(
@@ -636,7 +654,7 @@ mod tests {
 
     #[test]
     fn handle_resolves_secret_reference() {
-        let reference = KubernetesSecretsCredentialDriver::resolve_handle(
+        let reference = KubernetesSecretsCredentialDriver::parse_handle(
             &handle("v1:openshell:provider-secret"),
             "API_KEY",
         )
@@ -649,11 +667,9 @@ mod tests {
 
     #[test]
     fn handle_rejects_malformed_value() {
-        let err = KubernetesSecretsCredentialDriver::resolve_handle(
-            &handle("provider-secret"),
-            "API_KEY",
-        )
-        .unwrap_err();
+        let err =
+            KubernetesSecretsCredentialDriver::parse_handle(&handle("provider-secret"), "API_KEY")
+                .unwrap_err();
 
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("malformed"));
@@ -661,7 +677,7 @@ mod tests {
 
     #[test]
     fn handle_rejects_invalid_namespace() {
-        let err = KubernetesSecretsCredentialDriver::resolve_handle(
+        let err = KubernetesSecretsCredentialDriver::parse_handle(
             &handle("v1:OpenShell:provider-secret"),
             "API_KEY",
         )
@@ -673,7 +689,7 @@ mod tests {
 
     #[test]
     fn handle_rejects_invalid_secret_name() {
-        let err = KubernetesSecretsCredentialDriver::resolve_handle(
+        let err = KubernetesSecretsCredentialDriver::parse_handle(
             &handle("v1:openshell:ProviderSecret"),
             "API_KEY",
         )
@@ -685,7 +701,7 @@ mod tests {
 
     #[test]
     fn handle_rejects_invalid_credential_key() {
-        let err = KubernetesSecretsCredentialDriver::resolve_handle(
+        let err = KubernetesSecretsCredentialDriver::parse_handle(
             &handle("v1:openshell:provider-secret"),
             "api/key",
         )
@@ -693,6 +709,61 @@ mod tests {
 
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("data key"));
+    }
+
+    #[test]
+    fn handle_rejects_cross_namespace_when_not_allowed() {
+        let settings = KubernetesSecretsDriverSettings {
+            namespace: "openshell".to_string(),
+            allow_reference_namespace: false,
+        };
+        let reference = KubernetesSecretsCredentialDriver::parse_handle(
+            &handle("v1:other-namespace:provider-secret"),
+            "API_KEY",
+        )
+        .unwrap();
+
+        assert_eq!(reference.namespace, "other-namespace");
+
+        let result =
+            if reference.namespace != settings.namespace && !settings.allow_reference_namespace {
+                Err(Status::permission_denied("cross-namespace"))
+            } else {
+                Ok(reference)
+            };
+        assert_eq!(result.unwrap_err().code(), Code::PermissionDenied);
+    }
+
+    #[test]
+    fn handle_allows_cross_namespace_when_configured() {
+        let settings = KubernetesSecretsDriverSettings {
+            namespace: "openshell".to_string(),
+            allow_reference_namespace: true,
+        };
+        let reference = KubernetesSecretsCredentialDriver::parse_handle(
+            &handle("v1:other-namespace:provider-secret"),
+            "API_KEY",
+        )
+        .unwrap();
+
+        let result =
+            if reference.namespace != settings.namespace && !settings.allow_reference_namespace {
+                Err(Status::permission_denied("cross-namespace"))
+            } else {
+                Ok(reference)
+            };
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn handle_allows_same_namespace() {
+        let reference = KubernetesSecretsCredentialDriver::parse_handle(
+            &handle("v1:openshell:provider-secret"),
+            "API_KEY",
+        )
+        .unwrap();
+
+        assert_eq!(reference.namespace, "openshell");
     }
 
     #[test]
