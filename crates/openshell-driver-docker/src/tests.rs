@@ -2288,3 +2288,17 @@ fn container_state_needs_resume_matches_startable_states() {
         );
     }
 }
+
+#[test]
+fn parse_cpu_limit_rejects_overflow() {
+    let err = parse_cpu_limit("1e300").unwrap_err();
+    assert!(err.message().contains("too large"));
+}
+
+#[test]
+fn parse_memory_limit_rejects_overflow() {
+    // 308 nines is finite as f64 (~1e308), but multiplying by Gi overflows to inf.
+    let huge = "9".repeat(308) + "Gi";
+    let err = parse_memory_limit(&huge).unwrap_err();
+    assert!(err.message().contains("too large"));
+}
