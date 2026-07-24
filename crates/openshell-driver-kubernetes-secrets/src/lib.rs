@@ -90,6 +90,22 @@ impl KubernetesSecretsCredentialDriver {
         })
     }
 
+    fn validate_handle_namespace(
+        &self,
+        reference: &KubernetesSecretReference,
+    ) -> Result<(), Status> {
+        if !self.settings.allow_reference_namespace
+            && reference.namespace != self.settings.namespace
+        {
+            return Err(Status::permission_denied(format!(
+                "credential handle references namespace '{}' but \
+                 allow_reference_namespace is disabled (configured namespace: '{}')",
+                reference.namespace, self.settings.namespace
+            )));
+        }
+        Ok(())
+    }
+
     fn resolve_handle(
         handle: &CredentialHandle,
         credential_key: &str,
@@ -138,6 +154,7 @@ impl KubernetesSecretsCredentialDriver {
                 &request.credential_key,
                 &reference.secret_name,
             )?;
+            self.validate_handle_namespace(&reference)?;
             reference
         } else {
             KubernetesSecretReference {
@@ -177,6 +194,7 @@ impl KubernetesSecretsCredentialDriver {
             &request.credential_key,
             &reference.secret_name,
         )?;
+        self.validate_handle_namespace(&reference)?;
         let owner_id = credential_owner_id(&request.provider_name, &request.credential_key);
         let api: Api<Secret> = Api::namespaced(self.client.clone(), &reference.namespace);
         let secret = match api.get(&reference.secret_name).await {
@@ -223,6 +241,7 @@ impl KubernetesSecretsCredentialDriver {
                 &request.credential_key,
                 &reference.secret_name,
             )?;
+            self.validate_handle_namespace(&reference)?;
             let owner_id = credential_owner_id(&request.provider_name, &request.credential_key);
             let value = self.resolve_secret_value(&reference, &owner_id).await?;
             responses.push(ResolvedCredential {
