@@ -736,7 +736,8 @@ pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
             ));
         }
     };
-    Ok(num * multiplier)
+    num.checked_mul(multiplier)
+        .ok_or_else(|| miette::miette!("duration value is too large: {s}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -974,5 +975,11 @@ mod tests {
 
         let err = parse_duration_to_ms("\u{20ac}").expect_err("missing number should error");
         assert!(err.to_string().contains("invalid duration"));
+    }
+
+    #[test]
+    fn parse_duration_to_ms_rejects_overflow() {
+        let err = parse_duration_to_ms("100000000000000h").expect_err("overflow should error");
+        assert!(err.to_string().contains("too large"));
     }
 }
