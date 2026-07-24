@@ -1074,7 +1074,9 @@ pub fn build_container_spec_for_image(
                     openshell_core::config::DEFAULT_SSH_PORT
                 ),
             ],
-            interval: config.health_check_interval_secs * 1_000_000_000,
+            interval: config
+                .health_check_interval_secs
+                .saturating_mul(1_000_000_000),
             timeout: 2_000_000_000,
             retries: 10,
             start_period: 5_000_000_000,
