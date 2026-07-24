@@ -1213,8 +1213,13 @@ fn parse_cpu_to_microseconds(quantity: &str) -> Option<u64> {
         if cores <= 0.0 || cores.is_nan() || cores.is_infinite() {
             return None;
         }
+        let micros_f = cores * 100_000.0;
+        #[allow(clippy::cast_precision_loss)]
+        if !micros_f.is_finite() || micros_f > u64::MAX as f64 {
+            return None;
+        }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let val = (cores * 100_000.0) as u64;
+        let val = micros_f as u64;
         val
     };
     // A quota of 0 microseconds is invalid — treat as no limit.
@@ -1287,6 +1292,12 @@ mod tests {
         assert_eq!(parse_cpu_to_microseconds("1"), Some(100_000));
         assert_eq!(parse_cpu_to_microseconds("2"), Some(200_000));
         assert_eq!(parse_cpu_to_microseconds("0.5"), Some(50_000));
+    }
+
+    #[test]
+    fn parse_cpu_huge_value_returns_none_instead_of_overflow() {
+        // A finite f64 whose product with 100_000 overflows to infinity.
+        assert_eq!(parse_cpu_to_microseconds("1e300"), None);
     }
 
     #[test]
