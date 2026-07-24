@@ -516,34 +516,42 @@ async fn apply_minted_credential(
     credential_key: &str,
     minted: &MintedCredential,
 ) -> Result<(), Status> {
+    let use_driver =
+        credentials.is_some_and(crate::credentials::CredentialRuntime::stores_provider_credentials);
+
     let mut updated = provider.clone();
-    let stored_handle = if let Some(credentials) = credentials
-        && credentials.stores_provider_credentials()
-    {
+
+    let all_stored_handles = if use_driver {
+        let credentials = credentials.unwrap();
+        let mut values_to_store =
+            HashMap::from([(credential_key.to_string(), minted.access_token.clone())]);
+        for (key, value) in &minted.additional_credentials {
+            values_to_store.insert(key.clone(), value.clone());
+        }
         let stored = credentials
             .store_provider_credentials(
                 provider.object_name(),
-                &HashMap::from([(credential_key.to_string(), minted.access_token.clone())]),
+                &values_to_store,
                 &provider.credential_handles,
             )
             .await?;
-        let handle = stored.get(credential_key).cloned().ok_or_else(|| {
-            Status::internal("credential driver did not return refreshed credential handle")
-        })?;
-        updated.credentials.remove(credential_key);
-        updated
-            .credential_handles
-            .insert(credential_key.to_string(), handle.clone());
-        Some(handle)
+        for (key, handle) in &stored {
+            updated.credentials.remove(key);
+            updated
+                .credential_handles
+                .insert(key.clone(), handle.clone());
+        }
+        stored
     } else {
         updated
             .credentials
             .insert(credential_key.to_string(), minted.access_token.clone());
-        None
+        for (key, value) in &minted.additional_credentials {
+            updated.credentials.insert(key.clone(), value.clone());
+        }
+        HashMap::new()
     };
-    for (key, value) in &minted.additional_credentials {
-        updated.credentials.insert(key.clone(), value.clone());
-    }
+
     if minted.expires_at_ms > 0 {
         updated
             .credential_expires_at_ms
@@ -563,20 +571,22 @@ async fn apply_minted_credential(
         store, workspace, &updated,
     )
     .await?;
-    store
+    let cas_result = store
         .update_message_cas::<Provider, _>(provider.object_id(), 0, |current| {
-            if let Some(handle) = stored_handle.clone() {
-                current.credentials.remove(credential_key);
-                current
-                    .credential_handles
-                    .insert(credential_key.to_string(), handle);
+            if use_driver {
+                for (key, handle) in &all_stored_handles {
+                    current.credentials.remove(key);
+                    current
+                        .credential_handles
+                        .insert(key.clone(), handle.clone());
+                }
             } else {
                 current
                     .credentials
                     .insert(credential_key.to_string(), minted.access_token.clone());
-            }
-            for (key, value) in &minted.additional_credentials {
-                current.credentials.insert(key.clone(), value.clone());
+                for (key, value) in &minted.additional_credentials {
+                    current.credentials.insert(key.clone(), value.clone());
+                }
             }
             if minted.expires_at_ms > 0 {
                 current
@@ -594,9 +604,34 @@ async fn apply_minted_credential(
                 }
             }
         })
-        .await
-        .map(|_| ())
-        .map_err(|e| Status::internal(format!("persist refreshed provider credential failed: {e}")))
+        .await;
+
+    match cas_result {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if let Some(credentials) = credentials
+                && !all_stored_handles.is_empty()
+                && let Err(cleanup_err) = credentials
+                    .delete_provider_credential_handles(provider.object_name(), &all_stored_handles)
+                    .await
+            {
+                let orphaned: Vec<_> = all_stored_handles
+                    .iter()
+                    .map(|(k, h)| format!("{}={}:{}", k, h.driver, h.handle))
+                    .collect();
+                tracing::warn!(
+                    provider = %provider.object_name(),
+                    orphaned_handles = ?orphaned,
+                    error = %cleanup_err,
+                    "failed to clean up stored credential handles after CAS failure; \
+                     handles may be orphaned and require manual deletion"
+                );
+            }
+            Err(Status::internal(format!(
+                "persist refreshed provider credential failed: {e}"
+            )))
+        }
+    }
 }
 
 /// Reject minting for strategies that require `providers_v2_enabled` when the
