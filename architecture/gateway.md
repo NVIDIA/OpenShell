@@ -272,9 +272,14 @@ default WAL journal mode), which mirror the same sensitive contents.
 Persisted state includes sandboxes, providers, provider credential refresh
 state, SSH sessions, policy revisions, settings, inference configuration, and
 deployment records. Provider refresh material is stored as a separate object
-scoped to the provider instance through `objects.scope`; the provider record
-keeps only the current injectable credential values and optional per-credential
-expiry timestamps. A refresh normally mints one credential, but a strategy may
+scoped to the provider instance through `objects.scope`. Provider records keep
+inline credential values only for legacy records created before credential
+driver storage. New provider writes keep driver-owned credential handles and
+optional per-credential expiry timestamps. When no external credential driver
+is configured, gateways use server-owned encrypted database credential storage
+for defense in depth. Multi-replica deployments can use that default with a
+shared database and shared key-encryption key, or opt into an external backend such as Vault
+or Kubernetes Secrets. A refresh normally mints one credential, but a strategy may
 co-mint several (AWS STS mints the access key, secret key, and session token in
 one call); the refresh state pins the resolved set of env keys it owns so
 collision checks reserve all of them before the first mint.
