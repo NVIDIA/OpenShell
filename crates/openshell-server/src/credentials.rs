@@ -208,43 +208,47 @@ impl CredentialRuntime {
         }
         let driver_name = self.registry.storage_owner_name();
         let driver = self.connected_driver(&driver_name)?;
-        let mut handles = HashMap::with_capacity(credentials.len());
 
-        for (credential_key, value) in credentials {
-            let existing_handle = existing_handles
-                .get(credential_key)
-                .filter(|handle| normalize_driver_name(&handle.driver) == driver_name)
-                .cloned();
-            let replaced_handle = existing_handles
-                .get(credential_key)
-                .filter(|handle| normalize_driver_name(&handle.driver) != driver_name)
-                .cloned();
-            let mut handle = driver
-                .store_credential(StoreCredentialRequest {
-                    provider_name: provider_name.to_string(),
-                    credential_key: credential_key.clone(),
-                    value: value.clone(),
-                    existing_handle,
-                })
-                .await?;
-            handle.driver.clone_from(&driver_name);
-            if handle.handle.trim().is_empty() {
-                return Err(Status::internal(format!(
-                    "credential driver '{driver_name}' returned an empty handle for provider credential '{credential_key}'"
-                )));
+        let futures = credentials.iter().map(|(credential_key, value)| {
+            let driver_name = driver_name.clone();
+            let driver = driver.clone();
+            async move {
+                let existing_handle = existing_handles
+                    .get(credential_key)
+                    .filter(|handle| normalize_driver_name(&handle.driver) == driver_name)
+                    .cloned();
+                let replaced_handle = existing_handles
+                    .get(credential_key)
+                    .filter(|handle| normalize_driver_name(&handle.driver) != driver_name)
+                    .cloned();
+                let mut handle = driver
+                    .store_credential(StoreCredentialRequest {
+                        provider_name: provider_name.to_string(),
+                        credential_key: credential_key.clone(),
+                        value: value.clone(),
+                        existing_handle,
+                    })
+                    .await?;
+                handle.driver.clone_from(&driver_name);
+                if handle.handle.trim().is_empty() {
+                    return Err(Status::internal(format!(
+                        "credential driver '{driver_name}' returned an empty handle for provider credential '{credential_key}'"
+                    )));
+                }
+                if let Some(replaced_handle) = replaced_handle {
+                    self.delete_provider_credential_handle(
+                        provider_name,
+                        credential_key,
+                        replaced_handle,
+                    )
+                    .await?;
+                }
+                Ok::<_, Status>((credential_key.clone(), handle))
             }
-            if let Some(replaced_handle) = replaced_handle {
-                self.delete_provider_credential_handle(
-                    provider_name,
-                    credential_key,
-                    replaced_handle,
-                )
-                .await?;
-            }
-            handles.insert(credential_key.clone(), handle);
-        }
-
-        Ok(handles)
+        });
+        let results: Vec<(String, CredentialHandle)> =
+            futures::future::try_join_all(futures).await?;
+        Ok(results.into_iter().collect())
     }
 
     pub async fn delete_provider_credential_handles(
@@ -252,10 +256,10 @@ impl CredentialRuntime {
         provider_name: &str,
         handles: &HashMap<String, CredentialHandle>,
     ) -> Result<(), Status> {
-        for (credential_key, handle) in handles {
+        let futures = handles.iter().map(|(credential_key, handle)| {
             self.delete_provider_credential_handle(provider_name, credential_key, handle.clone())
-                .await?;
-        }
+        });
+        futures::future::try_join_all(futures).await?;
         Ok(())
     }
 

@@ -34,7 +34,7 @@ const STORED_VALUE_KEY: &str = "value";
 pub struct VaultCredentialDriver {
     client: reqwest::Client,
     settings: VaultDriverSettings,
-    cached_token: Arc<tokio::sync::RwLock<Option<CachedVaultToken>>>,
+    cached_token: Arc<tokio::sync::Mutex<Option<CachedVaultToken>>>,
 }
 
 struct CachedVaultToken {
@@ -136,7 +136,7 @@ impl VaultCredentialDriver {
         Ok(Self {
             client,
             settings,
-            cached_token: Arc::new(tokio::sync::RwLock::new(None)),
+            cached_token: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -263,13 +263,11 @@ impl VaultCredentialDriver {
                 auth_mount,
                 service_account_token_path,
             } => {
+                let mut cache = self.cached_token.lock().await;
+                if let Some(cached) = cache.as_ref()
+                    && Instant::now() < cached.valid_until
                 {
-                    let cache = self.cached_token.read().await;
-                    if let Some(cached) = cache.as_ref()
-                        && Instant::now() < cached.valid_until
-                    {
-                        return Ok(cached.token.clone());
-                    }
+                    return Ok(cached.token.clone());
                 }
                 let jwt = read_secret_file(
                     service_account_token_path,
@@ -279,7 +277,6 @@ impl VaultCredentialDriver {
                 let (token, lease_duration) = self.login_kubernetes(role, auth_mount, &jwt).await?;
                 if lease_duration > Duration::ZERO {
                     let ttl = lease_duration.mul_f64(0.8);
-                    let mut cache = self.cached_token.write().await;
                     *cache = Some(CachedVaultToken {
                         token: token.clone(),
                         valid_until: Instant::now() + ttl,

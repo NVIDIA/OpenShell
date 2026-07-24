@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Api, Client};
 use openshell_core::VERSION;
 use openshell_core::proto::CredentialHandle;
@@ -28,6 +28,7 @@ const HANDLE_VERSION: &str = "v1";
 const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 const MANAGED_BY_VALUE: &str = "openshell";
 const OWNER_ANNOTATION: &str = "openshell.nvidia.com/provider-credential-id";
+const CONFLICT_RETRY_LIMIT: u32 = 3;
 
 pub struct KubernetesSecretsCredentialDriver {
     client: Client,
@@ -198,35 +199,49 @@ impl KubernetesSecretsCredentialDriver {
         )?;
         let owner_id = credential_owner_id(&request.provider_name, &request.credential_key);
         let api: Api<Secret> = Api::namespaced(self.client.clone(), &reference.namespace);
-        let secret = match api.get(&reference.secret_name).await {
-            Ok(secret) => secret,
-            Err(kube::Error::Api(api_err)) if api_err.code == 404 => return Ok(()),
-            Err(err) => {
-                return Err(kube_error_to_status(
-                    &reference.namespace,
-                    &reference.secret_name,
-                    err,
-                ));
+        for attempt in 0..CONFLICT_RETRY_LIMIT {
+            let secret = match api.get(&reference.secret_name).await {
+                Ok(secret) => secret,
+                Err(kube::Error::Api(api_err)) if api_err.code == 404 => return Ok(()),
+                Err(err) => {
+                    return Err(kube_error_to_status(
+                        &reference.namespace,
+                        &reference.secret_name,
+                        err,
+                    ));
+                }
+            };
+            ensure_secret_is_managed_for(&secret, &reference, &owner_id)?;
+            let delete_params = DeleteParams {
+                preconditions: Some(Preconditions {
+                    uid: secret.metadata.uid.clone(),
+                    resource_version: secret.metadata.resource_version.clone(),
+                }),
+                ..Default::default()
+            };
+            match api.delete(&reference.secret_name, &delete_params).await {
+                Ok(_) => return Ok(()),
+                Err(kube::Error::Api(api_err)) if api_err.code == 404 => return Ok(()),
+                Err(kube::Error::Api(api_err))
+                    if api_err.code == 409 && attempt + 1 < CONFLICT_RETRY_LIMIT => {}
+                Err(kube::Error::Api(api_err)) if api_err.code == 403 => {
+                    return Err(Status::permission_denied(format!(
+                        "gateway is not allowed to delete Kubernetes Secret '{}' in namespace '{}'",
+                        reference.secret_name, reference.namespace
+                    )));
+                }
+                Err(err) => {
+                    return Err(Status::unavailable(format!(
+                        "failed to delete Kubernetes Secret '{}' in namespace '{}': {err}",
+                        reference.secret_name, reference.namespace
+                    )));
+                }
             }
-        };
-        ensure_secret_is_managed_for(&secret, &reference, &owner_id)?;
-        match api
-            .delete(&reference.secret_name, &DeleteParams::default())
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(kube::Error::Api(api_err)) if api_err.code == 404 => Ok(()),
-            Err(kube::Error::Api(api_err)) if api_err.code == 403 => {
-                Err(Status::permission_denied(format!(
-                    "gateway is not allowed to delete Kubernetes Secret '{}' in namespace '{}'",
-                    reference.secret_name, reference.namespace
-                )))
-            }
-            Err(err) => Err(Status::unavailable(format!(
-                "failed to delete Kubernetes Secret '{}' in namespace '{}': {err}",
-                reference.secret_name, reference.namespace
-            ))),
         }
+        Err(Status::aborted(format!(
+            "Kubernetes Secret '{}' in namespace '{}' was modified concurrently; exceeded retry limit",
+            reference.secret_name, reference.namespace
+        )))
     }
 
     pub async fn resolve_credentials(
@@ -283,32 +298,48 @@ impl KubernetesSecretsCredentialDriver {
         value: &str,
     ) -> Result<(), Status> {
         let api: Api<Secret> = Api::namespaced(self.client.clone(), &reference.namespace);
-        let secret = match api.get(&reference.secret_name).await {
-            Ok(secret) => secret,
-            Err(kube::Error::Api(api_err)) if api_err.code == 404 => {
-                return self.create_secret_value(reference, owner_id, value).await;
-            }
-            Err(err) => {
-                return Err(kube_error_to_status(
-                    &reference.namespace,
-                    &reference.secret_name,
-                    err,
-                ));
-            }
-        };
-        ensure_secret_is_managed_for(&secret, reference, owner_id)?;
+        for attempt in 0..CONFLICT_RETRY_LIMIT {
+            let secret = match api.get(&reference.secret_name).await {
+                Ok(secret) => secret,
+                Err(kube::Error::Api(api_err)) if api_err.code == 404 => {
+                    return self.create_secret_value(reference, owner_id, value).await;
+                }
+                Err(err) => {
+                    return Err(kube_error_to_status(
+                        &reference.namespace,
+                        &reference.secret_name,
+                        err,
+                    ));
+                }
+            };
+            ensure_secret_is_managed_for(&secret, reference, owner_id)?;
 
-        let patch = managed_secret(&reference.secret_name, &reference.key, owner_id, value);
-        api.patch(
-            &reference.secret_name,
-            &PatchParams::default(),
-            &Patch::Merge(&patch),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            kube_write_error_to_status(&reference.namespace, &reference.secret_name, err)
-        })
+            let mut patch = managed_secret(&reference.secret_name, &reference.key, owner_id, value);
+            patch.metadata.resource_version = secret.metadata.resource_version.clone();
+            match api
+                .patch(
+                    &reference.secret_name,
+                    &PatchParams::default(),
+                    &Patch::Merge(&patch),
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(kube::Error::Api(api_err))
+                    if api_err.code == 409 && attempt + 1 < CONFLICT_RETRY_LIMIT => {}
+                Err(err) => {
+                    return Err(kube_write_error_to_status(
+                        &reference.namespace,
+                        &reference.secret_name,
+                        err,
+                    ));
+                }
+            }
+        }
+        Err(Status::aborted(format!(
+            "Kubernetes Secret '{}' in namespace '{}' was modified concurrently; exceeded retry limit",
+            reference.secret_name, reference.namespace
+        )))
     }
 
     async fn resolve_secret_value(
