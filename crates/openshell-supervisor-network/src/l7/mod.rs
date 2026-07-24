@@ -962,6 +962,11 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
         };
 
         for (i, ep) in endpoints.iter().enumerate() {
+            let loc = format!("{name}.endpoints[{i}]");
+            if !ep.is_object() {
+                errors.push(format!("{loc}: endpoint entry must be an object"));
+                continue;
+            }
             let protocol = ep.get("protocol").and_then(|v| v.as_str()).unwrap_or("");
             let l7_protocol = L7Protocol::parse(protocol);
             let jsonrpc_family = l7_protocol.is_some_and(L7Protocol::is_jsonrpc_family);
@@ -986,9 +991,13 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                         .into_iter()
                         .collect()
                 },
-                |arr| arr.iter().filter_map(serde_json::Value::as_u64).collect(),
+                |arr| {
+                    arr.iter()
+                        .filter_map(serde_json::Value::as_u64)
+                        .filter(|p| *p > 0)
+                        .collect()
+                },
             );
-            let loc = format!("{name}.endpoints[{i}]");
 
             if protocol == "mcp" {
                 if host.trim().is_empty() {
@@ -1557,7 +1566,13 @@ pub fn expand_access_presets(data: &mut serde_json::Value) -> Vec<String> {
                 && !has_rules
                 && mcp_allow_all_known_mcp_methods
             {
-                ep.as_object_mut().unwrap().insert(
+                let Some(obj) = ep.as_object_mut() else {
+                    warnings.push(format!(
+                        "{name}.endpoints[{i}]: endpoint entry is not an object; skipping access preset expansion"
+                    ));
+                    continue;
+                };
+                obj.insert(
                     "rules".to_string(),
                     serde_json::Value::Array(vec![jsonrpc_rule_json("*")]),
                 );
@@ -1582,9 +1597,13 @@ pub fn expand_access_presets(data: &mut serde_json::Value) -> Vec<String> {
                 continue;
             };
 
-            ep.as_object_mut()
-                .unwrap()
-                .insert("rules".to_string(), serde_json::Value::Array(rules));
+            if let Some(obj) = ep.as_object_mut() {
+                obj.insert("rules".to_string(), serde_json::Value::Array(rules));
+            } else {
+                warnings.push(format!(
+                    "{name}.endpoints[{i}]: endpoint entry is not an object; skipping access preset expansion"
+                ));
+            }
         }
     }
 
