@@ -121,7 +121,7 @@ impl ReconcilerLease {
     pub async fn try_steal_expired(&self) -> Result<LeaseGuard, LeaseError> {
         let record = self.read().await?.ok_or(LeaseError::NotFound)?;
 
-        let age_ms = now_ms() - record.updated_at_ms;
+        let age_ms = now_ms().saturating_sub(record.updated_at_ms);
         let ttl_ms = i64::try_from(self.ttl.as_millis()).unwrap_or(i64::MAX);
         if age_ms < ttl_ms {
             return Err(LeaseError::AlreadyHeld);
