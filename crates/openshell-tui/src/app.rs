@@ -248,8 +248,9 @@ pub type CreateFormData = (
 );
 
 /// Which field is focused in the create sandbox modal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CreateFormField {
+    #[default]
     Name,
     Image,
     Command,
@@ -291,9 +292,10 @@ pub struct ProviderEntry {
 }
 
 /// Tracks which phase the create sandbox modal is in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum CreatePhase {
     /// Filling out the form.
+    #[default]
     Form,
     /// Creating the sandbox (background task running).
     Creating,
@@ -303,6 +305,7 @@ pub enum CreatePhase {
 pub const MIN_CREATING_DISPLAY: Duration = Duration::from_secs(4);
 
 /// State for the create sandbox modal form.
+#[derive(Default)]
 pub struct CreateSandboxForm {
     pub focused_field: CreateFormField,
     pub name: String,
@@ -327,9 +330,10 @@ pub struct CreateSandboxForm {
 // Create provider form
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum CreateProviderPhase {
     /// Pick provider type from the known list.
+    #[default]
     SelectType,
     /// Choose: autodetect from env or enter key manually.
     ChooseMethod,
@@ -340,8 +344,9 @@ pub enum CreateProviderPhase {
 }
 
 /// Which field is focused in the provider key entry form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ProviderKeyField {
+    #[default]
     Name,
     /// Focused credential row for known types (index via `cred_cursor`).
     Credential,
@@ -358,6 +363,7 @@ pub enum ProviderKeyField {
     Submit,
 }
 
+#[derive(Default)]
 pub struct CreateProviderForm {
     pub phase: CreateProviderPhase,
     /// Known provider type slugs.
@@ -2214,17 +2220,8 @@ impl App {
             .collect();
 
         self.create_form = Some(CreateSandboxForm {
-            focused_field: CreateFormField::Name,
-            name: String::new(),
-            image: String::new(),
-            command: String::new(),
             providers,
-            provider_cursor: 0,
-            ports: String::new(),
-            status: None,
-            phase: CreatePhase::Form,
-            anim_start: None,
-            create_result: None,
+            ..CreateSandboxForm::default()
         });
     }
 
@@ -2325,26 +2322,8 @@ impl App {
         let types: Vec<String> = known.into_iter().map(String::from).collect();
 
         self.create_provider_form = Some(CreateProviderForm {
-            phase: CreateProviderPhase::SelectType,
             types,
-            type_cursor: 0,
-            method_cursor: 0,
-            name: String::new(),
-            credentials: Vec::new(),
-            cred_cursor: 0,
-            config: IndexMap::new(),
-            config_cursor: 0,
-            config_key_input: String::new(),
-            config_value_input: String::new(),
-            generic_env_name: String::new(),
-            generic_value: String::new(),
-            key_field: ProviderKeyField::Name,
-            is_generic: false,
-            status: None,
-            warning: None,
-            anim_start: None,
-            create_result: None,
-            discovered_credentials: None,
+            ..CreateProviderForm::default()
         });
     }
 
