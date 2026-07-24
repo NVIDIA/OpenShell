@@ -786,7 +786,7 @@ async fn ssh_tar_upload(
             "mkdir -p {escaped_dest} && cat | tar xf - -C {escaped_dest}",
         ))
         .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
+        .stdout(Stdio::null())
         .stderr(Stdio::inherit());
 
     let mut child = ssh.spawn().into_diagnostic()?;
