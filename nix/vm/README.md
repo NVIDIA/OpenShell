@@ -16,6 +16,31 @@ This prototype uses Nix, QEMU, and Ansible to boot and configure disposable Linu
 
 The first run downloads the selected cloud image and VM runtime. Nix reuses those immutable inputs on later runs, while each guest starts from a fresh writable overlay.
 
+## Directory structure
+
+```text
+nix/vm/
+├── README.md
+├── default.nix
+├── run.sh
+├── distros/
+│   ├── ubuntu.nix
+│   ├── centos.nix
+│   └── rocky.nix
+└── configuration/
+    ├── docker.yml
+    ├── podman.yml
+    └── selinux.yml
+```
+
+- `default.nix` assembles the VM flake app. It selects host architecture and acceleration, supplies QEMU and Ansible through the Nix runtime closure, imports the distro catalog, and maps `--with` names to playbooks.
+- `run.sh` owns the disposable VM lifecycle: argument validation, cloud-image realization, cloud-init seed creation, QEMU startup, SSH readiness, Ansible execution, artifact installation, guest command execution, and cleanup.
+- `distros/*.nix` define the immutable base-image catalog. Each record pins the image URL and hash and declares the expected OS ID, version, and package family. Distro definitions do not provision extra software.
+- `configuration/*.yml` are host-executed Ansible playbooks that layer optional capabilities onto a base guest. Configurations remain independent and run in the order supplied with repeated `--with` arguments.
+- `README.md` documents the supported combinations and developer interface.
+
+The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-vm` app. Debian artifact creation remains outside the VM harness in [`tasks/scripts/package-deb.sh`](../../tasks/scripts/package-deb.sh); the runner only installs or copies artifacts that already exist.
+
 ## Supported configurations
 
 | Distro | Docker | Podman | SELinux | Package format |
