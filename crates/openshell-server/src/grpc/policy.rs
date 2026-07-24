@@ -1628,13 +1628,15 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         &provider_names,
     )
     .await?;
-    let provider_environment = super::provider::resolve_provider_environment_with_catalog(
-        state.store.as_ref(),
-        &provider_profile_catalog,
-        &workspace,
-        &provider_names,
-    )
-    .await?;
+    let provider_environment =
+        super::provider::resolve_provider_environment_with_catalog_and_credentials(
+            state.store.as_ref(),
+            &provider_profile_catalog,
+            &workspace,
+            &provider_names,
+            &state.credentials,
+        )
+        .await?;
 
     info!(
         sandbox_id = %sandbox_id,
