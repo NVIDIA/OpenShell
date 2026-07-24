@@ -1168,10 +1168,14 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
 /// Symlinks are skipped (not followed) to prevent privilege escalation via
 /// malicious container images. The TOCTOU window is not exploitable because
 /// no untrusted process is running yet.
+///
+/// The root path is chowned unconditionally — EROFS there is a hard error
+/// (a read-only `/sandbox` is a misconfiguration). For children, `EROFS`
+/// causes the walker to skip that path and its entire subtree — descending
+/// into a read-only mount we do not control would be a TOCTOU risk
+/// (CWE-367/CWE-59). Siblings of the read-only path are still visited.
 #[cfg(unix)]
 fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
-    use nix::unistd::chown;
-
     let meta = std::fs::symlink_metadata(root).into_diagnostic()?;
     if meta.file_type().is_symlink() {
         return Err(miette::miette!(
@@ -1180,23 +1184,63 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
         ));
     }
 
-    chown(root, uid, gid).into_diagnostic()?;
+    nix::unistd::chown(root, uid, gid).into_diagnostic()?;
 
-    if meta.is_dir()
-        && let Ok(entries) = std::fs::read_dir(root)
-    {
-        for entry in entries {
-            let entry = entry.into_diagnostic()?;
-            let path = entry.path();
-            if path
-                .symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_symlink())
-            {
-                debug!(path = %path.display(), "Skipping symlink during sandbox home chown");
-                continue;
+    if meta.is_dir() {
+        chown_children(root, uid, gid, &nix::unistd::chown)?;
+    }
+
+    Ok(())
+}
+
+/// Walk directory children and chown each entry, skipping symlinks and
+/// EROFS subtrees. Called after the parent has already been chowned.
+#[cfg(unix)]
+fn chown_children(
+    dir: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
+) -> Result<()> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.into_diagnostic()?;
+                let child = entry.path();
+                chown_recursive(&child, uid, gid, do_chown)?;
             }
-            chown_sandbox_home(&path, uid, gid)?;
         }
+        Err(e) => {
+            debug!(path = %dir.display(), error = %e, "Cannot list directory during sandbox home chown");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chown_recursive(
+    path: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
+) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path).into_diagnostic()?;
+
+    if meta.file_type().is_symlink() {
+        debug!(path = %path.display(), "Skipping symlink during sandbox home chown");
+        return Ok(());
+    }
+
+    if let Err(e) = do_chown(path, uid, gid) {
+        if e == nix::errno::Errno::EROFS {
+            debug!(path = %path.display(), "Skipping read-only path during sandbox home chown");
+            return Ok(());
+        }
+        return Err(e).into_diagnostic();
+    }
+
+    if meta.is_dir() {
+        chown_children(path, uid, gid, do_chown)?;
     }
 
     Ok(())
@@ -2113,6 +2157,89 @@ mod tests {
             Some(nix::unistd::getegid()),
         )
         .expect("should skip symlink children without error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_recursive_skips_erofs_subtree_but_continues_siblings() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+
+        let readonly_dir = root.join("ro-mount");
+        std::fs::create_dir(&readonly_dir).unwrap();
+        std::fs::write(readonly_dir.join("child-under-ro.txt"), "data").unwrap();
+
+        std::fs::write(root.join("writable-sibling.txt"), "data").unwrap();
+
+        let uid = Some(nix::unistd::geteuid());
+        let gid = Some(nix::unistd::getegid());
+
+        let chowned: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let chowned_ref = Arc::clone(&chowned);
+
+        let readonly_dir_clone = readonly_dir.clone();
+        let fake_chown =
+            move |path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+                if path == readonly_dir_clone {
+                    return Err(nix::errno::Errno::EROFS);
+                }
+                chowned_ref.lock().unwrap().push(path.to_path_buf());
+                Ok(())
+            };
+
+        chown_children(&root, uid, gid, &fake_chown).expect("EROFS should be handled gracefully");
+
+        let chowned = chowned.lock().unwrap();
+        assert!(
+            !chowned.contains(&readonly_dir.join("child-under-ro.txt")),
+            "children under EROFS directory must NOT be descended into"
+        );
+        assert!(
+            chowned.contains(&root.join("writable-sibling.txt")),
+            "writable sibling should still be chowned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_recursive_propagates_non_erofs_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+
+        let uid = Some(nix::unistd::geteuid());
+        let gid = Some(nix::unistd::getegid());
+
+        let fake_chown = |_path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+            Err(nix::errno::Errno::EPERM)
+        };
+
+        let result = chown_recursive(&root, uid, gid, &fake_chown);
+        assert!(result.is_err(), "non-EROFS errors should propagate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_children_skips_all_erofs_children_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::write(root.join("b.txt"), "data").unwrap();
+
+        let uid = Some(nix::unistd::geteuid());
+        let gid = Some(nix::unistd::getegid());
+
+        let always_erofs = |_path: &Path,
+                            _uid: Option<Uid>,
+                            _gid: Option<Gid>|
+         -> nix::Result<()> { Err(nix::errno::Errno::EROFS) };
+
+        chown_children(&root, uid, gid, &always_erofs)
+            .expect("EROFS on all children should be skipped gracefully");
     }
 
     #[cfg(unix)]

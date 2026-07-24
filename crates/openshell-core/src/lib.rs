@@ -20,9 +20,12 @@ pub mod forward;
 pub mod google_cloud;
 pub mod gpu;
 pub mod grpc_client;
+pub mod host_pattern;
 pub mod image;
 pub mod inference;
+pub mod jwt;
 pub mod metadata;
+pub mod middleware;
 pub mod net;
 pub mod paths;
 pub mod policy;
@@ -44,7 +47,9 @@ pub use config::{
     MtlsAuthConfig, OidcConfig, TlsConfig,
 };
 pub use error::{ComputeDriverError, Error, Result};
-pub use metadata::{GetResourceVersion, ObjectId, ObjectLabels, ObjectName, SetResourceVersion};
+pub use metadata::{
+    GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
+};
 
 /// Build version string derived from git metadata.
 ///

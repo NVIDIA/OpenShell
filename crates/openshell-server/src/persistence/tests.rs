@@ -13,7 +13,7 @@ async fn sqlite_put_get_round_trip() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "abc", "my-sandbox", b"payload", None)
+        .put("sandbox", "abc", "my-sandbox", "default", b"payload", None)
         .await
         .unwrap();
 
@@ -28,7 +28,7 @@ async fn sqlite_put_get_round_trip() {
 async fn sqlite_connect_runs_embedded_migrations() {
     let store = test_store().await;
 
-    let records = store.list("sandbox", 10, 0).await.unwrap();
+    let records = store.list("sandbox", "default", 10, 0).await.unwrap();
     assert!(records.is_empty());
 }
 
@@ -214,14 +214,14 @@ async fn sqlite_updates_timestamp() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "abc", "my-sandbox", b"payload", None)
+        .put("sandbox", "abc", "my-sandbox", "default", b"payload", None)
         .await
         .unwrap();
 
     let first = store.get("sandbox", "abc").await.unwrap().unwrap();
 
     store
-        .put("sandbox", "abc", "my-sandbox", b"payload2", None)
+        .put("sandbox", "abc", "my-sandbox", "default", b"payload2", None)
         .await
         .unwrap();
 
@@ -239,12 +239,12 @@ async fn sqlite_list_paging() {
         let name = format!("name-{idx}");
         let payload = format!("payload-{idx}");
         store
-            .put("sandbox", &id, &name, payload.as_bytes(), None)
+            .put("sandbox", &id, &name, "default", payload.as_bytes(), None)
             .await
             .unwrap();
     }
 
-    let records = store.list("sandbox", 2, 1).await.unwrap();
+    let records = store.list("sandbox", "default", 2, 1).await.unwrap();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].name, "name-1");
     assert_eq!(records[1].name, "name-2");
@@ -255,7 +255,7 @@ async fn sqlite_delete_behavior() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "abc", "my-sandbox", b"payload", None)
+        .put("sandbox", "abc", "my-sandbox", "default", b"payload", None)
         .await
         .unwrap();
 
@@ -294,12 +294,12 @@ async fn sqlite_get_by_name() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "id-1", "my-sandbox", b"payload", None)
+        .put("sandbox", "id-1", "my-sandbox", "default", b"payload", None)
         .await
         .unwrap();
 
     let record = store
-        .get_by_name("sandbox", "my-sandbox")
+        .get_by_name("sandbox", "default", "my-sandbox")
         .await
         .unwrap()
         .unwrap();
@@ -307,7 +307,10 @@ async fn sqlite_get_by_name() {
     assert_eq!(record.name, "my-sandbox");
     assert_eq!(record.payload, b"payload");
 
-    let missing = store.get_by_name("sandbox", "no-such-name").await.unwrap();
+    let missing = store
+        .get_by_name("sandbox", "default", "no-such-name")
+        .await
+        .unwrap();
     assert!(missing.is_none());
 }
 
@@ -324,7 +327,7 @@ async fn sqlite_get_message_by_name() {
     store.put_message(&object).await.unwrap();
 
     let loaded = store
-        .get_message_by_name::<ObjectForTest>("my-test")
+        .get_message_by_name::<ObjectForTest>("", "my-test")
         .await
         .unwrap()
         .unwrap();
@@ -333,7 +336,7 @@ async fn sqlite_get_message_by_name() {
     assert_eq!(loaded.count, 7);
 
     let missing = store
-        .get_message_by_name::<ObjectForTest>("no-such-name")
+        .get_message_by_name::<ObjectForTest>("", "no-such-name")
         .await
         .unwrap();
     assert!(missing.is_none());
@@ -344,14 +347,20 @@ async fn sqlite_delete_by_name() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "id-1", "my-sandbox", b"payload", None)
+        .put("sandbox", "id-1", "my-sandbox", "default", b"payload", None)
         .await
         .unwrap();
 
-    let deleted = store.delete_by_name("sandbox", "my-sandbox").await.unwrap();
+    let deleted = store
+        .delete_by_name("sandbox", "default", "my-sandbox")
+        .await
+        .unwrap();
     assert!(deleted);
 
-    let deleted_again = store.delete_by_name("sandbox", "my-sandbox").await.unwrap();
+    let deleted_again = store
+        .delete_by_name("sandbox", "default", "my-sandbox")
+        .await
+        .unwrap();
     assert!(!deleted_again);
 
     let gone = store.get("sandbox", "id-1").await.unwrap();
@@ -363,18 +372,32 @@ async fn sqlite_name_unique_per_object_type() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "id-1", "shared-name", b"payload1", None)
+        .put(
+            "sandbox",
+            "id-1",
+            "shared-name",
+            "default",
+            b"payload1",
+            None,
+        )
         .await
         .unwrap();
 
     // Same name, same object_type, different id -> upsert on name.
     store
-        .put("sandbox", "id-2", "shared-name", b"payload2", None)
+        .put(
+            "sandbox",
+            "id-2",
+            "shared-name",
+            "default",
+            b"payload2",
+            None,
+        )
         .await
         .unwrap();
 
     let record = store
-        .get_by_name("sandbox", "shared-name")
+        .get_by_name("sandbox", "default", "shared-name")
         .await
         .unwrap()
         .unwrap();
@@ -383,9 +406,60 @@ async fn sqlite_name_unique_per_object_type() {
 
     // Same name, different object_type -> should succeed.
     store
-        .put("secret", "id-3", "shared-name", b"payload3", None)
+        .put(
+            "secret",
+            "id-3",
+            "shared-name",
+            "default",
+            b"payload3",
+            None,
+        )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_name_unique_scoped_by_workspace() {
+    let store = test_store().await;
+
+    store
+        .put("sandbox", "id-1", "shared-name", "alpha", b"payload1", None)
+        .await
+        .unwrap();
+
+    // Same name, same type, different workspace -> separate records.
+    store
+        .put("sandbox", "id-2", "shared-name", "beta", b"payload2", None)
+        .await
+        .unwrap();
+
+    let alpha = store
+        .get_by_name("sandbox", "alpha", "shared-name")
+        .await
+        .unwrap()
+        .unwrap();
+    let beta = store
+        .get_by_name("sandbox", "beta", "shared-name")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alpha.id, "id-1");
+    assert_eq!(beta.id, "id-2");
+    assert_eq!(alpha.payload, b"payload1");
+    assert_eq!(beta.payload, b"payload2");
+
+    // Same name, same type, same workspace -> upsert (existing behavior).
+    store
+        .put("sandbox", "id-3", "shared-name", "alpha", b"payload3", None)
+        .await
+        .unwrap();
+    let alpha = store
+        .get_by_name("sandbox", "alpha", "shared-name")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alpha.id, "id-1", "upsert should keep original id");
+    assert_eq!(alpha.payload, b"payload3", "upsert should update payload");
 }
 
 #[tokio::test]
@@ -393,14 +467,14 @@ async fn sqlite_id_globally_unique() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "same-id", "name-a", b"payload1", None)
+        .put("sandbox", "same-id", "name-a", "default", b"payload1", None)
         .await
         .unwrap();
 
     // Same id, different object_type -> should fail because ids remain global
     // primary keys even when writes upsert on name.
     let result = store
-        .put("secret", "same-id", "name-b", b"payload2", None)
+        .put("secret", "same-id", "name-b", "default", b"payload2", None)
         .await;
     assert!(result.is_err());
 
@@ -446,6 +520,7 @@ async fn labels_round_trip() {
             "sandbox",
             "id-1",
             "labeled-sandbox",
+            "default",
             b"payload",
             Some(labels),
         )
@@ -461,11 +536,25 @@ async fn label_selector_single_match() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "id-1", "s1", b"p1", Some(r#"{"env":"prod"}"#))
+        .put(
+            "sandbox",
+            "id-1",
+            "s1",
+            "default",
+            b"p1",
+            Some(r#"{"env":"prod"}"#),
+        )
         .await
         .unwrap();
     store
-        .put("sandbox", "id-2", "s2", b"p2", Some(r#"{"env":"dev"}"#))
+        .put(
+            "sandbox",
+            "id-2",
+            "s2",
+            "default",
+            b"p2",
+            Some(r#"{"env":"dev"}"#),
+        )
         .await
         .unwrap();
     store
@@ -473,6 +562,7 @@ async fn label_selector_single_match() {
             "sandbox",
             "id-3",
             "s3",
+            "default",
             b"p3",
             Some(r#"{"env":"prod","team":"platform"}"#),
         )
@@ -480,7 +570,7 @@ async fn label_selector_single_match() {
         .unwrap();
 
     let results = store
-        .list_with_selector("sandbox", "env=prod", 10, 0)
+        .list_with_selector("sandbox", "default", "env=prod", 10, 0)
         .await
         .unwrap();
 
@@ -499,6 +589,7 @@ async fn label_selector_multiple_labels() {
             "sandbox",
             "id-1",
             "s1",
+            "default",
             b"p1",
             Some(r#"{"env":"prod","team":"platform"}"#),
         )
@@ -509,6 +600,7 @@ async fn label_selector_multiple_labels() {
             "sandbox",
             "id-2",
             "s2",
+            "default",
             b"p2",
             Some(r#"{"env":"prod","team":"data"}"#),
         )
@@ -519,6 +611,7 @@ async fn label_selector_multiple_labels() {
             "sandbox",
             "id-3",
             "s3",
+            "default",
             b"p3",
             Some(r#"{"env":"dev","team":"platform"}"#),
         )
@@ -526,7 +619,7 @@ async fn label_selector_multiple_labels() {
         .unwrap();
 
     let results = store
-        .list_with_selector("sandbox", "env=prod,team=platform", 10, 0)
+        .list_with_selector("sandbox", "default", "env=prod,team=platform", 10, 0)
         .await
         .unwrap();
 
@@ -539,12 +632,19 @@ async fn label_selector_no_match() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "id-1", "s1", b"p1", Some(r#"{"env":"prod"}"#))
+        .put(
+            "sandbox",
+            "id-1",
+            "s1",
+            "default",
+            b"p1",
+            Some(r#"{"env":"prod"}"#),
+        )
         .await
         .unwrap();
 
     let results = store
-        .list_with_selector("sandbox", "env=staging", 10, 0)
+        .list_with_selector("sandbox", "default", "env=staging", 10, 0)
         .await
         .unwrap();
 
@@ -559,25 +659,32 @@ async fn label_selector_respects_paging() {
         let id = format!("id-{idx}");
         let name = format!("name-{idx}");
         store
-            .put("sandbox", &id, &name, b"payload", Some(r#"{"env":"prod"}"#))
+            .put(
+                "sandbox",
+                &id,
+                &name,
+                "default",
+                b"payload",
+                Some(r#"{"env":"prod"}"#),
+            )
             .await
             .unwrap();
     }
 
     let page1 = store
-        .list_with_selector("sandbox", "env=prod", 2, 0)
+        .list_with_selector("sandbox", "default", "env=prod", 2, 0)
         .await
         .unwrap();
     assert_eq!(page1.len(), 2);
 
     let page2 = store
-        .list_with_selector("sandbox", "env=prod", 2, 2)
+        .list_with_selector("sandbox", "default", "env=prod", 2, 2)
         .await
         .unwrap();
     assert_eq!(page2.len(), 2);
 
     let page3 = store
-        .list_with_selector("sandbox", "env=prod", 2, 4)
+        .list_with_selector("sandbox", "default", "env=prod", 2, 4)
         .await
         .unwrap();
     assert_eq!(page3.len(), 1);
@@ -588,16 +695,23 @@ async fn empty_labels_not_matched_by_selector() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "id-1", "s1", b"p1", None)
+        .put("sandbox", "id-1", "s1", "default", b"p1", None)
         .await
         .unwrap();
     store
-        .put("sandbox", "id-2", "s2", b"p2", Some(r#"{"env":"prod"}"#))
+        .put(
+            "sandbox",
+            "id-2",
+            "s2",
+            "default",
+            b"p2",
+            Some(r#"{"env":"prod"}"#),
+        )
         .await
         .unwrap();
 
     let results = store
-        .list_with_selector("sandbox", "env=prod", 10, 0)
+        .list_with_selector("sandbox", "default", "env=prod", 10, 0)
         .await
         .unwrap();
 
@@ -615,6 +729,7 @@ fn policy_test_sandbox(id: &str, name: &str) -> Sandbox {
             id: id.to_string(),
             name: name.to_string(),
             created_at_ms: 1,
+            workspace: "default".to_string(),
             ..Default::default()
         }),
         spec: Some(SandboxSpec::default()),
@@ -645,6 +760,7 @@ async fn policy_atomic_write_commits_revision_provenance_and_sandbox_projection(
         .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
             id: "policy-atomic-1".to_string(),
             sandbox_id: "sandbox-atomic".to_string(),
+            workspace: "default".to_string(),
             version: 1,
             policy_payload: policy.encode_to_vec(),
             policy_hash: "hash-atomic-1".to_string(),
@@ -695,6 +811,7 @@ async fn policy_atomic_write_rolls_back_sandbox_when_revision_insert_conflicts()
         .put_policy_revision(
             "existing-policy",
             "sandbox-rollback",
+            "default",
             1,
             &policy.encode_to_vec(),
             "existing-hash",
@@ -712,6 +829,7 @@ async fn policy_atomic_write_rolls_back_sandbox_when_revision_insert_conflicts()
         .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
             id: "conflicting-policy".to_string(),
             sandbox_id: "sandbox-rollback".to_string(),
+            workspace: "default".to_string(),
             version: 1,
             policy_payload: policy.encode_to_vec(),
             policy_hash: "conflicting-hash".to_string(),
@@ -738,12 +856,51 @@ async fn policy_atomic_write_rolls_back_sandbox_when_revision_insert_conflicts()
 }
 
 #[tokio::test]
+async fn policy_atomic_write_persists_workspace() {
+    let store = test_store().await;
+    store
+        .put_message(&policy_test_sandbox("sandbox-ws", "ws-test"))
+        .await
+        .unwrap();
+    let current = store
+        .get_message::<Sandbox>("sandbox-ws")
+        .await
+        .unwrap()
+        .unwrap();
+    let current_version = current.metadata.as_ref().unwrap().resource_version;
+    let policy = SandboxPolicy::default();
+
+    store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: "policy-ws-1".to_string(),
+            sandbox_id: "sandbox-ws".to_string(),
+            workspace: "my-workspace".to_string(),
+            version: 1,
+            policy_payload: policy.encode_to_vec(),
+            policy_hash: "hash-ws-1".to_string(),
+            provenance: StdHashMap::new(),
+            expected_resource_version: current_version,
+            annotations: StdHashMap::new(),
+            backfill_policy: Some(policy),
+        })
+        .await
+        .unwrap();
+
+    let record = store
+        .get("sandbox_policy", "policy-ws-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.workspace, "my-workspace");
+}
+
+#[tokio::test]
 async fn policy_put_and_get_latest() {
     let store = test_store().await;
 
     let policy_v1 = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, &policy_v1, "hash1")
+        .put_policy_revision("p1", "sandbox-1", "default", 1, &policy_v1, "hash1")
         .await
         .unwrap();
 
@@ -760,7 +917,7 @@ async fn policy_put_and_get_latest() {
     }
     .encode_to_vec();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, &policy_v2, "hash2")
+        .put_policy_revision("p2", "sandbox-1", "default", 2, &policy_v2, "hash2")
         .await
         .unwrap();
 
@@ -780,11 +937,11 @@ async fn policy_get_by_version() {
     }
     .encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, &policy_v1, "h1")
+        .put_policy_revision("p1", "sandbox-1", "default", 1, &policy_v1, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, &policy_v2, "h2")
+        .put_policy_revision("p2", "sandbox-1", "default", 2, &policy_v2, "h2")
         .await
         .unwrap();
 
@@ -814,7 +971,7 @@ async fn policy_update_status_and_get_loaded() {
 
     let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
+        .put_policy_revision("p1", "sandbox-1", "default", 1, &payload, "h1")
         .await
         .unwrap();
 
@@ -845,7 +1002,7 @@ async fn policy_status_failed_with_error() {
 
     let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
+        .put_policy_revision("p1", "sandbox-1", "default", 1, &payload, "h1")
         .await
         .unwrap();
 
@@ -869,15 +1026,15 @@ async fn policy_supersede_older() {
 
     let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
+        .put_policy_revision("p1", "sandbox-1", "default", 1, &payload, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, &payload, "h2")
+        .put_policy_revision("p2", "sandbox-1", "default", 2, &payload, "h2")
         .await
         .unwrap();
     store
-        .put_policy_revision("p3", "sandbox-1", 3, &payload, "h3")
+        .put_policy_revision("p3", "sandbox-1", "default", 3, &payload, "h3")
         .await
         .unwrap();
 
@@ -922,15 +1079,15 @@ async fn policy_list_ordered_by_version_desc() {
 
     let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
+        .put_policy_revision("p1", "sandbox-1", "default", 1, &payload, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, &payload, "h2")
+        .put_policy_revision("p2", "sandbox-1", "default", 2, &payload, "h2")
         .await
         .unwrap();
     store
-        .put_policy_revision("p3", "sandbox-1", 3, &payload, "h3")
+        .put_policy_revision("p3", "sandbox-1", "default", 3, &payload, "h3")
         .await
         .unwrap();
 
@@ -958,11 +1115,11 @@ async fn policy_isolation_between_sandboxes() {
     }
     .encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, &policy_s1, "h1")
+        .put_policy_revision("p1", "sandbox-1", "default", 1, &policy_s1, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-2", 1, &policy_s2, "h2")
+        .put_policy_revision("p2", "sandbox-2", "default", 1, &policy_s2, "h2")
         .await
         .unwrap();
 
@@ -1060,6 +1217,7 @@ async fn cas_put_if_must_create_succeeds() {
             "sandbox",
             "id-1",
             "new-sandbox",
+            "default",
             b"payload",
             None,
             WriteCondition::MustCreate,
@@ -1086,6 +1244,7 @@ async fn cas_put_if_must_create_fails_on_duplicate() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"payload1",
             None,
             WriteCondition::MustCreate,
@@ -1099,6 +1258,7 @@ async fn cas_put_if_must_create_fails_on_duplicate() {
             "sandbox",
             "id-1",
             "sandbox-2",
+            "default",
             b"payload2",
             None,
             WriteCondition::MustCreate,
@@ -1123,6 +1283,7 @@ async fn cas_put_if_match_version_succeeds() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"v1",
             None,
             WriteCondition::MustCreate,
@@ -1136,6 +1297,7 @@ async fn cas_put_if_match_version_succeeds() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"v2",
             None,
             WriteCondition::MatchResourceVersion(1),
@@ -1162,6 +1324,7 @@ async fn cas_put_if_match_version_fails_on_mismatch() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"v1",
             None,
             WriteCondition::MustCreate,
@@ -1175,6 +1338,7 @@ async fn cas_put_if_match_version_fails_on_mismatch() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"v2",
             None,
             WriteCondition::MatchResourceVersion(99),
@@ -1205,6 +1369,7 @@ async fn cas_delete_if_succeeds_with_correct_version() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"payload",
             None,
             WriteCondition::MustCreate,
@@ -1230,6 +1395,7 @@ async fn cas_delete_if_fails_with_wrong_version() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"payload",
             None,
             WriteCondition::MustCreate,
@@ -1262,6 +1428,7 @@ async fn cas_resource_version_increments() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"v1",
             None,
             WriteCondition::MustCreate,
@@ -1276,6 +1443,7 @@ async fn cas_resource_version_increments() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"v2",
             None,
             WriteCondition::MatchResourceVersion(1),
@@ -1290,6 +1458,7 @@ async fn cas_resource_version_increments() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"v3",
             None,
             WriteCondition::MatchResourceVersion(2),
@@ -1315,6 +1484,7 @@ async fn cas_concurrent_updates_one_succeeds() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"initial",
             None,
             WriteCondition::MustCreate,
@@ -1332,6 +1502,7 @@ async fn cas_concurrent_updates_one_succeeds() {
                     "sandbox",
                     "id-1",
                     "sandbox-1",
+                    "default",
                     format!("update-{i}").as_bytes(),
                     None,
                     WriteCondition::MatchResourceVersion(1),
@@ -1374,6 +1545,8 @@ async fn cas_update_message_cas_succeeds() {
             labels: std::collections::HashMap::new(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
+            workspace: "default".to_string(),
+            deletion_timestamp_ms: 0,
         }),
         spec: None,
         status: None,
@@ -1414,6 +1587,8 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
             labels: std::collections::HashMap::new(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
+            workspace: "default".to_string(),
+            deletion_timestamp_ms: 0,
         }),
         spec: None,
         status: None,
@@ -1465,5 +1640,133 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
             .map_or(0, |m| m.resource_version),
         2,
         "resource_version should be 2 (initial 1 + 1 successful update)"
+    );
+}
+
+#[tokio::test]
+async fn cas_update_message_cas_rejects_workspace_change() {
+    use openshell_core::proto::Sandbox;
+
+    let store = test_store().await;
+
+    let sandbox = Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "ws-immutable".to_string(),
+            name: "test-sandbox".to_string(),
+            created_at_ms: 1000,
+            labels: std::collections::HashMap::new(),
+            annotations: std::collections::HashMap::new(),
+            resource_version: 0,
+            workspace: "alpha".to_string(),
+            deletion_timestamp_ms: 0,
+        }),
+        spec: None,
+        status: None,
+    };
+
+    store.put_message(&sandbox).await.unwrap();
+
+    let err = store
+        .update_message_cas::<Sandbox, _>("ws-immutable", 0, |s| {
+            if let Some(meta) = s.metadata.as_mut() {
+                meta.workspace = "beta".to_string();
+            }
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, PersistenceError::Encode(_)),
+        "expected Encode error, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("cannot be changed"),
+        "error should mention immutability: {err}"
+    );
+}
+
+#[tokio::test]
+async fn cas_update_message_cas_rejects_name_change() {
+    use openshell_core::proto::Sandbox;
+
+    let store = test_store().await;
+
+    let sandbox = Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "name-immutable".to_string(),
+            name: "original".to_string(),
+            created_at_ms: 1000,
+            labels: std::collections::HashMap::new(),
+            annotations: std::collections::HashMap::new(),
+            resource_version: 0,
+            workspace: "default".to_string(),
+            deletion_timestamp_ms: 0,
+        }),
+        spec: None,
+        status: None,
+    };
+
+    store.put_message(&sandbox).await.unwrap();
+
+    let err = store
+        .update_message_cas::<Sandbox, _>("name-immutable", 0, |s| {
+            if let Some(meta) = s.metadata.as_mut() {
+                meta.name = "renamed".to_string();
+            }
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, PersistenceError::Encode(_)),
+        "expected Encode error, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("name cannot be changed"),
+        "error should mention name immutability: {err}"
+    );
+}
+
+#[tokio::test]
+async fn list_by_scope_returns_resource_version() {
+    let store = test_store().await;
+
+    // Create a scoped record via put_scoped (resource_version = 1).
+    store
+        .put_scoped(
+            "ssh_session",
+            "sess-1",
+            "sess-1",
+            "default",
+            "sandbox-owner-id",
+            b"payload-v1",
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Update via put_scoped (ON CONFLICT increments resource_version to 2).
+    store
+        .put_scoped(
+            "ssh_session",
+            "sess-1",
+            "sess-1",
+            "default",
+            "sandbox-owner-id",
+            b"payload-v2",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let records = store
+        .list_by_scope("ssh_session", "sandbox-owner-id", 100, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].resource_version, 2,
+        "list_by_scope must return the actual resource_version, not a default"
     );
 }

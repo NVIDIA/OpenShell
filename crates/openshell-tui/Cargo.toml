@@ -26,6 +26,7 @@ miette = { workspace = true }
 owo-colors = { workspace = true }
 serde = { workspace = true }
 url = { workspace = true }
+indexmap = { workspace = true }
 
 [lints]
 workspace = true

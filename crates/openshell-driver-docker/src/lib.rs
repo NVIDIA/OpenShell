@@ -25,7 +25,8 @@ use openshell_core::config::{
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH, supervisor_image_should_refresh,
+    LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH,
+    supervisor_image_should_refresh,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -93,6 +94,11 @@ pub trait SupervisorReadiness: Send + Sync + 'static {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DockerComputeConfig {
+    /// Docker API Unix socket. When unset, use the socket selected by gateway
+    /// auto-detection, falling back to `/var/run/docker.sock` for an explicitly
+    /// configured Docker driver.
+    pub socket_path: Option<PathBuf>,
+
     /// Default OCI image for sandboxes.
     pub default_image: String,
 
@@ -145,6 +151,7 @@ pub struct DockerComputeConfig {
 impl Default for DockerComputeConfig {
     fn default() -> Self {
         Self {
+            socket_path: None,
             default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: String::new(),
             sandbox_namespace: "default".to_string(),
@@ -307,8 +314,22 @@ impl DockerComputeDriver {
         docker_config: &DockerComputeConfig,
         supervisor_readiness: Arc<dyn SupervisorReadiness>,
     ) -> CoreResult<Self> {
-        let docker = Docker::connect_with_local_defaults()
-            .map_err(|err| Error::execution(format!("failed to create Docker client: {err}")))?;
+        let socket_path = docker_config
+            .socket_path
+            .clone()
+            .or_else(openshell_core::config::detect_docker_socket)
+            .unwrap_or_else(|| PathBuf::from("/var/run/docker.sock"));
+        let socket_path_str = socket_path.to_str().ok_or_else(|| {
+            Error::config(format!(
+                "Docker socket path is not valid UTF-8: {}",
+                socket_path.display()
+            ))
+        })?;
+        let docker =
+            Docker::connect_with_socket(socket_path_str, 120, bollard::API_DEFAULT_VERSION)
+                .map_err(|err| {
+                    Error::execution(format!("failed to create Docker client: {err}"))
+                })?;
         let version = docker.version().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;
@@ -1535,6 +1556,7 @@ fn pending_sandbox_snapshot(
             conditions: vec![condition],
             deleting,
         }),
+        workspace: sandbox.workspace.clone(),
     }
 }
 
@@ -2292,6 +2314,10 @@ fn build_container_create_body_with_gpu_devices(
     );
     labels.insert(LABEL_SANDBOX_ID.to_string(), sandbox.id.clone());
     labels.insert(LABEL_SANDBOX_NAME.to_string(), sandbox.name.clone());
+    labels.insert(
+        LABEL_SANDBOX_WORKSPACE.to_string(),
+        sandbox.workspace.clone(),
+    );
     // The list/get/find paths filter by `config.sandbox_namespace`, so use
     // the same value here. `DriverSandbox.namespace` is unset on the request
     // path (the gateway elides it), and using it would produce containers
@@ -2723,6 +2749,10 @@ fn sandbox_from_container_summary(
         .get(LABEL_SANDBOX_NAMESPACE)
         .cloned()
         .unwrap_or_default();
+    let workspace = labels
+        .get(LABEL_SANDBOX_WORKSPACE)
+        .cloned()
+        .unwrap_or_default();
 
     let supervisor_connected = readiness.is_supervisor_connected(&id);
     Some(DriverSandbox {
@@ -2735,6 +2765,7 @@ fn sandbox_from_container_summary(
             &name,
             supervisor_connected,
         )),
+        workspace,
     })
 }
 
@@ -2908,24 +2939,26 @@ const CONTAINER_NAME_PREFIX: &str = "openshell-";
 
 fn container_name_for_sandbox(sandbox: &DriverSandbox) -> String {
     let id_suffix = sanitize_docker_name(&sandbox.id);
+    let workspace = sanitize_docker_name(&sandbox.workspace);
     let name = sanitize_docker_name(&sandbox.name);
+
+    // Format: openshell-{workspace}--{name}-{id}
+    // The workspace and id are never truncated — they ensure uniqueness.
+    // Only the sandbox name portion is truncated when the total exceeds
+    // MAX_CONTAINER_NAME_LEN.
+
     if name.is_empty() {
-        let mut base = format!("{CONTAINER_NAME_PREFIX}{id_suffix}");
-        // The prefix is always < MAX_CONTAINER_NAME_LEN. Truncate the id
-        // suffix only if the sandbox id itself is pathologically long.
+        let mut base = format!("{CONTAINER_NAME_PREFIX}{workspace}---{id_suffix}");
         if base.len() > MAX_CONTAINER_NAME_LEN {
             base.truncate(MAX_CONTAINER_NAME_LEN);
         }
-        return base;
+        return trim_container_name_tail(base);
     }
 
-    // Reserve space for the prefix and the `-<id_suffix>` tail so the id
-    // suffix — which is what makes the name unique between sandboxes that
-    // share a human-readable prefix — is never truncated away.
-    let reserved = CONTAINER_NAME_PREFIX.len() + 1 + id_suffix.len();
+    // Reserve space for fixed parts: prefix + workspace + "--" + "-" + id
+    let reserved = CONTAINER_NAME_PREFIX.len() + workspace.len() + 2 + 1 + id_suffix.len();
     if reserved >= MAX_CONTAINER_NAME_LEN {
-        // Pathological sandbox id. Fall back to `<prefix><id>` and truncate.
-        let mut base = format!("{CONTAINER_NAME_PREFIX}{id_suffix}");
+        let mut base = format!("{CONTAINER_NAME_PREFIX}{workspace}---{id_suffix}");
         base.truncate(MAX_CONTAINER_NAME_LEN);
         return trim_container_name_tail(base);
     }
@@ -2936,7 +2969,7 @@ fn container_name_for_sandbox(sandbox: &DriverSandbox) -> String {
     } else {
         name
     };
-    format!("{CONTAINER_NAME_PREFIX}{truncated_name}-{id_suffix}")
+    format!("{CONTAINER_NAME_PREFIX}{workspace}--{truncated_name}-{id_suffix}")
 }
 
 /// Docker container names may not end with `-`, `.`, or `_`. Truncation can

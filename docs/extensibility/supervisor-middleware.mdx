@@ -1,0 +1,179 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Supervisor Middleware"
+sidebar-title: "Supervisor Middleware"
+description: "Configure and operate built-in and operator-run middleware for sandbox HTTP requests."
+keywords: "Generative AI, Cybersecurity, AI Agents, Supervisor Middleware, Extensibility, Request Filtering"
+---
+
+Supervisor middleware adds ordered request-processing stages to allowed HTTP egress. Middleware runs after network and L7 policy admit a request and before OpenShell injects provider credentials. A stage can allow or deny the request, replace its body, add approved headers, and report audit-safe findings.
+
+Middleware selection is independent of the network policy rule that admitted the request. OpenShell matches middleware by destination host, so the same middleware applies consistently across broad, specific, user-authored, and provider-derived network policies.
+
+## Request Flow
+
+For each inspected HTTP request, the supervisor:
+
+1. Evaluates network and L7 policy.
+2. Selects middleware whose host selectors match the admitted destination.
+3. Buffers the request body using the largest body limit in the selected chain.
+4. Runs matching middleware by ascending `order`. Policy validation rejects duplicate order values.
+5. Re-checks body-aware protocol policy (GraphQL, JSON-RPC, MCP) after each stage that replaces the body. Every middleware receives a payload the policy admits, and a transformation cannot smuggle a denied or unparseable operation to a later stage or the upstream.
+6. Applies allowed transformations, injects provider credentials, and forwards the request.
+
+Because each transformed body is re-checked before the next stage runs, a middleware hook always receives a request that satisfies the sandbox policy. A stage whose output the policy rejects stops the chain; under `enforcement: audit` the rejection is logged and the request proceeds.
+
+If post-transformation policy evaluation itself fails, OpenShell denies the request and emits a high-severity detection finding. This failure is separate from middleware `on_error` because the middleware completed successfully; the sandbox policy could not validate its output.
+
+Middleware receives the request before credential injection. Operator-run services cannot inspect OpenShell-managed credentials. Middleware-visible request headers are delivered in wire order and repeated header names are preserved as separate entries. OpenShell filters credential, routing, framing, and hop-by-hop headers before invoking middleware. It rejects malformed request headers and unsupported transfer-coding sequences before middleware or policy dispatch. Headers named by a request's `Connection` field are omitted from middleware input and removed before forwarding, except for the validated WebSocket upgrade pair.
+
+## Choose a Middleware Type
+
+| Type | Registration | Body limit | Deployment |
+| --- | --- | --- | --- |
+| Built-in | None | Defined by OpenShell | Runs inside the supervisor |
+| Operator-run service | Required in gateway TOML | Set by the operator, up to the service capability | Runs as a separate service reachable by the gateway and supervisors |
+
+`openshell/regex` is an example built-in middleware. It replaces only simple, self-contained token patterns in UTF-8 request bodies; the initial pattern recognizes `sk-` tokens. It does not infer values from keyword assignments such as JSON `password` fields. This best-effort text transformation is not parser-aware and does not guarantee that it will detect or fully remove sensitive values. Its `config` accepts one field, `mode: redact`, which is also the default when the field is omitted. Unknown config fields and non-string values are rejected at policy validation. Custom expressions are not configurable yet.
+
+Operator-run services expose bindings for supported operation and phase pairs. A binding is identified by its operation and phase; V1 supports only `HttpRequest/pre_credentials`. Policies attach the complete middleware by its operator-owned gateway registration name.
+
+## Register a Middleware Service
+
+Start an operator-run service before starting the gateway, then add a registration to the local gateway TOML:
+
+```toml
+[[openshell.supervisor.middleware]]
+name = "local-content-guard"
+grpc_endpoint = "http://host.openshell.internal:50051"
+max_body_bytes = 262144
+timeout = "500ms"
+```
+
+| Field | Description |
+| --- | --- |
+| `name` | Operator-owned registration name used by policy attachments and diagnostics. Names must be unique, and `openshell/` is reserved for built-ins. |
+| `grpc_endpoint` | Service address reachable from both the gateway and sandbox supervisors. Supports plaintext `http://` and TLS `https://` with platform trust roots. |
+| `max_body_bytes` | Operator limit applied to every binding exposed by the service, up to the 4 MiB platform maximum. |
+| `timeout` | Optional service-wide RPC timeout using an integer with an `ms` or `s` suffix. Defaults to `500ms`; valid values range from `10ms` through `30s`. |
+
+Each binding returned by `Describe` may advertise a shorter `timeout` using the same syntax and bounds. The operator-configured service timeout is a ceiling: OpenShell uses the smaller of the binding and service values. An omitted binding timeout inherits the service setting, and an omitted service setting uses the 500 ms platform default. OpenShell rejects an invalid timeout before accepting the manifest. The service timeout applies to `Describe`, while the effective binding timeout applies to `ValidateConfig` and `EvaluateHttpRequest`.
+
+The gateway connects to every registered service and verifies its capabilities before accepting traffic. Gateway startup fails when a service is unavailable, reports an invalid capability, or exposes more than one binding for the same operation and phase. The manifest `name` is diagnostic metadata and does not need to match the operator registration name. Operator-run registration names cannot claim the reserved `openshell/` namespace.
+
+Registration is static. Restart the gateway after adding, removing, or changing a service. See [Gateway Configuration](/reference/gateway-config#supervisor-middleware-services) for the complete gateway TOML context.
+
+## Apply Middleware with Policy
+
+Add middleware configs to the top-level `network_middlewares` map. Each key is the policy-local config name:
+
+```yaml
+network_middlewares:
+  regex-redactor:
+    name: Redact API tokens
+    middleware: openshell/regex
+    order: 10
+    config:
+      mode: redact
+    on_error: fail_closed
+    endpoints:
+      include: ["*.example.com"]
+      exclude: ["trusted.example.com"]
+```
+
+Each config has a stable policy-local identity from its map key, an optional human-readable `name` that defaults to that key, a built-in or operator-owned registration name in `middleware`, an integer `order`, implementation-owned `config`, failure behavior, and host selectors. The optional name does not replace the map key for attachment or future keyed updates. A policy accepts at most 10 middleware configs.
+
+`include` selects destination hosts. `exclude` takes precedence and removes hosts from that selection. Each config accepts at most 32 combined include and exclude patterns. Matching is case-insensitive and uses the same exact-host and DNS glob behavior as network policy endpoints: `*` matches exactly one DNS label, `**` matches one or more labels, and intra-label patterns like `*-api.example.com` work. Brace alternates such as `{prod,staging}` are rejected at validation; list each host pattern separately.
+
+Matching configs run once each by ascending `order`; lower values run first. Order values must be unique across the complete policy, even when endpoint selectors do not overlap. The default order is `0`, so policies with multiple configs normally set explicit values. Different map keys may attach the same middleware and run as separate stages. Map keys are structurally unique. Runtime selection defensively rejects chains with more than 10 stages.
+
+See [Policy Schema](/reference/policy-schema#network-middleware) for the complete field reference.
+
+## Configure Failure Behavior
+
+`on_error` controls what happens when middleware is unavailable, rejects its configuration, returns an invalid result, or exceeds a body limit.
+
+| Value | Behavior |
+| --- | --- |
+| `fail_closed` | Denies the request when the middleware stage fails. This is the default. |
+| `fail_open` | Skips the failed stage and continues the request through the remaining chain. |
+
+Use `fail_open` only when bypassing the middleware preserves the intended security policy. OpenShell emits a detection finding when a failed stage is bypassed.
+
+An explicit deny decision always stops the chain and denies the request, regardless of `on_error`. The HTTP response uses `error: middleware_denied`, identifies the policy-local middleware config, and omits policy-advisor remediation because the network and L7 allow rules already matched. OpenShell never copies the free-form middleware `reason` into the response or security logs. A service can instead return an optional stable `reason_code`: 1–64 bytes, starting with a lowercase ASCII letter and containing only lowercase ASCII letters, digits, and underscores. Invalid codes make the result a middleware failure governed by `on_error`.
+
+```json
+{
+  "error": "middleware_denied",
+  "detail": "Request rejected by configured middleware",
+  "policy": "api-policy",
+  "middleware": "prototype-content-guard",
+  "reason_code": "content_match"
+}
+```
+
+A failed `fail_closed` stage uses `error: middleware_failed` and a platform-owned `detail`. It also omits `rule_missing`, `next_steps`, and `agent_guidance`: the failure did not result from a missing network or L7 policy rule, and changing policy cannot repair it. Runtime diagnostic text is available only through sanitized operator telemetry.
+
+Middleware decisions are enforced regardless of the endpoint's `enforcement` mode. `enforcement: audit` applies to an endpoint's network and L7 policy rules and does not bypass middleware: a middleware deny, or a failed `fail_closed` stage, blocks the request even on an audit endpoint. A middleware service that needs to observe traffic without blocking should return an allow decision with findings, which OpenShell emits as detection findings.
+
+## Set Body Limits
+
+Every middleware binding declares the largest request or replacement body it supports.
+
+- Built-in middleware uses its OpenShell-defined limit.
+- Each operator-run registration sets `max_body_bytes` no higher than the service capability.
+- A selected chain buffers using its largest stage limit, so every stage that can process the body receives it.
+- The same per-stage limit applies to request bodies and replacement bodies.
+
+The gateway rejects a registration whose operator limit exceeds the service capability or the 4 MiB platform maximum instead of silently clamping it. OpenShell also bounds the non-body protobuf components: 64 KiB for service config, 4 KiB for request context, 32 KiB for the target, and 128 request header lines totaling at most 64 KiB encoded. Results allow a 4 KiB discarded free-form reason, a 64-byte validated reason code, 64 header mutations totaling at most 64 KiB encoded, 32 findings of at most 4 KiB encoded each, and 64 metadata entries totaling at most 32 KiB. Middleware gRPC servers should configure request and response message limits to at least 4 MiB plus 293 KiB so every platform-valid envelope fits.
+
+At request time, exceeding a selected stage's limit is a middleware failure for that stage alone and follows that config's `on_error` behavior; other stages in the chain still run against their own limits. OpenShell can apply `fail_open` to an oversized `Content-Length` before consuming body bytes. A chunked body can cross the limit only after bytes have been consumed, so OpenShell denies that request because it cannot safely resume the original stream.
+
+## Mutate Request Headers
+
+A middleware result can return ordered header mutations before OpenShell injects credentials. A `write` mutation adds a value when the case-insensitive header name is absent and selects one behavior when it is already present:
+
+- `append` adds another field value.
+- `overwrite` removes every existing value before adding the new value.
+- `skip` leaves existing values unchanged.
+
+A `remove` mutation removes every value for a case-insensitive header name. OpenShell applies each successful stage's mutations before invoking the next middleware, so later stages observe the accumulated header state.
+
+Header writes must use the `x-openshell-middleware-` prefix. Removes may target other middleware-visible request headers. Protected credential, routing, framing, and hop-by-hop headers are always rejected. Header values must not contain control characters.
+
+OpenShell validates and applies each stage's mutations atomically. An invalid operation discards every mutation from that stage and follows its `on_error` behavior. Built-in failures can name the offending header. Operator-run failures use a platform-owned error code so request-derived header text cannot reach logs or denied responses.
+
+## Operate Middleware Services
+
+Plan startup and updates around these boundaries:
+
+- Start registered services before the gateway. The gateway validates every registration during startup.
+- Keep service endpoints reachable from both the gateway and sandbox supervisors. The supervisors call operator-run services directly on the request path.
+- Restart the gateway after changing registrations.
+- Keep required services available before creating or updating policies. The gateway validates implementation-owned config before persisting a policy.
+- Treat `fail_open` as an explicit availability-over-enforcement decision.
+
+When the effective sandbox configuration changes, a running supervisor validates the new service registry before installing it. If the reload fails, the supervisor keeps its last-known-good registry and emits a configuration failure event.
+
+## Observe Middleware
+
+Middleware activity is emitted through OpenShell's OCSF logging:
+
+- Each invocation records its policy-local config name, attached middleware name, decision, transformation state, and failure state.
+- A denied invocation records a platform-owned reason derived from the policy-local config name and optional validated reason code. OpenShell does not record service-provided free-form reason text.
+- A bypass under `fail_open` emits a detection finding.
+- A required stage that fails closed emits a high-severity detection finding.
+- Built-in findings include their type, label, and aggregate count. Operator-run findings use the operator-owned registration name and a platform label plus the aggregate count; OpenShell does not log service-provided finding text or diagnostic metadata. A stage can return at most 32 findings. Exceeding the per-stage cap is an invalid response handled through `on_error`. A maximum 10-stage chain retains and emits up to 320 findings without silently dropping findings from later stages.
+- Registry reload success and failure are emitted as configuration state changes.
+
+See [Logging](/observability/logging) for log access and [OCSF JSON Export](/observability/ocsf-json-export) for structured export.
+
+## Current Limitations
+
+- Middleware applies only to HTTP requests parsed by the supervisor. Traffic the supervisor cannot inspect, such as HTTP/2 prior knowledge or non-HTTP TCP protocols, is denied on hosts matched by a fail-closed middleware, and relayed with a detection finding when every matching middleware is `fail_open`.
+- The typed operation and phase are `HTTP_REQUEST/PRE_CREDENTIALS`.
+- Selection uses destination host include and exclude patterns.
+- A fail-closed middleware cannot cover `tls: skip` endpoints because OpenShell cannot inspect that traffic. An all-`fail_open` match may cover the endpoint; OpenShell bypasses the middleware and emits a detection finding.
+- Operator-run services support plaintext `http://` and TLS `https://` endpoints. HTTPS certificates must chain to a CA in the platform trust store.
+- Custom trust roots, client authentication, health checks, and runtime registration are not available.

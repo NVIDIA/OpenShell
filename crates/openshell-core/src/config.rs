@@ -12,7 +12,6 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -163,7 +162,7 @@ pub fn detect_driver() -> Option<ComputeDriverKind> {
         return Some(ComputeDriverKind::Podman);
     }
 
-    // Docker: check if the CLI is available or a local Docker socket exists.
+    // Docker: check for a reachable local API socket.
     if is_docker_available() {
         return Some(ComputeDriverKind::Docker);
     }
@@ -171,18 +170,20 @@ pub fn detect_driver() -> Option<ComputeDriverKind> {
     None
 }
 
-/// Check if a binary is available on the system PATH.
-fn is_binary_available(name: &str) -> bool {
-    Command::new(name)
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
+fn is_podman_available() -> bool {
+    detect_podman_socket().is_some()
 }
 
-fn is_podman_available() -> bool {
-    podman_socket_candidates()
+/// Return the first responsive Podman API socket, or `None` if none respond.
+pub fn detect_podman_socket() -> Option<PathBuf> {
+    detect_podman_socket_from_candidates(&podman_socket_candidates())
+}
+
+fn detect_podman_socket_from_candidates(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
         .iter()
-        .any(|path| podman_socket_responds(path))
+        .find(|path| podman_socket_responds(path))
+        .cloned()
 }
 
 fn podman_socket_candidates() -> Vec<PathBuf> {
@@ -228,13 +229,18 @@ fn podman_socket_candidates_from_env(
 }
 
 fn is_docker_available() -> bool {
-    is_binary_available("docker") || docker_socket_available()
+    detect_docker_socket().is_some()
 }
 
-fn docker_socket_available() -> bool {
-    docker_socket_candidates()
+pub fn detect_docker_socket() -> Option<PathBuf> {
+    detect_docker_socket_from_candidates(&docker_socket_candidates())
+}
+
+fn detect_docker_socket_from_candidates(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
         .iter()
-        .any(|path| is_unix_socket(path))
+        .find(|path| docker_socket_responds(path))
+        .cloned()
 }
 
 fn docker_socket_candidates() -> Vec<PathBuf> {
@@ -274,6 +280,15 @@ fn is_unix_socket(path: &Path) -> bool {
 fn podman_socket_responds(path: &Path) -> bool {
     unix_socket_http_ping(path, |response| {
         http_response_is_success(response) && contains_ascii(response, b"Libpod-Api-Version:")
+    })
+}
+
+#[cfg(unix)]
+fn docker_socket_responds(path: &Path) -> bool {
+    unix_socket_http_ping(path, |response| {
+        http_response_is_success(response)
+            && contains_ascii(response, b"Api-Version:")
+            && !contains_ascii(response, b"Libpod-Api-Version:")
     })
 }
 
@@ -346,6 +361,12 @@ fn is_unix_socket(path: &Path) -> bool {
 
 #[cfg(not(unix))]
 fn podman_socket_responds(path: &Path) -> bool {
+    let _ = path;
+    false
+}
+
+#[cfg(not(unix))]
+fn docker_socket_responds(path: &Path) -> bool {
     let _ = path;
     false
 }
@@ -960,7 +981,8 @@ mod tests {
     use super::{
         ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
         GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
-        GatewayProviderProfileSourceConfig, detect_driver, docker_host_unix_socket_path,
+        GatewayProviderProfileSourceConfig, detect_docker_socket_from_candidates, detect_driver,
+        detect_podman_socket_from_candidates, docker_host_unix_socket_path, docker_socket_responds,
         is_unix_socket, normalize_compute_driver_name, podman_socket_candidates_from_env,
         podman_socket_responds,
     };
@@ -1239,6 +1261,90 @@ mod tests {
         handle.join().expect("probe server exits");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn docker_socket_probe_accepts_successful_ping_response() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let socket_path = temp_dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind docker socket");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept docker probe");
+            let mut request = [0_u8; 128];
+            let n = stream.read(&mut request).expect("read docker probe");
+            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nApi-Version: 1.51\r\nDocker-Experimental: false\r\nContent-Length: 2\r\n\r\nOK",
+                )
+                .expect("write docker ping response");
+        });
+
+        assert!(docker_socket_responds(&socket_path));
+        handle.join().expect("probe server exits");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_socket_probe_rejects_podman_ping_response() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let socket_path = temp_dir.path().join("podman.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind podman socket");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept docker probe");
+            let mut request = [0_u8; 128];
+            let n = stream.read(&mut request).expect("read docker probe");
+            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nLibpod-Api-Version: 5.8.2\r\nContent-Length: 2\r\n\r\nOK",
+                )
+                .expect("write podman ping response");
+        });
+
+        assert!(!docker_socket_responds(&socket_path));
+        handle.join().expect("probe server exits");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_socket_probe_rejects_inactive_socket() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let socket_path = temp_dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind docker socket");
+        drop(listener);
+
+        assert!(is_unix_socket(&socket_path));
+        assert!(!docker_socket_responds(&socket_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_socket_detection_returns_the_responsive_candidate() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let inactive_path = temp_dir.path().join("inactive.sock");
+        let inactive_listener = UnixListener::bind(&inactive_path).expect("bind inactive socket");
+        drop(inactive_listener);
+
+        let responsive_path = temp_dir.path().join("responsive.sock");
+        let listener = UnixListener::bind(&responsive_path).expect("bind responsive socket");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept docker probe");
+            let mut request = [0_u8; 128];
+            let _ = stream.read(&mut request).expect("read docker probe");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nApi-Version: 1.51\r\nContent-Length: 2\r\n\r\nOK")
+                .expect("write docker ping response");
+        });
+
+        assert_eq!(
+            detect_docker_socket_from_candidates(&[inactive_path, responsive_path.clone(),]),
+            Some(responsive_path)
+        );
+        handle.join().expect("probe server exits");
+    }
+
     #[test]
     fn podman_socket_candidates_include_env_runtime_and_home_paths() {
         let candidates = podman_socket_candidates_from_env(
@@ -1252,6 +1358,34 @@ mod tests {
         assert!(candidates.contains(&PathBuf::from(
             "/tmp/home/.local/share/containers/podman/machine/podman.sock"
         )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn podman_socket_detection_returns_the_responsive_candidate() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let inactive_path = temp_dir.path().join("inactive.sock");
+        let inactive_listener = UnixListener::bind(&inactive_path).expect("bind inactive socket");
+        drop(inactive_listener);
+
+        let responsive_path = temp_dir.path().join("responsive.sock");
+        let listener = UnixListener::bind(&responsive_path).expect("bind responsive socket");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept podman probe");
+            let mut request = [0_u8; 128];
+            let _ = stream.read(&mut request).expect("read podman probe");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nLibpod-Api-Version: 5.8.2\r\nContent-Length: 2\r\n\r\nOK",
+                )
+                .expect("write podman ping response");
+        });
+
+        assert_eq!(
+            detect_podman_socket_from_candidates(&[inactive_path, responsive_path.clone(),]),
+            Some(responsive_path)
+        );
+        handle.join().expect("probe server exits");
     }
 
     #[test]

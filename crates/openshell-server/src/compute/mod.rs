@@ -13,7 +13,10 @@ pub use openshell_driver_podman::PodmanComputeConfig;
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
-use crate::persistence::{ObjectId, ObjectName, ObjectRecord, ObjectType, Store, WriteCondition};
+use crate::persistence::{
+    DRAFT_CHUNK_OBJECT_TYPE, ObjectId, ObjectName, ObjectRecord, ObjectType, POLICY_OBJECT_TYPE,
+    Store, WriteCondition,
+};
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
 use crate::supervisor_session::SupervisorSessionRegistry;
@@ -32,19 +35,21 @@ use openshell_core::proto::compute::v1::{
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxTemplate, SshSession,
+    SandboxTemplate, ServiceEndpoint, SshSession,
 };
+use openshell_core::{ObjectLabels, ObjectWorkspace};
 use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
 };
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -59,6 +64,100 @@ type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
 
 const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
+
+/// Serializes request-side deletes for the same stable sandbox ID.
+///
+/// Watch events deliberately do not use these gates, so a slow driver delete
+/// cannot block the sequential watch loop. Weak values let entries disappear
+/// after the last request using a sandbox's gate completes.
+#[derive(Debug, Default)]
+struct DeleteGateRegistry {
+    gates: StdMutex<HashMap<String, Weak<Mutex<()>>>>,
+}
+
+impl DeleteGateRegistry {
+    async fn lock_for(&self, sandbox_id: &str) -> SandboxDeleteGuard {
+        let gate = self.gate_for(sandbox_id);
+        SandboxDeleteGuard {
+            _guard: gate.lock_owned().await,
+        }
+    }
+
+    fn gate_for(&self, sandbox_id: &str) -> Arc<Mutex<()>> {
+        let mut gates = self
+            .gates
+            .lock()
+            .expect("sandbox delete gate registry lock poisoned");
+        gates.retain(|_, gate| gate.strong_count() > 0);
+
+        if let Some(gate) = gates.get(sandbox_id).and_then(Weak::upgrade) {
+            return gate;
+        }
+
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(sandbox_id.to_string(), Arc::downgrade(&gate));
+        gate
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.gates
+            .lock()
+            .expect("sandbox delete gate registry lock poisoned")
+            .len()
+    }
+}
+
+/// Proof that the current delete operation holds its sandbox-ID gate.
+///
+/// Delete code must acquire this guard before taking `ComputeRuntime::sync_lock`.
+/// Passing it to `lock_global_for_delete` makes that ordering visible at every
+/// global-lock acquisition in the delete path.
+#[derive(Debug)]
+struct SandboxDeleteGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+#[derive(Debug)]
+struct SandboxDeleteTarget {
+    sandbox_id: String,
+    sandbox_name: String,
+}
+
+/// Identity and driver result for a completed delete request.
+#[derive(Debug, Eq, PartialEq)]
+pub struct DeleteSandboxResult {
+    pub sandbox_id: String,
+    pub deleted: bool,
+}
+
+#[derive(Debug)]
+struct DeleteTransition {
+    /// Snapshot restored if the driver result is ambiguous and no newer write
+    /// has replaced the exact `Deleting` version.
+    previous: Sandbox,
+    /// Exact durable `Deleting` snapshot owned by this request.
+    deleting: Sandbox,
+}
+
+/// Result of trying to claim ownership of a sandbox's delete operation.
+#[derive(Debug)]
+enum BeginDelete {
+    /// This request persisted `Deleting` and owns the driver call and recovery.
+    Started(Box<DeleteTransition>),
+    /// Another request already owns or completed the driver-side delete call.
+    AlreadyDeleting,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComputeDriverInfoSnapshot {
+    /// Gateway-selected driver name used for routing and `driver_config` keys.
+    pub name: String,
+    /// Driver-reported human-readable name from the startup capability snapshot.
+    pub driver_name: String,
+    /// Driver-reported implementation version from the startup capability snapshot.
+    pub driver_version: String,
+}
 
 #[tonic::async_trait]
 trait ShutdownCleanup: Send + Sync {
@@ -259,7 +358,7 @@ impl ComputeDriver for RemoteComputeDriver {
 #[derive(Clone)]
 pub struct ComputeRuntime {
     driver: SharedComputeDriver,
-    driver_name: String,
+    driver_info: ComputeDriverInfoSnapshot,
     shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
     startup_resume: Option<Arc<dyn StartupResume>>,
     _driver_process: Option<Arc<ManagedDriverProcess>>,
@@ -270,6 +369,7 @@ pub struct ComputeRuntime {
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
     sync_lock: Arc<Mutex<()>>,
+    delete_gates: Arc<DeleteGateRegistry>,
     gateway_bind_addresses: Vec<SocketAddr>,
     replica_id: String,
 }
@@ -307,10 +407,15 @@ impl ComputeRuntime {
             in_tree = driver_kind.is_some(),
             "Compute driver connected"
         );
+        let driver_info = ComputeDriverInfoSnapshot {
+            name: driver_name,
+            driver_name: capabilities.driver_name,
+            driver_version: capabilities.driver_version,
+        };
         let default_image = capabilities.default_image;
         Ok(Self {
             driver,
-            driver_name,
+            driver_info,
             shutdown_cleanup,
             startup_resume,
             _driver_process: driver_process,
@@ -321,6 +426,7 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
             sync_lock: Arc::new(Mutex::new(())),
+            delete_gates: Arc::new(DeleteGateRegistry::default()),
             gateway_bind_addresses,
             replica_id: lease::replica_id(),
         })
@@ -334,6 +440,21 @@ impl ComputeRuntime {
     /// tracked by #1255 before enabling multiple gateway writers.
     pub(crate) async fn sandbox_sync_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.sync_lock.clone().lock_owned().await
+    }
+
+    /// Acquires the process-wide lock for code that already holds the
+    /// sandbox-ID delete gate. The guard parameter documents and enforces that
+    /// delete-path callers acquire locks in delete-gate -> global-lock order.
+    async fn lock_global_for_delete(
+        &self,
+        _delete_guard: &SandboxDeleteGuard,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.sync_lock.clone().lock_owned().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delete_gate_entry_count(&self) -> usize {
+        self.delete_gates.entry_count()
     }
 
     pub async fn new_docker(
@@ -457,8 +578,13 @@ impl ComputeRuntime {
     }
 
     #[must_use]
+    pub fn driver_info_snapshots(&self) -> &[ComputeDriverInfoSnapshot] {
+        std::slice::from_ref(&self.driver_info)
+    }
+
+    #[must_use]
     pub fn driver_kind(&self) -> Option<ComputeDriverKind> {
-        self.driver_name.parse().ok()
+        self.driver_info.name.parse().ok()
     }
 
     #[must_use]
@@ -467,8 +593,8 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        let driver_sandbox =
-            driver_sandbox_from_public(sandbox, &self.driver_name).map_err(|status| *status)?;
+        let driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
+            .map_err(|status| *status)?;
         self.driver
             .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
                 sandbox: Some(driver_sandbox),
@@ -483,20 +609,30 @@ impl ComputeRuntime {
         sandbox_token: Option<String>,
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
-        let mut driver_sandbox =
-            driver_sandbox_from_public(&sandbox, &self.driver_name).map_err(|status| *status)?;
+        let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
+            .map_err(|status| *status)?;
 
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
         let mut sandbox = sandbox;
+        let labels_map = sandbox.object_labels();
+        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&labels_map)
+                    .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
+            )
+        };
         let result = self
             .store
             .put_if(
                 Sandbox::object_type(),
                 &sandbox_id,
                 sandbox.object_name(),
+                sandbox.object_workspace(),
                 &sandbox.encode_to_vec(),
-                None,
+                labels_json.as_deref(),
                 WriteCondition::MustCreate,
             )
             .await
@@ -563,59 +699,133 @@ impl ComputeRuntime {
         }
     }
 
-    pub async fn delete_sandbox(&self, name: &str) -> Result<bool, Status> {
-        let _guard = self.sync_lock.lock().await;
-
-        // Resolve sandbox ID from name
-        let sandbox = self
+    pub(crate) async fn delete_sandbox(
+        &self,
+        workspace: &str,
+        name: &str,
+    ) -> Result<DeleteSandboxResult, Status> {
+        // Resolve and acquire both request-side locks before spawning the
+        // owned worker. Cancellation while any of these awaits is pending is
+        // harmless because no mutation or detached work has started.
+        let candidate = self
             .store
-            .get_message_by_name::<Sandbox>(name)
+            .get_message_by_name::<Sandbox>(workspace, name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let target = SandboxDeleteTarget {
+            sandbox_id: candidate.object_id().to_string(),
+            sandbox_name: candidate.object_name().to_string(),
+        };
+        let delete_guard = self.delete_gates.lock_for(&target.sandbox_id).await;
+        let global_guard = self.lock_global_for_delete(&delete_guard).await;
+
+        // There is no await between acquiring the initial guards and spawning
+        // the worker. From this commitment point onward, request cancellation
+        // cannot stop the delete after it starts mutating durable state.
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            runtime
+                .delete_sandbox_inner(target, delete_guard, global_guard)
+                .await
+        })
+        .await
+        .map_err(|err| {
+            Status::internal(format!(
+                "sandbox delete worker terminated unexpectedly: {err}"
+            ))
+        })?
+    }
+
+    async fn delete_sandbox_inner(
+        &self,
+        target: SandboxDeleteTarget,
+        delete_guard: SandboxDeleteGuard,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<DeleteSandboxResult, Status> {
+        let current = self
+            .store
+            .get_message::<Sandbox>(&target.sandbox_id)
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
-
-        let Some(sandbox) = sandbox else {
-            return Err(Status::not_found("sandbox not found"));
+        let Some(current) = current else {
+            // A delete that owned this ID's gate completed while this request
+            // waited. A different sandbox may now use the old name; this
+            // request acknowledges only the disappearance of its original ID.
+            self.cleanup_removed_sandbox_state(&target.sandbox_id);
+            return Ok(DeleteSandboxResult {
+                sandbox_id: target.sandbox_id,
+                deleted: true,
+            });
         };
-
-        let id = sandbox.object_id().to_string();
-
-        let sandbox = self.set_sandbox_phase_deleting_with_retry(&id).await?;
-
-        self.sandbox_index.update_from_sandbox(&sandbox);
-        self.sandbox_watch_bus.notify(&id);
-        self.cleanup_sandbox_owned_records(&sandbox).await;
-
-        let deleted = self
-            .driver
-            .delete_sandbox(Request::new(DeleteSandboxRequest {
-                sandbox_id: sandbox.object_id().to_string(),
-                sandbox_name: sandbox.object_name().to_string(),
-            }))
-            .await
-            .map(|response| response.into_inner().deleted)
-            .map_err(|err| Status::internal(format!("delete sandbox failed: {}", err.message())))?;
-
-        if !deleted && let Err(e) = self.store.delete(Sandbox::object_type(), &id).await {
-            warn!(sandbox_id = %id, error = %e, "Failed to clean up store after delete");
+        if current.object_name() != target.sandbox_name {
+            return Err(Status::aborted(
+                "sandbox name changed while the delete request was waiting; retry explicitly",
+            ));
         }
 
-        self.cleanup_sandbox_state(&id);
-        Ok(deleted)
+        // `Started` carries both sides of the CAS transition: the durable
+        // `Deleting` row used to fence recovery, and the prior row used only
+        // for exact-version rollback after an ambiguous driver failure.
+        let transition = match self
+            .begin_sandbox_delete_with_initial_snapshot(&target.sandbox_id, Some(current))
+            .await?
+        {
+            BeginDelete::AlreadyDeleting => {
+                return Ok(DeleteSandboxResult {
+                    sandbox_id: target.sandbox_id,
+                    deleted: true,
+                });
+            }
+            BeginDelete::Started(transition) => *transition,
+        };
+
+        self.sandbox_index.update_from_sandbox(&transition.deleting);
+        self.sandbox_watch_bus.notify(&target.sandbox_id);
+        drop(guard);
+
+        let result = self
+            .driver
+            .delete_sandbox(Request::new(DeleteSandboxRequest {
+                sandbox_id: transition.deleting.object_id().to_string(),
+                sandbox_name: transition.deleting.object_name().to_string(),
+            }))
+            .await;
+
+        match result {
+            Ok(response) => {
+                let deleted = response.into_inner().deleted;
+                if deleted {
+                    self.cleanup_local_state_if_sandbox_absent(&delete_guard, &target.sandbox_id)
+                        .await?;
+                } else if !self
+                    .remove_deleting_sandbox_record(&delete_guard, &target.sandbox_id)
+                    .await
+                {
+                    return Err(Status::internal(
+                        "compute resource was absent, but gateway cleanup did not complete",
+                    ));
+                }
+                Ok(DeleteSandboxResult {
+                    sandbox_id: target.sandbox_id,
+                    deleted,
+                })
+            }
+            Err(err) => {
+                self.recover_failed_delete(&delete_guard, &transition).await;
+                Err(Status::internal(format!(
+                    "delete sandbox failed: {}",
+                    err.message()
+                )))
+            }
+        }
     }
 
-    async fn set_sandbox_phase_deleting_with_retry(
-        &self,
-        sandbox_id: &str,
-    ) -> Result<Sandbox, Status> {
-        self.set_sandbox_phase_deleting_with_initial_snapshot(sandbox_id, None)
-            .await
-    }
-
-    async fn set_sandbox_phase_deleting_with_initial_snapshot(
+    async fn begin_sandbox_delete_with_initial_snapshot(
         &self,
         sandbox_id: &str,
         mut initial_snapshot: Option<Sandbox>,
-    ) -> Result<Sandbox, Status> {
+    ) -> Result<BeginDelete, Status> {
         let operation = "set sandbox phase to Deleting";
 
         for attempt in 1..=DELETE_PHASE_CAS_RETRY_LIMIT {
@@ -629,18 +839,29 @@ impl ComputeRuntime {
                     .ok_or_else(|| Status::not_found("sandbox not found"))?,
             };
 
+            if SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown)
+                == SandboxPhase::Deleting
+            {
+                return Ok(BeginDelete::AlreadyDeleting);
+            }
+
+            let previous = sandbox.clone();
+
             match self
                 .write_sandbox_phase_deleting_from_snapshot(sandbox)
                 .await
             {
-                Ok(sandbox) => {
+                Ok(deleting) => {
                     if attempt > 1 {
                         debug!(
                             sandbox_id,
                             attempt, "Retried sandbox delete phase transition after CAS conflict"
                         );
                     }
-                    return Ok(sandbox);
+                    return Ok(BeginDelete::Started(Box::new(DeleteTransition {
+                        previous,
+                        deleting,
+                    })));
                 }
                 Err(crate::persistence::PersistenceError::Conflict {
                     current_resource_version,
@@ -664,6 +885,325 @@ impl ComputeRuntime {
         }
 
         unreachable!("delete phase retry loop always returns")
+    }
+
+    /// Removes a durable `Deleting` row after the driver confirms that its
+    /// compute resource is already absent (`deleted = false`).
+    ///
+    /// Benign resource-version changes are retried, but cleanup stops if the
+    /// row leaves `Deleting`; that state belongs to a concurrent writer.
+    async fn remove_deleting_sandbox_record(
+        &self,
+        delete_guard: &SandboxDeleteGuard,
+        sandbox_id: &str,
+    ) -> bool {
+        let _guard = self.lock_global_for_delete(delete_guard).await;
+        for attempt in 1..=DELETE_PHASE_CAS_RETRY_LIMIT {
+            let record = match self.store.get(Sandbox::object_type(), sandbox_id).await {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    self.cleanup_removed_sandbox_state(sandbox_id);
+                    return true;
+                }
+                Err(err) => {
+                    warn!(
+                        sandbox_id,
+                        error = %err,
+                        "Failed to fetch sandbox after the compute resource was absent"
+                    );
+                    return false;
+                }
+            };
+            let sandbox = match decode_sandbox_record(&record) {
+                Ok(sandbox) => sandbox,
+                Err(err) => {
+                    warn!(sandbox_id, error = %err, "Failed to decode sandbox during cleanup");
+                    return false;
+                }
+            };
+            if SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown)
+                != SandboxPhase::Deleting
+            {
+                debug!(
+                    sandbox_id,
+                    "Skipped cleanup of a sandbox no longer deleting"
+                );
+                return false;
+            }
+
+            match self
+                .remove_sandbox_record_if_version_locked(sandbox_id, record.resource_version)
+                .await
+            {
+                Ok(true) => return true,
+                Ok(false) if attempt < DELETE_PHASE_CAS_RETRY_LIMIT => {
+                    tokio::task::yield_now().await;
+                }
+                Ok(false) => return false,
+                Err(err) => {
+                    warn!(
+                        sandbox_id,
+                        error = %err,
+                        "Failed to clean up store after the compute resource was absent"
+                    );
+                    return false;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Removes the sandbox by stable ID only when the expected resource
+    /// version still owns the row. The caller holds `sync_lock`; a successful
+    /// delete also removes sandbox-owned records, while successful or
+    /// already-completed removal clears this replica's index and watch/log
+    /// buses.
+    async fn remove_sandbox_record_if_version_locked(
+        &self,
+        sandbox_id: &str,
+        expected_resource_version: u64,
+    ) -> Result<bool, String> {
+        let Some(record) = self
+            .store
+            .get(Sandbox::object_type(), sandbox_id)
+            .await
+            .map_err(|err| err.to_string())?
+        else {
+            self.cleanup_removed_sandbox_state(sandbox_id);
+            return Ok(false);
+        };
+
+        if record.resource_version != expected_resource_version {
+            debug!(
+                sandbox_id,
+                expected_resource_version,
+                current_resource_version = record.resource_version,
+                "Skipped sandbox cleanup after a concurrent state change"
+            );
+            return Ok(false);
+        }
+
+        let sandbox = decode_sandbox_record(&record)?;
+        self.cleanup_sandbox_owned_records(&sandbox).await?;
+
+        match self
+            .store
+            .delete_if(
+                Sandbox::object_type(),
+                sandbox_id,
+                expected_resource_version,
+            )
+            .await
+        {
+            Ok(true) => {
+                self.cleanup_removed_sandbox_state(sandbox_id);
+                Ok(true)
+            }
+            Ok(false) => {
+                self.cleanup_removed_sandbox_state(sandbox_id);
+                Ok(false)
+            }
+            Err(crate::persistence::PersistenceError::Conflict {
+                current_resource_version,
+            }) => {
+                debug!(
+                    sandbox_id,
+                    expected_resource_version,
+                    current_resource_version,
+                    "Skipped sandbox cleanup after a concurrent state change"
+                );
+                Ok(false)
+            }
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    /// Resolves an ambiguous driver delete error without overwriting newer
+    /// gateway state.
+    ///
+    /// The external lookup runs without `sync_lock`. Recovery then uses the
+    /// exact `Deleting` resource version to apply one of three outcomes:
+    /// reconcile an observed backend snapshot, remove a confirmed-absent
+    /// backend, or restore the pre-delete snapshot when lookup is inconclusive.
+    async fn recover_failed_delete(
+        &self,
+        delete_guard: &SandboxDeleteGuard,
+        transition: &DeleteTransition,
+    ) {
+        let sandbox_id = transition.deleting.object_id();
+        let sandbox_name = transition.deleting.object_name();
+        let deleting_resource_version = sandbox_resource_version(&transition.deleting);
+
+        // The driver lookup is deliberately outside the process-wide guard.
+        let observed = self.get_driver_sandbox(sandbox_id, sandbox_name).await;
+        let _guard = self.lock_global_for_delete(delete_guard).await;
+
+        match observed {
+            Ok(Some(snapshot)) if snapshot.id == sandbox_id && snapshot.status.is_some() => {
+                let session_connected = self.supervisor_sessions.has_session(sandbox_id);
+                self.write_delete_recovery_with_retry(
+                    sandbox_id,
+                    deleting_resource_version,
+                    "reconcile observed backend snapshot",
+                    |sandbox| apply_driver_snapshot(sandbox, &snapshot, session_connected),
+                )
+                .await;
+            }
+            Ok(None) => {
+                match self
+                    .remove_sandbox_record_if_version_locked(sandbox_id, deleting_resource_version)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(err) => {
+                        debug!(
+                            sandbox_id,
+                            error = %err,
+                            "Skipped absent-backend recovery after a concurrent state change"
+                        );
+                    }
+                }
+            }
+            Ok(Some(_)) | Err(_) => {
+                let previous = transition.previous.clone();
+                self.write_delete_recovery_with_retry(
+                    sandbox_id,
+                    deleting_resource_version,
+                    "restore pre-delete snapshot",
+                    |sandbox| *sandbox = previous.clone(),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Applies an exact-version delete recovery, retrying transient persistence
+    /// failures only while the durable row remains at the version this delete
+    /// owns. CAS conflicts belong to a newer writer and are never retried.
+    async fn write_delete_recovery_with_retry<F>(
+        &self,
+        sandbox_id: &str,
+        deleting_resource_version: u64,
+        recovery_action: &'static str,
+        apply: F,
+    ) where
+        F: Fn(&mut Sandbox) + Send + Sync,
+    {
+        for attempt in 1..=DELETE_PHASE_CAS_RETRY_LIMIT {
+            match self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    sandbox_id,
+                    deleting_resource_version,
+                    |sandbox| apply(sandbox),
+                )
+                .await
+            {
+                Ok(recovered) => {
+                    self.sandbox_index.update_from_sandbox(&recovered);
+                    self.sandbox_watch_bus.notify(sandbox_id);
+                    return;
+                }
+                Err(error @ crate::persistence::PersistenceError::Conflict { .. }) => {
+                    self.handle_delete_recovery_conflict(sandbox_id, error, recovery_action)
+                        .await;
+                    return;
+                }
+                Err(error) => match self.store.get(Sandbox::object_type(), sandbox_id).await {
+                    Ok(None) => {
+                        debug!(
+                            sandbox_id,
+                            recovery_action,
+                            "Delete recovery found the row removed by another replica; cleaning local state"
+                        );
+                        self.cleanup_removed_sandbox_state(sandbox_id);
+                        return;
+                    }
+                    Ok(Some(record))
+                        if record.resource_version == deleting_resource_version
+                            && attempt < DELETE_PHASE_CAS_RETRY_LIMIT =>
+                    {
+                        debug!(
+                            sandbox_id,
+                            recovery_action,
+                            attempt,
+                            error = %error,
+                            "Delete recovery write failed while its version was unchanged; retrying"
+                        );
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(Some(record)) if record.resource_version == deleting_resource_version => {
+                        warn!(
+                            sandbox_id,
+                            recovery_action,
+                            attempt,
+                            error = %error,
+                            "Delete recovery write failed after bounded retries; sandbox remains deleting"
+                        );
+                        return;
+                    }
+                    Ok(Some(record)) => {
+                        debug!(
+                            sandbox_id,
+                            recovery_action,
+                            error = %error,
+                            current_resource_version = record.resource_version,
+                            "Skipped delete recovery after a concurrent state change"
+                        );
+                        return;
+                    }
+                    Err(fetch_error) => {
+                        warn!(
+                            sandbox_id,
+                            recovery_action,
+                            error = %error,
+                            fetch_error = %fetch_error,
+                            "Failed to verify sandbox state after delete recovery write failure"
+                        );
+                        return;
+                    }
+                },
+            }
+        }
+    }
+
+    /// Handles a recovery CAS conflict while the caller holds `sync_lock`.
+    /// Another replica may have removed the durable row during the external
+    /// driver lookup; in that case this replica still needs local cleanup.
+    async fn handle_delete_recovery_conflict(
+        &self,
+        sandbox_id: &str,
+        error: crate::persistence::PersistenceError,
+        recovery_action: &'static str,
+    ) {
+        match self.store.get(Sandbox::object_type(), sandbox_id).await {
+            Ok(None) => {
+                debug!(
+                    sandbox_id,
+                    recovery_action,
+                    "Delete recovery found the row removed by another replica; cleaning local state"
+                );
+                self.cleanup_removed_sandbox_state(sandbox_id);
+            }
+            Ok(Some(_)) => {
+                debug!(
+                    sandbox_id,
+                    recovery_action,
+                    error = %error,
+                    "Skipped delete recovery after a concurrent state change"
+                );
+            }
+            Err(fetch_error) => {
+                warn!(
+                    sandbox_id,
+                    recovery_action,
+                    error = %error,
+                    fetch_error = %fetch_error,
+                    "Failed to verify sandbox state after delete recovery conflict"
+                );
+            }
+        }
     }
 
     async fn write_sandbox_phase_deleting_from_snapshot(
@@ -698,6 +1238,7 @@ impl ComputeRuntime {
                 Sandbox::object_type(),
                 &id,
                 &name,
+                sandbox.object_workspace(),
                 &sandbox.encode_to_vec(),
                 labels_json.as_deref(),
                 WriteCondition::MatchResourceVersion(expected_resource_version),
@@ -754,7 +1295,7 @@ impl ComputeRuntime {
 
         let records = self
             .store
-            .list(Sandbox::object_type(), 1000, 0)
+            .list_by_type(Sandbox::object_type(), 1000, 0)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -1054,7 +1595,7 @@ impl ComputeRuntime {
 
         let records = self
             .store
-            .list(Sandbox::object_type(), 500, 0)
+            .list_by_type(Sandbox::object_type(), 500, 0)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -1124,147 +1665,36 @@ impl ComputeRuntime {
         incoming: DriverSandbox,
         existing_record: Option<ObjectRecord>,
     ) -> Result<(), String> {
-        let existing = existing_record
-            .as_ref()
-            .map(decode_sandbox_record)
-            .transpose()?;
+        let Some(existing_record) = existing_record else {
+            // The gateway store is authoritative. API creation persists the
+            // complete row before asking the driver to create its resource, so
+            // an unknown snapshot is either stale or unmanaged.
+            debug!(
+                sandbox_id = %incoming.id,
+                sandbox_name = %incoming.name,
+                "Ignoring driver snapshot for sandbox absent from gateway store"
+            );
+            return Ok(());
+        };
+        let existing = decode_sandbox_record(&existing_record)?;
 
-        // If no existing record, create initial sandbox (first watch event for this sandbox)
-        if existing.is_none() {
-            use crate::persistence::WriteCondition;
-            let now_ms = openshell_core::time::now_ms();
-
-            let session_connected = self.supervisor_sessions.has_session(&incoming.id);
-            let mut phase = derive_phase(incoming.status.as_ref());
-            let sandbox_name = incoming.name.clone();
-
-            let supervisor_promoted = session_connected
-                && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown);
-            if supervisor_promoted {
-                phase = SandboxPhase::Ready;
-            }
-
-            let mut status = incoming
-                .status
-                .as_ref()
-                .map(|s| public_status_from_driver(s, phase, 0));
-            rewrite_user_facing_conditions(&mut status, None);
-            if supervisor_promoted {
-                ensure_supervisor_ready_status(&mut status, &sandbox_name);
-            }
-            let mut sandbox = Sandbox {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: incoming.id.clone(),
-                    name: sandbox_name,
-                    created_at_ms: now_ms,
-                    labels: std::collections::HashMap::new(),
-                    resource_version: 0,
-                    annotations: std::collections::HashMap::new(),
-                }),
-                spec: None,
-                status,
-            };
-            sandbox.set_phase(phase as i32);
-
-            self.store
-                .put_if(
-                    Sandbox::object_type(),
-                    &incoming.id,
-                    sandbox.object_name(),
-                    &sandbox.encode_to_vec(),
-                    None,
-                    WriteCondition::MustCreate,
-                )
-                .await
-                .map_err(|e| match e {
-                    crate::persistence::PersistenceError::Conflict {
-                        current_resource_version,
-                    } => format!(
-                        "concurrent modification detected during sandbox creation (current resource_version: {})",
-                        current_resource_version
-                            .map_or_else(|| "unknown".to_string(), |v| v.to_string())
-                    ),
-                    other => other.to_string(),
-                })?;
-
-            self.sandbox_index.update_from_sandbox(&sandbox);
-            self.sandbox_watch_bus.notify(sandbox.object_id());
+        if SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown)
+            == SandboxPhase::Deleting
+        {
+            // Ordinary driver snapshots cannot recover or regress a durable
+            // deletion. Delete-failure recovery is explicit and version-bound.
             return Ok(());
         }
 
         // Single-attempt CAS: on conflict, the next watch event will naturally retry
         let session_connected = self.supervisor_sessions.has_session(&incoming.id);
-        let sandbox_name = incoming.name.clone();
-
         let sandbox = self
             .store
-            .update_message_cas::<Sandbox, _>(&incoming.id, 0, |sandbox| {
-                let old_phase =
-                    SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-                let mut phase = incoming
-                    .status
-                    .as_ref()
-                    .map_or(old_phase, |status| derive_phase(Some(status)));
-                let supervisor_promoted = session_connected
-                    && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown);
-                if supervisor_promoted {
-                    phase = SandboxPhase::Ready;
-                }
-
-                let cpv = sandbox.current_policy_version();
-                let mut status = incoming
-                    .status
-                    .as_ref()
-                    .map(|s| public_status_from_driver(s, phase, cpv))
-                    .or_else(|| sandbox.status.clone());
-                rewrite_user_facing_conditions(&mut status, sandbox.spec.as_ref());
-                if supervisor_promoted {
-                    ensure_supervisor_ready_status(&mut status, &sandbox_name);
-                }
-
-                if let Some(s) = status.as_mut()
-                    && s.sandbox_name.is_empty()
-                {
-                    s.sandbox_name.clone_from(&sandbox_name);
-                }
-
-                if old_phase != phase {
-                    info!(
-                        sandbox_id = %incoming.id,
-                        sandbox_name = %sandbox_name,
-                        old_phase = ?old_phase,
-                        new_phase = ?phase,
-                        "Sandbox phase changed"
-                    );
-                }
-
-                if phase == SandboxPhase::Error
-                    && let Some(ref status) = status
-                {
-                    for condition in &status.conditions {
-                        if condition.r#type == "Ready"
-                            && condition.status.eq_ignore_ascii_case("false")
-                            && is_terminal_failure_reason(&condition.reason)
-                        {
-                            warn!(
-                                sandbox_id = %incoming.id,
-                                sandbox_name = %sandbox_name,
-                                reason = %condition.reason,
-                                message = %condition.message,
-                                "Sandbox failed to become ready"
-                            );
-                        }
-                    }
-                }
-
-                // Update metadata fields
-                if let Some(metadata) = sandbox.metadata.as_mut() {
-                    metadata.name.clone_from(&sandbox_name);
-                }
-                sandbox.status = status;
-                sandbox.set_phase(phase as i32);
-                sandbox.set_current_policy_version(cpv);
-            })
+            .update_message_cas::<Sandbox, _>(
+                &incoming.id,
+                existing_record.resource_version,
+                |sandbox| apply_driver_snapshot(sandbox, &incoming, session_connected),
+            )
             .await
             .map_err(|e| match e {
                 crate::persistence::PersistenceError::Conflict {
@@ -1297,23 +1727,33 @@ impl ComputeRuntime {
     ) -> Result<(), String> {
         let _guard = self.sync_lock.lock().await;
 
+        let Some(existing) = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|err| err.to_string())?
+        else {
+            return Ok(());
+        };
+        let current_phase =
+            SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown);
+        if current_phase == SandboxPhase::Deleting || current_phase == SandboxPhase::Error {
+            return Ok(());
+        }
+        if !connected && current_phase != SandboxPhase::Ready {
+            return Ok(());
+        }
+        let expected_resource_version = sandbox_resource_version(&existing);
+
         // Use CAS to update sandbox phase based on supervisor session state
         let result = self
             .store
-            .update_message_cas::<Sandbox, _>(sandbox_id, 0, |sandbox| {
-                let current_phase =
-                    SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-
-                // Skip if sandbox is in terminal state
-                if current_phase == SandboxPhase::Deleting || current_phase == SandboxPhase::Error {
-                    return;
-                }
-
+            .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
                 let sandbox_name = sandbox.object_name().to_string();
                 if connected {
                     ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
                     sandbox.set_phase(SandboxPhase::Ready as i32);
-                } else if current_phase == SandboxPhase::Ready {
+                } else {
                     ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
                     sandbox.set_phase(SandboxPhase::Provisioning as i32);
                 }
@@ -1357,7 +1797,7 @@ impl ComputeRuntime {
             .await
             .map_err(|e| e.to_string())?;
         if let Some(sandbox) = sandbox.as_ref() {
-            self.cleanup_sandbox_owned_records(sandbox).await;
+            self.cleanup_sandbox_owned_records(sandbox).await?;
         }
 
         let _ = self
@@ -1365,48 +1805,126 @@ impl ComputeRuntime {
             .delete(Sandbox::object_type(), sandbox_id)
             .await
             .map_err(|e| e.to_string())?;
-        self.sandbox_index.remove_sandbox(sandbox_id);
-        self.sandbox_watch_bus.notify(sandbox_id);
-        self.cleanup_sandbox_state(sandbox_id);
+        self.cleanup_removed_sandbox_state(sandbox_id);
         Ok(())
     }
 
-    async fn cleanup_sandbox_owned_records(&self, sandbox: &Sandbox) {
-        self.cleanup_sandbox_ssh_sessions(sandbox.object_id()).await;
-
-        if let Err(e) = self
-            .store
-            .delete_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_name())
-            .await
-        {
-            warn!(
-                sandbox_id = %sandbox.object_id(),
-                sandbox_name = %sandbox.object_name(),
-                error = %e,
-                "Failed to delete sandbox settings during cleanup"
-            );
-        }
+    async fn apply_deleted_if_version_locked(
+        &self,
+        sandbox: &Sandbox,
+        expected_resource_version: u64,
+    ) -> Result<(), String> {
+        let sandbox_id = sandbox.object_id();
+        self.remove_sandbox_record_if_version_locked(sandbox_id, expected_resource_version)
+            .await?;
+        Ok(())
     }
 
-    async fn cleanup_sandbox_ssh_sessions(&self, sandbox_id: &str) {
-        if let Ok(records) = self.store.list(SshSession::object_type(), 1000, 0).await {
-            for record in records {
-                if let Ok(session) = SshSession::decode(record.payload.as_slice())
-                    && session.sandbox_id == sandbox_id
-                    && let Err(e) = self
-                        .store
-                        .delete(SshSession::object_type(), session.object_id())
-                        .await
-                {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        session_id = %session.object_id(),
-                        error = %e,
-                        "Failed to delete SSH session during sandbox cleanup"
-                    );
-                }
+    async fn cleanup_sandbox_owned_records(&self, sandbox: &Sandbox) -> Result<(), String> {
+        self.cleanup_sandbox_ssh_sessions(sandbox.object_id(), sandbox.object_workspace())
+            .await?;
+        self.cleanup_sandbox_service_endpoints(sandbox.object_id(), sandbox.object_workspace())
+            .await?;
+
+        self.store
+            .delete_by_name(
+                SANDBOX_SETTINGS_OBJECT_TYPE,
+                sandbox.object_workspace(),
+                sandbox.object_name(),
+            )
+            .await
+            .map_err(|e| format!("delete sandbox settings: {e}"))?;
+
+        for (object_type, label) in [
+            (POLICY_OBJECT_TYPE, "policy revisions"),
+            (DRAFT_CHUNK_OBJECT_TYPE, "draft policy chunks"),
+        ] {
+            self.store
+                .delete_by_scope(object_type, sandbox.object_id())
+                .await
+                .map_err(|e| format!("delete {label}: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_sandbox_ssh_sessions(
+        &self,
+        sandbox_id: &str,
+        workspace: &str,
+    ) -> Result<(), String> {
+        let records = self
+            .store
+            .list(SshSession::object_type(), workspace, 1000, 0)
+            .await
+            .map_err(|e| format!("list SSH sessions: {e}"))?;
+
+        for record in records {
+            if let Ok(session) = SshSession::decode(record.payload.as_slice())
+                && session.sandbox_id == sandbox_id
+            {
+                self.store
+                    .delete(SshSession::object_type(), session.object_id())
+                    .await
+                    .map_err(|e| format!("delete SSH session {}: {e}", session.object_id()))?;
             }
         }
+
+        Ok(())
+    }
+
+    // TODO: introduce a per-sandbox cap on service endpoints and paginate
+    // this cleanup loop, or query by sandbox label instead of scanning the
+    // full workspace. Without a cap the flat 1,000-record page could miss
+    // endpoints in large workspaces.
+    async fn cleanup_sandbox_service_endpoints(
+        &self,
+        sandbox_id: &str,
+        workspace: &str,
+    ) -> Result<(), String> {
+        let records = self
+            .store
+            .list(ServiceEndpoint::object_type(), workspace, 1000, 0)
+            .await
+            .map_err(|e| format!("list service endpoints: {e}"))?;
+
+        for record in records {
+            if let Ok(endpoint) = ServiceEndpoint::decode(record.payload.as_slice())
+                && endpoint.sandbox_id == sandbox_id
+            {
+                self.store
+                    .delete(ServiceEndpoint::object_type(), endpoint.object_id())
+                    .await
+                    .map_err(|e| {
+                        format!("delete service endpoint {}: {e}", endpoint.object_id())
+                    })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_local_state_if_sandbox_absent(
+        &self,
+        delete_guard: &SandboxDeleteGuard,
+        sandbox_id: &str,
+    ) -> Result<(), Status> {
+        let _guard = self.lock_global_for_delete(delete_guard).await;
+        let record = self
+            .store
+            .get(Sandbox::object_type(), sandbox_id)
+            .await
+            .map_err(|err| Status::internal(format!("fetch sandbox failed: {err}")))?;
+        if record.is_none() {
+            self.cleanup_removed_sandbox_state(sandbox_id);
+        }
+        Ok(())
+    }
+
+    fn cleanup_removed_sandbox_state(&self, sandbox_id: &str) {
+        self.sandbox_index.remove_sandbox(sandbox_id);
+        self.sandbox_watch_bus.notify(sandbox_id);
+        self.cleanup_sandbox_state(sandbox_id);
     }
 
     fn cleanup_sandbox_state(&self, sandbox_id: &str) {
@@ -1420,6 +1938,30 @@ impl ComputeRuntime {
         snapshot: DriverSandbox,
         sweep_started_at_ms: i64,
     ) -> Result<(), String> {
+        let expected_resource_version = {
+            let _guard = self.sync_lock.lock().await;
+            let Some(existing) = self
+                .store
+                .get(Sandbox::object_type(), &snapshot.id)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                return Ok(());
+            };
+
+            if existing.updated_at_ms > sweep_started_at_ms {
+                return Ok(());
+            }
+            existing.resource_version
+        };
+
+        let Some(current) = self
+            .get_driver_sandbox(&snapshot.id, &snapshot.name)
+            .await?
+        else {
+            return Ok(());
+        };
+
         let _guard = self.sync_lock.lock().await;
         let Some(existing) = self
             .store
@@ -1429,17 +1971,11 @@ impl ComputeRuntime {
         else {
             return Ok(());
         };
-
-        if existing.updated_at_ms > sweep_started_at_ms {
+        if existing.resource_version != expected_resource_version
+            || existing.updated_at_ms > sweep_started_at_ms
+        {
             return Ok(());
         }
-
-        let Some(current) = self
-            .get_driver_sandbox(&snapshot.id, &snapshot.name)
-            .await?
-        else {
-            return Ok(());
-        };
 
         self.apply_sandbox_update_locked(current, Some(existing))
             .await
@@ -1451,42 +1987,68 @@ impl ComputeRuntime {
         sweep_started_at_ms: i64,
         grace_ms: i64,
     ) -> Result<(), String> {
+        let (sandbox_id, sandbox_name, expected_resource_version, age_ms) = {
+            let _guard = self.sync_lock.lock().await;
+            let Some(current_record) = self
+                .store
+                .get(Sandbox::object_type(), &record.id)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                return Ok(());
+            };
+
+            if current_record.updated_at_ms > sweep_started_at_ms {
+                return Ok(());
+            }
+
+            let sandbox = decode_sandbox_record(&current_record)?;
+            let age_ms =
+                openshell_core::time::now_ms().saturating_sub(current_record.created_at_ms);
+            if age_ms < grace_ms {
+                return Ok(());
+            }
+
+            (
+                sandbox.object_id().to_string(),
+                sandbox.object_name().to_string(),
+                current_record.resource_version,
+                age_ms,
+            )
+        };
+
+        let current = self.get_driver_sandbox(&sandbox_id, &sandbox_name).await?;
+
         let _guard = self.sync_lock.lock().await;
         let Some(current_record) = self
             .store
-            .get(Sandbox::object_type(), &record.id)
+            .get(Sandbox::object_type(), &sandbox_id)
             .await
             .map_err(|e| e.to_string())?
         else {
             return Ok(());
         };
-
-        if current_record.updated_at_ms > sweep_started_at_ms {
-            return Ok(());
-        }
-
-        let sandbox = decode_sandbox_record(&current_record)?;
-        let age_ms = openshell_core::time::now_ms().saturating_sub(current_record.created_at_ms);
-        if age_ms < grace_ms {
-            return Ok(());
-        }
-
-        if let Some(current) = self
-            .get_driver_sandbox(sandbox.object_id(), sandbox.object_name())
-            .await?
+        if current_record.resource_version != expected_resource_version
+            || current_record.updated_at_ms > sweep_started_at_ms
         {
+            return Ok(());
+        }
+
+        if let Some(current) = current {
             return self
                 .apply_sandbox_update_locked(current, Some(current_record))
                 .await;
         }
 
+        let sandbox = decode_sandbox_record(&current_record)?;
         info!(
-            sandbox_id = %sandbox.object_id(),
-            sandbox_name = %sandbox.object_name(),
+            sandbox_id = %sandbox_id,
+            sandbox_name = %sandbox_name,
             age_secs = age_ms / 1000,
             "Removing sandbox from store after it disappeared from the compute driver snapshot"
         );
-        self.apply_deleted_locked(sandbox.object_id()).await
+        self.apply_deleted_if_version_locked(&sandbox, expected_resource_version)
+            .await
     }
 
     async fn get_driver_sandbox(
@@ -1502,7 +2064,18 @@ impl ComputeRuntime {
             }))
             .await
         {
-            Ok(response) => Ok(response.into_inner().sandbox),
+            Ok(response) => {
+                let sandbox = response.into_inner().sandbox;
+                if let Some(sandbox) = sandbox.as_ref()
+                    && sandbox.id != sandbox_id
+                {
+                    return Err(format!(
+                        "compute driver returned sandbox '{}' for requested id '{sandbox_id}'",
+                        sandbox.id
+                    ));
+                }
+                Ok(sandbox)
+            }
             Err(status) if status.code() == Code::NotFound => Ok(None),
             Err(status) => Err(status.to_string()),
         }
@@ -1562,6 +2135,7 @@ fn driver_sandbox_from_public(
             .map(|spec| driver_sandbox_spec_from_public(spec, driver_name))
             .transpose()?,
         status: sandbox.status.as_ref().map(driver_status_from_public),
+        workspace: sandbox.object_workspace().to_string(),
     })
 }
 
@@ -1833,6 +2407,13 @@ fn decode_sandbox_record(record: &ObjectRecord) -> Result<Sandbox, String> {
     Sandbox::decode(record.payload.as_slice()).map_err(|e| e.to_string())
 }
 
+fn sandbox_resource_version(sandbox: &Sandbox) -> u64 {
+    sandbox
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version)
+}
+
 fn public_status_from_driver(
     status: &DriverSandboxStatus,
     phase: SandboxPhase,
@@ -1851,6 +2432,73 @@ fn public_status_from_driver(
         phase: phase as i32,
         current_policy_version,
     }
+}
+
+fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, session_connected: bool) {
+    let old_phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    let mut phase = incoming
+        .status
+        .as_ref()
+        .map_or(old_phase, |status| derive_phase(Some(status)));
+    let sandbox_name = &incoming.name;
+    let supervisor_promoted =
+        session_connected && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown);
+    if supervisor_promoted {
+        phase = SandboxPhase::Ready;
+    }
+
+    let cpv = sandbox.current_policy_version();
+    let mut status = incoming
+        .status
+        .as_ref()
+        .map(|status| public_status_from_driver(status, phase, cpv))
+        .or_else(|| sandbox.status.clone());
+    rewrite_user_facing_conditions(&mut status, sandbox.spec.as_ref());
+    if supervisor_promoted {
+        ensure_supervisor_ready_status(&mut status, sandbox_name);
+    }
+
+    if let Some(status) = status.as_mut()
+        && status.sandbox_name.is_empty()
+    {
+        status.sandbox_name.clone_from(sandbox_name);
+    }
+
+    if old_phase != phase {
+        info!(
+            sandbox_id = %incoming.id,
+            sandbox_name = %sandbox_name,
+            old_phase = ?old_phase,
+            new_phase = ?phase,
+            "Sandbox phase changed"
+        );
+    }
+
+    if phase == SandboxPhase::Error
+        && let Some(ref status) = status
+    {
+        for condition in &status.conditions {
+            if condition.r#type == "Ready"
+                && condition.status.eq_ignore_ascii_case("false")
+                && is_terminal_failure_reason(&condition.reason)
+            {
+                warn!(
+                    sandbox_id = %incoming.id,
+                    sandbox_name = %sandbox_name,
+                    reason = %condition.reason,
+                    message = %condition.message,
+                    "Sandbox failed to become ready"
+                );
+            }
+        }
+    }
+
+    if let Some(metadata) = sandbox.metadata.as_mut() {
+        metadata.name.clone_from(sandbox_name);
+    }
+    sandbox.status = status;
+    sandbox.set_phase(phase as i32);
+    sandbox.set_current_policy_version(cpv);
 }
 
 fn ensure_supervisor_ready_status(status: &mut Option<SandboxStatus>, sandbox_name: &str) {
@@ -2097,7 +2745,11 @@ impl ComputeDriver for NoopTestDriver {
 pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
     ComputeRuntime {
         driver: Arc::new(NoopTestDriver),
-        driver_name: "test".to_string(),
+        driver_info: ComputeDriverInfoSnapshot {
+            name: "test".to_string(),
+            driver_name: "test".to_string(),
+            driver_version: "test".to_string(),
+        },
         shutdown_cleanup: None,
         startup_resume: None,
         _driver_process: None,
@@ -2108,6 +2760,7 @@ pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
         tracing_log_bus: TracingLogBus::new(),
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
         sync_lock: Arc::new(Mutex::new(())),
+        delete_gates: Arc::new(DeleteGateRegistry::default()),
         gateway_bind_addresses: Vec::new(),
         replica_id: "test-replica".to_string(),
     }
@@ -2120,10 +2773,13 @@ mod tests {
     use openshell_core::proto::compute::v1::{
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
         GetSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateResponse,
+        WatchSandboxesDeletedEvent, WatchSandboxesSandboxEvent,
     };
     use std::collections::HashMap;
-    use std::sync::Arc;
-    use tokio::sync::{mpsc, oneshot};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as TestMutex};
+    use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
+    use tokio_stream::wrappers::UnboundedReceiverStream;
 
     fn string_value(value: &str) -> prost_types::Value {
         prost_types::Value {
@@ -2341,6 +2997,212 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    enum ControlledDeleteOutcome {
+        Ok(bool),
+        Error(&'static str),
+    }
+
+    #[derive(Clone)]
+    enum ControlledGetOutcome {
+        Sandbox(Box<DriverSandbox>),
+        Missing,
+        Error(&'static str),
+    }
+
+    struct ControlledDriver {
+        watch_tx: mpsc::UnboundedSender<Result<WatchSandboxesEvent, Status>>,
+        watch_rx: TestMutex<Option<mpsc::UnboundedReceiver<Result<WatchSandboxesEvent, Status>>>>,
+        watch_started: Notify,
+        delete_started: Notify,
+        delete_release: Semaphore,
+        delete_blocked: AtomicBool,
+        delete_calls: AtomicUsize,
+        delete_outcome: TestMutex<ControlledDeleteOutcome>,
+        get_started: Notify,
+        get_release: Semaphore,
+        get_blocked: AtomicBool,
+        get_outcome: TestMutex<ControlledGetOutcome>,
+    }
+
+    impl ControlledDriver {
+        fn new() -> Arc<Self> {
+            let (watch_tx, watch_rx) = mpsc::unbounded_channel();
+            Arc::new(Self {
+                watch_tx,
+                watch_rx: TestMutex::new(Some(watch_rx)),
+                watch_started: Notify::new(),
+                delete_started: Notify::new(),
+                delete_release: Semaphore::new(0),
+                delete_blocked: AtomicBool::new(false),
+                delete_calls: AtomicUsize::new(0),
+                delete_outcome: TestMutex::new(ControlledDeleteOutcome::Ok(true)),
+                get_started: Notify::new(),
+                get_release: Semaphore::new(0),
+                get_blocked: AtomicBool::new(false),
+                get_outcome: TestMutex::new(ControlledGetOutcome::Missing),
+            })
+        }
+
+        fn block_delete(&self) {
+            self.delete_blocked.store(true, Ordering::SeqCst);
+        }
+
+        fn release_delete(&self) {
+            self.delete_release.add_permits(1);
+        }
+
+        fn block_get(&self) {
+            self.get_blocked.store(true, Ordering::SeqCst);
+        }
+
+        fn release_get(&self) {
+            self.get_release.add_permits(1);
+        }
+
+        fn set_delete_outcome(&self, outcome: ControlledDeleteOutcome) {
+            *self
+                .delete_outcome
+                .lock()
+                .expect("delete outcome lock poisoned") = outcome;
+        }
+
+        fn set_get_outcome(&self, outcome: ControlledGetOutcome) {
+            *self.get_outcome.lock().expect("get outcome lock poisoned") = outcome;
+        }
+
+        fn delete_calls(&self) -> usize {
+            self.delete_calls.load(Ordering::SeqCst)
+        }
+
+        fn send_event(&self, event: WatchSandboxesEvent) {
+            self.watch_tx
+                .send(Ok(event))
+                .expect("watch loop should still be receiving events");
+        }
+    }
+
+    #[tonic::async_trait]
+    impl ComputeDriver for ControlledDriver {
+        type WatchSandboxesStream = DriverWatchStream;
+
+        async fn get_capabilities(
+            &self,
+            _request: Request<GetCapabilitiesRequest>,
+        ) -> Result<tonic::Response<GetCapabilitiesResponse>, Status> {
+            Ok(tonic::Response::new(GetCapabilitiesResponse {
+                driver_name: "controlled-test-driver".to_string(),
+                driver_version: "test".to_string(),
+                default_image: "openshell/sandbox:test".to_string(),
+            }))
+        }
+
+        async fn validate_sandbox_create(
+            &self,
+            _request: Request<ValidateSandboxCreateRequest>,
+        ) -> Result<tonic::Response<ValidateSandboxCreateResponse>, Status> {
+            Ok(tonic::Response::new(ValidateSandboxCreateResponse {}))
+        }
+
+        async fn get_sandbox(
+            &self,
+            _request: Request<GetSandboxRequest>,
+        ) -> Result<tonic::Response<GetSandboxResponse>, Status> {
+            self.get_started.notify_one();
+            if self.get_blocked.load(Ordering::SeqCst) {
+                self.get_release
+                    .acquire()
+                    .await
+                    .expect("get release semaphore closed")
+                    .forget();
+            }
+            let outcome = self
+                .get_outcome
+                .lock()
+                .expect("get outcome lock poisoned")
+                .clone();
+            match outcome {
+                ControlledGetOutcome::Sandbox(sandbox) => {
+                    Ok(tonic::Response::new(GetSandboxResponse {
+                        sandbox: Some(*sandbox),
+                    }))
+                }
+                ControlledGetOutcome::Missing => Err(Status::not_found("sandbox not found")),
+                ControlledGetOutcome::Error(message) => Err(Status::internal(message)),
+            }
+        }
+
+        async fn list_sandboxes(
+            &self,
+            _request: Request<ListSandboxesRequest>,
+        ) -> Result<
+            tonic::Response<openshell_core::proto::compute::v1::ListSandboxesResponse>,
+            Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::compute::v1::ListSandboxesResponse {
+                    sandboxes: Vec::new(),
+                },
+            ))
+        }
+
+        async fn create_sandbox(
+            &self,
+            _request: Request<CreateSandboxRequest>,
+        ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
+            Ok(tonic::Response::new(CreateSandboxResponse {}))
+        }
+
+        async fn stop_sandbox(
+            &self,
+            _request: Request<StopSandboxRequest>,
+        ) -> Result<tonic::Response<StopSandboxResponse>, Status> {
+            Ok(tonic::Response::new(StopSandboxResponse {}))
+        }
+
+        async fn delete_sandbox(
+            &self,
+            _request: Request<DeleteSandboxRequest>,
+        ) -> Result<tonic::Response<DeleteSandboxResponse>, Status> {
+            self.delete_calls.fetch_add(1, Ordering::SeqCst);
+            self.delete_started.notify_one();
+            if self.delete_blocked.load(Ordering::SeqCst) {
+                self.delete_release
+                    .acquire()
+                    .await
+                    .expect("delete release semaphore closed")
+                    .forget();
+            }
+            let outcome = self
+                .delete_outcome
+                .lock()
+                .expect("delete outcome lock poisoned")
+                .clone();
+            match outcome {
+                ControlledDeleteOutcome::Ok(deleted) => {
+                    Ok(tonic::Response::new(DeleteSandboxResponse { deleted }))
+                }
+                ControlledDeleteOutcome::Error(message) => Err(Status::internal(message)),
+            }
+        }
+
+        async fn watch_sandboxes(
+            &self,
+            _request: Request<WatchSandboxesRequest>,
+        ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
+            let receiver = self
+                .watch_rx
+                .lock()
+                .expect("watch receiver lock poisoned")
+                .take()
+                .ok_or_else(|| Status::failed_precondition("watch already started"))?;
+            self.watch_started.notify_one();
+            Ok(tonic::Response::new(Box::pin(
+                UnboundedReceiverStream::new(receiver),
+            )))
+        }
+    }
+
     async fn test_runtime(driver: SharedComputeDriver) -> ComputeRuntime {
         test_runtime_with_resume(driver, None).await
     }
@@ -2352,7 +3214,11 @@ mod tests {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
             driver,
-            driver_name: "test-driver".to_string(),
+            driver_info: ComputeDriverInfoSnapshot {
+                name: "test-driver".to_string(),
+                driver_name: "test-driver".to_string(),
+                driver_version: "test".to_string(),
+            },
             shutdown_cleanup: None,
             startup_resume,
             _driver_process: None,
@@ -2363,6 +3229,7 @@ mod tests {
             tracing_log_bus: TracingLogBus::new(),
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
             sync_lock: Arc::new(Mutex::new(())),
+            delete_gates: Arc::new(DeleteGateRegistry::default()),
             gateway_bind_addresses: Vec::new(),
             replica_id: "test-replica".to_string(),
         }
@@ -2388,6 +3255,8 @@ mod tests {
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
             }),
             ..Default::default()
         };
@@ -2404,12 +3273,151 @@ mod tests {
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
             }),
             sandbox_id: sandbox_id.to_string(),
             token: format!("token-{id}"),
             revoked: false,
             expires_at_ms: 0,
         }
+    }
+
+    fn service_endpoint_record(id: &str, sandbox: &Sandbox) -> ServiceEndpoint {
+        ServiceEndpoint {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: id.to_string(),
+                name: format!("{}--web", sandbox.object_name()),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: sandbox.object_workspace().to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            sandbox_id: sandbox.object_id().to_string(),
+            sandbox_name: sandbox.object_name().to_string(),
+            service_name: "web".to_string(),
+            target_port: 8080,
+            domain: true,
+        }
+    }
+
+    async fn seed_sandbox_owned_records(runtime: &ComputeRuntime, sandbox: &Sandbox) -> SshSession {
+        runtime
+            .store
+            .put(
+                SANDBOX_SETTINGS_OBJECT_TYPE,
+                &format!("settings-{}", sandbox.object_id()),
+                sandbox.object_name(),
+                sandbox.object_workspace(),
+                br#"{"revision":1,"settings":{}}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        let session = ssh_session_record("owned", sandbox.object_id());
+        runtime.store.put_message(&session).await.unwrap();
+
+        let endpoint = service_endpoint_record("endpoint-owned", sandbox);
+        runtime.store.put_message(&endpoint).await.unwrap();
+
+        runtime
+            .store
+            .put_scoped(
+                POLICY_OBJECT_TYPE,
+                "policy-owned",
+                "policy-owned",
+                sandbox.object_workspace(),
+                sandbox.object_id(),
+                br#"{"version":1}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        runtime
+            .store
+            .put_scoped(
+                DRAFT_CHUNK_OBJECT_TYPE,
+                "draft-owned",
+                "draft-owned",
+                sandbox.object_workspace(),
+                sandbox.object_id(),
+                br#"{"chunk":1}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        session
+    }
+
+    async fn remove_sandbox_owned_records_from_store(runtime: &ComputeRuntime, sandbox: &Sandbox) {
+        runtime
+            .cleanup_sandbox_owned_records(sandbox)
+            .await
+            .unwrap();
+        runtime
+            .store
+            .delete(Sandbox::object_type(), sandbox.object_id())
+            .await
+            .unwrap();
+    }
+
+    async fn assert_sandbox_owned_records(
+        runtime: &ComputeRuntime,
+        sandbox: &Sandbox,
+        session: &SshSession,
+        expected: bool,
+    ) {
+        assert_eq!(
+            runtime
+                .store
+                .get_by_name(
+                    SANDBOX_SETTINGS_OBJECT_TYPE,
+                    sandbox.object_workspace(),
+                    sandbox.object_name(),
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            expected
+        );
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_some(),
+            expected
+        );
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<ServiceEndpoint>("endpoint-owned")
+                .await
+                .unwrap()
+                .is_some(),
+            expected
+        );
+        assert_eq!(
+            runtime
+                .store
+                .get(POLICY_OBJECT_TYPE, "policy-owned")
+                .await
+                .unwrap()
+                .is_some(),
+            expected
+        );
+        assert_eq!(
+            runtime
+                .store
+                .get(DRAFT_CHUNK_OBJECT_TYPE, "draft-owned")
+                .await
+                .unwrap()
+                .is_some(),
+            expected
+        );
     }
 
     fn make_driver_condition(reason: &str, message: &str) -> DriverCondition {
@@ -2433,10 +3441,89 @@ mod tests {
         }
     }
 
+    fn ready_driver_sandbox(id: &str, name: &str) -> DriverSandbox {
+        DriverSandbox {
+            id: id.to_string(),
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            workspace: "default".to_string(),
+            spec: None,
+            status: Some(DriverSandboxStatus {
+                sandbox_name: name.to_string(),
+                instance_id: format!("{name}-pod"),
+                agent_fd: String::new(),
+                sandbox_fd: String::new(),
+                conditions: vec![DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: "DependenciesReady".to_string(),
+                    message: "Sandbox is ready".to_string(),
+                    last_transition_time: String::new(),
+                }],
+                deleting: false,
+            }),
+        }
+    }
+
+    fn sandbox_watch_event(sandbox: DriverSandbox) -> WatchSandboxesEvent {
+        WatchSandboxesEvent {
+            payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                WatchSandboxesSandboxEvent {
+                    sandbox: Some(sandbox),
+                },
+            )),
+        }
+    }
+
+    fn deleted_watch_event(sandbox_id: &str) -> WatchSandboxesEvent {
+        WatchSandboxesEvent {
+            payload: Some(watch_sandboxes_event::Payload::Deleted(
+                WatchSandboxesDeletedEvent {
+                    sandbox_id: sandbox_id.to_string(),
+                },
+            )),
+        }
+    }
+
+    async fn start_watch_loop(
+        runtime: &ComputeRuntime,
+        driver: &ControlledDriver,
+    ) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let runtime = Arc::new(runtime.clone());
+        let handle = tokio::spawn(async move { runtime.watch_loop(shutdown_rx).await });
+        tokio::time::timeout(Duration::from_secs(1), driver.watch_started.notified())
+            .await
+            .expect("watch loop did not start");
+        (shutdown_tx, handle)
+    }
+
+    async fn stop_watch_loop(
+        shutdown_tx: watch::Sender<bool>,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("watch loop did not stop")
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn sqlite_store_is_single_replica() {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         assert!(store.is_single_replica());
+    }
+
+    #[test]
+    fn delete_gate_registry_removes_stale_entries() {
+        let registry = DeleteGateRegistry::default();
+        let first = registry.gate_for("sb-1");
+        assert_eq!(registry.entry_count(), 1);
+        drop(first);
+
+        let _second = registry.gate_for("sb-2");
+        assert_eq!(registry.entry_count(), 1);
     }
 
     #[test]
@@ -2740,7 +3827,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_sandbox_phase_deleting_retries_after_stale_snapshot_conflict() {
+    async fn begin_sandbox_delete_retries_after_stale_snapshot_conflict() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         runtime.store.put_message(&sandbox).await.unwrap();
@@ -2760,10 +3847,15 @@ mod tests {
             .await
             .unwrap();
 
-        let updated = runtime
-            .set_sandbox_phase_deleting_with_initial_snapshot("sb-1", Some(stale_snapshot))
+        let transition = runtime
+            .begin_sandbox_delete_with_initial_snapshot("sb-1", Some(stale_snapshot))
             .await
             .unwrap();
+        let BeginDelete::Started(transition) = transition else {
+            panic!("expected a new delete transition");
+        };
+        let transition = *transition;
+        let updated = transition.deleting;
 
         assert_eq!(
             SandboxPhase::try_from(updated.phase()).unwrap(),
@@ -2777,6 +3869,7 @@ mod tests {
                 .map_or(0, |metadata| metadata.resource_version),
             3
         );
+        assert_eq!(transition.previous.current_policy_version(), 7);
 
         let stored = runtime
             .store
@@ -2792,10 +3885,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_sandbox_update_allows_delete_failures_to_recover() {
+    async fn apply_sandbox_update_is_noop_while_deleting() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Deleting);
         runtime.store.put_message(&sandbox).await.unwrap();
+        let before = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
 
         runtime
             .apply_sandbox_update(DriverSandbox {
@@ -2817,6 +3917,7 @@ mod tests {
                     }],
                     deleting: false,
                 }),
+                workspace: "default".to_string(),
             })
             .await
             .unwrap();
@@ -2829,7 +3930,1110 @@ mod tests {
             .unwrap();
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Deleting
+        );
+        assert_eq!(
+            sandbox_resource_version(&stored),
+            sandbox_resource_version(&before)
+        );
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn supervisor_session_change_is_noop_while_deleting() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Deleting);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let before = runtime
+            .store
+            .get(Sandbox::object_type(), "sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
+
+        runtime
+            .supervisor_session_disconnected("sb-1")
+            .await
+            .unwrap();
+
+        let after = runtime
+            .store
+            .get(Sandbox::object_type(), "sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.resource_version, before.resource_version);
+        assert_eq!(after.payload, before.payload);
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_watch_snapshot_does_not_create_gateway_state() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-unknown");
+
+        runtime
+            .apply_sandbox_update(ready_driver_sandbox("sb-unknown", "unmanaged"))
+            .await
+            .unwrap();
+
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-unknown")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "unmanaged")
+                .is_none()
+        );
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn watcher_update_preserves_complete_api_created_spec() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        sandbox.spec = Some(SandboxSpec {
+            log_level: "debug".to_string(),
+            template: Some(SandboxTemplate {
+                image: "example.test/sandbox:complete".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        runtime.create_sandbox(sandbox, None).await.unwrap();
+        runtime
+            .apply_sandbox_update(ready_driver_sandbox("sb-1", "sandbox-a"))
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.as_ref())
+                .map(|template| template.image.as_str()),
+            Some("example.test/sandbox:complete")
+        );
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_delete_does_not_delay_unrelated_deleted_watch_event() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        let runtime = test_runtime(driver.clone()).await;
+
+        for sandbox in [
+            sandbox_record("sb-a", "sandbox-a", SandboxPhase::Ready),
+            sandbox_record("sb-b", "sandbox-b", SandboxPhase::Ready),
+        ] {
+            runtime.store.put_message(&sandbox).await.unwrap();
+            runtime.sandbox_index.update_from_sandbox(&sandbox);
+        }
+
+        let (shutdown_tx, watch_handle) = start_watch_loop(&runtime, &driver).await;
+        let mut sandbox_b_rx = runtime.sandbox_watch_bus.subscribe("sb-b");
+        let delete_runtime = runtime.clone();
+        let delete_handle =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("delete did not reach the driver");
+
+        let before = runtime
+            .store
+            .get(Sandbox::object_type(), "sb-a")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stale_snapshot = ready_driver_sandbox("sb-a", "sandbox-a");
+        stale_snapshot.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "container exited during deletion",
+        )));
+        driver.send_event(sandbox_watch_event(stale_snapshot));
+        driver.send_event(deleted_watch_event("sb-b"));
+
+        tokio::time::timeout(Duration::from_secs(1), sandbox_b_rx.recv())
+            .await
+            .expect("sandbox B event was blocked by sandbox A deletion")
+            .expect("sandbox B watch bus closed before notification");
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-b")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let after = runtime
+            .store
+            .get(Sandbox::object_type(), "sb-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.resource_version, before.resource_version);
+        assert_eq!(after.payload, before.payload);
+
+        driver.release_delete();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), delete_handle)
+                .await
+                .expect("delete did not finish")
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        stop_watch_loop(shutdown_tx, watch_handle).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_deletes_call_driver_once() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let first_runtime = runtime.clone();
+        let first =
+            tokio::spawn(async move { first_runtime.delete_sandbox("default", "sandbox-a").await });
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("first delete did not reach the driver");
+
+        let second_runtime = runtime.clone();
+        let second =
+            tokio::spawn(
+                async move { second_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        driver.release_delete();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), first)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), second)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert_eq!(driver.delete_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn waiting_delete_retries_after_leader_failure_recovery() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Error("delete failed"));
+        driver.set_get_outcome(ControlledGetOutcome::Error("lookup failed"));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let delete_gate = runtime.delete_gates.gate_for(sandbox.object_id());
+        let first_runtime = runtime.clone();
+        let first =
+            tokio::spawn(async move { first_runtime.delete_sandbox("default", "sandbox-a").await });
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("first delete did not reach the driver");
+
+        let second_runtime = runtime.clone();
+        let second =
+            tokio::spawn(
+                async move { second_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&delete_gate) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second delete did not start waiting on the sandbox gate");
+
+        driver.release_delete();
+        let first_error = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first delete did not finish")
+            .unwrap()
+            .unwrap_err();
+        assert!(first_error.message().contains("delete failed"));
+
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("waiting delete did not retry the driver call");
+        driver.set_delete_outcome(ControlledDeleteOutcome::Ok(false));
+        driver.release_delete();
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), second)
+                .await
+                .expect("second delete did not finish")
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert_eq!(driver.delete_calls(), 2);
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_waiting_delete_does_not_retry_after_leader_failure() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Error("delete failed"));
+        driver.set_get_outcome(ControlledGetOutcome::Error("lookup failed"));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let delete_gate = runtime.delete_gates.gate_for(sandbox.object_id());
+        let first_runtime = runtime.clone();
+        let first =
+            tokio::spawn(async move { first_runtime.delete_sandbox("default", "sandbox-a").await });
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("first delete did not reach the driver");
+
+        let second_runtime = runtime.clone();
+        let second =
+            tokio::spawn(
+                async move { second_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&delete_gate) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second delete did not start waiting on the sandbox gate");
+
+        second.abort();
+        assert!(second.await.unwrap_err().is_cancelled());
+        driver.release_delete();
+
+        let first_error = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first delete did not finish")
+            .unwrap()
+            .unwrap_err();
+        assert!(first_error.message().contains("delete failed"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), driver.delete_started.notified())
+                .await
+                .is_err(),
+            "canceled waiting delete unexpectedly reached the driver"
+        );
+        assert_eq!(driver.delete_calls(), 1);
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_delete_does_not_retarget_a_reused_name() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let original = sandbox_record("sb-original", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&original).await.unwrap();
+
+        // Hold the original ID's gate so the request resolves the name and
+        // then waits before it can revalidate the durable row.
+        let delete_gate = runtime.delete_gates.gate_for(original.object_id());
+        let delete_guard = delete_gate.lock().await;
+        let delete_runtime = runtime.clone();
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&delete_gate) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delete did not start waiting on the original ID gate");
+
+        runtime
+            .store
+            .delete(Sandbox::object_type(), original.object_id())
+            .await
+            .unwrap();
+        let replacement = sandbox_record("sb-replacement", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&replacement).await.unwrap();
+        drop(delete_guard);
+
+        assert!(delete.await.unwrap().unwrap().deleted);
+        assert_eq!(driver.delete_calls(), 0);
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>(replacement.object_id())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn request_cancellation_does_not_cancel_the_delete_worker() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Ok(false));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let delete_runtime = runtime.clone();
+        let request =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("delete did not reach the driver");
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        driver.release_delete();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime
+                    .store
+                    .get_message::<Sandbox>("sb-1")
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached delete worker did not finish cleanup");
+        assert_eq!(driver.delete_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn already_absent_driver_resource_is_removed_synchronously() {
+        let driver = ControlledDriver::new();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Ok(false));
+        let runtime = test_runtime(driver).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime.sandbox_index.update_from_sandbox(&sandbox);
+        let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
+
+        assert!(
+            !runtime
+                .delete_sandbox("default", "sandbox-a")
+                .await
+                .unwrap()
+                .deleted
+        );
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_sandbox_owned_records(&runtime, &sandbox, &session, false).await;
+        assert!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
+                .is_none()
+        );
+
+        runtime
+            .apply_sandbox_update(ready_driver_sandbox("sb-1", "sandbox-a"))
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_sandbox_owned_records(&runtime, &sandbox, &session, false).await;
+    }
+
+    #[tokio::test]
+    async fn already_absent_delete_retries_cleanup_after_a_deleting_version_change() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Ok(false));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let delete_runtime = runtime.clone();
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("delete did not reach the driver");
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>("sb-1", 0, |sandbox| {
+                sandbox.set_current_policy_version(9);
+            })
+            .await
+            .unwrap();
+
+        driver.release_delete();
+        assert!(!delete.await.unwrap().unwrap().deleted);
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn already_absent_delete_reports_incomplete_gateway_cleanup() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Ok(false));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let delete_runtime = runtime.clone();
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("delete did not reach the driver");
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>("sb-1", 0, |sandbox| {
+                sandbox.set_phase(SandboxPhase::Ready as i32);
+            })
+            .await
+            .unwrap();
+
+        driver.release_delete();
+        let error = delete.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), Code::Internal);
+        assert_eq!(
+            SandboxPhase::try_from(
+                runtime
+                    .store
+                    .get_message::<Sandbox>("sb-1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .phase()
+            )
+            .unwrap(),
+            SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_driver_delete_leaves_removal_to_watcher() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
+        let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
+
+        assert!(
+            runtime
+                .delete_sandbox("default", "sandbox-a")
+                .await
+                .unwrap()
+                .deleted
+        );
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Deleting
+        );
+        assert_sandbox_owned_records(&runtime, &sandbox, &session, true).await;
+        assert!(watch_rx.try_recv().is_ok());
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        runtime.apply_deleted("sb-1").await.unwrap();
+        assert_sandbox_owned_records(&runtime, &sandbox, &session, false).await;
+        assert!(watch_rx.try_recv().is_ok());
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_delete_cleans_local_state_after_another_replica_removes_row() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime.sandbox_index.update_from_sandbox(&sandbox);
+        let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
+        let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
+
+        let delete_runtime = runtime.clone();
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("delete did not reach the driver");
+        tokio::time::timeout(Duration::from_secs(1), watch_rx.recv())
+            .await
+            .expect("deleting notification was not sent")
+            .expect("watch bus closed before the deleting notification");
+
+        remove_sandbox_owned_records_from_store(&runtime, &sandbox).await;
+        driver.release_delete();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), delete)
+                .await
+                .expect("delete did not finish")
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert_sandbox_owned_records(&runtime, &sandbox, &session, false).await;
+        assert!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
+                .is_none()
+        );
+        assert!(watch_rx.try_recv().is_ok());
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn absent_delete_cleans_local_state_after_another_replica_removes_row() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Ok(false));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime.sandbox_index.update_from_sandbox(&sandbox);
+        let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
+        let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
+
+        let delete_runtime = runtime.clone();
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("delete did not reach the driver");
+        tokio::time::timeout(Duration::from_secs(1), watch_rx.recv())
+            .await
+            .expect("deleting notification was not sent")
+            .expect("watch bus closed before the deleting notification");
+
+        remove_sandbox_owned_records_from_store(&runtime, &sandbox).await;
+        driver.release_delete();
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), delete)
+                .await
+                .expect("delete did not finish")
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert_sandbox_owned_records(&runtime, &sandbox, &session, false).await;
+        assert!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
+                .is_none()
+        );
+        assert!(watch_rx.try_recv().is_ok());
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_error_with_absent_backend_removes_gateway_row() {
+        let driver = ControlledDriver::new();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Error("delete failed"));
+        let runtime = test_runtime(driver).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
+
+        runtime
+            .delete_sandbox("default", "sandbox-a")
+            .await
+            .unwrap_err();
+
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_sandbox_owned_records(&runtime, &sandbox, &session, false).await;
+    }
+
+    #[tokio::test]
+    async fn delete_error_cleans_local_state_after_another_replica_removes_row() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Error("delete failed"));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime.sandbox_index.update_from_sandbox(&sandbox);
+        let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
+        let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
+
+        let delete_runtime = runtime.clone();
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("delete did not reach the driver");
+        tokio::time::timeout(Duration::from_secs(1), watch_rx.recv())
+            .await
+            .expect("deleting notification was not sent")
+            .expect("watch bus closed before the deleting notification");
+
+        remove_sandbox_owned_records_from_store(&runtime, &sandbox).await;
+        driver.release_delete();
+
+        tokio::time::timeout(Duration::from_secs(1), delete)
+            .await
+            .expect("delete did not finish")
+            .unwrap()
+            .unwrap_err();
+        assert_sandbox_owned_records(&runtime, &sandbox, &session, false).await;
+        assert!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
+                .is_none()
+        );
+        assert!(watch_rx.try_recv().is_ok());
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+        ));
+    }
+
+    async fn assert_recovery_cleans_local_state_after_row_removed_during_lookup(
+        get_outcome: ControlledGetOutcome,
+    ) {
+        let driver = ControlledDriver::new();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Error("delete failed"));
+        driver.set_get_outcome(get_outcome);
+        driver.block_get();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime.sandbox_index.update_from_sandbox(&sandbox);
+        let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
+        let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
+
+        let delete_runtime = runtime.clone();
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.get_started.notified())
+            .await
+            .expect("delete recovery did not reach the driver lookup");
+        tokio::time::timeout(Duration::from_secs(1), watch_rx.recv())
+            .await
+            .expect("deleting notification was not sent")
+            .expect("watch bus closed before the deleting notification");
+
+        remove_sandbox_owned_records_from_store(&runtime, &sandbox).await;
+        driver.release_get();
+
+        tokio::time::timeout(Duration::from_secs(1), delete)
+            .await
+            .expect("delete did not finish")
+            .unwrap()
+            .unwrap_err();
+        assert_sandbox_owned_records(&runtime, &sandbox, &session, false).await;
+        assert!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
+                .is_none()
+        );
+        assert!(watch_rx.try_recv().is_ok());
+        assert!(matches!(
+            watch_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_recovery_cleans_local_state_after_another_replica_removes_row() {
+        assert_recovery_cleans_local_state_after_row_removed_during_lookup(
+            ControlledGetOutcome::Sandbox(Box::new(ready_driver_sandbox("sb-1", "sandbox-a"))),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rollback_recovery_cleans_local_state_after_another_replica_removes_row() {
+        assert_recovery_cleans_local_state_after_row_removed_during_lookup(
+            ControlledGetOutcome::Error("lookup failed"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_error_recovers_from_current_driver_snapshot() {
+        let driver = ControlledDriver::new();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Error("delete failed"));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+            ready_driver_sandbox("sb-1", "sandbox-a"),
+        )));
+        let runtime = test_runtime(driver).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.spec = Some(SandboxSpec {
+            log_level: "debug".to_string(),
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
+
+        let error = runtime
+            .delete_sandbox("default", "sandbox-a")
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Internal);
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        assert_sandbox_owned_records(&runtime, &sandbox, &session, true).await;
+        assert_eq!(
+            stored.spec.as_ref().map(|spec| spec.log_level.as_str()),
+            Some("debug")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_error_rolls_back_when_driver_lookup_fails() {
+        let driver = ControlledDriver::new();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Error("delete failed"));
+        driver.set_get_outcome(ControlledGetOutcome::Error("lookup failed"));
+        let runtime = test_runtime(driver).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
+
+        runtime
+            .delete_sandbox("default", "sandbox-a")
+            .await
+            .unwrap_err();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        assert_sandbox_owned_records(&runtime, &sandbox, &session, true).await;
+    }
+
+    #[tokio::test]
+    async fn delete_error_recovery_does_not_overwrite_concurrent_cas_update() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Error("delete failed"));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+            ready_driver_sandbox("sb-1", "sandbox-a"),
+        )));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let delete_runtime = runtime.clone();
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("delete did not reach the driver");
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>("sb-1", 0, |sandbox| {
+                sandbox.set_current_policy_version(9);
+            })
+            .await
+            .unwrap();
+
+        driver.release_delete();
+        tokio::time::timeout(Duration::from_secs(1), delete)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Deleting
+        );
+        assert_eq!(stored.current_policy_version(), 9);
+    }
+
+    #[tokio::test]
+    async fn driver_completion_tolerates_watcher_removing_row_in_flight() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let delete_runtime = runtime.clone();
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("delete did not reach the driver");
+        runtime.apply_deleted("sb-1").await.unwrap();
+
+        driver.release_delete();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), delete)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_error_does_not_resurrect_row_removed_by_watcher() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Error("delete failed"));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+            ready_driver_sandbox("sb-1", "sandbox-a"),
+        )));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let delete_runtime = runtime.clone();
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("delete did not reach the driver");
+        runtime.apply_deleted("sb-1").await.unwrap();
+
+        driver.release_delete();
+        tokio::time::timeout(Duration::from_secs(1), delete)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_reconciliation_lookup_does_not_delay_watch_events() {
+        let driver = ControlledDriver::new();
+        driver.block_get();
+        let snapshot = ready_driver_sandbox("sb-a", "sandbox-a");
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(snapshot.clone())));
+        let runtime = test_runtime(driver.clone()).await;
+        for sandbox in [
+            sandbox_record("sb-a", "sandbox-a", SandboxPhase::Provisioning),
+            sandbox_record("sb-b", "sandbox-b", SandboxPhase::Ready),
+        ] {
+            runtime.store.put_message(&sandbox).await.unwrap();
+        }
+
+        let (shutdown_tx, watch_handle) = start_watch_loop(&runtime, &driver).await;
+        let mut sandbox_b_rx = runtime.sandbox_watch_bus.subscribe("sb-b");
+        let reconcile_runtime = runtime.clone();
+        let reconcile = tokio::spawn(async move {
+            reconcile_runtime
+                .reconcile_snapshot_sandbox(snapshot, i64::MAX)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), driver.get_started.notified())
+            .await
+            .expect("reconciliation did not reach the driver lookup");
+
+        driver.send_event(deleted_watch_event("sb-b"));
+        tokio::time::timeout(Duration::from_secs(1), sandbox_b_rx.recv())
+            .await
+            .expect("watch event was blocked by reconciliation lookup")
+            .expect("sandbox B watch bus closed before notification");
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-b")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        driver.release_get();
+        tokio::time::timeout(Duration::from_secs(1), reconcile)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        stop_watch_loop(shutdown_tx, watch_handle).await;
+    }
+
+    #[tokio::test]
+    async fn non_deleting_container_exit_still_transitions_to_error() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let mut exited = ready_driver_sandbox("sb-1", "sandbox-a");
+        exited.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "container exited unexpectedly",
+        )));
+
+        runtime.apply_sandbox_update(exited).await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Error
         );
     }
 
@@ -2859,6 +5063,7 @@ mod tests {
                 namespace: "default".to_string(),
                 spec: None,
                 status: None,
+                workspace: "default".to_string(),
             })
             .await
             .unwrap();
@@ -2907,6 +5112,7 @@ mod tests {
                     "Starting",
                     "VM is starting",
                 ))),
+                workspace: "default".to_string(),
             })
             .await
             .unwrap();
@@ -3026,6 +5232,7 @@ mod tests {
                     }],
                     deleting: false,
                 }),
+                workspace: "default".to_string(),
             }],
             current_sandboxes: vec![DriverSandbox {
                 id: "sb-1".to_string(),
@@ -3046,6 +5253,7 @@ mod tests {
                     }],
                     deleting: false,
                 }),
+                workspace: "default".to_string(),
             }],
         }))
         .await;
@@ -3094,6 +5302,7 @@ mod tests {
                     "DependenciesNotReady",
                     "Pod exists with phase: Pending; Service Exists",
                 ))),
+                workspace: "default".to_string(),
             }],
             current_sandboxes: vec![DriverSandbox {
                 id: "sb-1".to_string(),
@@ -3107,6 +5316,7 @@ mod tests {
                     message: "Pod is Ready".to_string(),
                     last_transition_time: String::new(),
                 })),
+                workspace: "default".to_string(),
             }],
         }))
         .await;
@@ -3148,6 +5358,7 @@ mod tests {
                     }],
                     deleting: false,
                 }),
+                workspace: "default".to_string(),
             }],
             ..Default::default()
         }))
@@ -3186,7 +5397,32 @@ mod tests {
                 SANDBOX_SETTINGS_OBJECT_TYPE,
                 "settings-sb-1",
                 sandbox.object_name(),
+                sandbox.object_workspace(),
                 br#"{"revision":1,"settings":{}}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        runtime
+            .store
+            .put(
+                POLICY_OBJECT_TYPE,
+                "policy-sb-1",
+                sandbox.object_id(),
+                sandbox.object_workspace(),
+                br#"{"version":1}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        runtime
+            .store
+            .put(
+                DRAFT_CHUNK_OBJECT_TYPE,
+                "draft-sb-1",
+                sandbox.object_id(),
+                sandbox.object_workspace(),
+                br#"{"chunk":1}"#,
                 None,
             )
             .await
@@ -3212,16 +5448,36 @@ mod tests {
         assert!(
             runtime
                 .sandbox_index
-                .sandbox_id_for_sandbox_name(sandbox.object_name())
+                .sandbox_id_for_sandbox_name(sandbox.object_workspace(), sandbox.object_name())
                 .is_none()
         );
         assert!(
             runtime
                 .store
-                .get_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_name())
+                .get_by_name(
+                    SANDBOX_SETTINGS_OBJECT_TYPE,
+                    sandbox.object_workspace(),
+                    sandbox.object_name()
+                )
                 .await
                 .unwrap()
                 .is_none()
+        );
+        assert!(
+            runtime
+                .store
+                .list_by_scope(POLICY_OBJECT_TYPE, sandbox.object_id(), 100, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .store
+                .list_by_scope(DRAFT_CHUNK_OBJECT_TYPE, sandbox.object_id(), 100, 0)
+                .await
+                .unwrap()
+                .is_empty()
         );
         assert!(
             runtime
@@ -3493,7 +5749,13 @@ mod tests {
 
         runtime.validate_sandbox_create(&sandbox).await.unwrap();
         runtime.create_sandbox(sandbox, None).await.unwrap();
-        assert!(runtime.delete_sandbox("uds-sandbox").await.unwrap());
+        assert!(
+            runtime
+                .delete_sandbox("default", "uds-sandbox")
+                .await
+                .unwrap()
+                .deleted
+        );
 
         let calls = driver.calls();
         assert_eq!(calls.len(), 4, "unexpected calls: {calls:?}");
@@ -3550,6 +5812,8 @@ mod tests {
             labels: HashMap::new(),
             resource_version: 0,
             annotations: HashMap::new(),
+            workspace: "default".to_string(),
+            deletion_timestamp_ms: 0,
         });
 
         let created = runtime.create_sandbox(sandbox, None).await.unwrap();
@@ -3573,6 +5837,29 @@ mod tests {
             1,
             "database should have resource_version: 1 after create"
         );
+    }
+
+    #[tokio::test]
+    async fn created_sandbox_is_immediately_visible_to_label_selectors() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox =
+            sandbox_record("sb-labeled", "labeled-sandbox", SandboxPhase::Provisioning);
+        sandbox
+            .metadata
+            .as_mut()
+            .unwrap()
+            .labels
+            .insert("env".to_string(), "prod".to_string());
+
+        runtime.create_sandbox(sandbox, None).await.unwrap();
+
+        let matching = runtime
+            .store
+            .list_messages_with_selector::<Sandbox>("default", "env=prod", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].object_id(), "sb-labeled");
     }
 
     #[tokio::test]
@@ -3625,7 +5912,7 @@ mod tests {
             .expect("should have one successful creation");
         let retrieved = runtime
             .store
-            .get_message_by_name::<Sandbox>("test-concurrent")
+            .get_message_by_name::<Sandbox>("default", "test-concurrent")
             .await
             .unwrap();
         assert!(
@@ -3637,5 +5924,74 @@ mod tests {
             created_sandbox.object_id(),
             "retrieved sandbox should match created sandbox"
         );
+    }
+
+    #[test]
+    fn driver_sandbox_from_public_populates_workspace() {
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-1".to_string(),
+                name: "work".to_string(),
+                workspace: "alpha".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let driver_sb = driver_sandbox_from_public(&sandbox, "kubernetes").unwrap();
+        assert_eq!(driver_sb.workspace, "alpha");
+        assert_eq!(driver_sb.name, "work");
+        assert_eq!(driver_sb.id, "sb-1");
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_ignores_unknown_workspace_snapshot() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-w1".to_string(),
+                name: "work".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(make_driver_status(make_driver_condition(
+                    "DependenciesNotReady",
+                    "Provisioning",
+                ))),
+                workspace: "team-ml".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime.store.get_message::<Sandbox>("sb-w1").await.unwrap();
+        assert!(stored.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_preserves_workspace() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-w2", "work", SandboxPhase::Provisioning);
+        sandbox.metadata.as_mut().unwrap().workspace = "alpha".to_string();
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-w2".to_string(),
+                name: "work".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(make_driver_status(make_driver_condition(
+                    "DependenciesNotReady",
+                    "Provisioning",
+                ))),
+                workspace: "different-workspace".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-w2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.object_workspace(), "alpha");
     }
 }

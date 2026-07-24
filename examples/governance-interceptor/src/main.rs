@@ -1235,6 +1235,8 @@ async fn propagate_policy_to_running_sandboxes(
                 limit,
                 offset,
                 label_selector: String::new(),
+                workspace: String::new(),
+                all_workspaces: true,
             })
             .await
             .map_err(|status| format!("list sandboxes failed: {status}"))?

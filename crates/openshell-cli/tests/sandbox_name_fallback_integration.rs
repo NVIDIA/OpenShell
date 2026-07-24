@@ -58,6 +58,13 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
+    async fn get_gateway_info(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
+    ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn create_sandbox(
         &self,
         _request: tonic::Request<CreateSandboxRequest>,
@@ -80,6 +87,8 @@ impl OpenShell for TestOpenShell {
                     labels: std::collections::HashMap::new(),
                     resource_version: 0,
                     annotations: std::collections::HashMap::new(),
+                    workspace: String::new(),
+                    deletion_timestamp_ms: 0,
                 }),
                 ..Default::default()
             }),
@@ -562,6 +571,55 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::ForwardTcpStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
+
+    async fn create_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::CreateWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::GetWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspaces(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspacesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspacesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn add_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::AddWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::AddWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn remove_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RemoveWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::RemoveWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspace_members(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspaceMembersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspaceMembersResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 }
 
 struct TestServer {
@@ -629,9 +687,16 @@ async fn run_server() -> TestServer {
 async fn sandbox_get_sends_correct_name() {
     let ts = run_server().await;
 
-    run::sandbox_get(&ts.endpoint, "my-sandbox", false, &ts.tls)
-        .await
-        .expect("sandbox_get should succeed");
+    run::sandbox_get(
+        &ts.endpoint,
+        "my-sandbox",
+        false,
+        "table",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox_get should succeed");
 
     let recorded = ts.openshell.state.last_get_name.lock().await.clone();
     assert_eq!(
@@ -646,9 +711,16 @@ async fn sandbox_get_sends_correct_name() {
 async fn sandbox_get_policy_only_round_trip() {
     let ts = run_server().await;
 
-    run::sandbox_get(&ts.endpoint, "my-sandbox", true, &ts.tls)
-        .await
-        .expect("sandbox_get with policy_only should succeed");
+    run::sandbox_get(
+        &ts.endpoint,
+        "my-sandbox",
+        true,
+        "table",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox_get with policy_only should succeed");
 
     let recorded = ts.openshell.state.last_get_name.lock().await.clone();
     assert_eq!(recorded.as_deref(), Some("my-sandbox"));
@@ -663,16 +735,16 @@ async fn sandbox_get_with_persisted_last_sandbox() {
     let _guard = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
 
     // Persist a last-used sandbox for "integration-cluster".
-    save_last_sandbox("integration-cluster", "persisted-sb")
+    save_last_sandbox("integration-cluster", "default", "persisted-sb")
         .expect("save_last_sandbox should succeed");
 
     // Resolve the name (simulates what the CLI does in main.rs).
-    let resolved = load_last_sandbox("integration-cluster")
+    let resolved = load_last_sandbox("integration-cluster", "default")
         .expect("load_last_sandbox should return the saved name");
     assert_eq!(resolved, "persisted-sb");
 
     // Call sandbox_get with the resolved name.
-    run::sandbox_get(&ts.endpoint, &resolved, false, &ts.tls)
+    run::sandbox_get(&ts.endpoint, &resolved, false, "table", "default", &ts.tls)
         .await
         .expect("sandbox_get should succeed");
 
@@ -696,6 +768,7 @@ async fn policy_get_full_json_cli_prints_policy_payload() {
         0,
         run::PolicyGetView::Full,
         "json",
+        "default",
         &ts.tls,
         (&mut stdout, &mut stderr),
     )
@@ -744,6 +817,7 @@ async fn policy_get_base_json_cli_prints_round_trippable_policy_payload() {
         0,
         run::PolicyGetView::Base,
         "json",
+        "default",
         &ts.tls,
         (&mut stdout, &mut stderr),
     )
@@ -785,6 +859,7 @@ async fn policy_get_explicit_revision_uses_stored_policy_status() {
         3,
         run::PolicyGetView::Full,
         "json",
+        "default",
         &ts.tls,
         (&mut stdout, &mut stderr),
     )
@@ -820,11 +895,18 @@ async fn explicit_name_takes_precedence_over_persisted() {
     let _guard = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
 
     // Persist one name, but supply a different one explicitly.
-    save_last_sandbox("my-cluster", "old-sandbox").expect("save should succeed");
+    save_last_sandbox("my-cluster", "default", "old-sandbox").expect("save should succeed");
 
-    run::sandbox_get(&ts.endpoint, "explicit-sandbox", false, &ts.tls)
-        .await
-        .expect("sandbox_get should succeed");
+    run::sandbox_get(
+        &ts.endpoint,
+        "explicit-sandbox",
+        false,
+        "table",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox_get should succeed");
 
     let recorded = ts.openshell.state.last_get_name.lock().await.clone();
     assert_eq!(

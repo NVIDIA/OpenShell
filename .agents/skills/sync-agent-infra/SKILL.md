@@ -9,7 +9,7 @@ Detect and fix drift across the agent-first infrastructure files. These files re
 
 | File | What it tracks |
 |------|---------------|
-| `AGENTS.md` | Project identity, workflow chains, architecture overview, issue/PR conventions |
+| `AGENTS.md` | Project identity, workflow chains, architecture overview, issue/PR conventions, skill maintenance pointer |
 | `CONTRIBUTING.md` | Skills table, workflow chains, "When to Open an Issue" guidance, skill references |
 | `README.md` | "Built With Agents" section, "Explore with your agent" skill references |
 | `.github/ISSUE_TEMPLATE/bug_report.yml` | Skill name references in diagnostic guidance |
@@ -18,15 +18,42 @@ Detect and fix drift across the agent-first infrastructure files. These files re
 | `.github/workflows/issue-triage.yml` | Comment text referencing skills |
 | `.agents/skills/triage-issue/SKILL.md` | Skill name references in gate check and diagnosis steps |
 | `.agents/skills/openshell-cli/SKILL.md` | Companion skills table |
-| `.agents/skills/build-from-issue/SKILL.md` | `state:triage-needed` label awareness |
+| `.agents/skills/create-github-pr/SKILL.md` | Pre-PR agent infrastructure check |
+| `.agents/skills/review-github-pr/SKILL.md` | Review-time agent infrastructure check |
+| `.agents/skills/build-from-issue/SKILL.md` | Label awareness and pre-commit agent infrastructure check |
+| `.claude/agents/principal-engineer-reviewer.md` | Shared review-time agent infrastructure check |
 
 ## When to Run
 
 - After adding, removing, or renaming a skill in `.agents/skills/`
 - After adding, removing, or renaming a crate in `crates/`
 - After changing workflow chain relationships between skills
+- After changing which product or development areas a skill covers
 - After modifying issue or PR templates
 - Before opening a PR that touches any of the above
+
+## Skill Maintenance Map
+
+Use this map when product behavior, commands, or development workflows change. It is a routing aid, not an exhaustive dependency list. Search `.agents/skills/` for the changed command, field, component, or workflow before concluding that no other skill needs an update.
+
+| Change area | Skills to review |
+|---|---|
+| CLI commands, flags, defaults, or workflows | `openshell-cli` |
+| Sandbox policy schema, presets, or enforcement behavior | `generate-sandbox-policy`, `openshell-cli` |
+| Supervisor middleware policy, registrations, runtime, or failure behavior | `generate-sandbox-policy`, `openshell-cli`, `debug-openshell-cluster` |
+| Gateway deployment, Helm, runtime drivers, or health checks | `debug-openshell-cluster`, `helm-dev-environment` |
+| Inference routing, providers, or `inference.local` behavior | `debug-inference`, `openshell-cli` |
+| TUI architecture, navigation, data fetching, or UX | `tui-development` |
+| Release artifacts or post-publish smoke coverage | `test-release-canary` |
+| GitHub Actions workflows, required checks, or CI diagnostics | `watch-github-actions`; also `test-release-canary` for release smoke coverage |
+| Gator harness, sandbox image, supervision, or model overrides | `launch-openshell-gator` |
+| SBOM generation, dependency metadata, or license workflows | `sbom` |
+| Issue templates, labels, contribution gates, or spike/build workflow | `triage-issue`, `create-spike`, `build-from-issue`, `create-github-issue` |
+| PR template, review conventions, or vouch behavior | `create-github-pr`, `review-github-pr`, `build-from-issue` |
+| Security review or remediation workflow | `review-security-issue`, `fix-security-issue` |
+| RFC template, numbering, or lifecycle | `create-rfc` |
+| Documentation structure, navigation, or doc-update workflow | `update-docs` |
+| Skills, crates, workflow chains, issue/PR templates, or agent cross-references | `sync-agent-infra` |
 
 ## Prerequisites
 
@@ -77,6 +104,7 @@ For each file in the table above, check for the following inconsistencies:
 1. **Architecture overview** — Every crate in `crates/` must appear in the architecture table. The `python/`, `proto/`, `deploy/`, `.agents/` rows must also be present.
 2. **Workflow chains** — Verify each skill named in a chain exists in `.agents/skills/`.
 3. **Issue/PR conventions** — Verify referenced skills (`create-github-issue`, `create-github-pr`, `build-from-issue`) exist.
+4. **Skill maintenance pointer** — Verify it still points to `sync-agent-infra` and does not duplicate the maintenance map from this skill.
 
 ### `README.md`
 
@@ -100,6 +128,7 @@ For each file in the table above, check for the following inconsistencies:
 3. **`build-from-issue`** — Label names must match the project's label taxonomy.
 4. **`create-spike`** — Reference to `build-from-issue` as next step must be accurate.
 5. **`review-security-issue`** / **`fix-security-issue`** — Cross-references between the two must be accurate.
+6. **PR creation and review checks** — The `create-github-pr`, `review-github-pr`, `build-from-issue`, and `principal-engineer-reviewer` references to `sync-agent-infra` must exist and use trigger conditions aligned with this skill.
 
 ## Step 3: Report Drift
 
@@ -125,6 +154,7 @@ If any inconsistencies are found, report them in a structured format:
 ### Cross-References
 - <file>:<line> references non-existent skill <skill>
 - <file>:<line> references non-existent label <label>
+- The skill maintenance map has a stale or missing change-area mapping: <details>
 - OK: <count> references consistent
 ```
 
@@ -140,6 +170,7 @@ If drift is found, fix it by updating the affected files:
 4. **Added crate** — Add a row to the AGENTS.md architecture table.
 5. **Removed crate** — Remove the row from the AGENTS.md architecture table.
 6. **Changed workflow chain** — Update chains in both `AGENTS.md` and `CONTRIBUTING.md`. Update the "Built With Agents" section in `README.md` if the change is user-visible.
+7. **Changed skill coverage** — Update the skill maintenance map in this file and any affected cross-references or companion-skill tables.
 
 After fixing, re-run Step 2 to verify consistency.
 

@@ -41,6 +41,28 @@ Environment:
                           Podman supervisor sideload image. Defaults to
                           openshell/supervisor:dev and is built on demand.
 
+Corporate proxy (Podman driver only):
+  OPENSHELL_SANDBOX_HTTPS_PROXY
+                          Corporate forward proxy URL for sandbox TLS
+                          egress, in explicit http://host:port form.
+  OPENSHELL_SANDBOX_NO_PROXY
+                          Comma-separated NO_PROXY list (hostnames, domain
+                          suffixes, IPs, CIDRs, optional :port qualifiers)
+                          dialed directly instead of through the proxy.
+  OPENSHELL_SANDBOX_PROXY_AUTH_FILE
+                          Path to a file with proxy credentials as
+                          user:pass. Requires the acknowledgement below —
+                          the gateway refuses to start with one but not
+                          the other.
+  OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE
+                          Set to true to acknowledge that the credential
+                          is sent as cleartext Basic auth over the
+                          plain-TCP connection to the http:// proxy.
+  OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME
+                          Set to true to send the destination hostname in
+                          CONNECT instead of a validated IP. Last resort
+                          for hostname-filtering proxy ACLs.
+
 Docker and VM runs delegate to gateway:docker and gateway:vm setup scripts.
 EOF
 }
@@ -108,6 +130,19 @@ detect_driver() {
   echo "ERROR: no compute driver detected." >&2
   echo "       Start Podman or Docker, run inside Kubernetes, or set OPENSHELL_DRIVERS." >&2
   exit 2
+}
+
+# Escape a value for embedding in a double-quoted TOML basic string, so
+# quotes, backslashes, or control characters in an environment value cannot
+# corrupt gateway.toml or inject extra configuration keys.
+toml_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "${s}"
 }
 
 port_is_in_use() {
@@ -310,6 +345,9 @@ echo "Generating local gateway credentials..."
 
 mkdir -p "${STATE_DIR}"
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
+# The config may reference credential-bearing material (e.g. proxy_auth_file);
+# keep it owner-only regardless of the ambient umask.
+install -m 600 /dev/null "${CONFIG_PATH}"
 cat >"${CONFIG_PATH}" <<EOF
 [openshell]
 version = 1
@@ -351,6 +389,43 @@ image_pull_policy = "$(podman_pull_policy "${SANDBOX_IMAGE_PULL_POLICY}")"
 EOF
     if [[ -n "${GRPC_ENDPOINT}" ]]; then
       printf 'grpc_endpoint = "%s"\n' "${GRPC_ENDPOINT}" >>"${CONFIG_PATH}"
+    fi
+    # ${VAR+x} distinguishes unset from set-but-empty: an unset variable
+    # writes nothing, but an explicitly empty one is written through so the
+    # gateway's fail-closed proxy validation rejects it at startup instead of
+    # this script silently dropping it.
+    if [[ -n "${OPENSHELL_SANDBOX_HTTPS_PROXY+x}" ]]; then
+      printf 'https_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_HTTPS_PROXY}")" >>"${CONFIG_PATH}"
+    fi
+    if [[ -n "${OPENSHELL_SANDBOX_NO_PROXY+x}" ]]; then
+      printf 'no_proxy = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_NO_PROXY}")" >>"${CONFIG_PATH}"
+    fi
+    if [[ -n "${OPENSHELL_SANDBOX_PROXY_AUTH_FILE+x}" ]]; then
+      printf 'proxy_auth_file = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_AUTH_FILE}")" >>"${CONFIG_PATH}"
+    fi
+    if [[ -n "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE+x}" ]]; then
+      case "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}" in
+        true|false)
+          printf 'proxy_auth_allow_insecure = %s\n' "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}" >>"${CONFIG_PATH}"
+          ;;
+        *)
+          # Not a TOML boolean: write it as a quoted string so the gateway's
+          # config parser rejects it at startup (fail closed, no injection).
+          printf 'proxy_auth_allow_insecure = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE}")" >>"${CONFIG_PATH}"
+          ;;
+      esac
+    fi
+    if [[ -n "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME+x}" ]]; then
+      case "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}" in
+        true|false)
+          printf 'proxy_connect_by_hostname = %s\n' "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}" >>"${CONFIG_PATH}"
+          ;;
+        *)
+          # Not a TOML boolean: write it as a quoted string so the gateway's
+          # config parser rejects it at startup (fail closed, no injection).
+          printf 'proxy_connect_by_hostname = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}")" >>"${CONFIG_PATH}"
+          ;;
+      esac
     fi
     ;;
 esac

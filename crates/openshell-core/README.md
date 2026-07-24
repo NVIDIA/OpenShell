@@ -50,3 +50,17 @@ router agree on provider defaults. Profiles define:
 
 Do not duplicate provider-specific inference behavior in callers. Add shared
 behavior here, then consume it from the gateway, sandbox, and router.
+
+## Middleware Contracts
+
+Built-in supervisor middleware identifiers, host-selector matching, and pure
+configuration validation live in `openshell_core::middleware`. Policy admission
+and the supervisor runtime consume the same contract without introducing a
+dependency from the policy crate to the supervisor implementation.
+
+## Protobuf Struct Conversion
+
+Use `openshell_core::proto_struct` when crossing between `serde_json` values and
+`prost_types::{Struct, Value}`. Both conversion directions live in this module;
+JSON-to-protobuf conversion is fallible so callers cannot silently replace an
+unrepresentable number.

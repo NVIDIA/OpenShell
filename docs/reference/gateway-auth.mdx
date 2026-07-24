@@ -20,6 +20,12 @@ When any CLI command needs to talk to the gateway, it resolves the target throug
 
 The CLI loads gateway metadata from `~/.config/openshell/gateways/<name>/metadata.json` first and falls back to `/etc/openshell/gateways/<name>/metadata.json` when no user entry exists.
 
+## Authentication Status
+
+`openshell status` reports gateway reachability and authentication separately. The public health RPC determines whether the gateway is connected and supplies its version. The CLI then calls the existing protected gateway-info capability query to verify the configured credentials. An authorization denial still confirms that the gateway authenticated the caller.
+
+For example, an expired bearer token can produce `Status: Connected` and `Authentication: Failed`. This means the gateway is healthy but protected commands cannot use the current credentials. Run `openshell gateway login <name>` to re-authenticate. When a gateway predates the gateway-info capability query, the CLI reports `Authentication: Unverified` rather than treating a successful public health check as proof of authentication.
+
 ## Authentication Modes
 
 The CLI uses one of these authentication modes depending on the gateway's configuration.
@@ -119,7 +125,7 @@ When you register or log in to an OIDC gateway, the CLI uses the Authorization C
 The connection flow:
 
 1. The CLI loads the stored OIDC token bundle.
-2. If the access token is expired and a refresh token is available, the CLI refreshes it.
+2. If the access token is expired and a refresh token is available, the CLI refreshes it with the OIDC scopes saved in the gateway metadata.
 3. The CLI connects to the gateway and attaches `authorization: Bearer <token>` metadata to each gRPC request.
 4. The gateway validates the JWT signature, issuer, audience, expiration, and key ID against the issuer's JWKS.
 5. The gateway extracts roles and optional scopes from the configured claim paths.

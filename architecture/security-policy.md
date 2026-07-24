@@ -28,6 +28,13 @@ enrichment adds existing GPU device nodes as read-write paths and promotes
 `/proc` to read-write because CUDA workloads write thread metadata under
 `/proc/<pid>/task/<tid>/comm`.
 
+Landlock rules are tailored to the inode type reported by the already-opened
+path descriptor. Directories retain the requested directory and file rights;
+regular files, device nodes, sockets, and other non-directories retain only
+file-compatible rights. This avoids rejecting valid mixed-path policies without
+weakening `hard_requirement`: genuine unsupported ABI capabilities and
+preparation failures still fail sandbox startup.
+
 ## Network Decisions
 
 Ordinary network traffic follows this order:
@@ -46,18 +53,21 @@ request is denied.
 ## Host Wildcards
 
 Network endpoint `host` patterns accept a `*` wildcard inside the first DNS
-label only. The OPA runtime matches with a `.` label boundary, so a wildcard
-never spans dots. The validator enforces the same boundary so that policy load
-fails fast instead of silently mismatching at the proxy.
+label and as an entire middle DNS label. The OPA runtime matches with a `.`
+label boundary, so a wildcard never spans dots. The validator enforces the same
+boundary so that policy load fails fast instead of silently mismatching at the
+proxy.
 
 | Pattern | Accepted | Example match | Notes |
 |---|---|---|---|
 | `*.example.com` | Yes | `api.example.com` | Single first label of any value. |
 | `**.example.com` | Yes | `a.b.example.com` | Recursive wildcard as the entire first label. |
 | `*-aiplatform.googleapis.com` | Yes | `us-central1-aiplatform.googleapis.com` | Intra-label wildcard inside the first DNS label. |
+| `*.s3.*.amazonaws.com` | Yes | `bucket.s3.us-east-1.amazonaws.com` | Middle-label `*` matches exactly one DNS label. |
 | `*` or `**` | No | — | Matches every host. |
 | `*.com`, `**.com` | No | — | TLD wildcards (`labels <= 2`). |
-| `foo.*.example.com` | No | — | Wildcard outside the first DNS label. |
+| `foo.us-*.example.com` | No | — | Partial middle-label wildcards are not allowed. |
+| `foo.**.example.com` | No | — | Recursive wildcard outside the first label is not allowed. |
 | `foo**.example.com` | No | — | Recursive `**` mixed inside a label; allowed only as the entire first label. |
 
 Validation rejects the disallowed patterns at policy load time with a message
@@ -112,17 +122,25 @@ through the proposal loop instead of treating the denial as terminal.
    policy plus the sandbox's attached-provider credential set, then computes
    the delta of findings between the current baseline and the merged policy.
 3. **Auto-approval gate (proposer-agnostic, opt-in).** Auto-approval fires
-   when *both* (a) the prover delta is empty (`prover: no new findings`) AND
-   (b) the `proposal_approval_mode` setting resolves to `"auto"` — gateway
-   scope wins, sandbox scope is the per-sandbox override, default is
-   `"manual"`. When both hold, the gateway internally invokes the approve
-   path with actor identity `system:auto`. The audit event uses
-   `CONFIG:APPROVED` and carries `auto=true`, `source=<mode>`,
-   `prover_delta=empty`, and `resolved_from=<gateway|sandbox>` as unmapped
-   fields, with message text `"auto-approved: no new prover findings"` —
-   never `safe`. The opt-in gate preserves OpenShell's default-deny
-   posture: with no setting at either scope, every proposal lands in
-   `pending` for human review, even when the prover sees no findings.
+   only when *all three* conditions hold: (a) `proposal_approval_mode`
+   resolves to `"auto"` — gateway scope wins, sandbox scope is the
+   per-sandbox override, default is `"manual"`; (b) the prover delta is empty
+   (`prover: no new findings`); and (c) the security notes recomputed from
+   the chunk's current proposed rule are empty (see
+   [Security-notes gate](#security-notes-gate)). Before merging, the gateway
+   reloads the stored chunk and reruns both checks on its current rule. This is
+   important after edits and mechanistic deduplication: the stored rule, not a
+   duplicate incoming payload or stale persisted analysis, controls the
+   decision. The recalculated prover verdict is decision-local rather than
+   persisted, so `validation_result` reads can still show the submit-time
+   verdict after an edit or deduplication. Decode, prover, or merge failures
+   leave the chunk pending. The audit event uses `CONFIG:APPROVED` and carries
+   `auto=true`, `source=<mode>`, `prover_delta=empty`, and
+   `resolved_from=<gateway|sandbox>` as unmapped fields, with message text
+   `"auto-approved: no new prover findings"` — never `safe`. The opt-in gate
+   preserves OpenShell's default-deny posture: with no setting at either
+   scope, every proposal lands in `pending` for human review, even
+   when the prover sees no findings.
 4. **Implicit supersede.** On any successful submission, the gateway scans
    the sandbox's pending chunks for matches on `(host, port, binary)` and
    auto-rejects the older ones with reason `"superseded by chunk X"`. This
@@ -141,6 +159,30 @@ through the proposal loop instead of treating the denial as terminal.
    would leave the governance ledger disagreeing with the still-enforced
    policy.
 6. **Escalation.** Anything else lands in `pending` for human review.
+
+### Security-notes gate
+
+Separately from the prover, each chunk carries advisory `security_notes`.
+Reads, bulk approval, and auto-approval regenerate them from the current
+stored proposed rule instead of trusting a persisted value that may be stale
+after an edit. Non-empty notes block auto-approval and make
+`ApproveAllDraftChunks` skip the chunk unless `include_security_flagged` is
+set. The chunk stays `pending`; an explicit human approval can still merge a
+flagged chunk.
+
+Private/internal destinations are advisory, not blocking. A literal endpoint
+IP, `allowed_ips` entry, or CIDR intersection in RFC 1918, CGNAT
+`100.64.0.0/10`, IPv6 ULA `fc00::/7`, or another special-use range covered by
+`openshell-core` `net::is_internal_net` produces a note. A hostless rule
+carrying `allowed_ips` earns an extra note because it can match any hostname
+resolving into the range.
+
+Always-blocked destinations are separate from this advisory classification.
+Loopback, link-local, and unspecified IPs/CIDRs, plus `localhost` and known
+metadata endpoint hostnames, are excluded from security notes. Submit and edit
+may store such a draft, but existing merge validation rejects it when an
+approval attempts to add it to policy; runtime SSRF protections remain the
+final enforcement boundary.
 
 ## What the prover decides
 
@@ -191,6 +233,10 @@ Sandbox events that represent observable behavior use OCSF structured logs:
 
 Use plain tracing for internal plumbing such as retries, debug state, and
 intermediate steps where the final observable event is logged separately.
+Forward-proxy success is a final observable event: emit it only after
+middleware, token grants, credential rewriting, policy-generation checks, and
+the HTTP relay have succeeded so a later denial cannot coexist with an allowed
+record for the same request.
 
 Never log secrets, credentials, bearer tokens, or query parameters in OCSF
 messages. OCSF JSONL output may be shipped to external systems.

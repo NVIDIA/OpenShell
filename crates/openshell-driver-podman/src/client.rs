@@ -484,12 +484,12 @@ impl PodmanClient {
         .await
     }
 
-    /// List containers matching a label filter (e.g. `"openshell.managed=true"`).
+    /// List containers matching label filters (e.g. `&["openshell.managed=true"]`).
     pub async fn list_containers(
         &self,
-        label_filter: &str,
+        label_filters: &[&str],
     ) -> Result<Vec<ContainerListEntry>, PodmanApiError> {
-        let filters = serde_json::json!({"label": [label_filter]});
+        let filters = serde_json::json!({"label": label_filters});
         let encoded = url_encode(&filters.to_string());
         self.request_json(
             hyper::Method::GET,

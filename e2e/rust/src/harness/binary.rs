@@ -3,9 +3,9 @@
 
 //! CLI binary resolution for e2e tests.
 //!
-//! Resolves the `openshell` binary at `<workspace>/target/debug/openshell`.
-//! The binary must already be built — the `e2e:rust` mise task handles
-//! this by running `cargo build -p openshell-cli` before the tests.
+//! Resolves the `openshell` binary from `OPENSHELL_BIN`, or from
+//! `<workspace>/target/debug/openshell` for local runs. The local binary must
+//! already be built — the E2E mise tasks do this before running the tests.
 
 use std::path::{Path, PathBuf};
 
@@ -22,17 +22,20 @@ fn workspace_root() -> PathBuf {
 
 /// Return the path to the `openshell` CLI binary.
 ///
-/// Expects the binary at `<workspace>/target/debug/openshell`.
+/// Uses `OPENSHELL_BIN` when set, otherwise expects the binary at
+/// `<workspace>/target/debug/openshell`.
 ///
 /// # Panics
 ///
-/// Panics if the binary is not found. Run `cargo build -p openshell-cli`
-/// (or `mise run e2e:rust`) first.
+/// Panics if the configured or locally-built binary is not found.
 pub fn openshell_bin() -> PathBuf {
-    let bin = workspace_root().join("target/debug/openshell");
+    let bin = std::env::var_os("OPENSHELL_BIN").map_or_else(
+        || workspace_root().join("target/debug/openshell"),
+        PathBuf::from,
+    );
     assert!(
         bin.is_file(),
-        "openshell binary not found at {} — run `cargo build -p openshell-cli` first",
+        "openshell binary not found at {} — set OPENSHELL_BIN or run `cargo build -p openshell-cli` first",
         bin.display()
     );
     bin

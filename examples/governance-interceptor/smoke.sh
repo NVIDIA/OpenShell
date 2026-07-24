@@ -53,7 +53,9 @@ if [[ "$RUN_TEST_SUITE" -eq 1 ]]; then
 else
   RUN_ID="governance-interactive-$$-$RANDOM"
 fi
-SANDBOX_NAME="$RUN_ID-sandbox"
+# Sandbox names are capped at 19 characters. Use a short prefix with
+# the PID for uniqueness; the full RUN_ID is kept for log directory naming.
+SANDBOX_NAME="gs-$$-$RANDOM"
 
 mkdir -p "$LOG_DIR" "$PROFILE_DIR"
 cp "$EXAMPLE_DIR"/profiles/*.yaml "$PROFILE_DIR"/

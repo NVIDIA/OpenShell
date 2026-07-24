@@ -10,7 +10,7 @@ position: 6
 
 Policy advisor lets a running sandboxed agent ask for a narrow network policy change after OpenShell denies a request. The agent submits a draft through `policy.local`, a developer approves or rejects it from outside the sandbox, and approved network policy hot-reloads into the same sandbox.
 
-Policy advisor preserves OpenShell's default-deny posture. The structured rule is the approval contract, and the agent's rationale is supporting context. By default every proposal lands in the draft inbox for human review. Opt-in [auto mode](#approval-modes) lets the gateway approve provably safe proposals — those whose [prover delta](#what-auto-approval-checks) is empty — without a reviewer in the loop; proposals with any prover finding still require human approval.
+Policy advisor preserves OpenShell's default-deny posture. The structured rule is the approval contract, and the agent's rationale is supporting context. By default every accepted proposal lands in the draft inbox for human review. Opt-in [auto mode](#approval-modes) approves a proposal without a reviewer only when its [prover delta](#what-auto-approval-checks) is empty and the current draft rule produces no security notes. A prover finding or security note keeps the proposal pending for human review.
 
 ## Enable Policy Advisor
 
@@ -49,16 +49,16 @@ Set the value before creating a sandbox when you want the first denied request t
 
 ## Approval Modes
 
-Every proposal — mechanistic or agent-authored — is routed through the [policy prover](#what-auto-approval-checks). The `proposal_approval_mode` setting decides what happens when the prover finds nothing to flag.
+Every proposal, mechanistic or agent-authored, is routed through the [policy prover](#what-auto-approval-checks). The gateway also recalculates security notes from the current draft rule before auto-approval. The `proposal_approval_mode` setting decides whether proposals that pass both checks require human review.
 
 | Mode | When unset / `manual` | `auto` |
 |---|---|---|
-| Empty prover delta | Lands in the draft inbox for human review. | Approved automatically; the sandbox hot-reloads the new rule and the agent retries. |
-| Any prover finding | Lands in the draft inbox. | Lands in the draft inbox — auto-approval is gated on an empty delta. |
+| Empty prover delta and no security notes | Lands in the draft inbox for human review. | Approved automatically. The sandbox hot-reloads the new rule and the agent retries. |
+| Any prover finding or security note | Lands in the draft inbox. | Remains pending for human review. |
 
 `manual` is the default. Auto mode is an explicit opt-in; OpenShell's default-deny posture is preserved unless you choose otherwise.
 
-Enable auto mode at gateway scope when you want every sandbox on this gateway to auto-approve safe proposals:
+Enable auto mode at gateway scope when you want every sandbox on this gateway to auto-approve eligible proposals:
 
 ```shell
 openshell settings set --global \
@@ -103,7 +103,7 @@ The loop has seven steps:
 3. The agent reads the policy advisor skill, inspects the current policy, and optionally reads recent denial log lines.
 4. The agent submits one or more `addRule` proposals to `http://policy.local/v1/proposals`.
 5. The gateway stores accepted proposals as pending draft chunks for the sandbox and runs the [policy prover](#what-auto-approval-checks) against the proposed delta.
-6. Under `auto` mode, proposals with an empty prover delta are approved immediately and skipped past human review. Under `manual` mode (the default), every proposal — and under `auto` mode, every proposal with a prover finding — lands in the draft inbox for a developer to approve or reject.
+6. Before auto-approval, the gateway reloads the current stored rule, recalculates its prover verdict, and regenerates its security notes. Under `auto` mode, it approves the proposal only when both the prover delta and security notes are empty. Any finding or security note keeps the proposal pending. Under `manual` mode, every accepted proposal lands in the draft inbox for a developer to approve or reject.
 7. The agent waits on `/v1/proposals/{chunk_id}/wait` until a decision is available. Approved proposals hot-reload into the sandbox; rejected proposals return `rejection_reason` and `validation_result` so the agent can revise.
 
 When a proposal is approved, `/wait` reports `policy_reloaded: true` only after the local sandbox policy covers the approved rule. At that point the agent can retry the original denied action once. If a proposal is rejected, `/wait` returns `rejection_reason` and `validation_result` so the agent can revise or stop. `validation_result` carries the categorical prover findings — `link_local_reach`, `l7_bypass_credentialed`, `credential_reach_expansion`, `capability_expansion` — so the agent can narrow the next attempt to the specific concern the prover flagged.
@@ -160,18 +160,26 @@ The current `policy.local` JSON shape covers L4 endpoints and REST method or pat
 
 Policy advisor proposals do not add `allowed_ips` automatically. If an advisor-proposed hostname resolves to an internal or private address, OpenShell's SSRF protections still block the connection until a developer explicitly adds the required `allowed_ips` entry. Exact hostname trust for user-declared policy endpoints does not apply to advisor-generated proposal binaries.
 
+Private RFC 1918, CGNAT, IPv6 ULA, and other special-use destinations classified as internal produce advisory security notes when they appear as literal endpoint IPs or in `allowed_ips`. CIDR intersections are included, and hostless `allowed_ips` rules receive an additional warning because they can match any hostname resolving into the configured range.
+
+Always-blocked destinations are not advisory. Loopback, link-local, and unspecified IPs or CIDRs, plus `localhost` and known metadata endpoint hostnames, are excluded from security notes. Submit and edit can store such a draft, but approval fails when merge validation prevents it from entering the active policy. Runtime SSRF protections continue to enforce the same boundary.
+
 ## What Auto-Approval Checks
 
-The policy prover runs against every proposal — mechanistic and agent-authored alike — and asks four formal questions about the proposed change. Each "yes" is one categorical finding. Any finding blocks auto-approval; only an empty delta is eligible.
+Auto-approval requires all three conditions: the effective mode is `auto`, the prover delta is empty, and recalculating security notes from the current stored rule produces none.
+
+The policy prover runs against mechanistic and agent-authored proposals alike and asks four formal questions about the proposed change. Each "yes" is one categorical finding. Any finding blocks auto-approval. An empty delta is necessary but not sufficient.
 
 | Category | Triggered when |
 |---|---|
-| `link_local_reach` | The proposal reaches a host in `169.254.0.0/16`, `fe80::/10`, or a known metadata hostname such as `metadata.google.internal` (cloud-metadata territory, which serves credentials regardless of sandbox state). Unconditional. |
+| `link_local_reach` | A rule reaches `169.254.0.0/16`, `fe80::/10`, or a known metadata hostname. |
 | `l7_bypass_credentialed` | A binary using a wire protocol the L7 proxy cannot inspect (`git-remote-https`, `ssh`, `nc`) gains reach to a host where a credential is in scope. |
 | `credential_reach_expansion` | A binary gains credentialed reach to a `(host, port)` it could not reach before. |
 | `capability_expansion` | On a `(binary, host, port)` that already had credentialed reach, the proposal adds a new HTTP method. The finding cites the specific method. |
 
-Findings are categorical — there is no severity tier. The reviewer reads the category and the structured evidence to decide. When the prover delta is empty, the proposal is provably safe under the model and auto-approval (if enabled) can fire.
+Findings are categorical. There is no severity tier. The reviewer reads the category and the structured evidence to decide.
+
+Before auto-approval, the gateway reloads the draft chunk, recomputes its prover verdict, and regenerates security notes from its current rule. These checks apply after edits and deduplicated resubmissions: an edited stored rule controls the decision even when the duplicate incoming proposal has an empty prover delta. The recalculated verdict is used for this decision but is not written back, so a later `validation_result` read can still show the submit-time verdict. Failures leave the chunk pending. Security notes flag concerns such as internal or private destinations and `allowed_ips`, wildcard hosts, hostless `allowed_ips`, ephemeral ports, and well-known database or service ports. Draft reads and bulk approval also regenerate notes from the stored rule. Any prover finding or security note keeps the chunk pending.
 
 The full reasoning model lives in [`crates/openshell-prover/README.md`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-prover/README.md). Provider profiles composed in via [Providers v2](/sandboxes/providers-v2) are part of the effective policy the prover reasons over.
 
@@ -183,7 +191,7 @@ Review pending chunks from the host:
 openshell rule get <sandbox-name> --status pending
 ```
 
-Under `auto` mode, only proposals the prover flagged appear here; empty-delta proposals are already approved and visible under `--status approved` with the auto-approval audit fields described in [Approval Modes](#approval-modes). Under `manual` mode, every proposal — regardless of prover verdict — shows up as pending.
+Under `auto` mode, proposals with a prover finding or any recalculated security note remain pending for human review. Proposals that pass both checks are visible under `--status approved` with the auto-approval audit fields described in [Approval Modes](#approval-modes). Under `manual` mode, every accepted proposal shows up as pending regardless of the prover verdict or security notes.
 
 The output shows the chunk ID, status, rationale, binary, and endpoint summary. For L7 proposals, the endpoint summary includes the protocol, method, and path:
 

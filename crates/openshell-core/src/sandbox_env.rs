@@ -114,3 +114,8 @@ pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
 /// Used alongside UID for PVC init container `chown` operations and when the
 /// supervisor drops privileges to a group other than the UID's primary group.
 pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
+
+// The corporate upstream-proxy configuration deliberately has no reserved
+// environment variables: it travels on the supervisor's argv
+// (`--upstream-proxy` and friends), which a sandbox image cannot forge the
+// way it could bake `ENV` values.

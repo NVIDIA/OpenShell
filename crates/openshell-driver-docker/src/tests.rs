@@ -46,6 +46,7 @@ fn test_sandbox() -> DriverSandbox {
             sandbox_token: String::new(),
         }),
         status: None,
+        workspace: String::new(),
     }
 }
 
@@ -118,40 +119,11 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
 }
 
 fn json_struct(value: serde_json::Value) -> prost_types::Struct {
-    match json_value(value).kind {
-        Some(prost_types::value::Kind::StructValue(value)) => value,
-        _ => panic!("expected JSON object"),
-    }
-}
-
-fn json_value(value: serde_json::Value) -> prost_types::Value {
-    match value {
-        serde_json::Value::Null => prost_types::Value { kind: None },
-        serde_json::Value::Bool(value) => prost_types::Value {
-            kind: Some(prost_types::value::Kind::BoolValue(value)),
-        },
-        serde_json::Value::Number(value) => prost_types::Value {
-            kind: value.as_f64().map(prost_types::value::Kind::NumberValue),
-        },
-        serde_json::Value::String(value) => prost_types::Value {
-            kind: Some(prost_types::value::Kind::StringValue(value)),
-        },
-        serde_json::Value::Array(values) => prost_types::Value {
-            kind: Some(prost_types::value::Kind::ListValue(
-                prost_types::ListValue {
-                    values: values.into_iter().map(json_value).collect(),
-                },
-            )),
-        },
-        serde_json::Value::Object(values) => prost_types::Value {
-            kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
-                fields: values
-                    .into_iter()
-                    .map(|(key, value)| (key, json_value(value)))
-                    .collect(),
-            })),
-        },
-    }
+    let serde_json::Value::Object(object) = value else {
+        panic!("expected JSON object");
+    };
+    openshell_core::proto_struct::json_object_to_struct(object)
+        .expect("test JSON must convert to a protobuf Struct")
 }
 
 fn inspected_volume(driver: &str, options: HashMap<String, String>) -> bollard::models::Volume {
@@ -1980,6 +1952,7 @@ fn container_name_preserves_id_suffix_for_long_names() {
         namespace: "default".to_string(),
         spec: None,
         status: None,
+        workspace: "default".to_string(),
     };
     let second = DriverSandbox {
         id: "sbx-second-0987654321".to_string(),
@@ -2005,15 +1978,19 @@ fn container_name_preserves_id_suffix_for_long_names() {
 }
 
 #[test]
-fn container_name_empty_sandbox_name_uses_id_only() {
+fn container_name_empty_sandbox_name_uses_workspace_and_id() {
     let sandbox = DriverSandbox {
         id: "sbx-abc".to_string(),
         name: String::new(),
         namespace: "default".to_string(),
         spec: None,
         status: None,
+        workspace: "default".to_string(),
     };
-    assert_eq!(container_name_for_sandbox(&sandbox), "openshell-sbx-abc",);
+    assert_eq!(
+        container_name_for_sandbox(&sandbox),
+        "openshell-default---sbx-abc",
+    );
 }
 
 #[test]

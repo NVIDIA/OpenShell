@@ -199,45 +199,16 @@ fn dynamic_credential_key_match_score(
         return None;
     }
 
-    let host_lc = host.to_ascii_lowercase();
-    let endpoint_host_lc = endpoint_host.to_ascii_lowercase();
-    if !host_pattern_matches(&endpoint_host_lc, &host_lc)
+    if !openshell_core::host_pattern::host_matches(endpoint_host, host).unwrap_or(false)
         || !crate::l7::endpoint_path_matches(endpoint_path, request_path)
     {
         return None;
     }
 
-    Some(host_pattern_specificity(&endpoint_host_lc) + endpoint_path_specificity(endpoint_path))
-}
-
-fn host_pattern_matches(pattern: &str, host: &str) -> bool {
-    if pattern == host {
-        return true;
-    }
-    if !pattern.contains('*') {
-        return false;
-    }
-
-    let pattern_labels: Vec<&str> = pattern.split('.').collect();
-    let host_labels: Vec<&str> = host.split('.').collect();
-    host_pattern_labels_match(&pattern_labels, &host_labels)
-}
-
-fn host_pattern_labels_match(pattern: &[&str], host: &[&str]) -> bool {
-    match pattern.split_first() {
-        None => host.is_empty(),
-        Some((label, rest)) if *label == "**" => {
-            host_pattern_labels_match(rest, host)
-                || (!host.is_empty() && host_pattern_labels_match(pattern, &host[1..]))
-        }
-        Some((label, rest)) if *label == "*" => {
-            !host.is_empty() && host_pattern_labels_match(rest, &host[1..])
-        }
-        Some((literal, rest)) => {
-            host.first().is_some_and(|label| label == literal)
-                && host_pattern_labels_match(rest, &host[1..])
-        }
-    }
+    Some(
+        host_pattern_specificity(&endpoint_host.to_ascii_lowercase())
+            + endpoint_path_specificity(endpoint_path),
+    )
 }
 
 fn host_pattern_specificity(pattern: &str) -> u32 {
@@ -576,6 +547,24 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_credential_key_matches_case_insensitive_intra_label_wildcard() {
+        let key = "*-API.Example.COM\t443\t\tprovider:access_token";
+
+        assert!(dynamic_credential_key_matches(
+            key,
+            "tenant-api.example.com",
+            443,
+            "/anything"
+        ));
+        assert!(!dynamic_credential_key_matches(
+            key,
+            "api.deep.example.com",
+            443,
+            "/anything"
+        ));
+    }
+
+    #[test]
     fn dynamic_credential_key_matches_double_wildcard_hosts() {
         let key = "**.example.com\t443\t\tprovider:access_token";
 
@@ -732,9 +721,9 @@ mod tests {
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
-            activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            ..Default::default()
         };
         let req = L7Request {
             action: "GET".to_string(),
@@ -769,9 +758,9 @@ mod tests {
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
-            activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            ..Default::default()
         };
         let req = L7Request {
             action: "GET".to_string(),

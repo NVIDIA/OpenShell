@@ -195,7 +195,7 @@ fn apply_vm_runtime_defaults(cfg: &mut VmComputeConfig, context: DriverStartupCo
 
 fn apply_podman_env_overrides(podman: &mut PodmanComputeConfig) {
     if let Ok(p) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
-        podman.socket_path = PathBuf::from(p);
+        podman.socket_path = Some(PathBuf::from(p));
     }
     if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
         podman.host_gateway_ip = ip;
@@ -319,6 +319,21 @@ enable_bind_mounts = true
         let cfg = docker_config_from_context(test_context(Some(&file))).expect("docker config");
 
         assert!(cfg.enable_bind_mounts);
+    }
+
+    #[test]
+    fn docker_config_reads_socket_path_from_driver_table() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.drivers.docker]
+socket_path = "/tmp/docker.sock"
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = docker_config_from_context(test_context(Some(&file))).expect("docker config");
+
+        assert_eq!(cfg.socket_path, Some(PathBuf::from("/tmp/docker.sock")));
     }
 
     #[test]

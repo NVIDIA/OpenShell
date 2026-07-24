@@ -24,6 +24,7 @@ use openshell_ocsf::{
 #[cfg(target_os = "linux")]
 use crate::netns::NetworkNamespace;
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
+use openshell_core::proposals::AgentProposals;
 use openshell_core::provider_credentials::ProviderCredentialState;
 
 #[cfg(target_os = "linux")]
@@ -64,6 +65,7 @@ pub async fn run_process(
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    agent_proposals: AgentProposals,
     #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
     #[cfg(target_os = "linux")] bypass_denial_tx: Option<
         tokio::sync::mpsc::UnboundedSender<DenialEvent>,
@@ -99,7 +101,7 @@ pub async fn run_process(
     // proposals flag is on at startup, rather than waiting for the policy
     // poll loop's first tick. In offline/file-mode there is no gateway, so
     // the flag stays at its default (false) and no skill is installed.
-    install_initial_agent_skill(sandbox_id, openshell_endpoint).await;
+    install_initial_agent_skill(sandbox_id, openshell_endpoint, &agent_proposals).await;
 
     // Install the supervisor seccomp prelude before spawning any workload-side
     // tasks. By this point the orchestrator has finished privileged startup
@@ -416,17 +418,12 @@ fn ssh_proxy_url_for_policy(
 ///
 /// Best-effort: any failure (no gateway, RPC error, install failure) is
 /// logged but does not fail sandbox startup.
-async fn install_initial_agent_skill(sandbox_id: Option<&str>, openshell_endpoint: Option<&str>) {
+async fn install_initial_agent_skill(
+    sandbox_id: Option<&str>,
+    openshell_endpoint: Option<&str>,
+    agent_proposals: &AgentProposals,
+) {
     use openshell_core::proto::setting_value;
-    use std::sync::atomic::Ordering;
-
-    let Some(flag) = openshell_core::proposals::AGENT_PROPOSALS_ENABLED.get() else {
-        // The orchestrator is responsible for setting the OnceLock before
-        // calling run_process. If it isn't set, behave as if the flag is
-        // off and skip the install.
-        tracing::debug!("AGENT_PROPOSALS_ENABLED not initialized; skipping skill install");
-        return;
-    };
 
     if let (Some(id), Some(endpoint)) = (sandbox_id, openshell_endpoint)
         && let Ok(client) =
@@ -443,10 +440,10 @@ async fn install_initial_agent_skill(sandbox_id: Option<&str>, openshell_endpoin
                 _ => None,
             })
             .unwrap_or(false);
-        flag.store(initial, Ordering::Relaxed);
+        agent_proposals.set_enabled(initial);
     }
 
-    if openshell_core::proposals::agent_proposals_enabled() {
+    if agent_proposals.enabled() {
         match crate::skills::install_static_skills() {
             Ok(installed) => info!(
                 path = %installed.policy_advisor.display(),

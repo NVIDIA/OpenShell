@@ -26,6 +26,38 @@ The capability RPC reports driver identity, version, and the default sandbox
 image used by the gateway. GPU availability stays driver-local and is validated
 when a sandbox create request asks for GPU resources.
 
+The gateway records driver identity and version from the startup capability
+response. Elevated gateway info reports that initialized driver snapshot instead
+of re-querying drivers on each request.
+
+## Deletion Lifecycle
+
+Delete requests use per-sandbox gates to serialize delete attempts. A request
+resolves the name once and remains bound to that stable ID. The only
+combined lock order is delete gate, then the gateway-wide state guard; external
+driver calls run without the global guard.
+
+Delete gates are process-local and do not coordinate gateway replicas. They
+serialize attempts rather than share results: if one attempt fails and recovery
+restores a deletable state, a request waiting on the gate may retry the driver.
+Persisted resource-version checks remain the cross-replica safety boundary.
+
+Watcher events do not acquire delete gates. Exact resource-version checks allow
+them to interleave safely: status snapshots are no-ops for `Deleting` rows,
+deleted events are idempotent, and snapshots for absent rows are ignored.
+
+An accepted delete (`deleted = true`) is finalized by the watcher. If the
+backend is already absent (`deleted = false`), the request removes gateway state
+synchronously. Sandbox row removal remains bound to the stable ID and resource
+version. Settings retain their existing best-effort name-based cleanup; SSH
+sessions, indexes, and watch/log buses are cleaned after confirmed removal.
+
+The request acquires both locks before starting owned work, so cancellation
+while queued does not leave a delete armed. After that commitment point, the
+owned task prevents cancellation from stranding a mutation. A gateway restart
+does not resume a persisted `Deleting` operation. If the backend completed the
+delete, reconciliation removes the row; otherwise it can remain `Deleting`.
+
 ## Runtime Summary
 
 | Runtime | Best fit | Sandbox boundary | Notes |
@@ -72,6 +104,10 @@ Runtime-specific implementation notes belong in the driver crate README:
 - `crates/openshell-driver-podman/README.md`
 - `crates/openshell-driver-kubernetes/README.md`
 - `crates/openshell-driver-vm/README.md`
+
+The combined VM topology runs `openshell-sandbox` as guest PID 1. libkrun
+executes the driver-owned guest bootstrap as PID 1, and the bootstrap preserves
+that identity when it execs the supervisor after mounting and network setup.
 
 ## Supervisor Delivery
 

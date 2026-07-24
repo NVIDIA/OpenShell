@@ -4,11 +4,12 @@
 //! Landlock filesystem sandboxing.
 
 use landlock::{
-    ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, PathFdError, Ruleset,
-    RulesetAttr, RulesetCreatedAttr,
+    ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, PathFdError,
+    Ruleset, RulesetAttr, RulesetCreatedAttr,
 };
 use miette::{IntoDiagnostic, Result};
 use openshell_core::policy::{LandlockCompatibility, SandboxPolicy};
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
@@ -216,9 +217,10 @@ fn prepare_with_path_open_mode(
 
         for path in &read_only {
             if let Some(path_fd) = try_open_path(path, compatibility, path_open_mode)? {
+                let allowed_access = access_for_path_fd(&path_fd, access_read, abi)?;
                 debug!(path = %path.display(), "Landlock allow read-only");
                 ruleset = ruleset
-                    .add_rule(PathBeneath::new(path_fd, access_read))
+                    .add_rule(PathBeneath::new(path_fd, allowed_access))
                     .into_diagnostic()?;
                 rules_applied += 1;
             }
@@ -226,9 +228,10 @@ fn prepare_with_path_open_mode(
 
         for path in &read_write {
             if let Some(path_fd) = try_open_path(path, compatibility, path_open_mode)? {
+                let allowed_access = access_for_path_fd(&path_fd, access_all, abi)?;
                 debug!(path = %path.display(), "Landlock allow read-write");
                 ruleset = ruleset
-                    .add_rule(PathBeneath::new(path_fd, access_all))
+                    .add_rule(PathBeneath::new(path_fd, allowed_access))
                     .into_diagnostic()?;
                 rules_applied += 1;
             }
@@ -342,6 +345,23 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
         enforce(prepared)?;
     }
     Ok(())
+}
+
+/// Tailor a rule's access mask to the inode referenced by its already-open FD.
+///
+/// Landlock directory-only rights such as `ReadDir` are invalid for regular
+/// files and device nodes in hard-requirement mode. Classifying through the
+/// same `PathFd` used by the rule avoids a pathname TOCTOU race.
+fn access_for_path_fd(
+    path_fd: &PathFd,
+    requested_access: BitFlags<AccessFs>,
+    abi: ABI,
+) -> Result<BitFlags<AccessFs>> {
+    let stat = rustix::fs::fstat(path_fd.as_fd()).into_diagnostic()?;
+    Ok(match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+        rustix::fs::FileType::Directory => requested_access,
+        _ => requested_access & AccessFs::from_file(abi),
+    })
 }
 
 /// Attempt to open a path for Landlock rule creation.
@@ -468,6 +488,98 @@ fn compat_level(level: &LandlockCompatibility) -> CompatLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy};
+
+    fn hard_requirement_policy(read_only: Vec<PathBuf>, read_write: Vec<PathBuf>) -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy {
+                read_only,
+                read_write,
+                include_workdir: false,
+            },
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy {
+                compatibility: LandlockCompatibility::HardRequirement,
+            },
+            process: ProcessPolicy::default(),
+        }
+    }
+
+    #[test]
+    fn prepare_hard_requirement_accepts_device_paths() {
+        if !matches!(probe_availability(), LandlockAvailability::Available { .. }) {
+            return;
+        }
+
+        let policy = hard_requirement_policy(
+            vec![PathBuf::from("/tmp"), PathBuf::from("/dev/urandom")],
+            vec![PathBuf::from("/dev/null")],
+        );
+
+        let result = prepare(&policy, None);
+        if let Err(err) = result {
+            panic!("hard_requirement should accept mixed directory and device paths: {err}");
+        }
+    }
+    fn tailored_access(path: &Path, requested_access: BitFlags<AccessFs>) -> BitFlags<AccessFs> {
+        let path_fd = PathFd::new(path).unwrap();
+        access_for_path_fd(&path_fd, requested_access, ABI::V2).unwrap()
+    }
+
+    #[test]
+    fn access_for_path_fd_preserves_directory_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let requested_access = AccessFs::from_all(ABI::V2);
+
+        assert_eq!(
+            tailored_access(dir.path(), requested_access),
+            requested_access
+        );
+    }
+
+    #[test]
+    fn access_for_path_fd_limits_regular_file_access() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let requested_access = AccessFs::from_all(ABI::V2);
+
+        assert_eq!(
+            tailored_access(file.path(), requested_access),
+            requested_access & AccessFs::from_file(ABI::V2)
+        );
+    }
+
+    #[test]
+    fn access_for_path_fd_limits_character_device_access() {
+        let requested_read = AccessFs::from_read(ABI::V2);
+        let requested_write = AccessFs::from_all(ABI::V2);
+
+        assert_eq!(
+            tailored_access(Path::new("/dev/urandom"), requested_read),
+            requested_read & AccessFs::from_file(ABI::V2)
+        );
+        assert_eq!(
+            tailored_access(Path::new("/dev/null"), requested_write),
+            requested_write & AccessFs::from_file(ABI::V2)
+        );
+    }
+
+    #[test]
+    fn access_for_path_fd_classifies_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::File::create(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let requested_access = AccessFs::from_all(ABI::V2);
+        assert_eq!(
+            tailored_access(&link, requested_access),
+            requested_access & AccessFs::from_file(ABI::V2)
+        );
+    }
 
     #[test]
     fn try_open_path_best_effort_returns_none_for_missing_path() {

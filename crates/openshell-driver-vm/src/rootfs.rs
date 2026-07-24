@@ -461,12 +461,19 @@ fn round_up_to_mib(bytes: u64) -> u64 {
     bytes.div_ceil(MIB) * MIB
 }
 
+enum FormatterAttempt {
+    Succeeded,
+    Failed(String),
+    Unavailable(String),
+}
+
 fn format_ext4_image_from_dir(source: &Path, image_path: &Path) -> Result<(), String> {
-    let mut last_error = None;
-    for tool in ["mke2fs", "mkfs.ext4"] {
-        for candidate in e2fs_tool_candidates(tool) {
+    let candidates = ["mke2fs", "mkfs.ext4"]
+        .into_iter()
+        .flat_map(e2fs_tool_candidates);
+    run_ext4_formatter_candidates(candidates, |candidate| {
             let label = candidate.display().to_string();
-            let output = Command::new(&candidate)
+            let output = Command::new(candidate)
                 .arg("-q")
                 .arg("-F")
                 .arg("-t")
@@ -478,29 +485,51 @@ fn format_ext4_image_from_dir(source: &Path, image_path: &Path) -> Result<(), St
                 .arg(image_path)
                 .output();
             match output {
-                Ok(output) if output.status.success() => return Ok(()),
-                Ok(output) => {
-                    last_error = Some(format!(
+                Ok(output) if output.status.success() => FormatterAttempt::Succeeded,
+                Ok(output) => FormatterAttempt::Failed(format!(
                         "{label} failed with status {}\nstdout: {}\nstderr: {}",
                         output.status,
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr)
-                    ));
-                }
+                    )),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    last_error = Some(format!("{label} not found"));
+                    FormatterAttempt::Unavailable(format!("{label} not found"))
                 }
-                Err(err) => {
-                    last_error = Some(format!("run {label}: {err}"));
-                }
+                Err(err) => FormatterAttempt::Failed(format!("run {label}: {err}")),
             }
+        })
+        .map_err(|details| {
+            format!(
+                "failed to create ext4 rootfs image from {}: {details}. Install e2fsprogs (mke2fs/mkfs.ext4) and retry",
+                source.display()
+            )
+        })
+}
+
+fn run_ext4_formatter_candidates(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    mut run: impl FnMut(&Path) -> FormatterAttempt,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    let mut unavailable = Vec::new();
+
+    for candidate in candidates {
+        match run(&candidate) {
+            FormatterAttempt::Succeeded => return Ok(()),
+            FormatterAttempt::Failed(error) => failures.push(error),
+            FormatterAttempt::Unavailable(error) => unavailable.push(error),
         }
     }
-    Err(format!(
-        "failed to create ext4 rootfs image from {}: {}. Install e2fsprogs (mke2fs/mkfs.ext4) and retry",
-        source.display(),
-        last_error.unwrap_or_else(|| "no ext4 formatter found".to_string())
-    ))
+
+    if failures.is_empty() {
+        Err(if unavailable.is_empty() {
+            "no ext4 formatter candidates configured".to_string()
+        } else {
+            unavailable.join("\n")
+        })
+    } else {
+        Err(failures.join("\n"))
+    }
 }
 
 fn ensure_rootfs_image_parent_dirs(image_path: &Path, guest_path: &str) {
@@ -1129,6 +1158,61 @@ mod tests {
             Some("\"/tmp/path/with\\\\backslash/and\\\"quote\"".to_string())
         );
         assert_eq!(debugfs_quote_argument("/tmp/bad\npath"), None);
+    }
+
+    #[test]
+    fn formatter_candidates_preserve_executed_failure_over_missing_fallback() {
+        let candidates = vec![PathBuf::from("mke2fs"), PathBuf::from("missing")];
+
+        let err = run_ext4_formatter_candidates(candidates, |candidate| {
+            if candidate == Path::new("mke2fs") {
+                FormatterAttempt::Failed(
+                    "mke2fs failed with status 1\nstdout: formatter output\nstderr: no space left"
+                        .to_string(),
+                )
+            } else {
+                FormatterAttempt::Unavailable("missing not found".to_string())
+            }
+        })
+        .expect_err("formatter should fail");
+
+        assert!(err.contains("mke2fs failed with status 1"));
+        assert!(err.contains("no space left"));
+        assert!(!err.contains("missing not found"));
+    }
+
+    #[test]
+    fn formatter_candidates_report_all_missing_tools() {
+        let candidates = vec![PathBuf::from("mke2fs"), PathBuf::from("mkfs.ext4")];
+
+        let err = run_ext4_formatter_candidates(candidates, |candidate| {
+            FormatterAttempt::Unavailable(format!("{} not found", candidate.display()))
+        })
+        .expect_err("formatter should be unavailable");
+
+        assert!(err.contains("mke2fs not found"));
+        assert!(err.contains("mkfs.ext4 not found"));
+    }
+
+    #[test]
+    fn formatter_candidates_accept_successful_fallback() {
+        let candidates = vec![PathBuf::from("first"), PathBuf::from("second")];
+        let mut attempted = Vec::new();
+
+        run_ext4_formatter_candidates(candidates, |candidate| {
+            attempted.push(candidate.to_path_buf());
+            if candidate == Path::new("second") {
+                FormatterAttempt::Succeeded
+            } else {
+                FormatterAttempt::Failed("first failed".to_string())
+            }
+        })
+        .expect("fallback should succeed");
+
+        assert_eq!(
+            attempted,
+            vec![PathBuf::from("first"), PathBuf::from("second")]
+        );
     }
 
     fn unique_temp_dir() -> PathBuf {

@@ -4,7 +4,7 @@
 title: "Run the Gateway with Docker Compose"
 sidebar-title: "Docker Compose Setup"
 slug: "get-started/tutorials/docker-compose"
-description: "Run the OpenShell gateway as a Docker Compose service and create agent sandboxes including OpenClaw."
+description: "Run the OpenShell gateway as a Docker Compose service and create agent sandboxes."
 keywords: "Generative AI, Docker Compose, Gateway, Sandbox, OpenClaw, Docker, Installation"
 ---
 
@@ -15,7 +15,7 @@ After completing this tutorial you have:
 - An OpenShell gateway running as a Compose service.
 - The `openshell` CLI registered against that gateway.
 - An AI provider configured with your API key.
-- A running OpenClaw sandbox.
+- A running agent sandbox.
 
 ## Prerequisites
 
@@ -134,9 +134,6 @@ Sandbox images are pulled automatically on first use, but the initial pull can t
 ```shell
 # Base image — includes Claude Code, OpenCode, Codex, and Copilot
 docker pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
-
-# OpenClaw image
-docker pull ghcr.io/nvidia/openshell-community/sandboxes/openclaw:latest
 ```
 
 ## Create a sandbox
@@ -144,11 +141,9 @@ docker pull ghcr.io/nvidia/openshell-community/sandboxes/openclaw:latest
 <Tabs>
 <Tab title="OpenClaw">
 
-```shell
-openshell sandbox create --from openclaw
-```
+OpenClaw runs inside OpenShell through [NemoClaw](https://github.com/NVIDIA/NemoClaw), which manages the sandbox image, inference routing, and security policies.
 
-OpenClaw launches directly. The first run pulls the image if it is not cached.
+Follow the [NemoClaw Quickstart](https://docs.nvidia.com/nemoclaw/latest/get-started/quickstart/) to set up an OpenClaw sandbox with managed inference.
 
 </Tab>
 <Tab title="Claude Code">

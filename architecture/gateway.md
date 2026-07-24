@@ -137,6 +137,21 @@ Supported auth modes:
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
 | OIDC | Bearer-token auth for users, with browser PKCE or client credentials login. |
 
+The CLI persists the scopes requested during OIDC login in gateway metadata and
+reuses them when refreshing an access token. This preserves the intended API
+resource selection for identity providers that bind access-token audiences to
+OAuth scopes.
+
+Gateway health and user authentication are separate probes. `OpenShell.Health`
+remains unauthenticated so deployment and load-balancer health checks do not
+depend on user credentials. The CLI uses the existing, side-effect-free
+`OpenShell.GetGatewayInfo` capability query as its protected authentication
+probe. `Unauthenticated` means the credentials were rejected, while
+`PermissionDenied` proves authentication succeeded before the caller failed
+the capability query's admin authorization check. The CLI combines the health
+and capability results so a reachable gateway with an expired or rejected
+token is reported as connected but unauthenticated.
+
 Sandbox supervisor RPCs authenticate with explicit sandbox credentials; mTLS
 does not grant sandbox identity. Kubernetes deployments use the
 gateway-minted JWT bootstrap path: the supervisor starts with a projected
@@ -259,7 +274,10 @@ state, SSH sessions, policy revisions, settings, inference configuration, and
 deployment records. Provider refresh material is stored as a separate object
 scoped to the provider instance through `objects.scope`; the provider record
 keeps only the current injectable credential values and optional per-credential
-expiry timestamps.
+expiry timestamps. A refresh normally mints one credential, but a strategy may
+co-mint several (AWS STS mints the access key, secret key, and session token in
+one call); the refresh state pins the resolved set of env keys it owns so
+collision checks reserve all of them before the first mint.
 
 ### Optimistic Concurrency (CAS)
 
@@ -365,6 +383,17 @@ Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The
 sandbox supervisor polls for config revisions and hot-reloads dynamic policy
 when the policy engine accepts the update.
+
+External supervisor middleware registration is operator-owned configuration
+under `[[openshell.supervisor.middleware]]`. At startup the gateway connects to
+each service and validates its described bindings and operator body limit.
+Policies attach a complete external middleware by its operator-owned registration
+name. Manifest bindings are identified by operation and phase, and each manifest
+may declare at most one binding for an operation and phase pair.
+Before persisting a policy, the gateway asks each selected implementation to
+validate its config. The effective sandbox config contains only the registered
+services required by that policy; supervisors invoke those services directly on
+the request path.
 
 Provider credential expiry is enforced during gateway-to-sandbox credential
 resolution and again by the sandbox placeholder resolver. This keeps expired

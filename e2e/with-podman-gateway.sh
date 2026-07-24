@@ -114,7 +114,7 @@ cleanup() {
     elif [ -n "${E2E_NAMESPACE}" ]; then
       sandbox_ids="$(podman_cmd ps -aq \
         --filter "label=openshell.managed=true" \
-        --filter "label=openshell.sandbox-namespace=${E2E_NAMESPACE}" \
+        --filter "label=openshell.ai/sandbox-namespace=${E2E_NAMESPACE}" \
         2>/dev/null || true)"
     fi
   fi
@@ -133,7 +133,7 @@ cleanup() {
   if [ -n "${sandbox_ids}" ]; then
     for id in ${sandbox_ids}; do
       local sandbox_id
-      sandbox_id="$(podman_cmd inspect --format '{{ index .Config.Labels "openshell.sandbox-id" }}' "${id}" 2>/dev/null || true)"
+      sandbox_id="$(podman_cmd inspect --format '{{ index .Config.Labels "openshell.ai/sandbox-id" }}' "${id}" 2>/dev/null || true)"
       podman_cmd rm -f "${id}" >/dev/null 2>&1 || true
       if [ -n "${sandbox_id}" ] && [ "${sandbox_id}" != "<no value>" ]; then
         podman_cmd volume rm -f "openshell-sandbox-${sandbox_id}-workspace" >/dev/null 2>&1 || true
@@ -173,7 +173,7 @@ ensure_e2e_podman_network() {
   podman_cmd network create \
     --driver bridge \
     --label openshell.managed=true \
-    --label "openshell.sandbox-namespace=${E2E_NAMESPACE}" \
+    --label "openshell.ai/sandbox-namespace=${E2E_NAMESPACE}" \
     "${network}" >/dev/null
   PODMAN_NETWORK_MANAGED=1
 }
