@@ -794,10 +794,17 @@ async fn cleanup_pre_stored_provider_credentials(
         .delete_provider_credential_handles(provider_name, handles)
         .await
     {
+        let orphaned: Vec<_> = handles
+            .iter()
+            .map(|(k, h)| format!("{}={}:{}", k, h.driver, h.handle))
+            .collect();
         warn!(
             provider_name = %provider_name,
+            handle_count = handles.len(),
+            orphaned_handles = ?orphaned,
             error = %err,
-            "failed to clean up staged provider credentials after provider update failure"
+            "failed to clean up staged provider credentials after provider update failure; \
+             these credential handles may be orphaned and require manual deletion"
         );
     }
 }
