@@ -117,7 +117,7 @@ The lane targets a Windows host with Visual Studio Build Tools and rustup.
 | Visual C++ ARM64 tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath` | Required for native ARM64 check, build, and tests and for x64-to-ARM64 check/build. Tests always require a native runner. |
 | Visual C++ ARM64 Spectre-mitigated libraries | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre -property installationPath` | Required by `regorus` through `msvc_spectre_libs`; the build fails when the selected MSVC toolset lacks `lib\spectre\arm64`. |
 | Visual C++ Clang tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath` | Provides host-native `libclang.dll` for `bindgen` and `clang-cl.exe` for ARM64 crypto dependencies such as `ring` and `aws-lc-sys`. On ARM64, the wrapper uses `VC\Tools\Llvm\Arm64\bin`. |
-| Visual C++ CMake tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath` | Required for bundled Z3. The x64-to-ARM64 path uses CMake's Visual Studio ARM64 generator with native MSVC `cl.exe` so Z3 does not inherit the crypto crates' `clang-cl` requirement. |
+| Visual C++ CMake tools | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath` | Provides CMake and Ninja. The x64-to-ARM64 path adds Ninja to `PATH` for native dependencies but keeps bundled Z3 on CMake's Visual Studio ARM64 generator with native MSVC `cl.exe`. |
 | Windows SDK | `where.exe rc.exe` from a Developer PowerShell | Install an SDK containing target libraries and ARM64 tools. |
 | Rust via rustup | `rustc --version` | Add each target being validated: `x86_64-pc-windows-msvc` and/or `aarch64-pc-windows-msvc`. The wrapper also adds the selected target. |
 | mise | `mise --version` | Used as a task runner only. |
@@ -137,7 +137,7 @@ from this skill.
 | `CARGO_TARGET_DIR` | `target` under repo root | Override Cargo output location. Use a short absolute path when x64-to-ARM64 builds approach Windows path-length limits. |
 | `Z3_LIBRARY_PATH_OVERRIDE` | unset | Directory containing an x64 system `libz3.lib`; not valid for ARM64. |
 | `Z3_SYS_Z3_HEADER` | unset | Full `z3.h` path required with a system Z3 library. |
-| `Z3_SYS_BUNDLED_DIR_OVERRIDE` | pinned cached source | Existing Z3 source tree containing `src/api/z3.h`. |
+| `Z3_SYS_BUNDLED_DIR_OVERRIDE` | pinned source cached under `CARGO_TARGET_DIR` when explicit, otherwise `%LOCALAPPDATA%\OpenShell\cache\z3` | Use an existing Z3 source tree containing `src/api/z3.h`; otherwise the wrapper fetches the pinned revision through Git and sets this automatically. |
 | `RUSTC_WRAPPER` | cleared by wrapper | The wrapper clears inherited values because `--skip-tools` does not provision `sccache`. |
 
 Legacy fork variables such as `OPENSHELL_UPSTREAM`,
@@ -192,11 +192,11 @@ order:
 7. Artifact reporting.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
-wrapper adds host-native LLVM to `PATH`, requires the ARM64 compiler and
-Spectre-mitigated libraries, lets ARM64 crypto crates select `clang-cl`, and
-keeps bundled Z3 on native MSVC `cl.exe` with CMake's Visual Studio ARM64
-generator. Do not substitute Ninja: `z3-sys 0.10.9` passes the MSBuild-only
-`-m` argument.
+wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
+ARM64 compiler and Spectre-mitigated libraries, lets ARM64 crypto crates select
+`clang-cl`, and keeps bundled Z3 on native MSVC `cl.exe` with CMake's Visual
+Studio ARM64 generator. Z3 does not use Ninja because `z3-sys 0.10.9` passes
+the MSBuild-only `-m` argument.
 
 On ARM64 hosts, validate the native ARM64 check, build, and test path. The
 wrapper rejects test targets that do not match the host architecture, so x64
@@ -292,7 +292,14 @@ Useful log files:
 The first bundled-Z3 check or test can spend several minutes in CMake/MSBuild
 without much console output because Cargo output is redirected to the log. Look
 for native `MSBuild.exe` workers before treating the process as stalled. The
-artifact report computes SHA256 through .NET directly and does not rely on the
+wrapper fetches the pinned Z3 source through Git before Cargo starts. It caches
+under an explicitly configured `CARGO_TARGET_DIR`, or under the current user's
+local application data directory when Cargo uses its default target tree.
+Concurrent commands publish the validated source through an atomic directory
+rename, so x64 and ARM64 validation can share the cache safely. The wrapper does
+not rely on the rate-limited GitHub Contents API used by `z3-sys`. A failed
+fetch reports the partial checkout path for diagnosis. The artifact report
+computes SHA256 through .NET directly and does not rely on the
 `Get-FileHash` module being available inside the mise-launched Windows
 PowerShell process.
 

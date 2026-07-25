@@ -95,12 +95,13 @@ ARM64 validation requires the Visual Studio ARM64 MSVC tools, ARM64
 Spectre-mitigated libraries, host-native Clang tools, CMake tools, and an
 ARM64-capable Windows SDK. Clang provides `libclang.dll` for `bindgen` and
 `clang-cl.exe` for ARM64 crypto dependencies. During x64-to-ARM64 check/build,
-the wrapper lets `cmake-rs` select the Visual Studio ARM64 generator with native
-MSVC `cl.exe` for bundled Z3 so the Z3 build does not inherit the crypto crates'
-compiler requirement. The Visual Studio generator is also compatible with the
-MSBuild `-m` argument emitted by `z3-sys`; Ninja is not. Artifact hashing uses
-.NET SHA256 directly because module autoloading in the mise-launched Windows
-PowerShell process is not guaranteed.
+the wrapper discovers and adds the Visual Studio-bundled Ninja to `PATH` for
+native dependencies. It lets `cmake-rs` select the Visual Studio ARM64
+generator with native MSVC `cl.exe` for bundled Z3 so the Z3 build does not
+inherit the crypto crates' compiler requirement. Z3 stays on the Visual Studio
+generator because `z3-sys` emits an MSBuild-only `-m` argument that Ninja
+rejects. Artifact hashing uses .NET SHA256 directly because module autoloading
+in the mise-launched Windows PowerShell process is not guaranteed.
 
 The wrapper defaults Cargo compilation to four jobs. Set
 `OPENSHELL_WINDOWS_BUILD_JOBS` to a positive integer to override that limit.

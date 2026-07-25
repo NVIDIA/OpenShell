@@ -257,6 +257,35 @@ function Resolve-LibclangPath {
     throw "Could not find libclang.dll. Install Visual Studio C++ Clang tools, or set LIBCLANG_PATH to the directory containing libclang.dll."
 }
 
+function Resolve-NinjaPath {
+    $fromPath = Get-Command ninja.exe -ErrorAction SilentlyContinue
+    if ($fromPath) {
+        return $fromPath.Source
+    }
+
+    $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+    if ($programFilesX86) {
+        $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
+    } else {
+        $vswhere = $null
+    }
+    if ($vswhere -and (Test-Path $vswhere)) {
+        $found = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -find "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe" | Select-Object -First 1
+        if ($found -and (Test-Path $found -PathType Leaf)) {
+            return (Resolve-Path $found).Path
+        }
+    }
+
+    foreach ($installRoot in Get-VsInstallRoots) {
+        $candidate = Join-Path $installRoot "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
+        if (Test-Path $candidate -PathType Leaf) {
+            return (Resolve-Path $candidate).Path
+        }
+    }
+
+    throw "Could not find ninja.exe. Install Microsoft.VisualStudio.Component.VC.CMake.Project."
+}
+
 function Add-PathEntry([string] $Directory) {
     if (($env:PATH -split ";") -notcontains $Directory) {
         $env:PATH = "$Directory;$env:PATH"
@@ -274,8 +303,12 @@ function Configure-Arm64CrossBuild([string[]] $RustTargets) {
     }
     Add-PathEntry $env:LIBCLANG_PATH
 
+    $ninja = Resolve-NinjaPath
+    Add-PathEntry (Split-Path -Parent $ninja)
+
     Write-Host "==> ARM64 cross-build toolchain"
     Write-Host "    clang-cl: $clangCl"
+    Write-Host "    ninja:    $ninja"
     Write-Host "    Z3:       MSVC cl.exe with the Visual Studio generator"
 }
 
