@@ -102,10 +102,13 @@ MSBuild `-m` argument emitted by `z3-sys`; Ninja is not. Artifact hashing uses
 .NET SHA256 directly because module autoloading in the mise-launched Windows
 PowerShell process is not guaranteed.
 
-The wrapper defaults Cargo and MSVC compilation to four jobs. Set
+The wrapper defaults Cargo compilation to four jobs. Set
 `OPENSHELL_WINDOWS_BUILD_JOBS` to a positive integer to override that limit.
 A host-local mutex serializes wrapper-owned Cargo commands so concurrent
 pre-commit tasks do not multiply the process count while bundled Z3 compiles.
+The wrapper deliberately leaves `CL` and `_CL_` unset because `clang-cl`
+consumes those variables too. Injecting MSVC-only options such as `/MP` can
+make ARM64 crypto dependency builds treat the option as an input file.
 
 ## CI Shape
 

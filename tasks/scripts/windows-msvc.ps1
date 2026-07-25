@@ -61,7 +61,6 @@ if ([string]::IsNullOrWhiteSpace($BuildJobsValue)) {
 if (-not [int]::TryParse($BuildJobsValue, [ref] $WindowsBuildJobs) -or $WindowsBuildJobs -lt 1) {
     throw "OPENSHELL_WINDOWS_BUILD_JOBS or CARGO_BUILD_JOBS must be a positive integer."
 }
-$ClOptions = "$($env:_CL_) /MP$WindowsBuildJobs".Trim()
 $WindowsCargoMutex = [System.Threading.Mutex]::new($false, "Local\OpenShellWindowsMsvcCargo")
 
 $UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-podman --exclude openshell-driver-vm --exclude openshell-supervisor-process"
@@ -488,7 +487,6 @@ function Invoke-VsCargo {
         "set `"CARGO_TARGET_DIR=$TargetDir`"",
         "set `"CARGO_BUILD_JOBS=$WindowsBuildJobs`"",
         "set `"CARGO_INCREMENTAL=0`"",
-        "set `"_CL_=$ClOptions`"",
         "set `"RUSTC_WRAPPER=`""
     )
     if ($hostArch -eq "amd64" -and $RustTarget -eq "aarch64-pc-windows-msvc") {

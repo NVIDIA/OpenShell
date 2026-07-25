@@ -172,9 +172,12 @@ build-environment shell-helper, and service/RPM-packaging tests skip. The
 Windows Clippy command allows unused imports, dead code, and unused async
 functions caused by cfg-gated stubs; other warnings remain errors.
 Wrapper-owned Cargo commands are serialized across processes and default to
-four Cargo/MSVC jobs to avoid multiplying bundled-Z3 compilation across
+four Cargo jobs to avoid multiplying bundled-Z3 compilation across
 parallel pre-commit tasks. Override the limit with a positive integer in
 `OPENSHELL_WINDOWS_BUILD_JOBS`.
+The wrapper leaves `CL` and `_CL_` unset because `clang-cl` consumes those
+variables too. Injecting MSVC-only options such as `/MP` can make ARM64 crypto
+dependency builds treat the option as an input file.
 
 | Task | Expected behavior |
 |---|---|

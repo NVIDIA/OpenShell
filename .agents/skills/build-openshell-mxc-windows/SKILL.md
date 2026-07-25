@@ -211,9 +211,12 @@ Windows-safe dependency setup command. Keep existing Unix `run` bodies
 unchanged when adding `run_windows` behavior. Linux installer,
 build-environment shell-helper, and packaging asset tests skip explicitly;
 cross-platform checks continue to run. The wrapper serializes its Cargo
-commands and limits Cargo/MSVC compilation to four jobs by default so
+commands and limits Cargo compilation to four jobs by default so
 concurrent pre-commit tasks do not exhaust Windows process resources. Set
 `OPENSHELL_WINDOWS_BUILD_JOBS` to a positive integer to override the limit.
+It deliberately leaves `CL` and `_CL_` unset because `clang-cl` consumes those
+variables too. Injecting MSVC-only options such as `/MP` can make ARM64 crypto
+dependency builds treat the option as an input file.
 
 ### Step 6: mise check on x86_64-pc-windows-msvc
 
