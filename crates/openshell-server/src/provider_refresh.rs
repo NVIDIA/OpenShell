@@ -795,11 +795,8 @@ async fn mint_aws_sts_assume_role(
     let session_token = creds.session_token().to_string();
 
     let now_ms = current_time_ms();
-    let expires_at_ms = creds
-        .expiration()
-        .to_millis()
-        .unwrap_or_else(|_| now_ms + max_lifetime_ms);
-    let max_expires = now_ms + max_lifetime_ms;
+    let max_expires = now_ms.saturating_add(max_lifetime_ms);
+    let expires_at_ms = creds.expiration().to_millis().unwrap_or(max_expires);
     let expires_at_ms = expires_at_ms.min(max_expires);
 
     // Map STS response fields to the env keys the profile bound to each semantic
@@ -1518,6 +1515,16 @@ mod tests {
             refresh_strategy_name(ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32),
             "aws_sts_assume_role"
         );
+    }
+
+    #[test]
+    fn aws_sts_max_expires_saturates_on_saturated_clock() {
+        assert_eq!(i64::MAX.saturating_add(3_600_000), i64::MAX);
+        let now_ms = i64::MAX - 1_000;
+        let max_lifetime_ms = 3_600_000;
+        let max_expires = now_ms.saturating_add(max_lifetime_ms);
+        assert_eq!(max_expires, i64::MAX);
+        assert!(max_expires >= now_ms);
     }
 
     #[tokio::test]
