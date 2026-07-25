@@ -2832,6 +2832,25 @@ async fn resolve_from_sandbox_hosts(
     None
 }
 
+/// Resolve a hostname using the proxy's own `/etc/hosts` file.
+///
+/// Used as a fallback for host-gateway aliases when the sandbox's `/etc/hosts`
+/// (read via `/proc/{pid}/root/etc/hosts`) does not contain the entry — e.g.
+/// because the sandbox runs in a separate mount namespace. The proxy's
+/// `/etc/hosts` is the container-level file populated by the compute driver's
+/// `--add-host` flag.
+#[cfg(any(target_os = "linux", test))]
+fn resolve_from_proxy_hosts(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    let contents = std::fs::read_to_string("/etc/hosts").ok()?;
+    let addrs = resolve_from_hosts_file_contents(&contents, host, port);
+    if addrs.is_empty() { None } else { Some(addrs) }
+}
+
+#[cfg(not(any(target_os = "linux", test)))]
+fn resolve_from_proxy_hosts(_host: &str, _port: u16) -> Option<Vec<SocketAddr>> {
+    None
+}
+
 async fn resolve_socket_addrs(
     host: &str,
     port: u16,
@@ -2842,6 +2861,18 @@ async fn resolve_socket_addrs(
     }
 
     if let Some(addrs) = resolve_from_sandbox_hosts(host, port, entrypoint_pid).await {
+        return Ok(addrs);
+    }
+
+    // Host-gateway aliases (host.openshell.internal, etc.) are synthetic
+    // hostnames injected by compute drivers into the container's /etc/hosts.
+    // The sandbox process may run in a separate mount namespace whose
+    // /etc/hosts does not contain the entry. Fall back to the proxy's own
+    // /etc/hosts (the container's) before trying system DNS, which will
+    // also fail for these synthetic names.
+    if is_host_gateway_alias(&host.to_ascii_lowercase())
+        && let Some(addrs) = resolve_from_proxy_hosts(host, port)
+    {
         return Ok(addrs);
     }
 
@@ -7161,6 +7192,43 @@ network_policies:
             err.contains("DNS resolution failed"),
             "expected 'DNS resolution failed' in error: {err}"
         );
+    }
+
+    // -- resolve_from_proxy_hosts --
+
+    #[test]
+    fn test_resolve_from_proxy_hosts_finds_host_gateway_alias() {
+        // The proxy's /etc/hosts is the container-level file populated by
+        // --add-host. resolve_from_proxy_hosts reads it directly, bypassing
+        // the system resolver, so host-gateway aliases resolve even when the
+        // sandbox's mount namespace has a different /etc/hosts.
+        //
+        // We test the underlying parser since the production function reads
+        // the real /etc/hosts.
+        let contents = "172.17.0.1\thost.openshell.internal host.containers.internal\n\
+                        127.0.0.1\tlocalhost\n";
+        let addrs = resolve_from_hosts_file_contents(contents, "host.openshell.internal", 9318);
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].ip(), IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1)));
+        assert_eq!(addrs[0].port(), 9318);
+    }
+
+    #[test]
+    fn test_resolve_from_proxy_hosts_returns_none_when_missing() {
+        let contents = "127.0.0.1\tlocalhost\n";
+        let addrs = resolve_from_hosts_file_contents(contents, "host.openshell.internal", 9318);
+        assert!(addrs.is_empty());
+    }
+
+    #[test]
+    fn test_host_gateway_alias_triggers_proxy_hosts_fallback() {
+        // Verify that is_host_gateway_alias returns true for all known
+        // aliases, ensuring the resolve_socket_addrs fallback is reachable.
+        assert!(is_host_gateway_alias("host.openshell.internal"));
+        assert!(is_host_gateway_alias("host.containers.internal"));
+        assert!(is_host_gateway_alias("host.docker.internal"));
+        assert!(!is_host_gateway_alias("example.com"));
+        assert!(!is_host_gateway_alias("inference.local"));
     }
 
     #[tokio::test]
