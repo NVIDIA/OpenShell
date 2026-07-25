@@ -325,6 +325,13 @@ socket_path        = "/var/run/docker.sock"
 default_image      = "ghcr.io/nvidia/openshell/sandbox:latest"
 # Docker vocabulary: Always | IfNotPresent | Never. Empty behaves like IfNotPresent.
 image_pull_policy  = "IfNotPresent"
+# Use the image's non-root OCI USER for agent children. This is the default.
+identity_source    = "image"
+# For operator-controlled external or shared storage, select "fixed" and set
+# both IDs. There is no implicit 10001:10001 local-driver identity.
+# identity_source  = "fixed"
+# fixed_uid        = 1000
+# fixed_gid        = 1000
 sandbox_namespace  = "docker-dev"
 # Empty auto-detects https://host.openshell.internal:<gateway-port> when guest TLS is set.
 grpc_endpoint      = "https://host.openshell.internal:17670"
@@ -367,6 +374,13 @@ compute_drivers = ["podman"]
 socket_path             = "/run/user/1000/podman/podman.sock"
 default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy       = "missing"   # always | missing | never | newer
+# Use the image's non-root OCI USER for agent children. This is the default.
+identity_source         = "image"
+# For operator-controlled external or shared storage, select "fixed" and set
+# both IDs. There is no implicit 10001:10001 local-driver identity.
+# identity_source       = "fixed"
+# fixed_uid             = 1000
+# fixed_gid             = 1000
 grpc_endpoint           = "https://host.containers.internal:17670"
 # The gateway overwrites gateway_port from bind_address at runtime.
 gateway_port            = 17670
@@ -452,6 +466,10 @@ health_check_interval_secs = 10
 # Last resort for hostname-filtering proxy ACLs; see the warning above.
 # proxy_connect_by_hostname = true
 ```
+
+For Docker and Podman, `identity_source` accepts `image` or `fixed` and defaults to `image`. In image mode, omit `fixed_uid` and `fixed_gid`. In fixed mode, set both fields to values from `1000` through `2000000000`, inclusive. OpenShell rejects partial fixed identity configuration and does not supply an implicit `10001:10001` identity.
+
+Image mode reads the non-root OCI `Config.User` from the final inspected image. It rejects images with no `USER`, identities that resolve to UID or GID 0, and creator-selected bind or named-volume mounts. Use fixed mode when an operator intentionally attaches external or shared storage under a known numeric principal. See [Sandbox Compute Drivers](./sandbox-compute-drivers#sandbox-user-identity) for accepted OCI `USER` forms, mount restrictions, and runtime behavior.
 
 ### MicroVM
 

@@ -273,6 +273,7 @@ fn write_guest_env_file(overlay_disk: &Path, env_vars: &[String]) -> Result<(), 
 
 fn qemu_guest_env_vars(config: &VmLaunchConfig, dns_server: Option<String>) -> Vec<String> {
     let mut env_vars = config.env.clone();
+    env_vars.retain(|value| !is_local_identity_metadata(value));
 
     if let Some(ip) = &config.guest_ip
         && let Some(host_ip) = &config.host_ip
@@ -300,6 +301,16 @@ fn shell_escape(s: &str) -> String {
         .replace('`', "\\`")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
+}
+
+fn is_local_identity_metadata(value: &str) -> bool {
+    let key = value.split_once('=').map_or(value, |(key, _)| key);
+    matches!(
+        key,
+        openshell_core::sandbox_env::IDENTITY_SOURCE
+            | openshell_core::sandbox_env::IMAGE_USER
+            | openshell_core::sandbox_env::IMAGE_ID
+    )
 }
 
 fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
@@ -897,7 +908,7 @@ fn libkrun_guest_env(config: &VmLaunchConfig) -> Vec<String> {
     // executable. OpenShell's guest init is itself an init process and ends
     // by exec'ing the supervisor, so ask libkrun to exec it directly. Keep
     // this driver-owned setting authoritative over sandbox image/user env.
-    env.retain(|value| !value.starts_with("KRUN_INIT_PID1="));
+    env.retain(|value| !value.starts_with("KRUN_INIT_PID1=") && !is_local_identity_metadata(value));
     env.push(KRUN_INIT_PID1_ENV.to_string());
     env
 }
@@ -1475,6 +1486,42 @@ mod tests {
 
         assert_eq!(pid_one_settings.len(), 1);
         assert_eq!(pid_one_settings[0], KRUN_INIT_PID1_ENV);
+    }
+
+    #[test]
+    fn guest_backends_remove_local_identity_metadata() {
+        let mut config = qemu_config();
+        config.env.extend([
+            format!("{}=image", openshell_core::sandbox_env::IDENTITY_SOURCE),
+            format!("{}=sandbox", openshell_core::sandbox_env::IMAGE_USER),
+            format!("{}=sha256:malicious", openshell_core::sandbox_env::IMAGE_ID),
+            format!("{}=1500", openshell_core::sandbox_env::SANDBOX_UID),
+            format!("{}=1600", openshell_core::sandbox_env::SANDBOX_GID),
+        ]);
+
+        for env in [
+            qemu_guest_env_vars(&config, None),
+            libkrun_guest_env(&config),
+        ] {
+            for key in [
+                openshell_core::sandbox_env::IDENTITY_SOURCE,
+                openshell_core::sandbox_env::IMAGE_USER,
+                openshell_core::sandbox_env::IMAGE_ID,
+            ] {
+                assert!(
+                    !env.iter()
+                        .any(|value| value.starts_with(&format!("{key}=")))
+                );
+            }
+            assert!(env.contains(&format!(
+                "{}=1500",
+                openshell_core::sandbox_env::SANDBOX_UID
+            )));
+            assert!(env.contains(&format!(
+                "{}=1600",
+                openshell_core::sandbox_env::SANDBOX_GID
+            )));
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
+use openshell_core::sandbox_env::IdentitySource;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -9,6 +10,9 @@ use std::str::FromStr;
 /// Default Podman bridge network name.
 pub const DEFAULT_NETWORK_NAME: &str = "openshell";
 pub const MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP: &str = "192.168.127.254";
+// Keep fixed local identities within the process-policy UID/GID range.
+const MIN_FIXED_ID: u32 = 1_000;
+const MAX_FIXED_ID: u32 = 2_000_000_000;
 
 // Re-export the shared default so existing imports inside this crate keep working.
 pub use openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT;
@@ -121,6 +125,13 @@ pub struct PodmanComputeConfig {
     ///
     /// Set to `0` to leave Podman's runtime/default PID limit unchanged.
     pub sandbox_pids_limit: i64,
+    /// Source used to select the agent identity. Image identity is the safe
+    /// default for isolated local sandboxes.
+    pub identity_source: IdentitySource,
+    /// Operator-selected UID used only in fixed identity mode.
+    pub fixed_uid: Option<u32>,
+    /// Operator-selected GID used only in fixed identity mode.
+    pub fixed_gid: Option<u32>,
     /// Allow sandbox requests to attach host bind mounts through
     /// `template.driver_config`.
     #[serde(default)]
@@ -235,6 +246,40 @@ impl PodmanComputeConfig {
             return Err(crate::client::PodmanApiError::InvalidInput(
                 "sandbox_pids_limit must be zero or greater".to_string(),
             ));
+        }
+        Ok(())
+    }
+
+    /// Validate the local agent identity selection.
+    pub fn validate_identity_config(&self) -> Result<(), crate::client::PodmanApiError> {
+        match self.identity_source {
+            IdentitySource::Image => {
+                if self.fixed_uid.is_some() || self.fixed_gid.is_some() {
+                    return Err(crate::client::PodmanApiError::InvalidInput(
+                        "fixed_uid and fixed_gid are only valid when identity_source = 'fixed'"
+                            .to_string(),
+                    ));
+                }
+            }
+            IdentitySource::Fixed => {
+                let uid = self.fixed_uid.ok_or_else(|| {
+                    crate::client::PodmanApiError::InvalidInput(
+                        "fixed_uid is required when identity_source = 'fixed'".to_string(),
+                    )
+                })?;
+                let gid = self.fixed_gid.ok_or_else(|| {
+                    crate::client::PodmanApiError::InvalidInput(
+                        "fixed_gid is required when identity_source = 'fixed'".to_string(),
+                    )
+                })?;
+                for (field, value) in [("fixed_uid", uid), ("fixed_gid", gid)] {
+                    if !(MIN_FIXED_ID..=MAX_FIXED_ID).contains(&value) {
+                        return Err(crate::client::PodmanApiError::InvalidInput(format!(
+                            "{field} must be in [{MIN_FIXED_ID}, {MAX_FIXED_ID}]"
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -372,6 +417,9 @@ impl Default for PodmanComputeConfig {
             guest_tls_cert: None,
             guest_tls_key: None,
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+            identity_source: IdentitySource::Image,
+            fixed_uid: None,
+            fixed_gid: None,
             enable_bind_mounts: false,
             health_check_interval_secs: DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
             https_proxy: None,
@@ -400,6 +448,9 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("guest_tls_cert", &self.guest_tls_cert)
             .field("guest_tls_key", &self.guest_tls_key)
             .field("sandbox_pids_limit", &self.sandbox_pids_limit)
+            .field("identity_source", &self.identity_source)
+            .field("fixed_uid", &self.fixed_uid)
+            .field("fixed_gid", &self.fixed_gid)
             .field("enable_bind_mounts", &self.enable_bind_mounts)
             .field(
                 "health_check_interval_secs",
@@ -470,6 +521,73 @@ mod tests {
         };
         let err = cfg.validate_runtime_limits().unwrap_err();
         assert!(err.to_string().contains("sandbox_pids_limit"));
+    }
+
+    #[test]
+    fn identity_defaults_to_image_without_fixed_ids() {
+        let cfg = PodmanComputeConfig::default();
+        assert_eq!(cfg.identity_source, IdentitySource::Image);
+        assert_eq!(cfg.fixed_uid, None);
+        assert_eq!(cfg.fixed_gid, None);
+        assert!(cfg.validate_identity_config().is_ok());
+    }
+
+    #[test]
+    fn image_identity_rejects_fixed_fields() {
+        for cfg in [
+            PodmanComputeConfig {
+                fixed_uid: Some(10_001),
+                ..PodmanComputeConfig::default()
+            },
+            PodmanComputeConfig {
+                fixed_gid: Some(10_001),
+                ..PodmanComputeConfig::default()
+            },
+        ] {
+            assert!(cfg.validate_identity_config().is_err());
+        }
+    }
+
+    #[test]
+    fn fixed_identity_requires_both_ids() {
+        for (fixed_uid, fixed_gid) in [(None, None), (Some(10_001), None), (None, Some(10_001))] {
+            let cfg = PodmanComputeConfig {
+                identity_source: IdentitySource::Fixed,
+                fixed_uid,
+                fixed_gid,
+                ..PodmanComputeConfig::default()
+            };
+            assert!(cfg.validate_identity_config().is_err());
+        }
+    }
+
+    #[test]
+    fn fixed_identity_accepts_explicit_policy_ids() {
+        let cfg = PodmanComputeConfig {
+            identity_source: IdentitySource::Fixed,
+            fixed_uid: Some(MIN_FIXED_ID),
+            fixed_gid: Some(MAX_FIXED_ID),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_identity_config().is_ok());
+    }
+
+    #[test]
+    fn fixed_identity_rejects_root_and_out_of_policy_ids() {
+        for (fixed_uid, fixed_gid) in [
+            (0, 10_001),
+            (10_001, 0),
+            (MIN_FIXED_ID - 1, 10_001),
+            (10_001, MAX_FIXED_ID + 1),
+        ] {
+            let cfg = PodmanComputeConfig {
+                identity_source: IdentitySource::Fixed,
+                fixed_uid: Some(fixed_uid),
+                fixed_gid: Some(fixed_gid),
+                ..PodmanComputeConfig::default()
+            };
+            assert!(cfg.validate_identity_config().is_err());
+        }
     }
 
     // ── Proxy config validation ───────────────────────────────────────

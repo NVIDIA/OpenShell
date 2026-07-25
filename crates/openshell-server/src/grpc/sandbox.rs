@@ -55,6 +55,39 @@ use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
 
+fn managed_local_driver(driver_kind: Option<openshell_core::ComputeDriverKind>) -> bool {
+    matches!(
+        driver_kind,
+        Some(openshell_core::ComputeDriverKind::Docker | openshell_core::ComputeDriverKind::Podman)
+    )
+}
+
+fn validate_creator_process_identity(
+    driver_kind: Option<openshell_core::ComputeDriverKind>,
+    policy: Option<&openshell_core::proto::SandboxPolicy>,
+) -> Result<(), Status> {
+    if !managed_local_driver(driver_kind) {
+        return Ok(());
+    }
+    let Some(process) = policy.and_then(|policy| policy.process.as_ref()) else {
+        return Ok(());
+    };
+    if !process.run_as_user.is_empty() || !process.run_as_group.is_empty() {
+        return Err(Status::invalid_argument(
+            "process.run_as_user and process.run_as_group are managed by the Docker/Podman runtime and must be omitted",
+        ));
+    }
+    Ok(())
+}
+
+fn initialize_sandbox_status(sandbox: &mut Sandbox, managed_identity_required: bool) {
+    sandbox.set_phase(SandboxPhase::Provisioning as i32);
+    sandbox
+        .status
+        .get_or_insert_default()
+        .managed_identity_required = managed_identity_required;
+}
+
 fn generate_routable_name() -> String {
     let name = petname::petname(2, "-").unwrap_or_else(generate_name);
     let mut truncated = &name[..name.len().min(MAX_ROUTABLE_NAME_LEN)];
@@ -135,6 +168,8 @@ async fn handle_create_sandbox_inner(
 
     // Validate field sizes before any I/O (fail fast on oversized payloads).
     validate_sandbox_spec(&request.name, &spec)?;
+    let managed_identity_required = managed_local_driver(state.compute.driver_kind());
+    validate_creator_process_identity(state.compute.driver_kind(), spec.policy.as_ref())?;
 
     // Validate labels (keys and values must meet Kubernetes requirements).
     for (key, value) in &request.labels {
@@ -204,7 +239,7 @@ async fn handle_create_sandbox_inner(
         spec: Some(spec),
         status: None,
     };
-    sandbox.set_phase(SandboxPhase::Provisioning as i32);
+    initialize_sandbox_status(&mut sandbox, managed_identity_required);
 
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
     super::validation::validate_object_metadata(sandbox.metadata.as_ref(), "sandbox")?;
@@ -2109,6 +2144,43 @@ mod tests {
     use crate::grpc::test_support::test_server_state;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
 
+    async fn test_server_state_with_driver_kind(
+        driver_kind: Option<openshell_core::ComputeDriverKind>,
+    ) -> Arc<ServerState> {
+        let store = Arc::new(
+            crate::persistence::Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        crate::ensure_default_workspace(&store).await.unwrap();
+        let compute = crate::compute::new_test_runtime_with_driver_kind(store.clone(), driver_kind);
+        Arc::new(ServerState::new(
+            openshell_core::Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
+            store,
+            compute,
+            crate::sandbox_index::SandboxIndex::new(),
+            crate::sandbox_watch::SandboxWatchBus::new(),
+            crate::tracing_bus::TracingLogBus::new(),
+            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+            None,
+        ))
+    }
+
+    fn with_sandbox_principal<T>(mut request: Request<T>, sandbox_id: &str) -> Request<T> {
+        request
+            .extensions_mut()
+            .insert(crate::auth::principal::Principal::Sandbox(
+                crate::auth::principal::SandboxPrincipal {
+                    sandbox_id: sandbox_id.to_string(),
+                    source: crate::auth::principal::SandboxIdentitySource::BootstrapJwt {
+                        issuer: "openshell-gateway:test".to_string(),
+                    },
+                    trust_domain: None,
+                },
+            ));
+        request
+    }
+
     // ---- shell_escape ----
 
     #[test]
@@ -2398,6 +2470,143 @@ mod tests {
             assert!(
                 name.chars().all(|c| c.is_ascii_lowercase()),
                 "fallback name should be all lowercase: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_local_create_rejects_creator_process_identity_before_normalization() {
+        let policy = openshell_core::proto::SandboxPolicy {
+            process: Some(openshell_core::proto::ProcessPolicy {
+                run_as_user: "agent".to_string(),
+                run_as_group: String::new(),
+            }),
+            ..Default::default()
+        };
+
+        for driver in [
+            openshell_core::ComputeDriverKind::Docker,
+            openshell_core::ComputeDriverKind::Podman,
+        ] {
+            let error = validate_creator_process_identity(Some(driver), Some(&policy))
+                .expect_err("managed local create must reject creator identity");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn creator_process_identity_is_preserved_outside_managed_local_create() {
+        let policy = openshell_core::proto::SandboxPolicy {
+            process: Some(openshell_core::proto::ProcessPolicy {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        for driver in [
+            Some(openshell_core::ComputeDriverKind::Kubernetes),
+            Some(openshell_core::ComputeDriverKind::Vm),
+            None,
+        ] {
+            validate_creator_process_identity(driver, Some(&policy))
+                .expect("non-local and custom drivers retain creator identity");
+        }
+    }
+
+    #[test]
+    fn managed_local_create_allows_omitted_process_identity() {
+        let policy = openshell_core::proto::SandboxPolicy {
+            process: Some(openshell_core::proto::ProcessPolicy::default()),
+            ..Default::default()
+        };
+
+        validate_creator_process_identity(
+            Some(openshell_core::ComputeDriverKind::Docker),
+            Some(&policy),
+        )
+        .expect("normalization must receive an omitted identity");
+    }
+
+    #[test]
+    fn create_status_persists_managed_local_identity_requirement() {
+        let mut managed = Sandbox::default();
+        initialize_sandbox_status(&mut managed, true);
+        let status = managed.status.unwrap();
+        assert_eq!(status.phase, SandboxPhase::Provisioning as i32);
+        assert!(status.managed_identity_required);
+
+        let mut legacy = Sandbox::default();
+        initialize_sandbox_status(&mut legacy, false);
+        assert!(!legacy.status.unwrap().managed_identity_required);
+    }
+
+    #[tokio::test]
+    async fn create_and_config_managed_identity_marker_follow_driver_kind_matrix() {
+        let cases = [
+            (Some(openshell_core::ComputeDriverKind::Docker), true),
+            (Some(openshell_core::ComputeDriverKind::Podman), true),
+            (Some(openshell_core::ComputeDriverKind::Kubernetes), false),
+            (Some(openshell_core::ComputeDriverKind::Vm), false),
+            (None, false),
+        ];
+
+        for (driver_kind, expected) in cases {
+            let state = test_server_state_with_driver_kind(driver_kind).await;
+            let name = driver_kind.map_or("custom", openshell_core::ComputeDriverKind::as_str);
+            let created = handle_create_sandbox(
+                &state,
+                Request::new(CreateSandboxRequest {
+                    name: format!("id-{name}"),
+                    spec: Some(openshell_core::proto::SandboxSpec::default()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("test driver create must succeed")
+            .into_inner()
+            .sandbox
+            .expect("create response must contain sandbox");
+
+            assert_eq!(
+                created
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.managed_identity_required),
+                expected,
+                "unexpected create marker for {name}"
+            );
+            let sandbox_id = created.object_id().to_string();
+            let stored = state
+                .store
+                .get_message::<Sandbox>(&sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.managed_identity_required),
+                expected,
+                "unexpected persisted marker for {name}"
+            );
+
+            let config = crate::grpc::policy::handle_get_sandbox_config(
+                &state,
+                with_sandbox_principal(
+                    Request::new(openshell_core::proto::GetSandboxConfigRequest {
+                        sandbox_id: sandbox_id.clone(),
+                    }),
+                    &sandbox_id,
+                ),
+            )
+            .await
+            .expect("sandbox config fetch must succeed")
+            .into_inner();
+            assert_eq!(
+                config.managed_identity_required, expected,
+                "unexpected config marker for {name}"
             );
         }
     }

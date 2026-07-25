@@ -36,6 +36,8 @@ use openshell_core::denial::DenialEvent;
 use crate::managed_children;
 use crate::process::{ProcessEnforcementMode, ProcessHandle};
 
+const MANAGED_IDENTITY_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
     openshell_ocsf::ctx::ctx()
 }
@@ -66,20 +68,14 @@ pub async fn run_process(
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     agent_proposals: AgentProposals,
+    managed_identity_required: bool,
+    resolved_identity: Option<openshell_core::sandbox_env::ResolvedAgentIdentity>,
     #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
     #[cfg(target_os = "linux")] bypass_denial_tx: Option<
         tokio::sync::mpsc::UnboundedSender<DenialEvent>,
     >,
     #[cfg(target_os = "linux")] bypass_activity_tx: Option<ActivitySender>,
 ) -> Result<i32> {
-    // When a driver injects a custom UID/GID, update /etc/passwd and
-    // /etc/group so the "sandbox" entry matches. Must run before
-    // validate_sandbox_user so passwd lookups see the correct identity.
-    #[cfg(unix)]
-    if enforcement_mode.uses_privileged_process_setup() {
-        crate::process::update_sandbox_passwd_entries()?;
-    }
-
     // Validate that the sandbox user exists in the image. All sandbox images
     // must include a "sandbox" user for privilege dropping; failing fast here
     // beats silently running children as root.
@@ -222,6 +218,34 @@ pub async fn run_process(
     let ssh_proxy_url = ssh_proxy_url_for_policy(policy, None);
 
     let ssh_socket_path: Option<std::path::PathBuf> = ssh_socket_path.map(std::path::PathBuf::from);
+
+    // A marked sandbox must persist its exact identity at the gateway before
+    // exposing either the SSH child-launch path or the direct entrypoint path.
+    if managed_identity_required {
+        let identity = resolved_identity.clone().ok_or_else(|| {
+            miette::miette!(
+                "gateway requires managed agent identity, but no resolved identity is available"
+            )
+        })?;
+        let (Some(endpoint), Some(id), Some(socket)) =
+            (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
+        else {
+            return Err(miette::miette!(
+                "gateway requires managed agent identity, but supervisor session metadata is incomplete (endpoint, sandbox ID, and SSH socket are required)"
+            ));
+        };
+        let (_session, ready) = crate::supervisor_session::spawn(
+            endpoint.to_string(),
+            id.to_string(),
+            socket.clone(),
+            ssh_netns_fd,
+            None,
+            Some(identity),
+        );
+        info!("supervisor session task spawned");
+        await_managed_identity_acceptance(ready).await?;
+    }
+
     if let Some(listen_path) = ssh_socket_path.clone() {
         let policy_clone = policy.clone();
         let workdir_clone = workdir.map(str::to_string);
@@ -294,17 +318,18 @@ pub async fn run_process(
         }
     }
 
-    // Spawn the persistent supervisor session if we have a gateway endpoint
-    // and sandbox identity. The session provides relay channels for SSH
-    // connect and ExecSandbox through the gateway.
-    if let (Some(endpoint), Some(id), Some(socket)) =
-        (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
+    // Legacy sessions preserve the prior ordering: bind SSH first, then start
+    // the gateway relay session without blocking entrypoint launch.
+    if !managed_identity_required
+        && let (Some(endpoint), Some(id), Some(socket)) =
+            (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
     {
-        crate::supervisor_session::spawn(
+        let _ = crate::supervisor_session::spawn(
             endpoint.to_string(),
             id.to_string(),
             socket.clone(),
             ssh_netns_fd,
+            None,
             None,
         );
         info!("supervisor session task spawned");
@@ -390,6 +415,24 @@ pub async fn run_process(
     );
 
     Ok(status.code())
+}
+
+async fn await_managed_identity_acceptance(
+    ready: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
+    match timeout(MANAGED_IDENTITY_SESSION_TIMEOUT, ready).await {
+        Ok(Ok(())) => {
+            info!("managed agent identity accepted by gateway");
+            Ok(())
+        }
+        Ok(Err(_)) => Err(miette::miette!(
+            "supervisor session ended before managed agent identity was accepted"
+        )),
+        Err(_) => Err(miette::miette!(
+            "gateway did not accept managed agent identity within {} seconds",
+            MANAGED_IDENTITY_SESSION_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 fn ssh_proxy_url_for_policy(
@@ -508,5 +551,46 @@ mod tests {
         let policy = policy(NetworkMode::Allow, Some(([127, 0, 0, 1], 3128).into()));
 
         assert_eq!(ssh_proxy_url_for_policy(&policy, None), None);
+    }
+
+    #[tokio::test]
+    async fn managed_identity_gate_blocks_ssh_and_direct_setup_until_acceptance() {
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let ssh_setup = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let direct_setup = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ssh_setup_task = Arc::clone(&ssh_setup);
+        let direct_setup_task = Arc::clone(&direct_setup);
+
+        let gated_setup = tokio::spawn(async move {
+            waiting_tx.send(()).unwrap();
+            await_managed_identity_acceptance(accept_rx).await.unwrap();
+            ssh_setup_task.store(true, Ordering::Release);
+            direct_setup_task.store(true, Ordering::Release);
+        });
+
+        waiting_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!ssh_setup.load(Ordering::Acquire));
+        assert!(!direct_setup.load(Ordering::Acquire));
+
+        accept_tx.send(()).unwrap();
+        gated_setup.await.unwrap();
+        assert!(ssh_setup.load(Ordering::Acquire));
+        assert!(direct_setup.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn managed_identity_gate_fails_when_session_ends_before_acceptance() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        drop(tx);
+        let error = await_managed_identity_acceptance(rx)
+            .await
+            .expect_err("closed session must keep launch gate closed");
+        assert!(
+            error
+                .to_string()
+                .contains("before managed agent identity was accepted")
+        );
     }
 }

@@ -1447,6 +1447,14 @@ pub(super) async fn handle_get_sandbox_config(
         provider_env_revision,
         supervisor_middleware_services,
         workspace,
+        resolved_identity: sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.resolved_identity.clone()),
+        managed_identity_required: sandbox
+            .status
+            .as_ref()
+            .is_some_and(|status| status.managed_identity_required),
     }))
 }
 
@@ -4828,7 +4836,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_sandbox_get_sandbox_config_allowed() {
-        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        use openshell_core::proto::{ResolvedAgentIdentity, SandboxPhase, SandboxSpec};
         let state = test_server_state().await;
         let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -4848,6 +4856,16 @@ mod tests {
             ..Default::default()
         };
         sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        let identity = ResolvedAgentIdentity {
+            version: openshell_core::sandbox_env::RESOLVED_AGENT_IDENTITY_VERSION,
+            source: "image".to_string(),
+            image_id: "sha256:image".to_string(),
+            uid: 1234,
+            gid: 2345,
+            supplementary_gids: Vec::new(),
+        };
+        sandbox.status.as_mut().unwrap().resolved_identity = Some(identity.clone());
+        sandbox.status.as_mut().unwrap().managed_identity_required = true;
         state.store.put_message(&sandbox).await.unwrap();
         let req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
@@ -4855,9 +4873,12 @@ mod tests {
             }),
             "sb-self",
         );
-        handle_get_sandbox_config(&state, req)
+        let response = handle_get_sandbox_config(&state, req)
             .await
-            .expect("matching principal must be allowed");
+            .expect("matching principal must be allowed")
+            .into_inner();
+        assert_eq!(response.resolved_identity, Some(identity));
+        assert!(response.managed_identity_required);
     }
 
     #[tokio::test]

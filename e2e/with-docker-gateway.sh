@@ -17,6 +17,8 @@
 # Sandbox image overrides:
 #   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE=...
 #   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=Always|IfNotPresent|Never
+#   OPENSHELL_E2E_IDENTITY_SOURCE=image|fixed (defaults to image)
+#   OPENSHELL_E2E_FIXED_UID/GID (required only for fixed identity mode)
 #
 # The default community sandbox image uses :latest. This wrapper refreshes it
 # before starting the gateway, while the Docker driver defaults to IfNotPresent
@@ -34,6 +36,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT}/e2e/support/gateway-common.sh"
 
 e2e_preserve_mise_dirs
+e2e_resolve_local_identity_config
 
 require_container_engine_lane() {
   local lane=$1
@@ -490,6 +493,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
   printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
   printf 'enable_bind_mounts = true\n'
+  e2e_write_local_identity_config
   printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
   if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
     printf 'host_gateway_ip = %s\n'    "$(toml_string "${GATEWAY_HOST_ALIAS_IP}")"

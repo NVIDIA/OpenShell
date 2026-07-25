@@ -73,15 +73,118 @@ template resource limits. Docker and Podman apply them as runtime limits.
 Kubernetes mirrors each limit into the matching request. VM accepts the fields
 but currently ignores them.
 
-Docker and Podman also accept per-sandbox driver-config mounts for existing
-runtime-managed named volumes and tmpfs mounts. Podman additionally accepts
-image mounts through its image-volume API. User-supplied bind and volume mounts
-default to read-only. Direct host bind mounts, and Docker or Podman local-driver
-bind-backed named volumes, are available only when explicitly enabled in the
-active local driver table of `gateway.toml`. Host bind mounts are an unsafe
-operator override because they place gateway-host filesystem state inside the
-sandbox and can negate OpenShell workspace isolation and filesystem-policy
-controls. Driver-owned supervisor, token, and TLS bind mounts stay reserved.
+## Docker and Podman Agent Identity
+
+By default, Docker and Podman preserve the selected sandbox image's non-root OCI
+`USER` for agent processes. This local-container contract does not run the
+supervisor as that user: the supervisor starts as root, prepares the isolation
+boundary, and then drops privileges for direct and SSH-launched agent children.
+
+### Image Selection and Startup
+
+The local drivers bind identity inspection to the root filesystem that the
+container engine starts. Docker implements this flow in
+`crates/openshell-driver-docker/src/lib.rs`; Podman implements it in
+`crates/openshell-driver-podman/src/driver.rs` and
+`crates/openshell-driver-podman/src/container.rs`. Supervisor resolution and
+persistence live in `crates/openshell-supervisor-process/src/identity.rs`.
+
+```mermaid
+sequenceDiagram
+    participant Gateway
+    participant Driver as Docker/Podman driver
+    participant Engine as Container engine
+    participant Supervisor
+    participant Agent as Agent child
+
+    Gateway->>Driver: CreateSandbox(spec)
+    Driver->>Engine: Resolve or pull requested image
+    Driver->>Engine: Inspect selected image
+    Engine-->>Driver: Immutable image ID + OCI Config.User
+    Driver->>Engine: Create by immutable ID with root supervisor
+    Engine->>Supervisor: Start in selected image rootfs
+    Supervisor->>Supervisor: Resolve and persist UID/GID
+    Supervisor->>Gateway: ConnectSupervisor(resolved identity)
+    Gateway-->>Supervisor: Persisted identity accepted
+    Supervisor->>Agent: Clear groups, setgid, setuid, exec
+```
+
+Docker inspects a local hit or the result of a pull and passes the returned image
+ID, rather than the mutable reference, to container creation. Podman pulls
+according to policy, inspects the selected result, and creates with
+`image_pull_policy = "never"` and the inspected ID. Podman applies the same
+inspection and pinning to its supervisor image and requested image mounts. A tag
+can therefore move after inspection without changing the rootfs selected for
+that sandbox.
+
+Both drivers insert the identity source, immutable image ID, and required
+identity inputs after image and request environment, so the sandbox image cannot
+override them. Docker sets the container user to `0`; Podman sets it to `0:0`.
+Those values apply only to the supervisor, which needs root for namespace,
+mount, network, filesystem, and privilege-drop setup.
+
+### Identity Modes
+
+The active Docker or Podman driver configuration selects one identity mode.
+
+| Mode | Agent identity | Storage boundary |
+|---|---|---|
+| `image` (default) | Resolve the inspected image's raw OCI `Config.User` to one non-root UID/GID. | Reject creator-selected bind and named-volume mounts. The driver-owned workspace and tmpfs mounts remain available; Podman also permits read-only image mounts pinned to inspected image IDs. |
+| `fixed` | Use the operator-configured `fixed_uid` and `fixed_gid`; both must be present and within the process-policy numeric range. | Permit external or shared storage subject to the normal mount and bind-enable checks. |
+
+Image mode accepts named users and groups from the image's `/etc/passwd` and
+`/etc/group`, or an explicit numeric `USER <uid>:<gid>` without account entries.
+A numeric UID without a group requires a matching passwd entry from which to
+obtain the primary GID. Missing users or groups and any identity resolving to
+UID or GID 0 fail sandbox startup. The supervisor uses bounded, file-only
+account parsing rather than NSS and does not create or rewrite image account
+files.
+
+Before the first agent starts, the supervisor stores the resolved identity in
+`/var/lib/openshell/agent-identity.json`, bound to the immutable image ID and,
+for image mode, the raw OCI user declaration. It reports the same versioned
+record to the gateway. The gateway persists the source, image ID, UID, GID, and
+empty supplementary-group set and rejects a missing or changed record on later
+connections. Restarts reuse the persisted identity rather than resolving a
+mutable tag again.
+
+The gateway marks new Docker and Podman sandboxes as requiring this managed
+identity and rejects creator-supplied `process.run_as_user` or
+`process.run_as_group`; those policy fields cannot override the runtime's
+selection. Existing containers without the creation marker retain their legacy
+policy-derived identity and are not reinterpreted during upgrade.
+
+### External Mount Boundary
+
+Docker and Podman accept per-sandbox driver-config mounts for existing named
+volumes and tmpfs mounts; Podman also accepts OCI image mounts. User-supplied
+bind and volume mounts default to read-only, but read-only access does not make
+external storage safe for an image-selected principal. Image mode therefore
+rejects every creator-selected host bind and named volume even when the global
+bind-mount switch is enabled. Operators must select fixed mode to bind external
+or shared storage to an operator-controlled UID/GID.
+
+Fixed mode is necessary but not sufficient for direct host access. Host binds,
+including local-driver bind-backed named volumes, still require
+`enable_bind_mounts` in the active local driver table of `gateway.toml`.
+Requested named volumes must already exist, and the driver inspects them to
+detect bind-backed storage. User mounts cannot replace the driver-owned
+workspace root, supervisor, token, or TLS paths, and cannot overlap
+identity-sensitive account, identity-state, or UID/GID-map paths.
+
+Host bind mounts remain an unsafe operator override because they place gateway
+host filesystem state inside the sandbox and can negate workspace isolation and
+filesystem-policy controls.
+
+### Kubernetes, OpenShift, and VM
+
+The managed image-identity flow applies only to Docker and Podman. Kubernetes
+continues to use an explicitly configured sandbox UID/GID, an OpenShift SCC
+namespace-assigned range when available, or its existing numeric defaults. The
+VM driver continues to use its configured numeric guest UID/GID, defaulting to
+`10001` and using the UID as the GID when no GID is configured. These runtimes
+do not derive agent identity from OCI `Config.User` and do not participate in
+the Docker/Podman resolved-identity handshake.
 
 Kubernetes deployments may set an AppArmor profile on sandbox agent containers
 through the driver configuration. The Helm chart defaults sandbox agents to

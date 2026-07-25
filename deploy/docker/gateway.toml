@@ -34,13 +34,22 @@ compute_drivers     = ["docker"]
 disable_tls         = true
 
 [openshell.drivers.docker]
-# Default image pulled for `openshell sandbox create` without --from.
+# Default image pulled for `openshell sandbox create` without --from. In the
+# default image identity mode, this image must declare a non-root OCI USER.
 default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 # Supervisor image from which the openshell-sandbox binary is extracted on
 # first start.  The binary is cached to XDG_DATA_HOME and reused on restart.
 supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
 # Only pull images that are not already cached locally.
 image_pull_policy = "IfNotPresent"
+# Run agent children as the image's non-root OCI USER. The supervisor still
+# runs as root for sandbox setup. This is the default when omitted.
+identity_source   = "image"
+# For operator-controlled external or shared storage, use fixed mode and set
+# both IDs. Docker has no implicit 10001:10001 identity.
+# identity_source = "fixed"
+# fixed_uid       = 1000
+# fixed_gid       = 1000
 # Prefix applied to sandbox container names.
 sandbox_namespace = "openshell"
 # Address sandbox containers use to call back to the gateway.

@@ -32,6 +32,15 @@ const RESERVED_MOUNT_TARGETS: &[&str] = &[
     "/run/netns",
 ];
 
+const IDENTITY_SENSITIVE_MOUNT_TARGETS: &[&str] = &[
+    "/etc/passwd",
+    "/etc/group",
+    "/var/lib/openshell",
+    "/proc/self/uid_map",
+    "/proc/self/gid_map",
+    "/proc/self/setgroups",
+];
+
 /// Validate a non-empty driver mount source.
 pub fn validate_mount_source(source: &str, field: &str) -> Result<(), String> {
     if source.is_empty() {
@@ -124,6 +133,15 @@ pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
             ));
         }
     }
+    for sensitive in IDENTITY_SENSITIVE_MOUNT_TARGETS {
+        let sensitive = Path::new(sensitive);
+        if path_is_or_under(path, sensitive) || path_is_or_under(sensitive, path) {
+            return Err(format!(
+                "mount target '{target}' overlaps identity-sensitive path '{}'",
+                sensitive.display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -174,6 +192,54 @@ mod tests {
     #[test]
     fn container_target_does_not_prefix_match_unrelated_paths() {
         validate_container_mount_target("/etc/openshell-tools").unwrap();
+    }
+
+    #[test]
+    fn container_target_rejects_identity_sensitive_paths_and_descendants() {
+        for &sensitive in IDENTITY_SENSITIVE_MOUNT_TARGETS {
+            for target in [sensitive.to_string(), format!("{sensitive}/shadowed")] {
+                let err = validate_container_mount_target(&target).unwrap_err();
+
+                assert!(
+                    err.contains("overlaps identity-sensitive path"),
+                    "unexpected error for {target}: {err}"
+                );
+                assert!(
+                    err.contains(sensitive),
+                    "error for {target} does not identify {sensitive}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn container_target_rejects_identity_sensitive_path_ancestors() {
+        for target in ["/etc", "/var", "/var/lib", "/proc", "/proc/self"] {
+            let err = validate_container_mount_target(target).unwrap_err();
+
+            assert!(
+                err.contains("overlaps identity-sensitive path"),
+                "unexpected error for {target}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_target_allows_identity_path_prefix_near_misses() {
+        for target in [
+            "/etc-agent",
+            "/etc/passwd-cache",
+            "/etc/group.d",
+            "/var/lib/openshell-data",
+            "/proc-agent",
+            "/proc/selfish",
+            "/proc/self/uid_map-backup",
+            "/proc/self/gid_map-backup",
+            "/proc/self/setgroups-backup",
+        ] {
+            validate_container_mount_target(target)
+                .unwrap_or_else(|err| panic!("unexpected error for {target}: {err}"));
+        }
     }
 
     #[test]

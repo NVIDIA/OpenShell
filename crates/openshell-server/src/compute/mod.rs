@@ -2431,11 +2431,21 @@ fn public_status_from_driver(
             .collect(),
         phase: phase as i32,
         current_policy_version,
+        resolved_identity: None,
+        managed_identity_required: false,
     }
 }
 
 fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, session_connected: bool) {
     let old_phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    let resolved_identity = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.resolved_identity.clone());
+    let managed_identity_required = sandbox
+        .status
+        .as_ref()
+        .is_some_and(|status| status.managed_identity_required);
     let mut phase = incoming
         .status
         .as_ref()
@@ -2462,6 +2472,10 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
         && status.sandbox_name.is_empty()
     {
         status.sandbox_name.clone_from(sandbox_name);
+    }
+    if let Some(status) = status.as_mut() {
+        status.resolved_identity = resolved_identity;
+        status.managed_identity_required = managed_identity_required;
     }
 
     if old_phase != phase {
@@ -2742,11 +2756,20 @@ impl ComputeDriver for NoopTestDriver {
 }
 
 #[cfg(test)]
-pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
+pub fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
+    new_test_runtime_with_driver_kind(store, None)
+}
+
+#[cfg(test)]
+pub fn new_test_runtime_with_driver_kind(
+    store: Arc<Store>,
+    driver_kind: Option<ComputeDriverKind>,
+) -> ComputeRuntime {
+    let driver_name = driver_kind.map_or_else(|| "test".to_string(), |kind| kind.as_str().into());
     ComputeRuntime {
         driver: Arc::new(NoopTestDriver),
         driver_info: ComputeDriverInfoSnapshot {
-            name: "test".to_string(),
+            name: driver_name,
             driver_name: "test".to_string(),
             driver_version: "test".to_string(),
         },
@@ -3572,6 +3595,41 @@ mod tests {
                 "Expected transient (non-terminal) for reason={reason}, message={message}"
             );
         }
+    }
+
+    #[test]
+    fn driver_snapshot_preserves_persisted_resolved_identity() {
+        let identity = openshell_core::proto::ResolvedAgentIdentity {
+            version: openshell_core::sandbox_env::RESOLVED_AGENT_IDENTITY_VERSION,
+            source: "image".to_string(),
+            image_id: "sha256:image".to_string(),
+            uid: 1234,
+            gid: 2345,
+            supplementary_gids: Vec::new(),
+        };
+        let mut sandbox = sandbox_record("sb-identity", "identity", SandboxPhase::Provisioning);
+        sandbox.status.as_mut().unwrap().resolved_identity = Some(identity.clone());
+        sandbox.status.as_mut().unwrap().managed_identity_required = true;
+
+        apply_driver_snapshot(
+            &mut sandbox,
+            &ready_driver_sandbox("sb-identity", "identity"),
+            true,
+        );
+
+        assert_eq!(
+            sandbox
+                .status
+                .as_ref()
+                .and_then(|status| status.resolved_identity.as_ref()),
+            Some(&identity)
+        );
+        assert!(
+            sandbox
+                .status
+                .as_ref()
+                .is_some_and(|status| status.managed_identity_required)
+        );
     }
 
     #[test]

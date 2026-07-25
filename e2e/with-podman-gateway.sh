@@ -13,6 +13,8 @@
 #
 # HTTPS endpoint-only mode is intentionally unsupported here. Use a named
 # gateway config when mTLS materials are needed.
+# Set OPENSHELL_E2E_IDENTITY_SOURCE=fixed and OPENSHELL_E2E_FIXED_UID/GID to
+# exercise operator-controlled external storage; image mode is the default.
 
 set -euo pipefail
 
@@ -24,6 +26,7 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=e2e/support/gateway-common.sh
 source "${ROOT}/e2e/support/gateway-common.sh"
+e2e_resolve_local_identity_config
 
 require_container_engine_lane() {
   local lane=$1
@@ -421,6 +424,7 @@ cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
   printf 'guest_tls_cert = %s\n'   "$(toml_string "${PKI_DIR}/client/tls.crt")"
   printf 'guest_tls_key = %s\n'    "$(toml_string "${PKI_DIR}/client/tls.key")"
   printf 'enable_bind_mounts = true\n'
+  e2e_write_local_identity_config
   # The in-process Podman driver reads `socket_path` from TOML only — the
   # OPENSHELL_PODMAN_SOCKET env var is honoured by the standalone driver
   # binary, not the in-process driver used here. Pin the socket to the one

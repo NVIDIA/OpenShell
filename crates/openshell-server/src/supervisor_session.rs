@@ -13,8 +13,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, Sandbox, SessionAccepted, SshRelayTarget,
-    SupervisorMessage, gateway_message, relay_open, supervisor_message,
+    GatewayMessage, RelayFrame, RelayInit, RelayOpen, ResolvedAgentIdentity, Sandbox,
+    SessionAccepted, SshRelayTarget, SupervisorMessage, gateway_message, relay_open,
+    supervisor_message,
 };
 
 use crate::ServerState;
@@ -22,6 +23,7 @@ use crate::auth::principal::Principal;
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
+const IDENTITY_CAS_RETRY_LIMIT: usize = 4;
 /// Initial backoff between session-availability polls in `wait_for_session`.
 const SESSION_WAIT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 /// Maximum backoff between session-availability polls in `wait_for_session`.
@@ -437,17 +439,126 @@ pub fn spawn_relay_reaper(state: Arc<ServerState>, interval: Duration) {
 async fn require_persisted_sandbox(
     store: &Arc<crate::persistence::Store>,
     sandbox_id: &str,
-) -> Result<(), Status> {
+) -> Result<Sandbox, Status> {
     let sandbox = store
         .get_message::<Sandbox>(sandbox_id)
         .await
         .map_err(|err| Status::internal(format!("failed to load sandbox: {err}")))?;
 
-    if sandbox.is_none() {
-        return Err(Status::not_found("sandbox not found"));
+    sandbox.ok_or_else(|| Status::not_found("sandbox not found"))
+}
+
+fn managed_identity_required(sandbox: &Sandbox) -> bool {
+    sandbox
+        .status
+        .as_ref()
+        .is_some_and(|status| status.managed_identity_required)
+}
+
+fn validate_resolved_identity(identity: &ResolvedAgentIdentity) -> Result<(), Status> {
+    if identity.version != openshell_core::sandbox_env::RESOLVED_AGENT_IDENTITY_VERSION {
+        return Err(Status::invalid_argument(format!(
+            "unsupported resolved identity version {}; expected {}",
+            identity.version,
+            openshell_core::sandbox_env::RESOLVED_AGENT_IDENTITY_VERSION
+        )));
+    }
+    if identity.uid == 0 || identity.gid == 0 {
+        return Err(Status::invalid_argument(
+            "resolved identity UID and GID must be nonzero",
+        ));
+    }
+    if !identity.supplementary_gids.is_empty() {
+        return Err(Status::invalid_argument(
+            "managed resolved identity must not contain supplementary groups",
+        ));
+    }
+    match identity.source.as_str() {
+        "image" | "fixed" if identity.image_id.is_empty() => Err(Status::invalid_argument(
+            "managed resolved identity requires an immutable image ID",
+        )),
+        "image" | "fixed" => Ok(()),
+        _ => Err(Status::invalid_argument(
+            "resolved identity source must be 'image' or 'fixed'",
+        )),
+    }
+}
+
+async fn validate_and_persist_supervisor_identity(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    incoming: Option<&ResolvedAgentIdentity>,
+) -> Result<(), Status> {
+    let _guard = state.compute.sandbox_sync_guard().await;
+    for _ in 0..IDENTITY_CAS_RETRY_LIMIT {
+        let sandbox = require_persisted_sandbox(&state.store, sandbox_id).await?;
+        let identity_required = managed_identity_required(&sandbox);
+        let stored = sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.resolved_identity.as_ref());
+
+        if !identity_required {
+            if incoming.is_some() {
+                return Err(Status::failed_precondition(
+                    "sandbox does not permit a managed resolved identity",
+                ));
+            }
+            if stored.is_some() {
+                return Err(Status::failed_precondition(
+                    "sandbox has a persisted identity without the managed identity requirement",
+                ));
+            }
+            return Ok(());
+        }
+
+        let Some(identity) = incoming else {
+            return Err(Status::failed_precondition(
+                "managed sandbox supervisor hello requires a resolved identity",
+            ));
+        };
+        validate_resolved_identity(identity)?;
+
+        if let Some(stored) = stored {
+            if incoming != Some(stored) {
+                return Err(Status::failed_precondition(
+                    "supervisor resolved identity does not match the persisted identity",
+                ));
+            }
+            return Ok(());
+        }
+
+        let expected_resource_version = sandbox
+            .metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.resource_version);
+        let identity = identity.clone();
+        match state
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
+                sandbox.status.get_or_insert_default().resolved_identity = Some(identity.clone());
+            })
+            .await
+        {
+            Ok(updated) => {
+                state.sandbox_index.update_from_sandbox(&updated);
+                state.sandbox_watch_bus.notify(sandbox_id);
+                return Ok(());
+            }
+            Err(crate::persistence::PersistenceError::Conflict { .. }) => {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => {
+                return Err(Status::internal(format!(
+                    "failed to persist resolved identity: {error}"
+                )));
+            }
+        }
     }
 
-    Ok(())
+    Err(Status::aborted(
+        "resolved identity persistence conflicted with concurrent sandbox updates",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -598,7 +709,8 @@ pub async fn handle_connect_supervisor(
     if let Some(principal) = principal.as_ref() {
         crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
     }
-    require_persisted_sandbox(&state.store, &sandbox_id).await?;
+    validate_and_persist_supervisor_identity(state, &sandbox_id, hello.resolved_identity.as_ref())
+        .await?;
 
     let session_id = Uuid::new_v4().to_string();
     info!(
@@ -847,6 +959,35 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    fn image_identity() -> ResolvedAgentIdentity {
+        ResolvedAgentIdentity {
+            version: openshell_core::sandbox_env::RESOLVED_AGENT_IDENTITY_VERSION,
+            source: "image".to_string(),
+            image_id: "sha256:image".to_string(),
+            uid: 1234,
+            gid: 2345,
+            supplementary_gids: Vec::new(),
+        }
+    }
+
+    fn fixed_identity() -> ResolvedAgentIdentity {
+        ResolvedAgentIdentity {
+            version: openshell_core::sandbox_env::RESOLVED_AGENT_IDENTITY_VERSION,
+            source: "fixed".to_string(),
+            image_id: "sha256:fixed-image".to_string(),
+            uid: 1234,
+            gid: 2345,
+            supplementary_gids: Vec::new(),
+        }
+    }
+
+    fn managed_sandbox_record(id: &str, name: &str) -> Sandbox {
+        let mut sandbox = sandbox_record(id, name);
+        sandbox.set_phase(openshell_core::proto::SandboxPhase::Provisioning as i32);
+        sandbox.status.as_mut().unwrap().managed_identity_required = true;
+        sandbox
     }
 
     fn pending_relay(
@@ -1285,6 +1426,181 @@ mod tests {
         require_persisted_sandbox(&store, "sbx-1")
             .await
             .expect("persisted sandbox should be accepted");
+    }
+
+    #[test]
+    fn resolved_identity_validation_enforces_managed_contract() {
+        let valid = image_identity();
+        validate_resolved_identity(&valid).unwrap();
+
+        let invalid = [
+            ResolvedAgentIdentity {
+                version: 2,
+                ..valid.clone()
+            },
+            ResolvedAgentIdentity {
+                source: "unknown".to_string(),
+                ..valid.clone()
+            },
+            ResolvedAgentIdentity {
+                uid: 0,
+                ..valid.clone()
+            },
+            ResolvedAgentIdentity {
+                gid: 0,
+                ..valid.clone()
+            },
+            ResolvedAgentIdentity {
+                supplementary_gids: vec![3456],
+                ..valid.clone()
+            },
+            ResolvedAgentIdentity {
+                image_id: String::new(),
+                ..valid.clone()
+            },
+            ResolvedAgentIdentity {
+                source: "fixed".to_string(),
+                image_id: String::new(),
+                ..valid.clone()
+            },
+            ResolvedAgentIdentity {
+                source: "fixed-unknown".to_string(),
+                ..valid
+            },
+        ];
+
+        for identity in invalid {
+            let error = validate_resolved_identity(&identity)
+                .expect_err("invalid identity must be rejected");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+
+        validate_resolved_identity(&ResolvedAgentIdentity {
+            version: openshell_core::sandbox_env::RESOLVED_AGENT_IDENTITY_VERSION,
+            source: "fixed".to_string(),
+            image_id: "sha256:fixed-image".to_string(),
+            uid: 1234,
+            gid: 2345,
+            supplementary_gids: Vec::new(),
+        })
+        .expect("fixed identity carries its immutable image ID");
+    }
+
+    #[tokio::test]
+    async fn first_managed_hello_persists_identity_and_restart_requires_exact_equality() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let sandbox = managed_sandbox_record("sbx-identity", "identity");
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let identity = image_identity();
+        validate_and_persist_supervisor_identity(&state, "sbx-identity", Some(&identity))
+            .await
+            .expect("first hello must persist before acceptance");
+
+        let stored = state
+            .store
+            .get_message::<Sandbox>("sbx-identity")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .status
+                .as_ref()
+                .and_then(|status| status.resolved_identity.as_ref()),
+            Some(&identity)
+        );
+
+        validate_and_persist_supervisor_identity(&state, "sbx-identity", Some(&identity))
+            .await
+            .expect("identical restart identity must be accepted");
+
+        let mut changed = identity.clone();
+        changed.uid += 1;
+        let error =
+            validate_and_persist_supervisor_identity(&state, "sbx-identity", Some(&changed))
+                .await
+                .expect_err("changed restart identity must be rejected");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+        let error = validate_and_persist_supervisor_identity(&state, "sbx-identity", None)
+            .await
+            .expect_err("restart must report persisted identity");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn fixed_identity_restart_compares_immutable_image_id() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        state
+            .store
+            .put_message(&managed_sandbox_record("sbx-fixed", "fixed"))
+            .await
+            .unwrap();
+
+        let identity = fixed_identity();
+        validate_and_persist_supervisor_identity(&state, "sbx-fixed", Some(&identity))
+            .await
+            .expect("fixed identity with image ID must persist");
+
+        let mut changed = identity;
+        changed.image_id = "sha256:other-image".to_string();
+        let error = validate_and_persist_supervisor_identity(&state, "sbx-fixed", Some(&changed))
+            .await
+            .expect_err("fixed identity image ID must be restart-stable");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn unmarked_kubernetes_vm_and_legacy_sandboxes_reject_supplied_identity() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let identity = image_identity();
+        for (id, name) in [
+            ("sbx-kubernetes", "kubernetes"),
+            ("sbx-vm", "vm"),
+            ("sbx-legacy", "legacy"),
+        ] {
+            state
+                .store
+                .put_message(&sandbox_record(id, name))
+                .await
+                .unwrap();
+            validate_and_persist_supervisor_identity(&state, id, None)
+                .await
+                .expect("unmarked sandbox may omit identity");
+            let error = validate_and_persist_supervisor_identity(&state, id, Some(&identity))
+                .await
+                .expect_err("unmarked sandbox must reject supplied identity");
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            let stored = state
+                .store
+                .get_message::<Sandbox>(id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                stored
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.resolved_identity.as_ref())
+                    .is_none(),
+                "rejected identity must not be persisted for {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn marked_sandbox_rejects_missing_identity() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        state
+            .store
+            .put_message(&managed_sandbox_record("sbx-managed", "managed"))
+            .await
+            .unwrap();
+        let error = validate_and_persist_supervisor_identity(&state, "sbx-managed", None)
+            .await
+            .expect_err("new managed sandbox must report identity");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
     // ---- claim_relay: expiry, drop, wiring ----

@@ -42,6 +42,39 @@ contract:
 
 The agent child process does not retain these supervisor privileges.
 
+## Agent Identity
+
+`[openshell.drivers.docker].identity_source` selects the identity for agent
+children. It accepts `image` or `fixed` and defaults to `image`. Image mode
+requires the sandbox image to declare a non-root OCI `USER`; there is no
+implicit `10001:10001` fallback. Fixed mode requires both `fixed_uid` and
+`fixed_gid`, each in the inclusive range `1000` through `2000000000`. Fixed
+fields are invalid in image mode.
+
+The driver applies the image pull policy, inspects the final image, and carries
+its raw OCI `Config.User` and immutable image ID into provisioning. The
+container uses the immutable ID as its rootfs image while `user = "0"` keeps
+the supervisor privileged. Only agent children drop to the resolved identity.
+
+Image identity accepts named, numeric, and mixed `user:group` OCI forms. A
+named user or group must resolve uniquely from the image's regular
+`/etc/passwd` or `/etc/group` file. A numeric UID without a group uses the
+matching passwd entry's primary GID. A numeric pair such as `USER 1234:1235`
+requires no account entries. OpenShell rejects a missing `USER`, an unknown or
+ambiguous name, an accountless numeric UID without a group, and any declaration
+that resolves to UID or GID 0.
+
+Agent children receive `HOME=/sandbox`, no supplementary groups, and the
+declared user name in `USER` and `LOGNAME` when one is available. Numeric and
+fixed identities use the numeric UID for presentation. OpenShell does not
+modify `/etc/passwd` or `/etc/group`.
+
+The supervisor persists the resolved source, immutable image ID, UID, GID, and
+empty supplementary group list. The gateway exposes this record in sandbox
+status, and the supervisor emits it as an OCSF configuration-state event.
+Restarts reuse the persisted identity instead of resolving a mutable tag or
+changed account file again.
+
 ## Driver Config Mounts
 
 The gateway forwards the `docker` block from `--driver-config-json` to this
@@ -49,11 +82,12 @@ driver. The driver accepts user-supplied `mounts` entries with these Docker
 mount types:
 
 - `bind`: mounts an absolute host path when `[openshell.drivers.docker]`
-  has `enable_bind_mounts = true`.
+  has `enable_bind_mounts = true`. It also requires fixed identity mode.
 - `volume`: mounts an existing Docker named volume. The driver validates that
   the volume exists before provisioning and never creates or removes it.
   Docker local-driver volumes created with bind options are treated as host
-  bind mounts and require `enable_bind_mounts = true`.
+  bind mounts and require `enable_bind_mounts = true`. All creator-selected
+  named volumes require fixed identity mode.
 - `tmpfs`: mounts an in-memory filesystem with optional `options`,
   `size_bytes`, and `mode`.
 
@@ -61,6 +95,11 @@ Host bind mounts are disabled by default because they expose gateway host
 paths to sandbox requests. Image mounts are not part of the Docker
 driver-config schema. The driver still uses internal bind mounts for
 OpenShell-owned supervisor, token, and TLS material.
+
+Image identity mode rejects creator-selected bind and named-volume mounts,
+even when `enable_bind_mounts = true`. It permits `tmpfs` and the driver-owned
+per-sandbox workspace volume. Use fixed mode for external or shared storage
+that expects an operator-controlled UID and GID.
 
 Docker `bind` mounts accept `source`, `target`, optional `read_only`, and an
 optional `selinux_label` of `shared` (applies `:z`) or `private` (applies
@@ -73,6 +112,13 @@ or overlap OpenShell supervisor files, `/etc/openshell`, `/etc/openshell-tls`,
 or `/run/netns`.
 
 Example named-volume usage:
+
+```toml
+[openshell.drivers.docker]
+identity_source = "fixed"
+fixed_uid = 1000
+fixed_gid = 1000
+```
 
 ```shell
 docker volume create openshell-work

@@ -10,6 +10,7 @@ use openshell_core::driver_mounts::SelinuxLabel;
 use openshell_core::gpu::{driver_gpu_requirements, validate_specific_gpu_device_request};
 use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
 use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
+use openshell_core::sandbox_env::IdentitySource;
 use openshell_core::{driver_mounts, proto_struct};
 use serde::Serialize;
 use serde_json::Value;
@@ -282,6 +283,15 @@ struct PodmanUserMounts {
     mounts: Vec<Mount>,
 }
 
+/// Immutable image selections resolved before container creation.
+#[derive(Debug, Clone)]
+pub struct PodmanContainerImages {
+    pub sandbox_id: String,
+    pub sandbox_user: String,
+    pub supervisor_id: String,
+    pub image_mount_ids: BTreeMap<String, String>,
+}
+
 #[derive(Serialize)]
 struct HealthConfig {
     test: Vec<String>,
@@ -396,7 +406,8 @@ fn upstream_proxy_cli_args(config: &PodmanComputeConfig) -> Vec<String> {
 fn build_env(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
-    image: &str,
+    requested_image: &str,
+    images: &PodmanContainerImages,
 ) -> BTreeMap<String, String> {
     let spec = sandbox.spec.as_ref();
     let template = spec.and_then(|s| s.template.as_ref());
@@ -421,6 +432,15 @@ fn build_env(
         for (k, v) in &s.environment {
             user_env.insert(k.clone(), v.clone());
         }
+    }
+    for key in [
+        openshell_core::sandbox_env::IDENTITY_SOURCE,
+        openshell_core::sandbox_env::IMAGE_USER,
+        openshell_core::sandbox_env::IMAGE_ID,
+        openshell_core::sandbox_env::SANDBOX_UID,
+        openshell_core::sandbox_env::SANDBOX_GID,
+    ] {
+        user_env.remove(key);
     }
     env.extend(user_env.clone());
     if !user_env.is_empty()
@@ -452,7 +472,10 @@ fn build_env(
         openshell_core::sandbox_env::SSH_SOCKET_PATH.into(),
         config.sandbox_ssh_socket_path.clone(),
     );
-    env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
+    env.insert(
+        "OPENSHELL_CONTAINER_IMAGE".into(),
+        requested_image.to_string(),
+    );
     env.insert(
         openshell_core::sandbox_env::SANDBOX_COMMAND.into(),
         "sleep infinity".into(),
@@ -492,6 +515,44 @@ fn build_env(
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.into(),
             SANDBOX_TOKEN_MOUNT_PATH.into(),
         );
+    }
+
+    // Identity metadata is driver-owned and inserted last. Explicit create
+    // environment overrides image-baked ENV values with the same names.
+    env.insert(
+        openshell_core::sandbox_env::IDENTITY_SOURCE.into(),
+        config.identity_source.to_string(),
+    );
+    env.insert(
+        openshell_core::sandbox_env::IMAGE_ID.into(),
+        images.sandbox_id.clone(),
+    );
+    match config.identity_source {
+        IdentitySource::Image => {
+            env.insert(
+                openshell_core::sandbox_env::IMAGE_USER.into(),
+                images.sandbox_user.clone(),
+            );
+            env.remove(openshell_core::sandbox_env::SANDBOX_UID);
+            env.remove(openshell_core::sandbox_env::SANDBOX_GID);
+        }
+        IdentitySource::Fixed => {
+            env.insert(
+                openshell_core::sandbox_env::SANDBOX_UID.into(),
+                config
+                    .fixed_uid
+                    .expect("validated fixed identity must include a UID")
+                    .to_string(),
+            );
+            env.insert(
+                openshell_core::sandbox_env::SANDBOX_GID.into(),
+                config
+                    .fixed_gid
+                    .expect("validated fixed identity must include a GID")
+                    .to_string(),
+            );
+            env.remove(openshell_core::sandbox_env::IMAGE_USER);
+        }
     }
 
     env
@@ -555,6 +616,7 @@ fn podman_pids_limit(value: i64) -> Option<i64> {
 pub fn podman_driver_volume_mount_sources(
     sandbox: &DriverSandbox,
     enable_bind_mounts: bool,
+    identity_source: IdentitySource,
 ) -> Result<Vec<String>, String> {
     let template = sandbox
         .spec
@@ -563,7 +625,7 @@ pub fn podman_driver_volume_mount_sources(
     let Some(template) = template else {
         return Ok(Vec::new());
     };
-    let config = podman_driver_config(template, enable_bind_mounts)?;
+    let config = podman_driver_config(template, enable_bind_mounts, identity_source)?;
     Ok(config
         .mounts
         .into_iter()
@@ -577,6 +639,7 @@ pub fn podman_driver_volume_mount_sources(
 pub fn podman_driver_image_mount_sources(
     sandbox: &DriverSandbox,
     enable_bind_mounts: bool,
+    identity_source: IdentitySource,
 ) -> Result<Vec<String>, String> {
     let template = sandbox
         .spec
@@ -585,7 +648,7 @@ pub fn podman_driver_image_mount_sources(
     let Some(template) = template else {
         return Ok(Vec::new());
     };
-    let config = podman_driver_config(template, enable_bind_mounts)?;
+    let config = podman_driver_config(template, enable_bind_mounts, identity_source)?;
     Ok(config
         .mounts
         .into_iter()
@@ -599,6 +662,8 @@ pub fn podman_driver_image_mount_sources(
 fn podman_user_mounts(
     sandbox: &DriverSandbox,
     enable_bind_mounts: bool,
+    identity_source: IdentitySource,
+    image_mount_ids: &BTreeMap<String, String>,
 ) -> Result<PodmanUserMounts, String> {
     let template = sandbox
         .spec
@@ -607,7 +672,7 @@ fn podman_user_mounts(
     let Some(template) = template else {
         return Ok(PodmanUserMounts::default());
     };
-    let config = podman_driver_config(template, enable_bind_mounts)?;
+    let config = podman_driver_config(template, enable_bind_mounts, identity_source)?;
     let mut result = PodmanUserMounts::default();
     for mount in config.mounts {
         match mount {
@@ -686,8 +751,11 @@ fn podman_user_mounts(
                 reject_subpath(subpath.as_deref(), "podman image mounts")?;
                 driver_mounts::validate_mount_source(&source, "image source")?;
                 driver_mounts::validate_container_mount_target(&target)?;
+                let immutable_source = image_mount_ids.get(&source).ok_or_else(|| {
+                    format!("podman image mount source '{source}' was not provisioned")
+                })?;
                 result.image_volumes.push(ImageVolume {
-                    source,
+                    source: immutable_source.clone(),
                     destination: target,
                     rw: !read_only,
                 });
@@ -700,6 +768,7 @@ fn podman_user_mounts(
 fn podman_driver_config(
     template: &DriverSandboxTemplate,
     enable_bind_mounts: bool,
+    identity_source: IdentitySource,
 ) -> Result<PodmanSandboxDriverConfig, String> {
     let Some(config) = template.driver_config.as_ref() else {
         return Ok(PodmanSandboxDriverConfig::default());
@@ -707,18 +776,25 @@ fn podman_driver_config(
     let json = Value::Object(proto_struct::struct_to_json_object(config));
     let config: PodmanSandboxDriverConfig = serde_json::from_value(json)
         .map_err(|err| format!("invalid podman driver_config: {err}"))?;
-    validate_podman_driver_mounts(&config.mounts, enable_bind_mounts)?;
+    validate_podman_driver_mounts(&config.mounts, enable_bind_mounts, identity_source)?;
     Ok(config)
 }
 
 fn validate_podman_driver_mounts(
     mounts: &[PodmanDriverMountConfig],
     enable_bind_mounts: bool,
+    identity_source: IdentitySource,
 ) -> Result<(), String> {
     let mut targets = HashSet::new();
     for mount in mounts {
         let target = match mount {
             PodmanDriverMountConfig::Bind { source, target, .. } => {
+                if identity_source == IdentitySource::Image {
+                    return Err(
+                        "podman bind mounts are not allowed when identity_source = 'image'; use fixed identity mode for external storage"
+                            .to_string(),
+                    );
+                }
                 if !enable_bind_mounts {
                     return Err(
                         "podman bind mounts require enable_bind_mounts = true in [openshell.drivers.podman]"
@@ -734,6 +810,12 @@ fn validate_podman_driver_mounts(
                 subpath,
                 ..
             } => {
+                if identity_source == IdentitySource::Image {
+                    return Err(
+                        "podman named volume mounts are not allowed when identity_source = 'image'; use fixed identity mode for external storage"
+                            .to_string(),
+                    );
+                }
                 driver_mounts::validate_mount_source(source, "volume source")?;
                 reject_subpath(subpath.as_deref(), "podman volume mounts")?;
                 target
@@ -752,9 +834,16 @@ fn validate_podman_driver_mounts(
             PodmanDriverMountConfig::Image {
                 source,
                 target,
+                read_only,
                 subpath,
                 ..
             } => {
+                if identity_source == IdentitySource::Image && !read_only {
+                    return Err(
+                        "podman image mounts must be read-only when identity_source = 'image'"
+                            .to_string(),
+                    );
+                }
                 driver_mounts::validate_mount_source(source, "image source")?;
                 reject_subpath(subpath.as_deref(), "podman image mounts")?;
                 target
@@ -876,21 +965,68 @@ pub fn try_build_container_spec_with_token(
     build_container_spec_with_token_and_gpu_devices(sandbox, config, token_secret_name, cdi_devices)
 }
 
+#[cfg(test)]
 pub fn build_container_spec_with_token_and_gpu_devices(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
     token_secret_name: Option<&str>,
     gpu_device_ids: Option<&[String]>,
 ) -> Result<Value, ComputeDriverError> {
-    let image = resolve_image(sandbox, config);
+    let image_mount_ids = podman_driver_image_mount_sources(
+        sandbox,
+        config.enable_bind_mounts,
+        config.identity_source,
+    )
+    .map_err(ComputeDriverError::InvalidArgument)?
+    .into_iter()
+    .map(|source| (source.clone(), source))
+    .collect();
+    let images = PodmanContainerImages {
+        sandbox_id: resolve_image(sandbox, config).to_string(),
+        sandbox_user: "sandbox".to_string(),
+        supervisor_id: config.supervisor_image.clone(),
+        image_mount_ids,
+    };
+    build_provisioned_container_spec_with_token_and_gpu_devices(
+        sandbox,
+        config,
+        token_secret_name,
+        gpu_device_ids,
+        &images,
+    )
+}
+
+pub fn build_provisioned_container_spec_with_token_and_gpu_devices(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    token_secret_name: Option<&str>,
+    gpu_device_ids: Option<&[String]>,
+    images: &PodmanContainerImages,
+) -> Result<Value, ComputeDriverError> {
+    config
+        .validate_identity_config()
+        .map_err(|error| ComputeDriverError::InvalidArgument(error.to_string()))?;
+    if config.identity_source == IdentitySource::Image && images.sandbox_user.trim().is_empty() {
+        return Err(ComputeDriverError::Precondition(
+            "sandbox image must declare a non-empty OCI Config.User when identity_source = 'image'"
+                .to_string(),
+        ));
+    }
+
+    let requested_image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     let vol = volume_name(&sandbox.id);
 
-    let env = build_env(sandbox, config, image);
+    let env = build_env(sandbox, config, requested_image, images);
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox, config);
-    let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
-        .map_err(ComputeDriverError::InvalidArgument)?;
+    let user_mounts = podman_user_mounts(
+        sandbox,
+        config.enable_bind_mounts,
+        config.identity_source,
+        &images.image_mount_ids,
+    )
+    .map_err(ComputeDriverError::InvalidArgument)?;
     if sandbox
         .spec
         .as_ref()
@@ -924,7 +1060,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
     volumes.extend(user_mounts.volumes);
 
     let mut image_volumes = vec![ImageVolume {
-        source: config.supervisor_image.clone(),
+        source: images.supervisor_id.clone(),
         destination: SUPERVISOR_MOUNT_DIR.into(),
         rw: false,
     }];
@@ -932,7 +1068,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
 
     let container_spec = ContainerSpec {
         name,
-        image: image.to_string(),
+        image: images.sandbox_id.clone(),
         labels,
         env,
         volumes,
@@ -1030,7 +1166,9 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         // locks itself down.
         no_new_privileges: true,
         seccomp_profile_path: "unconfined".into(),
-        image_pull_policy: config.image_pull_policy.as_str().to_string(),
+        // All image references were resolved and inspected before this spec
+        // was built. Never let container creation make a second pull choice.
+        image_pull_policy: "never".to_string(),
         healthconfig: HealthConfig {
             test: vec![
                 "CMD-SHELL".into(),
@@ -1987,6 +2125,315 @@ mod tests {
         }
     }
 
+    fn fixed_test_config() -> PodmanComputeConfig {
+        PodmanComputeConfig {
+            identity_source: IdentitySource::Fixed,
+            fixed_uid: Some(10_001),
+            fixed_gid: Some(10_001),
+            ..test_config()
+        }
+    }
+
+    fn sandbox_with_mount(mount: Value) -> DriverSandbox {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({"mounts": [mount]}))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        sandbox
+    }
+
+    fn provisioned_images(user: &str) -> PodmanContainerImages {
+        PodmanContainerImages {
+            sandbox_id: "sha256:sandbox-immutable".to_string(),
+            sandbox_user: user.to_string(),
+            supervisor_id: "sha256:supervisor-immutable".to_string(),
+            image_mount_ids: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn provisioned_container_uses_immutable_images_root_supervisor_and_pull_never() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let images = provisioned_images("app:staff");
+
+        let spec = build_provisioned_container_spec_with_token_and_gpu_devices(
+            &sandbox, &config, None, None, &images,
+        )
+        .unwrap();
+
+        assert_eq!(spec["image"].as_str(), Some("sha256:sandbox-immutable"));
+        assert_eq!(spec["user"].as_str(), Some("0:0"));
+        assert_eq!(spec["image_pull_policy"].as_str(), Some("never"));
+        assert_eq!(
+            spec["image_volumes"][0]["source"].as_str(),
+            Some("sha256:supervisor-immutable")
+        );
+    }
+
+    #[test]
+    fn image_identity_metadata_overrides_request_spoofing_and_omits_fixed_ids() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let spoofed = std::collections::HashMap::from([
+            (
+                openshell_core::sandbox_env::IDENTITY_SOURCE.to_string(),
+                "fixed".to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::IMAGE_USER.to_string(),
+                "attacker".to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::IMAGE_ID.to_string(),
+                "sha256:attacker".to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::SANDBOX_UID.to_string(),
+                "1234".to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::SANDBOX_GID.to_string(),
+                "1234".to_string(),
+            ),
+        ]);
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            environment: spoofed.clone(),
+            template: Some(DriverSandboxTemplate {
+                environment: spoofed,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let images = provisioned_images(" app:staff ");
+
+        let spec = build_provisioned_container_spec_with_token_and_gpu_devices(
+            &sandbox,
+            &test_config(),
+            None,
+            None,
+            &images,
+        )
+        .unwrap();
+        let env = spec["env"].as_object().unwrap();
+
+        assert_eq!(
+            env[openshell_core::sandbox_env::IDENTITY_SOURCE].as_str(),
+            Some("image")
+        );
+        assert_eq!(
+            env[openshell_core::sandbox_env::IMAGE_USER].as_str(),
+            Some(" app:staff ")
+        );
+        assert_eq!(
+            env[openshell_core::sandbox_env::IMAGE_ID].as_str(),
+            Some("sha256:sandbox-immutable")
+        );
+        assert!(!env.contains_key(openshell_core::sandbox_env::SANDBOX_UID));
+        assert!(!env.contains_key(openshell_core::sandbox_env::SANDBOX_GID));
+        if let Some(serialized) = env
+            .get(openshell_core::sandbox_env::USER_ENVIRONMENT)
+            .and_then(Value::as_str)
+        {
+            let user_env: BTreeMap<String, String> = serde_json::from_str(serialized).unwrap();
+            for key in [
+                openshell_core::sandbox_env::IDENTITY_SOURCE,
+                openshell_core::sandbox_env::IMAGE_USER,
+                openshell_core::sandbox_env::IMAGE_ID,
+                openshell_core::sandbox_env::SANDBOX_UID,
+                openshell_core::sandbox_env::SANDBOX_GID,
+            ] {
+                assert!(!user_env.contains_key(key));
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_identity_injects_explicit_ids_and_immutable_image_id() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let spoofed = std::collections::HashMap::from([
+            (
+                openshell_core::sandbox_env::IDENTITY_SOURCE.to_string(),
+                "image".to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::IMAGE_USER.to_string(),
+                "attacker".to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::IMAGE_ID.to_string(),
+                "sha256:attacker".to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::SANDBOX_UID.to_string(),
+                "1234".to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::SANDBOX_GID.to_string(),
+                "1234".to_string(),
+            ),
+        ]);
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            environment: spoofed.clone(),
+            template: Some(DriverSandboxTemplate {
+                environment: spoofed,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = fixed_test_config();
+        let images = provisioned_images("");
+
+        let spec = build_provisioned_container_spec_with_token_and_gpu_devices(
+            &sandbox, &config, None, None, &images,
+        )
+        .unwrap();
+        let env = spec["env"].as_object().unwrap();
+
+        assert_eq!(
+            env[openshell_core::sandbox_env::IDENTITY_SOURCE].as_str(),
+            Some("fixed")
+        );
+        assert_eq!(
+            env[openshell_core::sandbox_env::SANDBOX_UID].as_str(),
+            Some("10001")
+        );
+        assert_eq!(
+            env[openshell_core::sandbox_env::SANDBOX_GID].as_str(),
+            Some("10001")
+        );
+        assert_eq!(
+            env[openshell_core::sandbox_env::IMAGE_ID].as_str(),
+            Some("sha256:sandbox-immutable")
+        );
+        assert!(!env.contains_key(openshell_core::sandbox_env::IMAGE_USER));
+        if let Some(serialized) = env
+            .get(openshell_core::sandbox_env::USER_ENVIRONMENT)
+            .and_then(Value::as_str)
+        {
+            let user_env: BTreeMap<String, String> = serde_json::from_str(serialized).unwrap();
+            for key in [
+                openshell_core::sandbox_env::IDENTITY_SOURCE,
+                openshell_core::sandbox_env::IMAGE_USER,
+                openshell_core::sandbox_env::IMAGE_ID,
+                openshell_core::sandbox_env::SANDBOX_UID,
+                openshell_core::sandbox_env::SANDBOX_GID,
+            ] {
+                assert!(!user_env.contains_key(key));
+            }
+        }
+    }
+
+    #[test]
+    fn image_identity_rejects_blank_image_user() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let error = build_provisioned_container_spec_with_token_and_gpu_devices(
+            &sandbox,
+            &test_config(),
+            None,
+            None,
+            &provisioned_images("  "),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("non-empty OCI Config.User"));
+    }
+
+    #[test]
+    fn image_identity_rejects_bind_mount_even_when_enabled() {
+        let sandbox = sandbox_with_mount(serde_json::json!({
+            "type": "bind",
+            "source": "/host/path",
+            "target": "/sandbox/host"
+        }));
+        let mut config = test_config();
+        config.enable_bind_mounts = true;
+
+        let error = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+        assert!(error.to_string().contains("identity_source = 'image'"));
+    }
+
+    #[test]
+    fn image_identity_rejects_named_volume_mount() {
+        let sandbox = sandbox_with_mount(serde_json::json!({
+            "type": "volume",
+            "source": "shared-work",
+            "target": "/sandbox/work"
+        }));
+
+        let error =
+            try_build_container_spec_with_token(&sandbox, &test_config(), None).unwrap_err();
+        assert!(error.to_string().contains("named volume mounts"));
+    }
+
+    #[test]
+    fn image_identity_allows_tmpfs_mount() {
+        let sandbox = sandbox_with_mount(serde_json::json!({
+            "type": "tmpfs",
+            "target": "/sandbox/cache"
+        }));
+
+        let spec = build_container_spec(&sandbox, &test_config());
+        assert!(spec["mounts"].as_array().unwrap().iter().any(|mount| {
+            mount["type"].as_str() == Some("tmpfs")
+                && mount["destination"].as_str() == Some("/sandbox/cache")
+        }));
+    }
+
+    #[test]
+    fn image_identity_allows_only_read_only_pinned_image_mounts() {
+        let source = "registry.example.com/tools:latest";
+        let sandbox = sandbox_with_mount(serde_json::json!({
+            "type": "image",
+            "source": source,
+            "target": "/opt/tools",
+            "read_only": true
+        }));
+        let mut images = provisioned_images("app");
+        images
+            .image_mount_ids
+            .insert(source.to_string(), "sha256:tools-immutable".to_string());
+
+        let spec = build_provisioned_container_spec_with_token_and_gpu_devices(
+            &sandbox,
+            &test_config(),
+            None,
+            None,
+            &images,
+        )
+        .unwrap();
+        assert!(
+            spec["image_volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| {
+                    mount["source"].as_str() == Some("sha256:tools-immutable")
+                        && mount["destination"].as_str() == Some("/opt/tools")
+                        && mount["rw"].as_bool() == Some(false)
+                })
+        );
+
+        let writable = sandbox_with_mount(serde_json::json!({
+            "type": "image",
+            "source": source,
+            "target": "/opt/tools",
+            "read_only": false
+        }));
+        let error =
+            try_build_container_spec_with_token(&writable, &test_config(), None).unwrap_err();
+        assert!(error.to_string().contains("must be read-only"));
+    }
+
     #[test]
     fn container_spec_includes_supervisor_image_volume() {
         let sandbox = test_sandbox("test-id", "test-name");
@@ -2054,7 +2501,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let config = test_config();
+        let config = fixed_test_config();
         let spec = build_container_spec(&sandbox, &config);
 
         let volumes = spec["volumes"]
@@ -2121,7 +2568,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let config = test_config();
+        let config = fixed_test_config();
 
         let spec = build_container_spec(&sandbox, &config);
         let volumes = spec["volumes"]
@@ -2156,7 +2603,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let config = test_config();
+        let config = fixed_test_config();
 
         let spec = build_container_spec(&sandbox, &config);
         let volumes = spec["volumes"]
@@ -2196,7 +2643,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let config = test_config();
+        let config = fixed_test_config();
 
         let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
 
@@ -2224,7 +2671,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let config = test_config();
+        let config = fixed_test_config();
 
         let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
 
@@ -2250,7 +2697,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let mut config = test_config();
+        let mut config = fixed_test_config();
         config.enable_bind_mounts = true;
 
         let spec = build_container_spec(&sandbox, &config);
@@ -2289,7 +2736,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let mut config = test_config();
+        let mut config = fixed_test_config();
         config.enable_bind_mounts = true;
 
         let spec = build_container_spec(&sandbox, &config);
@@ -2328,7 +2775,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let mut config = test_config();
+        let mut config = fixed_test_config();
         config.enable_bind_mounts = true;
 
         let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
@@ -2359,7 +2806,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let mut config = test_config();
+        let mut config = fixed_test_config();
         config.enable_bind_mounts = true;
 
         let spec = build_container_spec(&sandbox, &config);
@@ -2398,7 +2845,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let mut config = test_config();
+        let mut config = fixed_test_config();
         config.enable_bind_mounts = true;
 
         let spec = build_container_spec(&sandbox, &config);
@@ -2435,7 +2882,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let config = test_config();
+        let config = fixed_test_config();
 
         let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
 

@@ -206,6 +206,39 @@ pub struct VolumeInspect {
     pub options: HashMap<String, String>,
 }
 
+/// Narrow subset of a Podman image-inspect response used for identity and
+/// immutable rootfs selection.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ImageInspect {
+    #[serde(rename = "Id", alias = "ID", alias = "id")]
+    pub id: String,
+    #[serde(rename = "Config", alias = "config", default)]
+    pub config: ImageConfig,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ImageConfig {
+    #[serde(rename = "User", alias = "user", default)]
+    pub user: String,
+}
+
+/// Selected immutable image identifier reported by an image pull, when the
+/// Podman API supplied one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImagePullResult {
+    pub id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ImagePullReport {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    images: Vec<String>,
+    #[serde(default)]
+    error: String,
+}
+
 /// A Podman event from the events stream.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -644,9 +677,14 @@ impl PodmanClient {
     /// exists API and the local image store (e.g. `openshell/supervisor:dev`
     /// vs `localhost/openshell/supervisor:dev`).
     ///
-    /// The Podman pull endpoint streams NDJSON progress. We consume the
-    /// entire stream and check for an `error` field in the final object.
-    pub async fn pull_image(&self, reference: &str, policy: &str) -> Result<(), PodmanApiError> {
+    /// The Podman pull endpoint streams NDJSON progress. Every nonempty report
+    /// is parsed and checked so an error in an intermediate object cannot be
+    /// hidden by a later progress update.
+    pub async fn pull_image(
+        &self,
+        reference: &str,
+        policy: &str,
+    ) -> Result<ImagePullResult, PodmanApiError> {
         let path = format!(
             "/libpod/images/pull?reference={}&policy={}",
             url_encode(reference),
@@ -660,19 +698,54 @@ impl PodmanClient {
         if !status.is_success() {
             return Err(error_from_response(status.as_u16(), &bytes));
         }
-        // The response is NDJSON. Check the last line for an error field.
-        let body = String::from_utf8_lossy(&bytes);
-        if let Some(last_line) = body.lines().rfind(|l| !l.is_empty())
-            && let Ok(obj) = serde_json::from_str::<Value>(last_line)
-            && let Some(err) = obj.get("error").and_then(|v| v.as_str())
-            && !err.is_empty()
-        {
-            return Err(PodmanApiError::Api {
-                status: 500,
-                message: format!("image pull failed: {err}"),
-            });
+        let mut selected_id = None;
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let report: ImagePullReport = serde_json::from_slice(line).map_err(|error| {
+                PodmanApiError::Json(format!(
+                    "invalid image pull report: {error}: {}",
+                    String::from_utf8_lossy(line)
+                ))
+            })?;
+            if !report.error.is_empty() {
+                return Err(PodmanApiError::Api {
+                    status: 500,
+                    message: format!("image pull failed: {}", report.error),
+                });
+            }
+            if let Some(id) = std::iter::once(report.id)
+                .chain(report.images.into_iter().rev())
+                .find(|id| !id.trim().is_empty())
+            {
+                selected_id = Some(id);
+            }
         }
-        Ok(())
+        Ok(ImagePullResult { id: selected_id })
+    }
+
+    /// Inspect an image by reference or immutable ID.
+    pub async fn inspect_image(&self, image: &str) -> Result<ImageInspect, PodmanApiError> {
+        if image.is_empty() {
+            return Err(PodmanApiError::InvalidInput(
+                "image reference must not be empty".to_string(),
+            ));
+        }
+        let encoded = url_encode(image);
+        let inspect: ImageInspect = self
+            .request_json(
+                hyper::Method::GET,
+                &format!("/libpod/images/{encoded}/json"),
+                None,
+            )
+            .await?;
+        if inspect.id.trim().is_empty() {
+            return Err(PodmanApiError::Json(
+                "image inspect response has an empty Id".to_string(),
+            ));
+        }
+        Ok(inspect)
     }
 
     // ── System operations ────────────────────────────────────────────────
@@ -901,6 +974,168 @@ mod tests {
                 .as_slice(),
             ["GET /v5.0.0/libpod/volumes/work-bind/json"]
         );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn inspect_image_escapes_reference_and_preserves_raw_user() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "inspect-image",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                r#"{"Id":"sha256:immutable","Config":{"User":" app:staff "}}"#,
+            )],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let image = client
+            .inspect_image("registry.example.com/team/image:latest")
+            .await
+            .expect("image inspect should parse");
+
+        assert_eq!(image.id, "sha256:immutable");
+        assert_eq!(image.config.user, " app:staff ");
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            ["GET /v5.0.0/libpod/images/registry.example.com%2Fteam%2Fimage%3Alatest/json"]
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn inspect_image_rejects_empty_id() {
+        let (socket_path, _request_log, handle) = spawn_podman_stub(
+            "inspect-image-empty-id",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                r#"{"Id":"  ","Config":{"User":"app"}}"#,
+            )],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let error = client.inspect_image("image:latest").await.unwrap_err();
+        assert!(error.to_string().contains("empty Id"));
+        handle.await.expect("stub task should finish");
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn pull_image_parses_every_report_and_returns_selected_id() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "pull-image-id",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                "{\"images\":[\"sha256:first\"]}\n{\"id\":\"sha256:selected\"}\n",
+            )],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let result = client
+            .pull_image("registry.example.com/team/image:latest", "newer")
+            .await
+            .expect("pull reports should parse");
+
+        assert_eq!(result.id.as_deref(), Some("sha256:selected"));
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            [
+                "POST /v5.0.0/libpod/images/pull?reference=registry.example.com%2Fteam%2Fimage%3Alatest&policy=newer"
+            ]
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn pull_image_never_accepts_empty_local_hit_response() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "pull-image-never-empty",
+            vec![StubResponse::new(StatusCode::OK, "")],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let result = client
+            .pull_image("localhost/image:local", "never")
+            .await
+            .expect("a successful local-only resolution may have no pull report");
+
+        assert_eq!(result.id, None);
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            ["POST /v5.0.0/libpod/images/pull?reference=localhost%2Fimage%3Alocal&policy=never"]
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn pull_image_local_hit_report_without_id_returns_none() {
+        let (socket_path, _request_log, handle) = spawn_podman_stub(
+            "pull-image-local-hit",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                "{\"stream\":\"Image already exists locally\"}\n",
+            )],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let result = client
+            .pull_image("localhost/image:local", "missing")
+            .await
+            .expect("a local hit without an ID should still succeed");
+
+        assert_eq!(result.id, None);
+        handle.await.expect("stub task should finish");
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn pull_image_fails_on_intermediate_error_report() {
+        let (socket_path, _request_log, handle) = spawn_podman_stub(
+            "pull-image-error",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                "{\"id\":\"sha256:first\"}\n{\"error\":\"registry denied\"}\n{\"id\":\"sha256:last\"}\n",
+            )],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let error = client
+            .pull_image("image:latest", "always")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("registry denied"));
+        handle.await.expect("stub task should finish");
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn pull_image_fails_on_malformed_report() {
+        let (socket_path, _request_log, handle) = spawn_podman_stub(
+            "pull-image-malformed",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                "{\"id\":\"sha256:first\"}\nnot-json\n",
+            )],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let error = client
+            .pull_image("image:latest", "missing")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid image pull report"));
+        handle.await.expect("stub task should finish");
         let _ = std::fs::remove_file(socket_path);
     }
 }

@@ -2889,10 +2889,10 @@ fn build_env_list(
     provider_spiffe_socket_path: Option<&str>,
 ) -> Vec<serde_json::Value> {
     let mut env = existing_env.cloned().unwrap_or_default();
-    apply_env_map(&mut env, template_environment);
-    apply_env_map(&mut env, spec_environment);
     let mut user_env = template_environment.clone();
     user_env.extend(spec_environment.clone());
+    remove_local_identity_metadata(&mut user_env);
+    apply_env_map(&mut env, &user_env);
     if !user_env.is_empty()
         && let Ok(json) = serde_json::to_string(&user_env)
     {
@@ -2987,6 +2987,30 @@ fn apply_required_env(
             openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
             socket_path,
         );
+    }
+    tombstone_local_identity_metadata(env);
+}
+
+fn remove_local_identity_metadata(environment: &mut std::collections::HashMap<String, String>) {
+    for key in [
+        openshell_core::sandbox_env::IDENTITY_SOURCE,
+        openshell_core::sandbox_env::IMAGE_USER,
+        openshell_core::sandbox_env::IMAGE_ID,
+    ] {
+        environment.remove(key);
+    }
+}
+
+fn tombstone_local_identity_metadata(env: &mut Vec<serde_json::Value>) {
+    // Kubernetes cannot remove image Config.Env entries. Explicit empty pod
+    // values mask them; the supervisor treats these protected tombstones as
+    // absent and retains the Kubernetes-assigned UID/GID behavior.
+    for key in [
+        openshell_core::sandbox_env::IDENTITY_SOURCE,
+        openshell_core::sandbox_env::IMAGE_USER,
+        openshell_core::sandbox_env::IMAGE_ID,
+    ] {
+        upsert_env(env, key, "");
     }
 }
 
@@ -5540,6 +5564,69 @@ mod tests {
                 assert_eq!(telemetry_entries[0]["value"], serde_json::json!("false"));
             },
         );
+    }
+
+    #[test]
+    fn sandbox_template_tombstones_local_identity_metadata() {
+        let protected = [
+            openshell_core::sandbox_env::IDENTITY_SOURCE,
+            openshell_core::sandbox_env::IMAGE_USER,
+            openshell_core::sandbox_env::IMAGE_ID,
+        ];
+        let template = SandboxTemplate {
+            environment: protected
+                .into_iter()
+                .map(|key| (key.to_string(), "image-value".to_string()))
+                .chain(std::iter::once((
+                    "SAFE_TEMPLATE".to_string(),
+                    "yes".to_string(),
+                )))
+                .collect(),
+            ..SandboxTemplate::default()
+        };
+        let spec_environment = protected
+            .into_iter()
+            .map(|key| (key.to_string(), "request-value".to_string()))
+            .chain(std::iter::once((
+                "SAFE_SPEC".to_string(),
+                "yes".to_string(),
+            )))
+            .collect();
+        let params = SandboxPodParams {
+            sandbox_uid: 1500,
+            sandbox_gid: 1600,
+            ..SandboxPodParams::default()
+        };
+
+        let pod_template =
+            sandbox_template_to_k8s(&template, false, &spec_environment, false, &params);
+        let agent = &pod_template["spec"]["containers"][0];
+
+        for key in protected {
+            assert_eq!(rendered_env(agent, key), Some(""));
+        }
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SANDBOX_UID),
+            Some("1500")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SANDBOX_GID),
+            Some("1600")
+        );
+
+        let user_env: std::collections::HashMap<String, String> = serde_json::from_str(
+            rendered_env(agent, openshell_core::sandbox_env::USER_ENVIRONMENT)
+                .expect("safe user environment should be serialized"),
+        )
+        .unwrap();
+        for key in protected {
+            assert!(!user_env.contains_key(key));
+        }
+        assert_eq!(
+            user_env.get("SAFE_TEMPLATE").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(user_env.get("SAFE_SPEC").map(String::as_str), Some("yes"));
     }
 
     #[test]

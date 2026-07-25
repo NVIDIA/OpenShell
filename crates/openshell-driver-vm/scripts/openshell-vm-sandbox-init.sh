@@ -815,6 +815,10 @@ run_openshell_init_dropins
 
 rewrite_openshell_endpoint_if_needed
 
+# Local container drivers own these identity selectors. VM sandboxes retain
+# their platform-assigned sandbox UID/GID and must never inherit image metadata.
+unset OPENSHELL_IDENTITY_SOURCE OPENSHELL_IMAGE_USER OPENSHELL_IMAGE_ID
+
 # Log supervisor connectivity state for debugging stuck-in-Provisioning issues
 if [ -n "${OPENSHELL_ENDPOINT:-}" ]; then
     _ep_parsed="$(parse_endpoint "$OPENSHELL_ENDPOINT" 2>/dev/null || true)"

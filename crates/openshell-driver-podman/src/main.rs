@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 use openshell_core::VERSION;
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::sandbox_env::IdentitySource;
 use openshell_driver_podman::config::{
     DEFAULT_NETWORK_NAME, DEFAULT_SANDBOX_PIDS_LIMIT, ImagePullPolicy,
 };
@@ -88,6 +89,23 @@ struct Args {
     )]
     sandbox_pids_limit: i64,
 
+    /// Source for the agent identity: the image's OCI USER or an explicit
+    /// operator-controlled numeric identity.
+    #[arg(
+        long,
+        env = "OPENSHELL_PODMAN_IDENTITY_SOURCE",
+        default_value_t = IdentitySource::Image
+    )]
+    identity_source: IdentitySource,
+
+    /// Numeric UID for fixed identity mode.
+    #[arg(long, env = "OPENSHELL_PODMAN_FIXED_UID")]
+    fixed_uid: Option<u32>,
+
+    /// Numeric GID for fixed identity mode.
+    #[arg(long, env = "OPENSHELL_PODMAN_FIXED_GID")]
+    fixed_gid: Option<u32>,
+
     /// OCI image containing the openshell-sandbox supervisor binary.
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
     supervisor_image: Option<String>,
@@ -163,6 +181,9 @@ async fn main() -> Result<()> {
         guest_tls_cert: args.podman_tls_cert,
         guest_tls_key: args.podman_tls_key,
         sandbox_pids_limit: args.sandbox_pids_limit,
+        identity_source: args.identity_source,
+        fixed_uid: args.fixed_uid,
+        fixed_gid: args.fixed_gid,
         https_proxy: args.sandbox_https_proxy,
         no_proxy: args.sandbox_no_proxy,
         proxy_auth_file: args.sandbox_proxy_auth_file,

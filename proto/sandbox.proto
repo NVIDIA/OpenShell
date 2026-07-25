@@ -57,6 +57,22 @@ message ProcessPolicy {
   string run_as_group = 2;
 }
 
+// Creation-time numeric identity selected by the managed sandbox runtime.
+message ResolvedAgentIdentity {
+  // Identity record schema version.
+  uint32 version = 1;
+  // Selection source: "image" or "fixed".
+  string source = 2;
+  // Immutable image identifier used to bind image and fixed identities to the rootfs.
+  string image_id = 3;
+  // Effective user ID for agent children.
+  uint32 uid = 4;
+  // Effective primary group ID for agent children.
+  uint32 gid = 5;
+  // Effective supplementary groups. Managed local identities require this to be empty.
+  repeated uint32 supplementary_gids = 6;
+}
+
 // A named network access policy rule.
 message NetworkPolicyRule {
   // Human-readable name for this policy rule.
@@ -367,6 +383,10 @@ message GetSandboxConfigResponse {
   // Workspace the sandbox belongs to. Allows the supervisor to learn its
   // workspace context for subsequent workspace-scoped RPCs.
   string workspace = 10;
+  // Persisted creation-time identity selected for agent children, when managed.
+  ResolvedAgentIdentity resolved_identity = 11;
+  // Whether this sandbox requires gateway-authorized managed runtime identity.
+  bool managed_identity_required = 12;
 }
 
 // Connection details for one operator-registered supervisor middleware service.

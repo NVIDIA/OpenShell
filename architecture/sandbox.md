@@ -10,8 +10,8 @@ Each sandbox workload has two trust levels:
 
 | Process | Role |
 |---|---|
-| Supervisor | Starts as root inside the workload, prepares isolation, runs the proxy, fetches config, injects credentials, serves the relay socket, and launches child processes. |
-| Agent child | Runs as an unprivileged user with filesystem, process, and network restrictions applied. |
+| Supervisor | Runs as root inside the workload, prepares isolation, runs the proxy, fetches config, injects credentials, serves the relay socket, and launches child processes. |
+| Agent child | Runs as the selected unprivileged identity with filesystem, process, and network restrictions applied. Managed local children use a resolved numeric UID and GID. |
 
 The supervisor keeps enough privilege to manage the sandbox, but the agent child
 loses that privilege before user code runs. On Linux, child setup clears the
@@ -21,18 +21,82 @@ container-granted capabilities. This is fail-closed: the supervisor retains
 aborts unless the bounding set ends up empty. A `setpcap` `EPERM` is tolerated
 only when the set is already empty; any other outcome fails the spawn.
 
+### Managed local identity
+
+Docker and Podman select the agent identity; the gateway rejects creator-set
+`process.run_as_user` or `process.run_as_group` values for these runtimes. Their
+default `image` mode inspects the selected image's immutable ID and OCI
+`Config.User`. Operators can instead configure `fixed` mode with both a numeric
+UID and GID in the policy identity range. Fixed mode is explicit and is the mode
+used when external storage requires an operator-controlled identity; image mode
+rejects bind and named-volume mounts that could have incompatible ownership.
+
+Both local drivers override the image entrypoint and OCI user so the supervisor
+starts as `0:0`. They pass the inspected image metadata or fixed IDs through
+driver-owned environment entries that template, request, and image environment
+values cannot replace. The supervisor then resolves the identity once and
+normalizes the process policy to its numeric UID and GID before launching any
+agent child.
+
+Image mode accepts only a non-empty OCI `USER` in `user`, `uid`, `user:group`,
+or `uid:gid` form. Named fields and an implicit primary group must resolve from
+the image's `/etc/passwd` and `/etc/group`; missing, ambiguous, malformed, or
+root-resolving identities fail startup. Resolution parses bounded, regular
+account files directly without following symlinks or invoking NSS. OpenShell
+does not add accounts or modify the image's passwd or group files. Fixed mode
+does not require account-file entries, but still rejects UID or GID 0.
+
+The first successful resolution is persisted at
+`/var/lib/openshell/agent-identity.json` and bound to the immutable image ID,
+identity source, and source-specific inputs. A restart fails if those inputs do
+not match the persisted record. Managed children receive no supplementary
+groups: child setup clears and verifies the group list before `setgid` and
+`setuid`, and aborts the launch if it cannot prove the list is empty.
+
+The gateway persists `SandboxStatus.managed_identity_required = true` when it
+creates a Docker- or Podman-managed sandbox. This creation-time marker is the
+only authorization for the supervisor to resolve and report a managed local
+identity. Unmarked legacy, offline, Kubernetes, and VM sandboxes do not
+interpret Docker/Podman source and image metadata. Kubernetes masks and VM
+strips those environment keys as defense in depth, so an image cannot opt either
+runtime into this protocol.
+
+Before exposing SSH or launching the direct entrypoint, a marked supervisor
+sends the resolved identity in `SupervisorHello`. The gateway validates the
+schema version, source, non-empty immutable image ID, non-root UID/GID, and
+empty supplementary-group list. It atomically stores the first identity in
+`SandboxStatus.resolved_identity`; later sessions must match it exactly. The
+supervisor proceeds only after `SessionAccepted`, and fails closed if the
+gateway rejects the identity or does not accept it before the startup timeout.
+The supervisor also emits an informational OCSF configuration-state event with
+the resolved source, image ID, UID, GID, and empty supplementary-group list.
+
+Filesystem preparation changes ownership only where required. For a
+driver-selected identity, it changes the `/sandbox` directory itself but never
+recursively traverses image content or nested mounts. Existing policy
+`read_write` paths retain their ownership; a missing final directory is created
+and owned through descriptor-relative, no-follow operations that reject symlink
+races.
+The implementation lives in
+`crates/openshell-supervisor-process/src/identity.rs` and
+`crates/openshell-supervisor-process/src/process.rs`.
+
 ## Startup Flow
 
-1. The compute runtime starts the workload with sandbox identity, callback
-   endpoint, TLS or secret material, image metadata, and initial command.
+1. The compute runtime starts the root supervisor with sandbox identity,
+   callback endpoint, TLS or secret material, image metadata, and initial
+   command.
 2. The supervisor loads policy and runtime settings from local files or the
    gateway, depending on mode.
-3. It prepares filesystem access, process restrictions, network namespace
-   routing, trust stores, provider credential resolution, and inference routes.
-4. It starts the policy proxy and local SSH server.
-5. It opens a supervisor session back to the gateway for connect, exec, file
-   sync, config polling, and log push.
-6. It launches the agent command as the restricted sandbox user.
+3. For a marked local sandbox, it resolves and persists the numeric agent
+   identity. It then prepares filesystem access, process restrictions, network
+   namespace routing, trust stores, provider credentials, and inference routes.
+4. It starts the policy proxy and opens the outbound supervisor session. A
+   marked sandbox waits for gateway identity acceptance.
+5. It starts the local SSH server and launches the agent command. Direct and SSH
+   children drop to the same resolved identity before executing user code.
+6. The supervisor session carries connect, exec, file sync, config polling, and
+   log traffic for the lifetime of the sandbox.
 
 ## Isolation Layers
 
@@ -41,7 +105,7 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 | Layer | Purpose |
 |---|---|
 | Filesystem policy | Landlock restricts the paths the agent can read or write. |
-| Process policy | The child process runs as a non-root user with reduced privileges. |
+| Process policy | The child process runs as a non-root identity without retained capabilities. Managed local children use numeric UID/GID and no supplementary groups. |
 | Seccomp | Blocks dangerous syscalls, including raw socket paths that bypass the proxy. |
 | Network namespace | Forces ordinary agent egress through the local CONNECT proxy. |
 | Policy proxy | Evaluates destination, binary identity, TLS/L7 rules, SSRF checks, and inference interception. |
@@ -174,9 +238,10 @@ operator decision.
 
 Provider credentials are stored at the gateway and fetched by the supervisor at
 runtime. The supervisor injects resolved environment variables into the initial
-agent process and SSH child processes. Driver-controlled environment variables
-override template values so sandbox images cannot spoof identity, callback, or
-relay settings.
+agent process and SSH child processes. Driver-controlled bootstrap values
+override template values so sandbox images cannot spoof callback or relay
+settings; managed local identity uses the creation marker and acceptance
+protocol described above rather than trusting environment presence alone.
 
 Supervisor bootstrap identity is not inherited by agent child processes. When
 provider token grants mount a SPIFFE Workload API socket, the socket path must

@@ -34,6 +34,45 @@ e2e_pick_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
 }
 
+e2e_resolve_local_identity_config() {
+  local source
+  source="$(printf '%s' "${OPENSHELL_E2E_IDENTITY_SOURCE:-image}" | tr '[:upper:]' '[:lower:]')"
+
+  case "${source}" in
+    image)
+      if [ -n "${OPENSHELL_E2E_FIXED_UID:-}" ] || [ -n "${OPENSHELL_E2E_FIXED_GID:-}" ]; then
+        echo "ERROR: OPENSHELL_E2E_FIXED_UID/GID must be unset in image identity mode." >&2
+        exit 2
+      fi
+      ;;
+    fixed)
+      for field in OPENSHELL_E2E_FIXED_UID OPENSHELL_E2E_FIXED_GID; do
+        local value="${!field:-}"
+        if ! [[ "${value}" =~ ^[0-9]+$ ]] \
+           || [ "${value}" -lt 1000 ] \
+           || [ "${value}" -gt 2000000000 ]; then
+          echo "ERROR: ${field} must be an integer in [1000, 2000000000] for fixed identity mode." >&2
+          exit 2
+        fi
+      done
+      ;;
+    *)
+      echo "ERROR: OPENSHELL_E2E_IDENTITY_SOURCE must be image or fixed, got '${source}'." >&2
+      exit 2
+      ;;
+  esac
+
+  export OPENSHELL_E2E_IDENTITY_SOURCE="${source}"
+}
+
+e2e_write_local_identity_config() {
+  printf 'identity_source = %s\n' "$(e2e_toml_string "${OPENSHELL_E2E_IDENTITY_SOURCE}")"
+  if [ "${OPENSHELL_E2E_IDENTITY_SOURCE}" = "fixed" ]; then
+    printf 'fixed_uid = %s\n' "${OPENSHELL_E2E_FIXED_UID}"
+    printf 'fixed_gid = %s\n' "${OPENSHELL_E2E_FIXED_GID}"
+  fi
+}
+
 e2e_generate_pki() {
   local gateway_bin=$1
   local pki_dir=$2

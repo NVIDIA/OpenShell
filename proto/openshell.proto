@@ -458,6 +458,10 @@ message SandboxStatus {
   SandboxPhase phase = 6;
   // Currently active policy version (updated when sandbox reports loaded).
   uint32 current_policy_version = 7;
+  // Persisted creation-time identity selected for agent children, when managed.
+  openshell.sandbox.v1.ResolvedAgentIdentity resolved_identity = 8;
+  // Whether this sandbox requires gateway-authorized managed runtime identity.
+  bool managed_identity_required = 9;
 }
 
 // User-facing sandbox condition derived from driver-native conditions.
@@ -1603,6 +1607,8 @@ message SupervisorHello {
   string sandbox_id = 1;
   // Supervisor instance ID (e.g. boot id or process epoch).
   string instance_id = 2;
+  // Creation-time identity resolved by a managed sandbox runtime.
+  openshell.sandbox.v1.ResolvedAgentIdentity resolved_identity = 3;
 }
 
 // Gateway accepts the supervisor session.

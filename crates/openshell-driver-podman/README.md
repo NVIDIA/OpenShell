@@ -50,6 +50,41 @@ The container spec in `container.rs` sets these security-critical fields:
 
 The restricted agent child does not retain these supervisor privileges.
 
+## Agent Identity
+
+`[openshell.drivers.podman].identity_source` selects the identity for agent
+children. It accepts `image` or `fixed` and defaults to `image`. Image mode
+requires the sandbox image to declare a non-root OCI `USER`; there is no
+implicit `10001:10001` fallback. Fixed mode requires both `fixed_uid` and
+`fixed_gid`, each in the inclusive range `1000` through `2000000000`. Fixed
+fields are invalid in image mode.
+
+The driver applies the image pull policy, inspects the final image, and carries
+its raw OCI `Config.User` and immutable image ID into provisioning. The
+container uses that immutable ID with create-time pull policy `never`, while
+`user = "0:0"` keeps the supervisor privileged. Only agent children drop to
+the resolved identity. The driver also resolves the supervisor image and
+driver-config image mounts to immutable IDs before container creation.
+
+Image identity accepts named, numeric, and mixed `user:group` OCI forms. A
+named user or group must resolve uniquely from the image's regular
+`/etc/passwd` or `/etc/group` file. A numeric UID without a group uses the
+matching passwd entry's primary GID. A numeric pair such as `USER 1234:1235`
+requires no account entries. OpenShell rejects a missing `USER`, an unknown or
+ambiguous name, an accountless numeric UID without a group, and any declaration
+that resolves to UID or GID 0.
+
+Agent children receive `HOME=/sandbox`, no supplementary groups, and the
+declared user name in `USER` and `LOGNAME` when one is available. Numeric and
+fixed identities use the numeric UID for presentation. OpenShell does not
+modify `/etc/passwd` or `/etc/group`.
+
+The supervisor persists the resolved source, immutable image ID, UID, GID, and
+empty supplementary group list. The gateway exposes this record in sandbox
+status, and the supervisor emits it as an OCSF configuration-state event.
+Restarts reuse the persisted identity instead of resolving a mutable tag or
+changed account file again.
+
 ## Driver Config Mounts
 
 The gateway forwards the `podman` block from `--driver-config-json` to this
@@ -57,19 +92,28 @@ driver. The driver accepts user-supplied `mounts` entries with these Podman
 mount types:
 
 - `bind`: mounts an absolute host path when `[openshell.drivers.podman]`
-  has `enable_bind_mounts = true`.
+  has `enable_bind_mounts = true`. It also requires fixed identity mode.
 - `volume`: mounts an existing Podman named volume. The driver validates that
   the volume exists before provisioning and never creates or removes it. Podman
   local-driver volumes created with bind options are treated as host bind
-  mounts and require `enable_bind_mounts = true`.
+  mounts and require `enable_bind_mounts = true`. All creator-selected named
+  volumes require fixed identity mode.
 - `tmpfs`: mounts an in-memory filesystem with optional `options`,
   `size_bytes`, and `mode`.
 - `image`: mounts an OCI image through Podman's image-volume API. The driver
-  pulls the image during provisioning using the sandbox image pull policy.
+  pulls and inspects the image during provisioning using the sandbox image pull
+  policy, then mounts its immutable ID. Image mode requires this mount to be
+  read-only.
 
 Host bind mounts are disabled by default because they expose gateway host paths
 to sandbox requests. The driver still uses internal bind mounts for configured
 TLS material; per-sandbox gateway JWTs are delivered through Podman secrets.
+
+Image identity mode rejects creator-selected bind and named-volume mounts,
+even when `enable_bind_mounts = true`. It permits `tmpfs`, the driver-owned
+per-sandbox workspace volume, and read-only immutable `image` mounts. Use fixed
+mode for external or shared storage that expects an operator-controlled UID and
+GID.
 
 Podman `bind` mounts accept `source`, `target`, optional `read_only`, and an
 optional `selinux_label` of `shared` (applies `:z`) or `private` (applies
@@ -82,6 +126,13 @@ the workspace root (`/sandbox`) or overlap OpenShell supervisor files,
 `/etc/openshell`, `/etc/openshell-tls`, or `/run/netns`.
 
 Example named-volume usage:
+
+```toml
+[openshell.drivers.podman]
+identity_source = "fixed"
+fixed_uid = 1000
+fixed_gid = 1000
+```
 
 ```shell
 podman volume create openshell-work
@@ -341,6 +392,9 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_SANDBOX_SSH_SOCKET_PATH` | `--sandbox-ssh-socket-path` | `/run/openshell/ssh.sock` | Supervisor Unix socket path in `PodmanComputeConfig`. |
 | `OPENSHELL_STOP_TIMEOUT` | `--stop-timeout` | `10` | Container stop timeout in seconds. |
 | `OPENSHELL_SANDBOX_PIDS_LIMIT` | `--sandbox-pids-limit` | `2048` | Podman cgroup PID limit for sandbox containers. Set `0` to inherit Podman's runtime/default PID limit. |
+| `OPENSHELL_PODMAN_IDENTITY_SOURCE` | `--identity-source` | `image` | Agent identity source. Accepted values are `image` and `fixed`. |
+| `OPENSHELL_PODMAN_FIXED_UID` | `--fixed-uid` | unset | Agent UID for fixed identity mode. Must be set with `--fixed-gid`. |
+| `OPENSHELL_PODMAN_FIXED_GID` | `--fixed-gid` | unset | Agent primary GID for fixed identity mode. Must be set with `--fixed-uid`. |
 | `OPENSHELL_SUPERVISOR_IMAGE` | `--supervisor-image` | `ghcr.io/nvidia/openshell/supervisor:latest` through the gateway, required standalone | OCI image containing the supervisor binary. |
 | `OPENSHELL_PODMAN_TLS_CA` | `--podman-tls-ca` | unset | Host path to the CA certificate mounted for sandbox mTLS. |
 | `OPENSHELL_PODMAN_TLS_CERT` | `--podman-tls-cert` | unset | Host path to the client certificate mounted for sandbox mTLS. |

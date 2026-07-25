@@ -1078,7 +1078,7 @@ mod tests {
                 .await
                 .expect("failed to create test store"),
         );
-        let compute = crate::compute::new_test_runtime(store.clone()).await;
+        let compute = crate::compute::new_test_runtime(store.clone());
         Arc::new(ServerState::new(
             Config::new(None)
                 .with_database_url("sqlite::memory:?cache=shared")

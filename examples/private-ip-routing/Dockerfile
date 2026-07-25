@@ -3,5 +3,7 @@
 
 FROM python:3.13-slim
 COPY server.py /app/server.py
+RUN chmod 0555 /app && chmod 0444 /app/server.py
 EXPOSE 8080
 CMD ["python", "/app/server.py"]
+USER 1234:1235

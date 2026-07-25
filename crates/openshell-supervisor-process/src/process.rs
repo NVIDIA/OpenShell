@@ -78,6 +78,11 @@ const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::TLS_CERT,
     openshell_core::sandbox_env::TLS_KEY,
     openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+    openshell_core::sandbox_env::IDENTITY_SOURCE,
+    openshell_core::sandbox_env::IMAGE_USER,
+    openshell_core::sandbox_env::IMAGE_ID,
+    openshell_core::sandbox_env::SANDBOX_UID,
+    openshell_core::sandbox_env::SANDBOX_GID,
 ];
 
 pub fn is_supervisor_only_env_var(key: &str) -> bool {
@@ -599,6 +604,12 @@ impl ProcessHandle {
             }
         }
 
+        // Apply identity last so image, request, and provider environment
+        // cannot replace the supervisor-selected child identity presentation.
+        for (key, value) in child_env::identity_env_vars(policy) {
+            cmd.env(key, value);
+        }
+
         // Probe Landlock availability and emit OCSF logs from the parent
         // process where the tracing subscriber is functional. The child's
         // pre_exec context cannot reliably emit structured logs.
@@ -740,6 +751,10 @@ impl ProcessHandle {
             }
         }
 
+        for (key, value) in child_env::identity_env_vars(policy) {
+            cmd.env(key, value);
+        }
+
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
@@ -869,7 +884,17 @@ pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
     let identity = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
 
     // Numeric UID — no passwd entry required; kernel resolves directly.
-    if openshell_policy::is_valid_sandbox_identity(identity) && identity.parse::<u32>().is_ok() {
+    if let Ok(uid) = identity.parse::<u32>() {
+        let driver_resolved =
+            std::env::var_os(openshell_core::sandbox_env::IDENTITY_SOURCE).is_some();
+        if uid == 0 {
+            return Err(miette::miette!("sandbox UID must not be 0"));
+        }
+        if !driver_resolved && !openshell_policy::is_valid_sandbox_identity(identity) {
+            return Err(miette::miette!(
+                "numeric sandbox UID {uid} is outside the allowed policy range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+            ));
+        }
         openshell_ocsf::ocsf_emit!(
             openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::Informational)
@@ -943,7 +968,17 @@ pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
 pub fn validate_sandbox_group(policy: &SandboxPolicy) -> Result<()> {
     let identity = policy.process.run_as_group.as_deref().unwrap_or("sandbox");
 
-    if openshell_policy::is_valid_sandbox_identity(identity) && identity.parse::<u32>().is_ok() {
+    if let Ok(gid) = identity.parse::<u32>() {
+        let driver_resolved =
+            std::env::var_os(openshell_core::sandbox_env::IDENTITY_SOURCE).is_some();
+        if gid == 0 {
+            return Err(miette::miette!("sandbox GID must not be 0"));
+        }
+        if !driver_resolved && !openshell_policy::is_valid_sandbox_identity(identity) {
+            return Err(miette::miette!(
+                "numeric sandbox GID {gid} is outside the allowed policy range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+            ));
+        }
         openshell_ocsf::ocsf_emit!(
             openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::Informational)
@@ -1009,241 +1044,27 @@ pub use openshell_policy::{MAX_SANDBOX_UID, MIN_SANDBOX_UID};
 
 /// Prepare a `read_write` path for the sandboxed process.
 ///
-/// Returns `true` when the path was created by the supervisor and therefore
-/// still needs to be chowned to the sandbox user/group. Existing paths keep
-/// their image-defined ownership.
+/// Returns `true` when the path was created and descriptor-owned by the
+/// supervisor. Existing paths keep their image-defined ownership.
 #[cfg(unix)]
-fn prepare_read_write_path(path: &Path) -> Result<bool> {
-    // SECURITY: use symlink_metadata (lstat) to inspect each path *before*
-    // calling chown. chown follows symlinks, so a malicious container image
-    // could place a symlink (e.g. /sandbox -> /etc/shadow) to trick the
-    // root supervisor into transferring ownership of arbitrary files.
-    // The TOCTOU window between lstat and chown is not exploitable because
-    // no untrusted process is running yet (the child has not been forked).
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return Err(miette::miette!(
-                "read_write path '{}' is a symlink — refusing to chown (potential privilege escalation)",
-                path.display()
-            ));
-        }
-
-        debug!(
-            path = %path.display(),
-            "Preserving ownership for existing read_write path"
-        );
-        Ok(false)
-    } else {
+fn prepare_read_write_path(path: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<bool> {
+    let created = crate::identity::prepare_read_write_path_owned(
+        path,
+        uid.map(Uid::as_raw),
+        gid.map(Gid::as_raw),
+    )?;
+    if created {
         debug!(path = %path.display(), "Creating read_write directory");
-        std::fs::create_dir_all(path).into_diagnostic()?;
-        Ok(true)
+    } else {
+        debug!(path = %path.display(), "Preserving ownership for existing read_write path");
     }
+    Ok(created)
 }
 
-/// Update `/etc/passwd` and `/etc/group` so the "sandbox" user/group entries
-/// match the driver-injected UID/GID from environment variables.
-///
-/// When `OPENSHELL_SANDBOX_UID` is set, the image-baked "sandbox" entry may
-/// have a different UID. Updating the files ensures `whoami`, `id`, `ls -l`,
-/// SSH sessions, and `initgroups` resolve the sandbox identity correctly.
-/// If no "sandbox" entry exists, one is appended.
+/// Chown only the workspace root, never image content or nested mounts.
 #[cfg(unix)]
-pub fn update_sandbox_passwd_entries() -> Result<()> {
-    let uid_str = match std::env::var(openshell_core::sandbox_env::SANDBOX_UID) {
-        Ok(v) if !v.is_empty() => v,
-        _ => return Ok(()),
-    };
-    let gid_str = match std::env::var(openshell_core::sandbox_env::SANDBOX_GID) {
-        Ok(v) if !v.is_empty() => v,
-        _ => uid_str.clone(),
-    };
-
-    let _: u32 = uid_str
-        .parse()
-        .map_err(|e| miette::miette!("invalid OPENSHELL_SANDBOX_UID '{uid_str}': {e}"))?;
-    let _: u32 = gid_str
-        .parse()
-        .map_err(|e| miette::miette!("invalid OPENSHELL_SANDBOX_GID '{gid_str}': {e}"))?;
-
-    update_passwd_file(&uid_str, &gid_str)?;
-    update_group_file(&gid_str)?;
-
-    info!(
-        uid = %uid_str,
-        gid = %gid_str,
-        "Updated /etc/passwd and /etc/group for sandbox identity"
-    );
-    Ok(())
-}
-
-/// Rewrite the `sandbox` line in `/etc/passwd` with the given UID/GID,
-/// or append a new entry if none exists.
-#[cfg(unix)]
-fn update_passwd_file(uid: &str, gid: &str) -> Result<()> {
-    rewrite_passwd_at(Path::new("/etc/passwd"), uid, gid)
-}
-
-/// Rewrite the `sandbox` line in `/etc/group` with the given GID,
-/// or append a new entry if none exists.
-#[cfg(unix)]
-fn update_group_file(gid: &str) -> Result<()> {
-    rewrite_group_at(Path::new("/etc/group"), gid)
-}
-
-#[cfg(unix)]
-fn rewrite_passwd_at(path: &Path, uid: &str, gid: &str) -> Result<()> {
-    let content = std::fs::read_to_string(path).into_diagnostic()?;
-
-    let mut found = false;
-    let mut lines: Vec<String> = content
-        .lines()
-        .map(|line| {
-            if line.starts_with("sandbox:") {
-                found = true;
-                let fields: Vec<&str> = line.split(':').collect();
-                if fields.len() >= 7 {
-                    format!(
-                        "{}:{}:{}:{}:{}:{}:{}",
-                        fields[0], fields[1], uid, gid, fields[4], fields[5], fields[6]
-                    )
-                } else {
-                    line.to_string()
-                }
-            } else {
-                line.to_string()
-            }
-        })
-        .collect();
-
-    if !found {
-        lines.push(format!("sandbox:x:{uid}:{gid}::/sandbox:/bin/sh"));
-    }
-
-    let mut output = lines.join("\n");
-    if content.ends_with('\n') || !found {
-        output.push('\n');
-    }
-
-    std::fs::write(path, output).into_diagnostic()?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
-    let content = std::fs::read_to_string(path).into_diagnostic()?;
-
-    let mut found = false;
-    let mut lines: Vec<String> = content
-        .lines()
-        .map(|line| {
-            if line.starts_with("sandbox:") {
-                found = true;
-                let fields: Vec<&str> = line.split(':').collect();
-                if fields.len() >= 4 {
-                    format!("{}:{}:{}:{}", fields[0], fields[1], gid, fields[3])
-                } else {
-                    line.to_string()
-                }
-            } else {
-                line.to_string()
-            }
-        })
-        .collect();
-
-    if !found {
-        lines.push(format!("sandbox:x:{gid}:"));
-    }
-
-    let mut output = lines.join("\n");
-    if content.ends_with('\n') || !found {
-        output.push('\n');
-    }
-
-    std::fs::write(path, output).into_diagnostic()?;
-    Ok(())
-}
-
-/// Recursively chown a directory tree to the given UID/GID.
-///
-/// Symlinks are skipped (not followed) to prevent privilege escalation via
-/// malicious container images. The TOCTOU window is not exploitable because
-/// no untrusted process is running yet.
-///
-/// The root path is chowned unconditionally — EROFS there is a hard error
-/// (a read-only `/sandbox` is a misconfiguration). For children, `EROFS`
-/// causes the walker to skip that path and its entire subtree — descending
-/// into a read-only mount we do not control would be a TOCTOU risk
-/// (CWE-367/CWE-59). Siblings of the read-only path are still visited.
-#[cfg(unix)]
-fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
-    let meta = std::fs::symlink_metadata(root).into_diagnostic()?;
-    if meta.file_type().is_symlink() {
-        return Err(miette::miette!(
-            "path '{}' is a symlink — refusing to chown (potential privilege escalation)",
-            root.display()
-        ));
-    }
-
-    nix::unistd::chown(root, uid, gid).into_diagnostic()?;
-
-    if meta.is_dir() {
-        chown_children(root, uid, gid, &nix::unistd::chown)?;
-    }
-
-    Ok(())
-}
-
-/// Walk directory children and chown each entry, skipping symlinks and
-/// EROFS subtrees. Called after the parent has already been chowned.
-#[cfg(unix)]
-fn chown_children(
-    dir: &Path,
-    uid: Option<Uid>,
-    gid: Option<Gid>,
-    do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
-) -> Result<()> {
-    match std::fs::read_dir(dir) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry.into_diagnostic()?;
-                let child = entry.path();
-                chown_recursive(&child, uid, gid, do_chown)?;
-            }
-        }
-        Err(e) => {
-            debug!(path = %dir.display(), error = %e, "Cannot list directory during sandbox home chown");
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn chown_recursive(
-    path: &Path,
-    uid: Option<Uid>,
-    gid: Option<Gid>,
-    do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
-) -> Result<()> {
-    let meta = std::fs::symlink_metadata(path).into_diagnostic()?;
-
-    if meta.file_type().is_symlink() {
-        debug!(path = %path.display(), "Skipping symlink during sandbox home chown");
-        return Ok(());
-    }
-
-    if let Err(e) = do_chown(path, uid, gid) {
-        if e == nix::errno::Errno::EROFS {
-            debug!(path = %path.display(), "Skipping read-only path during sandbox home chown");
-            return Ok(());
-        }
-        return Err(e).into_diagnostic();
-    }
-
-    if meta.is_dir() {
-        chown_children(path, uid, gid, do_chown)?;
-    }
-
-    Ok(())
+fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<bool> {
+    crate::identity::chown_directory_no_follow(root, uid.map(Uid::as_raw), gid.map(Gid::as_raw))
 }
 
 /// Prepare filesystem for the sandboxed process.
@@ -1256,7 +1077,6 @@ fn chown_recursive(
 /// UIDs/GIDs (passed directly to `chown` without a passwd lookup).
 #[cfg(unix)]
 pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
-    use nix::unistd::chown;
     use nix::unistd::{Gid, Uid};
 
     let user_name = match policy.process.run_as_user.as_deref() {
@@ -1291,29 +1111,36 @@ pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
         _ => None,
     };
 
+    #[cfg(target_os = "linux")]
+    crate::identity::validate_user_namespace_mappings(
+        uid.unwrap_or_else(nix::unistd::geteuid).as_raw(),
+        gid.unwrap_or_else(nix::unistd::getegid).as_raw(),
+    )?;
+
     // Create missing read_write paths and only chown the ones we created.
     for path in &policy.filesystem.read_write {
-        if prepare_read_write_path(path)? {
+        if prepare_read_write_path(path, uid, gid)? {
             debug!(
                 path = %path.display(),
                 ?uid,
                 ?gid,
                 "Setting ownership on newly created read_write path"
             );
-            chown(path, uid, gid).into_diagnostic()?;
         }
     }
 
-    // When a driver injects a custom UID/GID via environment variables, the
-    // /sandbox home directory may already exist with image-default ownership
-    // (e.g. UID 1000) that differs from the driver-assigned identity.
-    // Recursively chown /sandbox so the sandbox process can use its home
-    // directory.
-    if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok() {
+    // Driver-selected identities own the workspace mount point itself. Never
+    // traverse descendants because they may contain image data or nested mounts.
+    if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok()
+        || std::env::var(openshell_core::sandbox_env::IDENTITY_SOURCE).is_ok()
+    {
         let sandbox_home = Path::new("/sandbox");
-        if sandbox_home.exists() {
-            info!(?uid, ?gid, "Chowning /sandbox for driver-injected UID/GID");
-            chown_sandbox_home(sandbox_home, uid, gid)?;
+        if chown_sandbox_home(sandbox_home, uid, gid)? {
+            info!(
+                ?uid,
+                ?gid,
+                "Chowning /sandbox root for driver-selected identity"
+            );
         }
     }
 
@@ -1389,10 +1216,14 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
         },
     };
 
+    #[cfg(target_os = "linux")]
+    crate::identity::validate_user_namespace_mappings(target_uid.as_raw(), target_gid.as_raw())?;
+
     // Resolve the user record for initgroups only when identity is name-based.
     // Numeric UIDs may not have a /etc/passwd entry; skip the lookup rather than
     // failing with a spurious "user record not found" error.
     let user_name_is_numeric = user_name.is_some_and(|n| n.parse::<u32>().is_ok());
+    let group_name_is_numeric = group_name.is_some_and(|n| n.parse::<u32>().is_ok());
     let user = if user_name.is_some() && !user_name_is_numeric {
         Some(
             User::from_uid(target_uid)
@@ -1405,9 +1236,16 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
         None
     };
 
-    // Set supplementary groups only when we have a name-based identity.
-    // Numeric UIDs may not have a passwd entry, so initgroups would fail.
-    if let Some(ref user) = user
+    // Resolved image/fixed identities are normalized to numeric UID/GID and
+    // must never inherit supervisor supplementary groups. Legacy named policy
+    // identities retain their existing initgroups behavior.
+    #[cfg(target_os = "linux")]
+    if user_name_is_numeric || group_name_is_numeric {
+        clear_supplementary_groups()?;
+    }
+    if !user_name_is_numeric
+        && !group_name_is_numeric
+        && let Some(ref user) = user
         && target_uid != nix::unistd::geteuid()
     {
         let user_cstr =
@@ -1479,6 +1317,38 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn clear_supplementary_groups() -> Result<()> {
+    let before = rustix::process::getgroups().into_diagnostic()?;
+    let clear_result = rustix::thread::set_thread_groups(&[]).map_err(|error| error.raw_os_error());
+    validate_supplementary_group_clear(clear_result, before.is_empty(), true)?;
+    let remaining = rustix::process::getgroups().into_diagnostic()?;
+    if !remaining.is_empty() {
+        return Err(miette::miette!(
+            "supplementary group clear verification failed: groups remain: {remaining:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn validate_supplementary_group_clear(
+    clear_result: std::result::Result<(), i32>,
+    groups_were_empty: bool,
+    allow_denied_when_empty: bool,
+) -> Result<()> {
+    match clear_result {
+        Ok(()) => Ok(()),
+        Err(error) if error == libc::EPERM && groups_were_empty && allow_denied_when_empty => {
+            debug!("setgroups is denied, but the supplementary group list is already empty");
+            Ok(())
+        }
+        Err(error) => Err(miette::miette!(
+            "failed to clear supplementary groups before privilege drop: {error}"
+        )),
+    }
 }
 
 /// Process exit status.
@@ -1998,23 +1868,42 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn prepare_read_write_path_as_current(path: &Path) -> Result<bool> {
+        prepare_read_write_path(
+            path,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+        )
+    }
+
+    #[cfg(unix)]
     #[test]
     fn prepare_read_write_path_creates_missing_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing").join("nested");
+        use std::os::unix::fs::MetadataExt;
 
-        assert!(prepare_read_write_path(&missing).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("missing")
+            .join("nested");
+
+        assert!(prepare_read_write_path_as_current(&missing).unwrap());
         assert!(missing.is_dir());
+        let metadata = std::fs::metadata(&missing).unwrap();
+        assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        assert_eq!(metadata.gid(), nix::unistd::getegid().as_raw());
     }
 
     #[cfg(unix)]
     #[test]
     fn prepare_read_write_path_preserves_existing_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let existing = dir.path().join("existing");
+        let existing = dir.path().canonicalize().unwrap().join("existing");
         std::fs::create_dir(&existing).unwrap();
 
-        assert!(!prepare_read_write_path(&existing).unwrap());
+        assert!(!prepare_read_write_path_as_current(&existing).unwrap());
         assert!(existing.is_dir());
     }
 
@@ -2024,18 +1913,39 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target");
-        let link = dir.path().join("link");
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join("target");
+        let link = root.join("link");
         std::fs::create_dir(&target).unwrap();
         symlink(&target, &link).unwrap();
 
-        let error = prepare_read_write_path(&link).unwrap_err();
+        let error = prepare_read_write_path_as_current(&link).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing unsafe directory path"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_read_write_path_rejects_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let real = root.join("real");
+        let linked = root.join("linked");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, &linked).unwrap();
+        let requested = linked.join("nested/path");
+
+        let error = prepare_read_write_path_as_current(&requested).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("is a symlink — refusing to chown"),
-            "unexpected error: {error}"
+                .contains("symlink or non-directory ancestor")
         );
+        assert!(!real.join("nested/path").exists());
     }
 
     #[cfg(unix)]
@@ -2059,7 +1969,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let existing = dir.path().join("existing");
+        let existing = dir.path().canonicalize().unwrap().join("existing");
         std::fs::create_dir(&existing).unwrap();
         let before = std::fs::metadata(&existing).unwrap();
 
@@ -2078,52 +1988,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[allow(clippy::similar_names)]
-    fn chown_sandbox_home_changes_ownership_recursively() {
-        use std::os::unix::fs::MetadataExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("sandbox");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("file.txt"), "hello").unwrap();
-        std::fs::create_dir(root.join("subdir")).unwrap();
-        std::fs::write(root.join("subdir").join("nested.txt"), "world").unwrap();
-
-        let expected_uid = nix::unistd::geteuid();
-        let expected_gid = nix::unistd::getegid();
-
-        chown_sandbox_home(&root, Some(expected_uid), Some(expected_gid)).unwrap();
-
-        for path in &[
-            root.clone(),
-            root.join("file.txt"),
-            root.join("subdir"),
-            root.join("subdir").join("nested.txt"),
-        ] {
-            let meta = std::fs::metadata(path).unwrap();
-            assert_eq!(
-                meta.uid(),
-                expected_uid.as_raw(),
-                "uid mismatch for {}",
-                path.display()
-            );
-            assert_eq!(
-                meta.gid(),
-                expected_gid.as_raw(),
-                "gid mismatch for {}",
-                path.display()
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn chown_sandbox_home_rejects_symlink_root() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("real");
-        let link = dir.path().join("link");
+        let temp_root = dir.path().canonicalize().unwrap();
+        let target = temp_root.join("real");
+        let link = temp_root.join("link");
         std::fs::create_dir(&target).unwrap();
         symlink(&target, &link).unwrap();
 
@@ -2141,185 +2012,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn chown_sandbox_home_skips_symlink_children() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("sandbox");
-        std::fs::create_dir(&root).unwrap();
-        let target = dir.path().join("outside");
-        std::fs::write(&target, "secret").unwrap();
-        symlink(&target, root.join("link")).unwrap();
-
-        chown_sandbox_home(
-            &root,
-            Some(nix::unistd::geteuid()),
-            Some(nix::unistd::getegid()),
-        )
-        .expect("should skip symlink children without error");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn chown_recursive_skips_erofs_subtree_but_continues_siblings() {
-        use std::sync::{Arc, Mutex};
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("sandbox");
-        std::fs::create_dir(&root).unwrap();
-
-        let readonly_dir = root.join("ro-mount");
-        std::fs::create_dir(&readonly_dir).unwrap();
-        std::fs::write(readonly_dir.join("child-under-ro.txt"), "data").unwrap();
-
-        std::fs::write(root.join("writable-sibling.txt"), "data").unwrap();
-
-        let uid = Some(nix::unistd::geteuid());
-        let gid = Some(nix::unistd::getegid());
-
-        let chowned: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
-        let chowned_ref = Arc::clone(&chowned);
-
-        let readonly_dir_clone = readonly_dir.clone();
-        let fake_chown =
-            move |path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
-                if path == readonly_dir_clone {
-                    return Err(nix::errno::Errno::EROFS);
-                }
-                chowned_ref.lock().unwrap().push(path.to_path_buf());
-                Ok(())
-            };
-
-        chown_children(&root, uid, gid, &fake_chown).expect("EROFS should be handled gracefully");
-
-        let chowned = chowned.lock().unwrap();
+    fn supplementary_group_clear_accepts_success() {
         assert!(
-            !chowned.contains(&readonly_dir.join("child-under-ro.txt")),
-            "children under EROFS directory must NOT be descended into"
-        );
-        assert!(
-            chowned.contains(&root.join("writable-sibling.txt")),
-            "writable sibling should still be chowned"
+            validate_supplementary_group_clear(Ok(()), true, cfg!(target_os = "linux")).is_ok()
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn chown_recursive_propagates_non_erofs_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("sandbox");
-        std::fs::create_dir(&root).unwrap();
-
-        let uid = Some(nix::unistd::geteuid());
-        let gid = Some(nix::unistd::getegid());
-
-        let fake_chown = |_path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
-            Err(nix::errno::Errno::EPERM)
-        };
-
-        let result = chown_recursive(&root, uid, gid, &fake_chown);
-        assert!(result.is_err(), "non-EROFS errors should propagate");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn chown_children_skips_all_erofs_children_gracefully() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("sandbox");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::create_dir(root.join("a")).unwrap();
-        std::fs::write(root.join("b.txt"), "data").unwrap();
-
-        let uid = Some(nix::unistd::geteuid());
-        let gid = Some(nix::unistd::getegid());
-
-        let always_erofs = |_path: &Path,
-                            _uid: Option<Uid>,
-                            _gid: Option<Gid>|
-         -> nix::Result<()> { Err(nix::errno::Errno::EROFS) };
-
-        chown_children(&root, uid, gid, &always_erofs)
-            .expect("EROFS on all children should be skipped gracefully");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rewrite_passwd_modifies_existing_sandbox_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let passwd = dir.path().join("passwd");
-        std::fs::write(
-            &passwd,
-            "root:x:0:0:root:/root:/bin/bash\nsandbox:x:1000:1000::/sandbox:/bin/bash\n",
-        )
-        .unwrap();
-
-        rewrite_passwd_at(&passwd, "5000", "6000").unwrap();
-
-        let content = std::fs::read_to_string(&passwd).unwrap();
-        assert!(content.contains("sandbox:x:5000:6000::/sandbox:/bin/bash"));
-        assert!(content.contains("root:x:0:0:root:/root:/bin/bash"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rewrite_passwd_appends_when_no_sandbox_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let passwd = dir.path().join("passwd");
-        std::fs::write(&passwd, "root:x:0:0:root:/root:/bin/bash\n").unwrap();
-
-        rewrite_passwd_at(&passwd, "5000", "6000").unwrap();
-
-        let content = std::fs::read_to_string(&passwd).unwrap();
-        assert!(content.contains("root:x:0:0:root:/root:/bin/bash"));
-        assert!(content.contains("sandbox:x:5000:6000::/sandbox:/bin/sh"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rewrite_group_modifies_existing_sandbox_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let group = dir.path().join("group");
-        std::fs::write(&group, "root:x:0:\nsandbox:x:1000:\n").unwrap();
-
-        rewrite_group_at(&group, "6000").unwrap();
-
-        let content = std::fs::read_to_string(&group).unwrap();
-        assert!(content.contains("sandbox:x:6000:"));
-        assert!(content.contains("root:x:0:"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rewrite_group_appends_when_no_sandbox_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let group = dir.path().join("group");
-        std::fs::write(&group, "root:x:0:\n").unwrap();
-
-        rewrite_group_at(&group, "6000").unwrap();
-
-        let content = std::fs::read_to_string(&group).unwrap();
-        assert!(content.contains("root:x:0:"));
-        assert!(content.contains("sandbox:x:6000:"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rewrite_passwd_preserves_other_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let passwd = dir.path().join("passwd");
-        std::fs::write(
-            &passwd,
-            "root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/:/usr/sbin/nologin\nsandbox:x:1000:1000::/sandbox:/bin/bash\n",
-        )
-        .unwrap();
-
-        rewrite_passwd_at(&passwd, "1234567", "1234567").unwrap();
-
-        let content = std::fs::read_to_string(&passwd).unwrap();
-        assert!(content.contains("root:x:0:0:root:/root:/bin/bash"));
-        assert!(content.contains("nobody:x:65534:65534:nobody:/:/usr/sbin/nologin"));
-        assert!(content.contains("sandbox:x:1234567:1234567::/sandbox:/bin/bash"));
-        assert_eq!(content.lines().count(), 3);
+    fn supplementary_group_clear_accepts_linux_eperm_only_when_already_empty() {
+        assert!(validate_supplementary_group_clear(Err(libc::EPERM), true, true).is_ok());
+        assert!(validate_supplementary_group_clear(Err(libc::EPERM), false, true).is_err());
+        assert!(validate_supplementary_group_clear(Err(libc::EPERM), true, false).is_err());
     }
 
     #[tokio::test]

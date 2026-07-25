@@ -681,33 +681,10 @@ impl Default for PtyRequest {
     }
 }
 
-/// Derive the session USER and HOME from the policy's `run_as_user`.
-///
-/// For name-based identities, looks up the home directory via `/etc/passwd`
-/// (or defaults to `/home/{user}`).
-///
-/// For numeric UIDs, there is no passwd entry — falls back to
-/// `("{uid}", "/sandbox")` so the agent session still has a meaningful
-/// USER identifier.
+/// Derive session presentation from the resolved identity with legacy fallback.
 fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
-    match policy.process.run_as_user.as_deref() {
-        Some(user) if !user.is_empty() => {
-            // Numeric UID — no passwd entry expected; use default HOME.
-            if user.parse::<u32>().is_ok() {
-                return (user.to_string(), "/sandbox".to_string());
-            }
-            // Name-based identity — look up home from /etc/passwd.
-            let home = nix::unistd::User::from_name(user)
-                .ok()
-                .flatten()
-                .map_or_else(
-                    || format!("/home/{user}"),
-                    |u| u.dir.to_string_lossy().into_owned(),
-                );
-            (user.to_string(), home)
-        }
-        _ => ("sandbox".to_string(), "/sandbox".to_string()),
-    }
+    let identity = child_env::identity_env_vars(policy);
+    (identity[1].1.clone(), identity[0].1.clone())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -725,8 +702,6 @@ fn apply_child_env(
 
     cmd.env_clear()
         .env(openshell_core::sandbox_env::SANDBOX, "1")
-        .env("HOME", session_home)
-        .env("USER", session_user)
         .env("SHELL", "/bin/bash")
         .env("PATH", &path)
         .env("TERM", term);
@@ -755,6 +730,11 @@ fn apply_child_env(
         }
         cmd.env(key, value);
     }
+
+    // Identity environment is authoritative over user/provider input.
+    cmd.env("HOME", session_home)
+        .env("USER", session_user)
+        .env("LOGNAME", session_user);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1675,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn session_user_and_home_returns_name_from_passwd() {
+    fn session_user_and_home_preserves_legacy_policy_name() {
         use openshell_core::policy::{
             FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
         };
@@ -1691,8 +1671,7 @@ mod tests {
         };
         let (user, home) = session_user_and_home(&policy);
         assert_eq!(user, "sandbox");
-        // Name-based — should resolve via passwd (or /home/{user}).
-        assert!(!home.is_empty());
+        assert_eq!(home, "/sandbox");
     }
 
     #[test]

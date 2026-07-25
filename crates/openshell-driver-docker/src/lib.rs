@@ -9,9 +9,9 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, CreateImageInfo,
-    DeviceRequest, EndpointSettings, HostConfig, Mount, MountTmpfsOptions, MountTypeEnum,
-    MountVolumeOptions, NetworkCreateRequest, NetworkingConfig, ProgressDetail, RestartPolicy,
-    RestartPolicyNameEnum, SystemInfo,
+    DeviceRequest, EndpointSettings, HostConfig, ImageInspect, Mount, MountTmpfsOptions,
+    MountTypeEnum, MountVolumeOptions, NetworkCreateRequest, NetworkingConfig, ProgressDetail,
+    RestartPolicy, RestartPolicyNameEnum, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -49,6 +49,7 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
+use openshell_core::sandbox_env::IdentitySource;
 use openshell_core::{Config, Error, Result as CoreResult};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -78,6 +79,10 @@ const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const DOCKER_NETWORK_DRIVER: &str = "bridge";
+// Keep fixed local-driver identities aligned with the process policy's numeric
+// identity range without adding a policy-engine dependency to the driver.
+const MIN_FIXED_ID: u32 = 1_000;
+const MAX_FIXED_ID: u32 = 2_000_000_000;
 
 /// Queried by the Docker driver to decide when a sandbox's supervisor
 /// relay is live. Implementations return `true` once a sandbox has an
@@ -146,6 +151,15 @@ pub struct DockerComputeConfig {
     /// `template.driver_config`.
     #[serde(default)]
     pub enable_bind_mounts: bool,
+
+    /// Source used to select the agent process identity.
+    pub identity_source: IdentitySource,
+
+    /// Operator-selected UID used when `identity_source = "fixed"`.
+    pub fixed_uid: Option<u32>,
+
+    /// Operator-selected GID used when `identity_source = "fixed"`.
+    pub fixed_gid: Option<u32>,
 }
 
 impl Default for DockerComputeConfig {
@@ -166,8 +180,50 @@ impl Default for DockerComputeConfig {
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
             enable_bind_mounts: false,
+            identity_source: IdentitySource::Image,
+            fixed_uid: None,
+            fixed_gid: None,
         }
     }
+}
+
+fn validate_docker_identity_config(
+    config: &DockerComputeConfig,
+) -> CoreResult<DockerIdentityConfig> {
+    match config.identity_source {
+        IdentitySource::Image => {
+            if config.fixed_uid.is_some() || config.fixed_gid.is_some() {
+                return Err(Error::config(
+                    "docker fixed_uid and fixed_gid must be omitted when identity_source = 'image'",
+                ));
+            }
+        }
+        IdentitySource::Fixed => {
+            let uid = config.fixed_uid.ok_or_else(|| {
+                Error::config("docker fixed_uid is required when identity_source = 'fixed'")
+            })?;
+            let gid = config.fixed_gid.ok_or_else(|| {
+                Error::config("docker fixed_gid is required when identity_source = 'fixed'")
+            })?;
+            validate_fixed_id("fixed_uid", uid)?;
+            validate_fixed_id("fixed_gid", gid)?;
+        }
+    }
+
+    Ok(DockerIdentityConfig {
+        source: config.identity_source,
+        fixed_uid: config.fixed_uid,
+        fixed_gid: config.fixed_gid,
+    })
+}
+
+fn validate_fixed_id(field: &str, id: u32) -> CoreResult<()> {
+    if !(MIN_FIXED_ID..=MAX_FIXED_ID).contains(&id) {
+        return Err(Error::config(format!(
+            "docker {field} must be in policy range [{MIN_FIXED_ID}, {MAX_FIXED_ID}], got {id}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +251,20 @@ struct DockerDriverRuntimeConfig {
     allow_all_default_gpu: bool,
     sandbox_pids_limit: i64,
     enable_bind_mounts: bool,
+    identity: DockerIdentityConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DockerIdentityConfig {
+    source: IdentitySource,
+    fixed_uid: Option<u32>,
+    fixed_gid: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DockerImageMetadata {
+    id: String,
+    user: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +384,9 @@ impl DockerComputeDriver {
         docker_config: &DockerComputeConfig,
         supervisor_readiness: Arc<dyn SupervisorReadiness>,
     ) -> CoreResult<Self> {
+        // Reject invalid identity settings before connecting to Docker or
+        // creating driver-managed networks and cache files.
+        let identity = validate_docker_identity_config(docker_config)?;
         let socket_path = docker_config
             .socket_path
             .clone()
@@ -392,6 +465,7 @@ impl DockerComputeDriver {
                 allow_all_default_gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
+                identity,
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -452,7 +526,11 @@ impl DockerComputeDriver {
         let _ = docker_resource_limits(template)?;
         let driver_config =
             DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
-        validate_docker_driver_mounts(&driver_config.mounts, config.enable_bind_mounts)?;
+        validate_docker_driver_mounts(
+            &driver_config.mounts,
+            config.enable_bind_mounts,
+            config.identity.source,
+        )?;
         let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
         Self::validate_gpu_request(gpu_requirements, config.supports_gpu, &driver_config)?;
         Ok(ValidatedDockerSandbox {
@@ -635,21 +713,16 @@ impl DockerComputeDriver {
     async fn create_sandbox_inner(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
         let validated = Self::validated_sandbox(sandbox, &self.config)?;
         Self::validate_sandbox_auth(sandbox)?;
+        preflight_container_create_body(sandbox, &self.config, &validated.driver_config)?;
         self.validate_user_volume_mounts_available(&validated.driver_config)
             .await?;
-        let gpu_devices = self
+        let _ = self
             .resolve_gpu_cdi_devices(
                 validated.gpu_requirements,
                 &validated.driver_config,
                 CdiGpuDefaultSelector::peek_device_ids,
             )
             .await?;
-        let _ = build_container_create_body_with_gpu_devices(
-            sandbox,
-            &self.config,
-            &validated.driver_config,
-            gpu_devices.as_deref(),
-        )?;
 
         if self
             .find_managed_container_summary(&sandbox.id, &sandbox.name)
@@ -710,7 +783,8 @@ impl DockerComputeDriver {
             DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
         })?;
         let template = validated.template;
-        self.ensure_image_available(&sandbox.id, &template.image)
+        let image = self
+            .ensure_image_available(&sandbox.id, &template.image)
             .await
             .map_err(|status| {
                 DockerProvisioningFailure::new("ImagePullFailed", status.message())
@@ -739,6 +813,7 @@ impl DockerComputeDriver {
             sandbox,
             &self.config,
             &validated.driver_config,
+            &image,
             gpu_devices.as_deref(),
         )
         .map_err(|status| {
@@ -1280,31 +1355,44 @@ impl DockerComputeDriver {
         }))
     }
 
-    async fn ensure_image_available(&self, sandbox_id: &str, image: &str) -> Result<(), Status> {
+    async fn ensure_image_available(
+        &self,
+        sandbox_id: &str,
+        image: &str,
+    ) -> Result<DockerImageMetadata, Status> {
         let policy = self.config.image_pull_policy.trim().to_ascii_lowercase();
         match policy.as_str() {
-            "" | "ifnotpresent" => {
-                if self.docker.inspect_image(image).await.is_ok() {
+            "" | "ifnotpresent" => match self.docker.inspect_image(image).await {
+                Ok(inspect) => {
+                    let metadata = docker_image_metadata(image, inspect, self.config.identity)?;
                     self.publish_docker_progress(
                         sandbox_id,
                         "ImagePresent",
                         format!("Docker image \"{image}\" is already present"),
                         HashMap::from([("image_ref".to_string(), image.to_string())]),
                     );
-                    return Ok(());
+                    Ok(metadata)
                 }
-                self.pull_image(sandbox_id, image).await
+                Err(err) if is_not_found_error(&err) => {
+                    self.pull_image(sandbox_id, image).await?;
+                    self.inspect_final_image(image).await
+                }
+                Err(err) => Err(internal_status("inspect Docker image", err)),
+            },
+            "always" => {
+                self.pull_image(sandbox_id, image).await?;
+                self.inspect_final_image(image).await
             }
-            "always" => self.pull_image(sandbox_id, image).await,
             "never" => match self.docker.inspect_image(image).await {
-                Ok(_) => {
+                Ok(inspect) => {
+                    let metadata = docker_image_metadata(image, inspect, self.config.identity)?;
                     self.publish_docker_progress(
                         sandbox_id,
                         "ImagePresent",
                         format!("Docker image \"{image}\" is already present"),
                         HashMap::from([("image_ref".to_string(), image.to_string())]),
                     );
-                    Ok(())
+                    Ok(metadata)
                 }
                 Err(err) if is_not_found_error(&err) => Err(Status::failed_precondition(format!(
                     "docker image '{image}' is not present locally and image_pull_policy=Never"
@@ -1315,6 +1403,15 @@ impl DockerComputeDriver {
                 "unsupported docker image_pull_policy '{other}'; expected Always, IfNotPresent, or Never",
             ))),
         }
+    }
+
+    async fn inspect_final_image(&self, image: &str) -> Result<DockerImageMetadata, Status> {
+        let inspect = self
+            .docker
+            .inspect_image(image)
+            .await
+            .map_err(|err| internal_status("inspect Docker image after pull", err))?;
+        docker_image_metadata(image, inspect, self.config.identity)
     }
 
     async fn pull_image(&self, sandbox_id: &str, image: &str) -> Result<(), Status> {
@@ -1528,6 +1625,50 @@ impl DockerProvisioningFailure {
     }
 }
 
+fn docker_image_metadata(
+    image: &str,
+    inspect: ImageInspect,
+    identity: DockerIdentityConfig,
+) -> Result<DockerImageMetadata, Status> {
+    let id = inspect
+        .id
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "docker image '{image}' inspection returned no immutable image ID"
+            ))
+        })?;
+    let metadata = DockerImageMetadata {
+        id,
+        user: inspect.config.and_then(|config| config.user),
+    };
+    validate_docker_image_metadata(image, &metadata, identity)?;
+    Ok(metadata)
+}
+
+fn validate_docker_image_metadata(
+    image: &str,
+    metadata: &DockerImageMetadata,
+    identity: DockerIdentityConfig,
+) -> Result<(), Status> {
+    if metadata.id.trim().is_empty() {
+        return Err(Status::failed_precondition(format!(
+            "docker image '{image}' inspection returned no immutable image ID"
+        )));
+    }
+    if identity.source == IdentitySource::Image
+        && metadata
+            .user
+            .as_ref()
+            .is_none_or(|user| user.trim().is_empty())
+    {
+        return Err(Status::failed_precondition(format!(
+            "docker image '{image}' must declare a non-empty OCI Config.User when identity_source = 'image'"
+        )));
+    }
+    Ok(())
+}
+
 fn sandbox_image(sandbox: &DriverSandbox) -> Option<String> {
     sandbox
         .spec
@@ -1730,12 +1871,16 @@ fn attach_docker_progress_metadata(
 #[cfg(test)]
 fn docker_driver_config(
     template: &DriverSandboxTemplate,
-    enable_bind_mounts: bool,
+    config: &DockerDriverRuntimeConfig,
 ) -> Result<DockerSandboxDriverConfig, Status> {
-    let config =
+    let driver_config =
         DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
-    validate_docker_driver_mounts(&config.mounts, enable_bind_mounts)?;
-    Ok(config)
+    validate_docker_driver_mounts(
+        &driver_config.mounts,
+        config.enable_bind_mounts,
+        config.identity.source,
+    )?;
+    Ok(driver_config)
 }
 
 /// Collect user-supplied bind mounts as string-format binds.
@@ -1866,11 +2011,17 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Option<M
 fn validate_docker_driver_mounts(
     mounts: &[DockerDriverMountConfig],
     enable_bind_mounts: bool,
+    identity_source: IdentitySource,
 ) -> Result<(), Status> {
     let mut targets = HashSet::new();
     for mount in mounts {
         let target = match mount {
             DockerDriverMountConfig::Bind { source, target, .. } => {
+                if identity_source == IdentitySource::Image {
+                    return Err(Status::failed_precondition(
+                        "docker bind mounts are not allowed when identity_source = 'image'",
+                    ));
+                }
                 if !enable_bind_mounts {
                     return Err(Status::failed_precondition(
                         "docker bind mounts require enable_bind_mounts = true in [openshell.drivers.docker]",
@@ -1886,6 +2037,11 @@ fn validate_docker_driver_mounts(
                 subpath,
                 ..
             } => {
+                if identity_source == IdentitySource::Image {
+                    return Err(Status::failed_precondition(
+                        "docker named volume mounts are not allowed when identity_source = 'image'",
+                    ));
+                }
                 driver_mounts::validate_mount_source(source, "volume source")
                     .map_err(Status::failed_precondition)?;
                 if let Some(subpath) = subpath {
@@ -2132,7 +2288,11 @@ fn cleanup_sandbox_token_file_by_id(sandbox_id: &str, config: &DockerDriverRunti
     }
 }
 
-fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) -> Vec<String> {
+fn build_environment(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    image: &DockerImageMetadata,
+) -> Vec<String> {
     let mut environment = HashMap::from([
         ("HOME".to_string(), "/root".to_string()),
         ("PATH".to_string(), SUPERVISOR_PATH.to_string()),
@@ -2149,6 +2309,7 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
             user_env.extend(template.environment.clone());
         }
         user_env.extend(spec.environment.clone());
+        user_env.retain(|key, _| !is_protected_identity_environment(key));
         environment.extend(user_env.clone());
         if !user_env.is_empty()
             && let Ok(json) = serde_json::to_string(&user_env)
@@ -2204,6 +2365,7 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
 
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    environment.retain(|key, _| !is_protected_identity_environment(key));
 
     // Gateway-minted sandbox JWT. Keep the raw bearer out of container
     // metadata; the supervisor reads it from this driver-owned bind mount.
@@ -2218,10 +2380,70 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
 
     let mut pairs = environment.into_iter().collect::<Vec<_>>();
     pairs.sort_by(|left, right| left.0.cmp(&right.0));
-    pairs
+    let mut result = pairs
         .into_iter()
         .map(|(key, value)| format!("{key}={value}"))
-        .collect()
+        .collect::<Vec<_>>();
+    result.extend(protected_identity_environment(config.identity, image));
+    result
+}
+
+fn is_protected_identity_environment(key: &str) -> bool {
+    matches!(
+        key,
+        openshell_core::sandbox_env::IDENTITY_SOURCE
+            | openshell_core::sandbox_env::IMAGE_USER
+            | openshell_core::sandbox_env::IMAGE_ID
+            | openshell_core::sandbox_env::SANDBOX_UID
+            | openshell_core::sandbox_env::SANDBOX_GID
+    )
+}
+
+fn protected_identity_environment(
+    identity: DockerIdentityConfig,
+    image: &DockerImageMetadata,
+) -> Vec<String> {
+    let image_user = image.user.as_ref().map_or_else(
+        || openshell_core::sandbox_env::IMAGE_USER.to_string(),
+        |user| format!("{}={user}", openshell_core::sandbox_env::IMAGE_USER),
+    );
+    let mut environment = vec![
+        format!(
+            "{}={}",
+            openshell_core::sandbox_env::IDENTITY_SOURCE,
+            identity.source
+        ),
+        image_user,
+        // Both identity modes bind persisted identity state to the immutable
+        // rootfs selected for this container.
+        format!("{}={}", openshell_core::sandbox_env::IMAGE_ID, image.id),
+    ];
+
+    match identity.source {
+        IdentitySource::Image => {
+            // Bare Docker environment names remove any values inherited from
+            // the image while preserving the distinction from an empty value.
+            environment.push(openshell_core::sandbox_env::SANDBOX_UID.to_string());
+            environment.push(openshell_core::sandbox_env::SANDBOX_GID.to_string());
+        }
+        IdentitySource::Fixed => {
+            let uid = identity
+                .fixed_uid
+                .expect("validated fixed Docker identity must include a UID");
+            let gid = identity
+                .fixed_gid
+                .expect("validated fixed Docker identity must include a GID");
+            environment.push(format!(
+                "{}={uid}",
+                openshell_core::sandbox_env::SANDBOX_UID
+            ));
+            environment.push(format!(
+                "{}={gid}",
+                openshell_core::sandbox_env::SANDBOX_GID
+            ));
+        }
+    }
+    environment
 }
 
 fn docker_cdi_gpu_inventory(info: &SystemInfo) -> CdiGpuInventory {
@@ -2264,7 +2486,7 @@ fn build_container_create_body(
         .as_ref()
         .and_then(|spec| spec.template.as_ref())
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
-    let driver_config = docker_driver_config(template, config.enable_bind_mounts)?;
+    let driver_config = docker_driver_config(template, config)?;
     let gpu_requirements = sandbox
         .spec
         .as_ref()
@@ -2280,13 +2502,42 @@ fn build_container_create_body(
     } else {
         None
     };
-    build_container_create_body_with_gpu_devices(sandbox, config, &driver_config, cdi_devices)
+    let image = DockerImageMetadata {
+        id: "sha256:test-image".to_string(),
+        user: Some("sandbox".to_string()),
+    };
+    build_container_create_body_with_gpu_devices(
+        sandbox,
+        config,
+        &driver_config,
+        &image,
+        cdi_devices,
+    )
+}
+
+fn preflight_container_create_body(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    driver_config: &DockerSandboxDriverConfig,
+) -> Result<(), Status> {
+    let template = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
+    let _ = docker_resource_limits(template)?;
+    let _ = docker_driver_mounts(driver_config)?;
+    let _ = docker_driver_bind_strings(driver_config)?;
+    let _ = build_binds(sandbox, config)?;
+    let _ = docker_pids_limit(config.sandbox_pids_limit)?;
+    Ok(())
 }
 
 fn build_container_create_body_with_gpu_devices(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
     driver_config: &DockerSandboxDriverConfig,
+    image: &DockerImageMetadata,
     gpu_device_ids: Option<&[String]>,
 ) -> Result<ContainerCreateBody, Status> {
     let spec = sandbox
@@ -2297,6 +2548,8 @@ fn build_container_create_body_with_gpu_devices(
         .template
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
+    preflight_container_create_body(sandbox, config, driver_config)?;
+    validate_docker_image_metadata("selected Docker image", image, config.identity)?;
     let resource_limits = docker_resource_limits(template)?;
     let user_mounts = docker_driver_mounts(driver_config)?;
     let user_bind_strings = docker_driver_bind_strings(driver_config)?;
@@ -2328,9 +2581,9 @@ fn build_container_create_body_with_gpu_devices(
     );
 
     Ok(ContainerCreateBody {
-        image: Some(template.image.clone()),
+        image: Some(image.id.clone()),
         user: Some("0".to_string()),
-        env: Some(build_environment(sandbox, config)),
+        env: Some(build_environment(sandbox, config, image)),
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
         // Clear the image CMD so Docker does not append inherited args to the
         // supervisor entrypoint.

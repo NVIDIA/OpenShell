@@ -8,6 +8,8 @@
 //! supervisor process (which reads them on startup).  Using constants here
 //! prevents typos from producing silently broken sandboxes.
 
+use serde::{Deserialize, Serialize};
+
 /// Name of the sandbox (used for policy sync and identification).
 pub const SANDBOX: &str = "OPENSHELL_SANDBOX";
 
@@ -103,10 +105,10 @@ pub const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET: &str =
 /// Resolved sandbox UID used to override `run_as_user` when the policy
 /// specifies a numeric value instead of the hardcoded "sandbox" user name.
 ///
-/// Set by compute drivers (Kubernetes, Docker, VM) from resolved config or
-/// cluster autodetection. The supervisor reads this at startup and uses it
-/// directly with `setuid()` / `chown()` without requiring an `/etc/passwd`
-/// entry in the sandbox image.
+/// Set by Kubernetes and VM drivers from resolved config or cluster
+/// autodetection, and by local drivers in explicit fixed identity mode. The
+/// supervisor reads it at startup and uses it directly with `setuid()` /
+/// `chown()` without requiring an `/etc/passwd` entry in the sandbox image.
 pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
 
 /// Resolved sandbox GID paired with [`SANDBOX_UID`].
@@ -114,6 +116,118 @@ pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
 /// Used alongside UID for PVC init container `chown` operations and when the
 /// supervisor drops privileges to a group other than the UID's primary group.
 pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
+
+/// Agent identity selection mode (`image` or `fixed`).
+///
+/// Docker and Podman set this protected value after image and request
+/// environment variables. When absent, the supervisor preserves the legacy
+/// policy-based identity behavior used by existing containers.
+pub const IDENTITY_SOURCE: &str = "OPENSHELL_IDENTITY_SOURCE";
+
+/// Raw OCI image `Config.User` declaration used by [`IdentitySource::Image`].
+pub const IMAGE_USER: &str = "OPENSHELL_IMAGE_USER";
+
+/// Immutable image identifier paired with [`IMAGE_USER`].
+pub const IMAGE_ID: &str = "OPENSHELL_IMAGE_ID";
+
+/// Current schema version for resolved agent identity exchange.
+pub const RESOLVED_AGENT_IDENTITY_VERSION: u32 = 1;
+
+/// Source used to select the agent process identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentitySource {
+    /// Resolve the image's OCI `USER` declaration inside the image rootfs.
+    Image,
+    /// Use operator-selected numeric [`SANDBOX_UID`] and [`SANDBOX_GID`].
+    Fixed,
+}
+
+impl std::str::FromStr for IdentitySource {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "image" => Ok(Self::Image),
+            "fixed" => Ok(Self::Fixed),
+            _ => Err(format!(
+                "unsupported identity source '{value}'; expected 'image' or 'fixed'"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for IdentitySource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Image => formatter.write_str("image"),
+            Self::Fixed => formatter.write_str("fixed"),
+        }
+    }
+}
+
+/// Numeric identity selected for agent children and persisted across restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedAgentIdentity {
+    pub uid: u32,
+    pub gid: u32,
+    pub presentation_user: String,
+    pub source: IdentitySource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<String>,
+}
+
+impl From<&ResolvedAgentIdentity> for crate::proto::ResolvedAgentIdentity {
+    fn from(identity: &ResolvedAgentIdentity) -> Self {
+        Self {
+            version: RESOLVED_AGENT_IDENTITY_VERSION,
+            source: identity.source.to_string(),
+            image_id: identity.image_id.clone().unwrap_or_default(),
+            uid: identity.uid,
+            gid: identity.gid,
+            supplementary_gids: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_identity_proto_conversion_preserves_authoritative_fields() {
+        let identity = ResolvedAgentIdentity {
+            uid: 1234,
+            gid: 2345,
+            presentation_user: "agent".to_string(),
+            source: IdentitySource::Image,
+            image_id: Some("sha256:image".to_string()),
+        };
+
+        let proto = crate::proto::ResolvedAgentIdentity::from(&identity);
+        assert_eq!(proto.version, RESOLVED_AGENT_IDENTITY_VERSION);
+        assert_eq!(proto.source, "image");
+        assert_eq!(proto.image_id, "sha256:image");
+        assert_eq!(proto.uid, 1234);
+        assert_eq!(proto.gid, 2345);
+        assert!(proto.supplementary_gids.is_empty());
+    }
+
+    #[test]
+    fn fixed_identity_proto_conversion_preserves_image_id() {
+        let identity = ResolvedAgentIdentity {
+            uid: 1234,
+            gid: 2345,
+            presentation_user: "1234".to_string(),
+            source: IdentitySource::Fixed,
+            image_id: Some("sha256:fixed-image".to_string()),
+        };
+
+        let proto = crate::proto::ResolvedAgentIdentity::from(&identity);
+        assert_eq!(proto.source, "fixed");
+        assert_eq!(proto.image_id, "sha256:fixed-image");
+    }
+}
 
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv

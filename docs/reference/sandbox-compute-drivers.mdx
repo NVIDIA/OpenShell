@@ -115,7 +115,7 @@ The gateway talks to the Docker daemon to create sandbox containers. Docker is a
 
 For maintainer-level implementation details, refer to the [Docker driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-docker/README.md).
 
-Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Configure Docker driver values such as `socket_path`, `grpc_endpoint`, `network_name`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, `ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.docker]`. When `socket_path` is unset, the driver uses the same responsive local socket selected by auto-detection. An explicitly selected Docker driver falls back to `/var/run/docker.sock` when no candidate responds.
+Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Configure Docker driver values such as `socket_path`, `grpc_endpoint`, `network_name`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, `identity_source`, `fixed_uid`, `fixed_gid`, `ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.docker]`. When `socket_path` is unset, the driver uses the same responsive local socket selected by auto-detection. An explicitly selected Docker driver falls back to `/var/run/docker.sock` when no candidate responds.
 
 For GPU-backed Docker sandboxes, configure Docker CDI before starting the gateway so OpenShell can detect the daemon capability.
 
@@ -123,12 +123,21 @@ For GPU-backed Docker sandboxes, configure Docker CDI before starting the gatewa
 
 Docker driver config accepts user-supplied `volume` and `tmpfs` mounts. It also
 accepts `bind` mounts when `[openshell.drivers.docker]` sets
-`enable_bind_mounts = true` in `gateway.toml`. See Docker's [storage documentation](https://docs.docker.com/engine/storage/) for more information.
+`enable_bind_mounts = true` in `gateway.toml`. Creator-selected `bind` and
+`volume` mounts require `identity_source = "fixed"`; image mode rejects them
+even when bind mounts are globally enabled. See Docker's [storage documentation](https://docs.docker.com/engine/storage/) for more information.
 Docker local-driver named volumes created with bind options also expose
 gateway-host paths, so OpenShell treats them like bind mounts and requires
 `enable_bind_mounts = true`.
 
-Use a `volume` mount for existing Docker named volumes:
+Use fixed identity mode for an existing Docker named volume:
+
+```toml
+[openshell.drivers.docker]
+identity_source = "fixed"
+fixed_uid = 1000
+fixed_gid = 1000
+```
 
 ```shell
 docker volume create openshell-work
@@ -180,7 +189,7 @@ The gateway talks to the Podman API socket. The Podman driver requires Podman 5.
 
 For maintainer-level implementation details, refer to the [Podman driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md) and [Podman networking notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/NETWORKING.md).
 
-Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
+Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `identity_source`, `fixed_uid`, `fixed_gid`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
 
 For proxy-required networks, the Podman driver also accepts the corporate egress proxy keys `https_proxy`, `no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`, and `proxy_connect_by_hostname`. The supervisor chains policy-approved TLS tunnels through the proxy with HTTP CONNECT instead of dialing destinations directly. See the [Gateway Configuration File](./gateway-config) reference for the full contract, including the cleartext-credential acknowledgement and the validated-IP CONNECT behavior.
 
@@ -190,13 +199,24 @@ On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192
 
 Podman driver config accepts user-supplied `volume`, `tmpfs`, and `image`
 mounts. It also accepts `bind` mounts when `[openshell.drivers.podman]` sets
-`enable_bind_mounts = true` in `gateway.toml`. Podman local-driver named
-volumes created with bind options also expose gateway-host paths, so
-OpenShell treats them like bind mounts and requires `enable_bind_mounts = true`.
+`enable_bind_mounts = true` in `gateway.toml`. Creator-selected `bind` and
+`volume` mounts require `identity_source = "fixed"`; image mode rejects them
+even when bind mounts are globally enabled. Image mode permits Podman `image`
+mounts only when they are read-only. The driver resolves those image sources
+to immutable image IDs before container creation. Podman local-driver named
+volumes created with bind options also expose gateway-host paths, so OpenShell
+treats them like bind mounts and requires `enable_bind_mounts = true`.
 Host bind mounts expose gateway host paths to sandbox requests, so they are
 disabled by default.
 
-Use a `volume` mount for existing Podman named volumes:
+Use fixed identity mode for an existing Podman named volume:
+
+```toml
+[openshell.drivers.podman]
+identity_source = "fixed"
+fixed_uid = 1000
+fixed_gid = 1000
+```
 
 ```shell
 podman volume create openshell-work
@@ -413,11 +433,69 @@ image.
 
 ## Sandbox User Identity
 
-OpenShell accepts both the hardcoded username `"sandbox"` and numeric UIDs in `[1000, 2_000_000_000]` for the supervisor's process identity (the policy's `run_as_user` field). The driver resolves the UID at sandbox creation time and passes it to the supervisor via environment variables.
+Compute drivers select the identity for agent child processes. Docker and Podman preserve the image identity by default. Kubernetes, OpenShift, and VM keep their existing platform-specific behavior.
+
+### Docker and Podman
+
+Docker and Podman use these driver fields:
+
+| Field | Accepted values | Default | Description |
+|---|---|---|---|
+| `identity_source` | `image`, `fixed` | `image` | Select the image-declared identity or an operator-controlled numeric identity. |
+| `fixed_uid` | `1000` through `2000000000` | None | Set the agent UID in fixed mode. |
+| `fixed_gid` | `1000` through `2000000000` | None | Set the agent primary GID in fixed mode. |
+
+Set both `fixed_uid` and `fixed_gid` when `identity_source = "fixed"`. Omit both fields in image mode. OpenShell rejects a partial pair, fixed fields in image mode, and values outside the accepted range. Docker and Podman do not use an implicit `10001:10001` identity.
+
+Use image mode for isolated local sandboxes. Use fixed mode when the operator attaches external or shared storage that expects a known UID and GID:
+
+```toml
+[openshell.drivers.docker]
+identity_source = "fixed"
+fixed_uid = 2000
+fixed_gid = 2000
+```
+
+The standalone Podman driver exposes the same settings as `--identity-source` with `OPENSHELL_PODMAN_IDENTITY_SOURCE`, `--fixed-uid` with `OPENSHELL_PODMAN_FIXED_UID`, and `--fixed-gid` with `OPENSHELL_PODMAN_FIXED_GID`.
+
+For newly created managed Docker and Podman sandboxes, the driver identity is authoritative. OpenShell rejects explicitly supplied process policy `run_as_user` or `run_as_group` values instead of claiming to apply an identity that the managed runtime ignores.
+
+#### Image User Forms
+
+In image mode, OpenShell accepts these OCI `USER` forms:
+
+| OCI `USER` | Resolution |
+|---|---|
+| `USER app` | Resolve `app` in the image's `/etc/passwd` and use its UID and primary GID. |
+| `USER app:staff` | Resolve `app` in `/etc/passwd` and `staff` in `/etc/group`. |
+| `USER app:1235` | Resolve the user name and use numeric GID `1235`. |
+| `USER 1234:staff` | Use numeric UID `1234` and resolve the group name. |
+| `USER 1234` | Use UID `1234` and the primary GID from the matching `/etc/passwd` entry. |
+| `USER 1234:1235` | Use the numeric pair without requiring passwd or group entries. |
+
+A passwd-less image can therefore declare `USER 1234:1235` without running `useradd` or `groupadd`. A numeric UID without an explicit group still requires a unique matching passwd entry so OpenShell can determine its primary GID.
+
+OpenShell rejects a missing or empty `USER`, malformed declarations, unknown names, ambiguous or malformed matching account records, and any declaration that resolves to UID or GID 0. This includes `USER root`, `USER 0`, root group aliases, and non-root names mapped to UID or GID 0. The supervisor reads regular `/etc/passwd` and `/etc/group` files without following symlinks and does not use image-controlled NSS modules.
+
+#### Runtime and Storage Boundaries
+
+The container runtime starts the OpenShell supervisor as root, with Docker `user = "0"` or Podman `user = "0:0"`. That identity belongs only to the supervisor so it can prepare namespaces, mounts, filesystem policy, and process restrictions. Direct and SSH-launched agent children run with the resolved non-root UID and GID and no supplementary groups.
+
+Agent children always receive `HOME=/sandbox`. For a named OCI user, `USER` and `LOGNAME` contain the declared user name. Numeric and fixed identities use the numeric UID for those variables. OpenShell does not add, rewrite, or otherwise mutate `/etc/passwd` or `/etc/group`.
+
+Before changing ownership or dropping privileges, the supervisor verifies that the resolved UID and GID appear in its Linux user namespace maps. An unmapped ID fails rather than falling back to another identity.
+
+Image-selected identities can access the image rootfs and the driver-owned per-sandbox `/sandbox` workspace. Image mode rejects creator-selected bind and named-volume mounts because an untrusted image must not choose the principal used for unrelated storage. It still permits `tmpfs`, the driver-owned workspace and internal mounts, and read-only immutable image mounts where the driver supports them. Podman supports read-only `image` mounts; Docker does not expose image mounts through driver config. Select fixed mode for creator-selected external or shared storage. Bind mounts continue to require the driver's `enable_bind_mounts = true` operator setting.
+
+#### Image Pinning and Observability
+
+Docker and Podman apply the configured pull policy, inspect the final sandbox image, and capture its OCI `Config.User` and immutable image ID. They create the container from that immutable ID rather than the mutable tag that was inspected. Podman also pins the supervisor image and driver-config image mounts and disables another pull decision during container creation.
+
+The supervisor resolves the identity once, persists a versioned record, and reuses it on restart instead of re-resolving a mutable tag or changed account file. The gateway stores the resolved record in sandbox status and exposes `version`, `source`, `image_id`, `uid`, `gid`, and the empty `supplementary_gids` list through the API. The supervisor emits the same fields in an OCSF configuration-state event. Existing sandboxes without managed identity metadata retain their creation-time legacy behavior. Changes to identity mode or fixed IDs apply only to newly created sandboxes; recreate existing sandboxes or migrate their persisted workspaces explicitly.
 
 ### Kubernetes / OpenShift
 
-The Kubernetes driver auto-detects the sandbox UID from OpenShift SCC namespace annotations:
+Kubernetes and OpenShift identity selection is unchanged. The Kubernetes driver auto-detects the sandbox UID from OpenShift SCC namespace annotations:
 
 - `openshift.io/sa.scc.uid-range` (format: `<start>/<size>`, e.g. `1000000000/10000`) provides the UID.
 - `openshift.io/sa.scc.supplemental-groups` provides the GID when present; otherwise the resolved UID is used as the GID.
@@ -432,8 +510,8 @@ The resolved UID/GID appear in:
 
 ### VM Driver
 
-The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/etc/group`, and `/etc/gshadow` during rootfs preparation. Default UID is `10001`; configure `sandbox_uid` in `[openshell.drivers.vm]` to use a different value.
+VM identity selection is unchanged. The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/etc/group`, and `/etc/gshadow` during rootfs preparation. Default UID is `10001`; configure `sandbox_uid` in `[openshell.drivers.vm]` to use a different value.
 
 ### Custom Images
 
-Custom sandbox images no longer need a baked-in `"sandbox"` user. If your image requires a passwd entry for tools like `sudo` or `ssh`, add one manually (e.g. `RUN useradd -m -u 1500 deploy`). The supervisor resolves the numeric UID directly via `setuid()` without needing `/etc/passwd`.
+Custom Docker and Podman sandbox images must declare a non-root OCI `USER` when the driver uses its default image identity mode. They do not need a user named `sandbox`. Use a numeric pair such as `USER 1234:1235` for an image without account database entries, or declare a named user when tools require a passwd entry.

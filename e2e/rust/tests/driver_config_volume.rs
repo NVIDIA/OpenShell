@@ -61,6 +61,10 @@ impl Drop for VolumeGuard {
 
 #[tokio::test]
 async fn sandbox_mounts_existing_driver_config_volume() {
+    if !fixed_identity_mode_enabled() {
+        return;
+    }
+
     let driver = e2e_driver().expect("OPENSHELL_E2E_DRIVER must be set by the e2e wrapper");
     assert!(
         matches!(driver.as_str(), "docker" | "podman"),
@@ -103,6 +107,10 @@ async fn sandbox_mounts_existing_driver_config_volume() {
 
 #[tokio::test]
 async fn sandbox_mounts_enabled_driver_config_bind() {
+    if !fixed_identity_mode_enabled() {
+        return;
+    }
+
     let driver = e2e_driver().expect("OPENSHELL_E2E_DRIVER must be set by the e2e wrapper");
     assert!(
         matches!(driver.as_str(), "docker" | "podman"),
@@ -171,14 +179,35 @@ filesystem_policy:
 
 landlock:
   compatibility: best_effort
-
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
 ",
     )
     .map_err(|err| format!("write bind policy: {err}"))?;
     Ok(file)
+}
+
+fn fixed_identity_mode_enabled() -> bool {
+    match std::env::var("OPENSHELL_E2E_IDENTITY_SOURCE").as_deref() {
+        Ok("fixed") => {
+            assert!(
+                std::env::var_os("OPENSHELL_E2E_FIXED_UID").is_some()
+                    && std::env::var_os("OPENSHELL_E2E_FIXED_GID").is_some(),
+                "fixed-mode gateway tests require OPENSHELL_E2E_FIXED_UID and OPENSHELL_E2E_FIXED_GID"
+            );
+            true
+        }
+        Ok("image") => {
+            eprintln!(
+                "skipping positive external-mount test: run against an explicitly fixed-mode gateway with OPENSHELL_E2E_IDENTITY_SOURCE=fixed and OPENSHELL_E2E_FIXED_UID/GID"
+            );
+            false
+        }
+        Ok(other) => panic!(
+            "OPENSHELL_E2E_IDENTITY_SOURCE must describe the gateway as image or fixed, got {other}"
+        ),
+        Err(error) => panic!(
+            "gateway wrapper must export OPENSHELL_E2E_IDENTITY_SOURCE so external mounts cannot run against an unknown identity mode: {error}"
+        ),
+    }
 }
 
 async fn seed_volume(volume: &VolumeGuard) -> Result<(), String> {

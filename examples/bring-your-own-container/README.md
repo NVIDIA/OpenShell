@@ -13,7 +13,7 @@ your local machine through port forwarding.
 
 | File         | Description                                             |
 | ------------ | ------------------------------------------------------- |
-| `Dockerfile` | Builds a Python 3.12 image that starts a REST API      |
+| `Dockerfile` | Builds a Python 3.13 image that starts a REST API      |
 | `app.py`     | Minimal HTTP server with `/hello` and `/health` routes  |
 
 ## Quick start
@@ -59,16 +59,14 @@ key requirements are:
 - **Pass your start command explicitly** — use `-- <command>` on the CLI.
   The image's `CMD` / `ENTRYPOINT` is replaced by the sandbox supervisor
   at runtime.
-- **Create a `sandbox` user** (uid/gid 1000660000) for non-root execution.
-  Use a high UID (1000000000+) to avoid conflicts with host users when running
-  without user namespace remapping.
-- **Make your application workdir writable by `sandbox`**. This example creates
-  `/sandbox` with `sandbox:sandbox` ownership before copying `app.py`.
+- **Declare a non-root OCI `USER`**. Local Docker and Podman gateways preserve
+  that identity for agent processes. This example uses the passwd-less numeric
+  pair `USER 1234:1235`; numeric pairs do not require account database entries.
+- **Use `/sandbox` as the application workdir**. OpenShell owns the isolated
+  workspace root for the declared image identity when the sandbox starts.
 - **Install `iproute2`** for full network namespace isolation.
 - **Use a standard Linux base image** — distroless and `FROM scratch`
   images are not supported.
-
-TODO(#70): Remove the sandbox user note once custom images are secure by default without requiring manual setup.
 
 ## How it works
 

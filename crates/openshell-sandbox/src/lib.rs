@@ -71,6 +71,24 @@ const SIDECAR_CA_BUNDLE: &str = "ca-bundle.pem";
 const SIDECAR_PROCESS_PROXY_ADDR: &str = "127.0.0.1:3128";
 const SIDECAR_READY_TIMEOUT_SECS: u64 = 120;
 
+fn resolve_identity_if_required<T>(
+    managed_identity_required: bool,
+    resolve: impl FnOnce() -> Result<Option<T>>,
+) -> Result<Option<T>> {
+    if !managed_identity_required {
+        return Ok(None);
+    }
+    resolve()?.map_or_else(
+        || {
+            Err(miette::miette!(
+                "gateway requires managed agent identity, but protected {} metadata is missing",
+                openshell_core::sandbox_env::IDENTITY_SOURCE
+            ))
+        },
+        |identity| Ok(Some(identity)),
+    )
+}
+
 /// Run a command in the sandbox.
 ///
 /// # Errors
@@ -160,6 +178,7 @@ pub async fn run_sandbox(
         middleware_registry_status,
         loaded_policy_origin,
         initial_agent_proposals_enabled,
+        managed_identity_required,
     ) = if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
         let (policy, opa_engine, retained_proto, loaded_policy_origin) =
             load_policy_from_sidecar_bootstrap(bootstrap)?;
@@ -170,6 +189,7 @@ pub async fn run_sandbox(
             MiddlewareRegistryStatus::Synchronized,
             loaded_policy_origin,
             bootstrap.agent_proposals_enabled,
+            false,
         )
     } else {
         load_policy(
@@ -182,37 +202,100 @@ pub async fn run_sandbox(
         .await?
     };
 
+    // Only the gateway-persisted creation marker authorizes protected local
+    // identity metadata. Unmarked legacy/offline sandboxes deliberately ignore
+    // image-baked OPENSHELL_IDENTITY_* variables.
+    #[cfg(unix)]
+    let resolved_agent_identity = {
+        let resolved = resolve_identity_if_required(managed_identity_required, || {
+            openshell_supervisor_process::identity::resolve_and_persist_agent_identity()
+        })?;
+        if let Some(identity) = resolved.as_ref()
+            && identity.source == openshell_core::sandbox_env::IdentitySource::Fixed
+            && identity.image_id.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(miette::miette!(
+                "managed fixed identity is missing its immutable image ID"
+            ));
+        }
+        resolved
+    };
+    #[cfg(not(unix))]
+    let resolved_agent_identity: Option<openshell_core::sandbox_env::ResolvedAgentIdentity> = {
+        if managed_identity_required {
+            return Err(miette::miette!(
+                "gateway requires managed agent identity, which is unsupported on this platform"
+            ));
+        }
+        None
+    };
+
+    let driver_identity_resolved = if let Some(identity) = resolved_agent_identity.as_ref() {
+        policy.process.run_as_user = Some(identity.uid.to_string());
+        policy.process.run_as_group = Some(identity.gid.to_string());
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "resolved")
+                .unmapped(
+                    "resolved_agent_identity",
+                    serde_json::json!({
+                        "version": openshell_core::sandbox_env::RESOLVED_AGENT_IDENTITY_VERSION,
+                        "source": identity.source.to_string(),
+                        "image_id": identity.image_id.as_deref(),
+                        "uid": identity.uid,
+                        "gid": identity.gid,
+                        "supplementary_gids": [],
+                    }),
+                )
+                .message(format!(
+                    "Resolved agent identity [source:{} uid:{} gid:{} image_id:{}]",
+                    identity.source,
+                    identity.uid,
+                    identity.gid,
+                    identity.image_id.as_deref().unwrap_or("none")
+                ))
+                .build()
+        );
+        true
+    } else {
+        false
+    };
+
     // Override the policy's process identity with the driver-resolved UID/GID
     // from the pod environment. The policy defaults to the name "sandbox" which
     // resolves via /etc/passwd, but the driver may have chosen a different
     // numeric UID (e.g. from OpenShift SCC annotations).
     // Validate overrides against the same rules as the policy layer to prevent
     // env-injected values (e.g. GID 0) from bypassing policy restrictions.
-    if let Ok(uid) = std::env::var(openshell_core::sandbox_env::SANDBOX_UID)
-        && !uid.is_empty()
-    {
-        if !openshell_policy::is_valid_sandbox_identity(&uid) {
-            return Err(miette::miette!(
-                "OPENSHELL_SANDBOX_UID contains invalid sandbox identity '{uid}'; \
-                 expected 'sandbox' or a numeric UID in range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
-            ));
+    if !driver_identity_resolved {
+        if let Ok(uid) = std::env::var(openshell_core::sandbox_env::SANDBOX_UID)
+            && !uid.is_empty()
+        {
+            if !openshell_policy::is_valid_sandbox_identity(&uid) {
+                return Err(miette::miette!(
+                    "OPENSHELL_SANDBOX_UID contains invalid sandbox identity '{uid}'; \
+                     expected 'sandbox' or a numeric UID in range [{}, {}]",
+                    openshell_policy::MIN_SANDBOX_UID,
+                    openshell_policy::MAX_SANDBOX_UID,
+                ));
+            }
+            policy.process.run_as_user = Some(uid);
         }
-        policy.process.run_as_user = Some(uid);
-    }
-    if let Ok(gid) = std::env::var(openshell_core::sandbox_env::SANDBOX_GID)
-        && !gid.is_empty()
-    {
-        if !openshell_policy::is_valid_sandbox_identity(&gid) {
-            return Err(miette::miette!(
-                "OPENSHELL_SANDBOX_GID contains invalid sandbox identity '{gid}'; \
-                 expected 'sandbox' or a numeric GID in range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
-            ));
+        if let Ok(gid) = std::env::var(openshell_core::sandbox_env::SANDBOX_GID)
+            && !gid.is_empty()
+        {
+            if !openshell_policy::is_valid_sandbox_identity(&gid) {
+                return Err(miette::miette!(
+                    "OPENSHELL_SANDBOX_GID contains invalid sandbox identity '{gid}'; \
+                     expected 'sandbox' or a numeric GID in range [{}, {}]",
+                    openshell_policy::MIN_SANDBOX_UID,
+                    openshell_policy::MAX_SANDBOX_UID,
+                ));
+            }
+            policy.process.run_as_group = Some(gid);
         }
-        policy.process.run_as_group = Some(gid);
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
@@ -713,6 +796,8 @@ pub async fn run_sandbox(
             provider_env,
             ca_file_paths,
             agent_proposals.clone(),
+            managed_identity_required,
+            resolved_agent_identity,
             #[cfg(target_os = "linux")]
             netns.as_ref(),
             #[cfg(target_os = "linux")]
@@ -984,12 +1069,13 @@ fn spawn_sidecar_entrypoint_handler(
                     );
                     continue;
                 };
-                openshell_supervisor_process::supervisor_session::spawn(
+                let _ = openshell_supervisor_process::supervisor_session::spawn(
                     endpoint.clone(),
                     id.clone(),
                     trusted_ssh_socket_path.clone(),
                     None,
                     Some(supervisor_pid),
+                    None,
                 );
                 session_started = true;
                 info!("sidecar supervisor session task spawned");
@@ -1849,6 +1935,7 @@ async fn load_policy(
     MiddlewareRegistryStatus,
     LoadedPolicyOrigin,
     bool,
+    bool,
 )> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
@@ -1897,6 +1984,7 @@ async fn load_policy(
             None,
             MiddlewareRegistryStatus::Synchronized,
             LoadedPolicyOrigin::LocalOverride,
+            false,
             false,
         ));
     }
@@ -2080,6 +2168,7 @@ async fn load_policy(
                 revision: loaded_policy_revision,
             },
             agent_proposals_enabled_from_settings(&snapshot.settings),
+            snapshot.managed_identity_required,
         ));
     }
 
@@ -3448,6 +3537,15 @@ filesystem_policy:
         assert!(matches!(local_policy.network.mode, NetworkMode::Proxy));
     }
 
+    #[test]
+    fn unmarked_sandbox_does_not_consult_protected_identity_metadata() {
+        let resolved = resolve_identity_if_required(false, || -> Result<Option<()>> {
+            panic!("unmarked sandbox must not inspect identity metadata")
+        })
+        .unwrap();
+        assert!(resolved.is_none());
+    }
+
     // ---- Initial policy acknowledgement tests ----
 
     fn proto_policy_fixture() -> openshell_core::proto::SandboxPolicy {
@@ -3470,6 +3568,7 @@ filesystem_policy:
             provider_env_revision: 0,
             supervisor_middleware_services: Vec::new(),
             workspace: String::new(),
+            managed_identity_required: false,
         }
     }
 

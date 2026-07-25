@@ -780,6 +780,8 @@ pub struct SettingsPollResult {
     pub supervisor_middleware_services: Vec<crate::proto::SupervisorMiddlewareService>,
     /// Workspace the sandbox belongs to.
     pub workspace: String,
+    /// Whether the gateway requires managed runtime identity for this sandbox.
+    pub managed_identity_required: bool,
 }
 
 fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
@@ -795,6 +797,21 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
         provider_env_revision: inner.provider_env_revision,
         supervisor_middleware_services: inner.supervisor_middleware_services,
         workspace: inner.workspace,
+        managed_identity_required: inner.managed_identity_required,
+    }
+}
+
+#[cfg(test)]
+mod settings_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn settings_snapshot_propagates_managed_identity_requirement() {
+        let snapshot = settings_poll_result(crate::proto::GetSandboxConfigResponse {
+            managed_identity_required: true,
+            ..Default::default()
+        });
+        assert!(snapshot.managed_identity_required);
     }
 }
 

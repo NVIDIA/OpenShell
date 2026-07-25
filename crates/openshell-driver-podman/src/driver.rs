@@ -3,7 +3,7 @@
 
 //! Podman compute driver.
 
-use crate::client::{PodmanApiError, PodmanClient, VolumeInspect};
+use crate::client::{ImageInspect, PodmanApiError, PodmanClient, VolumeInspect};
 use crate::config::PodmanComputeConfig;
 use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, PodmanSandboxDriverConfig};
 use crate::watcher::{
@@ -19,6 +19,8 @@ use openshell_core::gpu::{
 use openshell_core::proto::compute::v1::{
     DriverSandbox, GetCapabilitiesResponse, GpuResourceRequirements,
 };
+use openshell_core::sandbox_env::IdentitySource;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -261,6 +263,7 @@ impl PodmanComputeDriver {
         // get a clear error instead of a silent fallback to plaintext HTTP.
         config.validate_tls_config()?;
         config.validate_runtime_limits()?;
+        config.validate_identity_config()?;
         config.validate_host_gateway_ip()?;
         config.validate_proxy_config()?;
 
@@ -412,6 +415,9 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &'a DriverSandbox,
     ) -> Result<ValidatedPodmanSandbox<'a>, ComputeDriverError> {
+        self.config
+            .validate_identity_config()
+            .map_err(|error| ComputeDriverError::Precondition(error.to_string()))?;
         let gpu_requirements = sandbox
             .spec
             .as_ref()
@@ -489,9 +495,12 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
-        let volumes =
-            container::podman_driver_volume_mount_sources(sandbox, self.config.enable_bind_mounts)
-                .map_err(ComputeDriverError::Precondition)?;
+        let volumes = container::podman_driver_volume_mount_sources(
+            sandbox,
+            self.config.enable_bind_mounts,
+            self.config.identity_source,
+        )
+        .map_err(ComputeDriverError::Precondition)?;
         for volume in volumes {
             match self.client.inspect_volume(&volume).await {
                 Ok(volume_info) => {
@@ -511,6 +520,23 @@ impl PodmanComputeDriver {
             }
         }
         Ok(())
+    }
+
+    async fn provision_image(
+        &self,
+        reference: &str,
+        pull_policy: &str,
+    ) -> Result<ImageInspect, ComputeDriverError> {
+        let pull = self
+            .client
+            .pull_image(reference, pull_policy)
+            .await
+            .map_err(ComputeDriverError::from)?;
+        let selected = pull.id.as_deref().unwrap_or(reference);
+        self.client
+            .inspect_image(selected)
+            .await
+            .map_err(ComputeDriverError::from)
     }
 
     /// Create a sandbox container.
@@ -551,10 +577,9 @@ impl PodmanComputeDriver {
             policy = supervisor_pull_policy,
             "Ensuring supervisor image"
         );
-        self.client
-            .pull_image(&self.config.supervisor_image, supervisor_pull_policy)
-            .await
-            .map_err(ComputeDriverError::from)?;
+        let supervisor_image = self
+            .provision_image(&self.config.supervisor_image, supervisor_pull_policy)
+            .await?;
 
         // 1b. Pull the sandbox image if needed (Podman does not pull on create).
         let image = container::resolve_image(sandbox, &self.config);
@@ -567,21 +592,37 @@ impl PodmanComputeDriver {
         }
         let pull_policy = self.config.image_pull_policy.as_str();
         info!(image = %image, policy = %pull_policy, "Ensuring sandbox image");
-        self.client
-            .pull_image(image, pull_policy)
-            .await
-            .map_err(ComputeDriverError::from)?;
-
-        for image in
-            container::podman_driver_image_mount_sources(sandbox, self.config.enable_bind_mounts)
-                .map_err(ComputeDriverError::Precondition)?
+        let sandbox_image = self.provision_image(image, pull_policy).await?;
+        if self.config.identity_source == IdentitySource::Image
+            && sandbox_image.config.user.trim().is_empty()
         {
-            info!(image = %image, policy = %pull_policy, "Ensuring image mount source");
-            self.client
-                .pull_image(&image, pull_policy)
-                .await
-                .map_err(ComputeDriverError::from)?;
+            return Err(ComputeDriverError::Precondition(format!(
+                "sandbox image '{image}' must declare a non-empty OCI Config.User when identity_source = 'image'"
+            )));
         }
+
+        let mut image_mount_ids = BTreeMap::new();
+        for image in container::podman_driver_image_mount_sources(
+            sandbox,
+            self.config.enable_bind_mounts,
+            self.config.identity_source,
+        )
+        .map_err(ComputeDriverError::Precondition)?
+        {
+            if image_mount_ids.contains_key(&image) {
+                continue;
+            }
+            info!(image = %image, policy = %pull_policy, "Ensuring image mount source");
+            let inspected = self.provision_image(&image, pull_policy).await?;
+            image_mount_ids.insert(image, inspected.id);
+        }
+
+        let images = container::PodmanContainerImages {
+            sandbox_id: sandbox_image.id,
+            sandbox_user: sandbox_image.config.user,
+            supervisor_id: supervisor_image.id,
+            image_mount_ids,
+        };
 
         // 2. Create workspace volume and per-sandbox token secret.
         if let Err(e) = self.client.create_volume(&vol_name).await {
@@ -630,11 +671,12 @@ impl PodmanComputeDriver {
                 return Err(e);
             }
         };
-        let spec = match container::build_container_spec_with_token_and_gpu_devices(
+        let spec = match container::build_provisioned_container_spec_with_token_and_gpu_devices(
             sandbox,
             &self.config,
             token_secret_name.as_deref(),
             gpu_devices.as_deref(),
+            &images,
         ) {
             Ok(spec) => spec,
             Err(e) => {
@@ -1377,6 +1419,18 @@ mod tests {
         PodmanComputeDriver::for_tests(config)
     }
 
+    fn test_driver_fixed(socket_path: PathBuf) -> PodmanComputeDriver {
+        let config = PodmanComputeConfig {
+            socket_path: Some(socket_path),
+            stop_timeout_secs: 10,
+            identity_source: IdentitySource::Fixed,
+            fixed_uid: Some(10_001),
+            fixed_gid: Some(10_001),
+            ..PodmanComputeConfig::default()
+        };
+        PodmanComputeDriver::for_tests(config)
+    }
+
     fn test_driver_with_config(config: PodmanComputeConfig) -> PodmanComputeDriver {
         PodmanComputeDriver::for_tests(config)
     }
@@ -1414,6 +1468,117 @@ mod tests {
 
     fn api_path(path: &str) -> String {
         format!("/v5.0.0{path}")
+    }
+
+    #[tokio::test]
+    async fn provision_image_inspects_pull_selected_id() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "provision-selected-id",
+            vec![
+                StubResponse::new(StatusCode::OK, "{\"id\":\"sha256:selected\"}\n"),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:selected","Config":{"User":"app"}}"#,
+                ),
+            ],
+        );
+        let driver = test_driver(socket_path.clone());
+
+        let image = driver
+            .provision_image("registry.example.com/team/image:latest", "newer")
+            .await
+            .unwrap();
+
+        assert_eq!(image.id, "sha256:selected");
+        assert_eq!(image.config.user, "app");
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            [
+                "POST /v5.0.0/libpod/images/pull?reference=registry.example.com%2Fteam%2Fimage%3Alatest&policy=newer",
+                "GET /v5.0.0/libpod/images/sha256%3Aselected/json",
+            ]
+        );
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn provision_image_without_pull_id_inspects_original_reference() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "provision-reference-fallback",
+            vec![
+                StubResponse::new(StatusCode::OK, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:local","Config":{"User":"app"}}"#,
+                ),
+            ],
+        );
+        let driver = test_driver(socket_path.clone());
+
+        let image = driver
+            .provision_image("localhost/team/image:local", "never")
+            .await
+            .unwrap();
+
+        assert_eq!(image.id, "sha256:local");
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            [
+                "POST /v5.0.0/libpod/images/pull?reference=localhost%2Fteam%2Fimage%3Alocal&policy=never",
+                "GET /v5.0.0/libpod/images/localhost%2Fteam%2Fimage%3Alocal/json",
+            ]
+        );
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn image_identity_missing_user_fails_before_volume_or_secret_creation() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "missing-image-user",
+            vec![
+                StubResponse::new(StatusCode::OK, "{\"id\":\"sha256:supervisor\"}\n"),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:supervisor","Config":{"User":"0:0"}}"#,
+                ),
+                StubResponse::new(StatusCode::OK, "{\"id\":\"sha256:sandbox\"}\n"),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":"  "}}"#,
+                ),
+            ],
+        );
+        let driver = test_driver(socket_path.clone());
+        let mut sandbox = plain_sandbox("sandbox-no-user", "demo");
+        sandbox.spec = Some(DriverSandboxSpec {
+            sandbox_token: "must-not-be-staged".to_string(),
+            ..Default::default()
+        });
+
+        let error = driver.create_sandbox(&sandbox).await.unwrap_err();
+
+        assert!(error.to_string().contains("non-empty OCI Config.User"));
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("/volumes/") && !request.contains("/secrets/")),
+            "identity failure must happen before volume or secret creation: {requests:?}"
+        );
+        let _ = fs::remove_file(socket_path);
     }
 
     #[test]
@@ -1475,7 +1640,7 @@ mod tests {
                 r#"{"Name":"work-bind","Driver":"local","Options":{"type":"none","o":"rw,bind","device":"/srv/work"}}"#,
             )],
         );
-        let driver = test_driver(socket_path.clone());
+        let driver = test_driver_fixed(socket_path.clone());
         let sandbox = sandbox_with_volume_mount("work-bind");
 
         let err = driver
@@ -1512,7 +1677,7 @@ mod tests {
                 r#"{"Name":"work-rbind","Driver":"local","Options":{"type":"none","o":"rw,rbind","device":"/srv/work"}}"#,
             )],
         );
-        let driver = test_driver(socket_path.clone());
+        let driver = test_driver_fixed(socket_path.clone());
         let sandbox = sandbox_with_volume_mount("work-rbind");
 
         let err = driver
@@ -1552,6 +1717,9 @@ mod tests {
         let config = PodmanComputeConfig {
             socket_path: Some(socket_path.clone()),
             enable_bind_mounts: true,
+            identity_source: IdentitySource::Fixed,
+            fixed_uid: Some(10_001),
+            fixed_gid: Some(10_001),
             ..PodmanComputeConfig::default()
         };
         let driver = test_driver_with_config(config);
@@ -1617,6 +1785,9 @@ mod tests {
             stop_timeout_secs: 10,
             proxy_auth_file: Some(auth_file.to_string_lossy().into_owned()),
             proxy_auth_allow_insecure: Some(true),
+            identity_source: IdentitySource::Fixed,
+            fixed_uid: Some(10_001),
+            fixed_gid: Some(10_001),
             ..PodmanComputeConfig::default()
         }
     }
@@ -1652,7 +1823,9 @@ mod tests {
             "create-container-fail",
             vec![
                 StubResponse::new(StatusCode::OK, "{}"), // pull supervisor image
+                StubResponse::new(StatusCode::OK, r#"{"Id":"sha256:supervisor","Config":{}}"#), // inspect supervisor image
                 StubResponse::new(StatusCode::OK, "{}"), // pull sandbox image
+                StubResponse::new(StatusCode::OK, r#"{"Id":"sha256:sandbox","Config":{}}"#), // inspect sandbox image
                 StubResponse::new(StatusCode::CREATED, "{}"), // create volume
                 StubResponse::new(StatusCode::CREATED, "{}"), // create proxy-auth secret
                 StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"message":"boom"}"#), // create container
@@ -1690,7 +1863,9 @@ mod tests {
             "create-start-fail",
             vec![
                 StubResponse::new(StatusCode::OK, "{}"), // pull supervisor image
+                StubResponse::new(StatusCode::OK, r#"{"Id":"sha256:supervisor","Config":{}}"#), // inspect supervisor image
                 StubResponse::new(StatusCode::OK, "{}"), // pull sandbox image
+                StubResponse::new(StatusCode::OK, r#"{"Id":"sha256:sandbox","Config":{}}"#), // inspect sandbox image
                 StubResponse::new(StatusCode::CREATED, "{}"), // create volume
                 StubResponse::new(StatusCode::CREATED, "{}"), // create proxy-auth secret
                 StubResponse::new(StatusCode::CREATED, "{}"), // create container

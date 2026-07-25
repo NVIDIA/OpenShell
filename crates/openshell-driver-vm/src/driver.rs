@@ -3998,6 +3998,13 @@ fn merged_environment(sandbox: &Sandbox) -> HashMap<String, String> {
     if let Some(spec) = sandbox.spec.as_ref() {
         environment.extend(spec.environment.clone());
     }
+    for key in [
+        openshell_core::sandbox_env::IDENTITY_SOURCE,
+        openshell_core::sandbox_env::IMAGE_USER,
+        openshell_core::sandbox_env::IMAGE_ID,
+    ] {
+        environment.remove(key);
+    }
     environment
 }
 
@@ -5978,6 +5985,69 @@ mod tests {
         assert!(env.contains(&format!(
             "OPENSHELL_SSH_SOCKET_PATH={GUEST_SSH_SOCKET_PATH}"
         )));
+    }
+
+    #[test]
+    fn build_guest_environment_removes_local_identity_metadata() {
+        let protected = [
+            openshell_core::sandbox_env::IDENTITY_SOURCE,
+            openshell_core::sandbox_env::IMAGE_USER,
+            openshell_core::sandbox_env::IMAGE_ID,
+        ];
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                environment: protected
+                    .into_iter()
+                    .map(|key| (key.to_string(), "request-value".to_string()))
+                    .chain(std::iter::once((
+                        "SAFE_SPEC".to_string(),
+                        "yes".to_string(),
+                    )))
+                    .collect(),
+                template: Some(SandboxTemplate {
+                    environment: protected
+                        .into_iter()
+                        .map(|key| (key.to_string(), "image-value".to_string()))
+                        .chain(std::iter::once((
+                            "SAFE_TEMPLATE".to_string(),
+                            "yes".to_string(),
+                        )))
+                        .collect(),
+                    ..SandboxTemplate::default()
+                }),
+                ..SandboxSpec::default()
+            }),
+            ..Sandbox::default()
+        };
+
+        let env = build_guest_environment(&sandbox, &VmDriverConfig::default(), None);
+
+        for key in protected {
+            assert!(
+                !env.iter()
+                    .any(|value| value.starts_with(&format!("{key}=")))
+            );
+        }
+        let user_env = env
+            .iter()
+            .find_map(|value| {
+                value
+                    .strip_prefix(&format!(
+                        "{}=",
+                        openshell_core::sandbox_env::USER_ENVIRONMENT
+                    ))
+                    .map(str::to_string)
+            })
+            .expect("safe user environment should be serialized");
+        let user_env: HashMap<String, String> = serde_json::from_str(&user_env).unwrap();
+        for key in protected {
+            assert!(!user_env.contains_key(key));
+        }
+        assert_eq!(
+            user_env.get("SAFE_TEMPLATE").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(user_env.get("SAFE_SPEC").map(String::as_str), Some("yes"));
     }
 
     #[test]

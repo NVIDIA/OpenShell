@@ -33,7 +33,7 @@ uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["fs", "thread"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 capctl = "0.2.4"

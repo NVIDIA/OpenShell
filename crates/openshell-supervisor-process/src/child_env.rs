@@ -3,7 +3,44 @@
 
 use std::path::Path;
 
+use openshell_core::policy::SandboxPolicy;
+
 const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1";
+
+/// Identity environment shared by direct and SSH-launched agent children.
+///
+/// Image and fixed identities are normalized into numeric policy fields before
+/// process preparation, while the separately resolved presentation name is
+/// retained in supervisor memory and never exposed as protected metadata.
+pub fn identity_env_vars(policy: &SandboxPolicy) -> [(&'static str, String); 3] {
+    #[cfg(unix)]
+    let presentation_user = crate::identity::resolved_presentation_user();
+    #[cfg(not(unix))]
+    let presentation_user = None;
+    identity_env_vars_with_presentation(policy, presentation_user)
+}
+
+fn identity_env_vars_with_presentation(
+    policy: &SandboxPolicy,
+    presentation_user: Option<&str>,
+) -> [(&'static str, String); 3] {
+    let user = presentation_user
+        .filter(|user| !user.is_empty())
+        .or_else(|| {
+            policy
+                .process
+                .run_as_user
+                .as_deref()
+                .filter(|user| !user.is_empty())
+        })
+        .unwrap_or("sandbox")
+        .to_string();
+    [
+        ("HOME", "/sandbox".to_string()),
+        ("USER", user.clone()),
+        ("LOGNAME", user),
+    ]
+}
 
 pub fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
     [
@@ -44,6 +81,52 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::process::Stdio;
+
+    #[test]
+    fn identity_env_uses_sandbox_home_and_numeric_presentation() {
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: openshell_core::policy::FilesystemPolicy::default(),
+            network: openshell_core::policy::NetworkPolicy::default(),
+            landlock: openshell_core::policy::LandlockPolicy::default(),
+            process: openshell_core::policy::ProcessPolicy {
+                run_as_user: Some("1234".into()),
+                run_as_group: Some("2345".into()),
+            },
+        };
+
+        assert_eq!(
+            identity_env_vars(&policy),
+            [
+                ("HOME", "/sandbox".to_string()),
+                ("USER", "1234".to_string()),
+                ("LOGNAME", "1234".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn identity_env_preserves_resolved_presentation_user() {
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: openshell_core::policy::FilesystemPolicy::default(),
+            network: openshell_core::policy::NetworkPolicy::default(),
+            landlock: openshell_core::policy::LandlockPolicy::default(),
+            process: openshell_core::policy::ProcessPolicy {
+                run_as_user: Some("1234".into()),
+                run_as_group: Some("2345".into()),
+            },
+        };
+
+        assert_eq!(
+            identity_env_vars_with_presentation(&policy, Some("app")),
+            [
+                ("HOME", "/sandbox".to_string()),
+                ("USER", "app".to_string()),
+                ("LOGNAME", "app".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn apply_proxy_env_includes_node_proxy_opt_in_and_local_bypass() {

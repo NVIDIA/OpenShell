@@ -21,12 +21,13 @@ use openshell_core::proto::{
     SupervisorHello, SupervisorMessage, TcpRelayTarget, gateway_message, relay_open,
     supervisor_message,
 };
+use openshell_core::sandbox_env::ResolvedAgentIdentity as RuntimeResolvedAgentIdentity;
 use openshell_ocsf::{
     ActivityId, ConnectionInfo, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext,
     SeverityId, StatusId, ocsf_emit,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
 use tracing::{debug, warn};
 
@@ -236,14 +237,19 @@ pub fn spawn(
     ssh_socket_path: std::path::PathBuf,
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_session_loop(
+    resolved_identity: Option<RuntimeResolvedAgentIdentity>,
+) -> (tokio::task::JoinHandle<()>, oneshot::Receiver<()>) {
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let handle = tokio::spawn(run_session_loop(
         endpoint,
         sandbox_id,
         ssh_socket_path,
         netns_fd,
         expected_ssh_peer_pid,
-    ))
+        resolved_identity,
+        Some(ready_tx),
+    ));
+    (handle, ready_rx)
 }
 
 async fn run_session_loop(
@@ -252,6 +258,8 @@ async fn run_session_loop(
     ssh_socket_path: std::path::PathBuf,
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
+    resolved_identity: Option<RuntimeResolvedAgentIdentity>,
+    mut ready_tx: Option<oneshot::Sender<()>>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
@@ -265,6 +273,8 @@ async fn run_session_loop(
             &ssh_socket_path,
             netns_fd,
             expected_ssh_peer_pid,
+            resolved_identity.as_ref(),
+            &mut ready_tx,
         )
         .await
         {
@@ -295,6 +305,8 @@ async fn run_single_session(
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
+    resolved_identity: Option<&RuntimeResolvedAgentIdentity>,
+    ready_tx: &mut Option<oneshot::Sender<()>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -312,10 +324,11 @@ async fn run_single_session(
     // Send hello as the first message.
     let instance_id = uuid::Uuid::new_v4().to_string();
     tx.send(SupervisorMessage {
-        payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
-            sandbox_id: sandbox_id.to_string(),
-            instance_id: instance_id.clone(),
-        })),
+        payload: Some(supervisor_message::Payload::Hello(supervisor_hello(
+            sandbox_id,
+            &instance_id,
+            resolved_identity,
+        ))),
     })
     .await
     .map_err(|_| "failed to queue hello")?;
@@ -342,6 +355,9 @@ async fn run_single_session(
     };
 
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
+    if let Some(ready_tx) = ready_tx.take() {
+        let _ = ready_tx.send(());
+    }
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
         endpoint,
@@ -380,6 +396,19 @@ async fn run_single_session(
                 }
             }
         }
+    }
+}
+
+fn supervisor_hello(
+    sandbox_id: &str,
+    instance_id: &str,
+    resolved_identity: Option<&RuntimeResolvedAgentIdentity>,
+) -> SupervisorHello {
+    SupervisorHello {
+        sandbox_id: sandbox_id.to_string(),
+        instance_id: instance_id.to_string(),
+        resolved_identity: resolved_identity
+            .map(openshell_core::proto::ResolvedAgentIdentity::from),
     }
 }
 
@@ -646,7 +675,7 @@ async fn connect_tcp_target(
     netns_fd: Option<RawFd>,
 ) -> Result<tokio::net::TcpStream, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(fd) = netns_fd {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         std::thread::spawn(move || {
             let result = (|| -> std::io::Result<std::net::TcpStream> {
                 #[allow(unsafe_code)]
@@ -752,6 +781,54 @@ mod target_tests {
 
         let err = validate_tcp_target(&tcp("127.0.0.1", 70000)).expect_err("too large rejected");
         assert_eq!(err, "tcp target port must be between 1 and 65535");
+    }
+
+    #[test]
+    fn managed_supervisor_hello_reports_resolved_identity() {
+        let runtime_identity = RuntimeResolvedAgentIdentity {
+            uid: 1234,
+            gid: 2345,
+            presentation_user: "agent".to_string(),
+            source: openshell_core::sandbox_env::IdentitySource::Image,
+            image_id: Some("sha256:image".to_string()),
+        };
+
+        let hello = supervisor_hello("sbx", "instance", Some(&runtime_identity));
+        let identity = hello
+            .resolved_identity
+            .expect("managed hello must carry identity");
+        assert_eq!(
+            identity.version,
+            openshell_core::sandbox_env::RESOLVED_AGENT_IDENTITY_VERSION
+        );
+        assert_eq!(identity.source, "image");
+        assert_eq!(identity.image_id, "sha256:image");
+        assert_eq!(identity.uid, 1234);
+        assert_eq!(identity.gid, 2345);
+        assert!(identity.supplementary_gids.is_empty());
+    }
+
+    #[test]
+    fn legacy_supervisor_hello_omits_resolved_identity() {
+        let hello = supervisor_hello("sbx", "instance", None);
+        assert!(hello.resolved_identity.is_none());
+    }
+
+    #[test]
+    fn fixed_supervisor_hello_preserves_immutable_image_id() {
+        let runtime_identity = RuntimeResolvedAgentIdentity {
+            uid: 1234,
+            gid: 2345,
+            presentation_user: "1234".to_string(),
+            source: openshell_core::sandbox_env::IdentitySource::Fixed,
+            image_id: Some("sha256:fixed-image".to_string()),
+        };
+
+        let identity = supervisor_hello("sbx", "instance", Some(&runtime_identity))
+            .resolved_identity
+            .unwrap();
+        assert_eq!(identity.source, "fixed");
+        assert_eq!(identity.image_id, "sha256:fixed-image");
     }
 }
 

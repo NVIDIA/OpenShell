@@ -115,7 +115,48 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         allow_all_default_gpu: false,
         sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
         enable_bind_mounts: false,
+        identity: DockerIdentityConfig {
+            source: IdentitySource::Image,
+            fixed_uid: None,
+            fixed_gid: None,
+        },
     }
+}
+
+fn fixed_runtime_config() -> DockerDriverRuntimeConfig {
+    let mut config = runtime_config();
+    config.identity = DockerIdentityConfig {
+        source: IdentitySource::Fixed,
+        fixed_uid: Some(1_234),
+        fixed_gid: Some(1_235),
+    };
+    config
+}
+
+fn image_metadata() -> DockerImageMetadata {
+    DockerImageMetadata {
+        id: "sha256:immutable-image-id".to_string(),
+        user: Some("app:staff".to_string()),
+    }
+}
+
+fn image_inspect(id: Option<&str>, user: Option<&str>) -> ImageInspect {
+    ImageInspect {
+        id: id.map(str::to_string),
+        config: Some(bollard::models::ImageConfig {
+            user: user.map(str::to_string),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn environment_values<'a>(environment: &'a [String], key: &str) -> Vec<Option<&'a str>> {
+    environment
+        .iter()
+        .filter(|entry| entry.split_once('=').map_or(entry.as_str(), |pair| pair.0) == key)
+        .map(|entry| entry.split_once('=').map(|pair| pair.1))
+        .collect()
 }
 
 fn json_struct(value: serde_json::Value) -> prost_types::Struct {
@@ -521,6 +562,173 @@ fn docker_pids_limit_uses_driver_default_and_allows_runtime_inherit() {
 fn docker_compute_config_disables_bind_mounts_by_default() {
     let cfg = DockerComputeConfig::default();
     assert!(!cfg.enable_bind_mounts);
+    assert_eq!(cfg.identity_source, IdentitySource::Image);
+    assert_eq!(cfg.fixed_uid, None);
+    assert_eq!(cfg.fixed_gid, None);
+}
+
+#[test]
+fn docker_identity_config_accepts_image_and_complete_fixed_modes() {
+    let image = DockerComputeConfig::default();
+    assert_eq!(
+        validate_docker_identity_config(&image).unwrap(),
+        DockerIdentityConfig {
+            source: IdentitySource::Image,
+            fixed_uid: None,
+            fixed_gid: None,
+        }
+    );
+
+    let fixed = DockerComputeConfig {
+        identity_source: IdentitySource::Fixed,
+        fixed_uid: Some(MIN_FIXED_ID),
+        fixed_gid: Some(MAX_FIXED_ID),
+        ..Default::default()
+    };
+    assert_eq!(
+        validate_docker_identity_config(&fixed).unwrap(),
+        DockerIdentityConfig {
+            source: IdentitySource::Fixed,
+            fixed_uid: Some(MIN_FIXED_ID),
+            fixed_gid: Some(MAX_FIXED_ID),
+        }
+    );
+}
+
+#[test]
+fn docker_identity_config_rejects_fixed_fields_in_image_mode() {
+    for (fixed_uid, fixed_gid) in [(Some(1_000), None), (None, Some(1_000))] {
+        let config = DockerComputeConfig {
+            fixed_uid,
+            fixed_gid,
+            ..Default::default()
+        };
+        let err = validate_docker_identity_config(&config).unwrap_err();
+        assert!(err.to_string().contains("must be omitted"));
+    }
+}
+
+#[test]
+fn docker_identity_config_requires_both_fixed_ids() {
+    for (fixed_uid, fixed_gid, missing) in [
+        (None, Some(1_000), "fixed_uid"),
+        (Some(1_000), None, "fixed_gid"),
+    ] {
+        let config = DockerComputeConfig {
+            identity_source: IdentitySource::Fixed,
+            fixed_uid,
+            fixed_gid,
+            ..Default::default()
+        };
+        let err = validate_docker_identity_config(&config).unwrap_err();
+        assert!(err.to_string().contains(missing));
+        assert!(err.to_string().contains("required"));
+    }
+}
+
+#[test]
+fn docker_identity_config_rejects_ids_outside_policy_range() {
+    for (fixed_uid, fixed_gid, invalid) in [
+        (0, MIN_FIXED_ID, 0),
+        (MIN_FIXED_ID - 1, MIN_FIXED_ID, MIN_FIXED_ID - 1),
+        (MIN_FIXED_ID, MAX_FIXED_ID + 1, MAX_FIXED_ID + 1),
+    ] {
+        let config = DockerComputeConfig {
+            identity_source: IdentitySource::Fixed,
+            fixed_uid: Some(fixed_uid),
+            fixed_gid: Some(fixed_gid),
+            ..Default::default()
+        };
+        let err = validate_docker_identity_config(&config).unwrap_err();
+        assert!(err.to_string().contains("policy range"));
+        assert!(err.to_string().contains(&invalid.to_string()));
+    }
+}
+
+#[test]
+fn docker_compute_config_serde_defaults_identity_and_denies_unknown_fields() {
+    let defaulted: DockerComputeConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert_eq!(defaulted.identity_source, IdentitySource::Image);
+    assert_eq!(defaulted.fixed_uid, None);
+    assert_eq!(defaulted.fixed_gid, None);
+
+    let fixed: DockerComputeConfig = serde_json::from_value(serde_json::json!({
+        "identity_source": "fixed",
+        "fixed_uid": 1234,
+        "fixed_gid": 1235
+    }))
+    .unwrap();
+    validate_docker_identity_config(&fixed).unwrap();
+
+    let err = serde_json::from_value::<DockerComputeConfig>(serde_json::json!({
+        "identity_source": "image",
+        "sandbox_uid": 1234
+    }))
+    .unwrap_err();
+    assert!(err.to_string().contains("unknown field"));
+}
+
+#[test]
+fn docker_image_metadata_preserves_immutable_id_and_raw_user() {
+    let metadata = docker_image_metadata(
+        "example:latest",
+        image_inspect(Some("sha256:abc123"), Some(" app:staff ")),
+        runtime_config().identity,
+    )
+    .unwrap();
+
+    assert_eq!(metadata.id, "sha256:abc123");
+    assert_eq!(metadata.user.as_deref(), Some(" app:staff "));
+}
+
+#[test]
+fn docker_image_metadata_requires_nonempty_immutable_id() {
+    for id in [None, Some(""), Some("   ")] {
+        let err = docker_image_metadata(
+            "example:latest",
+            image_inspect(id, Some("app")),
+            runtime_config().identity,
+        )
+        .unwrap_err();
+        assert!(err.message().contains("immutable image ID"));
+    }
+}
+
+#[test]
+fn docker_image_metadata_requires_user_only_in_image_mode() {
+    for user in [None, Some(""), Some("   ")] {
+        let err = docker_image_metadata(
+            "example:latest",
+            image_inspect(Some("sha256:abc123"), user),
+            runtime_config().identity,
+        )
+        .unwrap_err();
+        assert!(err.message().contains("Config.User"));
+
+        let metadata = docker_image_metadata(
+            "example:latest",
+            image_inspect(Some("sha256:abc123"), user),
+            fixed_runtime_config().identity,
+        )
+        .unwrap();
+        assert_eq!(metadata.user.as_deref(), user);
+    }
+}
+
+#[test]
+fn docker_not_found_classification_does_not_treat_other_inspect_errors_as_missing() {
+    let not_found = BollardError::DockerResponseServerError {
+        status_code: 404,
+        message: "missing".to_string(),
+    };
+    let server_error = BollardError::DockerResponseServerError {
+        status_code: 500,
+        message: "daemon failed".to_string(),
+    };
+
+    assert!(is_not_found_error(&not_found));
+    assert!(!is_not_found_error(&server_error));
+    assert!(!is_not_found_error(&BollardError::RequestTimeoutError));
 }
 
 #[test]
@@ -532,7 +740,7 @@ fn container_create_body_sets_driver_owned_pids_limit() {
 
 #[test]
 fn build_environment_sets_docker_tls_paths() {
-    let env = build_environment(&test_sandbox(), &runtime_config());
+    let env = build_environment(&test_sandbox(), &runtime_config(), &image_metadata());
     assert!(env.contains(&format!("OPENSHELL_TLS_CA={TLS_CA_MOUNT_PATH}")));
     assert!(env.contains(&format!("OPENSHELL_TLS_CERT={TLS_CERT_MOUNT_PATH}")));
     assert!(env.contains(&format!("OPENSHELL_TLS_KEY={TLS_KEY_MOUNT_PATH}")));
@@ -553,7 +761,7 @@ fn build_environment_keeps_path_driver_controlled() {
         .environment
         .insert("PATH".to_string(), "/malicious/template/bin".to_string());
 
-    let env = build_environment(&sandbox, &runtime_config());
+    let env = build_environment(&sandbox, &runtime_config(), &image_metadata());
     let path_entries = env
         .iter()
         .filter(|entry| entry.starts_with("PATH="))
@@ -579,7 +787,7 @@ fn build_environment_keeps_telemetry_toggle_driver_controlled() {
                 "true".to_string(),
             );
 
-            let env = build_environment(&sandbox, &runtime_config());
+            let env = build_environment(&sandbox, &runtime_config(), &image_metadata());
             let telemetry_entries = env
                 .iter()
                 .filter(|entry| {
@@ -596,6 +804,198 @@ fn build_environment_keeps_telemetry_toggle_driver_controlled() {
                 &format!("{}=false", openshell_core::sandbox_env::TELEMETRY_ENABLED)
             );
         },
+    );
+}
+
+#[test]
+fn image_baked_and_request_identity_cannot_override_protected_metadata() {
+    let protected = [
+        openshell_core::sandbox_env::IDENTITY_SOURCE,
+        openshell_core::sandbox_env::IMAGE_USER,
+        openshell_core::sandbox_env::IMAGE_ID,
+        openshell_core::sandbox_env::SANDBOX_UID,
+        openshell_core::sandbox_env::SANDBOX_GID,
+    ];
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    for key in protected {
+        spec.template
+            .as_mut()
+            .unwrap()
+            .environment
+            .insert(key.to_string(), "template-spoof".to_string());
+        spec.environment
+            .insert(key.to_string(), "request-spoof".to_string());
+    }
+    let mut inspect = image_inspect(Some("sha256:authoritative-image"), Some("image-app"));
+    inspect.config.as_mut().unwrap().env = Some(
+        protected
+            .iter()
+            .map(|key| format!("{key}=image-baked-spoof"))
+            .collect(),
+    );
+    let image =
+        docker_image_metadata("example:latest", inspect, runtime_config().identity).unwrap();
+    let body = build_container_create_body_with_gpu_devices(
+        &sandbox,
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        &image,
+        None,
+    )
+    .unwrap();
+    let env = body.env.expect("final container environment");
+
+    assert_eq!(
+        environment_values(&env, openshell_core::sandbox_env::IDENTITY_SOURCE),
+        vec![Some("image")]
+    );
+    assert_eq!(
+        environment_values(&env, openshell_core::sandbox_env::IMAGE_USER),
+        vec![Some("image-app")]
+    );
+    assert_eq!(
+        environment_values(&env, openshell_core::sandbox_env::IMAGE_ID),
+        vec![Some("sha256:authoritative-image")]
+    );
+    assert_eq!(
+        environment_values(&env, openshell_core::sandbox_env::SANDBOX_UID),
+        vec![None]
+    );
+    assert_eq!(
+        environment_values(&env, openshell_core::sandbox_env::SANDBOX_GID),
+        vec![None]
+    );
+
+    let user_environment = env
+        .iter()
+        .find_map(|entry| {
+            entry
+                .strip_prefix(&format!(
+                    "{}=",
+                    openshell_core::sandbox_env::USER_ENVIRONMENT
+                ))
+                .map(str::to_string)
+        })
+        .expect("serialized user environment");
+    let user_environment: HashMap<String, String> =
+        serde_json::from_str(&user_environment).unwrap();
+    assert!(
+        protected
+            .iter()
+            .all(|key| !user_environment.contains_key(*key))
+    );
+}
+
+#[test]
+fn fixed_identity_environment_injects_one_authoritative_image_id_and_numeric_ids() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:fixed-image".to_string(),
+        user: None,
+    };
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    for key in [
+        openshell_core::sandbox_env::IDENTITY_SOURCE,
+        openshell_core::sandbox_env::IMAGE_USER,
+        openshell_core::sandbox_env::IMAGE_ID,
+        openshell_core::sandbox_env::SANDBOX_UID,
+        openshell_core::sandbox_env::SANDBOX_GID,
+    ] {
+        spec.template
+            .as_mut()
+            .unwrap()
+            .environment
+            .insert(key.to_string(), "template-spoof".to_string());
+        spec.environment
+            .insert(key.to_string(), "request-spoof".to_string());
+    }
+    let env = build_environment(&sandbox, &fixed_runtime_config(), &metadata);
+
+    assert_eq!(
+        environment_values(&env, openshell_core::sandbox_env::IDENTITY_SOURCE),
+        vec![Some("fixed")]
+    );
+    assert_eq!(
+        environment_values(&env, openshell_core::sandbox_env::IMAGE_USER),
+        vec![None]
+    );
+    assert_eq!(
+        environment_values(&env, openshell_core::sandbox_env::IMAGE_ID),
+        vec![Some("sha256:fixed-image")]
+    );
+    assert_eq!(
+        environment_values(&env, openshell_core::sandbox_env::SANDBOX_UID),
+        vec![Some("1234")]
+    );
+    assert_eq!(
+        environment_values(&env, openshell_core::sandbox_env::SANDBOX_GID),
+        vec![Some("1235")]
+    );
+}
+
+#[test]
+fn final_container_body_uses_immutable_image_id_and_root_supervisor() {
+    let sandbox = test_sandbox();
+    let config = runtime_config();
+    let driver_config = DockerSandboxDriverConfig::default();
+    let image = image_metadata();
+
+    preflight_container_create_body(&sandbox, &config, &driver_config).unwrap();
+    let body = build_container_create_body_with_gpu_devices(
+        &sandbox,
+        &config,
+        &driver_config,
+        &image,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(body.image.as_deref(), Some("sha256:immutable-image-id"));
+    assert_eq!(body.user.as_deref(), Some("0"));
+    assert_ne!(
+        body.image.as_deref(),
+        sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+            .map(|template| template.image.as_str())
+    );
+}
+
+#[test]
+fn fixed_identity_final_body_pins_image_and_carries_id_for_persistence() {
+    let image = DockerImageMetadata {
+        id: "sha256:fixed-image".to_string(),
+        user: None,
+    };
+    let body = build_container_create_body_with_gpu_devices(
+        &test_sandbox(),
+        &fixed_runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        &image,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(body.image.as_deref(), Some("sha256:fixed-image"));
+    assert_eq!(body.user.as_deref(), Some("0"));
+    let env = body.env.expect("final container environment");
+    assert_eq!(
+        environment_values(&env, openshell_core::sandbox_env::IDENTITY_SOURCE),
+        vec![Some("fixed")]
+    );
+    assert_eq!(
+        environment_values(&env, openshell_core::sandbox_env::IMAGE_ID),
+        vec![Some("sha256:fixed-image")]
+    );
+    assert_eq!(
+        environment_values(&env, openshell_core::sandbox_env::SANDBOX_UID),
+        vec![Some("1234")]
+    );
+    assert_eq!(
+        environment_values(&env, openshell_core::sandbox_env::SANDBOX_GID),
+        vec![Some("1235")]
     );
 }
 
@@ -640,7 +1040,7 @@ fn build_container_create_body_includes_driver_config_mounts() {
         ]
     })));
 
-    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let body = build_container_create_body(&sandbox, &fixed_runtime_config()).unwrap();
     let mounts = body
         .host_config
         .unwrap()
@@ -688,7 +1088,7 @@ fn driver_config_defaults_volume_mounts_to_read_only() {
         }]
     })));
 
-    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let body = build_container_create_body(&sandbox, &fixed_runtime_config()).unwrap();
     let mounts = body
         .host_config
         .unwrap()
@@ -717,7 +1117,7 @@ fn driver_config_allows_explicit_writable_volume_mounts() {
         }]
     })));
 
-    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let body = build_container_create_body(&sandbox, &fixed_runtime_config()).unwrap();
     let mounts = body
         .host_config
         .unwrap()
@@ -751,7 +1151,7 @@ fn driver_config_rejects_duplicate_mount_targets() {
         ]
     })));
 
-    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+    let err = build_container_create_body(&sandbox, &fixed_runtime_config()).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(
@@ -778,10 +1178,90 @@ fn driver_config_rejects_bind_mounts_unless_enabled() {
         }]
     })));
 
-    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+    let err = build_container_create_body(&sandbox, &fixed_runtime_config()).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("enable_bind_mounts = true"));
+}
+
+#[test]
+fn image_identity_rejects_bind_mounts_even_when_globally_enabled() {
+    let bind_src = TempDir::new().unwrap();
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": bind_src.path().to_str().unwrap(),
+            "target": "/sandbox/host"
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let err = build_container_create_body(&sandbox, &config).unwrap_err();
+    assert!(err.message().contains("identity_source = 'image'"));
+}
+
+#[test]
+fn image_identity_rejects_named_volumes_but_permits_tmpfs() {
+    let mut volume_sandbox = test_sandbox();
+    volume_sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "volume",
+            "source": "shared-data",
+            "target": "/sandbox/shared"
+        }]
+    })));
+    let err = build_container_create_body(&volume_sandbox, &runtime_config()).unwrap_err();
+    assert!(err.message().contains("named volume mounts"));
+    assert!(err.message().contains("identity_source = 'image'"));
+
+    let mut tmpfs_sandbox = test_sandbox();
+    tmpfs_sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "tmpfs",
+            "target": "/sandbox/cache"
+        }]
+    })));
+    let body = build_container_create_body(&tmpfs_sandbox, &runtime_config()).unwrap();
+    assert_eq!(
+        body.host_config
+            .as_ref()
+            .and_then(|host| host.mounts.as_ref())
+            .and_then(|mounts| mounts.first())
+            .and_then(|mount| mount.typ),
+        Some(MountTypeEnum::TMPFS)
+    );
+    assert!(
+        body.host_config
+            .as_ref()
+            .and_then(|host| host.binds.as_ref())
+            .is_some_and(|binds| binds
+                .iter()
+                .any(|bind| bind.contains(SUPERVISOR_MOUNT_PATH))),
+        "driver-owned supervisor bind must remain present in image mode"
+    );
 }
 
 #[test]
@@ -804,7 +1284,7 @@ fn build_container_create_body_includes_bind_mounts_when_enabled() {
             "read_only": true
         }]
     })));
-    let mut config = runtime_config();
+    let mut config = fixed_runtime_config();
     config.enable_bind_mounts = true;
 
     let body = build_container_create_body(&sandbox, &config).unwrap();
@@ -849,7 +1329,7 @@ fn driver_config_defaults_enabled_bind_mounts_to_read_only() {
             "target": "/sandbox/host"
         }]
     })));
-    let mut config = runtime_config();
+    let mut config = fixed_runtime_config();
     config.enable_bind_mounts = true;
 
     let body = build_container_create_body(&sandbox, &config).unwrap();
@@ -887,7 +1367,7 @@ fn bind_mount_selinux_shared_label() {
             "selinux_label": "shared"
         }]
     })));
-    let mut config = runtime_config();
+    let mut config = fixed_runtime_config();
     config.enable_bind_mounts = true;
 
     let body = build_container_create_body(&sandbox, &config).unwrap();
@@ -925,7 +1405,7 @@ fn bind_mount_selinux_private_label() {
             "selinux_label": "private"
         }]
     })));
-    let mut config = runtime_config();
+    let mut config = fixed_runtime_config();
     config.enable_bind_mounts = true;
 
     let body = build_container_create_body(&sandbox, &config).unwrap();
@@ -962,7 +1442,7 @@ fn bind_mount_without_selinux_label() {
             "read_only": false
         }]
     })));
-    let mut config = runtime_config();
+    let mut config = fixed_runtime_config();
     config.enable_bind_mounts = true;
 
     let body = build_container_create_body(&sandbox, &config).unwrap();
@@ -996,7 +1476,7 @@ fn driver_config_rejects_missing_bind_source() {
             "target": "/sandbox/data"
         }]
     })));
-    let mut config = runtime_config();
+    let mut config = fixed_runtime_config();
     config.enable_bind_mounts = true;
 
     let err = build_container_create_body(&sandbox, &config).unwrap_err();
@@ -1026,7 +1506,7 @@ fn driver_config_rejects_relative_bind_sources_when_enabled() {
             "target": "/sandbox/host"
         }]
     })));
-    let mut config = runtime_config();
+    let mut config = fixed_runtime_config();
     config.enable_bind_mounts = true;
 
     let err = build_container_create_body(&sandbox, &config).unwrap_err();
@@ -1056,7 +1536,7 @@ fn driver_config_rejects_image_mounts() {
         }]
     })));
 
-    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+    let err = build_container_create_body(&sandbox, &fixed_runtime_config()).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("invalid docker driver_config"));
@@ -1080,7 +1560,7 @@ fn driver_config_rejects_reserved_mount_targets() {
         }]
     })));
 
-    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+    let err = build_container_create_body(&sandbox, &fixed_runtime_config()).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("reserved OpenShell path"));
@@ -1148,7 +1628,7 @@ fn build_environment_uses_token_file_without_raw_token_env() {
         "user-provided-token".to_string(),
     );
 
-    let env = build_environment(&sandbox, &runtime_config());
+    let env = build_environment(&sandbox, &runtime_config(), &image_metadata());
 
     assert!(!env.iter().any(|entry| {
         entry.starts_with(&format!("{}=", openshell_core::sandbox_env::SANDBOX_TOKEN))
@@ -1422,6 +1902,7 @@ fn build_container_create_body_maps_default_gpu_to_selected_cdi_device() {
         &sandbox,
         &config,
         &driver_config,
+        &image_metadata(),
         Some(&gpu_devices),
     )
     .unwrap();
@@ -1557,6 +2038,7 @@ fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
         &first_sandbox,
         &driver.config,
         &driver_config,
+        &image_metadata(),
         Some(&first_devices),
     )
     .unwrap();
@@ -1571,6 +2053,7 @@ fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
         &second_sandbox,
         &driver.config,
         &driver_config,
+        &image_metadata(),
         Some(&second_devices),
     )
     .unwrap();
