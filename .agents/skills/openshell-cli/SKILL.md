@@ -341,9 +341,11 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
 - Binary matching patterns
-- Ordered `network_middlewares`, host selection, and `fail_open` or `fail_closed` behavior
+- Ordered `network_middlewares`, host selection, HTTP and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
 `network_policies` and `network_middlewares` can be modified at runtime. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+
+Middleware can inspect parsed HTTP request bodies and complete client-to-upstream WebSocket text messages over both `ws://` and `wss://` when the implementation advertises the matching binding. Binary and upstream-to-client WebSocket messages remain uninspected. A broken fail-open WebSocket stage is disabled for the rest of that connection; inspect sandbox OCSF logs for `openshell.middleware.websocket_stage_disabled`.
 
 ### Step 5: Push the updated policy
 

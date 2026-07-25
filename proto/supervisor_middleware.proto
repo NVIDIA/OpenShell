@@ -9,7 +9,8 @@ import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
 
 // SupervisorMiddleware lets an operator-run service inspect and transform
-// sandbox HTTP egress before OpenShell injects credentials.
+// sandbox HTTP requests and client WebSocket text messages before OpenShell
+// injects credentials.
 service SupervisorMiddleware {
   // Describe returns the service manifest and declared bindings.
   rpc Describe(google.protobuf.Empty) returns (MiddlewareManifest);

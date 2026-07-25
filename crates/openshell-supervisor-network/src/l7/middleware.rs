@@ -84,7 +84,7 @@ pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: 
     ocsf_emit!(event);
 }
 
-pub(super) fn emit_websocket_preflight_events(
+pub fn emit_websocket_preflight_events(
     ctx: &L7EvalContext,
     outcome: &openshell_supervisor_middleware::WebSocketPreflightResult,
 ) {
@@ -224,6 +224,26 @@ fn emit_websocket_invocations(
                 .build();
             ocsf_emit!(event);
         }
+        if invocation.stage_disabled {
+            let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(SeverityId::Medium)
+                .finding_info(FindingInfo::new(
+                    "openshell.middleware.websocket_stage_disabled",
+                    "WebSocket middleware stage disabled",
+                ))
+                .evidence_pairs(&[
+                    ("policy", ctx.policy_name.as_str()),
+                    ("host", ctx.host.as_str()),
+                    ("config", invocation.config_name.as_str()),
+                    ("implementation", invocation.implementation.as_str()),
+                    ("disposition", outcome_name),
+                ])
+                .message(
+                    "WebSocket middleware stage stream became unusable and was disabled for this session",
+                )
+                .build();
+            ocsf_emit!(event);
+        }
     }
 }
 
@@ -324,6 +344,10 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
             }
         });
     };
+    // Reserve shared middleware capacity before reading any request body.
+    // Keeping the guard through evaluation bounds aggregate buffered input
+    // across HTTP requests and WebSocket messages.
+    let admission = runner.reserve_middleware_work().await?;
     let buffered = match crate::l7::rest::buffer_request_body_for_middleware(
         &req,
         client,
@@ -352,7 +376,12 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     // replacement or documents that this protocol's policy is body-independent.
     // An ALLOW outcome therefore means the final body is policy-compliant.
     let outcome = runner
-        .evaluate_described_with_policy(&chain, input, transformed_body_policy)
+        .evaluate_described_with_policy_admitted(
+            &chain,
+            input,
+            transformed_body_policy,
+            Some(admission),
+        )
         .await?;
     emit_middleware_events(ctx, &req, &outcome);
     if !outcome.allowed {

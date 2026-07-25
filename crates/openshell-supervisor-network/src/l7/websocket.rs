@@ -30,6 +30,67 @@ const OPCODE_CLOSE: u8 = 0x8;
 const OPCODE_PING: u8 = 0x9;
 const OPCODE_PONG: u8 = 0xA;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebSocketTerminationCause {
+    PeerDisconnect,
+    PolicyReload,
+    MiddlewareDenial,
+    MiddlewareFailure,
+    PolicyDenial,
+    InvalidUtf8,
+    ProtocolError,
+    MessageTooBig,
+}
+
+impl WebSocketTerminationCause {
+    fn close_code(self) -> Option<u16> {
+        match self {
+            Self::PeerDisconnect => None,
+            Self::PolicyReload => Some(1012),
+            Self::MiddlewareDenial | Self::MiddlewareFailure | Self::PolicyDenial => Some(1008),
+            Self::InvalidUtf8 => Some(1007),
+            Self::ProtocolError => Some(1002),
+            Self::MessageTooBig => Some(1009),
+        }
+    }
+
+    fn session_end_reason(self) -> openshell_core::proto::WebSocketSessionEndReason {
+        match self {
+            Self::PeerDisconnect => {
+                openshell_core::proto::WebSocketSessionEndReason::PeerDisconnect
+            }
+            Self::PolicyReload => openshell_core::proto::WebSocketSessionEndReason::PolicyReload,
+            Self::MiddlewareDenial | Self::PolicyDenial => {
+                openshell_core::proto::WebSocketSessionEndReason::MiddlewareDenial
+            }
+            Self::MiddlewareFailure => {
+                openshell_core::proto::WebSocketSessionEndReason::MiddlewareFailure
+            }
+            Self::InvalidUtf8 | Self::ProtocolError | Self::MessageTooBig => {
+                openshell_core::proto::WebSocketSessionEndReason::ProtocolError
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WebSocketTermination {
+    cause: WebSocketTerminationCause,
+    error: miette::Report,
+}
+
+#[derive(Debug)]
+enum WebSocketDecompressionError {
+    MessageTooBig(miette::Report),
+    Protocol(miette::Report),
+}
+
+type WebSocketRelayResult<T> = std::result::Result<T, WebSocketTermination>;
+
+fn terminate(cause: WebSocketTerminationCause, error: miette::Report) -> WebSocketTermination {
+    WebSocketTermination { cause, error }
+}
+
 #[derive(Debug)]
 struct FrameHeader {
     fin: bool,
@@ -44,7 +105,11 @@ struct FrameHeader {
 #[derive(Debug)]
 enum FragmentState {
     None,
-    Text { payload: Vec<u8>, compressed: bool },
+    Text {
+        payload: Vec<u8>,
+        compressed: bool,
+        admission: Option<openshell_supervisor_middleware::MiddlewareAdmission>,
+    },
     Binary,
 }
 
@@ -104,32 +169,44 @@ where
     let server_to_client = async {
         tokio::io::copy(&mut upstream_read, &mut client_write)
             .await
-            .into_diagnostic()?;
-        client_write.flush().await.into_diagnostic()?;
-        Ok::<(), miette::Report>(())
+            .map_err(|error| {
+                terminate(
+                    WebSocketTerminationCause::PeerDisconnect,
+                    miette!("websocket upstream relay ended: {error}"),
+                )
+            })?;
+        client_write.flush().await.map_err(|error| {
+            terminate(
+                WebSocketTerminationCause::PeerDisconnect,
+                miette!("websocket client relay ended: {error}"),
+            )
+        })?;
+        Ok::<_, WebSocketTermination>(
+            openshell_core::proto::WebSocketSessionEndReason::PeerDisconnect,
+        )
     };
 
     let result = tokio::select! {
         result = client_to_server => result,
         result = server_to_client => result,
     };
-    if let Err(error) = &result {
-        let code = websocket_close_code(error);
+    if let Err(termination) = &result
+        && let Some(code) = termination.cause.close_code()
+    {
         let payload = code.to_be_bytes();
         let _ = write_masked_close(&mut upstream_write, &payload).await;
         let _ = write_unmasked_close(&mut client_write, &payload).await;
     }
     if let Some(session) = options.middleware_session.take() {
-        let reason = if result.is_ok() {
-            openshell_core::proto::WebSocketSessionEndReason::NormalClose
-        } else {
-            openshell_core::proto::WebSocketSessionEndReason::MiddlewareFailure
+        let reason = match &result {
+            Ok(reason) => *reason,
+            Err(termination) => termination.cause.session_end_reason(),
         };
         session.end(reason).await;
     }
     let _ = upstream_write.shutdown().await;
     let _ = client_write.shutdown().await;
-    result
+    result.map(|_| ()).map_err(|termination| termination.error)
 }
 
 async fn relay_client_to_server<R, W>(
@@ -138,7 +215,7 @@ async fn relay_client_to_server<R, W>(
     host: &str,
     port: u16,
     options: &mut RelayOptions<'_>,
-) -> Result<()>
+) -> WebSocketRelayResult<openshell_core::proto::WebSocketSessionEndReason>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -146,33 +223,45 @@ where
     let mut fragments = FragmentState::None;
     let mut fragment_count = 0usize;
     let mut close_seen = false;
-
     loop {
-        let Some(frame) = read_frame_header(reader).await.inspect_err(|e| {
-            emit_protocol_failure(host, port, options.policy_name, protocol_failure_class(e));
-        })?
+        let Some(frame) = read_frame_header(reader)
+            .await
+            .inspect_err(|e| {
+                emit_protocol_failure(host, port, options.policy_name, protocol_failure_class(e));
+            })
+            .map_err(|error| terminate(WebSocketTerminationCause::ProtocolError, error))?
         else {
-            writer.shutdown().await.into_diagnostic()?;
-            return Ok(());
+            let _ = writer.shutdown().await;
+            return Ok(if close_seen {
+                openshell_core::proto::WebSocketSessionEndReason::NormalClose
+            } else {
+                openshell_core::proto::WebSocketSessionEndReason::PeerDisconnect
+            });
         };
 
         if close_seen {
-            let e = miette!("websocket frame received after close frame");
-            emit_protocol_failure(host, port, options.policy_name, protocol_failure_class(&e));
-            return Err(e);
+            let error = miette!("websocket frame received after close frame");
+            emit_protocol_failure(
+                host,
+                port,
+                options.policy_name,
+                protocol_failure_class(&error),
+            );
+            return Err(terminate(WebSocketTerminationCause::ProtocolError, error));
         }
 
         if let Err(e) = validate_frame_header(&frame, &fragments, options.compression) {
             emit_protocol_failure(host, port, options.policy_name, protocol_failure_class(&e));
-            return Err(e);
+            return Err(terminate(WebSocketTerminationCause::ProtocolError, e));
         }
         if matches!(frame.opcode, OPCODE_TEXT | OPCODE_BINARY) && !frame.fin {
             fragment_count = 1;
         } else if frame.opcode == OPCODE_CONTINUATION {
             fragment_count = fragment_count.saturating_add(1);
             if fragment_count > MAX_MESSAGE_FRAGMENTS {
-                return Err(miette!(
-                    "websocket message exceeds {MAX_MESSAGE_FRAGMENTS} fragment limit"
+                return Err(terminate(
+                    WebSocketTerminationCause::ProtocolError,
+                    miette!("websocket message exceeds {MAX_MESSAGE_FRAGMENTS} fragment limit"),
                 ));
             }
             if frame.fin {
@@ -182,19 +271,22 @@ where
 
         match frame.opcode {
             OPCODE_TEXT => {
-                let payload = read_masked_payload(reader, &frame).await.inspect_err(|e| {
-                    emit_protocol_failure(
-                        host,
-                        port,
-                        options.policy_name,
-                        protocol_failure_class(e),
-                    );
-                })?;
-                let compressed = frame.rsv == 0x40;
-                if frame.fin {
-                    relay_text_payload(
-                        writer, &frame, payload, false, compressed, host, port, options,
-                    )
+                if frame.payload_len > MAX_TEXT_MESSAGE_BYTES as u64 {
+                    return Err(terminate(
+                        WebSocketTerminationCause::MessageTooBig,
+                        miette!(
+                            "websocket text message exceeds {MAX_TEXT_MESSAGE_BYTES} byte limit"
+                        ),
+                    ));
+                }
+                let admission = if let Some(session) = options.middleware_session.as_ref() {
+                    Some(session.reserve_message().await.map_err(|error| {
+                        terminate(WebSocketTerminationCause::MiddlewareFailure, error)
+                    })?)
+                } else {
+                    None
+                };
+                let payload = read_masked_payload(reader, &frame)
                     .await
                     .inspect_err(|e| {
                         emit_protocol_failure(
@@ -203,11 +295,22 @@ where
                             options.policy_name,
                             protocol_failure_class(e),
                         );
+                    })
+                    .map_err(|error| terminate(WebSocketTerminationCause::ProtocolError, error))?;
+                let compressed = frame.rsv == 0x40;
+                if frame.fin {
+                    relay_text_payload(
+                        writer, &frame, payload, admission, false, compressed, host, port, options,
+                    )
+                    .await
+                    .inspect_err(|termination| {
+                        observe_termination(host, port, options.policy_name, termination);
                     })?;
                 } else {
                     fragments = FragmentState::Text {
                         payload,
                         compressed,
+                        admission,
                     };
                 }
             }
@@ -215,38 +318,17 @@ where
                 FragmentState::Text {
                     payload,
                     compressed,
+                    admission,
                 } => {
-                    let next = read_masked_payload(reader, &frame).await.inspect_err(|e| {
-                        emit_protocol_failure(
-                            host,
-                            port,
-                            options.policy_name,
-                            protocol_failure_class(e),
-                        );
-                    })?;
-                    if let Err(e) = append_text_fragment(payload, next) {
-                        emit_protocol_failure(
-                            host,
-                            port,
-                            options.policy_name,
-                            protocol_failure_class(&e),
-                        );
-                        return Err(e);
+                    if frame.payload_len > MAX_TEXT_MESSAGE_BYTES as u64 {
+                        return Err(terminate(
+                            WebSocketTerminationCause::MessageTooBig,
+                            miette!(
+                                "websocket text message exceeds {MAX_TEXT_MESSAGE_BYTES} byte limit"
+                            ),
+                        ));
                     }
-                    if frame.fin {
-                        let complete = std::mem::take(payload);
-                        let was_compressed = *compressed;
-                        fragments = FragmentState::None;
-                        relay_text_payload(
-                            writer,
-                            &frame,
-                            complete,
-                            true,
-                            was_compressed,
-                            host,
-                            port,
-                            options,
-                        )
+                    let next = read_masked_payload(reader, &frame)
                         .await
                         .inspect_err(|e| {
                             emit_protocol_failure(
@@ -255,6 +337,38 @@ where
                                 options.policy_name,
                                 protocol_failure_class(e),
                             );
+                        })
+                        .map_err(|error| {
+                            terminate(WebSocketTerminationCause::ProtocolError, error)
+                        })?;
+                    if let Err(e) = append_text_fragment(payload, next) {
+                        emit_protocol_failure(
+                            host,
+                            port,
+                            options.policy_name,
+                            protocol_failure_class(&e),
+                        );
+                        return Err(terminate(WebSocketTerminationCause::MessageTooBig, e));
+                    }
+                    if frame.fin {
+                        let complete = std::mem::take(payload);
+                        let was_compressed = *compressed;
+                        let admission = admission.take();
+                        fragments = FragmentState::None;
+                        relay_text_payload(
+                            writer,
+                            &frame,
+                            complete,
+                            admission,
+                            true,
+                            was_compressed,
+                            host,
+                            port,
+                            options,
+                        )
+                        .await
+                        .inspect_err(|termination| {
+                            observe_termination(host, port, options.policy_name, termination);
                         })?;
                     }
                 }
@@ -268,6 +382,9 @@ where
                                 options.policy_name,
                                 protocol_failure_class(e),
                             );
+                        })
+                        .map_err(|error| {
+                            terminate(WebSocketTerminationCause::PeerDisconnect, error)
                         })?;
                     if frame.fin {
                         fragments = FragmentState::None;
@@ -282,7 +399,7 @@ where
                         options.policy_name,
                         protocol_failure_class(&e),
                     );
-                    return Err(e);
+                    return Err(terminate(WebSocketTerminationCause::ProtocolError, e));
                 }
             },
             OPCODE_BINARY => {
@@ -298,7 +415,8 @@ where
                             options.policy_name,
                             protocol_failure_class(e),
                         );
-                    })?;
+                    })
+                    .map_err(|error| terminate(WebSocketTerminationCause::PeerDisconnect, error))?;
             }
             OPCODE_CLOSE | OPCODE_PING | OPCODE_PONG => {
                 relay_control_frame(reader, writer, &frame)
@@ -310,7 +428,8 @@ where
                             options.policy_name,
                             protocol_failure_class(e),
                         );
-                    })?;
+                    })
+                    .map_err(|error| terminate(WebSocketTerminationCause::PeerDisconnect, error))?;
                 if frame.opcode == OPCODE_CLOSE {
                     close_seen = true;
                 }
@@ -515,19 +634,31 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &FrameHeader,
     payload: Vec<u8>,
+    admission: Option<openshell_supervisor_middleware::MiddlewareAdmission>,
     force_reframe: bool,
     compressed: bool,
     host: &str,
     port: u16,
     options: &mut RelayOptions<'_>,
-) -> Result<()> {
+) -> WebSocketRelayResult<()> {
     let message_payload = if compressed {
-        decompress_permessage_deflate(&payload)?
+        decompress_permessage_deflate(&payload).map_err(|error| match error {
+            WebSocketDecompressionError::MessageTooBig(error) => {
+                terminate(WebSocketTerminationCause::MessageTooBig, error)
+            }
+            WebSocketDecompressionError::Protocol(error) => {
+                terminate(WebSocketTerminationCause::ProtocolError, error)
+            }
+        })?
     } else {
         payload
     };
-    let mut text = String::from_utf8(message_payload)
-        .map_err(|_| miette!("websocket text message is not valid UTF-8"))?;
+    let mut text = String::from_utf8(message_payload).map_err(|_| {
+        terminate(
+            WebSocketTerminationCause::InvalidUtf8,
+            miette!("websocket text message is not valid UTF-8"),
+        )
+    })?;
 
     // Built-in transport/GraphQL inspection sees the original unresolved
     // message. External transformations run next, then policy is re-evaluated
@@ -538,24 +669,39 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
 
     let mut middleware_transformed = false;
     if let Some(session) = options.middleware_session.as_mut() {
-        let outcome = session.evaluate_text(text.into_bytes()).await;
+        let outcome = session
+            .evaluate_text_admitted(text.into_bytes(), admission)
+            .await;
         if let Some(ctx) = options.middleware_context {
             crate::l7::middleware::emit_websocket_message_events(ctx, &outcome);
         }
         if !outcome.allowed {
             if outcome.platform_oversize {
-                return Err(miette!(
-                    "websocket message over middleware platform capacity"
+                return Err(terminate(
+                    WebSocketTerminationCause::MessageTooBig,
+                    miette!("websocket message over middleware platform capacity"),
                 ));
             }
-            return Err(miette!("websocket middleware denied message"));
+            let cause = if outcome.denial.is_some() {
+                WebSocketTerminationCause::MiddlewareDenial
+            } else {
+                WebSocketTerminationCause::MiddlewareFailure
+            };
+            return Err(terminate(
+                cause,
+                miette!("websocket middleware denied message: {}", outcome.reason),
+            ));
         }
         middleware_transformed = outcome
             .invocations
             .iter()
             .any(|invocation| invocation.transformed);
-        text = String::from_utf8(outcome.payload)
-            .map_err(|_| miette!("websocket middleware returned invalid UTF-8"))?;
+        text = String::from_utf8(outcome.payload).map_err(|_| {
+            terminate(
+                WebSocketTerminationCause::MiddlewareFailure,
+                miette!("websocket middleware returned invalid UTF-8"),
+            )
+        })?;
     }
 
     if middleware_transformed && let Some(inspector) = options.inspector.as_ref() {
@@ -565,23 +711,43 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     let replacements = if let Some(resolver) = options.resolver {
         resolver
             .rewrite_websocket_text_placeholders(&mut text)
-            .map_err(|_| miette!("websocket credential placeholder resolution failed"))?
+            .map_err(|_| {
+                terminate(
+                    WebSocketTerminationCause::MiddlewareFailure,
+                    miette!("websocket credential placeholder resolution failed"),
+                )
+            })?
     } else {
         0
     };
 
     if replacements == 0 && !middleware_transformed && !force_reframe && !compressed {
-        writer
-            .write_all(&frame.raw_header)
-            .await
-            .into_diagnostic()?;
+        writer.write_all(&frame.raw_header).await.map_err(|error| {
+            terminate(
+                WebSocketTerminationCause::PeerDisconnect,
+                miette!("websocket upstream write failed: {error}"),
+            )
+        })?;
         let mut payload = text.into_bytes();
-        let mask_key = frame
-            .mask_key
-            .ok_or_else(|| miette!("websocket client frame is not masked"))?;
+        let mask_key = frame.mask_key.ok_or_else(|| {
+            terminate(
+                WebSocketTerminationCause::ProtocolError,
+                miette!("websocket client frame is not masked"),
+            )
+        })?;
         apply_mask(&mut payload, mask_key);
-        writer.write_all(&payload).await.into_diagnostic()?;
-        writer.flush().await.into_diagnostic()?;
+        writer.write_all(&payload).await.map_err(|error| {
+            terminate(
+                WebSocketTerminationCause::PeerDisconnect,
+                miette!("websocket upstream write failed: {error}"),
+            )
+        })?;
+        writer.flush().await.map_err(|error| {
+            terminate(
+                WebSocketTerminationCause::PeerDisconnect,
+                miette!("websocket upstream flush failed: {error}"),
+            )
+        })?;
         return Ok(());
     }
 
@@ -589,10 +755,15 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
         emit_rewrite_event(host, port, options.policy_name, replacements);
     }
     if compressed {
-        let compressed_payload = compress_permessage_deflate(text.as_bytes())?;
-        return write_masked_frame_with_rsv(writer, OPCODE_TEXT, 0x40, &compressed_payload).await;
+        let compressed_payload = compress_permessage_deflate(text.as_bytes())
+            .map_err(|error| terminate(WebSocketTerminationCause::ProtocolError, error))?;
+        return write_masked_frame_with_rsv(writer, OPCODE_TEXT, 0x40, &compressed_payload)
+            .await
+            .map_err(|error| terminate(WebSocketTerminationCause::PeerDisconnect, error));
     }
-    write_masked_frame(writer, OPCODE_TEXT, text.as_bytes()).await
+    write_masked_frame(writer, OPCODE_TEXT, text.as_bytes())
+        .await
+        .map_err(|error| terminate(WebSocketTerminationCause::PeerDisconnect, error))
 }
 
 fn inspect_websocket_text_message(
@@ -601,7 +772,7 @@ fn inspect_websocket_text_message(
     policy_name: &str,
     inspector: &InspectionOptions<'_>,
     text: &str,
-) -> Result<()> {
+) -> WebSocketRelayResult<()> {
     if inspector.graphql_policy {
         return inspect_graphql_websocket_message(host, port, policy_name, inspector, text);
     }
@@ -613,7 +784,8 @@ fn inspect_websocket_text_message(
         graphql: None,
         jsonrpc: None,
     };
-    let (allowed, reason) = evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)?;
+    let (allowed, reason) = evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)
+        .map_err(|error| terminate(WebSocketTerminationCause::PolicyReload, error))?;
     let decision = match (allowed, inspector.enforcement) {
         (true, _) => "allow",
         (false, EnforcementMode::Audit) => "audit",
@@ -629,7 +801,10 @@ fn inspect_websocket_text_message(
         None,
     );
     if !allowed && inspector.enforcement == EnforcementMode::Enforce {
-        return Err(miette!("websocket text message denied by policy"));
+        return Err(terminate(
+            WebSocketTerminationCause::PolicyDenial,
+            miette!("websocket text message denied by policy"),
+        ));
     }
     Ok(())
 }
@@ -640,7 +815,7 @@ fn inspect_graphql_websocket_message(
     policy_name: &str,
     inspector: &InspectionOptions<'_>,
     text: &str,
-) -> Result<()> {
+) -> WebSocketRelayResult<()> {
     match classify_graphql_websocket_message(text) {
         GraphqlWebSocketMessage::Control { message_type } => {
             let request_info = L7RequestInfo {
@@ -680,7 +855,8 @@ fn inspect_graphql_websocket_message(
             let (allowed, reason) = if let Some(reason) = parse_error_reason {
                 (false, reason)
             } else {
-                evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)?
+                evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)
+                    .map_err(|error| terminate(WebSocketTerminationCause::PolicyReload, error))?
             };
             let decision = match (allowed, inspector.enforcement) {
                 (_, _) if force_deny => "deny",
@@ -699,7 +875,10 @@ fn inspect_graphql_websocket_message(
                 Some(&graphql),
             );
             if (!allowed && inspector.enforcement == EnforcementMode::Enforce) || force_deny {
-                return Err(miette!("websocket GraphQL message denied by policy"));
+                return Err(terminate(
+                    WebSocketTerminationCause::PolicyDenial,
+                    miette!("websocket GraphQL message denied by policy"),
+                ));
             }
             Ok(())
         }
@@ -943,7 +1122,9 @@ async fn write_masked_frame_with_rsv<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-fn decompress_permessage_deflate(payload: &[u8]) -> Result<Vec<u8>> {
+fn decompress_permessage_deflate(
+    payload: &[u8],
+) -> std::result::Result<Vec<u8>, WebSocketDecompressionError> {
     let mut decoder = Decompress::new(false);
     let mut input = Vec::with_capacity(payload.len() + 4);
     input.extend_from_slice(payload);
@@ -956,18 +1137,30 @@ fn decompress_permessage_deflate(payload: &[u8]) -> Result<Vec<u8>> {
         let before_out = decoder.total_out();
         let status = decoder
             .decompress(&input[input_pos..], &mut scratch, FlushDecompress::Sync)
-            .map_err(|e| miette!("websocket permessage-deflate decompression failed: {e}"))?;
-        let read = usize::try_from(decoder.total_in() - before_in)
-            .map_err(|_| miette!("websocket permessage-deflate input length overflow"))?;
-        let written = usize::try_from(decoder.total_out() - before_out)
-            .map_err(|_| miette!("websocket permessage-deflate output length overflow"))?;
-        input_pos = input_pos
-            .checked_add(read)
-            .ok_or_else(|| miette!("websocket permessage-deflate input length overflow"))?;
+            .map_err(|e| {
+                WebSocketDecompressionError::Protocol(miette!(
+                    "websocket permessage-deflate decompression failed: {e}"
+                ))
+            })?;
+        let read = usize::try_from(decoder.total_in() - before_in).map_err(|_| {
+            WebSocketDecompressionError::Protocol(miette!(
+                "websocket permessage-deflate input length overflow"
+            ))
+        })?;
+        let written = usize::try_from(decoder.total_out() - before_out).map_err(|_| {
+            WebSocketDecompressionError::Protocol(miette!(
+                "websocket permessage-deflate output length overflow"
+            ))
+        })?;
+        input_pos = input_pos.checked_add(read).ok_or_else(|| {
+            WebSocketDecompressionError::Protocol(miette!(
+                "websocket permessage-deflate input length overflow"
+            ))
+        })?;
         if out.len().saturating_add(written) > MAX_TEXT_MESSAGE_BYTES {
-            return Err(miette!(
+            return Err(WebSocketDecompressionError::MessageTooBig(miette!(
                 "websocket text message exceeds {MAX_TEXT_MESSAGE_BYTES} byte limit"
-            ));
+            )));
         }
         out.extend_from_slice(&scratch[..written]);
         if matches!(status, Status::StreamEnd) {
@@ -977,9 +1170,9 @@ fn decompress_permessage_deflate(payload: &[u8]) -> Result<Vec<u8>> {
             break;
         }
         if read == 0 && written == 0 {
-            return Err(miette!(
+            return Err(WebSocketDecompressionError::Protocol(miette!(
                 "websocket permessage-deflate decompression did not make progress"
-            ));
+            )));
         }
     }
     Ok(out)
@@ -1169,21 +1362,24 @@ fn protocol_failure_class(error: &miette::Report) -> &'static str {
     }
 }
 
-fn websocket_close_code(error: &miette::Report) -> u16 {
-    let message = error.to_string().to_ascii_lowercase();
-    if message.contains("middleware denied") || message.contains("denied by policy") {
-        1008
-    } else if message.contains("fragment limit") {
-        1002
-    } else if message.contains("capacity")
-        || message.contains("too large")
-        || message.contains("exceeds")
-    {
-        1009
-    } else if message.contains("stale") {
-        1012
-    } else {
-        1002
+fn observe_termination(
+    host: &str,
+    port: u16,
+    policy_name: &str,
+    termination: &WebSocketTermination,
+) {
+    if matches!(
+        termination.cause,
+        WebSocketTerminationCause::InvalidUtf8
+            | WebSocketTerminationCause::ProtocolError
+            | WebSocketTerminationCause::MessageTooBig
+    ) {
+        emit_protocol_failure(
+            host,
+            port,
+            policy_name,
+            protocol_failure_class(&termination.error),
+        );
     }
 }
 
@@ -1249,6 +1445,50 @@ network_policies:
     binaries:
       - { path: /usr/bin/node }
 "#;
+
+    #[test]
+    fn termination_causes_map_to_protocol_close_codes_and_session_reasons() {
+        use openshell_core::proto::WebSocketSessionEndReason as EndReason;
+
+        assert_eq!(
+            WebSocketTerminationCause::InvalidUtf8.close_code(),
+            Some(1007)
+        );
+        assert_eq!(
+            WebSocketTerminationCause::ProtocolError.close_code(),
+            Some(1002)
+        );
+        assert_eq!(
+            WebSocketTerminationCause::MessageTooBig.close_code(),
+            Some(1009)
+        );
+        assert_eq!(
+            WebSocketTerminationCause::MiddlewareDenial.close_code(),
+            Some(1008)
+        );
+        assert_eq!(
+            WebSocketTerminationCause::PolicyReload.close_code(),
+            Some(1012)
+        );
+        assert_eq!(WebSocketTerminationCause::PeerDisconnect.close_code(), None);
+
+        assert_eq!(
+            WebSocketTerminationCause::InvalidUtf8.session_end_reason(),
+            EndReason::ProtocolError
+        );
+        assert_eq!(
+            WebSocketTerminationCause::MiddlewareDenial.session_end_reason(),
+            EndReason::MiddlewareDenial
+        );
+        assert_eq!(
+            WebSocketTerminationCause::MiddlewareFailure.session_end_reason(),
+            EndReason::MiddlewareFailure
+        );
+        assert_eq!(
+            WebSocketTerminationCause::PolicyReload.session_end_reason(),
+            EndReason::PolicyReload
+        );
+    }
 
     fn resolver() -> (HashMap<String, String>, SecretResolver) {
         let (child_env, resolver) = SecretResolver::from_provider_env(
@@ -1356,7 +1596,9 @@ network_policies:
 
         let mut output = Vec::new();
         upstream_read.read_to_end(&mut output).await.unwrap();
-        result.map(|()| output)
+        result
+            .map(|_| output)
+            .map_err(|termination| termination.error)
     }
 
     async fn run_client_to_server_with_graphql_policy(
@@ -1423,7 +1665,9 @@ network_policies:
 
         let mut output = Vec::new();
         upstream_read.read_to_end(&mut output).await.unwrap();
-        result.map(|()| output)
+        result
+            .map(|_| output)
+            .map_err(|termination| termination.error)
     }
 
     async fn run_client_to_server_compressed(input: Vec<u8>) -> Result<Vec<u8>> {
@@ -1454,7 +1698,9 @@ network_policies:
 
         let mut output = Vec::new();
         upstream_read.read_to_end(&mut output).await.unwrap();
-        result.map(|()| output)
+        result
+            .map(|_| output)
+            .map_err(|termination| termination.error)
     }
 
     fn decode_masked_text_frame(frame: &[u8]) -> String {

@@ -59,16 +59,15 @@ impl RemoteMiddlewareService {
     pub async fn open_websocket(
         &self,
         receiver: tokio::sync::mpsc::Receiver<WebSocketEvaluationRequest>,
-        timeout: Duration,
     ) -> std::result::Result<
         tonic::Streaming<openshell_core::proto::WebSocketEvaluationResponse>,
         Status,
     > {
         let mut client = self.client.clone();
-        let mut request = Request::new(tokio_stream::wrappers::ReceiverStream::new(receiver));
-        request.set_timeout(timeout);
         client
-            .evaluate_web_socket(request)
+            .evaluate_web_socket(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
             .await
             .map(Response::into_inner)
     }

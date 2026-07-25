@@ -31,7 +31,7 @@ use openshell_core::proto::{
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
     ValidateConfigRequest,
 };
-use tokio::sync::{OnceCell, Semaphore};
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::Request;
 
 /// Concrete response stream used by object-safe middleware service handles.
@@ -48,6 +48,24 @@ pub type WebSocketResponseStream = Pin<
 >;
 type MiddlewareService =
     dyn SupervisorMiddleware<EvaluateWebSocketStream = WebSocketResponseStream>;
+
+const MAX_QUEUED_MIDDLEWARE_WORK: usize = MAX_CONCURRENT_MIDDLEWARE_WORK;
+
+/// One slot in the shared middleware work budget.
+///
+/// Callers that buffer request or message bodies acquire this guard first and
+/// retain it through evaluation, bounding aggregate buffered middleware input.
+#[derive(Debug)]
+pub struct MiddlewareAdmission {
+    _work: OwnedSemaphorePermit,
+    saturated: bool,
+}
+
+impl MiddlewareAdmission {
+    pub fn saturated(&self) -> bool {
+        self.saturated
+    }
+}
 
 pub use openshell_core::middleware::{
     DEFAULT_MIDDLEWARE_TIMEOUT, MAX_CONCURRENT_MIDDLEWARE_WORK, MAX_MIDDLEWARE_CHAIN_FINDINGS,
@@ -408,6 +426,7 @@ pub struct MiddlewareRegistry {
     registered_services: Arc<Vec<RegisteredMiddlewareService>>,
     middleware_names: Arc<HashSet<String>>,
     admission: Arc<Semaphore>,
+    admission_waiters: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for MiddlewareRegistry {
@@ -437,6 +456,7 @@ impl Default for MiddlewareRegistry {
             registered_services: Arc::new(Vec::new()),
             middleware_names: Arc::new(HashSet::new()),
             admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
+            admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
         }
     }
 }
@@ -875,6 +895,7 @@ impl MiddlewareRegistry {
             registered_services: Arc::new(registered_services),
             middleware_names: Arc::new(middleware_names),
             admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
+            admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
         })
     }
 
@@ -958,6 +979,7 @@ impl ChainRunner {
                 registered_services: Arc::new(Vec::new()),
                 middleware_names: Arc::new(HashSet::new()),
                 admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
+                admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             }),
         }
     }
@@ -1169,6 +1191,29 @@ impl ChainRunner {
         input: HttpRequestInput,
         transformed_body_policy: TransformedBodyPolicy<'_>,
     ) -> Result<ChainOutcome> {
+        let admission = if entries.is_empty() {
+            None
+        } else {
+            Some(self.reserve_middleware_work().await?)
+        };
+        self.evaluate_described_with_policy_admitted(
+            entries,
+            input,
+            transformed_body_policy,
+            admission,
+        )
+        .await
+    }
+
+    /// Evaluate a chain using capacity reserved before its request body was
+    /// buffered. The guard is retained until the ordered chain completes.
+    pub async fn evaluate_described_with_policy_admitted(
+        &self,
+        entries: &[DescribedChainEntry],
+        input: HttpRequestInput,
+        transformed_body_policy: TransformedBodyPolicy<'_>,
+        admission: Option<MiddlewareAdmission>,
+    ) -> Result<ChainOutcome> {
         ensure_chain_capacity(entries.len())?;
         let mut headers = input.headers.clone();
         let mut body = input.body.clone();
@@ -1176,13 +1221,7 @@ impl ChainRunner {
         let mut findings = Vec::new();
         let mut metadata = BTreeMap::new();
         let mut applied = Vec::new();
-        // One shared permit covers the whole ordered chain. Waiting is
-        // intentional backpressure and is excluded from the chain deadline.
-        let _permit = if entries.is_empty() {
-            None
-        } else {
-            Some(self.admit_middleware_work().await.0)
-        };
+        let _admission = admission;
         let chain_deadline = tokio::time::Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
 
         for entry in entries {
@@ -2550,6 +2589,7 @@ mod tests {
             registered_services: Arc::new(vec![RegisteredMiddlewareService { registration }]),
             middleware_names: Arc::new(HashSet::from([builtin_name, registration_name])),
             admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
+            admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
         }
     }
 
@@ -3755,6 +3795,7 @@ mod tests {
     struct OpenAiRedactionService {
         preflight: Arc<std::sync::Mutex<Option<openshell_core::proto::WebSocketPreflight>>>,
         skip: bool,
+        close_on_first_message: bool,
         messages: Arc<std::sync::atomic::AtomicUsize>,
     }
 
@@ -3820,6 +3861,7 @@ mod tests {
             let mut requests = request.into_inner();
             let preflight = Arc::clone(&self.preflight);
             let skip = self.skip;
+            let close_on_first_message = self.close_on_first_message;
             let messages = Arc::clone(&self.messages);
             let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
@@ -3843,6 +3885,9 @@ mod tests {
                         }
                         Some(web_socket_evaluation_request::Request::Message(value)) => {
                             messages.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if close_on_first_message {
+                                break;
+                            }
                             let payload = String::from_utf8(value.payload)
                                 .expect("test OpenAI event must be UTF-8")
                                 .replace("customer-secret", "[REDACTED]");
@@ -3953,6 +3998,134 @@ mod tests {
             .await
             .expect("join test middleware")
             .expect("serve middleware");
+    }
+
+    #[tokio::test]
+    async fn fail_open_disables_broken_websocket_stage_for_later_messages() {
+        let service = OpenAiRedactionService {
+            close_on_first_message: true,
+            ..Default::default()
+        };
+        let observed_preflight = Arc::clone(&service.preflight);
+        let message_count = Arc::clone(&service.messages);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind WebSocket middleware");
+        let address = listener.local_addr().expect("middleware address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tonic::transport::Server::builder()
+            .add_service(SupervisorMiddlewareServer::new(service))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let server_task = tokio::spawn(server);
+
+        let mut registration = external_registration(0);
+        registration.grpc_endpoint = format!("http://{address}");
+        let registry = MiddlewareRegistry::connect_services(Vec::new(), vec![registration])
+            .await
+            .expect("connect WebSocket middleware");
+        let runner = ChainRunner::from_registry(registry);
+        let chain = [ChainEntry {
+            name: "openai-redactor".into(),
+            implementation: "local-guard-service".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailOpen,
+        }];
+        let preflight = runner
+            .preflight_websocket(
+                &chain,
+                WebSocketPreflightInput {
+                    session_id: "ws-session".into(),
+                    request_id: "request".into(),
+                    sandbox_id: "sandbox".into(),
+                    scheme: "ws".into(),
+                    host: "api.openai.com".into(),
+                    port: 80,
+                    path: "/v1/responses".into(),
+                    requested_subprotocols: Vec::new(),
+                },
+            )
+            .await
+            .expect("preflight");
+        let mut session = preflight.session.expect("middleware chose to inspect");
+        assert!(session.start("").await.allowed);
+        assert_eq!(
+            observed_preflight
+                .lock()
+                .expect("preflight lock")
+                .as_ref()
+                .expect("preflight observed")
+                .scheme,
+            "ws"
+        );
+
+        let first = session
+            .evaluate_text(br#"{"type":"response.create"}"#.to_vec())
+            .await;
+        assert!(first.allowed, "fail-open should bypass the broken stage");
+        assert_eq!(first.invocations.len(), 1);
+        assert!(first.invocations[0].failed);
+        assert!(first.invocations[0].stage_disabled);
+
+        let second = session
+            .evaluate_text(br#"{"type":"response.cancel"}"#.to_vec())
+            .await;
+        assert!(second.allowed);
+        assert!(
+            second.invocations.is_empty(),
+            "disabled stage must not be called again in this session"
+        );
+        assert_eq!(message_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        session
+            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .await;
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join test middleware")
+            .expect("serve middleware");
+    }
+
+    #[tokio::test]
+    async fn websocket_admission_wait_queue_is_bounded() {
+        let runner = ChainRunner::default();
+        let mut active = Vec::new();
+        for _ in 0..MAX_CONCURRENT_MIDDLEWARE_WORK {
+            active.push(
+                runner
+                    .reserve_middleware_work()
+                    .await
+                    .expect("active admission"),
+            );
+        }
+
+        let mut waiters = Vec::new();
+        for _ in 0..MAX_QUEUED_MIDDLEWARE_WORK {
+            let runner = runner.clone();
+            waiters.push(tokio::spawn(async move {
+                runner.reserve_middleware_work().await
+            }));
+        }
+        while runner.registry.admission_waiters.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let overflow = runner
+            .reserve_middleware_work()
+            .await
+            .expect_err("work beyond the bounded waiter queue must be shed");
+        assert!(overflow.to_string().contains("admission queue is full"));
+
+        drop(active);
+        for waiter in waiters {
+            waiter
+                .await
+                .expect("waiter task")
+                .expect("queued admission after capacity is released");
+        }
     }
 
     #[tokio::test]

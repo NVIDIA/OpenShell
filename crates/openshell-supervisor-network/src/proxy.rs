@@ -4915,6 +4915,7 @@ async fn handle_forward_proxy(
         .await?;
         return Ok(());
     }
+    let websocket_chain = forward_websocket_request.then(|| chain.clone());
     if !chain.is_empty() {
         let middleware_runner = opa_engine.middleware_runner()?;
         let request = crate::l7::rest::request_from_buffered_http(
@@ -4951,6 +4952,58 @@ async fn handle_forward_proxy(
             }
         };
     }
+
+    let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
+        let request = crate::l7::rest::request_from_buffered_http(
+            method,
+            middleware_path,
+            &upstream_target,
+            forward_request_bytes.clone(),
+        )?;
+        let middleware_runner = opa_engine.middleware_runner()?;
+        let preflight = crate::l7::relay::websocket_middleware_preflight(
+            &request,
+            chain,
+            &middleware_runner,
+            &l7_ctx,
+            "ws",
+        )
+        .await;
+        let preflight = match preflight {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                warn!(error = %error, "Plaintext WebSocket middleware preflight failed");
+                respond(
+                    client,
+                    &build_json_error_response(
+                        502,
+                        "Bad Gateway",
+                        "middleware_failed",
+                        "WebSocket middleware preflight failed",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        crate::l7::middleware::emit_websocket_preflight_events(&l7_ctx, &preflight);
+        if !preflight.allowed {
+            respond(
+                client,
+                &build_json_error_response(
+                    502,
+                    "Bad Gateway",
+                    "middleware_failed",
+                    "WebSocket middleware preflight denied the upgrade",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        preflight.session
+    } else {
+        None
+    };
 
     forward_request_bytes = match inject_token_grant_for_forward_request(
         method,
@@ -5077,40 +5130,53 @@ async fn handle_forward_proxy(
     }
     emit_forward_success_activity(activity_tx, l7_activity_pending);
 
-    if let crate::l7::provider::RelayOutcome::Upgraded {
-        overflow,
-        websocket_permessage_deflate,
-        ..
-    } = outcome
-    {
-        let mut upgrade_options = if let (Some(config), Some(engine)) = (
-            forward_upgrade_config.as_ref(),
-            forward_tunnel_engine.as_ref(),
-        ) {
-            crate::l7::relay::upgrade_options(
-                config,
-                &l7_ctx,
-                forward_websocket_request,
-                &forward_upgrade_target,
-                &forward_upgrade_query_params,
-                Some(engine),
-            )
-        } else {
-            crate::l7::relay::UpgradeRelayOptions {
-                websocket_request: forward_websocket_request,
-                ..Default::default()
+    match outcome {
+        crate::l7::provider::RelayOutcome::Reusable
+        | crate::l7::provider::RelayOutcome::Consumed => {
+            if let Some(session) = middleware_session.take() {
+                session
+                    .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                    .await;
             }
-        };
-        upgrade_options.websocket.permessage_deflate = websocket_permessage_deflate;
-        crate::l7::relay::handle_upgrade(
-            client,
-            &mut upstream,
+        }
+        crate::l7::provider::RelayOutcome::Upgraded {
             overflow,
-            &host_lc,
-            port,
-            upgrade_options,
-        )
-        .await?;
+            websocket_permessage_deflate,
+            websocket_subprotocol,
+        } => {
+            let mut upgrade_options = if let (Some(config), Some(engine)) = (
+                forward_upgrade_config.as_ref(),
+                forward_tunnel_engine.as_ref(),
+            ) {
+                crate::l7::relay::upgrade_options(
+                    config,
+                    &l7_ctx,
+                    forward_websocket_request,
+                    &forward_upgrade_target,
+                    &forward_upgrade_query_params,
+                    Some(engine),
+                )
+            } else {
+                crate::l7::relay::UpgradeRelayOptions {
+                    websocket_request: forward_websocket_request,
+                    ctx: Some(&l7_ctx),
+                    policy_name: l7_ctx.policy_name.clone(),
+                    ..Default::default()
+                }
+            };
+            upgrade_options.websocket.permessage_deflate = websocket_permessage_deflate;
+            upgrade_options.middleware_session = middleware_session.take();
+            upgrade_options.selected_subprotocol = websocket_subprotocol;
+            crate::l7::relay::handle_upgrade(
+                client,
+                &mut upstream,
+                overflow,
+                &host_lc,
+                port,
+                upgrade_options,
+            )
+            .await?;
+        }
     }
 
     Ok(())

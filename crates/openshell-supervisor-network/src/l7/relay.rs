@@ -510,7 +510,14 @@ where
                 }
             };
             let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
-                let preflight = websocket_middleware_preflight(&req, chain, &engine, ctx).await;
+                let preflight = websocket_middleware_preflight(
+                    &req,
+                    chain,
+                    engine.middleware_runner(),
+                    ctx,
+                    "wss",
+                )
+                .await;
                 let preflight = match preflight {
                     Ok(preflight) => preflight,
                     Err(error) => {
@@ -677,11 +684,12 @@ fn emit_activity(ctx: &L7EvalContext, denied: bool, deny_group: &'static str) {
     }
 }
 
-async fn websocket_middleware_preflight(
+pub(crate) async fn websocket_middleware_preflight(
     req: &crate::l7::provider::L7Request,
     chain: &[openshell_supervisor_middleware::ChainEntry],
-    engine: &TunnelPolicyEngine,
+    runner: &openshell_supervisor_middleware::ChainRunner,
     ctx: &L7EvalContext,
+    scheme: &str,
 ) -> Result<openshell_supervisor_middleware::WebSocketPreflightResult> {
     let header_end = req
         .raw_header
@@ -690,15 +698,14 @@ async fn websocket_middleware_preflight(
         .map_or(req.raw_header.len(), |position| position + 4);
     let requested_subprotocols =
         crate::l7::rest::websocket_requested_subprotocols(&req.raw_header[..header_end])?;
-    engine
-        .middleware_runner()
+    runner
         .preflight_websocket(
             chain,
             openshell_supervisor_middleware::WebSocketPreflightInput {
                 session_id: uuid::Uuid::new_v4().to_string(),
                 request_id: uuid::Uuid::new_v4().to_string(),
                 sandbox_id: openshell_ocsf::ctx::ctx().sandbox_id.clone(),
-                scheme: "wss".to_string(),
+                scheme: scheme.to_string(),
                 host: ctx.host.clone(),
                 port: ctx.port,
                 path: req.target.clone(),
@@ -1104,8 +1111,14 @@ where
                     }
                 };
             let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
-                let preflight =
-                    websocket_middleware_preflight(&req_with_auth, chain, engine, ctx).await;
+                let preflight = websocket_middleware_preflight(
+                    &req_with_auth,
+                    chain,
+                    engine.middleware_runner(),
+                    ctx,
+                    "wss",
+                )
+                .await;
                 let preflight = match preflight {
                     Ok(preflight) => preflight,
                     Err(error) => {

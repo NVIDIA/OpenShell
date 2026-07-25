@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use futures::future::join_all;
 use prost::Message as _;
-use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use openshell_core::proto::{
@@ -32,11 +32,6 @@ const STREAM_CHANNEL_CAPACITY: usize = 4;
 const MAX_REQUESTED_SUBPROTOCOLS: usize = 32;
 const MAX_SUBPROTOCOL_BYTES: usize = 4 * 1024;
 const MAX_SELECTED_SUBPROTOCOL_BYTES: usize = 256;
-// OpenAI currently caps WebSocket mode connections at 60 minutes. Give the
-// stream a bounded lifetime just beyond that while local per-message deadlines
-// remain substantially shorter.
-const WEBSOCKET_STREAM_TIMEOUT: Duration = Duration::from_secs(61 * 60);
-
 #[derive(Debug, Clone)]
 pub struct WebSocketPreflightInput {
     pub session_id: String,
@@ -70,6 +65,9 @@ pub struct WebSocketInvocation {
     pub replacement_size: Option<usize>,
     pub transformed: bool,
     pub failed: bool,
+    /// The stage stream became unusable and will be bypassed for the rest of
+    /// this session when its policy is `fail_open`.
+    pub stage_disabled: bool,
     pub reason_code: Option<String>,
 }
 
@@ -121,16 +119,29 @@ enum OpenStage {
 }
 
 impl ChainRunner {
-    pub(super) async fn admit_middleware_work(&self) -> (OwnedSemaphorePermit, bool) {
-        match Arc::clone(&self.registry.admission).try_acquire_owned() {
-            Ok(permit) => (permit, false),
-            Err(_) => (
-                Arc::clone(&self.registry.admission)
-                    .acquire_owned()
-                    .await
-                    .expect("middleware admission semaphore is never closed"),
-                true,
-            ),
+    pub async fn reserve_middleware_work(&self) -> miette::Result<super::MiddlewareAdmission> {
+        if let Ok(permit) = Arc::clone(&self.registry.admission).try_acquire_owned() {
+            Ok(super::MiddlewareAdmission {
+                _work: permit,
+                saturated: false,
+            })
+        } else {
+            let waiter = Arc::clone(&self.registry.admission_waiters)
+                .try_acquire_owned()
+                .map_err(|_| {
+                    miette::miette!(
+                        "middleware admission queue is full; refusing additional buffered work"
+                    )
+                })?;
+            let permit = Arc::clone(&self.registry.admission)
+                .acquire_owned()
+                .await
+                .map_err(|_| miette::miette!("middleware admission semaphore closed"))?;
+            drop(waiter);
+            Ok(super::MiddlewareAdmission {
+                _work: permit,
+                saturated: true,
+            })
         }
     }
 
@@ -153,7 +164,8 @@ impl ChainRunner {
 
         // One permit covers the complete concurrent preflight fan-out. Permit
         // wait is deliberate backpressure and is excluded from every deadline.
-        let (_permit, saturated) = self.admit_middleware_work().await;
+        let permit = self.reserve_middleware_work().await?;
+        let saturated = permit.saturated();
         let opened = join_all(
             described
                 .into_iter()
@@ -208,6 +220,10 @@ impl ChainRunner {
 }
 
 impl WebSocketSession {
+    pub async fn reserve_message(&self) -> miette::Result<super::MiddlewareAdmission> {
+        self.runner.reserve_middleware_work().await
+    }
+
     pub async fn start(&mut self, selected_subprotocol: &str) -> WebSocketSessionStartOutcome {
         if selected_subprotocol.len() > MAX_SELECTED_SUBPROTOCOL_BYTES {
             return WebSocketSessionStartOutcome {
@@ -233,7 +249,8 @@ impl WebSocketSession {
             if !matches!(sent, Ok(Ok(()))) {
                 stage.active = false;
                 let reason = "session_start_send_failed";
-                let invocation = failure_invocation(&stage.entry, None, 0, reason);
+                let mut invocation = failure_invocation(&stage.entry, None, 0, reason);
+                invocation.stage_disabled = true;
                 if stage.entry.entry.on_error == OnError::FailClosed {
                     fail_closed.get_or_insert_with(|| format!("middleware_failed: {reason}"));
                 }
@@ -248,6 +265,15 @@ impl WebSocketSession {
     }
 
     pub async fn evaluate_text(&mut self, payload: Vec<u8>) -> WebSocketMessageOutcome {
+        let admission = self.reserve_message().await.ok();
+        self.evaluate_text_admitted(payload, admission).await
+    }
+
+    pub async fn evaluate_text_admitted(
+        &mut self,
+        payload: Vec<u8>,
+        admission: Option<super::MiddlewareAdmission>,
+    ) -> WebSocketMessageOutcome {
         if payload.len() > MAX_MIDDLEWARE_BODY_BYTES {
             return WebSocketMessageOutcome {
                 allowed: false,
@@ -262,7 +288,20 @@ impl WebSocketSession {
             };
         }
 
-        let (_permit, saturated) = self.runner.admit_middleware_work().await;
+        let Some(permit) = admission else {
+            return WebSocketMessageOutcome {
+                allowed: false,
+                reason: "middleware_admission_over_capacity".to_string(),
+                payload,
+                findings: Vec::new(),
+                metadata: BTreeMap::new(),
+                invocations: Vec::new(),
+                denial: None,
+                saturated: true,
+                platform_oversize: false,
+            };
+        };
+        let saturated = permit.saturated();
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         let chain_deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
@@ -299,10 +338,11 @@ impl WebSocketSession {
             let remaining = chain_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 let reason = "middleware_chain_timeout";
-                let invocation =
+                let mut invocation =
                     failure_invocation(&stage.entry, Some(sequence), original_size, reason);
                 let fail_closed = stage.entry.entry.on_error == OnError::FailClosed;
                 stage.active = false;
+                invocation.stage_disabled = true;
                 invocations.push(invocation);
                 if fail_closed {
                     return denied_message_outcome(
@@ -538,9 +578,7 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
             })
             .await
             .map_err(|_| tonic::Status::unavailable("request stream closed"))?;
-        let mut responses = remote
-            .open_websocket(receiver, WEBSOCKET_STREAM_TIMEOUT)
-            .await?;
+        let mut responses = remote.open_websocket(receiver).await?;
         let response = responses.message().await?;
         Ok::<_, tonic::Status>((sender, responses, response))
     })
@@ -719,12 +757,9 @@ fn handle_stage_failure(
     saturated: bool,
 ) -> Option<WebSocketMessageOutcome> {
     stage.active = false;
-    invocations.push(failure_invocation(
-        &stage.entry,
-        Some(sequence),
-        original_size,
-        reason,
-    ));
+    let mut invocation = failure_invocation(&stage.entry, Some(sequence), original_size, reason);
+    invocation.stage_disabled = true;
+    invocations.push(invocation);
     (stage.entry.entry.on_error == OnError::FailClosed).then(|| {
         denied_message_outcome(
             current.to_vec(),
@@ -778,6 +813,7 @@ fn success_invocation(
         replacement_size,
         transformed,
         failed: false,
+        stage_disabled: false,
         reason_code,
     }
 }
@@ -801,6 +837,7 @@ fn failure_invocation(
         replacement_size: None,
         transformed: false,
         failed: true,
+        stage_disabled: false,
         reason_code: None,
     }
 }
