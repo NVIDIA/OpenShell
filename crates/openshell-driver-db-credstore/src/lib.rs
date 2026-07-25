@@ -235,7 +235,7 @@ impl DbCredstoreCredentialDriver {
             &request.credential_key,
         )?;
 
-        for attempt in 0..CONFLICT_RETRY_LIMIT {
+        for _attempt in 0..CONFLICT_RETRY_LIMIT {
             let record = self
                 .store
                 .get_credential_object(OBJECT_TYPE, &id, "load credential for deletion")
@@ -263,9 +263,7 @@ impl DbCredstoreCredentialDriver {
                 .await
             {
                 Ok(()) => return Ok(()),
-                Err(err)
-                    if err.code() == tonic::Code::Aborted && attempt + 1 < CONFLICT_RETRY_LIMIT => {
-                }
+                Err(err) if err.code() == tonic::Code::Aborted => {}
                 Err(err) => return Err(err),
             }
         }

@@ -199,7 +199,7 @@ impl KubernetesSecretsCredentialDriver {
         )?;
         let owner_id = credential_owner_id(&request.provider_name, &request.credential_key);
         let api: Api<Secret> = Api::namespaced(self.client.clone(), &reference.namespace);
-        for attempt in 0..CONFLICT_RETRY_LIMIT {
+        for _attempt in 0..CONFLICT_RETRY_LIMIT {
             let secret = match api.get(&reference.secret_name).await {
                 Ok(secret) => secret,
                 Err(kube::Error::Api(api_err)) if api_err.code == 404 => return Ok(()),
@@ -222,8 +222,7 @@ impl KubernetesSecretsCredentialDriver {
             match api.delete(&reference.secret_name, &delete_params).await {
                 Ok(_) => return Ok(()),
                 Err(kube::Error::Api(api_err)) if api_err.code == 404 => return Ok(()),
-                Err(kube::Error::Api(api_err))
-                    if api_err.code == 409 && attempt + 1 < CONFLICT_RETRY_LIMIT => {}
+                Err(kube::Error::Api(api_err)) if api_err.code == 409 => {}
                 Err(kube::Error::Api(api_err)) if api_err.code == 403 => {
                     return Err(Status::permission_denied(format!(
                         "gateway is not allowed to delete Kubernetes Secret '{}' in namespace '{}'",
@@ -298,7 +297,7 @@ impl KubernetesSecretsCredentialDriver {
         value: &str,
     ) -> Result<(), Status> {
         let api: Api<Secret> = Api::namespaced(self.client.clone(), &reference.namespace);
-        for attempt in 0..CONFLICT_RETRY_LIMIT {
+        for _attempt in 0..CONFLICT_RETRY_LIMIT {
             let secret = match api.get(&reference.secret_name).await {
                 Ok(secret) => secret,
                 Err(kube::Error::Api(api_err)) if api_err.code == 404 => {
@@ -325,8 +324,7 @@ impl KubernetesSecretsCredentialDriver {
                 .await
             {
                 Ok(_) => return Ok(()),
-                Err(kube::Error::Api(api_err))
-                    if api_err.code == 409 && attempt + 1 < CONFLICT_RETRY_LIMIT => {}
+                Err(kube::Error::Api(api_err)) if api_err.code == 409 => {}
                 Err(err) => {
                     return Err(kube_write_error_to_status(
                         &reference.namespace,

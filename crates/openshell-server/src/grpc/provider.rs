@@ -378,11 +378,6 @@ async fn update_provider_record_validating(
     for key in credential_update.deferred_store_values.keys() {
         candidate.credentials.remove(key);
     }
-    validate_provider_mutable_fields(&candidate)?;
-    validate_provider_update_against_attached_sandboxes_with_catalog(
-        store, catalog, workspace, &candidate,
-    )
-    .await?;
     if credentials.is_some_and(crate::credentials::CredentialRuntime::stores_provider_credentials) {
         for key in updated_credential_values.keys() {
             candidate.credentials.remove(key);
