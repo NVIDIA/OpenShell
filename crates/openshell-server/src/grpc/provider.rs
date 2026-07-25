@@ -394,71 +394,49 @@ async fn update_provider_record_validating(
     candidate
         .credential_handles
         .extend(credential_update.pre_stored_handles.clone());
-    if let Err(err) = validate_provider_mutable_fields(&candidate) {
-        cleanup_pre_stored_provider_credentials(
-            credentials,
-            candidate.object_name(),
-            &credential_update.pre_stored_handles,
+
+    let cas_result = async {
+        validate_provider_mutable_fields(&candidate)?;
+        validate_provider_update_against_attached_sandboxes_with_catalog(
+            store, catalog, workspace, &candidate,
         )
-        .await;
-        return Err(err);
+        .await?;
+
+        let labels_map = candidate.object_labels();
+        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&labels_map)
+                    .map_err(|e| Status::internal(format!("serialize labels failed: {e}")))?,
+            )
+        };
+
+        store
+            .put_if(
+                Provider::object_type(),
+                candidate.object_id(),
+                candidate.object_name(),
+                workspace,
+                &candidate.encode_to_vec(),
+                labels_json.as_deref(),
+                WriteCondition::MatchResourceVersion(cas_version),
+            )
+            .await
+            .map_err(provider_update_persistence_error_to_status)
     }
-    if let Err(err) = validate_provider_update_against_attached_sandboxes_with_catalog(
-        store, catalog, workspace, &candidate,
-    )
-    .await
-    {
-        cleanup_pre_stored_provider_credentials(
-            credentials,
-            candidate.object_name(),
-            &credential_update.pre_stored_handles,
-        )
-        .await;
-        return Err(err);
-    }
+    .await;
 
-    // Serialize labels for storage
-    let labels_map = candidate.object_labels();
-    let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
-        None
-    } else {
-        match serde_json::to_string(&labels_map) {
-            Ok(labels_json) => Some(labels_json),
-            Err(e) => {
-                cleanup_pre_stored_provider_credentials(
-                    credentials,
-                    candidate.object_name(),
-                    &credential_update.pre_stored_handles,
-                )
-                .await;
-                return Err(Status::internal(format!("serialize labels failed: {e}")));
-            }
-        }
-    };
-
-    // Write validated candidate with CAS condition
-    let write_result = store
-        .put_if(
-            Provider::object_type(),
-            candidate.object_id(),
-            candidate.object_name(),
-            workspace,
-            &candidate.encode_to_vec(),
-            labels_json.as_deref(),
-            WriteCondition::MatchResourceVersion(cas_version),
-        )
-        .await;
-
-    let result = match write_result {
+    let result = match cas_result {
         Ok(result) => result,
-        Err(e) => {
+        Err(err) => {
             cleanup_pre_stored_provider_credentials(
                 credentials,
                 candidate.object_name(),
                 &credential_update.pre_stored_handles,
             )
             .await;
-            return Err(provider_update_persistence_error_to_status(e));
+            return Err(err);
         }
     };
 

@@ -246,9 +246,38 @@ impl CredentialRuntime {
                 Ok::<_, Status>((credential_key.clone(), handle))
             }
         });
-        let results: Vec<(String, CredentialHandle)> =
-            futures::future::try_join_all(futures).await?;
-        Ok(results.into_iter().collect())
+        let results = futures::future::join_all(futures).await;
+
+        let mut successes = HashMap::new();
+        let mut first_error: Option<Status> = None;
+        for result in results {
+            match result {
+                Ok((key, handle)) => {
+                    successes.insert(key, handle);
+                }
+                Err(err) if first_error.is_none() => {
+                    first_error = Some(err);
+                }
+                Err(_) => {}
+            }
+        }
+
+        if let Some(err) = first_error {
+            if !successes.is_empty()
+                && let Err(cleanup_err) = self
+                    .delete_provider_credential_handles(provider_name, &successes)
+                    .await
+            {
+                tracing::warn!(
+                    provider_name = %provider_name,
+                    error = %cleanup_err,
+                    "failed to clean up partially stored credentials after error"
+                );
+            }
+            return Err(err);
+        }
+
+        Ok(successes)
     }
 
     pub async fn delete_provider_credential_handles(
@@ -259,7 +288,18 @@ impl CredentialRuntime {
         let futures = handles.iter().map(|(credential_key, handle)| {
             self.delete_provider_credential_handle(provider_name, credential_key, handle.clone())
         });
-        futures::future::try_join_all(futures).await?;
+        let results = futures::future::join_all(futures).await;
+        let mut first_error: Option<Status> = None;
+        for result in results {
+            if let Err(err) = result
+                && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
         Ok(())
     }
 

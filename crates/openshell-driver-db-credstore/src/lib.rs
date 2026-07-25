@@ -42,6 +42,7 @@ const DEFAULT_KEY_ENCRYPTION_KEY_FILE: &str = "key-encryption-key.bin";
 
 pub const DRIVER_NAME: &str = "openshell-driver-db-credstore";
 pub const OBJECT_TYPE: &str = "credential.gateway-encrypted";
+const CONFLICT_RETRY_LIMIT: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct DbCredstoreCredentialDriver {
@@ -228,32 +229,49 @@ impl DbCredstoreCredentialDriver {
         let handle =
             EncryptedGatewayCredentialStoreCrypto::handle_from_request("delete", request.handle)?;
         let id = EncryptedGatewayCredentialStoreCrypto::id_from_handle(&handle)?;
-        let record = self
-            .store
-            .get_credential_object(OBJECT_TYPE, &id, "load credential for deletion")
-            .await?;
-        let Some(record) = record else {
-            return Ok(());
-        };
-
-        let envelope = deserialize_credential_envelope(&record)?;
-        EncryptedGatewayCredentialStoreCrypto::ensure_envelope_owner(
-            &envelope,
-            &id,
-            EncryptedGatewayCredentialStoreCrypto::validate_provider_name(&request.provider_name)?,
-            EncryptedGatewayCredentialStoreCrypto::validate_credential_key(
-                &request.credential_key,
-            )?,
+        let provider_name =
+            EncryptedGatewayCredentialStoreCrypto::validate_provider_name(&request.provider_name)?;
+        let credential_key = EncryptedGatewayCredentialStoreCrypto::validate_credential_key(
+            &request.credential_key,
         )?;
 
-        self.store
-            .delete_credential_object(
-                OBJECT_TYPE,
+        for attempt in 0..CONFLICT_RETRY_LIMIT {
+            let record = self
+                .store
+                .get_credential_object(OBJECT_TYPE, &id, "load credential for deletion")
+                .await?;
+            let Some(record) = record else {
+                return Ok(());
+            };
+
+            let envelope = deserialize_credential_envelope(&record)?;
+            EncryptedGatewayCredentialStoreCrypto::ensure_envelope_owner(
+                &envelope,
                 &id,
-                record.resource_version,
-                "delete credential",
-            )
-            .await
+                provider_name,
+                credential_key,
+            )?;
+
+            match self
+                .store
+                .delete_credential_object(
+                    OBJECT_TYPE,
+                    &id,
+                    record.resource_version,
+                    "delete credential",
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(err)
+                    if err.code() == tonic::Code::Aborted && attempt + 1 < CONFLICT_RETRY_LIMIT => {
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(Status::aborted(format!(
+            "credential '{id}' was modified concurrently; exceeded retry limit"
+        )))
     }
 
     pub async fn resolve_credentials(
@@ -628,7 +646,7 @@ fn credential_handle(state: &EncryptedGatewayCredentialState, id: &str) -> Crede
 }
 
 fn validate_handle_owner(handle: &CredentialHandle) -> Result<(), Status> {
-    if handle.driver.trim() == DRIVER_NAME {
+    if handle.driver == DRIVER_NAME {
         return Ok(());
     }
     Err(Status::invalid_argument(format!(
