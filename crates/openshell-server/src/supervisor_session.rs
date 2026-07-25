@@ -136,14 +136,6 @@ impl SupervisorSessionRegistry {
         }
     }
 
-    /// Report whether a live supervisor session is registered for a sandbox.
-    ///
-    /// Used by compute drivers that need to surface "supervisor relay ready"
-    /// through the Ready condition without polling the sandbox runtime.
-    pub fn is_connected(&self, sandbox_id: &str) -> bool {
-        self.sessions.lock().unwrap().contains_key(sandbox_id)
-    }
-
     /// Remove the session for a sandbox.
     fn remove(&self, sandbox_id: &str) {
         self.sessions.lock().unwrap().remove(sandbox_id);

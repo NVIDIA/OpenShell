@@ -2543,6 +2543,7 @@ fn ensure_supervisor_ready_status(status: &mut Option<SandboxStatus>, sandbox_na
 struct ComposedPhase {
     phase: SandboxPhase,
     session_connected: bool,
+    backend_ready_without_session: bool,
 }
 
 impl ComposedPhase {
@@ -2560,6 +2561,8 @@ impl ComposedPhase {
         Self {
             phase,
             session_connected,
+            backend_ready_without_session: backend_phase == SandboxPhase::Ready
+                && !session_connected,
         }
     }
 
@@ -2570,10 +2573,26 @@ impl ComposedPhase {
         spec: Option<&SandboxSpec>,
     ) {
         rewrite_user_facing_conditions(status, spec);
-        if self.session_connected && self.phase == SandboxPhase::Ready {
+        if self.backend_ready_without_session {
+            ensure_supervisor_not_connected_status(status, sandbox_name);
+        } else if self.session_connected && self.phase == SandboxPhase::Ready {
             ensure_supervisor_ready_status(status, sandbox_name);
         }
     }
+}
+
+fn ensure_supervisor_not_connected_status(status: &mut Option<SandboxStatus>, sandbox_name: &str) {
+    upsert_ready_condition(
+        status,
+        sandbox_name,
+        SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: "SupervisorNotConnected".to_string(),
+            message: "Backend ready; waiting for supervisor session".to_string(),
+            last_transition_time: String::new(),
+        },
+    );
 }
 
 fn ensure_supervisor_not_ready_status(status: &mut Option<SandboxStatus>, sandbox_name: &str) {
@@ -2700,6 +2719,7 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
     let transient_reasons = [
         "reconcilererror",
         "dependenciesnotready",
+        "supervisornotconnected",
         "starting",
         "containerstarting",
         "containercreated",
@@ -3620,6 +3640,10 @@ mod tests {
                 "Pod exists with phase: Pending; Service Exists",
             ),
             ("dependenciesnotready", "lowercase also works"),
+            (
+                "SupervisorNotConnected",
+                "Backend ready; waiting for supervisor session",
+            ),
             ("Starting", "VM is starting"),
             (
                 "ContainerCreated",
@@ -4107,7 +4131,8 @@ mod tests {
             .as_ref()
             .and_then(|s| s.conditions.iter().find(|c| c.r#type == "Ready"))
             .unwrap();
-        assert_eq!(ready_condition.reason, "BackendReady");
+        assert_eq!(ready_condition.status, "False");
+        assert_eq!(ready_condition.reason, "SupervisorNotConnected");
     }
 
     #[tokio::test]
@@ -5349,8 +5374,12 @@ mod tests {
             SandboxPhase::Provisioning
         );
         let cond = ready_condition(&stored).unwrap();
-        assert_eq!(cond.status, "True");
-        assert_eq!(cond.reason, "BackendReady");
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason, "SupervisorNotConnected");
+        assert_eq!(
+            cond.message,
+            "Backend ready; waiting for supervisor session"
+        );
     }
 
     #[tokio::test]
@@ -5519,7 +5548,8 @@ mod tests {
             SandboxPhase::Provisioning
         );
         let cond = ready_condition(&stored).unwrap();
-        assert_eq!(cond.reason, "BackendReady");
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason, "SupervisorNotConnected");
     }
 
     #[tokio::test]

@@ -48,9 +48,11 @@ public_phase =
 
 When `public_phase == Ready` the sandbox is usable through the gateway — both the
 backend resource is healthy and a supervisor session is registered. A sandbox whose
-backend reports ready but has no supervisor session yet holds `Provisioning`; the
-driver's `BackendReady=True` condition is visible in the sandbox status for operators
-who need to distinguish that state from a sandbox still provisioning its compute resource.
+backend reports ready but has no supervisor session yet holds `Provisioning` with a
+`Ready=False`, `SupervisorNotConnected` condition and the message
+`Backend ready; waiting for supervisor session`. This distinguishes it from a sandbox
+whose compute resource is still provisioning without exposing contradictory public
+readiness signals.
 
 **Session precedence over lagging driver snapshots:** A supervisor session can only be
 established by a running workload. When `set_supervisor_session_state` promotes the
