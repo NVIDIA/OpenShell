@@ -1322,7 +1322,8 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
 #[cfg(target_os = "linux")]
 fn clear_supplementary_groups() -> Result<()> {
     let before = rustix::process::getgroups().into_diagnostic()?;
-    let clear_result = rustix::thread::set_thread_groups(&[]).map_err(|error| error.raw_os_error());
+    let clear_result =
+        rustix::thread::set_thread_groups(&[]).map_err(rustix::io::Errno::raw_os_error);
     validate_supplementary_group_clear(clear_result, before.is_empty(), true)?;
     let remaining = rustix::process::getgroups().into_diagnostic()?;
     if !remaining.is_empty() {
