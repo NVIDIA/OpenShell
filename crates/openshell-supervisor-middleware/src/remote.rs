@@ -8,7 +8,7 @@ use openshell_core::proto::middleware::v1::supervisor_middleware_client::Supervi
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
     HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse,
+    ValidateConfigResponse, WebSocketEvaluationRequest,
 };
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Request, Response, Status};
@@ -55,10 +55,29 @@ impl RemoteMiddlewareService {
                 .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
         })
     }
+
+    pub async fn open_websocket(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<WebSocketEvaluationRequest>,
+        timeout: Duration,
+    ) -> std::result::Result<
+        tonic::Streaming<openshell_core::proto::WebSocketEvaluationResponse>,
+        Status,
+    > {
+        let mut client = self.client.clone();
+        let mut request = Request::new(tokio_stream::wrappers::ReceiverStream::new(receiver));
+        request.set_timeout(timeout);
+        client
+            .evaluate_web_socket(request)
+            .await
+            .map(Response::into_inner)
+    }
 }
 
 #[tonic::async_trait]
 impl SupervisorMiddleware for RemoteMiddlewareService {
+    type EvaluateWebSocketStream = crate::WebSocketResponseStream;
+
     async fn describe(
         &self,
         request: Request<()>,
@@ -81,5 +100,14 @@ impl SupervisorMiddleware for RemoteMiddlewareService {
     ) -> std::result::Result<Response<HttpRequestResult>, Status> {
         let mut client = self.client.clone();
         client.evaluate_http_request(request).await
+    }
+
+    async fn evaluate_web_socket(
+        &self,
+        _request: Request<tonic::Streaming<WebSocketEvaluationRequest>>,
+    ) -> std::result::Result<Response<Self::EvaluateWebSocketStream>, Status> {
+        Err(Status::unimplemented(
+            "remote middleware streams are initiated by the registry",
+        ))
     }
 }

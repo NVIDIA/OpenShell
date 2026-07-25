@@ -11,6 +11,12 @@ pub const DEFAULT_MIDDLEWARE_TIMEOUT: Duration = Duration::from_millis(500);
 pub const MIN_MIDDLEWARE_TIMEOUT: Duration = Duration::from_millis(10);
 /// Largest operator-configured supervisor middleware RPC timeout.
 pub const MAX_MIDDLEWARE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum time a complete message may spend in all middleware stages.
+pub const MAX_MIDDLEWARE_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum time WebSocket preflight may delay an upstream handshake.
+pub const MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(1);
+/// Process-wide safety valve for concurrently buffered middleware work.
+pub const MAX_CONCURRENT_MIDDLEWARE_WORK: usize = 32;
 
 /// Largest number of middleware configurations accepted in one sandbox policy.
 pub const MAX_MIDDLEWARE_CONFIGS: usize = 10;

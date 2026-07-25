@@ -8,7 +8,8 @@ use crate::opa::PolicyGenerationGuard;
 use miette::{Result, miette};
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
-    HttpActivityBuilder, HttpRequest, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
+    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
+    ocsf_emit,
 };
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -79,6 +80,166 @@ pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: 
         } else {
             "Uninspectable traffic bypassed middleware (fail_open)"
         })
+        .build();
+    ocsf_emit!(event);
+}
+
+pub(super) fn emit_websocket_preflight_events(
+    ctx: &L7EvalContext,
+    outcome: &openshell_supervisor_middleware::WebSocketPreflightResult,
+) {
+    emit_websocket_invocations(ctx, &outcome.invocations);
+    if outcome.saturated {
+        emit_websocket_saturation(ctx);
+    }
+}
+
+pub(super) fn emit_websocket_session_start_events(
+    ctx: &L7EvalContext,
+    outcome: &openshell_supervisor_middleware::WebSocketSessionStartOutcome,
+) {
+    emit_websocket_invocations(ctx, &outcome.invocations);
+}
+
+pub(super) fn emit_websocket_message_events(
+    ctx: &L7EvalContext,
+    outcome: &openshell_supervisor_middleware::WebSocketMessageOutcome,
+) {
+    emit_websocket_invocations(ctx, &outcome.invocations);
+    if outcome.saturated {
+        emit_websocket_saturation(ctx);
+    }
+    for finding in &outcome.findings {
+        let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+            .severity(SeverityId::Medium)
+            .finding_info(FindingInfo::new(
+                "openshell.middleware.websocket_finding",
+                "WebSocket middleware finding",
+            ))
+            .evidence_pairs(&[
+                ("policy", ctx.policy_name.as_str()),
+                ("host", ctx.host.as_str()),
+                ("middleware", finding.middleware.as_str()),
+            ])
+            .message("WebSocket middleware reported a finding")
+            .build();
+        ocsf_emit!(event);
+    }
+}
+
+fn emit_websocket_invocations(
+    ctx: &L7EvalContext,
+    invocations: &[openshell_supervisor_middleware::WebSocketInvocation],
+) {
+    for invocation in invocations {
+        use openshell_supervisor_middleware::WebSocketInvocationOutcome as Outcome;
+        let (action, disposition, severity, status, outcome_name) = match invocation.outcome {
+            Outcome::Inspect => (
+                ActionId::Other,
+                DispositionId::Allowed,
+                SeverityId::Informational,
+                StatusId::Success,
+                "inspect",
+            ),
+            Outcome::Skip => (
+                ActionId::Other,
+                DispositionId::Other,
+                SeverityId::Informational,
+                StatusId::Success,
+                "voluntary_skip",
+            ),
+            Outcome::Allow => (
+                ActionId::Allowed,
+                DispositionId::Allowed,
+                SeverityId::Informational,
+                StatusId::Success,
+                "allow",
+            ),
+            Outcome::Deny => (
+                ActionId::Denied,
+                DispositionId::Blocked,
+                SeverityId::Medium,
+                StatusId::Failure,
+                "deny",
+            ),
+            Outcome::FailOpen => (
+                ActionId::Other,
+                DispositionId::Allowed,
+                SeverityId::Medium,
+                StatusId::Failure,
+                "fail_open",
+            ),
+            Outcome::FailClosed => (
+                ActionId::Denied,
+                DispositionId::Blocked,
+                SeverityId::High,
+                StatusId::Failure,
+                "fail_closed",
+            ),
+        };
+        let sequence = invocation
+            .sequence
+            .map_or_else(|| "-".to_string(), |sequence| sequence.to_string());
+        let replacement_size = invocation
+            .replacement_size
+            .map_or_else(|| "-".to_string(), |size| size.to_string());
+        let reason_code = invocation.reason_code.as_deref().unwrap_or("-");
+        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Other)
+            .activity_name("WebSocket middleware")
+            .action(action)
+            .disposition(disposition)
+            .severity(severity)
+            .status(status)
+            .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+            .firewall_rule(&ctx.policy_name, "supervisor-middleware")
+            .message(format!(
+                "WEBSOCKET_MIDDLEWARE {outcome_name} config={} implementation={} sequence={sequence} input_bytes={} replacement_bytes={replacement_size} transformed={} reason_code={reason_code}",
+                invocation.config_name,
+                invocation.implementation,
+                invocation.original_size,
+                invocation.transformed,
+            ))
+            .build();
+        ocsf_emit!(event);
+        if invocation.failed {
+            let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(if invocation.outcome == Outcome::FailClosed {
+                    SeverityId::High
+                } else {
+                    SeverityId::Medium
+                })
+                .finding_info(FindingInfo::new(
+                    "openshell.middleware.websocket_failure",
+                    "WebSocket middleware processing failure",
+                ))
+                .evidence_pairs(&[
+                    ("policy", ctx.policy_name.as_str()),
+                    ("host", ctx.host.as_str()),
+                    ("config", invocation.config_name.as_str()),
+                    ("implementation", invocation.implementation.as_str()),
+                    ("disposition", outcome_name),
+                ])
+                .message("WebSocket middleware stage failed")
+                .build();
+            ocsf_emit!(event);
+        }
+    }
+}
+
+fn emit_websocket_saturation(ctx: &L7EvalContext) {
+    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(SeverityId::Medium)
+        .finding_info(FindingInfo::new(
+            "openshell.middleware.admission_saturated",
+            "Supervisor middleware admission saturated",
+        ))
+        .evidence_pairs(&[
+            ("policy", ctx.policy_name.as_str()),
+            ("host", ctx.host.as_str()),
+            ("operation", "websocket_message"),
+        ])
+        .message("WebSocket middleware work waited for admission capacity")
         .build();
     ocsf_emit!(event);
 }

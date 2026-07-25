@@ -5,11 +5,19 @@
 
 mod headers;
 mod remote;
+mod websocket;
+
+pub use websocket::{
+    WebSocketInvocation, WebSocketInvocationOutcome, WebSocketMessageOutcome,
+    WebSocketPreflightInput, WebSocketPreflightResult, WebSocketSession,
+    WebSocketSessionStartOutcome,
+};
 
 #[cfg(test)]
 use std::collections::HashMap;
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,14 +31,30 @@ use openshell_core::proto::{
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
     ValidateConfigRequest,
 };
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 use tonic::Request;
 
+/// Concrete response stream used by object-safe middleware service handles.
+pub type WebSocketResponseStream = Pin<
+    Box<
+        dyn futures::Stream<
+                Item = std::result::Result<
+                    openshell_core::proto::WebSocketEvaluationResponse,
+                    tonic::Status,
+                >,
+            > + Send
+            + 'static,
+    >,
+>;
+type MiddlewareService =
+    dyn SupervisorMiddleware<EvaluateWebSocketStream = WebSocketResponseStream>;
+
 pub use openshell_core::middleware::{
-    DEFAULT_MIDDLEWARE_TIMEOUT, MAX_MIDDLEWARE_CHAIN_FINDINGS, MAX_MIDDLEWARE_CHAIN_STAGES,
-    MAX_MIDDLEWARE_CONFIGS, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_SELECTOR_PATTERNS,
-    MAX_MIDDLEWARE_TIMEOUT, MIN_MIDDLEWARE_TIMEOUT, middleware_timeout_or_default,
-    parse_middleware_timeout,
+    DEFAULT_MIDDLEWARE_TIMEOUT, MAX_CONCURRENT_MIDDLEWARE_WORK, MAX_MIDDLEWARE_CHAIN_FINDINGS,
+    MAX_MIDDLEWARE_CHAIN_STAGES, MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_CONFIGS,
+    MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT,
+    MAX_MIDDLEWARE_SELECTOR_PATTERNS, MAX_MIDDLEWARE_TIMEOUT, MIN_MIDDLEWARE_TIMEOUT,
+    middleware_timeout_or_default, parse_middleware_timeout,
 };
 
 /// Largest request or replacement body accepted by the middleware platform.
@@ -80,11 +104,13 @@ pub const MIDDLEWARE_GRPC_ENVELOPE_BYTES: usize =
 pub const MIDDLEWARE_GRPC_MESSAGE_BYTES: usize =
     MAX_MIDDLEWARE_BODY_BYTES + MIDDLEWARE_GRPC_ENVELOPE_BYTES;
 
-const HTTP_REQUEST_OPERATION: SupervisorMiddlewareOperation =
-    SupervisorMiddlewareOperation::HttpRequest;
-const PRE_CREDENTIALS_PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::PreCredentials;
 const MAX_STABLE_IDENTIFIER_BYTES: usize = 128;
 const EXTERNAL_FINDING_LABEL: &str = "External middleware finding";
+#[cfg(test)]
+const HTTP_REQUEST_OPERATION: SupervisorMiddlewareOperation =
+    SupervisorMiddlewareOperation::HttpRequest;
+#[cfg(test)]
+const PRE_CREDENTIALS_PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::PreCredentials;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnError {
     FailClosed,
@@ -144,12 +170,17 @@ pub struct DescribedChainEntry {
     service: Option<Arc<MiddlewareServiceState>>,
     binding: Option<MiddlewareBinding>,
     max_body_bytes: usize,
+    max_message_bytes: usize,
     timeout: Duration,
 }
 
 impl DescribedChainEntry {
     pub fn max_body_bytes(&self) -> usize {
         self.max_body_bytes
+    }
+
+    pub fn max_message_bytes(&self) -> usize {
+        self.max_message_bytes
     }
 
     pub fn on_error(&self) -> OnError {
@@ -303,7 +334,8 @@ struct MiddlewareServiceState {
     /// single-service test constructor leaves this empty and uses the manifest
     /// name after Describe.
     attachment_name: Option<String>,
-    service: Arc<dyn SupervisorMiddleware>,
+    service: Arc<MiddlewareService>,
+    remote: Option<remote::RemoteMiddlewareService>,
     manifest: OnceCell<MiddlewareManifest>,
     diagnostic_policy: MiddlewareDiagnosticPolicy,
     operator_max_body_bytes: Option<usize>,
@@ -375,6 +407,7 @@ pub struct MiddlewareRegistry {
     services: Arc<Vec<Arc<MiddlewareServiceState>>>,
     registered_services: Arc<Vec<RegisteredMiddlewareService>>,
     middleware_names: Arc<HashSet<String>>,
+    admission: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for MiddlewareRegistry {
@@ -384,6 +417,10 @@ impl std::fmt::Debug for MiddlewareRegistry {
             .field("service_count", &self.services.len())
             .field("registered_service_count", &self.registered_services.len())
             .field("middleware_count", &self.middleware_names.len())
+            .field(
+                "available_work_permits",
+                &self.admission.available_permits(),
+            )
             .finish()
     }
 }
@@ -399,6 +436,7 @@ impl Default for MiddlewareRegistry {
             services: Arc::new(Vec::new()),
             registered_services: Arc::new(Vec::new()),
             middleware_names: Arc::new(HashSet::new()),
+            admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
         }
     }
 }
@@ -420,12 +458,6 @@ fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<D
     {
         return Err(miette!(
             "middleware registration '{}' grpc_endpoint must use http:// or https://",
-            registration.name
-        ));
-    }
-    if registration.max_body_bytes == 0 {
-        return Err(miette!(
-            "middleware registration '{}' max_body_bytes must be greater than zero",
             registration.name
         ));
     }
@@ -490,6 +522,50 @@ fn validate_body_limit(source: &str, binding: &MiddlewareBinding) -> Result<usiz
         .map_err(|_| miette!("{source} reports a body limit too large for this platform"))
 }
 
+fn validate_message_limit(source: &str, binding: &MiddlewareBinding) -> Result<usize> {
+    if binding.max_message_bytes == 0 {
+        return Err(miette!("{source} must advertise a non-zero message limit"));
+    }
+    if binding.max_message_bytes > MAX_MIDDLEWARE_BODY_BYTES as u64 {
+        return Err(miette!(
+            "{source} message limit exceeds the platform maximum of {MAX_MIDDLEWARE_BODY_BYTES}"
+        ));
+    }
+    usize::try_from(binding.max_message_bytes)
+        .map_err(|_| miette!("{source} reports a message limit too large for this platform"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupportedBinding {
+    HttpPreCredentials,
+    WebSocketPreCredentials,
+}
+
+fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<SupportedBinding> {
+    match (
+        SupervisorMiddlewareOperation::try_from(binding.operation).ok(),
+        SupervisorMiddlewarePhase::try_from(binding.phase).ok(),
+    ) {
+        (
+            Some(SupervisorMiddlewareOperation::HttpRequest),
+            Some(SupervisorMiddlewarePhase::PreCredentials),
+        ) => Ok(SupportedBinding::HttpPreCredentials),
+        (
+            Some(SupervisorMiddlewareOperation::WebsocketMessage),
+            Some(SupervisorMiddlewarePhase::PreCredentials),
+        ) => Ok(SupportedBinding::WebSocketPreCredentials),
+        (
+            Some(SupervisorMiddlewareOperation::WebsocketMessage),
+            Some(SupervisorMiddlewarePhase::PreReturn),
+        ) => Err(miette!(
+            "{source} advertises WEBSOCKET_MESSAGE/PRE_RETURN, which is reserved for PR 2"
+        )),
+        _ => Err(miette!(
+            "{source} advertises an unsupported middleware operation/phase pair"
+        )),
+    }
+}
+
 fn validate_manifest_bindings(
     source: &str,
     manifest: &MiddlewareManifest,
@@ -501,27 +577,45 @@ fn validate_manifest_bindings(
 
     let mut described_pairs = HashSet::with_capacity(manifest.bindings.len());
     for binding in &manifest.bindings {
-        if binding.operation != HTTP_REQUEST_OPERATION as i32
-            || binding.phase != PRE_CREDENTIALS_PHASE as i32
-        {
-            return Err(miette!(
-                "{source} must support HTTP_REQUEST/PRE_CREDENTIALS"
-            ));
-        }
+        let kind = supported_binding(source, binding)?;
         if !described_pairs.insert((binding.operation, binding.phase)) {
             return Err(miette!(
-                "{source} describes more than one binding for HTTP_REQUEST/PRE_CREDENTIALS"
+                "{source} describes a duplicate middleware operation/phase pair"
             ));
         }
-        let advertised = validate_body_limit(source, binding)?;
+        let advertised = match kind {
+            SupportedBinding::HttpPreCredentials => {
+                if binding.max_message_bytes != 0 {
+                    return Err(miette!(
+                        "{source} HTTP_REQUEST binding must omit max_message_bytes"
+                    ));
+                }
+                validate_body_limit(source, binding)?
+            }
+            SupportedBinding::WebSocketPreCredentials => {
+                if binding.max_body_bytes != 0 {
+                    return Err(miette!(
+                        "{source} WEBSOCKET_MESSAGE binding must omit max_body_bytes"
+                    ));
+                }
+                validate_message_limit(source, binding)?
+            }
+        };
         if !binding.timeout.trim().is_empty() {
             parse_middleware_timeout(&binding.timeout)
                 .map_err(|reason| miette!("{source} has invalid timeout for binding: {reason}"))?;
         }
-        if operator_max_body_bytes.is_some_and(|limit| limit > advertised) {
+        if kind == SupportedBinding::HttpPreCredentials
+            && operator_max_body_bytes.is_some_and(|limit| limit > advertised)
+        {
             return Err(miette!(
                 "{source} max_body_bytes ({}) exceeds the binding capability ({advertised})",
                 operator_max_body_bytes.expect("operator limit checked above")
+            ));
+        }
+        if kind == SupportedBinding::HttpPreCredentials && operator_max_body_bytes == Some(0) {
+            return Err(miette!(
+                "{source} must configure max_body_bytes for its HTTP_REQUEST binding"
             ));
         }
     }
@@ -531,12 +625,12 @@ fn validate_manifest_bindings(
 fn validate_external_manifest(
     registration: &SupervisorMiddlewareService,
     manifest: &MiddlewareManifest,
-    operator_max_body_bytes: usize,
+    operator_max_body_bytes: Option<usize>,
 ) -> Result<()> {
     validate_manifest_bindings(
         &format!("external middleware registration '{}'", registration.name),
         manifest,
-        Some(operator_max_body_bytes),
+        operator_max_body_bytes,
     )
 }
 
@@ -668,7 +762,7 @@ impl MiddlewareRegistry {
     /// Describe in-process services, then connect and validate every
     /// operator-provided service registration.
     pub async fn connect_services(
-        in_process_services: Vec<Arc<dyn SupervisorMiddleware>>,
+        in_process_services: Vec<Arc<MiddlewareService>>,
         registrations: Vec<SupervisorMiddlewareService>,
     ) -> Result<Self> {
         let mut services = Vec::with_capacity(in_process_services.len() + registrations.len());
@@ -714,6 +808,7 @@ impl MiddlewareRegistry {
             services.push(Arc::new(MiddlewareServiceState {
                 attachment_name: Some(attachment_name),
                 service,
+                remote: None,
                 manifest: manifest_cell,
                 diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                 operator_max_body_bytes: None,
@@ -737,13 +832,12 @@ impl MiddlewareRegistry {
                         registration.name
                     )
                 })?;
-            let service = Arc::new(
-                remote::RemoteMiddlewareService::connect(
-                    &registration.name,
-                    &registration.grpc_endpoint,
-                )
-                .await?,
-            );
+            let remote_service = remote::RemoteMiddlewareService::connect(
+                &registration.name,
+                &registration.grpc_endpoint,
+            )
+            .await?;
+            let service = Arc::new(remote_service.clone());
             let manifest = call_with_timeout(
                 operator_timeout,
                 "Describe",
@@ -758,7 +852,7 @@ impl MiddlewareRegistry {
                     safe_reason(&error.to_string())
                 )
             })?;
-            validate_external_manifest(&registration, &manifest, operator_max_body_bytes)?;
+            validate_external_manifest(&registration, &manifest, Some(operator_max_body_bytes))?;
             let manifest_cell = OnceCell::new();
             manifest_cell
                 .set(manifest)
@@ -766,9 +860,11 @@ impl MiddlewareRegistry {
             services.push(Arc::new(MiddlewareServiceState {
                 attachment_name: Some(registration.name.clone()),
                 service,
+                remote: Some(remote_service),
                 manifest: manifest_cell,
                 diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
-                operator_max_body_bytes: Some(operator_max_body_bytes),
+                operator_max_body_bytes: (operator_max_body_bytes != 0)
+                    .then_some(operator_max_body_bytes),
                 operator_timeout,
             }));
             registered_services.push(RegisteredMiddlewareService { registration });
@@ -778,6 +874,7 @@ impl MiddlewareRegistry {
             services: Arc::new(services),
             registered_services: Arc::new(registered_services),
             middleware_names: Arc::new(middleware_names),
+            admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
         })
     }
 
@@ -846,12 +943,13 @@ impl Default for ChainRunner {
 }
 
 impl ChainRunner {
-    pub fn new(service: Arc<dyn SupervisorMiddleware>) -> Self {
+    pub fn new(service: Arc<MiddlewareService>) -> Self {
         Self {
             registry: Arc::new(MiddlewareRegistry {
                 services: Arc::new(vec![Arc::new(MiddlewareServiceState {
                     attachment_name: None,
                     service,
+                    remote: None,
                     manifest: OnceCell::new(),
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                     operator_max_body_bytes: None,
@@ -859,6 +957,7 @@ impl ChainRunner {
                 })]),
                 registered_services: Arc::new(Vec::new()),
                 middleware_names: Arc::new(HashSet::new()),
+                admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             }),
         }
     }
@@ -905,62 +1004,92 @@ impl ChainRunner {
             .unwrap_or(manifest.name.as_str())
     }
 
-    fn http_pre_credentials_binding(manifest: &MiddlewareManifest) -> Option<&MiddlewareBinding> {
-        manifest.bindings.iter().find(|binding| {
-            binding.operation == HTTP_REQUEST_OPERATION as i32
-                && binding.phase == PRE_CREDENTIALS_PHASE as i32
-        })
+    fn binding(
+        manifest: &MiddlewareManifest,
+        operation: SupervisorMiddlewareOperation,
+        phase: SupervisorMiddlewarePhase,
+    ) -> Option<&MiddlewareBinding> {
+        manifest
+            .bindings
+            .iter()
+            .find(|binding| binding.operation == operation as i32 && binding.phase == phase as i32)
     }
 
     pub async fn describe_chain(&self, entries: &[ChainEntry]) -> Result<Vec<DescribedChainEntry>> {
+        self.describe_chain_for(
+            entries,
+            SupervisorMiddlewareOperation::HttpRequest,
+            SupervisorMiddlewarePhase::PreCredentials,
+        )
+        .await
+    }
+
+    pub async fn describe_websocket_chain(
+        &self,
+        entries: &[ChainEntry],
+    ) -> Result<Vec<DescribedChainEntry>> {
+        self.describe_chain_for(
+            entries,
+            SupervisorMiddlewareOperation::WebsocketMessage,
+            SupervisorMiddlewarePhase::PreCredentials,
+        )
+        .await
+    }
+
+    async fn describe_chain_for(
+        &self,
+        entries: &[ChainEntry],
+        operation: SupervisorMiddlewareOperation,
+        phase: SupervisorMiddlewarePhase,
+    ) -> Result<Vec<DescribedChainEntry>> {
         ensure_chain_capacity(entries.len())?;
         let manifests = self.manifests().await?;
         let mut entries = entries.to_vec();
         sort_chain_entries(&mut entries);
-        entries
-            .iter()
-            .map(|entry| {
-                let described = manifests
-                    .iter()
-                    .find(|(state, manifest)| {
-                        Self::attachment_name(state, manifest) == entry.implementation
-                    })
-                    .and_then(|(state, manifest)| {
-                        Self::http_pre_credentials_binding(manifest)
-                            .cloned()
-                            .map(|binding| (Arc::clone(state), binding))
-                    });
-                let (service, binding) = described.map_or((None, None), |(service, binding)| {
-                    (Some(service), Some(binding))
+        let mut described_entries = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let Some((state, manifest)) = manifests.iter().find(|(state, manifest)| {
+                Self::attachment_name(state, manifest) == entry.implementation
+            }) else {
+                described_entries.push(DescribedChainEntry {
+                    entry,
+                    service: None,
+                    binding: None,
+                    max_body_bytes: 0,
+                    max_message_bytes: 0,
+                    timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                 });
-                let max_body_bytes = binding
-                    .as_ref()
-                    .map(|binding| {
-                        let advertised = validate_body_limit("middleware manifest", binding)?;
-                        Ok::<_, miette::Report>(
-                            service
-                                .as_ref()
-                                .and_then(|state| state.operator_max_body_bytes)
-                                .unwrap_or(advertised),
-                        )
-                    })
-                    .transpose()?
-                    .unwrap_or(0);
-                let timeout = service
-                    .as_ref()
-                    .zip(binding.as_ref())
-                    .map(|(state, binding)| state.timeout_for_binding(binding))
-                    .transpose()?
-                    .unwrap_or(DEFAULT_MIDDLEWARE_TIMEOUT);
-                Ok(DescribedChainEntry {
-                    entry: entry.clone(),
-                    service,
-                    binding,
-                    max_body_bytes,
-                    timeout,
-                })
-            })
-            .collect()
+                continue;
+            };
+            let Some(binding) = Self::binding(manifest, operation, phase).cloned() else {
+                // The config remains globally ordered, but it does not
+                // participate in this exact operation/phase chain.
+                continue;
+            };
+            let timeout = state.timeout_for_binding(&binding)?;
+            let max_body_bytes = if operation == SupervisorMiddlewareOperation::HttpRequest {
+                let advertised = validate_body_limit("middleware manifest", &binding)?;
+                state.operator_max_body_bytes.unwrap_or(advertised)
+            } else {
+                0
+            };
+            let max_message_bytes = if operation == SupervisorMiddlewareOperation::WebsocketMessage
+            {
+                validate_message_limit("middleware manifest", &binding)?
+            } else {
+                0
+            };
+            described_entries.push(DescribedChainEntry {
+                entry,
+                service: Some(Arc::clone(state)),
+                binding: Some(binding),
+                max_body_bytes,
+                max_message_bytes,
+                timeout,
+            });
+        }
+        ensure_chain_capacity(described_entries.len())?;
+        Ok(described_entries)
     }
 
     pub async fn validate_config(
@@ -974,16 +1103,14 @@ impl ChainRunner {
             ));
         }
         let manifests = self.manifests().await?;
-        let Some((state, binding)) = manifests.iter().find_map(|(state, manifest)| {
-            (Self::attachment_name(state, manifest) == middleware_name)
-                .then(|| Self::http_pre_credentials_binding(manifest))
-                .flatten()
-                .map(|binding| (state, binding))
-        }) else {
+        let Some((state, _manifest)) = manifests
+            .iter()
+            .find(|(state, manifest)| Self::attachment_name(state, manifest) == middleware_name)
+        else {
             return Err(miette!("middleware '{middleware_name}' is not registered"));
         };
         let response = call_with_timeout(
-            state.timeout_for_binding(binding)?,
+            state.operator_timeout,
             "ValidateConfig",
             state
                 .service
@@ -1049,6 +1176,14 @@ impl ChainRunner {
         let mut findings = Vec::new();
         let mut metadata = BTreeMap::new();
         let mut applied = Vec::new();
+        // One shared permit covers the whole ordered chain. Waiting is
+        // intentional backpressure and is excluded from the chain deadline.
+        let _permit = if entries.is_empty() {
+            None
+        } else {
+            Some(self.admit_middleware_work().await.0)
+        };
+        let chain_deadline = tokio::time::Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
 
         for entry in entries {
             let Some(binding) = entry.binding.as_ref() else {
@@ -1106,8 +1241,26 @@ impl ChainRunner {
             let Some(service) = entry.service.as_ref() else {
                 unreachable!("described binding always has a service")
             };
+            let remaining = chain_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                match apply_on_error(entry, "middleware_chain_timeout", &mut applied) {
+                    OnErrorAction::FailOpen => continue,
+                    OnErrorAction::FailClosed(reason) => {
+                        return Ok(ChainOutcome {
+                            allowed: false,
+                            reason,
+                            body,
+                            header_mutations,
+                            findings,
+                            metadata,
+                            applied,
+                            denial: None,
+                        });
+                    }
+                }
+            }
             let mut result = match call_with_timeout(
-                entry.timeout,
+                entry.timeout.min(remaining),
                 "EvaluateHttpRequest",
                 service
                     .service
@@ -1421,6 +1574,7 @@ mod tests {
     };
     use openshell_core::proto::{ExistingHeaderAction, header_mutation};
     use openshell_supervisor_middleware_builtins::{BUILTIN_REGEX, services};
+
     use tokio_stream::wrappers::TcpListenerStream;
 
     fn builtin_runner() -> ChainRunner {
@@ -1644,12 +1798,12 @@ mod tests {
 
     #[tokio::test]
     async fn injected_services_cannot_duplicate_middleware_names() {
-        let first: Arc<dyn SupervisorMiddleware> = Arc::new(ScriptedService {
+        let first: Arc<MiddlewareService> = Arc::new(ScriptedService {
             manifest_name: "openshell/test".into(),
             max_body_bytes: 1024,
             result: allow_result(),
         });
-        let second: Arc<dyn SupervisorMiddleware> = Arc::new(ScriptedService {
+        let second: Arc<MiddlewareService> = Arc::new(ScriptedService {
             manifest_name: "openshell/test".into(),
             max_body_bytes: 1024,
             result: allow_result(),
@@ -1676,6 +1830,16 @@ mod tests {
 
     #[tonic::async_trait]
     impl SupervisorMiddleware for ScriptedService {
+        type EvaluateWebSocketStream = WebSocketResponseStream;
+
+        async fn evaluate_web_socket(
+            &self,
+            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("HTTP-only test middleware"))
+        }
+
         async fn describe(
             &self,
             _request: Request<()>,
@@ -1688,6 +1852,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: self.max_body_bytes,
                     timeout: String::new(),
+                    max_message_bytes: 0,
                 }],
             }))
         }
@@ -1725,6 +1890,16 @@ mod tests {
 
     #[tonic::async_trait]
     impl SupervisorMiddleware for SlowService {
+        type EvaluateWebSocketStream = WebSocketResponseStream;
+
+        async fn evaluate_web_socket(
+            &self,
+            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("HTTP-only test middleware"))
+        }
+
         async fn describe(
             &self,
             _request: Request<()>,
@@ -1737,6 +1912,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: 4096,
                     timeout: self.binding_timeout.clone(),
+                    max_message_bytes: 0,
                 }],
             }))
         }
@@ -1778,6 +1954,16 @@ mod tests {
 
     #[tonic::async_trait]
     impl SupervisorMiddleware for TwoStageService {
+        type EvaluateWebSocketStream = WebSocketResponseStream;
+
+        async fn evaluate_web_socket(
+            &self,
+            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("HTTP-only test middleware"))
+        }
+
         async fn describe(
             &self,
             _request: Request<()>,
@@ -1790,6 +1976,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: 256 * 1024,
                     timeout: String::new(),
+                    max_message_bytes: 0,
                 }],
             }))
         }
@@ -1842,7 +2029,7 @@ mod tests {
         // must stop there: the second stage never runs, so it never sees a
         // payload the policy would reject.
         let second_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let service: Arc<dyn SupervisorMiddleware> = Arc::new(TwoStageService {
+        let service: Arc<MiddlewareService> = Arc::new(TwoStageService {
             second_ran: Arc::clone(&second_ran),
         });
         let runner = ChainRunner::new(service);
@@ -1904,7 +2091,7 @@ mod tests {
         // A validator that accepts every body lets both stages run; the second
         // stage sees the first stage's output.
         let second_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let service: Arc<dyn SupervisorMiddleware> = Arc::new(TwoStageService {
+        let service: Arc<MiddlewareService> = Arc::new(TwoStageService {
             second_ran: Arc::clone(&second_ran),
         });
         let runner = ChainRunner::new(service);
@@ -1956,7 +2143,7 @@ mod tests {
     #[tokio::test]
     async fn per_stage_validator_error_becomes_structured_denial() {
         let second_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let service: Arc<dyn SupervisorMiddleware> = Arc::new(TwoStageService {
+        let service: Arc<MiddlewareService> = Arc::new(TwoStageService {
             second_ran: Arc::clone(&second_ran),
         });
         let runner = ChainRunner::new(service);
@@ -2042,6 +2229,16 @@ mod tests {
 
     #[tonic::async_trait]
     impl SupervisorMiddleware for RecordingService {
+        type EvaluateWebSocketStream = WebSocketResponseStream;
+
+        async fn evaluate_web_socket(
+            &self,
+            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("HTTP-only test middleware"))
+        }
+
         async fn describe(
             &self,
             _request: Request<()>,
@@ -2054,6 +2251,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: 4096,
                     timeout: String::new(),
+                    max_message_bytes: 0,
                 }],
             }))
         }
@@ -2101,6 +2299,16 @@ mod tests {
 
     #[tonic::async_trait]
     impl SupervisorMiddleware for HeaderChainService {
+        type EvaluateWebSocketStream = WebSocketResponseStream;
+
+        async fn evaluate_web_socket(
+            &self,
+            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("HTTP-only test middleware"))
+        }
+
         async fn describe(
             &self,
             _request: Request<()>,
@@ -2113,6 +2321,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: 4096,
                     timeout: String::new(),
+                    max_message_bytes: 0,
                 }],
             }))
         }
@@ -2226,7 +2435,7 @@ mod tests {
             validated: std::sync::Mutex::new(Vec::new()),
             received: std::sync::Mutex::new(Vec::new()),
         });
-        let recorder: Arc<dyn SupervisorMiddleware> = service.clone();
+        let recorder: Arc<MiddlewareService> = service.clone();
         let runner = ChainRunner::new(recorder);
         runner
             .validate_config("test/recorder", prost_types::Struct::default())
@@ -2285,7 +2494,7 @@ mod tests {
     }
 
     async fn registry_with_external(
-        service: Arc<dyn SupervisorMiddleware>,
+        service: Arc<MiddlewareService>,
         registration: SupervisorMiddlewareService,
     ) -> MiddlewareRegistry {
         let builtin_service = services()
@@ -2312,7 +2521,7 @@ mod tests {
             .into_inner();
         let operator_max_body_bytes = usize::try_from(registration.max_body_bytes).unwrap();
         let operator_timeout = validate_registration(&registration).expect("valid registration");
-        validate_external_manifest(&registration, &manifest, operator_max_body_bytes)
+        validate_external_manifest(&registration, &manifest, Some(operator_max_body_bytes))
             .expect("valid external manifest");
         let manifest_cell = OnceCell::new();
         manifest_cell.set(manifest).expect("manifest cache");
@@ -2322,6 +2531,7 @@ mod tests {
                 Arc::new(MiddlewareServiceState {
                     attachment_name: Some(builtin_name.clone()),
                     service: builtin_service,
+                    remote: None,
                     manifest: builtin_manifest_cell,
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                     operator_max_body_bytes: None,
@@ -2330,6 +2540,7 @@ mod tests {
                 Arc::new(MiddlewareServiceState {
                     attachment_name: Some(registration_name.clone()),
                     service,
+                    remote: None,
                     manifest: manifest_cell,
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
                     operator_max_body_bytes: Some(operator_max_body_bytes),
@@ -2338,6 +2549,7 @@ mod tests {
             ]),
             registered_services: Arc::new(vec![RegisteredMiddlewareService { registration }]),
             middleware_names: Arc::new(HashSet::from([builtin_name, registration_name])),
+            admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
         }
     }
 
@@ -2528,9 +2740,10 @@ mod tests {
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_body_bytes: 4096,
                 timeout: String::new(),
+                max_message_bytes: 0,
             }],
         };
-        let error = validate_external_manifest(&registration, &manifest, 4097)
+        let error = validate_external_manifest(&registration, &manifest, Some(4097))
             .expect_err("operator limit must fit capability");
         assert!(error.to_string().contains("exceeds"));
     }
@@ -2554,9 +2767,10 @@ mod tests {
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_body_bytes: u64::MAX,
                 timeout: String::new(),
+                max_message_bytes: 0,
             }],
         };
-        let error = validate_external_manifest(&registration, &manifest, 4096)
+        let error = validate_external_manifest(&registration, &manifest, Some(4096))
             .expect_err("extreme advertised body limit must be rejected");
         assert!(error.to_string().contains("platform maximum"));
     }
@@ -2569,6 +2783,7 @@ mod tests {
             phase: PRE_CREDENTIALS_PHASE as i32,
             max_body_bytes: 4096,
             timeout: String::new(),
+            max_message_bytes: 0,
         };
         let manifest = MiddlewareManifest {
             name: "example/service".into(),
@@ -2576,13 +2791,36 @@ mod tests {
             bindings: vec![binding(), binding()],
         };
 
-        let error = validate_external_manifest(&registration, &manifest, 4096)
+        let error = validate_external_manifest(&registration, &manifest, Some(4096))
             .expect_err("one service cannot advertise two bindings for the same pair");
         assert!(
             error
                 .to_string()
-                .contains("more than one binding for HTTP_REQUEST/PRE_CREDENTIALS")
+                .contains("duplicate middleware operation/phase pair")
         );
+    }
+
+    #[test]
+    fn manifest_accepts_forward_websocket_binding_and_reserves_return_phase() {
+        let binding = |phase| MiddlewareBinding {
+            operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
+            phase: phase as i32,
+            max_body_bytes: 0,
+            timeout: "500ms".into(),
+            max_message_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
+        };
+        let mut manifest = MiddlewareManifest {
+            name: "example/websocket".into(),
+            service_version: "test".into(),
+            bindings: vec![binding(SupervisorMiddlewarePhase::PreCredentials)],
+        };
+        validate_manifest_bindings("test WebSocket service", &manifest, None)
+            .expect("forward WebSocket binding is supported");
+
+        manifest.bindings = vec![binding(SupervisorMiddlewarePhase::PreReturn)];
+        let error = validate_manifest_bindings("test WebSocket service", &manifest, None)
+            .expect_err("return-path binding stays reserved for PR 2");
+        assert!(error.to_string().contains("reserved for PR 2"));
     }
 
     #[test]
@@ -2650,9 +2888,10 @@ mod tests {
                     phase: PRE_CREDENTIALS_PHASE as i32,
                     max_body_bytes: 4096,
                     timeout: timeout.into(),
+                    max_message_bytes: 0,
                 }],
             };
-            let error = validate_external_manifest(&registration, &manifest, 4096)
+            let error = validate_external_manifest(&registration, &manifest, Some(4096))
                 .expect_err("out-of-bounds binding timeout must be rejected");
             assert!(error.to_string().contains("invalid timeout"));
         }
@@ -3510,5 +3749,270 @@ mod tests {
             "middleware_failed: invalid_response_decision"
         );
         assert!(outcome.applied[0].failed);
+    }
+
+    #[derive(Clone, Default)]
+    struct OpenAiRedactionService {
+        preflight: Arc<std::sync::Mutex<Option<openshell_core::proto::WebSocketPreflight>>>,
+        skip: bool,
+        messages: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl SupervisorMiddleware for OpenAiRedactionService {
+        type EvaluateWebSocketStream = WebSocketResponseStream;
+
+        async fn describe(
+            &self,
+            _request: Request<()>,
+        ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
+            Ok(tonic::Response::new(MiddlewareManifest {
+                name: "test/openai-websocket-redactor".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_body_bytes: 0,
+                    timeout: "1s".into(),
+                    max_message_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
+                }],
+            }))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: Request<ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: Request<HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented(
+                "WebSocket-only test middleware",
+            ))
+        }
+
+        async fn evaluate_web_socket(
+            &self,
+            request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+        {
+            use openshell_core::proto::{
+                WebSocketEvaluationResponse, WebSocketMessageResult, WebSocketPreflightAction,
+                WebSocketPreflightDecision, web_socket_evaluation_request,
+                web_socket_evaluation_response,
+            };
+
+            let mut requests = request.into_inner();
+            let preflight = Arc::clone(&self.preflight);
+            let skip = self.skip;
+            let messages = Arc::clone(&self.messages);
+            let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Ok(Some(request)) = requests.message().await {
+                    let response = match request.request {
+                        Some(web_socket_evaluation_request::Request::Preflight(value)) => {
+                            *preflight.lock().expect("preflight lock") = Some(value);
+                            Some(WebSocketEvaluationResponse {
+                                response: Some(
+                                    web_socket_evaluation_response::Response::PreflightDecision(
+                                        WebSocketPreflightDecision {
+                                            action: if skip {
+                                                WebSocketPreflightAction::Skip as i32
+                                            } else {
+                                                WebSocketPreflightAction::Inspect as i32
+                                            },
+                                        },
+                                    ),
+                                ),
+                            })
+                        }
+                        Some(web_socket_evaluation_request::Request::Message(value)) => {
+                            messages.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let payload = String::from_utf8(value.payload)
+                                .expect("test OpenAI event must be UTF-8")
+                                .replace("customer-secret", "[REDACTED]");
+                            Some(WebSocketEvaluationResponse {
+                                response: Some(
+                                    web_socket_evaluation_response::Response::MessageResult(
+                                        WebSocketMessageResult {
+                                            sequence: value.sequence,
+                                            decision: Decision::Allow as i32,
+                                            replacement: payload.into_bytes(),
+                                            has_replacement: true,
+                                            reason_code: "redacted".into(),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
+                            })
+                        }
+                        Some(
+                            web_socket_evaluation_request::Request::SessionStart(_)
+                            | web_socket_evaluation_request::Request::SessionEnd(_),
+                        )
+                        | None => None,
+                    };
+                    if let Some(response) = response
+                        && responses_tx.send(Ok(response)).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            Ok(tonic::Response::new(Box::pin(
+                tokio_stream::wrappers::ReceiverStream::new(responses_rx),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_websocket_event_is_introspected_and_redacted() {
+        let service = OpenAiRedactionService::default();
+        let observed_preflight = Arc::clone(&service.preflight);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind WebSocket middleware");
+        let address = listener.local_addr().expect("middleware address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tonic::transport::Server::builder()
+            .add_service(SupervisorMiddlewareServer::new(service))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let server_task = tokio::spawn(server);
+
+        let mut registration = external_registration(0);
+        registration.grpc_endpoint = format!("http://{address}");
+        let registry = MiddlewareRegistry::connect_services(Vec::new(), vec![registration])
+            .await
+            .expect("connect WebSocket middleware");
+        let runner = ChainRunner::from_registry(registry);
+        let chain = [ChainEntry {
+            name: "openai-redactor".into(),
+            implementation: "local-guard-service".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        }];
+        let preflight = runner
+            .preflight_websocket(
+                &chain,
+                WebSocketPreflightInput {
+                    session_id: "ws-session".into(),
+                    request_id: "request".into(),
+                    sandbox_id: "sandbox".into(),
+                    scheme: "wss".into(),
+                    host: "api.openai.com".into(),
+                    port: 443,
+                    path: "/v1/responses".into(),
+                    requested_subprotocols: vec!["realtime".into()],
+                },
+            )
+            .await
+            .expect("preflight");
+        assert!(preflight.allowed);
+        let mut session = preflight.session.expect("middleware chose to inspect");
+        assert!(session.start("realtime").await.allowed);
+
+        let original = br#"{"type":"response.create","response":{"input":"customer-secret"}}"#;
+        let outcome = session.evaluate_text(original.to_vec()).await;
+        assert!(outcome.allowed);
+        let transformed = String::from_utf8(outcome.payload).expect("transformed UTF-8");
+        assert!(transformed.contains("[REDACTED]"));
+        assert!(!transformed.contains("customer-secret"));
+        assert!(outcome.invocations[0].transformed);
+
+        let observed = observed_preflight
+            .lock()
+            .expect("preflight lock")
+            .clone()
+            .expect("preflight observed");
+        assert_eq!(observed.host, "api.openai.com");
+        assert_eq!(observed.path, "/v1/responses");
+        assert_eq!(observed.requested_subprotocols, ["realtime"]);
+        session
+            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .await;
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join test middleware")
+            .expect("serve middleware");
+    }
+
+    #[tokio::test]
+    async fn websocket_preflight_skip_removes_stage_without_message_calls() {
+        let service = OpenAiRedactionService {
+            skip: true,
+            ..Default::default()
+        };
+        let message_count = Arc::clone(&service.messages);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind WebSocket middleware");
+        let address = listener.local_addr().expect("middleware address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tonic::transport::Server::builder()
+            .add_service(SupervisorMiddlewareServer::new(service))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let server_task = tokio::spawn(server);
+        let mut registration = external_registration(0);
+        registration.grpc_endpoint = format!("http://{address}");
+        let runner = ChainRunner::from_registry(
+            MiddlewareRegistry::connect_services(Vec::new(), vec![registration])
+                .await
+                .expect("connect middleware"),
+        );
+        let result = runner
+            .preflight_websocket(
+                &[ChainEntry {
+                    name: "scope".into(),
+                    implementation: "local-guard-service".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                }],
+                WebSocketPreflightInput {
+                    session_id: "session".into(),
+                    request_id: "request".into(),
+                    sandbox_id: "sandbox".into(),
+                    scheme: "wss".into(),
+                    host: "api.openai.com".into(),
+                    port: 443,
+                    path: "/v1/responses".into(),
+                    requested_subprotocols: Vec::new(),
+                },
+            )
+            .await
+            .expect("preflight");
+        assert!(result.allowed);
+        assert!(result.session.is_none());
+        assert_eq!(
+            result.invocations[0].outcome,
+            WebSocketInvocationOutcome::Skip
+        );
+        assert_eq!(message_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware")
+            .expect("serve middleware");
     }
 }

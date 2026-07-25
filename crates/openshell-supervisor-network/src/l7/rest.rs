@@ -2020,6 +2020,12 @@ fn validate_websocket_upgrade_request(raw_header: &[u8]) -> Result<bool> {
     parse_websocket_upgrade_request(raw_header).map(|request| request.is_some())
 }
 
+pub(crate) fn websocket_requested_subprotocols(raw_header: &[u8]) -> Result<Vec<String>> {
+    Ok(parse_websocket_upgrade_request(raw_header)?
+        .map(|request| request.subprotocols)
+        .unwrap_or_default())
+}
+
 fn parse_websocket_upgrade_request(raw_header: &[u8]) -> Result<Option<WebSocketUpgradeRequest>> {
     let header_str = std::str::from_utf8(raw_header)
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
@@ -2760,7 +2766,7 @@ where
         if !options.client_requested_upgrade {
             return Ok(RelayOutcome::Consumed);
         }
-        let websocket_permessage_deflate = validate_websocket_response(
+        let (websocket_permessage_deflate, websocket_subprotocol) = validate_websocket_response(
             &header_str,
             options.websocket_extensions,
             options.websocket.as_ref(),
@@ -2779,6 +2785,7 @@ where
         return Ok(RelayOutcome::Upgraded {
             overflow,
             websocket_permessage_deflate,
+            websocket_subprotocol,
         });
     }
 
@@ -2908,9 +2915,10 @@ fn validate_websocket_response(
     headers: &str,
     mode: WebSocketExtensionMode,
     websocket: Option<&WebSocketResponseValidation>,
-) -> Result<bool> {
+) -> Result<(bool, Option<String>)> {
     let Some(validation) = websocket else {
-        return validate_websocket_response_extensions_preserved(headers, mode);
+        return validate_websocket_response_extensions_preserved(headers, mode)
+            .map(|compressed| (compressed, None));
     };
 
     let mut upgrade_websocket = false;
@@ -2970,11 +2978,11 @@ fn validate_websocket_response(
             "websocket upgrade response has multiple Sec-WebSocket-Protocol headers"
         ));
     }
-    if let Some(protocol) = selected_subprotocol
+    if let Some(ref protocol) = selected_subprotocol
         && !validation
             .offered_subprotocols
             .iter()
-            .any(|offered| offered == &protocol)
+            .any(|offered| offered == protocol)
     {
         return Err(miette!(
             "upstream selected WebSocket subprotocol that was not offered"
@@ -2986,8 +2994,10 @@ fn validate_websocket_response(
         (None, Some(_)) => Err(miette!(
             "upstream negotiated WebSocket extension that was not offered"
         )),
-        (None | Some(_), None) => Ok(false),
-        (Some(expected), Some(actual)) if expected.eq_ignore_ascii_case(actual) => Ok(true),
+        (None | Some(_), None) => Ok((false, selected_subprotocol)),
+        (Some(expected), Some(actual)) if expected.eq_ignore_ascii_case(actual) => {
+            Ok((true, selected_subprotocol))
+        }
         (Some(_), Some(_)) => Err(miette!(
             "upstream negotiated WebSocket extension that does not match the safe offer"
         )),
@@ -3562,6 +3572,7 @@ mod tests {
             let RelayOutcome::Upgraded {
                 overflow,
                 websocket_permessage_deflate,
+                ..
             } = outcome
             else {
                 panic!("expected upgraded relay outcome");
@@ -6075,7 +6086,7 @@ mod tests {
             offered_subprotocols: Vec::new(),
         };
 
-        let negotiated = validate_websocket_response(
+        let (negotiated, subprotocol) = validate_websocket_response(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n",
             WebSocketExtensionMode::PermessageDeflate,
             Some(&validation),
@@ -6083,6 +6094,7 @@ mod tests {
         .expect("reordered safe extension params should canonicalize");
 
         assert!(negotiated);
+        assert_eq!(subprotocol, None);
     }
 
     #[test]
@@ -6105,7 +6117,7 @@ mod tests {
 
     #[test]
     fn preserve_mode_leaves_malformed_extension_response_raw() {
-        let negotiated = validate_websocket_response(
+        let (negotiated, subprotocol) = validate_websocket_response(
             "HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover=\"true\"\r\n\r\n",
             WebSocketExtensionMode::Preserve,
             None,
@@ -6113,6 +6125,7 @@ mod tests {
         .expect("preserve mode should not parse or reject raw extension negotiation");
 
         assert!(!negotiated);
+        assert_eq!(subprotocol, None);
     }
 
     #[test]
@@ -6136,7 +6149,7 @@ mod tests {
             offered_subprotocols: vec!["chat".to_string(), "superchat".to_string()],
         };
 
-        let negotiated = validate_websocket_response(
+        let (negotiated, subprotocol) = validate_websocket_response(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: superchat\r\n\r\n",
             WebSocketExtensionMode::PermessageDeflate,
             Some(&validation),
@@ -6144,6 +6157,7 @@ mod tests {
         .expect("offered subprotocol should validate");
 
         assert!(!negotiated);
+        assert_eq!(subprotocol.as_deref(), Some("superchat"));
     }
 
     #[test]

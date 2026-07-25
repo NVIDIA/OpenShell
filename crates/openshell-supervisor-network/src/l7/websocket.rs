@@ -19,8 +19,9 @@ use openshell_ocsf::{
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-const MAX_TEXT_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_TEXT_MESSAGE_BYTES: usize = openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES;
 const MAX_RAW_FRAME_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_MESSAGE_FRAGMENTS: usize = 4096;
 const COPY_BUF_SIZE: usize = 8192;
 const OPCODE_CONTINUATION: u8 = 0x0;
 const OPCODE_TEXT: u8 = 0x1;
@@ -67,6 +68,8 @@ pub(super) struct RelayOptions<'a> {
     pub(super) resolver: Option<&'a SecretResolver>,
     pub(super) inspector: Option<InspectionOptions<'a>>,
     pub(super) compression: WebSocketCompression,
+    pub(super) middleware_session: Option<openshell_supervisor_middleware::WebSocketSession>,
+    pub(super) middleware_context: Option<&'a L7EvalContext>,
 }
 
 /// Relay an upgraded WebSocket connection with optional client text inspection,
@@ -77,7 +80,7 @@ pub(super) async fn relay_with_options<C, U>(
     overflow: Vec<u8>,
     host: &str,
     port: u16,
-    options: RelayOptions<'_>,
+    mut options: RelayOptions<'_>,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -91,8 +94,13 @@ where
         client_write.flush().await.into_diagnostic()?;
     }
 
-    let client_to_server =
-        relay_client_to_server(&mut client_read, &mut upstream_write, host, port, &options);
+    let client_to_server = relay_client_to_server(
+        &mut client_read,
+        &mut upstream_write,
+        host,
+        port,
+        &mut options,
+    );
     let server_to_client = async {
         tokio::io::copy(&mut upstream_read, &mut client_write)
             .await
@@ -105,6 +113,20 @@ where
         result = client_to_server => result,
         result = server_to_client => result,
     };
+    if let Err(error) = &result {
+        let code = websocket_close_code(error);
+        let payload = code.to_be_bytes();
+        let _ = write_masked_close(&mut upstream_write, &payload).await;
+        let _ = write_unmasked_close(&mut client_write, &payload).await;
+    }
+    if let Some(session) = options.middleware_session.take() {
+        let reason = if result.is_ok() {
+            openshell_core::proto::WebSocketSessionEndReason::NormalClose
+        } else {
+            openshell_core::proto::WebSocketSessionEndReason::MiddlewareFailure
+        };
+        session.end(reason).await;
+    }
     let _ = upstream_write.shutdown().await;
     let _ = client_write.shutdown().await;
     result
@@ -115,13 +137,14 @@ async fn relay_client_to_server<R, W>(
     writer: &mut W,
     host: &str,
     port: u16,
-    options: &RelayOptions<'_>,
+    options: &mut RelayOptions<'_>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut fragments = FragmentState::None;
+    let mut fragment_count = 0usize;
     let mut close_seen = false;
 
     loop {
@@ -142,6 +165,19 @@ where
         if let Err(e) = validate_frame_header(&frame, &fragments, options.compression) {
             emit_protocol_failure(host, port, options.policy_name, protocol_failure_class(&e));
             return Err(e);
+        }
+        if matches!(frame.opcode, OPCODE_TEXT | OPCODE_BINARY) && !frame.fin {
+            fragment_count = 1;
+        } else if frame.opcode == OPCODE_CONTINUATION {
+            fragment_count = fragment_count.saturating_add(1);
+            if fragment_count > MAX_MESSAGE_FRAGMENTS {
+                return Err(miette!(
+                    "websocket message exceeds {MAX_MESSAGE_FRAGMENTS} fragment limit"
+                ));
+            }
+            if frame.fin {
+                fragment_count = 0;
+            }
         }
 
         match frame.opcode {
@@ -483,7 +519,7 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     compressed: bool,
     host: &str,
     port: u16,
-    options: &RelayOptions<'_>,
+    options: &mut RelayOptions<'_>,
 ) -> Result<()> {
     let message_payload = if compressed {
         decompress_permessage_deflate(&payload)?
@@ -492,6 +528,40 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     };
     let mut text = String::from_utf8(message_payload)
         .map_err(|_| miette!("websocket text message is not valid UTF-8"))?;
+
+    // Built-in transport/GraphQL inspection sees the original unresolved
+    // message. External transformations run next, then policy is re-evaluated
+    // before credential material is introduced.
+    if let Some(inspector) = options.inspector.as_ref() {
+        inspect_websocket_text_message(host, port, options.policy_name, inspector, &text)?;
+    }
+
+    let mut middleware_transformed = false;
+    if let Some(session) = options.middleware_session.as_mut() {
+        let outcome = session.evaluate_text(text.into_bytes()).await;
+        if let Some(ctx) = options.middleware_context {
+            crate::l7::middleware::emit_websocket_message_events(ctx, &outcome);
+        }
+        if !outcome.allowed {
+            if outcome.platform_oversize {
+                return Err(miette!(
+                    "websocket message over middleware platform capacity"
+                ));
+            }
+            return Err(miette!("websocket middleware denied message"));
+        }
+        middleware_transformed = outcome
+            .invocations
+            .iter()
+            .any(|invocation| invocation.transformed);
+        text = String::from_utf8(outcome.payload)
+            .map_err(|_| miette!("websocket middleware returned invalid UTF-8"))?;
+    }
+
+    if middleware_transformed && let Some(inspector) = options.inspector.as_ref() {
+        inspect_websocket_text_message(host, port, options.policy_name, inspector, &text)?;
+    }
+
     let replacements = if let Some(resolver) = options.resolver {
         resolver
             .rewrite_websocket_text_placeholders(&mut text)
@@ -500,11 +570,7 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
         0
     };
 
-    if let Some(inspector) = options.inspector.as_ref() {
-        inspect_websocket_text_message(host, port, options.policy_name, inspector, &text)?;
-    }
-
-    if replacements == 0 && !force_reframe && !compressed {
+    if replacements == 0 && !middleware_transformed && !force_reframe && !compressed {
         writer
             .write_all(&frame.raw_header)
             .await
@@ -821,6 +887,28 @@ async fn write_masked_frame<W: AsyncWrite + Unpin>(
     write_masked_frame_with_rsv(writer, opcode, 0, payload).await
 }
 
+pub(super) async fn write_masked_close<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    payload: &[u8],
+) -> Result<()> {
+    write_masked_frame(writer, OPCODE_CLOSE, payload).await
+}
+
+pub(super) async fn write_unmasked_close<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    payload: &[u8],
+) -> Result<()> {
+    let payload_len = u8::try_from(payload.len())
+        .map_err(|_| miette!("websocket close payload exceeds 125 bytes"))?;
+    writer
+        .write_all(&[0x80 | OPCODE_CLOSE, payload_len])
+        .await
+        .into_diagnostic()?;
+    writer.write_all(payload).await.into_diagnostic()?;
+    writer.flush().await.into_diagnostic()?;
+    Ok(())
+}
+
 async fn write_masked_frame_with_rsv<W: AsyncWrite + Unpin>(
     writer: &mut W,
     opcode: u8,
@@ -1054,6 +1142,8 @@ fn protocol_failure_class(error: &miette::Report) -> &'static str {
         "credential_resolution_failed"
     } else if msg.contains("utf-8") {
         "invalid_utf8"
+    } else if msg.contains("fragment limit") {
+        "invalid_fragmentation"
     } else if msg.contains("close frame") || msg.contains("after close") {
         "invalid_close_frame"
     } else if msg.contains("control frame") {
@@ -1076,6 +1166,24 @@ fn protocol_failure_class(error: &miette::Report) -> &'static str {
         "malformed_frame"
     } else {
         "protocol_error"
+    }
+}
+
+fn websocket_close_code(error: &miette::Report) -> u16 {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("middleware denied") || message.contains("denied by policy") {
+        1008
+    } else if message.contains("fragment limit") {
+        1002
+    } else if message.contains("capacity")
+        || message.contains("too large")
+        || message.contains("exceeds")
+    {
+        1009
+    } else if message.contains("stale") {
+        1012
+    } else {
+        1002
     }
 }
 
@@ -1108,9 +1216,14 @@ mod tests {
     use super::*;
     use crate::l7::relay::L7EvalContext;
     use crate::opa::{NetworkInput, OpaEngine};
+    use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
+        SupervisorMiddleware, SupervisorMiddlewareServer,
+    };
     use openshell_core::secrets::SecretResolver;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+    use tonic::{Request, Response, Status};
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
     const GRAPHQL_WS_POLICY: &str = r#"
@@ -1223,18 +1336,20 @@ network_policies:
         client_write.write_all(&input).await.unwrap();
         drop(client_write);
 
-        let options = RelayOptions {
+        let mut options = RelayOptions {
             policy_name: "test-policy",
             resolver: Some(&resolver),
             inspector: None,
             compression: WebSocketCompression::None,
+            middleware_session: None,
+            middleware_context: None,
         };
         let result = relay_client_to_server(
             &mut relay_read,
             &mut relay_write,
             "gateway.example.test",
             443,
-            &options,
+            &mut options,
         )
         .await;
         drop(relay_write);
@@ -1281,7 +1396,7 @@ network_policies:
         client_write.write_all(&input).await.unwrap();
         drop(client_write);
 
-        let options = RelayOptions {
+        let mut options = RelayOptions {
             policy_name: "graphql_ws",
             resolver,
             inspector: Some(InspectionOptions {
@@ -1293,13 +1408,15 @@ network_policies:
                 graphql_policy: true,
             }),
             compression: WebSocketCompression::None,
+            middleware_session: None,
+            middleware_context: None,
         };
         let result = relay_client_to_server(
             &mut relay_read,
             &mut relay_write,
             "realtime.graphql.test",
             443,
-            &options,
+            &mut options,
         )
         .await;
         drop(relay_write);
@@ -1317,18 +1434,20 @@ network_policies:
         client_write.write_all(&input).await.unwrap();
         drop(client_write);
 
-        let options = RelayOptions {
+        let mut options = RelayOptions {
             policy_name: "test-policy",
             resolver: Some(&resolver),
             inspector: None,
             compression: WebSocketCompression::PermessageDeflate,
+            middleware_session: None,
+            middleware_context: None,
         };
         let result = relay_client_to_server(
             &mut relay_read,
             &mut relay_write,
             "gateway.example.test",
             443,
-            &options,
+            &mut options,
         )
         .await;
         drop(relay_write);
@@ -1559,6 +1678,8 @@ network_policies:
                     resolver: Some(&resolver),
                     inspector: None,
                     compression: WebSocketCompression::None,
+                    middleware_session: None,
+                    middleware_context: None,
                 },
             )
             .await
@@ -1581,6 +1702,280 @@ network_policies:
         drop(client_app);
         drop(upstream_app);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay).await;
+    }
+
+    #[derive(Clone, Default)]
+    struct OpenAiWebSocketRedactor;
+
+    #[tonic::async_trait]
+    impl SupervisorMiddleware for OpenAiWebSocketRedactor {
+        type EvaluateWebSocketStream = openshell_supervisor_middleware::WebSocketResponseStream;
+
+        async fn describe(
+            &self,
+            _request: Request<()>,
+        ) -> std::result::Result<Response<openshell_core::proto::MiddlewareManifest>, Status>
+        {
+            use openshell_core::proto::{
+                MiddlewareBinding, MiddlewareManifest, SupervisorMiddlewareOperation,
+                SupervisorMiddlewarePhase,
+            };
+            Ok(Response::new(MiddlewareManifest {
+                name: "test/openai-websocket-redactor".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_body_bytes: 0,
+                    timeout: "1s".into(),
+                    max_message_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES
+                        as u64,
+                }],
+            }))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: Request<openshell_core::proto::ValidateConfigRequest>,
+        ) -> std::result::Result<Response<openshell_core::proto::ValidateConfigResponse>, Status>
+        {
+            Ok(Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: Request<openshell_core::proto::HttpRequestEvaluation>,
+        ) -> std::result::Result<Response<openshell_core::proto::HttpRequestResult>, Status>
+        {
+            Err(Status::unimplemented("WebSocket-only test middleware"))
+        }
+
+        async fn evaluate_web_socket(
+            &self,
+            request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
+        ) -> std::result::Result<Response<Self::EvaluateWebSocketStream>, Status> {
+            use openshell_core::proto::{
+                Decision, WebSocketEvaluationResponse, WebSocketMessageResult,
+                WebSocketPreflightAction, WebSocketPreflightDecision,
+                web_socket_evaluation_request, web_socket_evaluation_response,
+            };
+            let mut requests = request.into_inner();
+            let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Ok(Some(request)) = requests.message().await {
+                    let response = match request.request {
+                        Some(web_socket_evaluation_request::Request::Preflight(_)) => {
+                            Some(WebSocketEvaluationResponse {
+                                response: Some(
+                                    web_socket_evaluation_response::Response::PreflightDecision(
+                                        WebSocketPreflightDecision {
+                                            action: WebSocketPreflightAction::Inspect as i32,
+                                        },
+                                    ),
+                                ),
+                            })
+                        }
+                        Some(web_socket_evaluation_request::Request::Message(message)) => {
+                            let text =
+                                String::from_utf8(message.payload).expect("OpenAI event UTF-8");
+                            let deny = text.contains("deny-me");
+                            let replacement =
+                                text.replace("customer-secret", "[REDACTED]").into_bytes();
+                            Some(WebSocketEvaluationResponse {
+                                response: Some(
+                                    web_socket_evaluation_response::Response::MessageResult(
+                                        WebSocketMessageResult {
+                                            sequence: message.sequence,
+                                            decision: if deny {
+                                                Decision::Deny as i32
+                                            } else {
+                                                Decision::Allow as i32
+                                            },
+                                            replacement: if deny {
+                                                Vec::new()
+                                            } else {
+                                                replacement
+                                            },
+                                            has_replacement: !deny,
+                                            reason_code: if deny {
+                                                "blocked".into()
+                                            } else {
+                                                "redacted".into()
+                                            },
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(response) = response
+                        && responses_tx.send(Ok(response)).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            Ok(Response::new(Box::pin(ReceiverStream::new(responses_rx))))
+        }
+    }
+
+    #[tokio::test]
+    async fn parsed_relay_sends_redacted_openai_event_to_upstream() {
+        use openshell_core::proto::SupervisorMiddlewareService;
+        use openshell_supervisor_middleware::{ChainEntry, MiddlewareRegistry, OnError};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind WebSocket middleware");
+        let address = listener.local_addr().expect("middleware address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tonic::transport::Server::builder()
+            .add_service(SupervisorMiddlewareServer::new(OpenAiWebSocketRedactor))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let server_task = tokio::spawn(server);
+        let registry = MiddlewareRegistry::connect_services(
+            Vec::new(),
+            vec![SupervisorMiddlewareService {
+                name: "openai-redactor".into(),
+                grpc_endpoint: format!("http://{address}"),
+                max_body_bytes: 0,
+                timeout: "2s".into(),
+            }],
+        )
+        .await
+        .expect("connect middleware");
+        let runner = openshell_supervisor_middleware::ChainRunner::from_registry(registry);
+        let preflight = runner
+            .preflight_websocket(
+                &[ChainEntry {
+                    name: "redact-openai".into(),
+                    implementation: "openai-redactor".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                }],
+                openshell_supervisor_middleware::WebSocketPreflightInput {
+                    session_id: "session".into(),
+                    request_id: "request".into(),
+                    sandbox_id: "sandbox".into(),
+                    scheme: "wss".into(),
+                    host: "api.openai.com".into(),
+                    port: 443,
+                    path: "/v1/responses".into(),
+                    requested_subprotocols: Vec::new(),
+                },
+            )
+            .await
+            .expect("preflight");
+        let mut session = preflight.session.expect("middleware inspects session");
+        assert!(session.start("").await.allowed);
+
+        let original = br#"{"type":"response.create","response":{"input":"customer-secret"}}"#;
+        let client_frame = masked_frame(true, OPCODE_TEXT, original);
+        let (mut client_app, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, mut upstream_app) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            relay_with_options(
+                &mut relay_client,
+                &mut relay_upstream,
+                Vec::new(),
+                "api.openai.com",
+                443,
+                RelayOptions {
+                    policy_name: "openai",
+                    resolver: None,
+                    inspector: None,
+                    compression: WebSocketCompression::None,
+                    middleware_session: Some(session),
+                    middleware_context: None,
+                },
+            )
+            .await
+        });
+
+        client_app
+            .write_all(&client_frame)
+            .await
+            .expect("send event");
+        client_app.flush().await.expect("flush event");
+        let upstream_frame = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_one_frame(&mut upstream_app),
+        )
+        .await
+        .expect("upstream receives event");
+        let upstream_text = decode_masked_text_frame(&upstream_frame);
+        assert!(upstream_text.contains("[REDACTED]"));
+        assert!(!upstream_text.contains("customer-secret"));
+
+        let denied = br#"{"type":"response.create","response":{"input":"deny-me"}}"#;
+        client_app
+            .write_all(&masked_frame(true, OPCODE_TEXT, denied))
+            .await
+            .expect("send denied event");
+        client_app.flush().await.expect("flush denied event");
+        let upstream_close = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_one_frame(&mut upstream_app),
+        )
+        .await
+        .expect("upstream receives close");
+        assert_eq!(upstream_close[0] & 0x0f, OPCODE_CLOSE);
+        assert_eq!(
+            u16::from_be_bytes(
+                decode_masked_payload(&upstream_close)[..2]
+                    .try_into()
+                    .expect("close code"),
+            ),
+            1008
+        );
+        let client_close = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_one_frame(&mut client_app),
+        )
+        .await
+        .expect("client receives close");
+        assert_eq!(client_close[0] & 0x0f, OPCODE_CLOSE);
+        assert_eq!(
+            u16::from_be_bytes(client_close[2..4].try_into().expect("close code")),
+            1008
+        );
+
+        drop(client_app);
+        drop(upstream_app);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay).await;
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware")
+            .expect("serve middleware");
+    }
+
+    #[tokio::test]
+    #[ignore = "PR 2 adds return-path inspection and completes this full-duplex fixture"]
+    async fn pr2_full_duplex_external_middleware_vertical_slice() {
+        // PR 2 should extend the real relay fixture above with controllable
+        // server-to-client transforms plus slow, hanging, closed, duplicate,
+        // missing, out-of-order, and oversized middleware responses.
+        let deferred_faults = [
+            "slow",
+            "hanging",
+            "closed",
+            "duplicate",
+            "missing",
+            "out-of-order",
+            "oversized",
+        ];
+        assert_eq!(deferred_faults.len(), 7);
     }
 
     #[tokio::test]

@@ -5,20 +5,29 @@
 
 mod regex;
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use miette::{Result, miette};
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
     HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse,
+    ValidateConfigResponse, WebSocketEvaluationRequest, WebSocketEvaluationResponse,
 };
 use tonic::{Request, Response, Status};
 
 pub use regex::{NAME as BUILTIN_REGEX, RegexConfig, RegexMode};
 
 /// Return the first-party services that the gateway and supervisor install.
-pub fn services() -> Vec<Arc<dyn SupervisorMiddleware>> {
+type WebSocketResponseStream = Pin<
+    Box<
+        dyn tokio_stream::Stream<Item = std::result::Result<WebSocketEvaluationResponse, Status>>
+            + Send,
+    >,
+>;
+
+pub fn services()
+-> Vec<Arc<dyn SupervisorMiddleware<EvaluateWebSocketStream = WebSocketResponseStream>>> {
     vec![Arc::new(BuiltinMiddlewareService)]
 }
 
@@ -47,6 +56,8 @@ pub struct BuiltinMiddlewareService;
 
 #[tonic::async_trait]
 impl SupervisorMiddleware for BuiltinMiddlewareService {
+    type EvaluateWebSocketStream = WebSocketResponseStream;
+
     async fn describe(
         &self,
         _request: Request<()>,
@@ -85,6 +96,15 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
         evaluate_http_request(&request.into_inner())
             .map(Response::new)
             .map_err(|error| Status::invalid_argument(error.to_string()))
+    }
+
+    async fn evaluate_web_socket(
+        &self,
+        _request: Request<tonic::Streaming<WebSocketEvaluationRequest>>,
+    ) -> Result<Response<Self::EvaluateWebSocketStream>, Status> {
+        Err(Status::unimplemented(
+            "built-in middleware does not advertise WebSocket support",
+        ))
     }
 }
 

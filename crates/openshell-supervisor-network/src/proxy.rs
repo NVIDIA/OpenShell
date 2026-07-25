@@ -5080,6 +5080,7 @@ async fn handle_forward_proxy(
     if let crate::l7::provider::RelayOutcome::Upgraded {
         overflow,
         websocket_permessage_deflate,
+        ..
     } = outcome
     {
         let mut upgrade_options = if let (Some(config), Some(engine)) = (
@@ -6192,6 +6193,14 @@ network_policies:
         frame
     }
 
+    fn masked_close_code(frame: &[u8]) -> u16 {
+        assert_eq!(frame[0] & 0x0f, 0x08, "expected a close frame");
+        assert_eq!(frame[1] & 0x7f, 2, "expected a two-byte close code");
+        assert_ne!(frame[1] & 0x80, 0, "client-to-upstream close is masked");
+        let decoded = [frame[6] ^ frame[2], frame[7] ^ frame[3]];
+        u16::from_be_bytes(decoded)
+    }
+
     async fn forward_websocket_denied_after_upgrade(
         config: crate::l7::L7EndpointConfig,
         tunnel_engine: crate::opa::TunnelPolicyEngine,
@@ -6243,6 +6252,7 @@ network_policies:
             if let crate::l7::provider::RelayOutcome::Upgraded {
                 overflow,
                 websocket_permessage_deflate,
+                ..
             } = outcome
             {
                 let mut options = crate::l7::relay::upgrade_options(
@@ -6426,9 +6436,10 @@ network_policies:
         .await;
 
         assert!(err.to_string().contains("websocket text message denied"));
-        assert!(
-            leaked.is_empty(),
-            "denied forward-proxy WebSocket text frames must not reach upstream"
+        assert_eq!(
+            masked_close_code(&leaked),
+            1008,
+            "only a policy close, not the denied text frame, may reach upstream"
         );
     }
 
@@ -6479,9 +6490,10 @@ network_policies:
         .await;
 
         assert!(err.to_string().contains("websocket GraphQL message denied"));
-        assert!(
-            leaked.is_empty(),
-            "denied forward-proxy GraphQL WebSocket operations must not reach upstream"
+        assert_eq!(
+            masked_close_code(&leaked),
+            1008,
+            "only a policy close, not the denied GraphQL operation, may reach upstream"
         );
     }
 

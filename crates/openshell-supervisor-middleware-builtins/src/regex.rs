@@ -52,6 +52,7 @@ pub fn describe() -> MiddlewareBinding {
         phase: SupervisorMiddlewarePhase::PreCredentials as i32,
         max_body_bytes: MAX_BODY_BYTES,
         timeout: String::new(),
+        max_message_bytes: 0,
     }
 }
 

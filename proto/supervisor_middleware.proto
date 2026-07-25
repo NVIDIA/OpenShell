@@ -20,6 +20,13 @@ service SupervisorMiddleware {
   // EvaluateHttpRequest returns an allow, deny, or mutation decision for one
   // buffered HTTP request.
   rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult);
+
+  // EvaluateWebSocket opens one ordered stream for a single middleware stage
+  // and WebSocket upgrade attempt. PR 1 supports client-to-upstream text
+  // messages at PRE_CREDENTIALS. A request may go unanswered when the session
+  // terminates; OpenShell then sends session_end on a best-effort basis.
+  rpc EvaluateWebSocket(stream WebSocketEvaluationRequest)
+      returns (stream WebSocketEvaluationResponse);
 }
 
 // MiddlewareManifest describes one middleware service and the bindings it
@@ -38,11 +45,14 @@ message MiddlewareManifest {
 
 // MiddlewareBinding declares one operation and phase supported by a service.
 message MiddlewareBinding {
-  // Supported operation. V1 supports HTTP_REQUEST.
+  // Supported operation.
   SupervisorMiddlewareOperation operation = 1;
-  // Supported evaluation phase. V1 supports PRE_CREDENTIALS.
+  // Supported evaluation phase. PR 1 supports PRE_CREDENTIALS. PRE_RETURN is
+  // reserved for the return-path follow-up and is rejected by current
+  // manifest validation.
   SupervisorMiddlewarePhase phase = 2;
-  // Maximum request or replacement body this binding can process.
+  // Maximum request or replacement HTTP body this binding can process.
+  // Required for HTTP_REQUEST and omitted for WEBSOCKET_MESSAGE.
   uint64 max_body_bytes = 3;
   // Optional binding-specific RPC timeout. Empty uses the operator-configured
   // service timeout, or the 500ms platform default when that is also omitted.
@@ -50,6 +60,9 @@ message MiddlewareBinding {
   // Values use an integer with an `ms` or `s` suffix and must be between
   // 10ms and 30s.
   string timeout = 4;
+  // Maximum complete WebSocket message or replacement this binding can
+  // process. Required for WEBSOCKET_MESSAGE and omitted for HTTP_REQUEST.
+  uint64 max_message_bytes = 5;
 }
 
 // ValidateConfigRequest contains one policy configuration to validate.
@@ -104,12 +117,128 @@ message HttpHeader {
 enum SupervisorMiddlewareOperation {
   SUPERVISOR_MIDDLEWARE_OPERATION_UNSPECIFIED = 0;
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST = 1;
+  SUPERVISOR_MIDDLEWARE_OPERATION_WEBSOCKET_MESSAGE = 2;
 }
 
 // Ordered phase within a supervisor operation.
 enum SupervisorMiddlewarePhase {
   SUPERVISOR_MIDDLEWARE_PHASE_UNSPECIFIED = 0;
   SUPERVISOR_MIDDLEWARE_PHASE_PRE_CREDENTIALS = 1;
+  SUPERVISOR_MIDDLEWARE_PHASE_PRE_RETURN = 2;
+}
+
+// Direction of one complete logical WebSocket message.
+enum WebSocketDirection {
+  WEB_SOCKET_DIRECTION_UNSPECIFIED = 0;
+  WEB_SOCKET_DIRECTION_CLIENT_TO_UPSTREAM = 1;
+  WEB_SOCKET_DIRECTION_UPSTREAM_TO_CLIENT = 2;
+}
+
+// Logical WebSocket message type. Raw frame mechanics are never exposed.
+enum WebSocketMessageType {
+  WEB_SOCKET_MESSAGE_TYPE_UNSPECIFIED = 0;
+  WEB_SOCKET_MESSAGE_TYPE_TEXT = 1;
+  WEB_SOCKET_MESSAGE_TYPE_BINARY = 2;
+}
+
+// Why OpenShell is ending a middleware stream.
+enum WebSocketSessionEndReason {
+  WEB_SOCKET_SESSION_END_REASON_UNSPECIFIED = 0;
+  WEB_SOCKET_SESSION_END_REASON_NORMAL_CLOSE = 1;
+  WEB_SOCKET_SESSION_END_REASON_PEER_DISCONNECT = 2;
+  WEB_SOCKET_SESSION_END_REASON_POLICY_RELOAD = 3;
+  WEB_SOCKET_SESSION_END_REASON_MIDDLEWARE_DENIAL = 4;
+  WEB_SOCKET_SESSION_END_REASON_MIDDLEWARE_FAILURE = 5;
+  WEB_SOCKET_SESSION_END_REASON_PROTOCOL_ERROR = 6;
+  WEB_SOCKET_SESSION_END_REASON_CANCELLATION = 7;
+  WEB_SOCKET_SESSION_END_REASON_UPSTREAM_REJECTED = 8;
+}
+
+// WebSocketEvaluationRequest is one ordered event in a stage-local stream.
+message WebSocketEvaluationRequest {
+  oneof request {
+    WebSocketPreflight preflight = 1;
+    WebSocketSessionStart session_start = 2;
+    WebSocketMessage message = 3;
+    WebSocketSessionEnd session_end = 4;
+  }
+}
+
+// WebSocketPreflight lets a service decline this upgrade before OpenShell
+// contacts upstream. It deliberately excludes query data, arbitrary request
+// headers, and message payloads.
+message WebSocketPreflight {
+  string session_id = 1;
+  SupervisorMiddlewarePhase phase = 2;
+  WebSocketDirection direction = 3;
+  RequestContext context = 4;
+  string scheme = 5;
+  string host = 6;
+  uint32 port = 7;
+  // Raw request path without the query string.
+  string path = 8;
+  repeated string requested_subprotocols = 9;
+  // Built-in middleware name or operator-owned registration name.
+  string middleware_name = 10;
+  // Stable policy-local configuration identity.
+  string config_name = 11;
+  google.protobuf.Struct config = 12;
+}
+
+// WebSocketSessionStart reports bounded metadata known only after the
+// upstream 101 response validates. Empty selected_subprotocol means none.
+message WebSocketSessionStart {
+  string selected_subprotocol = 1;
+}
+
+// WebSocketMessage contains one complete reconstructed logical message.
+message WebSocketMessage {
+  uint64 sequence = 1;
+  WebSocketDirection direction = 2;
+  WebSocketMessageType message_type = 3;
+  // Limited to 4 MiB by the platform and the binding-specific cap.
+  bytes payload = 4;
+}
+
+message WebSocketSessionEnd {
+  WebSocketSessionEndReason reason = 1;
+}
+
+// WebSocketPreflightAction is the service's one-time scoping decision.
+enum WebSocketPreflightAction {
+  WEB_SOCKET_PREFLIGHT_ACTION_UNSPECIFIED = 0;
+  WEB_SOCKET_PREFLIGHT_ACTION_INSPECT = 1;
+  WEB_SOCKET_PREFLIGHT_ACTION_SKIP = 2;
+}
+
+message WebSocketPreflightDecision {
+  WebSocketPreflightAction action = 1;
+}
+
+// WebSocketMessageResult contains the decision and optional replacement for
+// one message. A replacement preserves the input message type; text
+// replacements must be valid UTF-8.
+message WebSocketMessageResult {
+  uint64 sequence = 1;
+  Decision decision = 2;
+  bytes replacement = 3;
+  // True when replacement should be used, including an empty replacement.
+  bool has_replacement = 4;
+  // Free-form service diagnostic. OpenShell never exposes this to the
+  // workload or security logs. Limited to 4 KiB before discarding.
+  string reason = 5;
+  repeated Finding findings = 6;
+  map<string, string> metadata = 7;
+  // Optional stable machine-readable code for OCSF only. Unlike the HTTP
+  // reason_code, this value is never put in a WebSocket close frame.
+  string reason_code = 8;
+}
+
+message WebSocketEvaluationResponse {
+  oneof response {
+    WebSocketPreflightDecision preflight_decision = 1;
+    WebSocketMessageResult message_result = 2;
+  }
 }
 
 // RequestContext identifies the sandbox request being evaluated.

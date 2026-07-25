@@ -78,6 +78,8 @@ pub(crate) struct UpgradeRelayOptions<'a> {
     pub(crate) target: String,
     pub(crate) query_params: std::collections::HashMap<String, Vec<String>>,
     pub(crate) policy_name: String,
+    pub(crate) middleware_session: Option<openshell_supervisor_middleware::WebSocketSession>,
+    pub(crate) selected_subprotocol: Option<String>,
 }
 
 #[derive(Default)]
@@ -470,6 +472,7 @@ where
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            let websocket_chain = websocket_request.then(|| chain.clone());
             // Route selection resolved `config` per request, so re-check the
             // body against that protocol's policy after every transforming
             // stage (a no-op for REST and websocket, whose policy inputs the
@@ -506,6 +509,25 @@ where
                     return Ok(());
                 }
             };
+            let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
+                let preflight = websocket_middleware_preflight(&req, chain, &engine, ctx).await;
+                let preflight = match preflight {
+                    Ok(preflight) => preflight,
+                    Err(error) => {
+                        warn!(error = %error, "WebSocket middleware preflight failed");
+                        write_bad_gateway_response(client).await?;
+                        return Ok(());
+                    }
+                };
+                crate::l7::middleware::emit_websocket_preflight_events(ctx, &preflight);
+                if !preflight.allowed {
+                    write_bad_gateway_response(client).await?;
+                    return Ok(());
+                }
+                preflight.session
+            } else {
+                None
+            };
             let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req,
                 client,
@@ -525,11 +547,25 @@ where
             )
             .await?;
             match outcome {
-                RelayOutcome::Reusable => {}
-                RelayOutcome::Consumed => return Ok(()),
+                RelayOutcome::Reusable => {
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .await;
+                    }
+                }
+                RelayOutcome::Consumed => {
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .await;
+                    }
+                    return Ok(());
+                }
                 RelayOutcome::Upgraded {
                     overflow,
                     websocket_permessage_deflate,
+                    websocket_subprotocol,
                 } => {
                     let mut options = upgrade_options(
                         config,
@@ -540,6 +576,8 @@ where
                         Some(&engine),
                     );
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
+                    options.middleware_session = middleware_session.take();
+                    options.selected_subprotocol = websocket_subprotocol;
                     return handle_upgrade(
                         client, upstream, overflow, &ctx.host, ctx.port, options,
                     )
@@ -639,6 +677,37 @@ fn emit_activity(ctx: &L7EvalContext, denied: bool, deny_group: &'static str) {
     }
 }
 
+async fn websocket_middleware_preflight(
+    req: &crate::l7::provider::L7Request,
+    chain: &[openshell_supervisor_middleware::ChainEntry],
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+) -> Result<openshell_supervisor_middleware::WebSocketPreflightResult> {
+    let header_end = req
+        .raw_header
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map_or(req.raw_header.len(), |position| position + 4);
+    let requested_subprotocols =
+        crate::l7::rest::websocket_requested_subprotocols(&req.raw_header[..header_end])?;
+    engine
+        .middleware_runner()
+        .preflight_websocket(
+            chain,
+            openshell_supervisor_middleware::WebSocketPreflightInput {
+                session_id: uuid::Uuid::new_v4().to_string(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                sandbox_id: openshell_ocsf::ctx::ctx().sandbox_id.clone(),
+                scheme: "wss".to_string(),
+                host: ctx.host.clone(),
+                port: ctx.port,
+                path: req.target.clone(),
+                requested_subprotocols,
+            },
+        )
+        .await
+}
+
 /// Handle an upgraded connection (101 Switching Protocols).
 ///
 /// Forwards any overflow bytes from the upgrade response to the client, then
@@ -650,16 +719,29 @@ pub(crate) async fn handle_upgrade<C, U>(
     overflow: Vec<u8>,
     host: &str,
     port: u16,
-    options: UpgradeRelayOptions<'_>,
+    mut options: UpgradeRelayOptions<'_>,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    if let Some(session) = options.middleware_session.as_mut() {
+        let start = session
+            .start(options.selected_subprotocol.as_deref().unwrap_or_default())
+            .await;
+        if let Some(ctx) = options.ctx {
+            crate::l7::middleware::emit_websocket_session_start_events(ctx, &start);
+        }
+        if !start.allowed {
+            send_websocket_close(client, upstream, 1008).await;
+            return Ok(());
+        }
+    }
     let use_websocket_relay = options.websocket_request
         && (options.websocket.message_policy.inspects_messages()
             || options.websocket.permessage_deflate
-            || (options.websocket.credential_rewrite && options.secret_resolver.is_some()));
+            || (options.websocket.credential_rewrite && options.secret_resolver.is_some())
+            || options.middleware_session.is_some());
     let relay_mode = if use_websocket_relay {
         "websocket parsed relay"
     } else {
@@ -718,6 +800,8 @@ where
                 resolver,
                 inspector,
                 compression,
+                middleware_session: options.middleware_session.take(),
+                middleware_context: options.ctx,
             },
         )
         .await;
@@ -730,6 +814,18 @@ where
         .await
         .into_diagnostic()?;
     Ok(())
+}
+
+async fn send_websocket_close<C, U>(client: &mut C, upstream: &mut U, code: u16)
+where
+    C: AsyncWrite + Unpin,
+    U: AsyncWrite + Unpin,
+{
+    let payload = code.to_be_bytes();
+    let _ = crate::l7::websocket::write_unmasked_close(client, &payload).await;
+    let _ = crate::l7::websocket::write_masked_close(upstream, &payload).await;
+    let _ = client.shutdown().await;
+    let _ = upstream.shutdown().await;
 }
 
 pub(crate) fn upgrade_options<'a>(
@@ -770,6 +866,8 @@ pub(crate) fn upgrade_options<'a>(
         target: target.to_string(),
         query_params: query_params.clone(),
         policy_name: ctx.policy_name.clone(),
+        middleware_session: None,
+        selected_subprotocol: None,
     }
 }
 
@@ -956,6 +1054,7 @@ where
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            let websocket_chain = websocket_request.then(|| chain.clone());
             // REST and websocket-upgrade policy evaluates only the method,
             // path, and query, which a middleware result cannot mutate, so no
             // per-stage body re-check is needed.
@@ -1004,6 +1103,26 @@ where
                         return Ok(());
                     }
                 };
+            let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
+                let preflight =
+                    websocket_middleware_preflight(&req_with_auth, chain, engine, ctx).await;
+                let preflight = match preflight {
+                    Ok(preflight) => preflight,
+                    Err(error) => {
+                        warn!(error = %error, "WebSocket middleware preflight failed");
+                        write_bad_gateway_response(client).await?;
+                        return Ok(());
+                    }
+                };
+                crate::l7::middleware::emit_websocket_preflight_events(ctx, &preflight);
+                if !preflight.allowed {
+                    write_bad_gateway_response(client).await?;
+                    return Ok(());
+                }
+                preflight.session
+            } else {
+                None
+            };
 
             // Forward request to upstream and relay response
             let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
@@ -1025,8 +1144,19 @@ where
             )
             .await?;
             match outcome {
-                RelayOutcome::Reusable => {} // continue loop
+                RelayOutcome::Reusable => {
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .await;
+                    }
+                }
                 RelayOutcome::Consumed => {
+                    if let Some(session) = middleware_session.take() {
+                        session
+                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .await;
+                    }
                     debug!(
                         host = %ctx.host,
                         port = ctx.port,
@@ -1037,6 +1167,7 @@ where
                 RelayOutcome::Upgraded {
                     overflow,
                     websocket_permessage_deflate,
+                    websocket_subprotocol,
                 } => {
                     let mut options = upgrade_options(
                         config,
@@ -1047,6 +1178,8 @@ where
                         Some(engine),
                     );
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
+                    options.middleware_session = middleware_session.take();
+                    options.selected_subprotocol = websocket_subprotocol;
                     return handle_upgrade(
                         client, upstream, overflow, &ctx.host, ctx.port, options,
                     )
@@ -1500,6 +1633,7 @@ where
                 RelayOutcome::Upgraded {
                     overflow,
                     websocket_permessage_deflate,
+                    ..
                 } => {
                     let options = UpgradeRelayOptions {
                         websocket: WebSocketUpgradeBehavior {
@@ -3206,6 +3340,20 @@ network_policies:
     impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
         for BodyReplacingService
     {
+        type EvaluateWebSocketStream = openshell_supervisor_middleware::WebSocketResponseStream;
+
+        async fn evaluate_web_socket(
+            &self,
+            _request: tonic::Request<
+                tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>,
+            >,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented(
+                "test service does not inspect WebSocket messages",
+            ))
+        }
+
         async fn describe(
             &self,
             _request: tonic::Request<()>,
@@ -3224,6 +3372,7 @@ network_policies:
                             as i32,
                         max_body_bytes: 8192,
                         timeout: String::new(),
+                        max_message_bytes: 0,
                     }],
                 },
             ))
@@ -3693,6 +3842,20 @@ network_policies:
     impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
         for LimitService
     {
+        type EvaluateWebSocketStream = openshell_supervisor_middleware::WebSocketResponseStream;
+
+        async fn evaluate_web_socket(
+            &self,
+            _request: tonic::Request<
+                tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>,
+            >,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented(
+                "test service does not inspect WebSocket messages",
+            ))
+        }
+
         async fn describe(
             &self,
             _request: tonic::Request<()>,
@@ -3712,6 +3875,7 @@ network_policies:
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: self.max_body_bytes,
                     timeout: String::new(),
+                    max_message_bytes: 0,
                 }],
             }))
         }
