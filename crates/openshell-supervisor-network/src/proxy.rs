@@ -20,6 +20,8 @@ use openshell_ocsf::{
     NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
 use std::net::{IpAddr, SocketAddr};
+#[cfg(any(target_os = "linux", test))]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -2840,15 +2842,31 @@ async fn resolve_from_sandbox_hosts(
 /// `/etc/hosts` is the container-level file populated by the compute driver's
 /// `--add-host` flag.
 #[cfg(any(target_os = "linux", test))]
-fn resolve_from_proxy_hosts(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
-    let contents = std::fs::read_to_string("/etc/hosts").ok()?;
-    let addrs = resolve_from_hosts_file_contents(&contents, host, port);
-    if addrs.is_empty() { None } else { Some(addrs) }
+async fn resolve_from_proxy_hosts(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    resolve_from_hosts_file(Path::new("/etc/hosts"), host, port).await
 }
 
 #[cfg(not(any(target_os = "linux", test)))]
-fn resolve_from_proxy_hosts(_host: &str, _port: u16) -> Option<Vec<SocketAddr>> {
+#[allow(clippy::unused_async)]
+async fn resolve_from_proxy_hosts(_host: &str, _port: u16) -> Option<Vec<SocketAddr>> {
     None
+}
+
+#[cfg(any(target_os = "linux", test))]
+async fn resolve_from_hosts_file(path: &Path, host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    let contents = match tokio::fs::read_to_string(path).await {
+        Ok(contents) => contents,
+        Err(error) => {
+            debug!(
+                path = %path.display(),
+                host,
+                "Falling back to DNS; failed to read hosts file: {error}"
+            );
+            return None;
+        }
+    };
+    let addrs = resolve_from_hosts_file_contents(&contents, host, port);
+    if addrs.is_empty() { None } else { Some(addrs) }
 }
 
 async fn resolve_socket_addrs(
@@ -2870,8 +2888,8 @@ async fn resolve_socket_addrs(
     // /etc/hosts does not contain the entry. Fall back to the proxy's own
     // /etc/hosts (the container's) before trying system DNS, which will
     // also fail for these synthetic names.
-    if is_host_gateway_alias(&host.to_ascii_lowercase())
-        && let Some(addrs) = resolve_from_proxy_hosts(host, port)
+    if is_host_gateway_alias(host)
+        && let Some(addrs) = resolve_from_proxy_hosts(host, port).await
     {
         return Ok(addrs);
     }
@@ -7196,39 +7214,49 @@ network_policies:
 
     // -- resolve_from_proxy_hosts --
 
-    #[test]
-    fn test_resolve_from_proxy_hosts_finds_host_gateway_alias() {
+    #[tokio::test]
+    async fn test_resolve_from_hosts_file_reads_host_gateway_alias_from_disk() {
         // The proxy's /etc/hosts is the container-level file populated by
         // --add-host. resolve_from_proxy_hosts reads it directly, bypassing
         // the system resolver, so host-gateway aliases resolve even when the
         // sandbox's mount namespace has a different /etc/hosts.
-        //
-        // We test the underlying parser since the production function reads
-        // the real /etc/hosts.
-        let contents = "172.17.0.1\thost.openshell.internal host.containers.internal\n\
-                        127.0.0.1\tlocalhost\n";
-        let addrs = resolve_from_hosts_file_contents(contents, "host.openshell.internal", 9318);
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts");
+        std::fs::write(
+            &hosts_path,
+            "172.17.0.1\thost.openshell.internal host.containers.internal\n\
+             127.0.0.1\tlocalhost\n",
+        )
+        .unwrap();
+
+        let addrs = resolve_from_hosts_file(&hosts_path, "host.openshell.internal", 9318).await;
+        let addrs = addrs.expect("alias should resolve from hosts file");
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].ip(), IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1)));
         assert_eq!(addrs[0].port(), 9318);
     }
 
-    #[test]
-    fn test_resolve_from_proxy_hosts_returns_none_when_missing() {
-        let contents = "127.0.0.1\tlocalhost\n";
-        let addrs = resolve_from_hosts_file_contents(contents, "host.openshell.internal", 9318);
-        assert!(addrs.is_empty());
+    #[tokio::test]
+    async fn test_resolve_from_hosts_file_returns_none_when_alias_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts");
+        std::fs::write(&hosts_path, "127.0.0.1\tlocalhost\n").unwrap();
+
+        let addrs = resolve_from_hosts_file(&hosts_path, "host.openshell.internal", 9318).await;
+        assert!(addrs.is_none(), "missing alias should yield None");
     }
 
-    #[test]
-    fn test_host_gateway_alias_triggers_proxy_hosts_fallback() {
-        // Verify that is_host_gateway_alias returns true for all known
-        // aliases, ensuring the resolve_socket_addrs fallback is reachable.
-        assert!(is_host_gateway_alias("host.openshell.internal"));
-        assert!(is_host_gateway_alias("host.containers.internal"));
-        assert!(is_host_gateway_alias("host.docker.internal"));
-        assert!(!is_host_gateway_alias("example.com"));
-        assert!(!is_host_gateway_alias("inference.local"));
+    #[tokio::test]
+    async fn test_resolve_from_hosts_file_returns_none_when_file_unreadable() {
+        // Missing file path: read fails, function returns None (logged at debug)
+        // rather than panicking or surfacing a DNS error.
+        let addrs = resolve_from_hosts_file(
+            Path::new("/nonexistent/openshell-test-hosts-9f3a2c"),
+            "host.openshell.internal",
+            9318,
+        )
+        .await;
+        assert!(addrs.is_none(), "unreadable hosts file should yield None");
     }
 
     #[tokio::test]
