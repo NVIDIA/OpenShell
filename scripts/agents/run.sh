@@ -9,10 +9,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 OPENSHELL_BIN="${OPENSHELL_BIN:-openshell}"
+PUBLISH_BIN="${OPENSHELL_AGENT_PUBLISH_BIN:-$SCRIPT_DIR/publish.sh}"
 AGENT_ARG="${OPENSHELL_AGENT_DIR:-}"
 GATEWAY_OVERRIDE=""
 SANDBOX_NAME_OVERRIDE=""
 SANDBOX_FROM_OVERRIDE=""
+PUBLISH_TO_OVERRIDE="${OPENSHELL_AGENT_PUBLISH_TO:-}"
+PUBLISH_PLATFORM_OVERRIDE="${OPENSHELL_AGENT_PLATFORM:-}"
 HARNESS_OVERRIDE="${GATOR_HARNESS:-}"
 GITHUB_PROVIDER_OVERRIDE="${GATOR_GITHUB_PROVIDER:-}"
 CODEX_PROVIDER_OVERRIDE="${GATOR_CODEX_PROVIDER:-}"
@@ -35,6 +38,8 @@ Options:
   --gateway NAME          Gateway name to use
   --name NAME             Sandbox name
   --from DOCKERFILE|DIR   Local Dockerfile source for the sandbox image
+  --publish-to REPOSITORY Build and push the staged image to an OCI repository
+  --platform PLATFORM     Published image platform (default: linux/amd64)
   --harness NAME          Agent harness to run
   --github-provider NAME  Override the github-gator provider instance name
   --codex-provider NAME   Override the codex-gator provider instance name
@@ -83,6 +88,16 @@ while [[ $# -gt 0 ]]; do
         --from)
             [[ $# -ge 2 ]] || fail "--from requires a value"
             SANDBOX_FROM_OVERRIDE="$2"
+            shift 2
+            ;;
+        --publish-to)
+            [[ $# -ge 2 ]] || fail "--publish-to requires a value"
+            PUBLISH_TO_OVERRIDE="$2"
+            shift 2
+            ;;
+        --platform)
+            [[ $# -ge 2 ]] || fail "--platform requires a value"
+            PUBLISH_PLATFORM_OVERRIDE="$2"
             shift 2
             ;;
         --harness)
@@ -308,6 +323,19 @@ openshell_cmd() {
     "$OPENSHELL_BIN" --gateway "$GATEWAY" "$@"
 }
 
+gateway_is_remote() {
+    local gateways_json
+
+    if ! gateways_json="$("$OPENSHELL_BIN" gateway list --output json 2>/dev/null)"; then
+        return 1
+    fi
+
+    GATEWAY_NAME="$GATEWAY" ruby -rjson -e '
+      gateway = JSON.parse(STDIN.read).find { |item| item["name"] == ENV.fetch("GATEWAY_NAME") }
+      exit(gateway && gateway["is_remote"] == true ? 0 : 1)
+    ' <<<"$gateways_json"
+}
+
 upsert_provider() {
     local name="$1"
     local type="$2"
@@ -487,6 +515,8 @@ SANDBOX_FROM="${SANDBOX_FROM_OVERRIDE:-${GATOR_SANDBOX_FROM:-$(resolve_manifest_
 RUN_MODE="${RUN_MODE_OVERRIDE:-$RUNTIME_MODE}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_OVERRIDE:-$RUNTIME_POLL_INTERVAL_SECONDS}"
 MAX_TRANSIENT_FAILURES="${MAX_TRANSIENT_FAILURES_OVERRIDE:-$RUNTIME_MAX_TRANSIENT_FAILURES}"
+PUBLISH_TO="$PUBLISH_TO_OVERRIDE"
+PUBLISH_PLATFORM="${PUBLISH_PLATFORM_OVERRIDE:-linux/amd64}"
 
 case "$RUN_MODE" in
     once|watch) ;;
@@ -495,6 +525,9 @@ esac
 [[ "$POLL_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || fail "--poll-interval must be an integer number of seconds"
 [[ "$MAX_TRANSIENT_FAILURES" =~ ^[0-9]+$ ]] || fail "max_transient_failures must be an integer"
 [[ "$POLL_INTERVAL_SECONDS" -gt 0 ]] || fail "--poll-interval must be greater than zero"
+if [[ -n "$PUBLISH_PLATFORM_OVERRIDE" && -z "$PUBLISH_TO" ]]; then
+    fail "--platform requires --publish-to"
+fi
 
 for ((provider_index = 0; provider_index < PROVIDER_COUNT; provider_index++)); do
     profile_var="PROVIDER_${provider_index}_PROFILE"
@@ -648,8 +681,32 @@ RUBY
     SANDBOX_FROM="$build_dockerfile"
 }
 
+publish_immutable_sandbox_source() {
+    local repository="$1"
+    local platform="$2"
+    local published_reference
+
+    log "The published image contains the rendered operator prompt; use a private repository with an appropriate retention policy."
+    if ! published_reference="$("$PUBLISH_BIN" \
+        --from "$SANDBOX_FROM" \
+        --publish-to "$repository" \
+        --platform "$platform")"; then
+        fail "failed to publish staged immutable image"
+    fi
+    [[ "$published_reference" =~ ^.+@sha256:[0-9a-f]{64}$ ]] || fail "publisher returned an invalid digest-pinned image reference"
+    SANDBOX_FROM="$published_reference"
+    log "Published immutable image '$SANDBOX_FROM'."
+}
+
+if [[ -z "$PUBLISH_TO" ]] && gateway_is_remote; then
+    fail "gateway '$GATEWAY' is remote; use --publish-to REPOSITORY so the launcher can push an immutable image that the gateway can pull"
+fi
+
 log "Staging immutable sandbox payload from '$SANDBOX_FROM'."
 prepare_immutable_sandbox_source "$SANDBOX_FROM"
+if [[ -n "$PUBLISH_TO" ]]; then
+    publish_immutable_sandbox_source "$PUBLISH_TO" "$PUBLISH_PLATFORM"
+fi
 
 log "Configuring gateway settings."
 for ((setting_index = 0; setting_index < SETTING_COUNT; setting_index++)); do

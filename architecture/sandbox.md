@@ -34,6 +34,14 @@ only when the set is already empty; any other outcome fails the spawn.
    sync, config polling, and log push.
 6. It launches the agent command as the restricted sandbox user.
 
+Repository-owned agent launchers treat their rendered prompt, skills, subagents,
+and runtime as an immutable image payload. A local gateway can build the staged
+Docker context directly. For a remote gateway, the launcher can publish the
+context to an operator-selected OCI repository and submit the registry-reported
+digest to the gateway. Registry authentication and retention remain
+operator-owned, and digest pinning ensures the launched payload is the one that
+was staged.
+
 ## Isolation Layers
 
 OpenShell uses overlapping controls rather than a single sandbox primitive:

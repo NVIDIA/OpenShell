@@ -54,6 +54,15 @@ command -v ruby
 ```
 
 The local `openshell` wrapper may recompile the CLI. If that fails, fix the local build or ask the operator before changing unrelated source.
+Remote gateway launches also require Docker with Buildx:
+
+```bash
+command -v docker
+docker buildx version
+```
+
+Authenticate Docker to an operator-selected private OCI repository before the
+launch. Do not print registry credentials or credential-helper configuration.
 
 ### Step 3: Verify GitHub Auth
 
@@ -132,6 +141,17 @@ sandbox_name="gator-pr-${pr_number}-supervised"
 
 For local image contexts passed to `--from`, use an agent-created path such as `mktemp -d`; do not pass raw user-supplied paths without validating that they are expected local Dockerfile contexts.
 
+For remote publication, accept only a repository without whitespace, a tag, or
+a digest. A registry port is allowed:
+
+```bash
+publish_repository="<operator-selected-private-repository>"
+[[ -n "$publish_repository" ]] || { echo "empty publish repository" >&2; exit 1; }
+[[ "$publish_repository" != *[[:space:]]* ]] || { echo "publish repository contains whitespace" >&2; exit 1; }
+[[ "$publish_repository" != *@* ]] || { echo "publish repository must not contain a digest" >&2; exit 1; }
+[[ "${publish_repository##*/}" != *:* ]] || { echo "publish repository must not contain a tag" >&2; exit 1; }
+```
+
 ## Standard Launches
 
 ### Launch A PR Watcher
@@ -156,6 +176,43 @@ sandbox_name="gator-pr-${pr_number}-supervised"
 ```
 
 The launcher builds the gator sandbox image when needed, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, creates the sandbox, and writes a background log under `scripts/agents/gator/logs/`.
+
+### Launch A PR Watcher On A Remote Gateway
+
+Use `--publish-to` when the selected gateway cannot access the operator's local
+Docker context. The registry repository must be private, authenticated on the
+host, and pullable by the remote gateway.
+
+```bash
+gateway_name="<selected-remote-gateway-name>"
+publish_repository="<operator-selected-private-repository>"
+pr_number="<digits-only>"
+[[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
+[[ -n "$publish_repository" ]] || { echo "empty publish repository" >&2; exit 1; }
+[[ "$publish_repository" != *[[:space:]]* ]] || { echo "publish repository contains whitespace" >&2; exit 1; }
+[[ "$publish_repository" != *@* ]] || { echo "publish repository must not contain a digest" >&2; exit 1; }
+[[ "${publish_repository##*/}" != *:* ]] || { echo "publish repository must not contain a tag" >&2; exit 1; }
+[[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
+sandbox_name="gator-pr-${pr_number}-supervised"
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+
+./scripts/agents/run.sh \
+  --agent gator \
+  --gateway "$gateway_name" \
+  --name "$sandbox_name" \
+  --publish-to "$publish_repository" \
+  --platform linux/amd64 \
+  --watch \
+  --background \
+  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
+```
+
+The launcher stages the same immutable payload used for local launches, pushes
+it with a content-derived tag, reads the pushed digest from BuildKit metadata,
+and creates the sandbox from `repository@sha256:...`. Publication finishes
+before gateway settings or providers are changed. The image contains the
+rendered operator prompt and injected agent assets, so use an appropriate
+registry retention policy.
 
 ### Launch An Issue Or Issue/PR Pair
 
@@ -342,12 +399,19 @@ Action: load `debug-openshell-cluster` and diagnose the gateway/driver. Do not k
 
 ### Image Build Failure
 
-Symptoms: Dockerfile step failure, missing package, incompatible Codex CLI, registry pull failure.
+Symptoms: Dockerfile step failure, missing package, incompatible Codex CLI,
+Buildx push failure, missing published digest, or registry pull failure.
 
 Actions:
 
 - Confirm the build context is `scripts/agents/gator/` or the intended temporary `--from` context.
 - Confirm Docker or the selected gateway runtime can pull `nvcr.io/nvidia/base/ubuntu:noble-20251013`.
+- For remote gateways, confirm Docker is authenticated to the publish repository
+  and the gateway runtime has pull access to it.
+- Pass a repository without a tag or digest to `--publish-to`; the launcher owns
+  the content tag and launches the registry-reported digest.
+- If publication fails, fix registry authentication or Buildx before retrying.
+  The launcher has not changed gateway settings or providers at that point.
 - For Codex CLI version experiments, adjust a temporary Docker context first.
 - Do not commit Dockerfile version changes unless the repo should permanently use that version.
 
@@ -386,7 +450,8 @@ When you launch or inspect gator, report:
 - Log path.
 - Target issue/PR scope.
 - Harness and model when relevant.
-- Whether image build and sandbox creation succeeded.
+- Whether image build, optional publication, and sandbox creation succeeded.
+- The digest-pinned image reference for remote launches.
 - Latest sentinel or heartbeat status.
 - Any human action needed.
 

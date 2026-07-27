@@ -5,7 +5,17 @@
 
 [test]
 description = "Run all tests (Rust + Python)"
-depends = ["test:rust", "test:python", "test:sbom", "test:install-sh", "test:build-env", "test:packaging-assets", "test:docs-website"]
+depends = ["test:rust", "test:python", "test:sbom", "test:install-sh", "test:build-env", "test:packaging-assets", "test:docs-website", "test:agents"]
+
+["test:agents"]
+description = "Run repository-owned agent launcher and runtime shell tests"
+run = [
+  "scripts/agents/publish_test.sh",
+  "scripts/agents/run_test.sh",
+  "scripts/agents/runtime/supervisor_test.sh",
+  "scripts/agents/gator/bin/gh_guard_test.sh",
+]
+hide = true
 
 ["test:docs-website"]
 description = "Test the docs-website sync script"

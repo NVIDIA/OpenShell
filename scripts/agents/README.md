@@ -10,6 +10,8 @@ and execution live in `runtime/harnesses/<name>/`.
 ```text
 scripts/agents/
   run.sh                    # Generic manifest-driven launcher
+  publish.sh                # Agent-agnostic OCI publisher
+  run_test.sh               # Launcher integration tests with isolated mocks
   runtime/                  # Shared in-sandbox runtime
     entrypoint.sh           # Starts the in-sandbox supervisor
     supervisor.sh           # Runs bounded harness cycles in once/watch mode
@@ -75,24 +77,27 @@ Manifest paths support these prefixes:
    manifest-declared subagent variables such as `{{REVIEWER_COMMAND}}`.
 9. Build a temporary Docker context that bakes the rendered payload into
    `/etc/openshell/agent-payload`.
-10. Apply manifest-declared gateway settings.
-11. Resolve provider profile IDs by scanning `profile_paths` in order.
-12. Import each provider profile into the gateway. If an active profile already
+10. When `--publish-to` is set, publish that context for the selected platform
+    and replace the local source with the repository's immutable image digest.
+11. Apply manifest-declared gateway settings.
+12. Resolve provider profile IDs by scanning `profile_paths` in order.
+13. Import each provider profile into the gateway. If an active profile already
      exists, the launcher keeps going and uses it.
-13. Resolve provider credentials from host commands, JSON files, or literal
+14. Resolve provider credentials from host commands, JSON files, or literal
      manifest values.
-14. Create or update each provider instance and attach every selected provider
+15. Create or update each provider instance and attach every selected provider
      to the sandbox.
-15. Configure and rotate refresh-backed provider credentials when declared by
+16. Configure and rotate refresh-backed provider credentials when declared by
      the manifest.
-16. Run `openshell sandbox create` from that temporary Dockerfile source.
-17. Inside the sandbox, run `/etc/openshell/agent-payload/runtime/entrypoint.sh`.
-18. The runtime entrypoint starts
+17. Run `openshell sandbox create` from the temporary Dockerfile source or
+    published digest.
+18. Inside the sandbox, run `/etc/openshell/agent-payload/runtime/entrypoint.sh`.
+19. The runtime entrypoint starts
     `/etc/openshell/agent-payload/runtime/supervisor.sh`.
-19. The supervisor invokes
+20. The supervisor invokes
     `/etc/openshell/agent-payload/runtime/harnesses/<harness>/exec.sh` as a
     bounded child execution.
-20. Harness adapters prepare harness-local auth/config and execute the agent
+21. Harness adapters prepare harness-local auth/config and execute the agent
     prompt headlessly.
 
 The payload directory is baked into the image under `/etc/openshell`, which the
@@ -100,6 +105,53 @@ gator filesystem policy mounts read-only for agent processes. Prompts, skills,
 subagent definitions, and runtime scripts are agent guts, not workspace state.
 Agents should write session artifacts, checkouts, temporary files, and future
 memory records under `/sandbox` or `/tmp` instead.
+
+## Remote Gateways
+
+A remote gateway cannot build a Dockerfile from the operator's filesystem. Pass
+an OCI repository to make the launcher build and push the staged context before
+it changes gateway settings or providers:
+
+```shell
+./scripts/agents/run.sh \
+  --agent gator \
+  --gateway drew-sandbox \
+  --publish-to us-west1-docker.pkg.dev/example-project/agents/gator \
+  --platform linux/amd64 \
+  "Review and monitor PR #2253 through the gator-gate workflow."
+```
+
+Authenticate Docker to the registry first and use a repository the remote
+gateway can pull. `--publish-to` accepts a repository without a tag or digest.
+The launcher derives a content tag for the push, reads the pushed digest from
+BuildKit metadata, and gives `openshell sandbox create` the digest-pinned image.
+This prevents a mutable tag from changing between publication and launch.
+
+The staged image contains the rendered operator prompt, skills, subagents, and
+runtime. Use a private repository with an appropriate access and retention
+policy. Set `OPENSHELL_AGENT_PUBLISH_TO` and `OPENSHELL_AGENT_PLATFORM` for
+environment-based configuration. The platform defaults to `linux/amd64`.
+
+Publishing is not gator-specific. `scripts/agents/publish.sh` accepts any
+Dockerfile or Docker context and prints only the digest-pinned reference on
+standard output:
+
+```shell
+image_ref="$(
+  ./scripts/agents/publish.sh \
+    --from ./path/to/context \
+    --publish-to us-west1-docker.pkg.dev/example-project/agents/example \
+    --platform linux/amd64
+)"
+```
+
+This lets other agent launchers and CI workflows reuse the publisher without
+depending on gator's manifest, providers, prompt, or runtime.
+
+If the selected gateway is known to be remote and `--publish-to` is omitted, the
+launcher stops with guidance before changing gateway state. If gateway metadata
+cannot be read, the existing local-source behavior is preserved and the
+OpenShell CLI reports any incompatibility.
 
 ## Runtime Modes
 

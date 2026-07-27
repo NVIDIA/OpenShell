@@ -7,7 +7,9 @@ Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShe
 - `gh` is authenticated on the host and has access to `NVIDIA/OpenShell` and `NVIDIA/OpenShell-Community`.
 - For `--harness codex`, `codex login` has created `$HOME/.codex/auth.json`.
 - For `--harness codex`, local Codex auth must include an access token, refresh token, and account ID.
-- A local gateway is available when using the default local Dockerfile source.
+- A local gateway is available when using the default local Dockerfile source,
+  or Docker Buildx is authenticated to a private OCI repository that the remote
+  gateway can pull.
 
 ## Usage
 
@@ -20,6 +22,28 @@ Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShe
 ```
 
 By default the launcher uses `scripts/agents/gator/Dockerfile` as the sandbox source. Local gateways build `scripts/agents/gator/` as the image context, so gator-specific image files such as `policy.yaml` and `bin/gh` stay with the gator agent. The launcher bakes rendered prompts, skills, subagents, and shared runtime files into `/etc/openshell/agent-payload`, so `--from` must point to a local Dockerfile or directory containing a Dockerfile.
+
+For a remote gateway, publish that fully staged context and launch its immutable
+digest:
+
+```shell
+./scripts/agents/run.sh \
+  --agent gator \
+  --gateway drew-sandbox \
+  --publish-to us-west1-docker.pkg.dev/example-project/agents/gator \
+  --platform linux/amd64 \
+  --watch \
+  --background \
+  "Review and monitor PR #2253 through the gator-gate workflow. Scope this invocation only to PR #2253."
+```
+
+Configure Docker's registry credential helper before launching. The repository
+must not include a tag or digest, and the remote gateway needs pull access. The
+launcher uses a content-derived push tag but creates the sandbox from the
+registry-reported digest. Because the image includes the rendered operator
+prompt and injected agent assets, use a private repository and an appropriate
+retention policy. `OPENSHELL_AGENT_PUBLISH_TO` and
+`OPENSHELL_AGENT_PLATFORM` are the equivalent environment variables.
 
 Use `--harness codex` to select Codex explicitly. Other harness names are rejected until their support is added to `agent.yaml` and `scripts/agents/runtime/harnesses/<name>/`. Agent directories do not carry their own harness implementations; they provide prompt templates and optional skills or subagents for the shared runtime to inject.
 
