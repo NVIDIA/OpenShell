@@ -262,6 +262,8 @@ pub struct HostInfo {
     #[serde(default)]
     pub network_backend: String,
     #[serde(default)]
+    pub rootless_network_cmd: String,
+    #[serde(default)]
     pub security: SecurityInfo,
 }
 
@@ -900,6 +902,24 @@ mod tests {
         // Exactly at the limit should be accepted.
         let exact_name = "a".repeat(MAX_NAME_LEN);
         assert!(validate_name(&exact_name).is_ok());
+    }
+
+    #[test]
+    fn system_info_parses_rootless_network_helper() {
+        let info: SystemInfo = serde_json::from_str(
+            r#"{
+                "host": {
+                    "cgroupVersion": "v2",
+                    "networkBackend": "netavark",
+                    "rootlessNetworkCmd": "pasta",
+                    "security": {"rootless": true}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(info.host.security.rootless);
+        assert_eq!(info.host.rootless_network_cmd, "pasta");
     }
 
     #[tokio::test]

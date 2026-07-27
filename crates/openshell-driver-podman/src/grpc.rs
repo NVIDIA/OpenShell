@@ -46,7 +46,10 @@ impl ComputeDriver for ComputeDriverService {
         _request: Request<GetGatewayListenerRequirementsRequest>,
     ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
         Ok(Response::new(GetGatewayListenerRequirementsResponse {
-            requirements: Vec::new(),
+            requirements: self
+                .driver
+                .gateway_listener_requirements()
+                .map_err(Status::from)?,
         }))
     }
 

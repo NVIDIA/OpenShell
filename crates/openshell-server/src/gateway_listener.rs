@@ -3,7 +3,7 @@
 
 use crate::compute::GatewayListenerRequirement;
 use openshell_core::{ComputeDriverKind, Error, Result};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -71,56 +71,148 @@ fn gateway_listener_specs(
     bind_address: SocketAddr,
     requirements: &[GatewayListenerRequirement],
 ) -> Result<Vec<GatewayListenerSpec>> {
+    let needs_default_route_resolution = requirements.iter().any(|requirement| {
+        matches!(
+            requirement,
+            GatewayListenerRequirement::DefaultRouteInterface { .. }
+        )
+    });
+    let default_route_ip = if needs_default_route_resolution {
+        Some(gateway_default_route_ip()?)
+    } else {
+        None
+    };
+    gateway_listener_specs_with_default_route_ip(bind_address, requirements, default_route_ip)
+}
+
+fn gateway_listener_specs_with_default_route_ip(
+    bind_address: SocketAddr,
+    requirements: &[GatewayListenerRequirement],
+    default_route_ip: Option<IpAddr>,
+) -> Result<Vec<GatewayListenerSpec>> {
     let mut specs = vec![GatewayListenerSpec::new(
         bind_address,
         GatewayListenerScope::Primary,
     )];
+
+    // Resolve exact requirements first so they can satisfy a later semantic
+    // requirement regardless of driver response ordering.
     for requirement in requirements {
+        let GatewayListenerRequirement::Exact { address, .. } = requirement else {
+            continue;
+        };
         validate_gateway_listener_requirement(bind_address, requirement)?;
-        let address = requirement.address;
-        let scope = GatewayListenerScope::ComputeDriverCallback;
-        if let Some(existing) = specs
-            .iter()
-            .position(|existing| listener_covers(existing.address, address))
-        {
-            let existing = &mut specs[existing];
-            if existing.address != address
-                && !existing
-                    .covered_addresses
-                    .iter()
-                    .any(|covered| covered.address == address)
-            {
-                existing.covered_addresses.push(CoveredGatewayAddress {
-                    address,
-                    scope,
-                });
-            }
-        } else {
-            specs.push(GatewayListenerSpec {
-                address,
-                scope,
-                covered_addresses: Vec::new(),
-                provenance: Some(GatewayListenerProvenance {
-                    driver_name: requirement.driver_name.clone(),
-                    reason: requirement.reason.clone(),
-                }),
-            });
-        }
+        add_callback_listener_spec(&mut specs, *address, requirement);
     }
+
+    for requirement in requirements {
+        let GatewayListenerRequirement::DefaultRouteInterface { .. } = requirement else {
+            continue;
+        };
+        validate_gateway_listener_requirement(bind_address, requirement)?;
+        let Some(ip) = default_route_ip else {
+            return Err(Error::config(format!(
+                "compute driver '{}' requested the gateway default-route interface, but no IPv4 source address was resolved (reason: {})",
+                requirement.driver_name(),
+                requirement.reason()
+            )));
+        };
+        if !gateway_default_route_ip_is_usable(ip) {
+            return Err(Error::config(format!(
+                "compute driver '{}' requested the gateway default-route interface, but its resolved address {ip} is not a private IPv4 address (reason: {})",
+                requirement.driver_name(),
+                requirement.reason()
+            )));
+        }
+        let address = SocketAddr::new(ip, bind_address.port());
+        validate_resolved_gateway_listener(bind_address, address)?;
+        add_callback_listener_spec(&mut specs, address, requirement);
+    }
+
+    for requirement in requirements {
+        let GatewayListenerRequirement::LoopbackInterface { .. } = requirement else {
+            continue;
+        };
+        validate_gateway_listener_requirement(bind_address, requirement)?;
+        let address = SocketAddr::from(([127, 0, 0, 1], bind_address.port()));
+        validate_resolved_gateway_listener(bind_address, address)?;
+        add_callback_listener_spec(&mut specs, address, requirement);
+    }
+
     Ok(specs)
+}
+
+fn add_callback_listener_spec(
+    specs: &mut Vec<GatewayListenerSpec>,
+    address: SocketAddr,
+    requirement: &GatewayListenerRequirement,
+) {
+    let scope = GatewayListenerScope::ComputeDriverCallback;
+    if let Some(existing) = specs
+        .iter_mut()
+        .find(|existing| listener_covers(existing.address, address))
+    {
+        if existing.address != address
+            && !existing
+                .covered_addresses
+                .iter()
+                .any(|covered| covered.address == address)
+        {
+            existing
+                .covered_addresses
+                .push(CoveredGatewayAddress { address, scope });
+        }
+        return;
+    }
+    specs.push(callback_listener_spec(address, requirement));
+}
+
+fn callback_listener_spec(
+    address: SocketAddr,
+    requirement: &GatewayListenerRequirement,
+) -> GatewayListenerSpec {
+    GatewayListenerSpec {
+        address,
+        scope: GatewayListenerScope::ComputeDriverCallback,
+        covered_addresses: Vec::new(),
+        provenance: Some(GatewayListenerProvenance {
+            driver_name: requirement.driver_name().to_string(),
+            reason: requirement.reason().to_string(),
+        }),
+    }
 }
 
 fn validate_gateway_listener_requirement(
     primary_listener: SocketAddr,
     requirement: &GatewayListenerRequirement,
 ) -> Result<()> {
-    let requested_listener = requirement.address;
-    if requirement.driver_name != ComputeDriverKind::Docker.as_str() {
-        return Err(Error::config(format!(
-            "compute driver '{}' is not authorized to request gateway listeners in this proof of concept",
-            requirement.driver_name
-        )));
+    match requirement {
+        GatewayListenerRequirement::Exact {
+            address,
+            driver_name,
+            ..
+        } if driver_name == ComputeDriverKind::Docker.as_str()
+            || driver_name == ComputeDriverKind::Podman.as_str() =>
+        {
+            validate_resolved_gateway_listener(primary_listener, *address)
+        }
+        GatewayListenerRequirement::DefaultRouteInterface { driver_name, .. }
+        | GatewayListenerRequirement::LoopbackInterface { driver_name, .. }
+            if driver_name == ComputeDriverKind::Podman.as_str() =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::config(format!(
+            "compute driver '{}' is not authorized for this gateway listener requirement in this proof of concept",
+            requirement.driver_name()
+        ))),
     }
+}
+
+fn validate_resolved_gateway_listener(
+    primary_listener: SocketAddr,
+    requested_listener: SocketAddr,
+) -> Result<()> {
     if requested_listener.ip().is_unspecified() {
         return Err(Error::config(format!(
             "compute driver requested wildcard gateway listener {requested_listener}"
@@ -144,6 +236,35 @@ fn validate_gateway_listener_requirement(
         )));
     }
     Ok(())
+}
+
+fn gateway_default_route_ip_is_usable(address: IpAddr) -> bool {
+    matches!(address, IpAddr::V4(address) if address.is_private())
+}
+
+#[cfg(target_os = "linux")]
+fn gateway_default_route_ip() -> Result<IpAddr> {
+    // UDP connect performs a local route lookup without sending a packet. The
+    // selected source address follows the IPv4 default route, matching pasta's
+    // default upstream-interface selection.
+    let socket =
+        std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).map_err(|err| {
+            Error::config(format!("failed to open default-route probe socket: {err}"))
+        })?;
+    socket
+        .connect((std::net::Ipv4Addr::new(192, 0, 2, 1), 9))
+        .map_err(|err| Error::config(format!("failed to resolve IPv4 default route: {err}")))?;
+    socket
+        .local_addr()
+        .map(|address| address.ip())
+        .map_err(|err| Error::config(format!("failed to read IPv4 default-route address: {err}")))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn gateway_default_route_ip() -> Result<IpAddr> {
+    Err(Error::config(
+        "default-route gateway listener requirements are supported only on Linux",
+    ))
 }
 
 pub async fn bind_gateway_listeners(
@@ -205,8 +326,8 @@ fn listener_covers(existing: SocketAddr, requested: SocketAddr) -> bool {
     }
 
     match (existing.ip(), requested.ip()) {
-        (std::net::IpAddr::V4(existing), std::net::IpAddr::V4(_)) => existing.is_unspecified(),
-        (std::net::IpAddr::V6(existing), std::net::IpAddr::V6(_)) => existing.is_unspecified(),
+        (IpAddr::V4(existing), IpAddr::V4(_)) => existing.is_unspecified(),
+        (IpAddr::V6(existing), IpAddr::V6(_)) => existing.is_unspecified(),
         _ => false,
     }
 }
@@ -216,6 +337,7 @@ mod tests {
     use super::{
         CoveredGatewayAddress, GatewayListenerProvenance, GatewayListenerScope,
         GatewayListenerSpec, bind_gateway_listeners, gateway_listener_specs,
+        gateway_listener_specs_with_default_route_ip,
     };
     use crate::compute::GatewayListenerRequirement;
     use std::net::SocketAddr;
@@ -299,7 +421,7 @@ mod tests {
     #[test]
     fn gateway_listener_specs_reject_unauthorized_external_driver() {
         let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let requirement = GatewayListenerRequirement {
+        let requirement = GatewayListenerRequirement::Exact {
             address: "172.18.0.1:8080".parse().unwrap(),
             driver_name: "external-test".to_string(),
             reason: "external bridge".to_string(),
@@ -324,6 +446,155 @@ mod tests {
                 "{address} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn gateway_listener_specs_use_exact_podman_network_gateway() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let podman_gateway: SocketAddr = "10.89.1.1:8080".parse().unwrap();
+
+        assert_eq!(
+            gateway_listener_specs(primary, &[podman_listener_requirement(podman_gateway)])
+                .unwrap(),
+            vec![
+                primary_listener_spec(primary),
+                callback_listener_spec(podman_gateway, "podman", "Podman managed bridge",),
+            ]
+        );
+    }
+
+    #[test]
+    fn gateway_listener_specs_track_podman_exact_when_primary_covers_it() {
+        let primary: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let podman_gateway: SocketAddr = "10.89.1.1:8080".parse().unwrap();
+
+        assert_eq!(
+            gateway_listener_specs(
+                primary,
+                &[podman_listener_requirement(podman_gateway)],
+            )
+            .unwrap(),
+            vec![primary_listener_spec_with_covered(
+                primary,
+                podman_gateway,
+            )]
+        );
+    }
+
+    #[test]
+    fn gateway_listener_specs_resolve_podman_default_route_source() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let default_route_ip = "192.168.20.20".parse().unwrap();
+
+        assert_eq!(
+            gateway_listener_specs_with_default_route_ip(
+                primary,
+                &[podman_default_route_listener_requirement()],
+                Some(default_route_ip),
+            )
+            .unwrap(),
+            vec![
+                primary_listener_spec(primary),
+                callback_listener_spec(
+                    "192.168.20.20:8080".parse().unwrap(),
+                    "podman",
+                    "rootless pasta upstream interface",
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn gateway_listener_specs_reject_public_default_route_source() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        let err = gateway_listener_specs_with_default_route_ip(
+            primary,
+            &[podman_default_route_listener_requirement()],
+            Some("203.0.113.20".parse().unwrap()),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("not a private IPv4 address"));
+    }
+
+    #[test]
+    fn gateway_listener_specs_track_default_route_when_primary_is_ipv4_wildcard() {
+        let primary: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let default_route_ip = "192.168.20.20".parse().unwrap();
+        let callback = "192.168.20.20:8080".parse().unwrap();
+
+        assert_eq!(
+            gateway_listener_specs_with_default_route_ip(
+                primary,
+                &[podman_default_route_listener_requirement()],
+                Some(default_route_ip),
+            )
+            .unwrap(),
+            vec![primary_listener_spec_with_covered(primary, callback)]
+        );
+    }
+
+    #[test]
+    fn gateway_listener_specs_resolve_podman_loopback_separately() {
+        let primary: SocketAddr = "192.168.20.20:8080".parse().unwrap();
+
+        assert_eq!(
+            gateway_listener_specs(primary, &[podman_loopback_listener_requirement()]).unwrap(),
+            vec![
+                primary_listener_spec(primary),
+                callback_listener_spec(
+                    "127.0.0.1:8080".parse().unwrap(),
+                    "podman",
+                    "Podman machine host forwarder",
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn gateway_listener_specs_track_podman_loopback_when_wildcard_primary_covers_it() {
+        let primary = "0.0.0.0:8080".parse().unwrap();
+        let loopback = "127.0.0.1:8080".parse().unwrap();
+
+        assert_eq!(
+            gateway_listener_specs(primary, &[podman_loopback_listener_requirement()]).unwrap(),
+            vec![primary_listener_spec_with_covered(primary, loopback)]
+        );
+    }
+
+    #[test]
+    fn gateway_listener_specs_skip_podman_loopback_when_primary_is_same_address() {
+        let primary = "127.0.0.1:8080".parse().unwrap();
+
+        assert_eq!(
+            gateway_listener_specs(primary, &[podman_loopback_listener_requirement()]).unwrap(),
+            vec![primary_listener_spec(primary)]
+        );
+    }
+
+    #[test]
+    fn gateway_listener_specs_do_not_use_ipv6_listener_for_ipv4_loopback_requirement() {
+        for primary in ["[::1]:8080", "[::]:8080"] {
+            let primary = primary.parse().unwrap();
+            let specs =
+                gateway_listener_specs(primary, &[podman_loopback_listener_requirement()]).unwrap();
+
+            assert_eq!(specs.len(), 2);
+            assert_eq!(specs[1].address, SocketAddr::from(([127, 0, 0, 1], 8080)));
+        }
+    }
+
+    #[test]
+    fn gateway_listener_specs_reject_cross_driver_selector_authority() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let requirement = GatewayListenerRequirement::LoopbackInterface {
+            driver_name: "docker".to_string(),
+            reason: "wrong selector".to_string(),
+        };
+
+        let err = gateway_listener_specs(primary, &[requirement]).unwrap_err();
+        assert!(err.to_string().contains("not authorized"));
     }
 
     #[tokio::test]
@@ -355,10 +626,72 @@ mod tests {
     }
 
     fn docker_listener_requirement(address: SocketAddr) -> GatewayListenerRequirement {
-        GatewayListenerRequirement {
+        GatewayListenerRequirement::Exact {
             address,
             driver_name: "docker".to_string(),
             reason: "managed bridge".to_string(),
+        }
+    }
+
+    fn podman_listener_requirement(address: SocketAddr) -> GatewayListenerRequirement {
+        GatewayListenerRequirement::Exact {
+            address,
+            driver_name: "podman".to_string(),
+            reason: "Podman managed bridge".to_string(),
+        }
+    }
+
+    fn podman_default_route_listener_requirement() -> GatewayListenerRequirement {
+        GatewayListenerRequirement::DefaultRouteInterface {
+            driver_name: "podman".to_string(),
+            reason: "rootless pasta upstream interface".to_string(),
+        }
+    }
+
+    fn podman_loopback_listener_requirement() -> GatewayListenerRequirement {
+        GatewayListenerRequirement::LoopbackInterface {
+            driver_name: "podman".to_string(),
+            reason: "Podman machine host forwarder".to_string(),
+        }
+    }
+
+    fn primary_listener_spec(address: SocketAddr) -> GatewayListenerSpec {
+        GatewayListenerSpec {
+            address,
+            scope: GatewayListenerScope::Primary,
+            covered_addresses: Vec::new(),
+            provenance: None,
+        }
+    }
+
+    fn primary_listener_spec_with_covered(
+        address: SocketAddr,
+        covered_address: SocketAddr,
+    ) -> GatewayListenerSpec {
+        GatewayListenerSpec {
+            address,
+            scope: GatewayListenerScope::Primary,
+            covered_addresses: vec![CoveredGatewayAddress {
+                address: covered_address,
+                scope: GatewayListenerScope::ComputeDriverCallback,
+            }],
+            provenance: None,
+        }
+    }
+
+    fn callback_listener_spec(
+        address: SocketAddr,
+        driver_name: &str,
+        reason: &str,
+    ) -> GatewayListenerSpec {
+        GatewayListenerSpec {
+            address,
+            scope: GatewayListenerScope::ComputeDriverCallback,
+            covered_addresses: Vec::new(),
+            provenance: Some(GatewayListenerProvenance {
+                driver_name: driver_name.to_string(),
+                reason: reason.to_string(),
+            }),
         }
     }
 }

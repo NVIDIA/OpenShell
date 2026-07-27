@@ -71,7 +71,9 @@ use tracing::{debug, error, info, warn};
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-use compute::{ComputeRuntime, GatewayListenerRequirement};
+use compute::ComputeRuntime;
+#[cfg(test)]
+use compute::GatewayListenerRequirement;
 #[cfg(test)]
 use gateway_listener::GatewayListenerSpec;
 use gateway_listener::{BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners};
@@ -1520,7 +1522,7 @@ mod tests {
     }
 
     fn docker_listener_requirement(address: SocketAddr) -> GatewayListenerRequirement {
-        GatewayListenerRequirement {
+        GatewayListenerRequirement::Exact {
             address,
             driver_name: "docker".to_string(),
             reason: "managed bridge".to_string(),

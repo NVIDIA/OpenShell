@@ -69,10 +69,38 @@ type SharedComputeDriver =
 const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GatewayListenerRequirement {
-    pub address: SocketAddr,
-    pub driver_name: String,
-    pub reason: String,
+pub enum GatewayListenerRequirement {
+    Exact {
+        address: SocketAddr,
+        driver_name: String,
+        reason: String,
+    },
+    DefaultRouteInterface {
+        driver_name: String,
+        reason: String,
+    },
+    LoopbackInterface {
+        driver_name: String,
+        reason: String,
+    },
+}
+
+impl GatewayListenerRequirement {
+    pub fn driver_name(&self) -> &str {
+        match self {
+            Self::Exact { driver_name, .. }
+            | Self::DefaultRouteInterface { driver_name, .. }
+            | Self::LoopbackInterface { driver_name, .. } => driver_name,
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Exact { reason, .. }
+            | Self::DefaultRouteInterface { reason, .. }
+            | Self::LoopbackInterface { reason, .. } => reason,
+        }
+    }
 }
 
 /// Serializes request-side deletes for the same stable sandbox ID.
@@ -441,21 +469,37 @@ impl ComputeRuntime {
                 .requirements
                 .into_iter()
                 .map(|requirement: ProtoGatewayListenerRequirement| {
-                    let Some(Selector::ExactBindAddress(bind_address)) = requirement.selector else {
+                    let Some(selector) = requirement.selector else {
                         return Err(ComputeError::Message(format!(
-                            "compute driver '{driver_name}' returned a gateway listener requirement without an exact bind address"
+                            "compute driver '{driver_name}' returned a gateway listener requirement without a selector"
                         )));
                     };
-                    let address = bind_address.parse::<SocketAddr>().map_err(|err| {
-                        ComputeError::Message(format!(
-                            "compute driver '{driver_name}' returned invalid gateway listener address '{bind_address}': {err}"
-                        ))
-                    })?;
-                    Ok(GatewayListenerRequirement {
-                        address,
-                        driver_name: driver_name.clone(),
-                        reason: requirement.reason,
-                    })
+                    match selector {
+                        Selector::ExactBindAddress(bind_address) => {
+                            let address = bind_address.parse::<SocketAddr>().map_err(|err| {
+                                ComputeError::Message(format!(
+                                    "compute driver '{driver_name}' returned invalid gateway listener address '{bind_address}': {err}"
+                                ))
+                            })?;
+                            Ok(GatewayListenerRequirement::Exact {
+                                address,
+                                driver_name: driver_name.clone(),
+                                reason: requirement.reason,
+                            })
+                        }
+                        Selector::DefaultRouteInterface(_) => {
+                            Ok(GatewayListenerRequirement::DefaultRouteInterface {
+                                driver_name: driver_name.clone(),
+                                reason: requirement.reason,
+                            })
+                        }
+                        Selector::LoopbackInterface(_) => {
+                            Ok(GatewayListenerRequirement::LoopbackInterface {
+                                driver_name: driver_name.clone(),
+                                reason: requirement.reason,
+                            })
+                        }
+                    }
                 })
                 .collect::<Result<Vec<_>, ComputeError>>()?,
             Err(status) if status.code() == Code::Unimplemented => {
@@ -6184,7 +6228,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             runtime.gateway_listener_requirements(),
-            &[GatewayListenerRequirement {
+            &[GatewayListenerRequirement::Exact {
                 address: "172.19.0.1:17670".parse().unwrap(),
                 driver_name: "external-test".to_string(),
                 reason: "external driver managed bridge".to_string(),

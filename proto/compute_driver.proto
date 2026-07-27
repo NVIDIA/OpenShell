@@ -74,8 +74,17 @@ message GatewayListenerRequirement {
     // Concrete IP:port address requested by the driver. The POC requires the
     // port to match the gateway's fixed primary listener port.
     string exact_bind_address = 2;
+    // Ask the gateway to bind the IPv4 address selected by its default route.
+    // This matches rootless pasta's default upstream-interface selection.
+    GatewayDefaultRouteInterfaceRequirement default_route_interface = 3;
+    // Ask the gateway to ensure an IPv4 loopback listener is present. This
+    // covers runtimes whose host forwarder terminates on gateway loopback.
+    GatewayLoopbackInterfaceRequirement loopback_interface = 4;
   }
 }
+
+message GatewayDefaultRouteInterfaceRequirement {}
+message GatewayLoopbackInterfaceRequirement {}
 
 message GetGatewayListenerRequirementsResponse {
   repeated GatewayListenerRequirement requirements = 1;
