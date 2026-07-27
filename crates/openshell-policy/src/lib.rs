@@ -70,11 +70,19 @@ struct FilesystemDef {
     read_write: Vec<String>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LandlockCompatibilityDef {
+    #[default]
+    BestEffort,
+    HardRequirement,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LandlockDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    compatibility: String,
+    #[serde(default)]
+    compatibility: LandlockCompatibilityDef,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -781,7 +789,10 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
             read_write: fs.read_write,
         }),
         landlock: raw.landlock.map(|ll| LandlockPolicy {
-            compatibility: ll.compatibility,
+            compatibility: match ll.compatibility {
+                LandlockCompatibilityDef::BestEffort => "best_effort".to_string(),
+                LandlockCompatibilityDef::HardRequirement => "hard_requirement".to_string(),
+            },
         }),
         process: raw.process.map(|p| ProcessPolicy {
             run_as_user: p.run_as_user,
@@ -804,7 +815,10 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
     });
 
     let landlock = policy.landlock.as_ref().map(|ll| LandlockDef {
-        compatibility: ll.compatibility.clone(),
+        compatibility: match ll.compatibility.as_str() {
+            "hard_requirement" => LandlockCompatibilityDef::HardRequirement,
+            _ => LandlockCompatibilityDef::BestEffort,
+        },
     });
 
     let process = policy.process.as_ref().and_then(|p| {

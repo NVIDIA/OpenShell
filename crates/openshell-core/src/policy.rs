@@ -114,7 +114,11 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
                 .map(FilesystemPolicy::from)
                 .unwrap_or_default(),
             network,
-            landlock: proto.landlock.map(LandlockPolicy::from).unwrap_or_default(),
+            landlock: proto
+                .landlock
+                .map(LandlockPolicy::try_from)
+                .transpose()?
+                .unwrap_or_default(),
             process: proto.process.map(ProcessPolicy::from).unwrap_or_default(),
         })
     }
@@ -138,14 +142,19 @@ impl From<ProtoFilesystemPolicy> for FilesystemPolicy {
     }
 }
 
-impl From<ProtoLandlockPolicy> for LandlockPolicy {
-    fn from(proto: ProtoLandlockPolicy) -> Self {
-        let compatibility = if proto.compatibility == "hard_requirement" {
-            LandlockCompatibility::HardRequirement
-        } else {
-            LandlockCompatibility::BestEffort
+impl TryFrom<ProtoLandlockPolicy> for LandlockPolicy {
+    type Error = miette::Error;
+
+    fn try_from(proto: ProtoLandlockPolicy) -> Result<Self, Self::Error> {
+        let compatibility = match proto.compatibility.as_str() {
+            "best_effort" | "" => LandlockCompatibility::BestEffort,
+            "hard_requirement" => LandlockCompatibility::HardRequirement,
+            otherwise => miette::bail!(
+                "invalid landlock.compatibility {:?}; accepted: best_effort, hard_requirement",
+                otherwise
+            ),
         };
-        Self { compatibility }
+        Ok(Self { compatibility })
     }
 }
 
