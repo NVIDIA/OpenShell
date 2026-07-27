@@ -431,6 +431,9 @@ pub(crate) async fn run_server(
     // snapshot on its first poll.
     ensure_default_workspace(&store).await?;
 
+    let gateway_listeners =
+        bind_gateway_listeners(config.bind_address, state.compute.gateway_bind_addresses()).await?;
+
     if let Err(err) = state.compute.resume_persisted_sandboxes().await {
         warn!(error = %err, "Failed to resume persisted sandboxes during startup");
     }
@@ -442,12 +445,6 @@ pub(crate) async fn run_server(
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
-
-    let gateway_listeners = bind_gateway_listeners(
-        config.bind_address,
-        state.compute.gateway_bind_addresses(),
-    )
-    .await?;
 
     // Bind the unauthenticated health endpoint on a separate port when configured.
     if let Some(health_bind_address) = config.health_bind_address {
@@ -1031,8 +1028,8 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
 mod tests {
     use super::{
         ConfiguredComputeDriver, ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
-        allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
-        gateway_listener_addresses, is_benign_tls_handshake_failure,
+        allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
+        configured_compute_driver, gateway_listener_addresses, is_benign_tls_handshake_failure,
         kubernetes_sandbox_jwt_expiry_disabled, serve_gateway_listener,
     };
     use openshell_core::{
@@ -1041,7 +1038,10 @@ mod tests {
     };
     use std::io::{Error, ErrorKind};
     use std::net::SocketAddr;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::time::Duration;
     use tempfile::{TempDir, tempdir};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1522,6 +1522,30 @@ mod tests {
         assert_eq!(
             gateway_listener_addresses(primary, &[docker, docker]),
             vec![primary, docker]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_gateway_listener_bind_does_not_attempt_persisted_sandbox_resume() {
+        let occupied_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_address = occupied_listener.local_addr().unwrap();
+        let resume_attempted = AtomicBool::new(false);
+        let primary_address: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let result: openshell_core::Result<()> = async {
+            let _listeners = bind_gateway_listeners(primary_address, &[occupied_address]).await?;
+            resume_attempted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        .await;
+
+        assert!(
+            result.is_err(),
+            "binding the occupied extra gateway address should fail"
+        );
+        assert!(
+            !resume_attempted.load(Ordering::SeqCst),
+            "persisted sandbox resume must not run before every gateway listener is bound"
         );
     }
 }
