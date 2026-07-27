@@ -389,7 +389,11 @@ fn classify_accept_error(err: &std::io::Error) -> AcceptErrorClass {
             | libc::EHOSTDOWN
             | libc::EHOSTUNREACH
             | libc::EOPNOTSUPP
-            | libc::ENETUNREACH,
+            | libc::ENETUNREACH
+            | libc::ENOSR
+            | libc::ESOCKTNOSUPPORT
+            | libc::EPROTONOSUPPORT
+            | libc::ETIMEDOUT,
         ) => AcceptErrorClass::Transient,
         #[cfg(target_os = "linux")]
         Some(libc::ENONET) => AcceptErrorClass::Transient,
@@ -407,7 +411,7 @@ fn classify_accept_error(_err: &std::io::Error) -> AcceptErrorClass {
 fn is_resource_pressure_error(err: &std::io::Error) -> bool {
     matches!(
         err.raw_os_error(),
-        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::ENOSR)
     )
 }
 
@@ -10018,6 +10022,9 @@ network_policies:
         assert!(is_resource_pressure_error(
             &std::io::Error::from_raw_os_error(libc::ENOMEM)
         ));
+        assert!(is_resource_pressure_error(
+            &std::io::Error::from_raw_os_error(libc::ENOSR)
+        ));
     }
 
     #[cfg(unix)]
@@ -10188,6 +10195,9 @@ network_policies:
             libc::EHOSTUNREACH,
             libc::EOPNOTSUPP,
             libc::ENETUNREACH,
+            libc::ESOCKTNOSUPPORT,
+            libc::EPROTONOSUPPORT,
+            libc::ETIMEDOUT,
         ] {
             assert_eq!(
                 classify_accept_error(&std::io::Error::from_raw_os_error(errno)),
@@ -10215,6 +10225,10 @@ network_policies:
         );
         assert_eq!(
             classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENOMEM)),
+            AcceptErrorClass::Transient,
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENOSR)),
             AcceptErrorClass::Transient,
         );
     }
