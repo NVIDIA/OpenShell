@@ -264,7 +264,7 @@ fn request_pipeline_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -
             &normalized_body_limit(right.graphql_max_body_bytes),
         );
     }
-    if is_json_rpc_family(&left.protocol) && is_json_rpc_family(&right.protocol) {
+    if left.protocol.eq_ignore_ascii_case(&right.protocol) && is_json_rpc_family(&left.protocol) {
         push_conflict(
             &mut conflicts,
             "json_rpc_max_body_bytes",
@@ -893,6 +893,43 @@ mod tests {
                 .conflicts
                 .iter()
                 .any(|field| field.contains("allow_encoded_slash"))
+        );
+    }
+
+    #[test]
+    fn json_rpc_body_limit_is_compared_only_within_the_same_protocol() {
+        let mut json_rpc = endpoint("api.example.com", 443);
+        json_rpc.protocol = "json-rpc".to_string();
+        json_rpc.json_rpc_max_body_bytes = 1_024;
+
+        let mut mcp = endpoint("api.example.com", 443);
+        mcp.protocol = "mcp".to_string();
+        mcp.json_rpc_max_body_bytes = 2_048;
+
+        let mixed_protocol = find_endpoint_ambiguities(&policy_with(json_rpc, mcp.clone()));
+        assert_eq!(mixed_protocol.len(), 1);
+        assert!(
+            mixed_protocol[0]
+                .conflicts
+                .iter()
+                .any(|field| field.contains("protocol"))
+        );
+        assert!(
+            !mixed_protocol[0]
+                .conflicts
+                .iter()
+                .any(|field| field.contains("json_rpc_max_body_bytes"))
+        );
+
+        let mut other_mcp = mcp.clone();
+        other_mcp.json_rpc_max_body_bytes = 4_096;
+        let same_protocol = find_endpoint_ambiguities(&policy_with(mcp, other_mcp));
+        assert_eq!(same_protocol.len(), 1);
+        assert!(
+            same_protocol[0]
+                .conflicts
+                .iter()
+                .any(|field| field.contains("json_rpc_max_body_bytes"))
         );
     }
 
