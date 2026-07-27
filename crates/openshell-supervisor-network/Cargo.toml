@@ -34,7 +34,7 @@ rcgen = { workspace = true }
 regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob"] }
 reqwest = { workspace = true }
 rustls = { workspace = true }
-rustls-native-certs = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true }
 rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -53,7 +53,6 @@ webpki-roots = { workspace = true, optional = true }
 [features]
 default = ["bundled-ca-roots"]
 bundled-ca-roots = ["dep:webpki-roots"]
-system-ca-roots = ["dep:rustls-native-certs"]
 
 [dev-dependencies]
 openshell-core = { path = "../openshell-core", features = ["test-helpers"] }

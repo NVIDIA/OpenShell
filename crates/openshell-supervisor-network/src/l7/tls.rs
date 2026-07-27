@@ -20,12 +20,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-#[cfg(all(feature = "bundled-ca-roots", feature = "system-ca-roots"))]
-compile_error!("features bundled-ca-roots and system-ca-roots are mutually exclusive");
-
-#[cfg(not(any(feature = "bundled-ca-roots", feature = "system-ca-roots")))]
-compile_error!("one of bundled-ca-roots or system-ca-roots must be enabled");
-
 const MAX_CACHED_CERTS: usize = 256;
 
 /// System CA bundle search paths (common Linux locations).
@@ -209,7 +203,7 @@ pub async fn tls_connect_upstream(
 /// with any locally-installed CAs from `system_ca_bundle` (e.g. corporate or private
 /// CAs added to `/etc/pki/ca-trust`). Duplicates with the Mozilla bundle are harmless.
 ///
-/// In `system-ca-roots` mode this uses the platform/native trust store exclusively;
+/// Without `bundled-ca-roots` this uses the platform/native trust store exclusively;
 /// `system_ca_bundle` is ignored because the native store already reflects all
 /// operator-installed trust anchors.
 pub fn build_upstream_client_config(system_ca_bundle: &str) -> Result<Arc<ClientConfig>> {
@@ -241,7 +235,7 @@ fn build_upstream_root_store(system_ca_bundle: &str) -> Result<rustls::RootCertS
         }
     }
 
-    #[cfg(feature = "system-ca-roots")]
+    #[cfg(not(feature = "bundled-ca-roots"))]
     {
         let _ = system_ca_bundle; // native store already includes operator-installed CAs
         add_native_roots(&mut root_store)?;
@@ -254,7 +248,7 @@ fn build_upstream_root_store(system_ca_bundle: &str) -> Result<rustls::RootCertS
     Ok(root_store)
 }
 
-#[cfg(feature = "system-ca-roots")]
+#[cfg(not(feature = "bundled-ca-roots"))]
 fn add_native_roots(root_store: &mut rustls::RootCertStore) -> Result<()> {
     let native_certs = rustls_native_certs::load_native_certs();
     let cert_count = native_certs.certs.len();
@@ -312,7 +306,7 @@ pub fn write_ca_files(
 /// Returns `(added, ignored)` counts. Invalid or unparseable certificates
 /// are silently ignored, matching the behavior of
 /// `RootCertStore::add_parsable_certificates`.
-#[cfg_attr(feature = "system-ca-roots", allow(dead_code))]
+#[cfg_attr(not(feature = "bundled-ca-roots"), allow(dead_code))]
 fn load_pem_certs_into_store(
     root_store: &mut rustls::RootCertStore,
     pem_data: &str,
