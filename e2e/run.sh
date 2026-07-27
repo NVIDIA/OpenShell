@@ -19,12 +19,14 @@ e2e_preserve_mise_dirs
 usage() {
 	cat <<'EOF'
 Usage:
-  e2e/run.sh [--vm DISTRO] [--with CONFIG ...] \
+  e2e/run.sh [--vm DISTRO] [--with CONFIG ...] [--guest-setup PATH] \
     --gateway-config PATH --suite NAME
 
 Options:
   --vm DISTRO          Run the gateway in a Nix test VM
   --with CONFIG        Apply a Nix test-VM configuration; repeatable
+  --guest-setup PATH   Run an executable setup script in the guest before the
+                       gateway starts; requires VM mode
   --gateway-config PATH
                        Fully resolved gateway TOML
   --suite NAME         Host-side suite at e2e/suites/NAME.sh
@@ -95,6 +97,8 @@ gateway_config=
 gateway_config_set=0
 suite_name=
 suite_set=0
+guest_setup=
+guest_setup_set=0
 with_configurations=()
 
 while [ "$#" -gt 0 ]; do
@@ -111,6 +115,15 @@ while [ "$#" -gt 0 ]; do
 	--with)
 		require_value "$1" "$#" "${2:-}"
 		with_configurations+=("$2")
+		shift 2
+		;;
+	--guest-setup)
+		require_value "$1" "$#" "${2:-}"
+		if [ "${guest_setup_set}" -eq 1 ]; then
+			die "--guest-setup may be supplied only once"
+		fi
+		guest_setup=$2
+		guest_setup_set=1
 		shift 2
 		;;
 	--gateway-config)
@@ -165,6 +178,12 @@ if [ ! -x "${suite_path}" ]; then
 	die "suite is not executable: ${suite_path}"
 fi
 suite_path="$(resolve_file "${suite_path}")"
+if [ "${guest_setup_set}" -eq 1 ]; then
+	guest_setup_source=${guest_setup}
+	if ! guest_setup="$(resolve_file "${guest_setup_source}")"; then
+		die "guest setup script does not exist: ${guest_setup_source}"
+	fi
+fi
 
 mode=host
 if [ "${vm_set}" -eq 1 ] || [ "${#with_configurations[@]}" -gt 0 ]; then
@@ -172,6 +191,9 @@ if [ "${vm_set}" -eq 1 ] || [ "${#with_configurations[@]}" -gt 0 ]; then
 	if [ "${vm_set}" -eq 0 ]; then
 		vm=ubuntu
 	fi
+fi
+if [ "${guest_setup_set}" -eq 1 ] && [ "${mode}" != vm ]; then
+	die "--guest-setup requires VM mode"
 fi
 
 if [ "${mode}" = vm ]; then
@@ -441,6 +463,10 @@ else
 	runtime_log="${run_dir}/vm.log"
 	guest_launcher="${run_dir}/launch-gateway.sh"
 	guest_launcher_path="/home/openshell/.cache/openshell-e2e/bin/launch-gateway"
+	guest_setup_path=
+	if [ "${guest_setup_set}" -eq 1 ]; then
+		guest_setup_path="/home/openshell/.cache/openshell-e2e/bin/guest-setup"
+	fi
 	config_payload="$(base64 <"${gateway_config}" | tr -d '\r\n')"
 	jwt_signing_payload="$(base64 <"${jwt_source_dir}/signing.pem" | tr -d '\r\n')"
 	jwt_public_payload="$(base64 <"${jwt_source_dir}/public.pem" | tr -d '\r\n')"
@@ -465,6 +491,10 @@ chmod 0600 "\${jwt_root}/signing.pem" "\${jwt_root}/public.pem" "\${jwt_root}/ki
 export XDG_CONFIG_HOME=\${state_root}/xdg/config
 export XDG_DATA_HOME=\${state_root}/xdg/data
 export XDG_STATE_HOME=\${state_root}/xdg/state
+if [ -n '${guest_setup_path}' ]; then
+	echo "==> Running guest setup"
+	'${guest_setup_path}'
+fi
 cd /home/openshell
 exec /usr/local/bin/openshell-gateway \
 	--config "\${config_path}" \
@@ -488,6 +518,9 @@ EOF
 		--copy "${guest_launcher}:${guest_launcher_path}"
 		--forward-port "${host_port}:${guest_port}"
 	)
+	if [ "${guest_setup_set}" -eq 1 ]; then
+		vm_args+=(--copy "${guest_setup}:${guest_setup_path}")
+	fi
 	if [ "${keep}" -eq 1 ]; then
 		vm_args+=(--keep)
 	fi
@@ -503,6 +536,7 @@ EOF
 	child_pid=$!
 	child_process_group=1
 fi
+export OPENSHELL_E2E_RUNTIME_LOG="${runtime_log}"
 
 wait_for_gateway() {
 	local elapsed=0

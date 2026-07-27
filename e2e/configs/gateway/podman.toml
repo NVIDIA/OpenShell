@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address = "127.0.0.1:8080"
+log_level = "info"
+compute_drivers = ["podman"]
+disable_tls = true
+
+[openshell.gateway.auth]
+allow_unauthenticated_users = true
+
+[openshell.gateway.gateway_jwt]
+signing_key_path = ".cache/openshell-e2e/gateway-jwt/signing.pem"
+public_key_path = ".cache/openshell-e2e/gateway-jwt/public.pem"
+kid_path = ".cache/openshell-e2e/gateway-jwt/kid"
+gateway_id = "openshell-e2e"
+ttl_secs = 0
+
+[openshell.drivers.podman]
+default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+image_pull_policy = "missing"
+network_name = "openshell-e2e"
+grpc_endpoint = "http://10.89.0.1:8080"
+host_gateway_ip = "10.89.0.1"
+supervisor_image = "localhost/openshell/supervisor:e2e-vm"
