@@ -64,6 +64,7 @@ const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PAT
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
 const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str =
     openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH;
+const PROXY_CA_MOUNT_PATH: &str = openshell_core::driver_utils::PROXY_CA_MOUNT_PATH;
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
     openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
 
@@ -457,6 +458,12 @@ fn upstream_proxy_cli_args(config: &PodmanComputeConfig) -> Vec<String> {
     // explicit hostname opt-in is passed through.
     if config.proxy_connect_by_hostname == Some(true) {
         args.push("--upstream-proxy-connect-by-hostname".to_string());
+    }
+    // A CA certificate is not secret, so the host PEM is bind-mounted
+    // read-only and the container-side mount path is passed on argv.
+    if config.proxy_ca_bundle.is_some() {
+        args.push("--upstream-proxy-ca-bundle".to_string());
+        args.push(PROXY_CA_MOUNT_PATH.to_string());
     }
     args
 }
@@ -1297,6 +1304,24 @@ pub fn build_container_spec_for_image(
                     options: ro,
                 });
             }
+            // Bind-mount the corporate proxy CA bundle read-only when
+            // configured. A CA certificate is not secret, so unlike the proxy
+            // credential (a driver secret) a plain read-only bind mount is
+            // used. The supervisor reads it via the --upstream-proxy-ca-bundle
+            // argv path (see upstream_proxy_cli_args) to verify an https://
+            // proxy and trust re-signed upstream certificates.
+            if let Some(ca_bundle) = &config.proxy_ca_bundle {
+                let mut ro = vec!["ro".into(), "rbind".into()];
+                if is_selinux_enabled() {
+                    ro.push("z".into());
+                }
+                m.push(Mount {
+                    kind: "bind".into(),
+                    source: ca_bundle.clone(),
+                    destination: PROXY_CA_MOUNT_PATH.into(),
+                    options: ro,
+                });
+            }
             if let Some(bin_path) = supervisor_bin_path {
                 let mut opts = vec!["ro".into(), "rbind".into()];
                 if is_selinux_enabled() {
@@ -2123,6 +2148,61 @@ mod tests {
         assert!(
             !command.iter().any(|a| a.starts_with("--upstream-proxy")),
             "no proxy flags without operator proxy config: {command:?}"
+        );
+    }
+
+    #[test]
+    fn container_spec_binds_proxy_ca_bundle_and_passes_argv() {
+        let sandbox = test_sandbox("ca-id", "ca-name");
+        let mut config = test_config();
+        config.https_proxy = Some("https://proxy.corp.com:3130".to_string());
+        config.proxy_ca_bundle = Some("/host/proxy-ca.pem".to_string());
+
+        let spec = build_container_spec(&sandbox, &config);
+        let command = spec_command(&spec);
+
+        // The container-side mount path travels on argv as a flag/value pair.
+        let idx = command
+            .iter()
+            .position(|a| a == "--upstream-proxy-ca-bundle")
+            .expect("CA bundle flag present");
+        assert_eq!(
+            command.get(idx + 1).map(String::as_str),
+            Some("/etc/openshell/tls/proxy/ca-bundle.pem")
+        );
+
+        // The host PEM is bind-mounted read-only at that container path.
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        let ca_mount = mounts
+            .iter()
+            .find(|m| {
+                m["type"].as_str() == Some("bind")
+                    && m["destination"].as_str() == Some("/etc/openshell/tls/proxy/ca-bundle.pem")
+            })
+            .expect("CA bundle bind mount present");
+        assert_eq!(ca_mount["source"].as_str(), Some("/host/proxy-ca.pem"));
+        assert!(
+            ca_mount["options"]
+                .as_array()
+                .expect("options array")
+                .iter()
+                .any(|o| o.as_str() == Some("ro")),
+            "CA bundle mount must be read-only"
+        );
+    }
+
+    #[test]
+    fn container_spec_omits_proxy_ca_bundle_when_unconfigured() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let spec = build_container_spec(&sandbox, &test_config());
+        let mounts = spec["mounts"].as_array().expect("mounts array");
+        assert!(
+            !mounts.iter().any(
+                |m| m["destination"].as_str() == Some("/etc/openshell/tls/proxy/ca-bundle.pem")
+            ),
+            "no CA bundle mount without operator config"
         );
     }
 
