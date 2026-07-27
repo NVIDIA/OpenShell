@@ -225,6 +225,16 @@ fn request_pipeline_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -
         &left.request_body_credential_rewrite,
         &right.request_body_credential_rewrite,
     );
+    if left.protocol.eq_ignore_ascii_case("websocket")
+        && right.protocol.eq_ignore_ascii_case("websocket")
+    {
+        push_conflict(
+            &mut conflicts,
+            "websocket_graphql_policy",
+            &websocket_graphql_policy(left),
+            &websocket_graphql_policy(right),
+        );
+    }
     push_conflict(
         &mut conflicts,
         "credential_signing",
@@ -271,6 +281,26 @@ fn request_pipeline_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -
         );
     }
     conflicts
+}
+
+fn websocket_graphql_policy(endpoint: &NetworkEndpoint) -> bool {
+    let allow_rule_has_graphql_fields = endpoint.rules.iter().any(|rule| {
+        rule.allow.as_ref().is_some_and(|allow| {
+            !allow.operation_type.is_empty()
+                || !allow.operation_name.is_empty()
+                || !allow.fields.is_empty()
+        })
+    });
+    let deny_rule_has_graphql_fields = endpoint.deny_rules.iter().any(|deny| {
+        !deny.operation_type.is_empty()
+            || !deny.operation_name.is_empty()
+            || !deny.fields.is_empty()
+    });
+
+    !endpoint.graphql_persisted_queries.is_empty()
+        || (!endpoint.persisted_queries.is_empty() && endpoint.persisted_queries != "deny")
+        || allow_rule_has_graphql_fields
+        || deny_rule_has_graphql_fields
 }
 
 fn push_conflict<T: fmt::Debug + PartialEq>(
@@ -346,7 +376,7 @@ fn path_patterns_overlap(left: &str, right: &str) -> bool {
     {
         return true;
     }
-    glob_patterns_overlap(left, right, '/')
+    runtime_path_patterns_overlap(left, right)
 }
 
 /// Match the runtime route-selection rank used by `L7EndpointConfig`.
@@ -364,12 +394,25 @@ fn path_selector_specificity(path: &str) -> usize {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GlobToken {
-    Literal(char),
-    Star { crosses_delimiter: bool },
+struct CharacterRange {
+    start: char,
+    end: char,
 }
 
-fn tokenize_glob(pattern: &str) -> Vec<GlobToken> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GlobToken {
+    Literal(char),
+    AnyChar,
+    CharacterClass {
+        ranges: Vec<CharacterRange>,
+        negated: bool,
+    },
+    Star {
+        crosses_delimiter: bool,
+    },
+}
+
+fn tokenize_delimited_glob(pattern: &str) -> Vec<GlobToken> {
     let chars = pattern.chars().collect::<Vec<_>>();
     let mut tokens = Vec::new();
     let mut index = 0;
@@ -391,14 +434,111 @@ fn tokenize_glob(pattern: &str) -> Vec<GlobToken> {
     tokens
 }
 
+fn tokenize_runtime_path_glob(pattern: &str) -> Option<Vec<GlobToken>> {
+    let chars = pattern.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        match chars[index] {
+            '?' => {
+                tokens.push(GlobToken::AnyChar);
+                index += 1;
+            }
+            '*' => {
+                let start = index;
+                while index < chars.len() && chars[index] == '*' {
+                    index += 1;
+                }
+                let count = index - start;
+                if count > 2 {
+                    return None;
+                }
+                if count == 2 {
+                    let starts_component = start == 0 || chars[start - 1] == '/';
+                    let ends_component = index == chars.len() || chars[index] == '/';
+                    if !starts_component || !ends_component {
+                        return None;
+                    }
+                    if index < chars.len() && chars[index] == '/' {
+                        index += 1;
+                    }
+                }
+                // `glob::Pattern::matches` uses `require_literal_separator:
+                // false`, so both `*` and `**` can consume `/`.
+                tokens.push(GlobToken::Star {
+                    crosses_delimiter: true,
+                });
+            }
+            '[' => {
+                let negated = chars.get(index + 1) == Some(&'!');
+                let content_start = index + if negated { 2 } else { 1 };
+                let close = chars[content_start..]
+                    .iter()
+                    .position(|character| *character == ']')
+                    .map(|offset| content_start + offset)?;
+                if close == content_start {
+                    return None;
+                }
+                tokens.push(GlobToken::CharacterClass {
+                    ranges: parse_character_ranges(&chars[content_start..close]),
+                    negated,
+                });
+                index = close + 1;
+            }
+            literal => {
+                tokens.push(GlobToken::Literal(literal));
+                index += 1;
+            }
+        }
+    }
+    Some(tokens)
+}
+
+fn parse_character_ranges(characters: &[char]) -> Vec<CharacterRange> {
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        if index + 2 < characters.len() && characters[index + 1] == '-' {
+            ranges.push(CharacterRange {
+                start: characters[index],
+                end: characters[index + 2],
+            });
+            index += 3;
+        } else {
+            ranges.push(CharacterRange {
+                start: characters[index],
+                end: characters[index],
+            });
+            index += 1;
+        }
+    }
+    ranges
+}
+
+fn runtime_path_patterns_overlap(left: &str, right: &str) -> bool {
+    let (Some(left), Some(right)) = (
+        tokenize_runtime_path_glob(left),
+        tokenize_runtime_path_glob(right),
+    ) else {
+        // Invalid path globs are rejected by ordinary policy validation. Keep
+        // ambiguity validation conservative if it is called independently.
+        return true;
+    };
+    token_languages_overlap(&left, &right, '/')
+}
+
 /// Decide whether two delimiter-aware glob languages intersect.
 ///
 /// This is a small product-NFA search. `*` consumes any character except the
 /// delimiter and `**` consumes any character, including the delimiter. Star
 /// epsilon transitions and self-loops make the state space finite.
 fn glob_patterns_overlap(left: &str, right: &str, delimiter: char) -> bool {
-    let left = tokenize_glob(left);
-    let right = tokenize_glob(right);
+    let left = tokenize_delimited_glob(left);
+    let right = tokenize_delimited_glob(right);
+    token_languages_overlap(&left, &right, delimiter)
+}
+
+fn token_languages_overlap(left: &[GlobToken], right: &[GlobToken], delimiter: char) -> bool {
     let mut queue = VecDeque::from([(0_usize, 0_usize)]);
     let mut seen = HashSet::new();
 
@@ -423,7 +563,7 @@ fn glob_patterns_overlap(left: &str, right: &str, delimiter: char) -> bool {
         let Some(right_token) = right.get(right_index) else {
             continue;
         };
-        if tokens_share_character(*left_token, *right_token, delimiter) {
+        if tokens_share_character(left_token, right_token, delimiter) {
             let next_left = if matches!(left_token, GlobToken::Star { .. }) {
                 left_index
             } else {
@@ -440,28 +580,105 @@ fn glob_patterns_overlap(left: &str, right: &str, delimiter: char) -> bool {
     false
 }
 
-fn tokens_share_character(left: GlobToken, right: GlobToken, delimiter: char) -> bool {
-    match (left, right) {
-        (GlobToken::Literal(left), GlobToken::Literal(right)) => left == right,
-        (GlobToken::Literal(value), GlobToken::Star { crosses_delimiter })
-        | (GlobToken::Star { crosses_delimiter }, GlobToken::Literal(value)) => {
-            crosses_delimiter || value != delimiter
+fn tokens_share_character(left: &GlobToken, right: &GlobToken, delimiter: char) -> bool {
+    let left_ranges = token_character_ranges(left, delimiter);
+    let right_ranges = token_character_ranges(right, delimiter);
+    left_ranges.iter().any(|left| {
+        right_ranges
+            .iter()
+            .any(|right| left.0 <= right.1 && right.0 <= left.1)
+    })
+}
+
+fn token_character_ranges(token: &GlobToken, delimiter: char) -> Vec<(u32, u32)> {
+    match token {
+        GlobToken::Literal(value) => vec![(u32::from(*value), u32::from(*value))],
+        GlobToken::AnyChar
+        | GlobToken::Star {
+            crosses_delimiter: true,
+        } => unicode_scalar_ranges(),
+        GlobToken::Star {
+            crosses_delimiter: false,
+        } => complement_ranges(&[(u32::from(delimiter), u32::from(delimiter))]),
+        GlobToken::CharacterClass { ranges, negated } => {
+            let ranges = normalize_ranges(
+                ranges
+                    .iter()
+                    .filter(|range| range.start <= range.end)
+                    .map(|range| (u32::from(range.start), u32::from(range.end)))
+                    .collect(),
+            );
+            if *negated {
+                complement_ranges(&ranges)
+            } else {
+                ranges
+            }
         }
-        (
-            GlobToken::Star {
-                crosses_delimiter: _,
-            },
-            GlobToken::Star {
-                crosses_delimiter: _,
-            },
-        ) => true,
     }
+}
+
+fn unicode_scalar_ranges() -> Vec<(u32, u32)> {
+    vec![(0, 0xD7FF), (0xE000, 0x0010_FFFF)]
+}
+
+fn normalize_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    ranges.sort_unstable();
+    let mut normalized: Vec<(u32, u32)> = Vec::new();
+    for (start, end) in ranges {
+        for (start, end) in intersect_with_unicode_scalars(start, end) {
+            if let Some(last) = normalized.last_mut()
+                && start <= last.1.saturating_add(1)
+            {
+                last.1 = last.1.max(end);
+            } else {
+                normalized.push((start, end));
+            }
+        }
+    }
+    normalized
+}
+
+fn intersect_with_unicode_scalars(start: u32, end: u32) -> Vec<(u32, u32)> {
+    unicode_scalar_ranges()
+        .into_iter()
+        .filter_map(|(scalar_start, scalar_end)| {
+            let start = start.max(scalar_start);
+            let end = end.min(scalar_end);
+            (start <= end).then_some((start, end))
+        })
+        .collect()
+}
+
+fn complement_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let ranges = normalize_ranges(ranges.to_vec());
+    let mut complement = Vec::new();
+    for (universe_start, universe_end) in unicode_scalar_ranges() {
+        let mut cursor = universe_start;
+        for &(start, end) in &ranges {
+            if end < universe_start || start > universe_end {
+                continue;
+            }
+            let start = start.max(universe_start);
+            let end = end.min(universe_end);
+            if cursor < start {
+                complement.push((cursor, start - 1));
+            }
+            cursor = end.saturating_add(1);
+            if cursor > universe_end {
+                break;
+            }
+        }
+        if cursor <= universe_end {
+            complement.push((cursor, universe_end));
+        }
+    }
+    complement
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::{NetworkBinary, NetworkPolicyRule};
+    use openshell_core::proto::{L7Allow, L7Rule, NetworkBinary, NetworkPolicyRule};
 
     fn endpoint(host: &str, port: u32) -> NetworkEndpoint {
         NetworkEndpoint {
@@ -558,6 +775,58 @@ mod tests {
     }
 
     #[test]
+    fn question_mark_path_overlap_is_detected() {
+        let mut left = endpoint("api.example.com", 443);
+        left.path = "/v?".to_string();
+        left.protocol = "rest".to_string();
+        let mut right = endpoint("api.example.com", 443);
+        right.path = "/v1".to_string();
+        right.protocol = "graphql".to_string();
+
+        let ambiguities = find_endpoint_ambiguities(&policy_with(left, right));
+        assert_eq!(ambiguities.len(), 1);
+        assert!(
+            ambiguities[0]
+                .conflicts
+                .iter()
+                .any(|field| field.contains("protocol"))
+        );
+    }
+
+    #[test]
+    fn overlapping_character_class_paths_are_detected() {
+        let mut left = endpoint("api.example.com", 443);
+        left.path = "/v[12]".to_string();
+        left.protocol = "rest".to_string();
+        let mut right = endpoint("api.example.com", 443);
+        right.path = "/v[23]".to_string();
+        right.protocol = "graphql".to_string();
+
+        assert_eq!(
+            find_endpoint_ambiguities(&policy_with(left, right)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn disjoint_character_class_paths_may_overlap_by_host_and_port() {
+        let mut left = endpoint("api.example.com", 443);
+        left.path = "/v[12]".to_string();
+        left.protocol = "rest".to_string();
+        let mut right = endpoint("api.example.com", 443);
+        right.path = "/v[34]".to_string();
+        right.protocol = "graphql".to_string();
+
+        assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
+    }
+
+    #[test]
+    fn negated_character_class_paths_follow_runtime_glob_semantics() {
+        assert!(runtime_path_patterns_overlap("/v[!0]", "/v1"));
+        assert!(!runtime_path_patterns_overlap("/v[!0]", "/v0"));
+    }
+
+    #[test]
     fn more_specific_path_may_override_request_pipeline_metadata() {
         let mut left = endpoint("api.example.com", 443);
         left.protocol = "rest".to_string();
@@ -625,6 +894,51 @@ mod tests {
                 .iter()
                 .any(|field| field.contains("allow_encoded_slash"))
         );
+    }
+
+    #[test]
+    fn websocket_graphql_classification_conflict_is_rejected() {
+        let mut graphql = endpoint("api.example.com", 443);
+        graphql.protocol = "websocket".to_string();
+        graphql.rules.push(L7Rule {
+            allow: Some(L7Allow {
+                operation_type: "subscription".to_string(),
+                ..Default::default()
+            }),
+        });
+        let mut transport = endpoint("api.example.com", 443);
+        transport.protocol = "websocket".to_string();
+        transport.rules.push(L7Rule {
+            allow: Some(L7Allow {
+                method: "WEBSOCKET_TEXT".to_string(),
+                ..Default::default()
+            }),
+        });
+
+        let ambiguities = find_endpoint_ambiguities(&policy_with(graphql, transport));
+        assert_eq!(ambiguities.len(), 1);
+        assert!(
+            ambiguities[0]
+                .conflicts
+                .iter()
+                .any(|field| field.contains("websocket_graphql_policy"))
+        );
+    }
+
+    #[test]
+    fn matching_websocket_graphql_classification_is_compatible() {
+        let mut left = endpoint("api.example.com", 443);
+        left.protocol = "websocket".to_string();
+        left.persisted_queries = "allow_registered".to_string();
+        let mut right = left.clone();
+        right.rules.push(L7Rule {
+            allow: Some(L7Allow {
+                operation_name: "Events".to_string(),
+                ..Default::default()
+            }),
+        });
+
+        assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
     }
 
     #[test]
