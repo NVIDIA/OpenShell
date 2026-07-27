@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const WATCH_PATHS: [&str; 2] = ["HEAD", "refs/tags"];
+const WATCH_PATHS: [&str; 3] = ["HEAD", "refs/tags", "packed-refs"];
 
 #[cfg(not(test))]
 pub fn emit_rerun_if_changed(manifest_dir: &Path) {
@@ -15,12 +15,36 @@ pub fn emit_rerun_if_changed(manifest_dir: &Path) {
 }
 
 pub fn watch_paths(manifest_dir: &Path) -> Vec<PathBuf> {
-    WATCH_PATHS
+    let mut git_paths = WATCH_PATHS
         .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+    if let Some(head_ref) = symbolic_head_ref(manifest_dir) {
+        git_paths.push(head_ref);
+    }
+
+    git_paths
+        .iter()
         .filter_map(|path| resolve_existing_git_path(manifest_dir, path))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn symbolic_head_ref(manifest_dir: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .current_dir(manifest_dir)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let head_ref = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!head_ref.is_empty()).then_some(head_ref)
 }
 
 fn resolve_existing_git_path(manifest_dir: &Path, path: &str) -> Option<PathBuf> {

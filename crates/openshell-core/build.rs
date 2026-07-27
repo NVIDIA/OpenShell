@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // build pipeline).
     git::emit_rerun_if_changed(&manifest_dir);
 
-    if let Some(version) = git_version() {
+    if let Some(version) = git_version(&manifest_dir) {
         println!("cargo:rustc-env=OPENSHELL_GIT_VERSION={version}");
     }
 
@@ -86,7 +86,7 @@ fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()
 ///   3 commits past v0.0.3  → "0.0.4-dev.3+g2bf9969"
 ///
 /// Returns `None` when git is unavailable or the repo has no matching tags.
-fn git_version() -> Option<String> {
+fn git_version(manifest_dir: &Path) -> Option<String> {
     // Match numeric release tags only (e.g. `v0.0.29`). The bare glob `v*`
     // also matches non-release tags like `vm-dev` or `vm-prod`; when one of
     // those lands on the same commit as a release tag, `git describe` picks
@@ -95,6 +95,7 @@ fn git_version() -> Option<String> {
     // those development tags without losing any release tag.
     let output = std::process::Command::new("git")
         .args(["describe", "--tags", "--long", "--match", "v[0-9]*"])
+        .current_dir(manifest_dir)
         .output()
         .ok()?;
 

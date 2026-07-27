@@ -59,8 +59,10 @@ fn resolves_metadata_paths_in_normal_checkout() {
     let (_temp, repo) = init_repository();
 
     let paths = git::watch_paths(&repo);
+    let head_ref = run_git(&repo, &["symbolic-ref", "HEAD"]);
 
     assert!(paths.contains(&git_path(&repo, "HEAD")));
+    assert!(paths.contains(&git_path(&repo, &head_ref)));
     assert!(paths.contains(&git_path(&repo, "refs/tags")));
     assert!(paths.iter().all(|path| path.exists()));
 }
@@ -77,10 +79,33 @@ fn resolves_metadata_paths_in_linked_worktree() {
 
     let paths = git::watch_paths(&worktree);
     let head = git_path(&worktree, "HEAD");
+    let head_ref = run_git(&worktree, &["symbolic-ref", "HEAD"]);
 
     assert!(paths.contains(&head));
     assert_ne!(head, worktree.join(".git/HEAD"));
+    assert!(paths.contains(&git_path(&worktree, &head_ref)));
     assert!(paths.contains(&git_path(&worktree, "refs/tags")));
+    assert!(paths.iter().all(|path| path.exists()));
+}
+
+#[test]
+fn watches_packed_refs() {
+    let (_temp, repo) = init_repository();
+    run_git(&repo, &["pack-refs", "--all"]);
+
+    let paths = git::watch_paths(&repo);
+
+    assert!(paths.contains(&git_path(&repo, "packed-refs")));
+}
+
+#[test]
+fn detached_head_does_not_require_a_symbolic_ref() {
+    let (_temp, repo) = init_repository();
+    run_git(&repo, &["checkout", "--quiet", "--detach"]);
+
+    let paths = git::watch_paths(&repo);
+
+    assert!(paths.contains(&git_path(&repo, "HEAD")));
     assert!(paths.iter().all(|path| path.exists()));
 }
 
