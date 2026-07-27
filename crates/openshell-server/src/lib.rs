@@ -71,7 +71,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-use compute::ComputeRuntime;
+use compute::{ComputeRuntime, GatewayListenerRequirement};
 #[cfg(test)]
 use gateway_listener::GatewayListenerSpec;
 use gateway_listener::{BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners};
@@ -443,8 +443,11 @@ pub(crate) async fn run_server(
     // snapshot on its first poll.
     ensure_default_workspace(&store).await?;
 
-    let gateway_listeners =
-        bind_gateway_listeners(config.bind_address, state.compute.gateway_bind_addresses()).await?;
+    let gateway_listeners = bind_gateway_listeners(
+        config.bind_address,
+        state.compute.gateway_listener_requirements(),
+    )
+    .await?;
 
     if let Err(err) = state.compute.resume_persisted_sandboxes().await {
         warn!(error = %err, "Failed to resume persisted sandboxes during startup");
@@ -1013,6 +1016,7 @@ mod tests {
         allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
         configured_compute_driver, is_benign_tls_handshake_failure,
         kubernetes_sandbox_jwt_expiry_disabled, serve_gateway_listener,
+        GatewayListenerRequirement,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -1495,7 +1499,11 @@ mod tests {
         let primary_address: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let result: openshell_core::Result<()> = async {
-            let _listeners = bind_gateway_listeners(primary_address, &[occupied_address]).await?;
+            let _listeners = bind_gateway_listeners(
+                primary_address,
+                &[docker_listener_requirement(occupied_address)],
+            )
+            .await?;
             resume_attempted.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -1509,5 +1517,13 @@ mod tests {
             !resume_attempted.load(Ordering::SeqCst),
             "persisted sandbox resume must not run before every gateway listener is bound"
         );
+    }
+
+    fn docker_listener_requirement(address: SocketAddr) -> GatewayListenerRequirement {
+        GatewayListenerRequirement {
+            address,
+            driver_name: "docker".to_string(),
+            reason: "managed bridge".to_string(),
+        }
     }
 }
