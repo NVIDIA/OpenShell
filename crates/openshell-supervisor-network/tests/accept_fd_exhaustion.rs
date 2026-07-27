@@ -78,10 +78,7 @@ fn accept_fd_exhaustion_child() {
         Err(ref e) if e.raw_os_error() == Some(libc::EMFILE) => {}
         Err(ref e) => panic!("expected EMFILE, got: {e}"),
         Ok(_) => {
-            // OS found a spare FD slot despite exhaustion attempt — platform
-            // does not reliably deliver EMFILE under these conditions.
-            eprintln!("SKIP: EMFILE not triggered (OS found a spare FD slot)");
-            return;
+            panic!("EMFILE not triggered: OS found a spare FD slot despite RLIMIT_NOFILE=32");
         }
     }
 
