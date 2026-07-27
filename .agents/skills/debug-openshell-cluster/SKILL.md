@@ -355,6 +355,23 @@ helm -n openshell get values openshell | grep sandboxNamespace
 
 Then inspect sandbox resources in that namespace.
 
+If `workspace_namespaces` is present in `gateway.toml`, inspect every mapped
+namespace rather than only `sandboxNamespace`:
+
+```bash
+kubectl -n openshell get configmap openshell-config \
+  -o jsonpath='{.data.gateway\.toml}' | grep workspace_namespaces
+kubectl -n <mapped-namespace> get sandbox,pod,event
+kubectl auth can-i list sandboxes.agents.x-k8s.io \
+  --namespace <mapped-namespace> \
+  --as system:serviceaccount:openshell:openshell
+```
+
+An unmapped workspace is rejected before the driver creates a Sandbox CR.
+Registration failures from an otherwise healthy mapped sandbox usually mean
+the gateway RoleBinding, sandbox ServiceAccount name, or projected-token
+bootstrap prerequisites differ between namespaces.
+
 Check the configured sandbox service account when TokenReview bootstrap or
 sandbox registration fails. Helm creates a dedicated sandbox service account by
 default and writes it to `[openshell.drivers.kubernetes].service_account_name`;

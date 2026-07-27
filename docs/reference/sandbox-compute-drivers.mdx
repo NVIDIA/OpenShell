@@ -312,6 +312,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 |---|---|---|
 | `compute_drivers = ["kubernetes"]` | Not applicable | Select the Kubernetes compute driver. |
 | `[openshell.drivers.kubernetes].namespace` | `server.sandboxNamespace` | Set the namespace for sandbox resources. The Helm chart defaults to the release namespace when left empty. |
+| `workspace_namespaces` | `server.workspaceNamespaces` | Map logical workspace names to pre-provisioned Kubernetes namespaces. A non-empty map fails closed for unmapped workspaces and limits lifecycle operations and bootstrap authentication to the mapped namespace set. |
 | `service_account_name` | `sandboxServiceAccount.name` | Set the Kubernetes service account assigned to sandbox pods and accepted by the gateway TokenReview bootstrap path. The Helm chart creates a dedicated sandbox service account by default. |
 | `default_image` | `server.sandboxImage` | Set the default sandbox image. |
 | `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
@@ -328,6 +329,12 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
+
+When `workspace_namespaces` is configured, the gateway opens one namespaced
+Sandbox and Event watch per distinct mapped namespace. The gateway
+ServiceAccount needs the same namespaced RoleBinding in every target namespace,
+and the configured sandbox ServiceAccount and referenced Secrets must exist in
+each namespace. Namespace creation and deletion remain operator-owned.
 
 In `combined` topology, the agent container carries the Linux capabilities
 needed by the supervisor for network namespace setup, Landlock filesystem
