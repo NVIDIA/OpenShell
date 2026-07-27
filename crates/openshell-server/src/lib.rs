@@ -298,7 +298,6 @@ pub(crate) async fn run_server(
         sandbox_index.clone(),
         sandbox_watch_bus.clone(),
         tracing_log_bus.clone(),
-        supervisor_sessions.clone(),
     )
     .await?;
     let gateway_interceptors =
@@ -796,7 +795,6 @@ async fn build_compute_runtime(
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
-    supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 ) -> Result<ComputeRuntime> {
     let driver = configured_compute_driver(config, driver_startup)?;
     info!(driver = %driver.name(), "Using compute driver");
@@ -812,7 +810,6 @@ async fn build_compute_runtime(
                 sandbox_index,
                 sandbox_watch_bus,
                 tracing_log_bus,
-                supervisor_sessions.clone(),
             )
             .await
         }
@@ -825,7 +822,6 @@ async fn build_compute_runtime(
                 sandbox_index,
                 sandbox_watch_bus,
                 tracing_log_bus,
-                supervisor_sessions,
             )
             .await
         }
@@ -837,7 +833,6 @@ async fn build_compute_runtime(
                 sandbox_index,
                 sandbox_watch_bus,
                 tracing_log_bus,
-                supervisor_sessions,
             )
             .await
         }
@@ -850,7 +845,6 @@ async fn build_compute_runtime(
                 sandbox_index,
                 sandbox_watch_bus,
                 tracing_log_bus,
-                supervisor_sessions,
             )
             .await
         }
@@ -871,7 +865,6 @@ async fn build_compute_runtime(
                 sandbox_index,
                 sandbox_watch_bus,
                 tracing_log_bus,
-                supervisor_sessions,
             )
             .await
         }

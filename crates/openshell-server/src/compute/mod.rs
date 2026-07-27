@@ -19,7 +19,6 @@ use crate::persistence::{
 };
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
-use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
 use hyper_util::rt::TokioIo;
@@ -64,6 +63,16 @@ type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
 
 const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
+const SUPERVISOR_SESSION_STATE_CAS_RETRY_LIMIT: usize = 3;
+const SUPERVISOR_PRESENCE_OBJECT_TYPE: &str = "sandbox_supervisor_presence";
+
+#[derive(Clone, PartialEq, Message)]
+struct SupervisorPresence {
+    #[prost(string, tag = "1")]
+    session_id: String,
+    #[prost(string, tag = "2")]
+    gateway_replica_id: String,
+}
 
 /// Serializes request-side deletes for the same stable sandbox ID.
 ///
@@ -367,7 +376,6 @@ pub struct ComputeRuntime {
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
-    supervisor_sessions: Arc<SupervisorSessionRegistry>,
     sync_lock: Arc<Mutex<()>>,
     delete_gates: Arc<DeleteGateRegistry>,
     gateway_bind_addresses: Vec<SocketAddr>,
@@ -392,7 +400,6 @@ impl ComputeRuntime {
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
-        supervisor_sessions: Arc<SupervisorSessionRegistry>,
         gateway_bind_addresses: Vec<SocketAddr>,
     ) -> Result<Self, ComputeError> {
         let capabilities = driver
@@ -424,7 +431,6 @@ impl ComputeRuntime {
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
-            supervisor_sessions,
             sync_lock: Arc::new(Mutex::new(())),
             delete_gates: Arc::new(DeleteGateRegistry::default()),
             gateway_bind_addresses,
@@ -464,7 +470,6 @@ impl ComputeRuntime {
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
-        supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
         let driver = Arc::new(
             DockerComputeDriver::new(&config, &docker_config)
@@ -485,7 +490,6 @@ impl ComputeRuntime {
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
-            supervisor_sessions,
             gateway_bind_addresses,
         )
         .await
@@ -497,7 +501,6 @@ impl ComputeRuntime {
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
-        supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
         let driver = KubernetesComputeDriver::new(config)
             .await
@@ -513,7 +516,6 @@ impl ComputeRuntime {
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
-            supervisor_sessions,
             Vec::new(),
         )
         .await
@@ -525,7 +527,6 @@ impl ComputeRuntime {
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
-        supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
         let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(endpoint.channel));
         Self::from_driver(
@@ -538,7 +539,6 @@ impl ComputeRuntime {
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
-            supervisor_sessions,
             Vec::new(),
         )
         .await
@@ -550,7 +550,6 @@ impl ComputeRuntime {
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
-        supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
         let driver = PodmanComputeDriver::new(config)
             .await
@@ -566,7 +565,6 @@ impl ComputeRuntime {
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
-            supervisor_sessions,
             Vec::new(),
         )
         .await
@@ -1041,12 +1039,30 @@ impl ComputeRuntime {
 
         match observed {
             Ok(Some(snapshot)) if snapshot.id == sandbox_id && snapshot.status.is_some() => {
-                let session_connected = self.supervisor_sessions.has_session(sandbox_id);
+                let supervisor_present = match self.supervisor_presence(sandbox_id).await {
+                    Ok(presence) => presence.is_some(),
+                    Err(err) => {
+                        warn!(
+                            sandbox_id,
+                            error = %err,
+                            "Failed to read supervisor presence during delete recovery; restoring pre-delete state"
+                        );
+                        let previous = transition.previous.clone();
+                        self.write_delete_recovery_with_retry(
+                            sandbox_id,
+                            deleting_resource_version,
+                            "restore pre-delete snapshot after presence read failure",
+                            |sandbox| *sandbox = previous.clone(),
+                        )
+                        .await;
+                        return;
+                    }
+                };
                 self.write_delete_recovery_with_retry(
                     sandbox_id,
                     deleting_resource_version,
                     "reconcile observed backend snapshot",
-                    |sandbox| apply_driver_snapshot(sandbox, &snapshot, session_connected),
+                    |sandbox| apply_driver_snapshot(sandbox, &snapshot, supervisor_present),
                 )
                 .await;
             }
@@ -1697,13 +1713,13 @@ impl ComputeRuntime {
         incoming: DriverSandbox,
         expected_resource_version: u64,
     ) -> Result<(), String> {
-        let session_connected = self.supervisor_sessions.has_session(&incoming.id);
+        let supervisor_present = self.supervisor_presence(&incoming.id).await?.is_some();
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(
                 &incoming.id,
                 expected_resource_version,
-                |sandbox| apply_driver_snapshot(sandbox, &incoming, session_connected),
+                |sandbox| apply_driver_snapshot(sandbox, &incoming, supervisor_present),
             )
             .await
             .map_err(|e| match e {
@@ -1721,78 +1737,288 @@ impl ComputeRuntime {
         self.sandbox_watch_bus.notify(sandbox.object_id());
         Ok(())
     }
-
-    pub async fn supervisor_session_connected(&self, sandbox_id: &str) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, true).await
-    }
-
-    pub async fn supervisor_session_disconnected(&self, sandbox_id: &str) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, false).await
-    }
-
-    async fn set_supervisor_session_state(
+    pub async fn supervisor_session_connected(
         &self,
         sandbox_id: &str,
-        connected: bool,
+        session_id: &str,
     ) -> Result<(), String> {
         let _guard = self.sync_lock.lock().await;
+        let Some(existing) = self.session_update_sandbox(sandbox_id).await? else {
+            return Ok(());
+        };
+        if !sandbox_phase_accepts_session_updates(&existing) {
+            return Ok(());
+        }
 
-        let Some(existing) = self
-            .store
+        self.write_supervisor_presence(&existing, session_id, WriteCondition::Unconditional)
+            .await
+            .map_err(|err| err.to_string())?;
+        self.set_supervisor_session_state_with_initial_snapshot(
+            sandbox_id,
+            true,
+            Some(existing),
+            Some(session_id),
+            true,
+        )
+        .await
+    }
+
+    pub async fn supervisor_session_heartbeat(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let _guard = self.sync_lock.lock().await;
+        let presence = self.supervisor_presence(sandbox_id).await?;
+        if presence
+            .as_ref()
+            .is_some_and(|(presence, _)| !self.supervisor_presence_matches(presence, session_id))
+        {
+            return Ok(());
+        }
+
+        let Some(existing) = self.session_update_sandbox(sandbox_id).await? else {
+            return Ok(());
+        };
+        if !sandbox_phase_accepts_session_updates(&existing) {
+            return Ok(());
+        }
+
+        if presence.is_none() {
+            match self
+                .write_supervisor_presence(&existing, session_id, WriteCondition::MustCreate)
+                .await
+            {
+                Ok(_)
+                | Err(
+                    crate::persistence::PersistenceError::Conflict { .. }
+                    | crate::persistence::PersistenceError::UniqueViolation { .. },
+                ) => {}
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+
+        self.set_supervisor_session_state_with_initial_snapshot(
+            sandbox_id,
+            true,
+            Some(existing),
+            Some(session_id),
+            false,
+        )
+        .await
+    }
+
+    pub async fn supervisor_session_disconnected(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let _guard = self.sync_lock.lock().await;
+        if !self
+            .remove_supervisor_presence_if_current(sandbox_id, session_id)
+            .await?
+        {
+            return Ok(());
+        }
+
+        self.set_supervisor_session_state_with_initial_snapshot(
+            sandbox_id, false, None, None, false,
+        )
+        .await
+    }
+
+    async fn session_update_sandbox(&self, sandbox_id: &str) -> Result<Option<Sandbox>, String> {
+        self.store
             .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn supervisor_presence(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<(SupervisorPresence, u64)>, String> {
+        let presence_object_id = supervisor_presence_object_id(sandbox_id);
+        let Some(record) = self
+            .store
+            .get(SUPERVISOR_PRESENCE_OBJECT_TYPE, &presence_object_id)
             .await
             .map_err(|err| err.to_string())?
         else {
-            return Ok(());
+            return Ok(None);
         };
-        let current_phase =
-            SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown);
-        if current_phase == SandboxPhase::Deleting || current_phase == SandboxPhase::Error {
-            return Ok(());
-        }
-        if !connected && current_phase != SandboxPhase::Ready {
-            return Ok(());
-        }
-        let expected_resource_version = sandbox_resource_version(&existing);
+        let presence = SupervisorPresence::decode(record.payload.as_slice())
+            .map_err(|err| format!("decode supervisor presence: {err}"))?;
+        Ok(Some((presence, record.resource_version)))
+    }
 
-        // Use CAS to update sandbox phase based on supervisor session state
-        let result = self
-            .store
-            .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
-                let sandbox_name = sandbox.object_name().to_string();
-                if connected {
-                    ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
-                    sandbox.set_phase(SandboxPhase::Ready as i32);
-                } else {
-                    ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
-                    sandbox.set_phase(SandboxPhase::Provisioning as i32);
-                }
-            })
-            .await;
+    fn supervisor_presence_matches(&self, presence: &SupervisorPresence, session_id: &str) -> bool {
+        presence.session_id == session_id && presence.gateway_replica_id == self.replica_id
+    }
 
-        // Handle not found gracefully (sandbox may have been deleted)
-        let sandbox = match result {
-            Ok(s) => s,
-            Err(crate::persistence::PersistenceError::Database(ref msg))
-                if msg.contains("not found") =>
+    async fn write_supervisor_presence(
+        &self,
+        sandbox: &Sandbox,
+        session_id: &str,
+        condition: WriteCondition,
+    ) -> crate::persistence::PersistenceResult<crate::persistence::WriteResult> {
+        let presence_object_id = supervisor_presence_object_id(sandbox.object_id());
+        let presence = SupervisorPresence {
+            session_id: session_id.to_string(),
+            gateway_replica_id: self.replica_id.clone(),
+        };
+        self.store
+            .put_if(
+                SUPERVISOR_PRESENCE_OBJECT_TYPE,
+                &presence_object_id,
+                sandbox.object_name(),
+                sandbox.object_workspace(),
+                &presence.encode_to_vec(),
+                None,
+                condition,
+            )
+            .await
+    }
+
+    async fn remove_supervisor_presence_if_current(
+        &self,
+        sandbox_id: &str,
+        session_id: &str,
+    ) -> Result<bool, String> {
+        for attempt in 1..=SUPERVISOR_SESSION_STATE_CAS_RETRY_LIMIT {
+            let Some((presence, resource_version)) = self.supervisor_presence(sandbox_id).await?
+            else {
+                return Ok(false);
+            };
+            if !self.supervisor_presence_matches(&presence, session_id) {
+                return Ok(false);
+            }
+
+            match self
+                .store
+                .delete_if(
+                    SUPERVISOR_PRESENCE_OBJECT_TYPE,
+                    &supervisor_presence_object_id(sandbox_id),
+                    resource_version,
+                )
+                .await
             {
+                Ok(deleted) => return Ok(deleted),
+                Err(crate::persistence::PersistenceError::Conflict { .. })
+                    if attempt < SUPERVISOR_SESSION_STATE_CAS_RETRY_LIMIT =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+
+        Err(format!(
+            "supervisor presence removal conflicted after \
+             {SUPERVISOR_SESSION_STATE_CAS_RETRY_LIMIT} attempts"
+        ))
+    }
+
+    async fn set_supervisor_session_state_with_initial_snapshot(
+        &self,
+        sandbox_id: &str,
+        connected: bool,
+        mut initial_snapshot: Option<Sandbox>,
+        expected_session_id: Option<&str>,
+        force_write: bool,
+    ) -> Result<(), String> {
+        for attempt in 1..=SUPERVISOR_SESSION_STATE_CAS_RETRY_LIMIT {
+            let presence = self.supervisor_presence(sandbox_id).await?;
+            let presence_matches = expected_session_id.map_or_else(
+                || presence.is_none(),
+                |expected| {
+                    presence.as_ref().is_some_and(|(presence, _)| {
+                        self.supervisor_presence_matches(presence, expected)
+                    })
+                },
+            );
+            if !presence_matches {
                 return Ok(());
             }
-            Err(crate::persistence::PersistenceError::Conflict {
-                current_resource_version,
-            }) => {
-                return Err(format!(
-                    "concurrent modification detected (current resource_version: {})",
-                    current_resource_version
-                        .map_or_else(|| "unknown".to_string(), |v| v.to_string())
-                ));
-            }
-            Err(e) => return Err(e.to_string()),
-        };
 
-        self.sandbox_index.update_from_sandbox(&sandbox);
-        self.sandbox_watch_bus.notify(sandbox_id);
-        Ok(())
+            let existing = if let Some(existing) = initial_snapshot.take() {
+                Some(existing)
+            } else {
+                self.session_update_sandbox(sandbox_id).await?
+            };
+            let Some(existing) = existing else {
+                return Ok(());
+            };
+            let current_phase =
+                SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown);
+            if current_phase == SandboxPhase::Deleting || current_phase == SandboxPhase::Error {
+                return Ok(());
+            }
+            if connected && current_phase == SandboxPhase::Ready && !force_write {
+                return Ok(());
+            }
+            if !connected && current_phase != SandboxPhase::Ready {
+                return Ok(());
+            }
+            let expected_resource_version = sandbox_resource_version(&existing);
+
+            let result = self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    sandbox_id,
+                    expected_resource_version,
+                    |sandbox| {
+                        let sandbox_name = sandbox.object_name().to_string();
+                        if connected {
+                            ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
+                            sandbox.set_phase(SandboxPhase::Ready as i32);
+                        } else {
+                            ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
+                            sandbox.set_phase(SandboxPhase::Provisioning as i32);
+                        }
+                    },
+                )
+                .await;
+
+            match result {
+                Ok(sandbox) => {
+                    self.sandbox_index.update_from_sandbox(&sandbox);
+                    self.sandbox_watch_bus.notify(sandbox_id);
+                    return Ok(());
+                }
+                Err(crate::persistence::PersistenceError::Database(ref msg))
+                    if msg.contains("not found") =>
+                {
+                    return Ok(());
+                }
+                Err(crate::persistence::PersistenceError::Conflict {
+                    current_resource_version,
+                }) if attempt < SUPERVISOR_SESSION_STATE_CAS_RETRY_LIMIT => {
+                    debug!(
+                        sandbox_id,
+                        connected,
+                        attempt,
+                        current_resource_version,
+                        "Supervisor session state update conflicted; retrying"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(crate::persistence::PersistenceError::Conflict {
+                    current_resource_version,
+                }) => {
+                    return Err(format!(
+                        "concurrent modification detected after \
+                         {SUPERVISOR_SESSION_STATE_CAS_RETRY_LIMIT} attempts \
+                         (current resource_version: {})",
+                        current_resource_version
+                            .map_or_else(|| "unknown".to_string(), |v| v.to_string())
+                    ));
+                }
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+
+        unreachable!("supervisor session state CAS retry loop always returns")
     }
 
     async fn apply_deleted(&self, sandbox_id: &str) -> Result<(), String> {
@@ -1835,6 +2061,13 @@ impl ComputeRuntime {
             .await?;
         self.cleanup_sandbox_service_endpoints(sandbox.object_id(), sandbox.object_workspace())
             .await?;
+        self.store
+            .delete(
+                SUPERVISOR_PRESENCE_OBJECT_TYPE,
+                &supervisor_presence_object_id(sandbox.object_id()),
+            )
+            .await
+            .map_err(|err| format!("delete supervisor presence: {err}"))?;
 
         self.store
             .delete_by_name(
@@ -2424,6 +2657,17 @@ fn sandbox_resource_version(sandbox: &Sandbox) -> u64 {
         .map_or(0, |metadata| metadata.resource_version)
 }
 
+fn supervisor_presence_object_id(sandbox_id: &str) -> String {
+    format!("sandbox-supervisor-presence-{sandbox_id}")
+}
+
+fn sandbox_phase_accepts_session_updates(sandbox: &Sandbox) -> bool {
+    !matches!(
+        SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown),
+        SandboxPhase::Deleting | SandboxPhase::Error
+    )
+}
+
 fn public_status_from_driver(
     status: &DriverSandboxStatus,
     phase: SandboxPhase,
@@ -2444,29 +2688,34 @@ fn public_status_from_driver(
     }
 }
 
-fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, session_connected: bool) {
+fn apply_driver_snapshot(
+    sandbox: &mut Sandbox,
+    incoming: &DriverSandbox,
+    supervisor_present: bool,
+) {
     let old_phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
     let sandbox_name = &incoming.name;
 
     let cpv = sandbox.current_policy_version();
     let (phase, mut status) = incoming.status.as_ref().map_or_else(
         || {
-            let mut phase = old_phase;
-            let supervisor_promoted = session_connected
-                && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown);
-            if supervisor_promoted {
-                phase = SandboxPhase::Ready;
-            }
+            let phase = match old_phase {
+                SandboxPhase::Error | SandboxPhase::Deleting => old_phase,
+                _ if supervisor_present => SandboxPhase::Ready,
+                _ => SandboxPhase::Provisioning,
+            };
 
             let mut status = sandbox.status.clone();
             rewrite_user_facing_conditions(&mut status, sandbox.spec.as_ref());
-            if supervisor_promoted {
+            if old_phase != SandboxPhase::Ready && phase == SandboxPhase::Ready {
                 ensure_supervisor_ready_status(&mut status, sandbox_name);
+            } else if old_phase == SandboxPhase::Ready && phase == SandboxPhase::Provisioning {
+                ensure_supervisor_not_connected_status(&mut status, sandbox_name);
             }
             (phase, status)
         },
         |incoming_status| {
-            let composed = ComposedPhase::new(incoming_status, session_connected);
+            let composed = ComposedPhase::new(incoming_status, supervisor_present);
             let mut status = Some(public_status_from_driver(
                 incoming_status,
                 composed.phase,
@@ -2542,27 +2791,23 @@ fn ensure_supervisor_ready_status(status: &mut Option<SandboxStatus>, sandbox_na
 /// do not modify it.
 struct ComposedPhase {
     phase: SandboxPhase,
-    session_connected: bool,
+    supervisor_present: bool,
     backend_ready_without_session: bool,
 }
 
 impl ComposedPhase {
-    fn new(incoming_status: &DriverSandboxStatus, session_connected: bool) -> Self {
+    fn new(incoming_status: &DriverSandboxStatus, supervisor_present: bool) -> Self {
         let backend_phase = derive_phase(Some(incoming_status));
-        // A live supervisor session is a stronger readiness signal than the backend phase.
-        // set_supervisor_session_state may have already promoted the store record to Ready
-        // before this driver snapshot arrived. Keep Ready rather than letting a lagging
-        // backend phase overwrite it.
         let phase = match backend_phase {
             SandboxPhase::Error | SandboxPhase::Deleting => backend_phase,
-            _ if session_connected => SandboxPhase::Ready,
+            _ if supervisor_present => SandboxPhase::Ready,
             _ => SandboxPhase::Provisioning,
         };
         Self {
             phase,
-            session_connected,
+            supervisor_present,
             backend_ready_without_session: backend_phase == SandboxPhase::Ready
-                && !session_connected,
+                && !supervisor_present,
         }
     }
 
@@ -2575,7 +2820,7 @@ impl ComposedPhase {
         rewrite_user_facing_conditions(status, spec);
         if self.backend_ready_without_session {
             ensure_supervisor_not_connected_status(status, sandbox_name);
-        } else if self.session_connected && self.phase == SandboxPhase::Ready {
+        } else if self.supervisor_present && self.phase == SandboxPhase::Ready {
             ensure_supervisor_ready_status(status, sandbox_name);
         }
     }
@@ -2839,7 +3084,6 @@ pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
         sandbox_index: SandboxIndex::new(),
         sandbox_watch_bus: SandboxWatchBus::new(),
         tracing_log_bus: TracingLogBus::new(),
-        supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
         sync_lock: Arc::new(Mutex::new(())),
         delete_gates: Arc::new(DeleteGateRegistry::default()),
         gateway_bind_addresses: Vec::new(),
@@ -2859,7 +3103,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as TestMutex};
-    use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
+    use tokio::sync::{Notify, Semaphore, mpsc};
     use tokio_stream::wrappers::UnboundedReceiverStream;
 
     fn string_value(value: &str) -> prost_types::Value {
@@ -3308,7 +3552,6 @@ mod tests {
             sandbox_index: SandboxIndex::new(),
             sandbox_watch_bus: SandboxWatchBus::new(),
             tracing_log_bus: TracingLogBus::new(),
-            supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
             sync_lock: Arc::new(Mutex::new(())),
             delete_gates: Arc::new(DeleteGateRegistry::default()),
             gateway_bind_addresses: Vec::new(),
@@ -3316,15 +3559,27 @@ mod tests {
         }
     }
 
-    fn register_test_supervisor_session(runtime: &ComputeRuntime, sandbox_id: &str) {
-        let (tx, _rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
-        runtime.supervisor_sessions.register(
-            sandbox_id.to_string(),
-            "session-1".to_string(),
-            tx,
-            shutdown_tx,
-        );
+    fn test_replica(runtime: &ComputeRuntime, replica_id: &str) -> ComputeRuntime {
+        let mut replica = runtime.clone();
+        replica.sandbox_index = SandboxIndex::new();
+        replica.sandbox_watch_bus = SandboxWatchBus::new();
+        replica.sync_lock = Arc::new(Mutex::new(()));
+        replica.delete_gates = Arc::new(DeleteGateRegistry::default());
+        replica.replica_id = replica_id.to_string();
+        replica
+    }
+
+    async fn record_test_supervisor_presence(runtime: &ComputeRuntime, sandbox_id: &str) {
+        let sandbox = runtime
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .unwrap()
+            .unwrap();
+        runtime
+            .write_supervisor_presence(&sandbox, "session-1", WriteCondition::Unconditional)
+            .await
+            .unwrap();
     }
 
     fn sandbox_record(id: &str, name: &str, phase: SandboxPhase) -> Sandbox {
@@ -3429,6 +3684,10 @@ mod tests {
             )
             .await
             .unwrap();
+        runtime
+            .write_supervisor_presence(sandbox, "session-owned", WriteCondition::Unconditional)
+            .await
+            .unwrap();
         session
     }
 
@@ -3494,6 +3753,18 @@ mod tests {
             runtime
                 .store
                 .get(DRAFT_CHUNK_OBJECT_TYPE, "draft-owned")
+                .await
+                .unwrap()
+                .is_some(),
+            expected
+        );
+        assert_eq!(
+            runtime
+                .store
+                .get(
+                    SUPERVISOR_PRESENCE_OBJECT_TYPE,
+                    &supervisor_presence_object_id(sandbox.object_id()),
+                )
                 .await
                 .unwrap()
                 .is_some(),
@@ -4041,7 +4312,7 @@ mod tests {
         let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
 
         runtime
-            .supervisor_session_disconnected("sb-1")
+            .supervisor_session_disconnected("sb-1", "session-1")
             .await
             .unwrap();
 
@@ -4895,7 +5166,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
-            SandboxPhase::Provisioning
+            SandboxPhase::Ready
         );
         assert_sandbox_owned_records(&runtime, &sandbox, &session, true).await;
         assert_eq!(
@@ -5147,6 +5418,7 @@ mod tests {
         });
         sandbox.set_phase(SandboxPhase::Ready as i32);
         runtime.store.put_message(&sandbox).await.unwrap();
+        record_test_supervisor_presence(&runtime, "sb-1").await;
 
         runtime
             .apply_sandbox_update(DriverSandbox {
@@ -5187,12 +5459,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn statusless_snapshot_demotes_legacy_ready_without_presence() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.status = Some(SandboxStatus {
+            sandbox_name: "sandbox-a".to_string(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: "DependenciesReady".to_string(),
+                message: "Supervisor session connected".to_string(),
+                last_transition_time: String::new(),
+            }],
+            ..Default::default()
+        });
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: None,
+                workspace: "default".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Provisioning
+        );
+        let condition = ready_condition(&stored).unwrap();
+        assert_eq!(condition.status, "False");
+        assert_eq!(condition.reason, "SupervisorNotConnected");
+    }
+
+    #[tokio::test]
     async fn apply_sandbox_update_promotes_connected_supervisor_session_to_ready() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        register_test_supervisor_session(&runtime, "sb-1");
+        record_test_supervisor_presence(&runtime, "sb-1").await;
 
         runtime
             .apply_sandbox_update(DriverSandbox {
@@ -5240,7 +5557,10 @@ mod tests {
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime.supervisor_session_connected("sb-1").await.unwrap();
+        runtime
+            .supervisor_session_connected("sb-1", "session-1")
+            .await
+            .unwrap();
 
         let stored = runtime
             .store
@@ -5271,9 +5591,10 @@ mod tests {
         });
         sandbox.set_phase(SandboxPhase::Ready as i32);
         runtime.store.put_message(&sandbox).await.unwrap();
+        record_test_supervisor_presence(&runtime, "sb-1").await;
 
         runtime
-            .supervisor_session_disconnected("sb-1")
+            .supervisor_session_disconnected("sb-1", "session-1")
             .await
             .unwrap();
 
@@ -5300,6 +5621,144 @@ mod tests {
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "DependenciesNotReady");
         assert_eq!(ready.message, "Supervisor session disconnected");
+    }
+
+    #[tokio::test]
+    async fn supervisor_session_retry_does_not_override_terminal_phase() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        record_test_supervisor_presence(&runtime, "sb-1").await;
+
+        let stale_snapshot = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                "sb-1",
+                sandbox_resource_version(&stale_snapshot),
+                |sandbox| sandbox.set_phase(SandboxPhase::Error as i32),
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .set_supervisor_session_state_with_initial_snapshot(
+                "sb-1",
+                true,
+                Some(stale_snapshot),
+                Some("session-1"),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Error
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_replica_disconnect_cannot_demote_new_session() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let replica_a = test_replica(&runtime, "replica-a");
+        let replica_b = test_replica(&runtime, "replica-b");
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        replica_a
+            .supervisor_session_connected("sb-1", "session-a")
+            .await
+            .unwrap();
+        replica_b
+            .supervisor_session_connected("sb-1", "session-b")
+            .await
+            .unwrap();
+        replica_a
+            .supervisor_session_disconnected("sb-1", "session-a")
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        let (presence, _) = runtime.supervisor_presence("sb-1").await.unwrap().unwrap();
+        assert_eq!(presence.session_id, "session-b");
+        assert_eq!(presence.gateway_replica_id, "replica-b");
+
+        replica_b
+            .supervisor_session_disconnected("sb-1", "session-b")
+            .await
+            .unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Provisioning
+        );
+        assert!(runtime.supervisor_presence("sb-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn supervisor_heartbeat_reasserts_lost_ready_transition() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .supervisor_session_connected("sb-1", "session-1")
+            .await
+            .unwrap();
+
+        let ready = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>("sb-1", sandbox_resource_version(&ready), |sandbox| {
+                sandbox.set_phase(SandboxPhase::Provisioning as i32);
+            })
+            .await
+            .unwrap();
+
+        runtime
+            .supervisor_session_heartbeat("sb-1", "session-1")
+            .await
+            .unwrap();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
     }
 
     // --- Composition rule tests ---
@@ -5387,7 +5846,7 @@ mod tests {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
-        register_test_supervisor_session(&runtime, "sb-1");
+        record_test_supervisor_presence(&runtime, "sb-1").await;
 
         runtime
             .apply_sandbox_update(DriverSandbox {
@@ -5417,12 +5876,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backend_ready_with_shared_presence_preserves_ready() {
+        // HA path: another replica owns the supervisor session and has already promoted the
+        // shared record. A backend snapshot on this replica must not undo that promotion solely
+        // because its process-local session registry is empty.
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.status = Some(SandboxStatus {
+            sandbox_name: "sandbox-a".to_string(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: "DependenciesReady".to_string(),
+                message: "Supervisor session connected".to_string(),
+                last_transition_time: String::new(),
+            }],
+            ..Default::default()
+        });
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        record_test_supervisor_presence(&runtime, "sb-1").await;
+
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                workspace: String::new(),
+                spec: None,
+                status: Some(make_ready_driver_status()),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        let cond = ready_condition(&stored).unwrap();
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason, "DependenciesReady");
+    }
+
+    #[tokio::test]
+    async fn legacy_ready_without_shared_presence_is_demoted() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.status = Some(SandboxStatus {
+            sandbox_name: "sandbox-a".to_string(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: "DependenciesReady".to_string(),
+                message: "Supervisor session connected".to_string(),
+                last_transition_time: String::new(),
+            }],
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                workspace: String::new(),
+                spec: None,
+                status: Some(make_ready_driver_status()),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Provisioning
+        );
+        let condition = ready_condition(&stored).unwrap();
+        assert_eq!(condition.status, "False");
+        assert_eq!(condition.reason, "SupervisorNotConnected");
+    }
+
+    #[tokio::test]
     async fn backend_not_ready_with_supervisor_becomes_ready() {
         // VM path: supervisor connects before backend reports Ready.
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
-        register_test_supervisor_session(&runtime, "sb-1");
+        record_test_supervisor_presence(&runtime, "sb-1").await;
 
         runtime
             .apply_sandbox_update(DriverSandbox {
@@ -5456,7 +6008,7 @@ mod tests {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
-        register_test_supervisor_session(&runtime, "sb-1");
+        record_test_supervisor_presence(&runtime, "sb-1").await;
 
         runtime
             .apply_sandbox_update(DriverSandbox {
@@ -5494,8 +6046,11 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
 
         // Promote to Ready via supervisor session connect.
-        register_test_supervisor_session(&runtime, "sb-1");
-        runtime.supervisor_session_connected("sb-1").await.unwrap();
+        record_test_supervisor_presence(&runtime, "sb-1").await;
+        runtime
+            .supervisor_session_connected("sb-1", "session-1")
+            .await
+            .unwrap();
         let stored = runtime
             .store
             .get_message::<Sandbox>("sb-1")
@@ -5508,9 +6063,8 @@ mod tests {
         );
 
         // Session drops.
-        runtime.supervisor_sessions.cleanup_sandbox("sb-1");
         runtime
-            .supervisor_session_disconnected("sb-1")
+            .supervisor_session_disconnected("sb-1", "session-1")
             .await
             .unwrap();
         let stored = runtime
@@ -5557,7 +6111,7 @@ mod tests {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
-        register_test_supervisor_session(&runtime, "sb-1");
+        record_test_supervisor_presence(&runtime, "sb-1").await;
 
         runtime
             .apply_sandbox_update(DriverSandbox {
@@ -5642,7 +6196,7 @@ mod tests {
         };
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime.sandbox_index.update_from_sandbox(&sandbox);
-        register_test_supervisor_session(&runtime, "sb-1");
+        record_test_supervisor_presence(&runtime, "sb-1").await;
 
         runtime
             .reconcile_store_with_backend(Duration::ZERO)
@@ -5741,7 +6295,7 @@ mod tests {
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime.sandbox_index.update_from_sandbox(&sandbox);
-        register_test_supervisor_session(&runtime, "sb-1");
+        record_test_supervisor_presence(&runtime, "sb-1").await;
 
         runtime
             .reconcile_store_with_backend(Duration::ZERO)
@@ -6093,7 +6647,6 @@ mod tests {
             SandboxIndex::new(),
             SandboxWatchBus::new(),
             TracingLogBus::new(),
-            Arc::new(SupervisorSessionRegistry::new()),
         )
         .await
         .unwrap();

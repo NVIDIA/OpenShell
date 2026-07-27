@@ -46,26 +46,29 @@ public_phase =
   if backend_phase in {Provisioning, Unknown} && no session: → Provisioning
 ```
 
-When `public_phase == Ready` the sandbox is usable through the gateway — both the
-backend resource is healthy and a supervisor session is registered. A sandbox whose
-backend reports ready but has no supervisor session yet holds `Provisioning` with a
-`Ready=False`, `SupervisorNotConnected` condition and the message
-`Backend ready; waiting for supervisor session`. This distinguishes it from a sandbox
-whose compute resource is still provisioning without exposing contradictory public
-readiness signals.
+When `public_phase == Ready` the sandbox is usable through the gateway. A connected
+supervisor is stronger evidence than a lagging non-terminal backend snapshot because
+the session can only originate from the running workload. A sandbox whose backend
+reports ready but has no supervisor presence holds `Provisioning` with a `Ready=False`,
+`SupervisorNotConnected` condition and the message `Backend ready; waiting for
+supervisor session`.
 
-**Session precedence over lagging driver snapshots:** A supervisor session can only be
-established by a running workload. When `set_supervisor_session_state` promotes the
-store record to `Ready` on session connect, a driver watch event may still arrive
-shortly after carrying a stale `Provisioning` or `Unknown` backend phase. The
-composition rule treats a connected session as the stronger signal and keeps `Ready`
-in that case, preventing a lagging snapshot from undoing the session-driven promotion.
+Before promoting a sandbox, the gateway writes a private shared supervisor-presence
+record keyed by sandbox ID. The record identifies the owning gateway replica and the
+opaque session ID. Every replica consults this record when composing driver snapshots;
+the public phase alone is not evidence of a live session. This also means a legacy
+`Ready` record without shared presence is corrected to `Provisioning` by the next
+backend snapshot.
 
-**HA deployments:** Supervisor sessions are process-local. A gateway replica that
-does not own the active supervisor session holds the public phase at `Provisioning`.
-The owning replica's `supervisor_session_connected` write propagates through the
-shared store and reconcile loop. This is correct behavior — a replica should not
-claim `Ready` for a session it does not hold.
+A disconnect removes presence only when both the replica and session IDs still match,
+so a superseded owner cannot demote a newer cross-replica session. The new owner also
+performs a sandbox resource-version write after claiming presence, which fences an
+in-flight disconnect. Supervisor heartbeats reassert `Ready` when a conflicting store
+write prevented the initial promotion from landing.
+
+The shared presence record is not yet a liveness lease. If its owning gateway exits
+without processing disconnect, readiness can remain stale until an expiring lease with
+renewal and orphan cleanup is implemented.
 
 **Extension point:** The readiness decision is a safety invariant, not an
 operator-configurable hook. The driver contract is the correct extension point for

@@ -636,7 +636,7 @@ pub async fn handle_connect_supervisor(
 
     if let Err(err) = state
         .compute
-        .supervisor_session_connected(&sandbox_id)
+        .supervisor_session_connected(&sandbox_id, &session_id)
         .await
     {
         warn!(
@@ -672,7 +672,7 @@ pub async fn handle_connect_supervisor(
                 .sandbox_session_disconnected(&sandbox_id_clone);
             if let Err(err) = state_clone
                 .compute
-                .supervisor_session_disconnected(&sandbox_id_clone)
+                .supervisor_session_disconnected(&sandbox_id_clone, &session_id)
                 .await
             {
                 warn!(
@@ -718,7 +718,7 @@ async fn run_session_loop(
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(msg)) => {
-                        handle_supervisor_message(state, sandbox_id, session_id, msg);
+                        handle_supervisor_message(state, sandbox_id, session_id, msg).await;
                     }
                     Ok(None) => {
                         info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: stream closed by supervisor");
@@ -745,7 +745,7 @@ async fn run_session_loop(
     }
 }
 
-fn handle_supervisor_message(
+async fn handle_supervisor_message(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     session_id: &str,
@@ -753,7 +753,18 @@ fn handle_supervisor_message(
 ) {
     match msg.payload {
         Some(supervisor_message::Payload::Heartbeat(_)) => {
-            // Heartbeat received — nothing to do for now.
+            if let Err(err) = state
+                .compute
+                .supervisor_session_heartbeat(sandbox_id, session_id)
+                .await
+            {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    session_id = %session_id,
+                    error = %err,
+                    "supervisor session: failed to reassert sandbox readiness"
+                );
+            }
         }
         Some(supervisor_message::Payload::RelayOpenResult(result)) => {
             if result.success {
