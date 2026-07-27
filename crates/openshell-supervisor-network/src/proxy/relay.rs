@@ -95,6 +95,23 @@ pub(super) fn pin_l7_evaluator(
     opa_engine.clone_engine_for_tunnel(expected_generation)
 }
 
+pub(super) fn validate_route_generation(
+    route: Option<&L7RouteSnapshot>,
+    expected_generation: u64,
+) -> Result<()> {
+    if let Some(route) = route
+        && route.l7_policy_generation != expected_generation
+    {
+        return Err(miette::miette!(
+            "policy changed before CONNECT route hydration \
+             [l4_generation:{} l7_generation:{}]",
+            expected_generation,
+            route.l7_policy_generation,
+        ));
+    }
+    Ok(())
+}
+
 /// Prepare a generation-pinned HTTP relay at the adapter boundary.
 ///
 /// A stale generation preserves the established CONNECT behavior: emit the
@@ -106,8 +123,17 @@ pub(super) fn prepare_http_relay<'a>(
     decision: &EgressDecision,
     request: &'a L7EvalContext,
 ) -> Option<RelayContext<'a>> {
+    if let Err(error) = validate_route_generation(route, decision.l4_policy_generation) {
+        emit_l7_tunnel_close_after_policy_change(
+            &decision.intent.destination.host,
+            decision.intent.destination.port,
+            error,
+        );
+        return None;
+    }
+
     let policy = if let Some(route) = route.filter(|route| !route.configs.is_empty()) {
-        let evaluator = match pin_l7_evaluator(opa_engine, route.l7_policy_generation) {
+        let evaluator = match pin_l7_evaluator(opa_engine, decision.l4_policy_generation) {
             Ok(evaluator) => evaluator,
             Err(error) => {
                 emit_l7_tunnel_close_after_policy_change(
@@ -128,20 +154,18 @@ pub(super) fn prepare_http_relay<'a>(
             evaluator: Box::new(evaluator),
         }
     } else {
-        let expected_generation = route.map_or(decision.l4_policy_generation, |route| {
-            route.l7_policy_generation
-        });
-        let generation_guard = match pin_policy_generation(opa_engine, expected_generation) {
-            Ok(guard) => guard,
-            Err(error) => {
-                emit_l7_tunnel_close_after_policy_change(
-                    &decision.intent.destination.host,
-                    decision.intent.destination.port,
-                    error,
-                );
-                return None;
-            }
-        };
+        let generation_guard =
+            match pin_policy_generation(opa_engine, decision.l4_policy_generation) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    emit_l7_tunnel_close_after_policy_change(
+                        &decision.intent.destination.host,
+                        decision.intent.destination.port,
+                        error,
+                    );
+                    return None;
+                }
+            };
         PreparedHttpPolicy::Passthrough { generation_guard }
     };
 
@@ -160,10 +184,16 @@ pub(super) fn prepare_raw_relay(
     opa_engine: &OpaEngine,
     decision: &EgressDecision,
 ) -> Option<PolicyGenerationGuard> {
-    let expected_generation = route.map_or(decision.l4_policy_generation, |route| {
-        route.l7_policy_generation
-    });
-    match pin_policy_generation(opa_engine, expected_generation) {
+    if let Err(error) = validate_route_generation(route, decision.l4_policy_generation) {
+        emit_l7_tunnel_close_after_policy_change(
+            &decision.intent.destination.host,
+            decision.intent.destination.port,
+            error,
+        );
+        return None;
+    }
+
+    match pin_policy_generation(opa_engine, decision.l4_policy_generation) {
         Ok(guard) => Some(guard),
         Err(error) => {
             emit_l7_tunnel_close_after_policy_change(
@@ -334,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_hydrated_route_pins_l7_lookup_generation() {
+    fn empty_hydrated_route_cannot_replace_stale_l4_generation() {
         let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
         let decision = decision(u64::MAX);
         let route = L7RouteSnapshot {
@@ -343,15 +373,57 @@ mod tests {
         };
         let request = request_context();
 
-        let context = prepare_http_relay(Some(&route), &engine, &decision, &request)
-            .expect("the hydrated route generation should take precedence over stale L4 data");
-        let PreparedHttpPolicy::Passthrough { generation_guard } = context.policy else {
-            panic!("empty L7 route should use a generation guard");
+        assert!(
+            prepare_http_relay(Some(&route), &engine, &decision, &request).is_none(),
+            "a current L7 lookup must not freshen a stale L4 allow"
+        );
+    }
+
+    #[test]
+    fn inspected_route_cannot_replace_stale_l4_generation() {
+        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let decision = decision(u64::MAX);
+        let route = L7RouteSnapshot {
+            configs: vec![super::super::L7ConfigSnapshot {
+                config: crate::l7::L7EndpointConfig {
+                    protocol: crate::l7::L7Protocol::Rest,
+                    path: "/**".to_string(),
+                    tls: crate::l7::TlsMode::Auto,
+                    enforcement: crate::l7::EnforcementMode::Enforce,
+                    graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+                    json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
+                    mcp_strict_tool_names: true,
+                    allow_encoded_slash: false,
+                    websocket_credential_rewrite: false,
+                    request_body_credential_rewrite: false,
+                    websocket_graphql_policy: false,
+                    credential_signing: crate::l7::CredentialSigning::None,
+                    signing_service: String::new(),
+                    signing_region: String::new(),
+                },
+            }],
+            l7_policy_generation: engine.current_generation(),
+        };
+        let request = request_context();
+
+        assert!(
+            prepare_http_relay(Some(&route), &engine, &decision, &request).is_none(),
+            "an inspected route must use the generation that authorized CONNECT"
+        );
+    }
+
+    #[test]
+    fn raw_route_cannot_replace_stale_l4_generation() {
+        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let decision = decision(u64::MAX);
+        let route = L7RouteSnapshot {
+            configs: vec![],
+            l7_policy_generation: engine.current_generation(),
         };
 
-        assert_eq!(
-            generation_guard.captured_generation(),
-            route.l7_policy_generation
+        assert!(
+            prepare_raw_relay(Some(&route), &engine, &decision).is_none(),
+            "a raw relay must not freshen a stale L4 allow"
         );
     }
 

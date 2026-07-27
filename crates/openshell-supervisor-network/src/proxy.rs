@@ -1272,6 +1272,22 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
+    let connect_generation_guard =
+        match relay::pin_policy_generation(&opa_engine, decision.l4_policy_generation) {
+            Ok(guard) => guard,
+            Err(error) => {
+                reject_stale_connect_policy(
+                    &mut client,
+                    &host_lc,
+                    port,
+                    activity_tx.as_ref(),
+                    error,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
     // Resolve the route's TLS treatment up front. `query_tls_mode` reads only
     // the policy decision + host/port (no peeked bytes), so it is valid before
     // the `200`. The fail-closed refusal that consumes it runs after the SSRF/
@@ -1383,9 +1399,45 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
-    let mut upstream = dial_upstream(&upstream_proxy, &host_lc, port, connector.addrs())
-        .await
-        .into_diagnostic()?;
+    // CONNECT must use one policy generation from authorization through route
+    // hydration and relay startup. A later L7 lookup must never make a stale
+    // L4 allow appear current.
+    hydrate_l7_route(&opa_engine, &mut decision);
+    let l7_route = decision.endpoint.l7_route.as_ref();
+    if let Err(error) =
+        relay::validate_route_generation(l7_route, connect_generation_guard.captured_generation())
+    {
+        reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
+            .await?;
+        return Ok(());
+    }
+
+    let upstream_result = tokio::select! {
+        result = dial_upstream(&upstream_proxy, &host_lc, port, connector.addrs()) => Some(result),
+        () = connect_generation_guard.wait_until_stale() => None,
+    };
+    let Some(upstream_result) = upstream_result else {
+        reject_stale_connect_policy(
+            &mut client,
+            &host_lc,
+            port,
+            activity_tx.as_ref(),
+            miette::miette!(
+                "policy changed while CONNECT was dialing upstream \
+                 [captured_generation:{} current_generation:{}]",
+                connect_generation_guard.captured_generation(),
+                connect_generation_guard.current_generation(),
+            ),
+        )
+        .await?;
+        return Ok(());
+    };
+    let mut upstream = upstream_result.into_diagnostic()?;
+    if let Err(error) = connect_generation_guard.ensure_current() {
+        reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
+            .await?;
+        return Ok(());
+    }
 
     debug!(
         "handle_tcp_connection dns_resolve_and_tcp_connect: {}ms host={host_lc}",
@@ -1394,10 +1446,6 @@ async fn handle_tcp_connection(
 
     respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
-    // Check if endpoint has L7 config for protocol-aware inspection, and
-    // retain the generation for HTTP passthrough keep-alive tunnels.
-    hydrate_l7_route(&opa_engine, &mut decision);
-    let l7_route = decision.endpoint.l7_route.as_ref();
     let should_inspect_l7 = l7_inspection_active(l7_route);
 
     // Log the allowed CONNECT — use CONNECT_L7 when L7 inspection follows,
@@ -2521,6 +2569,33 @@ fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette
         ))
         .build();
     ocsf_emit!(event);
+}
+
+async fn reject_stale_connect_policy(
+    client: &mut TcpStream,
+    host: &str,
+    port: u16,
+    activity_tx: Option<&ActivitySender>,
+    error: miette::Report,
+) -> Result<()> {
+    warn!(
+        host,
+        port,
+        error = %error,
+        "CONNECT rejected because policy changed after L4 authorization"
+    );
+    emit_l7_tunnel_close_after_policy_change(host, port, error);
+    emit_activity_simple(activity_tx, true, "policy_stale");
+    respond(
+        client,
+        &build_json_error_response(
+            403,
+            "Forbidden",
+            "policy_denied",
+            &format!("CONNECT {host}:{port} not permitted because policy changed"),
+        ),
+    )
+    .await
 }
 
 /// Query L7 endpoint config from the OPA engine for an allowed egress decision.
