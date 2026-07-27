@@ -311,6 +311,7 @@ mod tests {
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            agent_proposals: openshell_core::proposals::AgentProposals::default(),
         }
     }
 

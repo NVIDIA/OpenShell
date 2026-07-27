@@ -1289,7 +1289,7 @@ async fn handle_tcp_connection(
             deny_connect_destination(
                 &mut client,
                 &denial,
-                peer_addr,
+                workload_addr,
                 &host_lc,
                 port,
                 &binary_str,
@@ -1383,14 +1383,9 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
-    let mut upstream = dial_upstream(
-        &upstream_proxy,
-        &host_lc,
-        port,
-        connector.addrs(),
-    )
-    .await
-    .into_diagnostic()?;
+    let mut upstream = dial_upstream(&upstream_proxy, &host_lc, port, connector.addrs())
+        .await
+        .into_diagnostic()?;
 
     debug!(
         "handle_tcp_connection dns_resolve_and_tcp_connect: {}ms host={host_lc}",
@@ -4516,7 +4511,7 @@ async fn handle_forward_proxy(
             deny_forward_destination(
                 client,
                 &denial,
-                peer_addr,
+                workload_addr,
                 method,
                 &host_lc,
                 port,
@@ -9536,6 +9531,8 @@ network_policies:
             None,
             None,
             None,
+            AgentProposals::default(),
+            Arc::new(None),
             Arc::new(None),
             None,
             None,

@@ -439,7 +439,10 @@ fn identity_required_mode_is_explicitly_unsupported_off_linux() {
     )
     .unwrap();
     let decision = authorize_egress_intent(
-        "127.0.0.1:41000".parse().unwrap(),
+        crate::procfs::WorkloadProxyTcpConnection::new(
+            "127.0.0.1:41000".parse().unwrap(),
+            "127.0.0.1:3000".parse().unwrap(),
+        ),
         &engine,
         &BinaryIdentityCache::new(),
         &AtomicU32::new(1),
@@ -594,6 +597,8 @@ network_policies:
                                     None,
                                     None,
                                     None,
+                                    AgentProposals::default(),
+                                    Arc::new(None),
                                     Arc::new(None),
                                     None,
                                     None,
