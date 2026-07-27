@@ -144,6 +144,14 @@ fn prepare_with_path_open_mode(
     }
 
     if read_only.is_empty() && read_write.is_empty() {
+        if matches!(
+            policy.landlock.compatibility,
+            LandlockCompatibility::HardRequirement
+        ) {
+            miette::bail!(
+                "landlock.compatibility is hard_requirement but no filesystem paths are configured"
+            );
+        }
         return Ok(None);
     }
 
