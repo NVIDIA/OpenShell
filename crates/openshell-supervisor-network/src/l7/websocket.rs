@@ -17,11 +17,16 @@ use openshell_ocsf::{
     ocsf_emit,
 };
 use std::collections::HashMap;
+use std::future::Future;
+use std::io::{Error as IoError, ErrorKind as IoErrorKind};
+use std::time::Duration as StdDuration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAX_TEXT_MESSAGE_BYTES: usize = openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES;
 const MAX_RAW_FRAME_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MESSAGE_FRAGMENTS: usize = 4096;
+const TEXT_MESSAGE_ASSEMBLY_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+const TEXT_MESSAGE_ASSEMBLY_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(120);
 const COPY_BUF_SIZE: usize = 8192;
 const OPCODE_CONTINUATION: u8 = 0x0;
 const OPCODE_TEXT: u8 = 0x1;
@@ -105,12 +110,136 @@ struct FrameHeader {
 #[derive(Debug)]
 enum FragmentState {
     None,
-    Text {
-        payload: Vec<u8>,
+    Text(TextMessageAssembly),
+    Binary { fragment_count: usize },
+}
+
+/// One admitted client text message while its complete logical payload is
+/// being assembled.
+///
+/// Keeping the admission permit with the buffer and deadlines makes every
+/// timeout and terminal parser error release shared middleware capacity through
+/// ordinary ownership. The total deadline includes interleaved control frames;
+/// the idle deadline resets only when a client read makes progress.
+#[derive(Debug)]
+struct TextMessageAssembly {
+    payload: Vec<u8>,
+    compressed: bool,
+    fragment_count: usize,
+    admission: Option<openshell_supervisor_middleware::MiddlewareAdmission>,
+    total_deadline: tokio::time::Instant,
+}
+
+impl TextMessageAssembly {
+    fn new(
         compressed: bool,
         admission: Option<openshell_supervisor_middleware::MiddlewareAdmission>,
-    },
-    Binary,
+    ) -> Self {
+        Self {
+            payload: Vec::new(),
+            compressed,
+            fragment_count: 1,
+            admission,
+            total_deadline: tokio::time::Instant::now() + TEXT_MESSAGE_ASSEMBLY_TOTAL_TIMEOUT,
+        }
+    }
+
+    async fn read_some<R: AsyncRead + Unpin>(
+        &self,
+        reader: &mut R,
+        buffer: &mut [u8],
+    ) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let idle_deadline = tokio::time::Instant::now() + TEXT_MESSAGE_ASSEMBLY_IDLE_TIMEOUT;
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(self.total_deadline) => {
+                Err(IoError::new(
+                    IoErrorKind::TimedOut,
+                    "websocket text message assembly total timeout",
+                ))
+            }
+            () = tokio::time::sleep_until(idle_deadline) => {
+                Err(IoError::new(
+                    IoErrorKind::TimedOut,
+                    "websocket text message assembly idle timeout",
+                ))
+            }
+            result = reader.read(buffer) => result,
+        }
+    }
+
+    async fn read_exact<R: AsyncRead + Unpin>(
+        &self,
+        reader: &mut R,
+        buffer: &mut [u8],
+    ) -> std::io::Result<()> {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let read = self.read_some(reader, &mut buffer[filled..]).await?;
+            if read == 0 {
+                return Err(IoError::new(
+                    IoErrorKind::UnexpectedEof,
+                    "websocket payload ended before declared length",
+                ));
+            }
+            filled += read;
+        }
+        Ok(())
+    }
+
+    async fn read_payload<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+        frame: &FrameHeader,
+    ) -> Result<()> {
+        let next = read_masked_payload(reader, frame, Some(self)).await?;
+        append_text_fragment(&mut self.payload, next)
+    }
+
+    fn ensure_payload_fits(&self, frame: &FrameHeader) -> Result<()> {
+        let frame_len = usize::try_from(frame.payload_len)
+            .map_err(|_| miette!("websocket text frame is too large to buffer"))?;
+        let complete_len = self
+            .payload
+            .len()
+            .checked_add(frame_len)
+            .ok_or_else(|| miette!("websocket text message length overflow"))?;
+        if complete_len > MAX_TEXT_MESSAGE_BYTES {
+            return Err(miette!(
+                "websocket text message exceeds {MAX_TEXT_MESSAGE_BYTES} byte limit"
+            ));
+        }
+        Ok(())
+    }
+
+    fn add_fragment(&mut self) -> Result<()> {
+        self.fragment_count = self.fragment_count.saturating_add(1);
+        if self.fragment_count > MAX_MESSAGE_FRAGMENTS {
+            return Err(miette!(
+                "websocket message exceeds {MAX_MESSAGE_FRAGMENTS} fragment limit"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn within_total<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
+        tokio::time::timeout_at(self.total_deadline, future)
+            .await
+            .map_err(|_| miette!("websocket text message assembly total timeout"))?
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        Vec<u8>,
+        bool,
+        Option<openshell_supervisor_middleware::MiddlewareAdmission>,
+    ) {
+        (self.payload, self.compressed, self.admission)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,10 +350,13 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut fragments = FragmentState::None;
-    let mut fragment_count = 0usize;
     let mut close_seen = false;
     loop {
-        let Some(frame) = read_frame_header(reader)
+        let assembly = match &fragments {
+            FragmentState::Text(assembly) => Some(assembly),
+            FragmentState::None | FragmentState::Binary { .. } => None,
+        };
+        let Some(frame) = read_frame_header(reader, assembly)
             .await
             .inspect_err(|e| {
                 emit_protocol_failure(host, port, options.policy_name, protocol_failure_class(e));
@@ -254,20 +386,6 @@ where
             emit_protocol_failure(host, port, options.policy_name, protocol_failure_class(&e));
             return Err(terminate(WebSocketTerminationCause::ProtocolError, e));
         }
-        if matches!(frame.opcode, OPCODE_TEXT | OPCODE_BINARY) && !frame.fin {
-            fragment_count = 1;
-        } else if frame.opcode == OPCODE_CONTINUATION {
-            fragment_count = fragment_count.saturating_add(1);
-            if fragment_count > MAX_MESSAGE_FRAGMENTS {
-                return Err(terminate(
-                    WebSocketTerminationCause::ProtocolError,
-                    miette!("websocket message exceeds {MAX_MESSAGE_FRAGMENTS} fragment limit"),
-                ));
-            }
-            if frame.fin {
-                fragment_count = 0;
-            }
-        }
 
         match frame.opcode {
             OPCODE_TEXT => {
@@ -286,7 +404,10 @@ where
                 } else {
                     None
                 };
-                let payload = read_masked_payload(reader, &frame)
+                let compressed = frame.rsv == 0x40;
+                let mut assembly = TextMessageAssembly::new(compressed, admission);
+                assembly
+                    .read_payload(reader, &frame)
                     .await
                     .inspect_err(|e| {
                         emit_protocol_failure(
@@ -297,8 +418,8 @@ where
                         );
                     })
                     .map_err(|error| terminate(WebSocketTerminationCause::ProtocolError, error))?;
-                let compressed = frame.rsv == 0x40;
                 if frame.fin {
+                    let (payload, compressed, admission) = assembly.into_parts();
                     relay_text_payload(
                         writer, &frame, payload, admission, false, compressed, host, port, options,
                     )
@@ -307,19 +428,20 @@ where
                         observe_termination(host, port, options.policy_name, termination);
                     })?;
                 } else {
-                    fragments = FragmentState::Text {
-                        payload,
-                        compressed,
-                        admission,
-                    };
+                    fragments = FragmentState::Text(assembly);
                 }
             }
-            OPCODE_CONTINUATION => match &mut fragments {
-                FragmentState::Text {
-                    payload,
-                    compressed,
-                    admission,
-                } => {
+            OPCODE_CONTINUATION => {
+                if let FragmentState::Text(assembly) = &mut fragments {
+                    if let Err(error) = assembly.add_fragment() {
+                        emit_protocol_failure(
+                            host,
+                            port,
+                            options.policy_name,
+                            protocol_failure_class(&error),
+                        );
+                        return Err(terminate(WebSocketTerminationCause::ProtocolError, error));
+                    }
                     if frame.payload_len > MAX_TEXT_MESSAGE_BYTES as u64 {
                         return Err(terminate(
                             WebSocketTerminationCause::MessageTooBig,
@@ -328,7 +450,17 @@ where
                             ),
                         ));
                     }
-                    let next = read_masked_payload(reader, &frame)
+                    if let Err(error) = assembly.ensure_payload_fits(&frame) {
+                        emit_protocol_failure(
+                            host,
+                            port,
+                            options.policy_name,
+                            protocol_failure_class(&error),
+                        );
+                        return Err(terminate(WebSocketTerminationCause::MessageTooBig, error));
+                    }
+                    assembly
+                        .read_payload(reader, &frame)
                         .await
                         .inspect_err(|e| {
                             emit_protocol_failure(
@@ -341,20 +473,13 @@ where
                         .map_err(|error| {
                             terminate(WebSocketTerminationCause::ProtocolError, error)
                         })?;
-                    if let Err(e) = append_text_fragment(payload, next) {
-                        emit_protocol_failure(
-                            host,
-                            port,
-                            options.policy_name,
-                            protocol_failure_class(&e),
-                        );
-                        return Err(terminate(WebSocketTerminationCause::MessageTooBig, e));
-                    }
                     if frame.fin {
-                        let complete = std::mem::take(payload);
-                        let was_compressed = *compressed;
-                        let admission = admission.take();
-                        fragments = FragmentState::None;
+                        let FragmentState::Text(assembly) =
+                            std::mem::replace(&mut fragments, FragmentState::None)
+                        else {
+                            unreachable!("validated text continuation state")
+                        };
+                        let (complete, was_compressed, admission) = assembly.into_parts();
                         relay_text_payload(
                             writer,
                             &frame,
@@ -371,8 +496,16 @@ where
                             observe_termination(host, port, options.policy_name, termination);
                         })?;
                     }
-                }
-                FragmentState::Binary => {
+                } else if let FragmentState::Binary { fragment_count } = &mut fragments {
+                    *fragment_count = fragment_count.saturating_add(1);
+                    if *fragment_count > MAX_MESSAGE_FRAGMENTS {
+                        return Err(terminate(
+                            WebSocketTerminationCause::ProtocolError,
+                            miette!(
+                                "websocket message exceeds {MAX_MESSAGE_FRAGMENTS} fragment limit"
+                            ),
+                        ));
+                    }
                     copy_raw_frame_payload(reader, writer, &frame)
                         .await
                         .inspect_err(|e| {
@@ -389,8 +522,7 @@ where
                     if frame.fin {
                         fragments = FragmentState::None;
                     }
-                }
-                FragmentState::None => {
+                } else {
                     let e =
                         miette!("websocket continuation frame without active fragmented message");
                     emit_protocol_failure(
@@ -401,10 +533,10 @@ where
                     );
                     return Err(terminate(WebSocketTerminationCause::ProtocolError, e));
                 }
-            },
+            }
             OPCODE_BINARY => {
                 if !frame.fin {
-                    fragments = FragmentState::Binary;
+                    fragments = FragmentState::Binary { fragment_count: 1 };
                 }
                 copy_raw_frame_payload(reader, writer, &frame)
                     .await
@@ -419,8 +551,22 @@ where
                     .map_err(|error| terminate(WebSocketTerminationCause::PeerDisconnect, error))?;
             }
             OPCODE_CLOSE | OPCODE_PING | OPCODE_PONG => {
-                relay_control_frame(reader, writer, &frame)
-                    .await
+                let control_result = match &fragments {
+                    FragmentState::Text(assembly) => {
+                        assembly
+                            .within_total(relay_control_frame(
+                                reader,
+                                writer,
+                                &frame,
+                                Some(assembly),
+                            ))
+                            .await
+                    }
+                    FragmentState::None | FragmentState::Binary { .. } => {
+                        relay_control_frame(reader, writer, &frame, None).await
+                    }
+                };
+                control_result
                     .inspect_err(|e| {
                         emit_protocol_failure(
                             host,
@@ -429,7 +575,14 @@ where
                             protocol_failure_class(e),
                         );
                     })
-                    .map_err(|error| terminate(WebSocketTerminationCause::PeerDisconnect, error))?;
+                    .map_err(|error| {
+                        let cause = if is_text_assembly_timeout(&error) {
+                            WebSocketTerminationCause::ProtocolError
+                        } else {
+                            WebSocketTerminationCause::PeerDisconnect
+                        };
+                        terminate(cause, error)
+                    })?;
                 if frame.opcode == OPCODE_CLOSE {
                     close_seen = true;
                 }
@@ -439,9 +592,29 @@ where
     }
 }
 
-async fn read_frame_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<FrameHeader>> {
-    let first = match reader.read_u8().await {
-        Ok(byte) => byte,
+async fn read_exact_for_assembly<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    assembly: Option<&TextMessageAssembly>,
+) -> std::io::Result<()> {
+    match assembly {
+        Some(assembly) => assembly.read_exact(reader, buffer).await,
+        None => reader.read_exact(buffer).await.map(|_| ()),
+    }
+}
+
+async fn read_frame_header<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    assembly: Option<&TextMessageAssembly>,
+) -> Result<Option<FrameHeader>> {
+    let mut first = [0u8; 1];
+    let first_read = match assembly {
+        Some(assembly) => assembly.read_some(reader, &mut first).await,
+        None => reader.read(&mut first).await,
+    };
+    let first = match first_read {
+        Ok(0) => return Ok(None),
+        Ok(_) => first[0],
         Err(e)
             if matches!(
                 e.kind(),
@@ -454,10 +627,11 @@ async fn read_frame_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Optio
         }
         Err(e) => return Err(miette!("{e}")),
     };
-    let second = reader
-        .read_u8()
+    let mut second = [0u8; 1];
+    read_exact_for_assembly(reader, &mut second, assembly)
         .await
         .map_err(|e| miette!("malformed websocket frame header: {e}"))?;
+    let second = second[0];
 
     let mut raw_header = vec![first, second];
     let len_code = second & 0x7F;
@@ -465,8 +639,7 @@ async fn read_frame_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Optio
         0..=125 => u64::from(len_code),
         126 => {
             let mut bytes = [0u8; 2];
-            reader
-                .read_exact(&mut bytes)
+            read_exact_for_assembly(reader, &mut bytes, assembly)
                 .await
                 .map_err(|e| miette!("malformed websocket extended length: {e}"))?;
             raw_header.extend_from_slice(&bytes);
@@ -480,8 +653,7 @@ async fn read_frame_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Optio
         }
         127 => {
             let mut bytes = [0u8; 8];
-            reader
-                .read_exact(&mut bytes)
+            read_exact_for_assembly(reader, &mut bytes, assembly)
                 .await
                 .map_err(|e| miette!("malformed websocket extended length: {e}"))?;
             if bytes[0] & 0x80 != 0 {
@@ -502,8 +674,7 @@ async fn read_frame_header<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Optio
     let masked = second & 0x80 != 0;
     let mask_key = if masked {
         let mut key = [0u8; 4];
-        reader
-            .read_exact(&mut key)
+        read_exact_for_assembly(reader, &mut key, assembly)
             .await
             .map_err(|e| miette!("malformed websocket mask key: {e}"))?;
         raw_header.extend_from_slice(&key);
@@ -568,7 +739,8 @@ fn validate_frame_header(
         ));
     }
     if (frame.opcode == OPCODE_BINARY
-        || (frame.opcode == OPCODE_CONTINUATION && matches!(fragments, FragmentState::Binary)))
+        || (frame.opcode == OPCODE_CONTINUATION
+            && matches!(fragments, FragmentState::Binary { .. })))
         && frame.payload_len > MAX_RAW_FRAME_PAYLOAD_BYTES
     {
         return Err(miette!(
@@ -595,6 +767,7 @@ fn valid_rsv_bits(
 async fn read_masked_payload<R: AsyncRead + Unpin>(
     reader: &mut R,
     frame: &FrameHeader,
+    assembly: Option<&TextMessageAssembly>,
 ) -> Result<Vec<u8>> {
     let payload_len = usize::try_from(frame.payload_len)
         .map_err(|_| miette!("websocket text frame is too large to buffer"))?;
@@ -604,8 +777,7 @@ async fn read_masked_payload<R: AsyncRead + Unpin>(
         ));
     }
     let mut payload = vec![0u8; payload_len];
-    reader
-        .read_exact(&mut payload)
+    read_exact_for_assembly(reader, &mut payload, assembly)
         .await
         .map_err(|e| miette!("malformed websocket payload: {e}"))?;
     let mask_key = frame
@@ -973,6 +1145,7 @@ async fn relay_control_frame<R, W>(
     reader: &mut R,
     writer: &mut W,
     frame: &FrameHeader,
+    assembly: Option<&TextMessageAssembly>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -981,8 +1154,7 @@ where
     let raw_payload_len = usize::try_from(frame.payload_len)
         .map_err(|_| miette!("websocket control frame payload length overflow"))?;
     let mut raw_payload = vec![0u8; raw_payload_len];
-    reader
-        .read_exact(&mut raw_payload)
+    read_exact_for_assembly(reader, &mut raw_payload, assembly)
         .await
         .map_err(|e| miette!("malformed websocket control payload: {e}"))?;
 
@@ -1331,7 +1503,11 @@ fn graphql_log_summary(info: &crate::l7::graphql::GraphqlRequestInfo) -> String 
 
 fn protocol_failure_class(error: &miette::Report) -> &'static str {
     let msg = error.to_string().to_ascii_lowercase();
-    if msg.contains("credential") {
+    if msg.contains("text message assembly idle timeout") {
+        "message_assembly_idle_timeout"
+    } else if msg.contains("text message assembly total timeout") {
+        "message_assembly_total_timeout"
+    } else if msg.contains("credential") {
         "credential_resolution_failed"
     } else if msg.contains("utf-8") {
         "invalid_utf8"
@@ -1360,6 +1536,13 @@ fn protocol_failure_class(error: &miette::Report) -> &'static str {
     } else {
         "protocol_error"
     }
+}
+
+fn is_text_assembly_timeout(error: &miette::Report) -> bool {
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("text message assembly")
 }
 
 fn observe_termination(
@@ -1559,6 +1742,23 @@ network_policies:
             frame.push(byte ^ mask_key[i % 4]);
         }
         frame
+    }
+
+    fn test_frame_header(fin: bool, opcode: u8, payload_len: u64) -> FrameHeader {
+        FrameHeader {
+            fin,
+            rsv: 0,
+            opcode,
+            masked: true,
+            payload_len,
+            mask_key: Some([0x37, 0xfa, 0x21, 0x3d]),
+            raw_header: Vec::new(),
+        }
+    }
+
+    async fn wait_for_stalled_task<T>(task: &tokio::task::JoinHandle<T>) {
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "fixture task must be pending");
     }
 
     fn close_payload(code: u16, reason: &[u8]) -> Vec<u8> {
@@ -1774,6 +1974,193 @@ network_policies:
         let mut frame = header.to_vec();
         frame.extend_from_slice(&rest);
         frame
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_initial_text_payload_releases_middleware_admission() {
+        let runner = openshell_supervisor_middleware::ChainRunner::default();
+        let admission = runner
+            .reserve_middleware_work()
+            .await
+            .expect("reserve middleware work");
+        let (client, mut reader) = tokio::io::duplex(8);
+        let frame = test_frame_header(true, OPCODE_TEXT, 4);
+        let task = tokio::spawn(async move {
+            let mut assembly = TextMessageAssembly::new(false, Some(admission));
+            assembly.read_payload(&mut reader, &frame).await
+        });
+
+        wait_for_stalled_task(&task).await;
+        tokio::time::advance(TEXT_MESSAGE_ASSEMBLY_IDLE_TIMEOUT + StdDuration::from_millis(1))
+            .await;
+        let error = task
+            .await
+            .expect("join stalled assembly")
+            .expect_err("initial payload must time out");
+        assert!(error.to_string().contains("assembly idle timeout"));
+
+        runner
+            .reserve_middleware_work()
+            .await
+            .expect("timed-out initial payload releases admission");
+        drop(client);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_continuation_payload_releases_middleware_admission() {
+        let runner = openshell_supervisor_middleware::ChainRunner::default();
+        let admission = runner
+            .reserve_middleware_work()
+            .await
+            .expect("reserve middleware work");
+        let (mut client, mut reader) = tokio::io::duplex(8);
+        client
+            .write_all(&[0x37])
+            .await
+            .expect("send partial continuation payload");
+        let frame = test_frame_header(true, OPCODE_CONTINUATION, 2);
+        let task = tokio::spawn(async move {
+            let mut assembly = TextMessageAssembly::new(false, Some(admission));
+            assembly.payload.extend_from_slice(b"first");
+            assembly.add_fragment().expect("continuation within limit");
+            assembly.read_payload(&mut reader, &frame).await
+        });
+
+        wait_for_stalled_task(&task).await;
+        tokio::time::advance(TEXT_MESSAGE_ASSEMBLY_IDLE_TIMEOUT + StdDuration::from_millis(1))
+            .await;
+        let error = task
+            .await
+            .expect("join stalled assembly")
+            .expect_err("continuation payload must time out");
+        assert!(error.to_string().contains("assembly idle timeout"));
+
+        runner
+            .reserve_middleware_work()
+            .await
+            .expect("timed-out continuation releases admission");
+        drop(client);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_continuation_header_releases_middleware_admission() {
+        let runner = openshell_supervisor_middleware::ChainRunner::default();
+        let admission = runner
+            .reserve_middleware_work()
+            .await
+            .expect("reserve middleware work");
+        let (client, mut reader) = tokio::io::duplex(8);
+        let task = tokio::spawn(async move {
+            let mut assembly = TextMessageAssembly::new(false, Some(admission));
+            assembly.payload.extend_from_slice(b"first");
+            let result = read_frame_header(&mut reader, Some(&assembly)).await;
+            drop(assembly);
+            result
+        });
+
+        wait_for_stalled_task(&task).await;
+        tokio::time::advance(TEXT_MESSAGE_ASSEMBLY_IDLE_TIMEOUT + StdDuration::from_millis(1))
+            .await;
+        let error = task
+            .await
+            .expect("join stalled assembly")
+            .expect_err("missing continuation header must time out");
+        assert!(error.to_string().contains("assembly idle timeout"));
+
+        runner
+            .reserve_middleware_work()
+            .await
+            .expect("missing continuation releases admission");
+        drop(client);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn text_assembly_total_deadline_does_not_reset_on_input_progress() {
+        let runner = openshell_supervisor_middleware::ChainRunner::default();
+        let admission = runner
+            .reserve_middleware_work()
+            .await
+            .expect("reserve middleware work");
+        let (mut client, mut reader) = tokio::io::duplex(8);
+        let frame = test_frame_header(true, OPCODE_TEXT, 1_024);
+        let task = tokio::spawn(async move {
+            let mut assembly = TextMessageAssembly::new(false, Some(admission));
+            assembly.read_payload(&mut reader, &frame).await
+        });
+        wait_for_stalled_task(&task).await;
+
+        let progress_interval = TEXT_MESSAGE_ASSEMBLY_IDLE_TIMEOUT / 2;
+        let mut elapsed = StdDuration::ZERO;
+        while elapsed + progress_interval < TEXT_MESSAGE_ASSEMBLY_TOTAL_TIMEOUT {
+            tokio::time::advance(progress_interval).await;
+            elapsed += progress_interval;
+            client
+                .write_all(&[0x37])
+                .await
+                .expect("make progress before idle timeout");
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished(), "idle deadline must reset on progress");
+        }
+        let until_total_timeout = TEXT_MESSAGE_ASSEMBLY_TOTAL_TIMEOUT
+            .checked_sub(elapsed)
+            .expect("progress schedule stays within total timeout");
+        tokio::time::advance(until_total_timeout + StdDuration::from_millis(1)).await;
+        let error = task
+            .await
+            .expect("join total assembly timeout")
+            .expect_err("total assembly deadline must not reset");
+        assert!(error.to_string().contains("assembly total timeout"));
+
+        runner
+            .reserve_middleware_work()
+            .await
+            .expect("total timeout releases admission");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_assemblies_release_the_saturated_shared_work_budget() {
+        let runner = openshell_supervisor_middleware::ChainRunner::default();
+        let mut clients = Vec::new();
+        let mut stalled = Vec::new();
+        for _ in 0..openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_WORK {
+            let admission = runner
+                .reserve_middleware_work()
+                .await
+                .expect("fill shared middleware work budget");
+            let (client, mut reader) = tokio::io::duplex(8);
+            clients.push(client);
+            let frame = test_frame_header(true, OPCODE_TEXT, 4);
+            stalled.push(tokio::spawn(async move {
+                let mut assembly = TextMessageAssembly::new(false, Some(admission));
+                assembly.read_payload(&mut reader, &frame).await
+            }));
+        }
+        tokio::task::yield_now().await;
+        assert!(stalled.iter().all(|task| !task.is_finished()));
+
+        let later_runner = runner.clone();
+        let later_work = tokio::spawn(async move { later_runner.reserve_middleware_work().await });
+        wait_for_stalled_task(&later_work).await;
+
+        tokio::time::advance(TEXT_MESSAGE_ASSEMBLY_IDLE_TIMEOUT + StdDuration::from_millis(1))
+            .await;
+        for task in stalled {
+            let error = task
+                .await
+                .expect("join stalled assembly")
+                .expect_err("stalled assembly must time out");
+            assert!(error.to_string().contains("assembly idle timeout"));
+        }
+
+        let admission = later_work
+            .await
+            .expect("join later middleware work")
+            .expect("later middleware work acquires released capacity");
+        assert!(
+            admission.saturated(),
+            "later work must have waited behind the saturated budget"
+        );
+        drop(clients);
     }
 
     #[test]

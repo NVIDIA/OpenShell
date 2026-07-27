@@ -51,6 +51,9 @@ paths, such as proxy support files or GPU device paths when a GPU is present.
 
 ## Network and Inference
 
+See [Sandbox Limits](sandbox-limits.md) for the current numeric safety ceilings,
+their ownership, terminal behavior, and known gaps.
+
 All ordinary agent egress is routed through the sandbox proxy. The proxy
 identifies the calling binary, checks trust-on-first-use binary identity, rejects
 unsafe internal destinations, and evaluates the active policy. On Linux, it
@@ -60,12 +63,11 @@ socket inode.
 For inspected HTTP traffic, the proxy can enforce REST method/path rules,
 WebSocket upgrade and text-message rules, GraphQL operation rules, and
 MCP method, tool, and supported params rules or generic JSON-RPC method rules
-on sandbox-to-server request bodies. MCP and JSON-RPC inspection buffers up to
-the endpoint `mcp.max_body_bytes` or `json_rpc.max_body_bytes` limit. MCP
-`tools/call` tool names are checked against the spec-recommended syntax by
-default before policy evaluation, with a per-endpoint `mcp.strict_tool_names`
-compatibility opt-out. Generic JSON-RPC policies do not support `params`
-matchers; generic JSON-RPC rules match only the method.
+on sandbox-to-server request bodies. MCP and JSON-RPC inspection buffers
+bounded request bodies. MCP `tools/call` tool names are checked against the
+spec-recommended syntax by default before policy evaluation, with a per-endpoint
+`mcp.strict_tool_names` compatibility opt-out. Generic JSON-RPC policies do not
+support `params` matchers; generic JSON-RPC rules match only the method.
 JSON-RPC responses and server-to-client MCP messages on response or SSE streams
 are relayed but are not currently parsed for policy enforcement.
 
@@ -91,8 +93,9 @@ credential, routing, or framing headers. Body transformations are re-evaluated
 against body-aware L7 policy before later stages or the upstream can observe
 them. Requests, results, chain length, execution time, and diagnostics are
 bounded; external free-form diagnostic text is not exposed in responses or
-security logs. See [Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx)
-for configuration and protocol details.
+security logs. See
+[Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx) for
+configuration and protocol details.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:
@@ -197,8 +200,7 @@ exchanges it for an OAuth2 access token, caches the token, and injects it as an
 `Authorization: Bearer` header before forwarding the request. Token grant
 endpoints are HTTPS-only except for loopback and Kubernetes service DNS hosts,
 and returned access tokens must be bearer-compatible before they are cached or
-injected. Token response lifetimes are capped and cached with an expiry margin
-unless a profile supplies an explicit cache TTL override.
+injected. Token caching follows response-derived and profile override TTL rules.
 
 For AWS endpoints that require request-level signing, the proxy supports SigV4
 re-signing. When `credential_signing: sigv4` is set on an L7 endpoint, the proxy
@@ -206,9 +208,8 @@ strips the client's placeholder-based AWS auth headers, re-signs with real
 credentials from the provider, and forwards the request upstream. The signing
 mode is auto-detected from the client SDK's `x-amz-content-sha256` header:
 
-- **Signed body** (hex hash): buffers the request body (up to 10 MiB), computes
-  its SHA-256, and includes the hash in the signature. Used by Bedrock and most
-  AWS services.
+- **Signed body** (hex hash): buffers the request body, computes its SHA-256,
+  and includes the hash in the signature. Used by Bedrock and most AWS services.
 - **Streaming unsigned** (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`): signs headers
   only and streams the body through without buffering. Used by S3 uploads with
   `aws-chunked` encoding.
@@ -281,12 +282,10 @@ remains `Pending`. If the first poll returns a different revision, the superviso
 processes it through the normal reload path instead of treating it as already
 loaded.
 
-Policy status delivery uses a FIFO background worker. Retryable delivery
-failures retain the ordered update and retry with capped exponential backoff;
-terminal errors are logged and discarded. The outbox is nonblocking and does
-not discard updates because of a fixed queue capacity, so status endpoint
-outages cannot block policy polling, enforcement, settings, or provider
-refreshes and cannot permanently lose the initial acknowledgement.
+Policy status delivery uses a FIFO background worker independently from policy
+reconciliation. Retryable delivery failures retain the ordered update; terminal
+errors are logged and discarded. This prevents status endpoint outages from
+blocking policy polling, enforcement, settings, or provider refreshes.
 
 Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than
 zero) are acknowledged. Global policies and local-file development policies do
