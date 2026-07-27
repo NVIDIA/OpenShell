@@ -17,7 +17,7 @@ mod sidecar_control;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -95,7 +95,7 @@ pub async fn run_sandbox(
     _health_check: bool,
     _health_port: u16,
     inference_routes: Option<String>,
-    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
+    ocsf_enabled: Arc<AtomicBool>,
     network_enabled: bool,
     process_enabled: bool,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
@@ -942,8 +942,9 @@ fn spawn_sidecar_entrypoint_handler(
     tokio::spawn(async move {
         let mut session_started = false;
         let mut trusted_supervisor_pid = None;
+        let terminating = Arc::new(AtomicBool::new(false));
         while let Some(started) = entrypoint_rx.recv().await {
-            entrypoint_pid.store(started.pid, std::sync::atomic::Ordering::Release);
+            entrypoint_pid.store(started.pid, Ordering::Release);
             if started.start_session {
                 info!(
                     pid = started.pid,
@@ -990,11 +991,13 @@ fn spawn_sidecar_entrypoint_handler(
                     trusted_ssh_socket_path.clone(),
                     None,
                     Some(supervisor_pid),
+                    Arc::clone(&terminating),
                 );
                 session_started = true;
                 info!("sidecar supervisor session task spawned");
             }
         }
+        terminating.store(true, Ordering::Release);
     });
 }
 
@@ -2521,7 +2524,7 @@ struct PolicyPollLoopContext {
     loaded_policy_origin: LoadedPolicyOrigin,
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
-    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
+    ocsf_enabled: Arc<AtomicBool>,
     provider_credentials: ProviderCredentialState,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
     agent_proposals: AgentProposals,
@@ -2970,7 +2973,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 }
 
 fn apply_ocsf_json_setting(
-    enabled: &std::sync::atomic::AtomicBool,
+    enabled: &AtomicBool,
     settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
 ) {
     use std::sync::atomic::Ordering;

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -9,6 +8,8 @@ use std::str::FromStr;
 /// Default Podman bridge network name.
 pub const DEFAULT_NETWORK_NAME: &str = "openshell";
 pub const MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP: &str = "192.168.127.254";
+/// Default Podman stop timeout in seconds (SIGTERM → SIGKILL).
+pub const DEFAULT_PODMAN_STOP_TIMEOUT_SECS: u32 = 45;
 
 // Re-export the shared default so existing imports inside this crate keep working.
 pub use openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT;
@@ -366,7 +367,7 @@ impl Default for PodmanComputeConfig {
             sandbox_ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             network_name: DEFAULT_NETWORK_NAME.to_string(),
             host_gateway_ip: Self::default_host_gateway_ip(),
-            stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
+            stop_timeout_secs: DEFAULT_PODMAN_STOP_TIMEOUT_SECS,
             supervisor_image: openshell_core::config::default_supervisor_image(),
             guest_tls_ca: None,
             guest_tls_cert: None,
@@ -426,6 +427,12 @@ mod tests {
             cfg.health_check_interval_secs,
             DEFAULT_HEALTH_CHECK_INTERVAL_SECS
         );
+    }
+
+    #[test]
+    fn default_config_sets_podman_stop_timeout() {
+        let cfg = PodmanComputeConfig::default();
+        assert_eq!(cfg.stop_timeout_secs, DEFAULT_PODMAN_STOP_TIMEOUT_SECS);
     }
 
     #[test]
