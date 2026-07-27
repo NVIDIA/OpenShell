@@ -114,6 +114,57 @@ async fn cleanup_sandbox_token_secret(client: &PodmanClient, secret_name: &str) 
     }
 }
 
+/// Read the operator's proxy credentials file and stage it as a per-sandbox
+/// Podman secret, so the credentials reach the supervisor through a root-only
+/// mount rather than the container environment.
+///
+/// Fails closed: when `proxy_auth_file` is configured but cannot be read or
+/// does not hold a valid `user:pass` credential, the sandbox is not created.
+/// Credential validation is shared with the in-container supervisor through
+/// [`openshell_core::driver_utils::parse_upstream_proxy_credential`], so a
+/// credential staged here can never be rejected at supervisor startup.
+async fn create_sandbox_proxy_auth_secret(
+    client: &PodmanClient,
+    config: &PodmanComputeConfig,
+    sandbox: &DriverSandbox,
+) -> Result<Option<String>, ComputeDriverError> {
+    let Some(path) = config.proxy_auth_file.as_deref() else {
+        return Ok(None);
+    };
+
+    // Bounded, blocking read shared with the supervisor: rejects non-regular
+    // files (e.g. /dev/zero) and caps the size so a hostile path cannot
+    // exhaust gateway memory.
+    let path_owned = path.to_string();
+    let raw = tokio::task::spawn_blocking(move || {
+        openshell_core::driver_utils::read_upstream_proxy_credential_file(&path_owned)
+    })
+    .await
+    .map_err(|e| ComputeDriverError::Message(format!("proxy_auth_file read task failed: {e}")))?
+    .map_err(ComputeDriverError::Message)?;
+    let credential =
+        openshell_core::driver_utils::parse_upstream_proxy_credential(&raw).map_err(|err| {
+            ComputeDriverError::InvalidArgument(format!("proxy_auth_file '{path}': {err}"))
+        })?;
+
+    let secret_name = container::proxy_auth_secret_name(&sandbox.id);
+    client
+        .create_secret(&secret_name, format!("{credential}\n").as_bytes())
+        .await
+        .map_err(ComputeDriverError::from)?;
+    Ok(Some(secret_name))
+}
+
+async fn cleanup_sandbox_proxy_auth_secret(client: &PodmanClient, secret_name: &str) {
+    if let Err(err) = client.remove_secret(secret_name).await {
+        warn!(
+            secret = %secret_name,
+            error = %err,
+            "Failed to remove Podman sandbox proxy-auth secret"
+        );
+    }
+}
+
 fn local_podman_cdi_gpu_inventory_from(dev_root: &Path) -> CdiGpuInventory {
     let mut device_ids = std::fs::read_dir(dev_root)
         .ok()
@@ -211,6 +262,7 @@ impl PodmanComputeDriver {
         config.validate_tls_config()?;
         config.validate_runtime_limits()?;
         config.validate_host_gateway_ip()?;
+        config.validate_proxy_config()?;
 
         let client = PodmanClient::new(socket_path);
 
@@ -542,6 +594,29 @@ impl PodmanComputeDriver {
                 return Err(e);
             }
         };
+        let proxy_auth_secret_name =
+            match create_sandbox_proxy_auth_secret(&self.client, &self.config, sandbox).await {
+                Ok(name) => name,
+                Err(e) => {
+                    let _ = self.client.remove_volume(&vol_name).await;
+                    if let Some(secret) = token_secret_name.as_deref() {
+                        cleanup_sandbox_token_secret(&self.client, secret).await;
+                    }
+                    return Err(e);
+                }
+            };
+
+        // Clean up the volume and both per-sandbox secrets on any failure past
+        // this point.
+        let cleanup_created = || async {
+            let _ = self.client.remove_volume(&vol_name).await;
+            if let Some(secret) = token_secret_name.as_deref() {
+                cleanup_sandbox_token_secret(&self.client, secret).await;
+            }
+            if let Some(secret) = proxy_auth_secret_name.as_deref() {
+                cleanup_sandbox_proxy_auth_secret(&self.client, secret).await;
+            }
+        };
 
         // 3. Create container.
         let gpu_devices = match self.resolve_gpu_cdi_devices(
@@ -551,10 +626,7 @@ impl PodmanComputeDriver {
         ) {
             Ok(devices) => devices,
             Err(e) => {
-                let _ = self.client.remove_volume(&vol_name).await;
-                if let Some(secret) = token_secret_name.as_deref() {
-                    cleanup_sandbox_token_secret(&self.client, secret).await;
-                }
+                cleanup_created().await;
                 return Err(e);
             }
         };
@@ -566,10 +638,7 @@ impl PodmanComputeDriver {
         ) {
             Ok(spec) => spec,
             Err(e) => {
-                let _ = self.client.remove_volume(&vol_name).await;
-                if let Some(secret) = token_secret_name.as_deref() {
-                    cleanup_sandbox_token_secret(&self.client, secret).await;
-                }
+                cleanup_created().await;
                 return Err(e);
             }
         };
@@ -580,17 +649,11 @@ impl PodmanComputeDriver {
                 // sandbox's ID, not the conflicting container's ID (which
                 // has the same name but a different ID), so it would be
                 // orphaned otherwise.
-                let _ = self.client.remove_volume(&vol_name).await;
-                if let Some(secret) = token_secret_name.as_deref() {
-                    cleanup_sandbox_token_secret(&self.client, secret).await;
-                }
+                cleanup_created().await;
                 return Err(ComputeDriverError::AlreadyExists);
             }
             Err(e) => {
-                let _ = self.client.remove_volume(&vol_name).await;
-                if let Some(secret) = token_secret_name.as_deref() {
-                    cleanup_sandbox_token_secret(&self.client, secret).await;
-                }
+                cleanup_created().await;
                 return Err(ComputeDriverError::from(e));
             }
         }
@@ -603,10 +666,7 @@ impl PodmanComputeDriver {
                 "Failed to start container; cleaning up"
             );
             let _ = self.client.remove_container(&name).await;
-            let _ = self.client.remove_volume(&vol_name).await;
-            if let Some(secret) = token_secret_name.as_deref() {
-                cleanup_sandbox_token_secret(&self.client, secret).await;
-            }
+            cleanup_created().await;
             return Err(ComputeDriverError::from(e));
         }
 
@@ -662,6 +722,11 @@ impl PodmanComputeDriver {
             }
             cleanup_sandbox_token_secret(&self.client, &container::token_secret_name(sandbox_id))
                 .await;
+            cleanup_sandbox_proxy_auth_secret(
+                &self.client,
+                &container::proxy_auth_secret_name(sandbox_id),
+            )
+            .await;
             return Ok(false);
         };
         info!(sandbox_id = %sandbox_id, container = %container_id, "Deleting sandbox container");
@@ -689,6 +754,11 @@ impl PodmanComputeDriver {
             );
         }
         cleanup_sandbox_token_secret(&self.client, &container::token_secret_name(sandbox_id)).await;
+        cleanup_sandbox_proxy_auth_secret(
+            &self.client,
+            &container::proxy_auth_secret_name(sandbox_id),
+        )
+        .await;
 
         Ok(container_existed)
     }
@@ -873,7 +943,7 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     // ── socket resolution ───────────────────────────────────────────────
     //
@@ -1529,6 +1599,156 @@ mod tests {
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))
             )
+        );
+        let _ = fs::remove_file(socket_path);
+    }
+
+    /// Write a valid `user:pass` credential to a unique path for proxy-auth
+    /// secret tests. Caller removes it.
+    fn write_proxy_auth_file(test_name: &str) -> PathBuf {
+        let path = crate::test_utils::unique_socket_path(test_name).with_extension("auth");
+        fs::write(&path, "user:pass\n").expect("write proxy auth file");
+        path
+    }
+
+    fn proxy_auth_config(socket_path: PathBuf, auth_file: &Path) -> PodmanComputeConfig {
+        PodmanComputeConfig {
+            socket_path: Some(socket_path),
+            stop_timeout_secs: 10,
+            proxy_auth_file: Some(auth_file.to_string_lossy().into_owned()),
+            proxy_auth_allow_insecure: Some(true),
+            ..PodmanComputeConfig::default()
+        }
+    }
+
+    fn plain_sandbox(id: &str, name: &str) -> DriverSandbox {
+        DriverSandbox {
+            id: id.to_string(),
+            name: name.to_string(),
+            namespace: String::new(),
+            workspace: String::new(),
+            spec: None,
+            status: None,
+        }
+    }
+
+    fn secret_delete_request(sandbox_id: &str) -> String {
+        format!(
+            "DELETE {}",
+            api_path(&format!(
+                "/libpod/secrets/{}",
+                container::proxy_auth_secret_name(sandbox_id)
+            ))
+        )
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_removes_proxy_auth_secret_on_container_create_failure() {
+        // A credential secret is staged before the container is created, so a
+        // container-create failure must remove it — no credential residue.
+        let sandbox_id = "sandbox-cc";
+        let auth_file = write_proxy_auth_file("create-fail");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "create-container-fail",
+            vec![
+                StubResponse::new(StatusCode::OK, "{}"), // pull supervisor image
+                StubResponse::new(StatusCode::OK, "{}"), // pull sandbox image
+                StubResponse::new(StatusCode::CREATED, "{}"), // create volume
+                StubResponse::new(StatusCode::CREATED, "{}"), // create proxy-auth secret
+                StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"message":"boom"}"#), // create container
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove volume
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove proxy-auth secret
+            ],
+        );
+        let driver = test_driver_with_config(proxy_auth_config(socket_path.clone(), &auth_file));
+
+        driver
+            .create_sandbox(&plain_sandbox(sandbox_id, "demo"))
+            .await
+            .expect_err("container create should fail");
+
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert!(
+            requests.contains(&secret_delete_request(sandbox_id)),
+            "proxy-auth secret must be removed on container-create failure: {requests:?}"
+        );
+        let _ = fs::remove_file(&auth_file);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_removes_proxy_auth_secret_on_start_failure() {
+        // The container is created but fails to start; the staged credential
+        // secret must still be removed.
+        let sandbox_id = "sandbox-sf";
+        let auth_file = write_proxy_auth_file("start-fail");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "create-start-fail",
+            vec![
+                StubResponse::new(StatusCode::OK, "{}"), // pull supervisor image
+                StubResponse::new(StatusCode::OK, "{}"), // pull sandbox image
+                StubResponse::new(StatusCode::CREATED, "{}"), // create volume
+                StubResponse::new(StatusCode::CREATED, "{}"), // create proxy-auth secret
+                StubResponse::new(StatusCode::CREATED, "{}"), // create container
+                StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"message":"boom"}"#), // start container
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove container
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove volume
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove proxy-auth secret
+            ],
+        );
+        let driver = test_driver_with_config(proxy_auth_config(socket_path.clone(), &auth_file));
+
+        driver
+            .create_sandbox(&plain_sandbox(sandbox_id, "demo"))
+            .await
+            .expect_err("container start should fail");
+
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert!(
+            requests.contains(&secret_delete_request(sandbox_id)),
+            "proxy-auth secret must be removed on start failure: {requests:?}"
+        );
+        let _ = fs::remove_file(&auth_file);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_removes_proxy_auth_secret() {
+        // Deleting a sandbox (here already gone out of band) must remove the
+        // per-sandbox proxy-auth secret so credentials never outlive it.
+        let sandbox_id = "sandbox-del";
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "delete-proxy-auth",
+            vec![
+                StubResponse::new(StatusCode::OK, "[]"), // list_containers (not found)
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove volume
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove token secret
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove proxy-auth secret
+            ],
+        );
+        let driver = test_driver(socket_path.clone());
+
+        driver
+            .delete_sandbox(sandbox_id)
+            .await
+            .expect("delete should succeed");
+
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert!(
+            requests.contains(&secret_delete_request(sandbox_id)),
+            "proxy-auth secret must be removed on delete: {requests:?}"
         );
         let _ = fs::remove_file(socket_path);
     }

@@ -142,7 +142,8 @@ pub fn extract_host_from_ssh_destination(destination: &str) -> String {
 
     // Handle user@host format
     dest.find('@')
-        .map_or_else(|| dest.to_string(), |at_pos| dest[at_pos + 1..].to_string())
+        .and_then(|at_pos| dest.get(at_pos + 1..))
+        .map_or_else(|| dest.to_string(), ToString::to_string)
 }
 
 /// Resolve an SSH host alias to the actual hostname or IP address.
@@ -455,6 +456,11 @@ mod tests {
             extract_host_from_ssh_destination("ssh://myserver"),
             "myserver"
         );
+    }
+
+    #[test]
+    fn extract_host_user_at_multi_byte_hostname() {
+        assert_eq!(extract_host_from_ssh_destination("user@mülti"), "mülti");
     }
 
     #[test]

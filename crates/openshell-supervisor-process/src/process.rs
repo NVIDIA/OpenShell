@@ -1101,11 +1101,8 @@ fn rewrite_passwd_at(path: &Path, uid: &str, gid: &str) -> Result<()> {
             if line.starts_with("sandbox:") {
                 found = true;
                 let fields: Vec<&str> = line.split(':').collect();
-                if fields.len() >= 7 {
-                    format!(
-                        "{}:{}:{}:{}:{}:{}:{}",
-                        fields[0], fields[1], uid, gid, fields[4], fields[5], fields[6]
-                    )
+                if let [name, pass, _, _, gecos, home, shell, ..] = fields.as_slice() {
+                    format!("{name}:{pass}:{uid}:{gid}:{gecos}:{home}:{shell}")
                 } else {
                     line.to_string()
                 }
@@ -1139,8 +1136,8 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
             if line.starts_with("sandbox:") {
                 found = true;
                 let fields: Vec<&str> = line.split(':').collect();
-                if fields.len() >= 4 {
-                    format!("{}:{}:{}:{}", fields[0], fields[1], gid, fields[3])
+                if let [name, pass, _, members, ..] = fields.as_slice() {
+                    format!("{name}:{pass}:{gid}:{members}")
                 } else {
                     line.to_string()
                 }
@@ -2300,6 +2297,30 @@ mod tests {
         let content = std::fs::read_to_string(&group).unwrap();
         assert!(content.contains("root:x:0:"));
         assert!(content.contains("sandbox:x:6000:"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_passwd_leaves_malformed_entry_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwd = dir.path().join("passwd");
+        // Only 3 fields — slice pattern should fall through instead of panic.
+        std::fs::write(&passwd, "sandbox:x:1000\n").unwrap();
+        rewrite_passwd_at(&passwd, "5000", "6000").unwrap();
+        let content = std::fs::read_to_string(&passwd).unwrap();
+        assert!(content.contains("sandbox:x:1000"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_group_leaves_malformed_entry_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = dir.path().join("group");
+        // Only 2 fields — slice pattern should fall through instead of panic.
+        std::fs::write(&group, "sandbox:x\n").unwrap();
+        rewrite_group_at(&group, "6000").unwrap();
+        let content = std::fs::read_to_string(&group).unwrap();
+        assert!(content.contains("sandbox:x"));
     }
 
     #[cfg(unix)]

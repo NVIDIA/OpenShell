@@ -52,17 +52,9 @@ use openshell_ocsf::{
 /// `run_sandbox()` startup via `openshell_ocsf::ctx::set_ctx`.
 pub(crate) use openshell_ocsf::ctx::ctx as ocsf_ctx;
 
-/// Process-wide flag for the agent-driven policy proposal surface.
-/// Set once during `run_sandbox()` startup and updated by the settings poll
-/// loop when `agent_policy_proposals_enabled` changes. Read by the
-/// `policy.local` route handler and the L7 deny body's `next_steps` builder
-/// to gate the agent-controlled mutation surface. Exposed `pub(crate)` so
-/// unit tests in sibling modules can flip the flag through a serialized
-/// guard (see `policy_local::tests::ProposalsFlagGuard`).
-pub(crate) use openshell_core::proposals::AGENT_PROPOSALS_ENABLED;
-
 use openshell_core::denial::DenialEvent;
 use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
+use openshell_core::proposals::AgentProposals;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_network::opa::OpaEngine;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
@@ -106,6 +98,7 @@ pub async fn run_sandbox(
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
     network_enabled: bool,
     process_enabled: bool,
+    upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
 ) -> Result<i32> {
     let (program, args) = command
         .split_first()
@@ -160,27 +153,34 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (mut policy, opa_engine, retained_proto, middleware_registry_status, loaded_policy_origin) =
-        if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
-            let (policy, opa_engine, retained_proto, loaded_policy_origin) =
-                load_policy_from_sidecar_bootstrap(bootstrap)?;
-            (
-                policy,
-                opa_engine,
-                retained_proto,
-                MiddlewareRegistryStatus::Synchronized,
-                loaded_policy_origin,
-            )
-        } else {
-            load_policy(
-                sandbox_id.clone(),
-                sandbox,
-                openshell_endpoint.clone(),
-                policy_rules,
-                policy_data,
-            )
-            .await?
-        };
+    let (
+        mut policy,
+        opa_engine,
+        retained_proto,
+        middleware_registry_status,
+        loaded_policy_origin,
+        initial_agent_proposals_enabled,
+    ) = if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
+        let (policy, opa_engine, retained_proto, loaded_policy_origin) =
+            load_policy_from_sidecar_bootstrap(bootstrap)?;
+        (
+            policy,
+            opa_engine,
+            retained_proto,
+            MiddlewareRegistryStatus::Synchronized,
+            loaded_policy_origin,
+            bootstrap.agent_proposals_enabled,
+        )
+    } else {
+        load_policy(
+            sandbox_id.clone(),
+            sandbox,
+            openshell_endpoint.clone(),
+            policy_rules,
+            policy_data,
+        )
+        .await?
+    };
 
     // Override the policy's process identity with the driver-resolved UID/GID
     // from the pod environment. The policy defaults to the name "sandbox" which
@@ -290,25 +290,23 @@ pub async fn run_sandbox(
             let provider_env = provider_credentials.child_env_with_gcp_resolved();
             (provider_credentials, provider_env)
         };
+
+    // Shared agent-proposals feature flag. Seed from the same initial settings
+    // snapshot that produced the policy so networking and process setup agree
+    // before the poll loop starts reconciling later changes.
+    let agent_proposals = AgentProposals::new(initial_agent_proposals_enabled);
+
     let process_control_writer = process_control_connection
         .as_ref()
         .map(|connection| connection.writer.clone());
     let mut process_control_closed = None;
     if let Some(connection) = process_control_connection {
         process_control_closed = Some(connection.closed);
-        spawn_sidecar_control_update_watcher(connection.updates, provider_credentials.clone());
-    }
-
-    // Initialize the agent-proposals feature flag. Default false until the
-    // initial settings fetch (or the poll loop) tells us otherwise. The flag
-    // gates the skill install, the policy.local route handler, and the L7
-    // deny body's `next_steps` field — see `agent_proposals_enabled()`.
-    let proposals_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if AGENT_PROPOSALS_ENABLED
-        .set(proposals_enabled.clone())
-        .is_err()
-    {
-        debug!("agent proposals flag already initialized, keeping existing");
+        spawn_sidecar_control_update_watcher(
+            connection.updates,
+            provider_credentials.clone(),
+            agent_proposals.clone(),
+        );
     }
 
     // Shared PID: set after process spawn so the proxy can look up
@@ -389,7 +387,9 @@ pub async fn run_sandbox(
                 inference_routes.as_deref(),
                 denial_tx,
                 activity_tx,
+                agent_proposals.clone(),
                 workspace_rx.clone(),
+                &upstream_proxy_args,
             )
             .await?,
         )
@@ -422,6 +422,7 @@ pub async fn run_sandbox(
                 policy_proto: proto.clone(),
                 provider_env_revision: provider_credentials.snapshot().revision,
                 provider_child_env: provider_env.clone(),
+                agent_proposals_enabled: agent_proposals.enabled(),
                 proxy_ca_cert_path: ca_paths.as_ref().map(|paths| paths.0.clone()),
                 proxy_ca_bundle_path: ca_paths.as_ref().map(|paths| paths.1.clone()),
             },
@@ -591,6 +592,7 @@ pub async fn run_sandbox(
             ocsf_enabled: poll_ocsf_enabled,
             provider_credentials: poll_provider_credentials,
             policy_local_ctx: poll_policy_local,
+            agent_proposals: agent_proposals.clone(),
             middleware_registry_status,
             sidecar_control_publisher: sidecar_control_publisher.clone(),
             workspace_tx,
@@ -710,6 +712,7 @@ pub async fn run_sandbox(
             provider_credentials,
             provider_env,
             ca_file_paths,
+            agent_proposals.clone(),
             #[cfg(target_os = "linux")]
             netns.as_ref(),
             #[cfg(target_os = "linux")]
@@ -870,11 +873,12 @@ fn load_policy_from_sidecar_bootstrap(
 fn spawn_sidecar_control_update_watcher(
     mut updates: tokio::sync::mpsc::UnboundedReceiver<sidecar_control::ControlUpdate>,
     provider_credentials: ProviderCredentialState,
+    agent_proposals: AgentProposals,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(update) = updates.recv().await {
             match update {
-                sidecar_control::ControlUpdate::ProviderEnvUpdated {
+                sidecar_control::ControlUpdate::ProviderEnv {
                     revision,
                     provider_child_env,
                 } => {
@@ -895,7 +899,7 @@ fn spawn_sidecar_control_update_watcher(
                             .build()
                     );
                 }
-                sidecar_control::ControlUpdate::PolicyUpdated {
+                sidecar_control::ControlUpdate::Policy {
                     policy_proto,
                     policy_hash,
                     config_revision,
@@ -905,6 +909,19 @@ fn spawn_sidecar_control_update_watcher(
                         policy_hash,
                         config_revision,
                         "Received sidecar policy update for process supervisor"
+                    );
+                }
+                sidecar_control::ControlUpdate::AgentProposals {
+                    enabled,
+                    config_revision,
+                } => {
+                    apply_agent_proposals_enabled(
+                        &agent_proposals,
+                        enabled,
+                        "sidecar control",
+                        Some(config_revision),
+                        None,
+                        skills::install_static_skills,
                     );
                 }
             }
@@ -1831,6 +1848,7 @@ async fn load_policy(
     Option<openshell_core::proto::SandboxPolicy>,
     MiddlewareRegistryStatus,
     LoadedPolicyOrigin,
+    bool,
 )> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
@@ -1879,6 +1897,7 @@ async fn load_policy(
             None,
             MiddlewareRegistryStatus::Synchronized,
             LoadedPolicyOrigin::LocalOverride,
+            false,
         ));
     }
 
@@ -2060,6 +2079,7 @@ async fn load_policy(
             LoadedPolicyOrigin::Gateway {
                 revision: loaded_policy_revision,
             },
+            agent_proposals_enabled_from_settings(&snapshot.settings),
         ));
     }
 
@@ -2504,6 +2524,7 @@ struct PolicyPollLoopContext {
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
     provider_credentials: ProviderCredentialState,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
+    agent_proposals: AgentProposals,
     middleware_registry_status: MiddlewareRegistryStatus,
     sidecar_control_publisher: Option<sidecar_control::Publisher>,
     workspace_tx: tokio::sync::watch::Sender<String>,
@@ -2623,6 +2644,14 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
                 InitialPollDisposition::Acknowledge(candidate) => {
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_agent_proposals_enabled(
+                        &ctx.agent_proposals,
+                        agent_proposals_enabled_from_settings(&result.settings),
+                        "initial settings poll",
+                        Some(candidate.config_revision),
+                        ctx.sidecar_control_publisher.as_ref(),
+                        skills::install_static_skills,
+                    );
                     current_config_revision = candidate.config_revision;
                     current_policy_hash.clone_from(&candidate.policy_hash);
                     current_middleware_services = result.supervisor_middleware_services;
@@ -2639,6 +2668,14 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                 InitialPollDisposition::Reconcile => pending_result = Some(result),
                 InitialPollDisposition::TrackOnly => {
                     apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_agent_proposals_enabled(
+                        &ctx.agent_proposals,
+                        agent_proposals_enabled_from_settings(&result.settings),
+                        "initial settings poll",
+                        Some(result.config_revision),
+                        ctx.sidecar_control_publisher.as_ref(),
+                        skills::install_static_skills,
+                    );
                     current_config_revision = result.config_revision;
                     current_policy_hash = result.policy_hash.clone();
                     current_middleware_services = result.supervisor_middleware_services;
@@ -2913,34 +2950,16 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         // off picks up the surface without a recreate. We never uninstall on
         // a true→false transition: stale skill content on disk is harmless
         // because route_request and agent_next_steps both gate on the live
-        // atomic, so the agent that reads the skill will see 404s and an
+        // shared flag, so the agent that reads the skill will see 404s and an
         // empty `next_steps` array regardless.
-        if let Some(flag) = AGENT_PROPOSALS_ENABLED.get() {
-            let new_proposals = extract_bool_setting(
-                &result.settings,
-                openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY,
-            )
-            .unwrap_or(false);
-            let prev_proposals = flag.swap(new_proposals, Ordering::Relaxed);
-            if new_proposals != prev_proposals {
-                info!(
-                    agent_policy_proposals_enabled = new_proposals,
-                    "agent-driven policy proposals toggled"
-                );
-                if new_proposals && !prev_proposals {
-                    match skills::install_static_skills() {
-                        Ok(installed) => info!(
-                            path = %installed.policy_advisor.display(),
-                            "Installed sandbox agent skill on toggle-on"
-                        ),
-                        Err(error) => warn!(
-                            error = %error,
-                            "Failed to install sandbox agent skill on toggle-on"
-                        ),
-                    }
-                }
-            }
-        }
+        apply_agent_proposals_enabled(
+            &ctx.agent_proposals,
+            agent_proposals_enabled_from_settings(&result.settings),
+            "settings poll",
+            Some(result.config_revision),
+            ctx.sidecar_control_publisher.as_ref(),
+            skills::install_static_skills,
+        );
 
         current_config_revision = result.config_revision;
         if !reloads_gateway_policy {
@@ -2977,6 +2996,52 @@ fn extract_bool_setting(
             setting_value::Value::BoolValue(b) => Some(*b),
             _ => None,
         })
+}
+
+fn agent_proposals_enabled_from_settings(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) -> bool {
+    extract_bool_setting(
+        settings,
+        openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY,
+    )
+    .unwrap_or(false)
+}
+
+fn apply_agent_proposals_enabled(
+    agent_proposals: &AgentProposals,
+    enabled: bool,
+    source: &'static str,
+    config_revision: Option<u64>,
+    sidecar_control_publisher: Option<&sidecar_control::Publisher>,
+    install_static_skills: impl FnOnce() -> Result<skills::InstalledSkills>,
+) {
+    let previously_enabled = agent_proposals.swap_enabled(enabled);
+    if enabled == previously_enabled {
+        return;
+    }
+
+    info!(
+        agent_policy_proposals_enabled = enabled,
+        source, config_revision, "agent-driven policy proposals toggled"
+    );
+
+    if let (Some(publisher), Some(config_revision)) = (sidecar_control_publisher, config_revision) {
+        publisher.publish_agent_proposals(enabled, config_revision);
+    }
+
+    if enabled && !previously_enabled {
+        match install_static_skills() {
+            Ok(installed) => info!(
+                path = %installed.policy_advisor.display(),
+                "Installed sandbox agent skill on toggle-on"
+            ),
+            Err(error) => warn!(
+                error = %error,
+                "Failed to install sandbox agent skill on toggle-on"
+            ),
+        }
+    }
 }
 
 /// Log individual setting changes between two snapshots.
@@ -3060,7 +3125,7 @@ mod tests {
     use openshell_core::policy::{
         FilesystemPolicy, LandlockPolicy, NetworkMode, NetworkPolicy, ProcessPolicy, ProxyPolicy,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn proxy_policy(http_addr: Option<std::net::SocketAddr>) -> SandboxPolicy {
         SandboxPolicy {
@@ -3132,9 +3197,13 @@ mod tests {
             1,
             std::collections::HashMap::from([("TOKEN".to_string(), "old".to_string())]),
         );
-        let handle = spawn_sidecar_control_update_watcher(rx, provider_credentials.clone());
+        let handle = spawn_sidecar_control_update_watcher(
+            rx,
+            provider_credentials.clone(),
+            AgentProposals::default(),
+        );
 
-        tx.send(sidecar_control::ControlUpdate::ProviderEnvUpdated {
+        tx.send(sidecar_control::ControlUpdate::ProviderEnv {
             revision: 2,
             provider_child_env: std::collections::HashMap::from([(
                 "TOKEN".to_string(),
@@ -3160,7 +3229,7 @@ mod tests {
             Some("new")
         );
 
-        tx.send(sidecar_control::ControlUpdate::ProviderEnvUpdated {
+        tx.send(sidecar_control::ControlUpdate::ProviderEnv {
             revision: 1,
             provider_child_env: std::collections::HashMap::from([(
                 "TOKEN".to_string(),
@@ -3178,6 +3247,72 @@ mod tests {
             Some("new")
         );
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn sidecar_control_agent_proposals_update_flips_shared_state() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let provider_credentials =
+            ProviderCredentialState::from_child_env_snapshot(0, std::collections::HashMap::new());
+        let agent_proposals = AgentProposals::new(true);
+        let handle =
+            spawn_sidecar_control_update_watcher(rx, provider_credentials, agent_proposals.clone());
+
+        tx.send(sidecar_control::ControlUpdate::AgentProposals {
+            enabled: false,
+            config_revision: 5,
+        })
+        .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !agent_proposals.enabled() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        handle.abort();
+    }
+
+    #[test]
+    fn apply_agent_proposals_enabled_installs_only_on_false_to_true() {
+        let agent_proposals = AgentProposals::default();
+        let installs = AtomicUsize::new(0);
+
+        apply_agent_proposals_enabled(&agent_proposals, true, "test", Some(1), None, || {
+            installs.fetch_add(1, Ordering::Relaxed);
+            Ok(skills::InstalledSkills {
+                policy_advisor: std::path::PathBuf::from("/tmp/policy_advisor.md"),
+                policy_advisor_skill: std::path::PathBuf::from("/tmp/SKILL.md"),
+                agents: None,
+            })
+        });
+        assert!(agent_proposals.enabled());
+        assert_eq!(installs.load(Ordering::Relaxed), 1);
+
+        apply_agent_proposals_enabled(&agent_proposals, true, "test", Some(2), None, || {
+            installs.fetch_add(1, Ordering::Relaxed);
+            Ok(skills::InstalledSkills {
+                policy_advisor: std::path::PathBuf::from("/tmp/policy_advisor.md"),
+                policy_advisor_skill: std::path::PathBuf::from("/tmp/SKILL.md"),
+                agents: None,
+            })
+        });
+        assert_eq!(installs.load(Ordering::Relaxed), 1);
+
+        apply_agent_proposals_enabled(&agent_proposals, false, "test", Some(3), None, || {
+            installs.fetch_add(1, Ordering::Relaxed);
+            Ok(skills::InstalledSkills {
+                policy_advisor: std::path::PathBuf::from("/tmp/policy_advisor.md"),
+                policy_advisor_skill: std::path::PathBuf::from("/tmp/SKILL.md"),
+                agents: None,
+            })
+        });
+        assert!(!agent_proposals.enabled());
+        assert_eq!(installs.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -3199,6 +3334,24 @@ mod tests {
         apply_ocsf_json_setting(&enabled, &settings);
 
         assert!(!enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn agent_proposals_setting_enables_from_initial_settings_snapshot() {
+        let mut settings = std::collections::HashMap::new();
+        settings.insert(
+            openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY.to_string(),
+            effective_bool(true),
+        );
+
+        assert!(agent_proposals_enabled_from_settings(&settings));
+    }
+
+    #[test]
+    fn agent_proposals_setting_defaults_false_when_unset() {
+        let settings = std::collections::HashMap::new();
+
+        assert!(!agent_proposals_enabled_from_settings(&settings));
     }
 
     // ---- Policy disk discovery tests ----

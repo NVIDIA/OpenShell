@@ -3855,6 +3855,7 @@ dependencies = [
  "openshell-core",
  "openshell-policy",
  "openshell-providers",
+ "openshell-sdk",
  "openshell-tui",
  "owo-colors",
  "prost-types",
@@ -3889,6 +3890,7 @@ dependencies = [
  "glob",
  "ipnet",
  "miette",
+ "nix",
  "prost",
  "prost-types",
  "protobuf-src",
@@ -4074,6 +4076,7 @@ version = "0.0.0"
 dependencies = [
  "glob",
  "openshell-core",
+ "openshell-policy",
  "serde",
  "serde_json",
  "serde_yml",
@@ -4143,6 +4146,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rustls 0.23.38",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -4151,6 +4155,7 @@ dependencies = [
  "tonic",
  "tower 0.5.3",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

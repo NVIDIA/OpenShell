@@ -30,8 +30,10 @@ tower = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream = { workspace = true }
+wiremock = "0.6"
 
 [lints]
 workspace = true

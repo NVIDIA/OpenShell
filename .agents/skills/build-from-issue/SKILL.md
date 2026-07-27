@@ -377,7 +377,7 @@ Verification has two phases: unit tests + pre-commit, then E2E tests (if applica
 On each attempt:
 
 ```bash
-# Run pre-commit checks (includes unit tests, linting, formatting)
+# Run pre-commit checks (linting, formatting, license headers)
 mise run pre-commit
 ```
 
@@ -640,7 +640,7 @@ If the `state:in-progress` label is present, the skill was previously started bu
 | `gh pr list --state open --search "..."` | Search for open PRs |
 | `gh pr create --title "..." --body "..."` | Create a pull request |
 | `gh api user --jq '.login'` | Get current GitHub username |
-| `mise run pre-commit` | Run pre-commit checks (includes unit tests, lint, format) |
+| `mise run pre-commit` | Run pre-commit checks (lint, format, license headers) |
 | `mise run e2e:docker` | Run smoke E2E against a standalone Docker-backed gateway |
 | `mise run e2e:podman` | Run smoke E2E against a Podman-backed gateway |
 | `mise run e2e:vm` | Run smoke E2E against the VM compute driver |

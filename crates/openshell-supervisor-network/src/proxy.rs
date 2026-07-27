@@ -7,6 +7,7 @@ use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
+use crate::upstream_proxy::{self, UpstreamProxyConfig};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::denial::DenialEvent;
@@ -200,6 +201,7 @@ impl ProxyHandle {
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
         activity_tx: Option<ActivitySender>,
         engine_ready: tokio::sync::watch::Receiver<bool>,
+        upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -239,6 +241,48 @@ impl ProxyHandle {
                  host-gateway aliases exempt from SSRF always-blocked check"
             );
         }
+        let agent_proposals = policy_local_ctx
+            .as_ref()
+            .map_or_else(Default::default, |ctx| ctx.agent_proposals());
+
+        // Corporate egress proxy configured by the operator and delivered on
+        // the supervisor's command line by the compute driver; the
+        // conventional HTTPS_PROXY/NO_PROXY variables the sandbox controls
+        // are ignored here.
+        //
+        // This is an operator-owned security boundary, so a present-but-invalid
+        // value (bad proxy URL, unreadable auth file, malformed credential) is
+        // fatal to proxy startup: failing closed prevents a misconfiguration
+        // from silently degrading to direct dialing or unauthenticated proxy
+        // access.
+        let upstream_proxy: Arc<Option<UpstreamProxyConfig>> = Arc::new(
+            UpstreamProxyConfig::from_args(upstream_proxy_args).map_err(|err| {
+                let event =
+                    openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                        .severity(SeverityId::High)
+                        .status(StatusId::Failure)
+                        .state(openshell_ocsf::StateId::Disabled, "invalid")
+                        .message(format!(
+                            "Upstream corporate proxy configuration invalid; \
+                             refusing to start: {err}"
+                        ))
+                        .build();
+                ocsf_emit!(event);
+                miette::miette!("invalid upstream corporate proxy configuration: {err}")
+            })?,
+        );
+        if let Some(cfg) = upstream_proxy.as_ref() {
+            let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "enabled")
+                .message(format!(
+                    "Upstream corporate proxy enabled: {}",
+                    cfg.summary()
+                ))
+                .build();
+            ocsf_emit!(event);
+        }
 
         let join = tokio::spawn(async move {
             // Wait for the OPA engine's symlink resolution reload to complete
@@ -265,16 +309,22 @@ impl ProxyHandle {
                 }
             }
 
+            let mut consecutive_resource_errors: u32 = 0;
+            let mut consecutive_unknown_errors: u32 = 0;
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
+                        consecutive_resource_errors = 0;
+                        consecutive_unknown_errors = 0;
                         let opa = opa_engine.clone();
                         let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
                         let policy_local = policy_local_ctx.clone();
+                        let proposals = agent_proposals.clone();
                         let gw = trusted_host_gateway.clone();
+                        let up_proxy = upstream_proxy.clone();
                         let resolver = provider_credentials
                             .as_ref()
                             .and_then(ProviderCredentialState::resolver);
@@ -295,7 +345,9 @@ impl ProxyHandle {
                                 tls,
                                 inf,
                                 policy_local,
+                                proposals,
                                 gw,
+                                up_proxy,
                                 resolver,
                                 dynamic_credentials,
                                 dtx,
@@ -314,14 +366,24 @@ impl ProxyHandle {
                         });
                     }
                     Err(err) => {
+                        let outcome = handle_accept_error(
+                            &err,
+                            &mut consecutive_resource_errors,
+                            &mut consecutive_unknown_errors,
+                        );
+
                         let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                             .activity(ActivityId::Fail)
-                            .severity(SeverityId::Low)
+                            .severity(outcome.severity)
                             .status(StatusId::Failure)
-                            .message(format!("Proxy accept error: {err}"))
+                            .message(outcome.message)
                             .build();
                         ocsf_emit!(event);
-                        break;
+
+                        match outcome.backoff {
+                            Some(backoff) => tokio::time::sleep(backoff).await,
+                            None => break,
+                        }
                     }
                 }
             }
@@ -348,6 +410,139 @@ impl Drop for ProxyHandle {
 fn emit_activity(tx: &Option<ActivitySender>, denied: bool, deny_group: &'static str) {
     if let Some(tx) = tx {
         let _ = try_record_activity(tx, denied, deny_group);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptErrorClass {
+    Transient,
+    Terminal,
+    Unknown,
+}
+
+#[cfg(unix)]
+fn classify_accept_error(err: &std::io::Error) -> AcceptErrorClass {
+    match err.raw_os_error() {
+        Some(
+            libc::EMFILE
+            | libc::ENFILE
+            | libc::ENOBUFS
+            | libc::ENOMEM
+            | libc::ECONNABORTED
+            | libc::ECONNRESET
+            | libc::EINTR
+            | libc::ENETDOWN
+            | libc::EPROTO
+            | libc::ENOPROTOOPT
+            | libc::EHOSTDOWN
+            | libc::EHOSTUNREACH
+            | libc::EOPNOTSUPP
+            | libc::ENETUNREACH
+            | libc::ENOSR
+            | libc::ESOCKTNOSUPPORT
+            | libc::EPROTONOSUPPORT
+            | libc::ETIMEDOUT,
+        ) => AcceptErrorClass::Transient,
+        #[cfg(target_os = "linux")]
+        Some(libc::ENONET) => AcceptErrorClass::Transient,
+        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK) => AcceptErrorClass::Terminal,
+        _ => AcceptErrorClass::Unknown,
+    }
+}
+
+#[cfg(not(unix))]
+fn classify_accept_error(_err: &std::io::Error) -> AcceptErrorClass {
+    AcceptErrorClass::Unknown
+}
+
+#[cfg(unix)]
+fn is_resource_pressure_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::ENOSR)
+    )
+}
+
+#[cfg(not(unix))]
+fn is_resource_pressure_error(_err: &std::io::Error) -> bool {
+    false
+}
+
+const ACCEPT_BACKOFF_BASE_MS: u64 = 100;
+const ACCEPT_BACKOFF_MAX_MS: u64 = 5_000;
+const MAX_CONSECUTIVE_UNKNOWN_ERRORS: u32 = 5;
+
+fn accept_backoff(consecutive_errors: u32) -> std::time::Duration {
+    let exponent = consecutive_errors.saturating_sub(1).min(7);
+    let ms = ACCEPT_BACKOFF_BASE_MS
+        .saturating_mul(1u64 << exponent)
+        .min(ACCEPT_BACKOFF_MAX_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+struct AcceptErrorOutcome {
+    severity: SeverityId,
+    message: String,
+    backoff: Option<std::time::Duration>,
+}
+
+fn handle_accept_error(
+    err: &std::io::Error,
+    consecutive_resource_errors: &mut u32,
+    consecutive_unknown_errors: &mut u32,
+) -> AcceptErrorOutcome {
+    let class = classify_accept_error(err);
+
+    match class {
+        AcceptErrorClass::Terminal => AcceptErrorOutcome {
+            severity: SeverityId::High,
+            message: format!("Proxy accept error (terminal, exiting): {err}"),
+            backoff: None,
+        },
+        AcceptErrorClass::Unknown => {
+            *consecutive_unknown_errors = consecutive_unknown_errors.saturating_add(1);
+            if *consecutive_unknown_errors > MAX_CONSECUTIVE_UNKNOWN_ERRORS {
+                AcceptErrorOutcome {
+                    severity: SeverityId::High,
+                    message: format!(
+                        "Proxy accept error (exceeded {MAX_CONSECUTIVE_UNKNOWN_ERRORS} retries, exiting): {err}"
+                    ),
+                    backoff: None,
+                }
+            } else {
+                let backoff = accept_backoff(*consecutive_unknown_errors);
+                AcceptErrorOutcome {
+                    severity: SeverityId::Medium,
+                    message: format!(
+                        "Proxy accept error (retry {}/{MAX_CONSECUTIVE_UNKNOWN_ERRORS} in {}ms): {err}",
+                        *consecutive_unknown_errors,
+                        backoff.as_millis(),
+                    ),
+                    backoff: Some(backoff),
+                }
+            }
+        }
+        AcceptErrorClass::Transient => {
+            *consecutive_unknown_errors = 0;
+            if is_resource_pressure_error(err) {
+                *consecutive_resource_errors = consecutive_resource_errors.saturating_add(1);
+                let backoff = accept_backoff(*consecutive_resource_errors);
+                AcceptErrorOutcome {
+                    severity: SeverityId::Medium,
+                    message: format!(
+                        "Proxy accept error (retrying in {}ms): {err}",
+                        backoff.as_millis(),
+                    ),
+                    backoff: Some(backoff),
+                }
+            } else {
+                AcceptErrorOutcome {
+                    severity: SeverityId::Low,
+                    message: format!("Proxy accept error (retrying in 100ms): {err}"),
+                    backoff: Some(std::time::Duration::from_millis(100)),
+                }
+            }
+        }
     }
 }
 
@@ -626,7 +821,9 @@ async fn handle_tcp_connection(
     tls_state: Option<Arc<ProxyTlsState>>,
     inference_ctx: Option<Arc<InferenceContext>>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
+    agent_proposals: openshell_core::proposals::AgentProposals,
     trusted_host_gateway: Arc<Option<IpAddr>>,
+    upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     dynamic_credentials: Option<
         Arc<
@@ -694,6 +891,7 @@ async fn handle_tcp_connection(
             identity_cache,
             entrypoint_pid,
             policy_local_ctx,
+            agent_proposals,
             trusted_host_gateway,
             secret_resolver,
             dynamic_credentials,
@@ -733,8 +931,9 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
-    let peer_addr = client.peer_addr().into_diagnostic()?;
-    let _local_addr = client.local_addr().into_diagnostic()?;
+    let workload_addr = client.peer_addr().into_diagnostic()?;
+    let proxy_addr = client.local_addr().into_diagnostic()?;
+    let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
 
     // Evaluate OPA policy with process-identity binding.
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
@@ -745,7 +944,7 @@ async fn handle_tcp_connection(
     let host_clone = host_lc.clone();
     let decision = tokio::task::spawn_blocking(move || {
         evaluate_opa_tcp(
-            peer_addr,
+            connection,
             &opa_clone,
             &cache_clone,
             &pid_clone,
@@ -803,7 +1002,7 @@ async fn handle_tcp_connection(
             .severity(SeverityId::Medium)
             .status(StatusId::Failure)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+            .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
             .actor_process(
                 Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                     .with_cmd_line(&cmdline_str),
@@ -886,7 +1085,7 @@ async fn handle_tcp_connection(
                         .severity(SeverityId::Medium)
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                        .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -940,7 +1139,7 @@ async fn handle_tcp_connection(
                                 .severity(SeverityId::Medium)
                                 .status(StatusId::Failure)
                                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                                .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                                .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
                                 .actor_process(
                                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                         .with_cmd_line(&cmdline_str),
@@ -988,7 +1187,7 @@ async fn handle_tcp_connection(
                         .severity(SeverityId::Medium)
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                        .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -1040,7 +1239,7 @@ async fn handle_tcp_connection(
                         .severity(SeverityId::Medium)
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                        .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -1090,7 +1289,7 @@ async fn handle_tcp_connection(
                         .severity(SeverityId::Medium)
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                        .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -1145,7 +1344,7 @@ async fn handle_tcp_connection(
             .severity(SeverityId::High)
             .status(StatusId::Failure)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+            .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
             .actor_process(
                 Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                     .with_cmd_line(&cmdline_str),
@@ -1170,7 +1369,7 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
-    let mut upstream = TcpStream::connect(validated_addrs.as_slice())
+    let mut upstream = dial_upstream(&upstream_proxy, &host_lc, port, &validated_addrs)
         .await
         .into_diagnostic()?;
 
@@ -1201,7 +1400,7 @@ async fn handle_tcp_connection(
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+            .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
             .actor_process(
                 Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                     .with_cmd_line(&cmdline_str),
@@ -1242,6 +1441,7 @@ async fn handle_tcp_connection(
         token_grant_resolver: dynamic_credentials
             .as_ref()
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
+        agent_proposals,
     };
 
     if effective_tls_skip {
@@ -1394,7 +1594,7 @@ async fn handle_tcp_connection(
                 .severity(SeverityId::High)
                 .status(StatusId::Failure)
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
                 .actor_process(
                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                         .with_cmd_line(&cmdline_str),
@@ -1517,7 +1717,7 @@ async fn handle_tcp_connection(
                 .severity(SeverityId::Medium)
                 .status(StatusId::Failure)
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
                 .actor_process(
                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                         .with_cmd_line(&cmdline_str),
@@ -1718,16 +1918,16 @@ fn collect_ancestor_identities(start_pid: u32, stop_pid: u32) -> Vec<(u32, PathB
 #[cfg(target_os = "linux")]
 fn resolve_process_identity(
     entrypoint_pid: u32,
-    peer_port: u16,
+    connection: crate::procfs::WorkloadProxyTcpConnection,
     identity_cache: &BinaryIdentityCache,
 ) -> std::result::Result<ResolvedIdentity, IdentityError> {
-    let socket_owners = crate::procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)
+    let socket_owners = crate::procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, connection)
         .map_err(|e| IdentityError {
-            reason: format!("failed to resolve peer binary: {e}"),
-            binary: None,
-            binary_pid: None,
-            ancestors: vec![],
-        })?;
+        reason: format!("failed to resolve peer binary: {e}"),
+        binary: None,
+        binary_pid: None,
+        ancestors: vec![],
+    })?;
 
     let mut identities = Vec::with_capacity(socket_owners.owners.len());
     for owner in &socket_owners.owners {
@@ -1786,7 +1986,7 @@ fn resolve_process_identity(
 /// Evaluate OPA policy for a TCP connection with identity binding via /proc/net/tcp.
 #[cfg(target_os = "linux")]
 fn evaluate_opa_tcp(
-    peer_addr: SocketAddr,
+    connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
     identity_cache: &BinaryIdentityCache,
     entrypoint_pid: &AtomicU32,
@@ -1833,9 +2033,7 @@ fn evaluate_opa_tcp(
     };
 
     let total_start = std::time::Instant::now();
-    let peer_port = peer_addr.port();
-
-    let identity = match resolve_process_identity(proc_net_anchor_pid, peer_port, identity_cache) {
+    let identity = match resolve_process_identity(proc_net_anchor_pid, connection, identity_cache) {
         Ok(id) => id,
         Err(err) => {
             return deny(
@@ -1938,7 +2136,7 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, host: &str, port: u16) -> Conn
 /// Non-Linux stub: OPA identity binding requires /proc.
 #[cfg(not(target_os = "linux"))]
 fn evaluate_opa_tcp(
-    _peer_addr: SocketAddr,
+    _connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
     _identity_cache: &BinaryIdentityCache,
     _entrypoint_pid: &AtomicU32,
@@ -2904,6 +3102,67 @@ fn validate_declared_endpoint_resolved_addrs(
     Ok(())
 }
 
+/// Dial a validated upstream destination for a TLS (CONNECT) tunnel.
+///
+/// Connects directly to the SSRF-checked resolved addresses, or chains
+/// through the corporate proxy (HTTP CONNECT) when one is configured for
+/// this destination via the driver-supplied upstream proxy arguments
+/// and not excluded by the operator `NO_PROXY` list. Policy evaluation and
+/// SSRF validation must have already succeeded; only the final TCP dial
+/// changes. Plain-HTTP requests never take this path: they always dial the
+/// destination directly.
+///
+/// `NO_PROXY` evaluation is port-aware and sees the validated resolved
+/// addresses: an entry with a `:port` qualifier only bypasses that port,
+/// and an IP/CIDR entry that matches through resolution limits the direct
+/// dial to the addresses it contains.
+///
+/// The CONNECT target sent to the corporate proxy is a validated resolved
+/// address, so the proxy performs no DNS resolution of its own and the
+/// tunnel stays bound to the answer that passed SSRF and `allowed_ips`
+/// validation; the hostname still travels inside the tunnel (TLS SNI,
+/// application `Host`). The operator opt-in `proxy_connect_by_hostname`
+/// sends the client-requested hostname instead, for proxies whose ACLs
+/// filter on hostnames, at the cost of re-opening proxy-side resolution.
+///
+/// Both paths return a [`upstream_proxy::PrefixedStream`]: for proxied
+/// dials it replays any tunneled bytes that arrived in the same read as the
+/// CONNECT response; for direct dials it is a plain passthrough.
+async fn dial_upstream(
+    upstream_proxy: &Option<UpstreamProxyConfig>,
+    host_lc: &str,
+    port: u16,
+    addrs: &[SocketAddr],
+) -> std::io::Result<upstream_proxy::PrefixedStream> {
+    if let Some(cfg) = upstream_proxy.as_ref() {
+        return match cfg.decision(host_lc, port, addrs) {
+            upstream_proxy::ProxyDecision::Proxy(endpoint) => {
+                if cfg.connect_by_hostname() {
+                    upstream_proxy::connect_via(
+                        endpoint,
+                        host_lc,
+                        port,
+                        upstream_proxy::ConnectTarget::Hostname,
+                    )
+                    .await
+                } else {
+                    // Try every validated address in order, matching the
+                    // fallback the direct path's `TcpStream::connect` does.
+                    upstream_proxy::connect_via_validated(endpoint, host_lc, port, addrs).await
+                }
+            }
+            upstream_proxy::ProxyDecision::Direct(direct_addrs) => {
+                Ok(upstream_proxy::PrefixedStream::without_prefix(
+                    TcpStream::connect(&direct_addrs[..]).await?,
+                ))
+            }
+        };
+    }
+    Ok(upstream_proxy::PrefixedStream::without_prefix(
+        TcpStream::connect(addrs).await?,
+    ))
+}
+
 /// Resolve a host:port using sandbox `/etc/hosts` first (when available), then
 /// reject if any resolved address is internal.
 ///
@@ -3542,6 +3801,7 @@ async fn handle_forward_proxy(
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
+    agent_proposals: openshell_core::proposals::AgentProposals,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     dynamic_credentials: Option<
@@ -3645,8 +3905,9 @@ async fn handle_forward_proxy(
         canonicalize_forward_host_header(&buf[..used], &canonical_authority)?;
 
     // 2. Evaluate OPA policy (same identity binding as CONNECT)
-    let peer_addr = client.peer_addr().into_diagnostic()?;
-    let _local_addr = client.local_addr().into_diagnostic()?;
+    let workload_addr = client.peer_addr().into_diagnostic()?;
+    let proxy_addr = client.local_addr().into_diagnostic()?;
+    let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
 
     let opa_clone = opa_engine.clone();
     let cache_clone = identity_cache.clone();
@@ -3654,7 +3915,7 @@ async fn handle_forward_proxy(
     let host_clone = host_lc.clone();
     let decision = tokio::task::spawn_blocking(move || {
         evaluate_opa_tcp(
-            peer_addr,
+            connection,
             &opa_clone,
             &cache_clone,
             &pid_clone,
@@ -3710,7 +3971,7 @@ async fn handle_forward_proxy(
                         OcsfUrl::new("http", &host_lc, &path, port),
                     ))
                     .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                    .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                    .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                     .actor_process(
                         Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                             .with_cmd_line(&cmdline_str),
@@ -3821,6 +4082,7 @@ async fn handle_forward_proxy(
         token_grant_resolver: dynamic_credentials
             .as_ref()
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
+        agent_proposals,
     };
     let mut l7_activity_pending = false;
 
@@ -3971,7 +4233,7 @@ async fn handle_forward_proxy(
                     OcsfUrl::new("http", &host_lc, &path, port),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                 .actor_process(
                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                         .with_cmd_line(&cmdline_str),
@@ -4213,7 +4475,7 @@ async fn handle_forward_proxy(
                     OcsfUrl::new("http", &host_lc, &path, port),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                 .actor_process(
                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                         .with_cmd_line(&cmdline_str),
@@ -4294,7 +4556,7 @@ async fn handle_forward_proxy(
                             OcsfUrl::new("http", &host_lc, &path, port),
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                        .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -4351,7 +4613,10 @@ async fn handle_forward_proxy(
                                     OcsfUrl::new("http", &host_lc, &path, port),
                                 ))
                                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                                .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                                .src_endpoint(Endpoint::from_ip(
+                                    workload_addr.ip(),
+                                    workload_addr.port(),
+                                ))
                                 .actor_process(
                                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                         .with_cmd_line(&cmdline_str),
@@ -4403,7 +4668,7 @@ async fn handle_forward_proxy(
                             OcsfUrl::new("http", &host_lc, &path, port),
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                        .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -4460,7 +4725,7 @@ async fn handle_forward_proxy(
                             OcsfUrl::new("http", &host_lc, &path, port),
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                        .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -4514,7 +4779,7 @@ async fn handle_forward_proxy(
                             OcsfUrl::new("http", &host_lc, &path, port),
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                        .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -4576,8 +4841,12 @@ async fn handle_forward_proxy(
         return Ok(());
     }
 
-    // 6. Connect upstream
-    let mut upstream = match TcpStream::connect(addrs.as_slice()).await {
+    // 6. Connect upstream. Plain-HTTP requests always dial the destination
+    //    directly: only TLS (CONNECT) tunnels chain through the corporate
+    //    proxy, since plain-HTTP forwarding would need absolute-form requests
+    //    rather than a CONNECT tunnel.
+    let dial_result = TcpStream::connect(addrs.as_slice()).await;
+    let mut upstream = match dial_result {
         Ok(s) => s,
         Err(e) => {
             let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -4589,7 +4858,7 @@ async fn handle_forward_proxy(
                     OcsfUrl::new("http", &host_lc, &path, port),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                 .actor_process(
                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                         .with_cmd_line(&cmdline_str),
@@ -4796,7 +5065,7 @@ async fn handle_forward_proxy(
                 OcsfUrl::new("http", &host_lc, &path, port),
             ))
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+            .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
             .actor_process(
                 Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                     .with_cmd_line(&cmdline_str),
@@ -4846,10 +5115,26 @@ async fn handle_forward_proxy(
     Ok(())
 }
 
+/// Parse a CONNECT authority into `(host, port)`.
+///
+/// IPv6 literals use the RFC 3986 bracketed form (`[::1]:443`); the returned
+/// host is bracket-free, matching what DNS resolution, SSRF validation, and
+/// `NO_PROXY` matching expect. Host content is otherwise passed through
+/// unvalidated — policy and resolution decide what it means.
 fn parse_target(target: &str) -> Result<(String, u16)> {
-    let (host, port_str) = target
-        .split_once(':')
-        .ok_or_else(|| miette::miette!("CONNECT target missing port: {target}"))?;
+    let (host, port_str) = if let Some(rest) = target.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| miette::miette!("CONNECT target has unclosed '[': {target}"))?;
+        let port_str = after
+            .strip_prefix(':')
+            .ok_or_else(|| miette::miette!("CONNECT target missing port: {target}"))?;
+        (host, port_str)
+    } else {
+        target
+            .split_once(':')
+            .ok_or_else(|| miette::miette!("CONNECT target missing port: {target}"))?
+    };
     let port: u16 = port_str
         .parse()
         .map_err(|_| miette::miette!("Invalid port in CONNECT target: {target}"))?;
@@ -5035,6 +5320,7 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 )]
 mod tests {
     use super::*;
+    use openshell_core::proposals::AgentProposals;
     use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
@@ -5071,6 +5357,8 @@ network_policies: {}
             None,
             None,
             None,
+            AgentProposals::default(),
+            Arc::new(None),
             Arc::new(None),
             None,
             None,
@@ -5579,9 +5867,7 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
-            activity_tx: None,
-            dynamic_credentials: None,
-            token_grant_resolver: None,
+            ..Default::default()
         };
         let runner = openshell_supervisor_middleware::ChainRunner::new(
             openshell_supervisor_middleware_builtins::services()
@@ -5808,9 +6094,9 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
-            activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            ..Default::default()
         };
 
         (ctx, fixture)
@@ -5866,9 +6152,7 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
-            activity_tx: None,
-            dynamic_credentials: None,
-            token_grant_resolver: None,
+            ..Default::default()
         };
         (config, tunnel_engine, ctx)
     }
@@ -6041,9 +6325,7 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver,
-            activity_tx: None,
-            dynamic_credentials: None,
-            token_grant_resolver: None,
+            ..Default::default()
         };
         let query_params = std::collections::HashMap::new();
 
@@ -6084,9 +6366,7 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
-            activity_tx: None,
-            dynamic_credentials: None,
-            token_grant_resolver: None,
+            ..Default::default()
         };
         let query_params = std::collections::HashMap::new();
         let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);
@@ -8304,11 +8584,30 @@ network_policies:
     }
 
     #[test]
-    fn test_parse_target_ipv6_bracket_notation_fails() {
-        assert!(
-            parse_target("[::1]:443").is_err(),
-            "split_once splits at first colon inside brackets — port parse fails"
-        );
+    fn test_parse_target_ipv6_bracket_notation() {
+        let (host, port) = parse_target("[::1]:443").unwrap();
+        assert_eq!(host, "::1", "brackets are stripped from the parsed host");
+        assert_eq!(port, 443);
+
+        let (host, port) = parse_target("[2001:db8::1]:8443").unwrap();
+        assert_eq!(host, "2001:db8::1");
+        assert_eq!(port, 8443);
+    }
+
+    #[test]
+    fn test_parse_target_rejects_malformed_ipv6_brackets() {
+        for target in [
+            // Unclosed bracket.
+            "[::1:443",
+            // No port after the bracket.
+            "[::1]",
+            "[::1]443",
+            // Empty or non-numeric port.
+            "[::1]:",
+            "[::1]:notaport",
+        ] {
+            assert!(parse_target(target).is_err(), "{target} should be rejected");
+        }
     }
 
     // -- parse_proxy_uri: hostname parser regression tests --
@@ -8492,9 +8791,7 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
-            activity_tx: None,
-            dynamic_credentials: None,
-            token_grant_resolver: None,
+            ..Default::default()
         };
         let runner = openshell_supervisor_middleware::ChainRunner::new(
             openshell_supervisor_middleware_builtins::services()
@@ -9396,14 +9693,16 @@ network_policies:
                 engine,
                 cache,
                 entrypoint_pid,
-                None,            // tls_state — ephemeral CA unavailable
-                None,            // inference_ctx
-                None,            // policy_local_ctx
-                Arc::new(None),  // trusted_host_gateway
-                None,            // secret_resolver
-                None,            // dynamic_credentials
-                Some(denial_tx), // denial_tx — positive allow/deny signal
-                None,            // activity_tx
+                None,                      // tls_state — ephemeral CA unavailable
+                None,                      // inference_ctx
+                None,                      // policy_local_ctx
+                AgentProposals::default(), // agent_proposals
+                Arc::new(None),            // trusted_host_gateway
+                Arc::new(None),            // upstream_proxy
+                None,                      // secret_resolver
+                None,                      // dynamic_credentials
+                Some(denial_tx),           // denial_tx — positive allow/deny signal
+                None,                      // activity_tx
             )),
         )
         .await
@@ -9626,9 +9925,9 @@ network_policies:
     /// 4. Spawn the temp bash as a child with a `/dev/tcp` one-liner that
     ///    opens a real TCP connection to the listener and holds it open
     ///    inside the bash process.
-    /// 5. Accept the connection on the listener side and capture the peer's
-    ///    ephemeral port — that's what `resolve_process_identity` uses to
-    ///    walk `/proc/net/tcp` back to the child PID.
+    /// 5. Accept the connection on the listener side and capture both socket
+    ///    endpoints — that's what `resolve_process_identity` uses to walk
+    ///    `/proc/net/tcp` back to the child PID.
     /// 6. Overwrite the temp bash on disk with different bytes to simulate
     ///    a `docker cp` hot-swap. The running child is unaffected (it still
     ///    executes from its in-memory image), but `/proc/<child>/exe` will
@@ -9656,7 +9955,7 @@ network_policies:
 
         // 1. Start a listener on loopback.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let listener_port = listener.local_addr().unwrap().port();
+        let proxy_addr = listener.local_addr().unwrap();
 
         // 2. Copy /bin/bash to a temp path.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -9676,8 +9975,10 @@ network_policies:
         //    to keep it open. Do not use an external command like `sleep`:
         //    it inherits the socket fd and intentionally trips the shared
         //    socket ambiguity guard instead of exercising the hot-swap path.
-        let script =
-            format!("exec 3<>/dev/tcp/127.0.0.1/{listener_port}; read -r -t 30 _ <&3 || true");
+        let script = format!(
+            "exec 3<>/dev/tcp/127.0.0.1/{}; read -r -t 30 _ <&3 || true",
+            proxy_addr.port()
+        );
         let mut child = Command::new(&bash_v1)
             .arg("-c")
             .arg(&script)
@@ -9687,9 +9988,9 @@ network_policies:
             .spawn()
             .expect("spawn hotswap-bash child");
 
-        // 5. Accept on the listener side, capture the peer port.
+        // 5. Accept on the listener side and capture the peer endpoint.
         listener.set_nonblocking(false).expect("blocking listener");
-        let (mut stream, peer_addr) = match listener.accept() {
+        let (mut stream, workload_addr) = match listener.accept() {
             Ok(pair) => pair,
             Err(e) => {
                 let _ = child.kill();
@@ -9697,7 +9998,7 @@ network_policies:
                 panic!("failed to accept child connection: {e}");
             }
         };
-        let peer_port = peer_addr.port();
+        let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         // Drain any spurious data; we just need the socket open.
         stream
             .set_read_timeout(Some(Duration::from_millis(50)))
@@ -9724,7 +10025,7 @@ network_policies:
         //    contract: hash the live executable via /proc/<pid>/exe while
         //    returning a clean display path for policy/logging.
         let test_pid = std::process::id();
-        let result = resolve_process_identity(test_pid, peer_port, &cache);
+        let result = resolve_process_identity(test_pid, connection, &cache);
         let child_pid = child.id();
 
         // Always clean up the child before asserting so a failure doesn't
@@ -9799,9 +10100,10 @@ network_policies:
         }
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let listener_port = listener.local_addr().unwrap().port();
-        let stream = TcpStream::connect(("127.0.0.1", listener_port)).expect("connect");
-        let peer_port = stream.local_addr().unwrap().port();
+        let proxy_addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(proxy_addr).expect("connect");
+        let workload_addr = stream.local_addr().unwrap();
+        let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         let (_accepted, _) = listener.accept().expect("accept");
 
         let fd = stream.as_raw_fd();
@@ -9857,7 +10159,7 @@ network_policies:
 
         let cache = BinaryIdentityCache::new();
 
-        let mut result = resolve_process_identity(entrypoint_pid, peer_port, &cache);
+        let mut result = resolve_process_identity(entrypoint_pid, connection, &cache);
         for _ in 0..10 {
             match &result {
                 Err(err)
@@ -9866,7 +10168,7 @@ network_policies:
                 {
                     // /proc/<pid>/fd scan transiently failed; give procfs time to settle.
                     std::thread::sleep(Duration::from_millis(50));
-                    result = resolve_process_identity(entrypoint_pid, peer_port, &cache);
+                    result = resolve_process_identity(entrypoint_pid, connection, &cache);
                 }
                 Ok(_) => {
                     // On arm64 under heavy CI load the /proc fd scan can transiently
@@ -9874,7 +10176,7 @@ network_policies:
                     // the child as owner and yielding a spurious Ok.  Retry to give
                     // both owners time to appear consistently in /proc/<pid>/fd.
                     std::thread::sleep(Duration::from_millis(50));
-                    result = resolve_process_identity(entrypoint_pid, peer_port, &cache);
+                    result = resolve_process_identity(entrypoint_pid, connection, &cache);
                 }
                 _ => break,
             }
@@ -9903,5 +10205,335 @@ network_policies:
                 );
             }
         }
+    }
+
+    #[test]
+    fn accept_backoff_exponential_progression() {
+        let ms = |n| accept_backoff(n).as_millis();
+        assert_eq!(ms(1), 100);
+        assert_eq!(ms(2), 200);
+        assert_eq!(ms(3), 400);
+        assert_eq!(ms(4), 800);
+        assert_eq!(ms(5), 1_600);
+        assert_eq!(ms(6), 3_200);
+        assert_eq!(ms(7), 5_000); // 6400 capped to 5000
+        assert_eq!(ms(8), 5_000); // stays at cap
+    }
+
+    #[test]
+    fn accept_backoff_zero_consecutive_errors() {
+        assert_eq!(accept_backoff(0).as_millis(), 100);
+    }
+
+    #[test]
+    fn accept_backoff_saturates_at_cap() {
+        assert_eq!(accept_backoff(100).as_millis(), 5_000);
+        assert_eq!(accept_backoff(u32::MAX).as_millis(), 5_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_resource_pressure_detects_emfile() {
+        let err = std::io::Error::from_raw_os_error(libc::EMFILE);
+        assert!(is_resource_pressure_error(&err));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_resource_pressure_detects_enfile() {
+        let err = std::io::Error::from_raw_os_error(libc::ENFILE);
+        assert!(is_resource_pressure_error(&err));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_resource_pressure_detects_memory_pressure() {
+        assert!(is_resource_pressure_error(
+            &std::io::Error::from_raw_os_error(libc::ENOBUFS)
+        ));
+        assert!(is_resource_pressure_error(
+            &std::io::Error::from_raw_os_error(libc::ENOMEM)
+        ));
+        assert!(is_resource_pressure_error(
+            &std::io::Error::from_raw_os_error(libc::ENOSR)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_resource_pressure_rejects_other_errors() {
+        let err = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
+        assert!(!is_resource_pressure_error(&err));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_accept_error_fd_exhaustion_is_transient() {
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EMFILE)),
+            AcceptErrorClass::Transient,
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENFILE)),
+            AcceptErrorClass::Transient,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_accept_error_connection_errors_are_transient() {
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ECONNABORTED)),
+            AcceptErrorClass::Transient,
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ECONNRESET)),
+            AcceptErrorClass::Transient,
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EINTR)),
+            AcceptErrorClass::Transient,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_accept_error_broken_listener_is_terminal() {
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EBADF)),
+            AcceptErrorClass::Terminal,
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EINVAL)),
+            AcceptErrorClass::Terminal,
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENOTSOCK)),
+            AcceptErrorClass::Terminal,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_accept_error_unrecognized_errno_is_unknown() {
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EPERM)),
+            AcceptErrorClass::Unknown,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_accept_error_terminal_exits_immediately() {
+        let mut res = 0;
+        let mut unk = 0;
+        let err = std::io::Error::from_raw_os_error(libc::EBADF);
+        let outcome = handle_accept_error(&err, &mut res, &mut unk);
+        assert!(outcome.backoff.is_none());
+        assert_eq!(outcome.severity, SeverityId::High);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_accept_error_transient_retries_indefinitely() {
+        let mut res = 0;
+        let mut unk = 0;
+        let err = std::io::Error::from_raw_os_error(libc::EMFILE);
+        for i in 1..=20 {
+            let outcome = handle_accept_error(&err, &mut res, &mut unk);
+            assert!(outcome.backoff.is_some(), "should retry on attempt {i}");
+            assert_eq!(outcome.severity, SeverityId::Medium);
+        }
+        assert_eq!(res, 20);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_accept_error_unknown_exits_after_limit() {
+        let mut res = 0;
+        let mut unk = 0;
+        let err = std::io::Error::from_raw_os_error(libc::EPERM);
+        for i in 1..=MAX_CONSECUTIVE_UNKNOWN_ERRORS {
+            let outcome = handle_accept_error(&err, &mut res, &mut unk);
+            assert!(
+                outcome.backoff.is_some(),
+                "should retry on attempt {i}/{MAX_CONSECUTIVE_UNKNOWN_ERRORS}",
+            );
+            assert_eq!(outcome.severity, SeverityId::Medium);
+        }
+        let outcome = handle_accept_error(&err, &mut res, &mut unk);
+        assert!(
+            outcome.backoff.is_none(),
+            "should exit after limit exceeded"
+        );
+        assert_eq!(outcome.severity, SeverityId::High);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_accept_error_transient_resets_unknown_counter() {
+        let mut res = 0;
+        let mut unk = 0;
+        let unknown_err = std::io::Error::from_raw_os_error(libc::EPERM);
+        let transient_err = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
+
+        // Accumulate unknowns up to the limit.
+        for _ in 1..=MAX_CONSECUTIVE_UNKNOWN_ERRORS {
+            handle_accept_error(&unknown_err, &mut res, &mut unk);
+        }
+        assert_eq!(unk, MAX_CONSECUTIVE_UNKNOWN_ERRORS);
+
+        // A transient error resets the unknown counter.
+        let outcome = handle_accept_error(&transient_err, &mut res, &mut unk);
+        assert!(outcome.backoff.is_some());
+        assert_eq!(unk, 0);
+
+        // Unknown errors can retry again from zero.
+        let outcome = handle_accept_error(&unknown_err, &mut res, &mut unk);
+        assert!(outcome.backoff.is_some());
+        assert_eq!(unk, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_accept_error_fd_exhaustion_uses_exponential_backoff() {
+        let mut res = 0;
+        let mut unk = 0;
+        let err = std::io::Error::from_raw_os_error(libc::EMFILE);
+
+        let b1 = handle_accept_error(&err, &mut res, &mut unk)
+            .backoff
+            .unwrap();
+        let b2 = handle_accept_error(&err, &mut res, &mut unk)
+            .backoff
+            .unwrap();
+        let b3 = handle_accept_error(&err, &mut res, &mut unk)
+            .backoff
+            .unwrap();
+
+        assert_eq!(b1.as_millis(), 100);
+        assert_eq!(b2.as_millis(), 200);
+        assert_eq!(b3.as_millis(), 400);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_accept_error_network_errors_are_transient() {
+        for errno in [
+            libc::ENETDOWN,
+            libc::EPROTO,
+            libc::ENOPROTOOPT,
+            libc::EHOSTDOWN,
+            libc::EHOSTUNREACH,
+            libc::EOPNOTSUPP,
+            libc::ENETUNREACH,
+            libc::ESOCKTNOSUPPORT,
+            libc::EPROTONOSUPPORT,
+            libc::ETIMEDOUT,
+        ] {
+            assert_eq!(
+                classify_accept_error(&std::io::Error::from_raw_os_error(errno)),
+                AcceptErrorClass::Transient,
+                "errno {errno} should be transient",
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn classify_accept_error_enonet_is_transient() {
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENONET)),
+            AcceptErrorClass::Transient,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_accept_error_resource_pressure_is_transient() {
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENOBUFS)),
+            AcceptErrorClass::Transient,
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENOMEM)),
+            AcceptErrorClass::Transient,
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENOSR)),
+            AcceptErrorClass::Transient,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_accept_error_non_resource_transient_uses_fixed_backoff() {
+        let mut res = 0;
+        let mut unk = 0;
+        let err = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
+
+        let o1 = handle_accept_error(&err, &mut res, &mut unk);
+        let o2 = handle_accept_error(&err, &mut res, &mut unk);
+
+        assert_eq!(o1.severity, SeverityId::Low);
+        assert_eq!(o1.backoff.unwrap().as_millis(), 100);
+        assert_eq!(o2.backoff.unwrap().as_millis(), 100);
+        assert_eq!(res, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_accept_error_unknown_uses_exponential_backoff() {
+        let mut res = 0;
+        let mut unk = 0;
+        let err = std::io::Error::from_raw_os_error(libc::EPERM);
+
+        let b1 = handle_accept_error(&err, &mut res, &mut unk)
+            .backoff
+            .unwrap();
+        let b2 = handle_accept_error(&err, &mut res, &mut unk)
+            .backoff
+            .unwrap();
+        let b3 = handle_accept_error(&err, &mut res, &mut unk)
+            .backoff
+            .unwrap();
+
+        assert_eq!(b1.as_millis(), 100);
+        assert_eq!(b2.as_millis(), 200);
+        assert_eq!(b3.as_millis(), 400);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_accept_error_resource_counter_persists_across_mixed_transient() {
+        let mut res = 0;
+        let mut unk = 0;
+        let resource_err = std::io::Error::from_raw_os_error(libc::EMFILE);
+        let transient_err = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
+
+        let o1 = handle_accept_error(&resource_err, &mut res, &mut unk);
+        assert_eq!(res, 1);
+        assert_eq!(o1.backoff.unwrap().as_millis(), 100);
+
+        let o2 = handle_accept_error(&transient_err, &mut res, &mut unk);
+        assert_eq!(res, 1);
+        assert_eq!(o2.backoff.unwrap().as_millis(), 100);
+
+        let o3 = handle_accept_error(&resource_err, &mut res, &mut unk);
+        assert_eq!(res, 2);
+        assert_eq!(o3.backoff.unwrap().as_millis(), 200);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_accept_error_terminal_leaves_counters_unchanged() {
+        let mut res = 3;
+        let mut unk = 2;
+        let err = std::io::Error::from_raw_os_error(libc::EBADF);
+
+        let outcome = handle_accept_error(&err, &mut res, &mut unk);
+        assert!(outcome.backoff.is_none());
+        assert_eq!(res, 3);
+        assert_eq!(unk, 2);
     }
 }

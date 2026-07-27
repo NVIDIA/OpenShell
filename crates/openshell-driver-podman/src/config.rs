@@ -133,6 +133,57 @@ pub struct PodmanComputeConfig {
     /// Set to `0` to disable health checks entirely.
     /// Defaults to [`DEFAULT_HEALTH_CHECK_INTERVAL_SECS`] (10 seconds).
     pub health_check_interval_secs: u64,
+    /// Corporate forward proxy URL passed to the in-container supervisor
+    /// (e.g. `http://proxy.corp.com:8080`).
+    ///
+    /// The supervisor chains policy-approved TLS tunnels through this proxy
+    /// with HTTP CONNECT instead of dialing upstream destinations directly.
+    /// Only `http://` proxy URLs in explicit `http://host:port` form (scheme
+    /// and port required) are supported. This is an operator-owned egress
+    /// boundary delivered on the supervisor's command line, so
+    /// sandbox/template environment cannot override it, and the conventional
+    /// `HTTPS_PROXY` variables are not used.
+    pub https_proxy: Option<String>,
+    /// Comma-separated `NO_PROXY` list passed alongside the proxy URL (e.g.
+    /// `*.svc.cluster.local,10.0.0.0/8`). Destinations matching an entry are
+    /// dialed directly instead of through the corporate proxy. Entries take
+    /// an optional `:port` qualifier that limits them to that destination
+    /// port, and IP/CIDR entries also match hostnames through their
+    /// validated DNS resolution.
+    pub no_proxy: Option<String>,
+    /// Path (on the gateway host) to a file containing the corporate proxy
+    /// credentials as `user:pass`.
+    ///
+    /// Credentials must be supplied through this file, never embedded in the
+    /// proxy URL: an inline `user:pass@` in `https_proxy` is
+    /// rejected at startup because it would leak into `gateway.toml` and
+    /// container metadata. The gateway reads this file at sandbox-create time
+    /// and delivers it to the supervisor through a root-only secret mount.
+    pub proxy_auth_file: Option<String>,
+    /// Explicit acknowledgement that proxy credentials are sent in cleartext.
+    ///
+    /// `Proxy-Authorization: Basic` is base64, not encryption, and the
+    /// connection to an `http://` corporate proxy is plain TCP, so anyone on
+    /// the network path between the sandbox host and the proxy can recover
+    /// the credential. Setting `proxy_auth_file` therefore requires
+    /// `proxy_auth_allow_insecure = true`; without it the configuration is
+    /// rejected at startup. Set it only when the path to the proxy is a
+    /// trusted network segment.
+    pub proxy_auth_allow_insecure: Option<bool>,
+    /// Send the destination *hostname* in CONNECT requests to the corporate
+    /// proxy instead of a validated IP.
+    ///
+    /// By default the supervisor CONNECTs to an address that already passed
+    /// SSRF and `allowed_ips` validation, so the proxy performs no DNS
+    /// resolution and the tunnel stays bound to the validated answer. Set
+    /// this to `true` only when the proxy's ACLs filter on hostnames and
+    /// reject IP CONNECT targets: the proxy then resolves the name itself,
+    /// so a name that resolves differently at the proxy (split-horizon DNS,
+    /// rebinding) can reach destinations the sandbox policy never approved,
+    /// and the proxy's own ACLs become the effective egress control. Prefer
+    /// pointing the gateway host at the corporate resolver so validated-IP
+    /// CONNECT works in split-horizon networks.
+    pub proxy_connect_by_hostname: Option<bool>,
 }
 
 pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 10;
@@ -188,6 +239,94 @@ impl PodmanComputeConfig {
         Ok(())
     }
 
+    /// Validate optional corporate proxy configuration.
+    ///
+    /// Shares validation semantics with the in-container supervisor through
+    /// [`openshell_core::driver_utils::parse_upstream_proxy_url`], so a value
+    /// accepted here can never be rejected by the supervisor at sandbox
+    /// startup (or vice versa). The supervisor only supports `http://`
+    /// forward proxies, so other schemes are rejected at config time instead
+    /// of failing inside every sandbox. Credentials must be supplied through
+    /// `proxy_auth_file`; an inline `user:pass@` in the URL is rejected
+    /// because it would otherwise be stored in `gateway.toml` and exposed in
+    /// container metadata.
+    pub fn validate_proxy_config(&self) -> Result<(), crate::client::PodmanApiError> {
+        use openshell_core::driver_utils::{UpstreamProxyUrlError, parse_upstream_proxy_url};
+        if let Some(url) = &self.https_proxy {
+            parse_upstream_proxy_url(url).map_err(|err| {
+                crate::client::PodmanApiError::InvalidInput(match err {
+                    UpstreamProxyUrlError::Empty => {
+                        "https_proxy must not be empty when set".to_string()
+                    }
+                    UpstreamProxyUrlError::InlineCredentials => {
+                        "https_proxy must not embed credentials in the URL; supply them via \
+                         proxy_auth_file so they are not stored in config or container metadata"
+                            .to_string()
+                    }
+                    err => format!("https_proxy {err}"),
+                })
+            })?;
+        }
+
+        // The supervisor treats a present-but-empty driver-supplied argument
+        // as a fatal misconfiguration, so never accept (and later pass) one.
+        if let Some(list) = self.no_proxy.as_deref() {
+            if list.trim().is_empty() {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "no_proxy must not be empty when set; omit it instead".to_string(),
+                ));
+            }
+            // A bypass list only makes sense relative to a proxy boundary. An
+            // operator who set one believed proxying was in effect, so accepting
+            // it while all egress dials directly would hide a fail-open state.
+            if self.https_proxy.is_none() {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "no_proxy is set but no https_proxy is configured".to_string(),
+                ));
+            }
+        }
+
+        if let Some(path) = self.proxy_auth_file.as_deref() {
+            if path.trim().is_empty() {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "proxy_auth_file must not be empty when set".to_string(),
+                ));
+            }
+            if self.https_proxy.is_none() {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "proxy_auth_file is set but no https_proxy is configured".to_string(),
+                ));
+            }
+            // Basic auth over the plain-TCP proxy connection is readable by
+            // anyone on the network path; sending it requires an explicit
+            // operator acknowledgement rather than being an implicit side
+            // effect of configuring credentials.
+            if self.proxy_auth_allow_insecure != Some(true) {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "proxy_auth_file sends the credential as cleartext Basic auth over the \
+                     plain-TCP connection to the http:// proxy; set proxy_auth_allow_insecure \
+                     = true to accept that exposure, or remove proxy_auth_file"
+                        .to_string(),
+                ));
+            }
+        } else if self.proxy_auth_allow_insecure.is_some() {
+            // The acknowledgement without credentials means the operator
+            // believed an auth file was configured; surface the mismatch.
+            return Err(crate::client::PodmanApiError::InvalidInput(
+                "proxy_auth_allow_insecure is set but no proxy_auth_file is configured".to_string(),
+            ));
+        }
+
+        // The CONNECT-target mode only means something relative to a proxy
+        // boundary the operator believed was in effect.
+        if self.proxy_connect_by_hostname.is_some() && self.https_proxy.is_none() {
+            return Err(crate::client::PodmanApiError::InvalidInput(
+                "proxy_connect_by_hostname is set but no https_proxy is configured".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate optional host gateway override.
     pub fn validate_host_gateway_ip(&self) -> Result<(), crate::client::PodmanApiError> {
         let trimmed = self.host_gateway_ip.trim();
@@ -235,6 +374,11 @@ impl Default for PodmanComputeConfig {
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
             enable_bind_mounts: false,
             health_check_interval_secs: DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
+            https_proxy: None,
+            no_proxy: None,
+            proxy_auth_file: None,
+            proxy_auth_allow_insecure: None,
+            proxy_connect_by_hostname: None,
         }
     }
 }
@@ -261,6 +405,12 @@ impl std::fmt::Debug for PodmanComputeConfig {
                 "health_check_interval_secs",
                 &self.health_check_interval_secs,
             )
+            // Proxy URLs may embed credentials in userinfo; log presence only.
+            .field("https_proxy", &self.https_proxy.is_some())
+            .field("no_proxy", &self.no_proxy)
+            .field("proxy_auth_file", &self.proxy_auth_file.is_some())
+            .field("proxy_auth_allow_insecure", &self.proxy_auth_allow_insecure)
+            .field("proxy_connect_by_hostname", &self.proxy_connect_by_hostname)
             .finish()
     }
 }
@@ -320,6 +470,210 @@ mod tests {
         };
         let err = cfg.validate_runtime_limits().unwrap_err();
         assert!(err.to_string().contains("sandbox_pids_limit"));
+    }
+
+    // ── Proxy config validation ───────────────────────────────────────
+
+    #[test]
+    fn validate_proxy_config_accepts_unset_and_http() {
+        assert!(
+            PodmanComputeConfig::default()
+                .validate_proxy_config()
+                .is_ok()
+        );
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+            no_proxy: Some("*.svc.cluster.local".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_non_http_schemes() {
+        for url in ["https://proxy:443", "socks5://proxy:1080"] {
+            let cfg = PodmanComputeConfig {
+                https_proxy: Some(url.to_string()),
+                ..PodmanComputeConfig::default()
+            };
+            let err = cfg.validate_proxy_config().unwrap_err();
+            assert!(
+                err.to_string().contains("unsupported proxy scheme"),
+                "{url}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_url_components() {
+        for url in [
+            "http://proxy.corp.com:8080/path",
+            "http://proxy.corp.com:8080?x=1",
+            "http://proxy.corp.com:8080#frag",
+        ] {
+            let cfg = PodmanComputeConfig {
+                https_proxy: Some(url.to_string()),
+                ..PodmanComputeConfig::default()
+            };
+            let err = cfg.validate_proxy_config().unwrap_err();
+            assert!(
+                err.to_string().contains("scheme://host:port"),
+                "{url}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_zero_port() {
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("http://proxy.corp.com:0".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("port must not be 0"), "{err}");
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_missing_scheme_or_port() {
+        // A scheme-less value (previously normalized to http://) and a
+        // port-less value (previously defaulted to 80) are both rejected so
+        // gateway.toml matches the documented http://host:port grammar.
+        for url in ["proxy.corp.com:8080", "http://proxy.corp.com"] {
+            let cfg = PodmanComputeConfig {
+                https_proxy: Some(url.to_string()),
+                ..PodmanComputeConfig::default()
+            };
+            let err = cfg.validate_proxy_config().unwrap_err();
+            assert!(err.to_string().contains("explicit"), "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_empty_value() {
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("  ".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("https_proxy"), "{err}");
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_empty_no_proxy() {
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+            no_proxy: Some(" ".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("no_proxy"), "{err}");
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_no_proxy_without_proxy() {
+        let cfg = PodmanComputeConfig {
+            no_proxy: Some("*.svc.cluster.local".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("no_proxy"), "{err}");
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_inline_credentials() {
+        for url in [
+            "http://user:pass@proxy.corp.com:8080",
+            "http://user@proxy.corp.com:8080",
+        ] {
+            let cfg = PodmanComputeConfig {
+                https_proxy: Some(url.to_string()),
+                ..PodmanComputeConfig::default()
+            };
+            let err = cfg.validate_proxy_config().unwrap_err();
+            assert!(
+                err.to_string().contains("proxy_auth_file"),
+                "{url} should be rejected and point at proxy_auth_file: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_proxy_config_accepts_auth_file_with_proxy_and_acknowledgement() {
+        let cfg = PodmanComputeConfig {
+            https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+            proxy_auth_file: Some("/etc/openshell/secrets/proxy-auth".to_string()),
+            proxy_auth_allow_insecure: Some(true),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.validate_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_auth_file_without_insecure_acknowledgement() {
+        // Basic auth over the plain-TCP proxy connection is readable on the
+        // network path; sending it must be an explicit operator decision.
+        for allow in [None, Some(false)] {
+            let cfg = PodmanComputeConfig {
+                https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+                proxy_auth_file: Some("/etc/openshell/secrets/proxy-auth".to_string()),
+                proxy_auth_allow_insecure: allow,
+                ..PodmanComputeConfig::default()
+            };
+            let err = cfg.validate_proxy_config().unwrap_err();
+            assert!(
+                err.to_string().contains("proxy_auth_allow_insecure"),
+                "{allow:?}: {err}"
+            );
+            assert!(err.to_string().contains("cleartext"), "{allow:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_proxy_config_accepts_connect_by_hostname_with_proxy() {
+        for by_hostname in [Some(true), Some(false)] {
+            let cfg = PodmanComputeConfig {
+                https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+                proxy_connect_by_hostname: by_hostname,
+                ..PodmanComputeConfig::default()
+            };
+            assert!(cfg.validate_proxy_config().is_ok(), "{by_hostname:?}");
+        }
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_connect_by_hostname_without_proxy() {
+        let cfg = PodmanComputeConfig {
+            proxy_connect_by_hostname: Some(true),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("no https_proxy"), "{err}");
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_acknowledgement_without_auth_file() {
+        for allow in [Some(true), Some(false)] {
+            let cfg = PodmanComputeConfig {
+                https_proxy: Some("http://proxy.corp.com:8080".to_string()),
+                proxy_auth_allow_insecure: allow,
+                ..PodmanComputeConfig::default()
+            };
+            let err = cfg.validate_proxy_config().unwrap_err();
+            assert!(
+                err.to_string().contains("no proxy_auth_file"),
+                "{allow:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_proxy_config_rejects_auth_file_without_proxy() {
+        let cfg = PodmanComputeConfig {
+            proxy_auth_file: Some("/etc/openshell/secrets/proxy-auth".to_string()),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_proxy_config().unwrap_err();
+        assert!(err.to_string().contains("proxy_auth_file"), "{err}");
     }
 
     // ── TLS config validation ─────────────────────────────────────────

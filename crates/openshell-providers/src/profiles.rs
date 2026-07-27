@@ -13,6 +13,7 @@ use openshell_core::proto::{
     ProviderProfileCredential, ProviderProfileDiscovery,
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
+use openshell_policy::{L7EndpointFields, validate_l7_endpoint_semantics};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{HashMap, HashSet};
@@ -51,6 +52,12 @@ pub enum ProfileError {
     InvalidEndpoint { id: String, host: String, port: u32 },
     #[error("provider profile '{id}' has duplicate credential env var '{env_var}'")]
     DuplicateCredentialEnvVar { id: String, env_var: String },
+    #[error("provider profile '{id}' validation error: {field}: {message}")]
+    ValidationError {
+        id: String,
+        field: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,14 +207,14 @@ pub struct EndpointProfile {
     pub access: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub enforcement: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rules: Vec<L7RuleProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<Vec<L7RuleProfile>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_ips: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<u32>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deny_rules: Vec<L7DenyRuleProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_rules: Option<Vec<L7DenyRuleProfile>>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_encoded_slash: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -264,6 +271,25 @@ pub struct L7AllowProfile {
     pub operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub params: HashMap<String, L7QueryMatcherProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<L7QueryMatcherProfile>,
+}
+
+impl L7AllowProfile {
+    fn has_tool_selector(&self) -> bool {
+        self.params.contains_key("name") || self.tool.is_some()
+    }
+
+    fn is_effectively_empty(&self) -> bool {
+        self.method.is_empty()
+            && self.path.is_empty()
+            && self.command.is_empty()
+            && self.operation_type.is_empty()
+            && self.operation_name.is_empty()
+            && !self.has_tool_selector()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -282,14 +308,50 @@ pub struct L7DenyRuleProfile {
     pub operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub params: HashMap<String, L7QueryMatcherProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<L7QueryMatcherProfile>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+impl L7DenyRuleProfile {
+    fn has_tool_selector(&self) -> bool {
+        self.params.contains_key("name") || self.tool.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct L7QueryMatcherProfile {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub glob: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub any: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for L7QueryMatcherProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrObject {
+            Scalar(String),
+            Object {
+                #[serde(default)]
+                glob: String,
+                #[serde(default)]
+                any: Vec<String>,
+            },
+        }
+        match StringOrObject::deserialize(deserializer)? {
+            StringOrObject::Scalar(s) => Ok(Self {
+                glob: s,
+                any: vec![],
+            }),
+            StringOrObject::Object { glob, any } => Ok(Self { glob, any }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -531,6 +593,63 @@ impl ProviderTypeProfile {
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
         }
+    }
+
+    pub fn validate_before_lowering(&self, source: &str) -> Vec<ProfileValidationDiagnostic> {
+        let mut diagnostics = Vec::new();
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            if endpoint.rules.as_ref().is_some_and(Vec::is_empty) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    &self.id,
+                    format!("endpoints[{index}]"),
+                    "rules list cannot be empty (would deny all traffic). \
+                     Use `access: full` or remove rules.",
+                ));
+            }
+            if endpoint.deny_rules.as_ref().is_some_and(Vec::is_empty) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    &self.id,
+                    format!("endpoints[{index}]"),
+                    "deny_rules list cannot be empty (would have no effect). \
+                     Remove it if no denials are needed.",
+                ));
+            }
+
+            if endpoint.protocol != "mcp" {
+                continue;
+            }
+            if let Some(rules) = &endpoint.rules {
+                for (rule_idx, rule) in rules.iter().enumerate() {
+                    if rule
+                        .allow
+                        .as_ref()
+                        .is_some_and(|a| a.tool.is_some() && a.params.contains_key("name"))
+                    {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            &self.id,
+                            format!("endpoints[{index}].rules[{rule_idx}].allow"),
+                            "MCP rules must use either tool or params.name, not both",
+                        ));
+                    }
+                }
+            }
+            if let Some(deny_rules) = &endpoint.deny_rules {
+                for (deny_idx, deny_rule) in deny_rules.iter().enumerate() {
+                    if deny_rule.tool.is_some() && deny_rule.params.contains_key("name") {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            &self.id,
+                            format!("endpoints[{index}].deny_rules[{deny_idx}]"),
+                            "MCP rules must use either tool or params.name, not both",
+                        ));
+                    }
+                }
+            }
+        }
+        diagnostics
     }
 }
 
@@ -936,10 +1055,22 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         tls: endpoint.tls.clone(),
         enforcement: endpoint.enforcement.clone(),
         access: endpoint.access.clone(),
-        rules: endpoint.rules.iter().map(rule_to_proto).collect(),
+        rules: endpoint
+            .rules
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(rule_to_proto)
+            .collect(),
         allowed_ips: endpoint.allowed_ips.clone(),
         ports: endpoint.ports.clone(),
-        deny_rules: endpoint.deny_rules.iter().map(deny_rule_to_proto).collect(),
+        deny_rules: endpoint
+            .deny_rules
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(deny_rule_to_proto)
+            .collect(),
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
         request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
@@ -968,14 +1099,24 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
         tls: endpoint.tls.clone(),
         access: endpoint.access.clone(),
         enforcement: endpoint.enforcement.clone(),
-        rules: endpoint.rules.iter().map(rule_from_proto).collect(),
+        rules: if endpoint.rules.is_empty() {
+            None
+        } else {
+            Some(endpoint.rules.iter().map(rule_from_proto).collect())
+        },
         allowed_ips: endpoint.allowed_ips.clone(),
         ports: endpoint.ports.clone(),
-        deny_rules: endpoint
-            .deny_rules
-            .iter()
-            .map(deny_rule_from_proto)
-            .collect(),
+        deny_rules: if endpoint.deny_rules.is_empty() {
+            None
+        } else {
+            Some(
+                endpoint
+                    .deny_rules
+                    .iter()
+                    .map(deny_rule_from_proto)
+                    .collect(),
+            )
+        },
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
         request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
@@ -1035,7 +1176,65 @@ fn rule_from_proto(rule: &L7Rule) -> L7RuleProfile {
     }
 }
 
+fn glob_uses_wildcard(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
+}
+
+fn matcher_uses_glob_wildcard(matcher: &L7QueryMatcherProfile) -> bool {
+    glob_uses_wildcard(&matcher.glob) || matcher.any.iter().any(|s| glob_uses_wildcard(s))
+}
+
+fn validate_mcp_matcher(
+    diagnostics: &mut Vec<ProfileValidationDiagnostic>,
+    source: &str,
+    profile_id: &str,
+    field: &str,
+    matcher: &L7QueryMatcherProfile,
+    strict_tool_names: bool,
+) {
+    if !matcher.glob.is_empty() && !matcher.any.is_empty() {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            field.to_string(),
+            "matcher cannot specify both glob and any",
+        ));
+    }
+    if matcher.glob.is_empty() && matcher.any.is_empty() {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            field.to_string(),
+            "matcher must specify glob or any",
+        ));
+    }
+    if !strict_tool_names && matcher_uses_glob_wildcard(matcher) {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            field.to_string(),
+            "wildcard tool-name matchers require mcp.strict_tool_names to remain enabled",
+        ));
+    }
+}
+
+fn method_matcher_matches_tools_call(method: &str) -> bool {
+    method == "tools/call"
+        || method == "*"
+        || glob::Pattern::new(method).is_ok_and(|pattern| pattern.matches("tools/call"))
+}
+
 fn allow_to_proto(allow: &L7AllowProfile) -> L7Allow {
+    let mut params: HashMap<String, L7QueryMatcher> = allow
+        .params
+        .iter()
+        .map(|(name, matcher)| (name.clone(), query_matcher_to_proto(matcher)))
+        .collect();
+    if let Some(tool) = &allow.tool {
+        params
+            .entry("name".to_string())
+            .or_insert_with(|| query_matcher_to_proto(tool));
+    }
     L7Allow {
         method: allow.method.clone(),
         path: allow.path.clone(),
@@ -1048,7 +1247,7 @@ fn allow_to_proto(allow: &L7AllowProfile) -> L7Allow {
         operation_type: allow.operation_type.clone(),
         operation_name: allow.operation_name.clone(),
         fields: allow.fields.clone(),
-        params: HashMap::new(),
+        params,
     }
 }
 
@@ -1065,10 +1264,26 @@ fn allow_from_proto(allow: &L7Allow) -> L7AllowProfile {
         operation_type: allow.operation_type.clone(),
         operation_name: allow.operation_name.clone(),
         fields: allow.fields.clone(),
+        params: allow
+            .params
+            .iter()
+            .map(|(name, matcher)| (name.clone(), query_matcher_from_proto(matcher)))
+            .collect(),
+        tool: None,
     }
 }
 
 fn deny_rule_to_proto(rule: &L7DenyRuleProfile) -> L7DenyRule {
+    let mut params: HashMap<String, L7QueryMatcher> = rule
+        .params
+        .iter()
+        .map(|(name, matcher)| (name.clone(), query_matcher_to_proto(matcher)))
+        .collect();
+    if let Some(tool) = &rule.tool {
+        params
+            .entry("name".to_string())
+            .or_insert_with(|| query_matcher_to_proto(tool));
+    }
     L7DenyRule {
         method: rule.method.clone(),
         path: rule.path.clone(),
@@ -1081,7 +1296,7 @@ fn deny_rule_to_proto(rule: &L7DenyRuleProfile) -> L7DenyRule {
         operation_type: rule.operation_type.clone(),
         operation_name: rule.operation_name.clone(),
         fields: rule.fields.clone(),
-        params: HashMap::new(),
+        params,
     }
 }
 
@@ -1098,6 +1313,12 @@ fn deny_rule_from_proto(rule: &L7DenyRule) -> L7DenyRuleProfile {
         operation_type: rule.operation_type.clone(),
         operation_name: rule.operation_name.clone(),
         fields: rule.fields.clone(),
+        params: rule
+            .params
+            .iter()
+            .map(|(name, matcher)| (name.clone(), query_matcher_from_proto(matcher)))
+            .collect(),
+        tool: None,
     }
 }
 
@@ -1210,6 +1431,11 @@ fn validate_profiles(profiles: &[ProviderTypeProfile]) -> Result<(), ProfileErro
                 port: endpoint.port,
             });
         }
+        return Err(ProfileError::ValidationError {
+            id: diagnostic.profile_id.clone(),
+            field: diagnostic.field.clone(),
+            message: diagnostic.message.clone(),
+        });
     }
 
     Ok(())
@@ -1624,6 +1850,342 @@ pub fn validate_profile_set(
                     format!("invalid endpoint '{}:{}'", endpoint.host, endpoint.port),
                 ));
             }
+
+            if endpoint.rules.as_ref().is_some_and(Vec::is_empty) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    "rules list cannot be empty (would deny all traffic). Use `access: full` or remove rules.",
+                ));
+            }
+
+            if endpoint.deny_rules.as_ref().is_some_and(Vec::is_empty) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    "deny_rules list cannot be empty (would have no effect). Remove it if no denials are needed.",
+                ));
+            }
+
+            let l7_fields = L7EndpointFields {
+                protocol: &endpoint.protocol,
+                access: &endpoint.access,
+                has_rules: endpoint.rules.as_ref().is_some_and(|r| !r.is_empty()),
+                has_deny_rules: endpoint.deny_rules.as_ref().is_some_and(|r| !r.is_empty()),
+                rules_would_deny_all: endpoint.rules.as_ref().is_some_and(|r| {
+                    !r.is_empty()
+                        && r.iter().all(|rule| {
+                            rule.allow
+                                .as_ref()
+                                .is_none_or(L7AllowProfile::is_effectively_empty)
+                        })
+                }),
+                allow_all_known_mcp_methods: endpoint
+                    .mcp
+                    .as_ref()
+                    .and_then(|opts| opts.allow_all_known_mcp_methods)
+                    .unwrap_or(false),
+            };
+            for msg in validate_l7_endpoint_semantics(&l7_fields) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    msg,
+                ));
+            }
+
+            if endpoint.protocol == "mcp" {
+                let strict_tool_names = endpoint
+                    .mcp
+                    .as_ref()
+                    .and_then(|opts| opts.strict_tool_names)
+                    .unwrap_or(true);
+
+                if let Some(rules) = &endpoint.rules {
+                    for (rule_idx, rule) in rules.iter().enumerate() {
+                        if let Some(allow) = &rule.allow {
+                            let allow_loc = format!("endpoints[{index}].rules[{rule_idx}].allow");
+                            if allow.tool.is_some() && allow.params.contains_key("name") {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    &allow_loc,
+                                    "MCP rules must use either tool or params.name, not both",
+                                ));
+                            }
+                            if allow.has_tool_selector()
+                                && !allow.method.is_empty()
+                                && allow.method != "tools/call"
+                            {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    &allow_loc,
+                                    "method must be tools/call when an MCP rule uses \
+                                     tool or params.name",
+                                ));
+                            }
+                            if allow.method.is_empty() && !l7_fields.allow_all_known_mcp_methods {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    &allow_loc,
+                                    "method is required when \
+                                     mcp.allow_all_known_mcp_methods is false",
+                                ));
+                            }
+                            if glob_uses_wildcard(&allow.method)
+                                && !allow.method.starts_with("tools/")
+                            {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    format!("{allow_loc}.method"),
+                                    "MCP method globs are only valid for the tools/ \
+                                     method family; omit method to use the endpoint \
+                                     method profile",
+                                ));
+                            }
+                            if !allow.path.is_empty() || !allow.query.is_empty() {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    &allow_loc,
+                                    "mcp L7 rules must use method/tool, not path/query",
+                                ));
+                            }
+                            for key in allow.params.keys() {
+                                if key != "name" {
+                                    diagnostics.push(ProfileValidationDiagnostic::error(
+                                        source,
+                                        profile_id,
+                                        format!("{allow_loc}.params.{key}"),
+                                        "MCP tool argument matching is not supported yet",
+                                    ));
+                                }
+                            }
+                            if let Some(tool) = &allow.tool {
+                                validate_mcp_matcher(
+                                    &mut diagnostics,
+                                    source,
+                                    profile_id,
+                                    &format!("{allow_loc}.tool"),
+                                    tool,
+                                    strict_tool_names,
+                                );
+                            }
+                            if let Some(params_name) = allow.params.get("name") {
+                                validate_mcp_matcher(
+                                    &mut diagnostics,
+                                    source,
+                                    profile_id,
+                                    &format!("{allow_loc}.params.name"),
+                                    params_name,
+                                    strict_tool_names,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if let Some(deny_rules) = &endpoint.deny_rules {
+                    for (deny_idx, deny_rule) in deny_rules.iter().enumerate() {
+                        let deny_loc = format!("endpoints[{index}].deny_rules[{deny_idx}]");
+                        if deny_rule.tool.is_some() && deny_rule.params.contains_key("name") {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                &deny_loc,
+                                "MCP rules must use either tool or params.name, not both",
+                            ));
+                        }
+                        if deny_rule.has_tool_selector()
+                            && !deny_rule.method.is_empty()
+                            && deny_rule.method != "tools/call"
+                        {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                &deny_loc,
+                                "method must be tools/call when an MCP rule uses \
+                                 tool or params.name",
+                            ));
+                        }
+                        if deny_rule.method.is_empty() && !l7_fields.allow_all_known_mcp_methods {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                &deny_loc,
+                                "method is required when \
+                                 mcp.allow_all_known_mcp_methods is false",
+                            ));
+                        }
+                        if glob_uses_wildcard(&deny_rule.method)
+                            && !deny_rule.method.starts_with("tools/")
+                        {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                format!("{deny_loc}.method"),
+                                "MCP method globs are only valid for the tools/ \
+                                 method family; omit method to use the endpoint \
+                                 method profile",
+                            ));
+                        }
+                        if !deny_rule.path.is_empty() || !deny_rule.query.is_empty() {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                &deny_loc,
+                                "mcp L7 rules must use method/tool, not path/query",
+                            ));
+                        }
+                        for key in deny_rule.params.keys() {
+                            if key != "name" {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    format!("{deny_loc}.params.{key}"),
+                                    "MCP tool argument matching is not supported yet",
+                                ));
+                            }
+                        }
+                        if let Some(tool) = &deny_rule.tool {
+                            validate_mcp_matcher(
+                                &mut diagnostics,
+                                source,
+                                profile_id,
+                                &format!("{deny_loc}.tool"),
+                                tool,
+                                strict_tool_names,
+                            );
+                        }
+                        if let Some(params_name) = deny_rule.params.get("name") {
+                            validate_mcp_matcher(
+                                &mut diagnostics,
+                                source,
+                                profile_id,
+                                &format!("{deny_loc}.params.name"),
+                                params_name,
+                                strict_tool_names,
+                            );
+                        }
+                    }
+                }
+
+                let has_tool_allow_selectors = endpoint.rules.as_ref().is_some_and(|r| {
+                    r.iter().any(|rule| {
+                        rule.allow
+                            .as_ref()
+                            .is_some_and(L7AllowProfile::has_tool_selector)
+                    })
+                });
+
+                if has_tool_allow_selectors {
+                    if let Some(rules) = &endpoint.rules {
+                        for (rule_idx, rule) in rules.iter().enumerate() {
+                            if let Some(allow) = &rule.allow {
+                                if !allow.has_tool_selector() {
+                                    let method = allow.method.as_str();
+                                    if method_matcher_matches_tools_call(method)
+                                        || (method.is_empty()
+                                            && l7_fields.allow_all_known_mcp_methods)
+                                    {
+                                        diagnostics.push(ProfileValidationDiagnostic::error(
+                                            source,
+                                            profile_id,
+                                            format!("endpoints[{index}].rules[{rule_idx}].allow"),
+                                            "method matcher allows every tool call and conflicts \
+                                             with MCP tool allow rules; add tool or params.name \
+                                             to narrow tools/call, or remove the tool allow rules",
+                                        ));
+                                    }
+                                }
+                            } else if l7_fields.allow_all_known_mcp_methods {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    format!("endpoints[{index}].rules[{rule_idx}].allow"),
+                                    "method matcher allows every tool call and conflicts \
+                                     with MCP tool allow rules; add tool or params.name \
+                                     to narrow tools/call, or remove the tool allow rules",
+                                ));
+                            }
+                        }
+                    }
+
+                    if let Some(deny_rules) = &endpoint.deny_rules {
+                        for (deny_idx, deny_rule) in deny_rules.iter().enumerate() {
+                            if !deny_rule.has_tool_selector()
+                                && method_matcher_matches_tools_call(&deny_rule.method)
+                            {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    format!("endpoints[{index}].deny_rules[{deny_idx}]"),
+                                    "method matcher denies every tool call and conflicts \
+                                     with MCP tool allow rules; add tool or params.name to \
+                                     deny specific tools, or remove the tool allow rules",
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else {
+                if endpoint.mcp.is_some() {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        format!("endpoints[{index}]"),
+                        "mcp options are only valid for protocol mcp",
+                    ));
+                }
+                if let Some(rules) = &endpoint.rules {
+                    for (rule_idx, rule) in rules.iter().enumerate() {
+                        if let Some(allow) = &rule.allow {
+                            if allow.tool.is_some() {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    format!("endpoints[{index}].rules[{rule_idx}].allow.tool"),
+                                    "MCP tool matching is only valid for protocol mcp",
+                                ));
+                            }
+                            if !allow.params.is_empty() {
+                                diagnostics.push(ProfileValidationDiagnostic::error(
+                                    source,
+                                    profile_id,
+                                    format!("endpoints[{index}].rules[{rule_idx}].allow.params"),
+                                    "params matching is only valid for protocol mcp",
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(deny_rules) = &endpoint.deny_rules {
+                    for (deny_idx, deny_rule) in deny_rules.iter().enumerate() {
+                        if deny_rule.tool.is_some() {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                format!("endpoints[{index}].deny_rules[{deny_idx}].tool"),
+                                "MCP tool matching is only valid for protocol mcp",
+                            ));
+                        }
+                        if !deny_rule.params.is_empty() {
+                            diagnostics.push(ProfileValidationDiagnostic::error(
+                                source,
+                                profile_id,
+                                format!("endpoints[{index}].deny_rules[{deny_idx}].params"),
+                                "params matching is only valid for protocol mcp",
+                            ));
+                        }
+                    }
+                }
+            }
         }
 
         for (index, binary) in profile.binaries.iter().enumerate() {
@@ -2003,9 +2565,9 @@ mod tests {
     use openshell_core::proto::ProviderProfileCategory;
 
     use super::{
-        DiscoveryProfile, ProfileError, ProviderTypeProfile, builtin_profiles,
-        normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
-        profile_to_json, profile_to_yaml, validate_profile_set,
+        DiscoveryProfile, L7AllowProfile, L7QueryMatcherProfile, ProfileError, ProviderTypeProfile,
+        builtin_profiles, normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json,
+        parse_profile_yaml, profile_to_json, profile_to_yaml, validate_profile_set,
     };
 
     fn builtin_profile(id: &str) -> &'static ProviderTypeProfile {
@@ -2375,6 +2937,53 @@ binaries:
         let exported = profile_to_yaml(&from_proto).expect("yaml");
         assert!(exported.contains("mcp:"));
         assert!(exported.contains("strict_tool_names: false"));
+    }
+
+    #[test]
+    fn mcp_allow_params_round_trips_through_proto() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-params
+display_name: MCP Params
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          params:
+            name:
+              glob: read_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let rules = profile.endpoints[0].rules.as_ref().expect("rules present");
+        assert_eq!(rules.len(), 1);
+        let allow = rules[0].allow.as_ref().expect("allow present");
+        assert!(
+            allow.params.contains_key("name"),
+            "params.name should be set"
+        );
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        let rt_rules = from_proto.endpoints[0]
+            .rules
+            .as_ref()
+            .expect("rules survive proto round-trip");
+        assert_eq!(rt_rules.len(), 1);
+        let rt_allow = rt_rules[0]
+            .allow
+            .as_ref()
+            .expect("allow survives proto round-trip");
+        assert!(
+            rt_allow.params.contains_key("name"),
+            "params.name should survive proto round-trip"
+        );
     }
 
     #[test]
@@ -2838,12 +3447,23 @@ id: advanced
 display_name: Advanced
 category: other
 endpoints:
+  - host: graphql.example.com
+    port: 443
+    protocol: graphql
+    access: read-only
+    persisted_queries: allow_registered
+    graphql_persisted_queries:
+      hash-a:
+        operation_type: query
+        operation_name: Viewer
+        fields: [viewer]
+    graphql_max_body_bytes: 131072
+    path: /graphql
   - host: api.example.com
     ports: [443, 8443]
     protocol: rest
     tls: terminate
     enforcement: enforce
-    access: read-only
     rules:
       - allow:
           method: GET
@@ -2856,14 +3476,6 @@ endpoints:
       - method: POST
         path: /admin/**
     allow_encoded_slash: true
-    persisted_queries: allow_registered
-    graphql_persisted_queries:
-      hash-a:
-        operation_type: query
-        operation_name: Viewer
-        fields: [viewer]
-    graphql_max_body_bytes: 131072
-    path: /graphql
 binaries:
   - path: /usr/bin/custom
     harness: true
@@ -2877,39 +3489,44 @@ binaries:
         );
 
         let proto = profile.to_proto();
-        let endpoint = proto.endpoints.first().expect("endpoint should exist");
-        assert_eq!(endpoint.port, 0);
-        assert_eq!(endpoint.ports, vec![443, 8443]);
-        assert_eq!(endpoint.tls, "terminate");
-        assert_eq!(endpoint.allowed_ips, vec!["10.0.0.0/24"]);
-        assert!(endpoint.allow_encoded_slash);
-        assert_eq!(endpoint.persisted_queries, "allow_registered");
-        assert_eq!(endpoint.graphql_max_body_bytes, 131_072);
-        assert_eq!(endpoint.path, "/graphql");
+
+        let graphql_ep = &proto.endpoints[0];
+        assert_eq!(graphql_ep.access, "read-only");
+        assert_eq!(graphql_ep.persisted_queries, "allow_registered");
+        assert_eq!(graphql_ep.graphql_max_body_bytes, 131_072);
+        assert_eq!(graphql_ep.path, "/graphql");
         assert_eq!(
-            endpoint
+            graphql_ep
+                .graphql_persisted_queries
+                .get("hash-a")
+                .map(|operation| operation.operation_name.as_str()),
+            Some("Viewer")
+        );
+
+        let rest_ep = &proto.endpoints[1];
+        assert_eq!(rest_ep.port, 0);
+        assert_eq!(rest_ep.ports, vec![443, 8443]);
+        assert_eq!(rest_ep.tls, "terminate");
+        assert_eq!(rest_ep.allowed_ips, vec!["10.0.0.0/24"]);
+        assert!(rest_ep.allow_encoded_slash);
+        assert_eq!(
+            rest_ep
                 .rules
                 .first()
                 .and_then(|rule| rule.allow.as_ref())
                 .map(|allow| allow.method.as_str()),
             Some("GET")
         );
-        assert_eq!(endpoint.deny_rules[0].method, "POST");
-        assert_eq!(
-            endpoint
-                .graphql_persisted_queries
-                .get("hash-a")
-                .map(|operation| operation.operation_name.as_str()),
-            Some("Viewer")
-        );
+        assert_eq!(rest_ep.deny_rules[0].method, "POST");
         assert!(proto.binaries[0].harness);
 
         let reparsed = parse_profile_yaml(&profile_to_yaml(&profile).expect("serialize YAML"))
             .expect("serialized profile should parse");
         let reprotoo = reparsed.to_proto();
-        assert_eq!(reprotoo.endpoints[0].rules.len(), 1);
-        assert_eq!(reprotoo.endpoints[0].deny_rules.len(), 1);
-        assert_eq!(reprotoo.endpoints[0].ports, vec![443, 8443]);
+        assert_eq!(reprotoo.endpoints[0].access, "read-only");
+        assert_eq!(reprotoo.endpoints[1].rules.len(), 1);
+        assert_eq!(reprotoo.endpoints[1].deny_rules.len(), 1);
+        assert_eq!(reprotoo.endpoints[1].ports, vec![443, 8443]);
         assert!(reprotoo.binaries[0].harness);
     }
 
@@ -3086,6 +3703,31 @@ endpoints:
         .unwrap_err();
 
         assert!(matches!(err, ProfileError::InvalidEndpoint { id, .. } if id == "bad-endpoint"));
+    }
+
+    #[test]
+    fn parse_profile_catalog_yamls_rejects_l7_validation_errors() {
+        let err = parse_profile_catalog_yamls(&[r"
+id: bad-l7
+display_name: Bad L7
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: read-write
+    rules:
+      - allow:
+          method: GET
+          path: /v1/**
+binaries:
+  - /usr/bin/example-agent
+"])
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ProfileError::ValidationError { ref id, ref message, .. } if id == "bad-l7" && message.contains("mutually exclusive")),
+            "expected L7 validation error for access+rules, got: {err}"
+        );
     }
 
     #[test]
@@ -3509,6 +4151,1335 @@ credentials:
         assert!(
             diagnostics.is_empty(),
             "unexpected diagnostics: {diagnostics:?}"
+        );
+    }
+
+    // -- L7 endpoint semantic validation (shared with runtime) ----------------
+
+    #[test]
+    fn validate_rejects_protocol_without_rules_or_access() {
+        let profile = parse_profile_yaml(
+            r"
+id: opencode-openrouter
+display_name: OpenCode (OpenRouter)
+credentials:
+  - name: api_key
+    env_vars: [OPENROUTER_API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: openrouter.ai
+    port: 443
+    protocol: rest
+    enforcement: enforce
+binaries:
+  - /usr/bin/opencode
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("protocol requires rules or access")),
+            "expected lint to reject protocol without rules or access, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_protocol_with_access() {
+        let profile = parse_profile_yaml(
+            r"
+id: valid-rest
+display_name: Valid REST
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: read-write
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == "error")
+            .collect();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_protocol() {
+        let profile = parse_profile_yaml(
+            r"
+id: bad-protocol
+display_name: Bad Protocol
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: ftp
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("unknown protocol")),
+            "expected lint to reject unknown protocol, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_rules_and_access_together() {
+        let profile = parse_profile_yaml(
+            r"
+id: both-rules-access
+display_name: Both
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+    rules:
+      - allow:
+          method: GET
+          path: /api/**
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("mutually exclusive")),
+            "expected lint to reject rules + access, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_rules_list() {
+        let profile = parse_profile_yaml(
+            r"
+id: empty-rules
+display_name: Empty Rules
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+    rules: []
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("rules list cannot be empty")),
+            "expected lint to reject empty rules list, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_allow_object_as_deny_all() {
+        let profile = parse_profile_yaml(
+            r"
+id: empty-allow
+display_name: Empty Allow
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    rules:
+      - allow: {}
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("would deny all traffic")),
+            "expected lint to reject empty allow object as deny-all, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_deny_rules_list() {
+        let profile = parse_profile_yaml(
+            r"
+id: empty-deny-rules
+display_name: Empty Deny Rules
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+    deny_rules: []
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("deny_rules list cannot be empty")),
+            "expected lint to reject empty deny_rules list, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_params_selector_not_classified_as_deny_all() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-params
+display_name: MCP Params
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          params:
+            name:
+              glob: read_*
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("would deny all traffic")),
+            "MCP rule with params.name selector should not be classified as deny-all: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_empty_allow_with_allow_all_conflicts_with_tool_rules() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-wildcard
+display_name: MCP Wildcard
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          params:
+            name:
+              glob: read_*
+      - allow: {}
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("allows every tool call")
+                    && d.message.contains("conflicts with MCP tool allow rules")),
+            "empty allow with allow_all should conflict with tool-specific rules: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_unsupported_params_rejected() {
+        let profile = parse_profile_yaml(
+            r"
+id: unsupported-params
+display_name: Unsupported Params
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          params:
+            arguments:
+              glob: '*'
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("not supported yet")),
+            "unsupported params key should be rejected: {diagnostics:?}"
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("would deny all traffic")),
+            "MCP with allow_all_known_mcp_methods should not emit deny-all for empty method: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_deny_rule_params_round_trips_through_proto() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-deny-params
+display_name: MCP Deny Params
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    deny_rules:
+      - method: tools/call
+        params:
+          name:
+            glob: dangerous_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let deny_rules = profile.endpoints[0]
+            .deny_rules
+            .as_ref()
+            .expect("deny_rules present");
+        assert!(
+            deny_rules[0].params.contains_key("name"),
+            "params.name should be set"
+        );
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        let rt_deny = from_proto.endpoints[0]
+            .deny_rules
+            .as_ref()
+            .expect("deny_rules survive proto round-trip");
+        assert!(
+            rt_deny[0].params.contains_key("name"),
+            "deny rule params.name should survive proto round-trip"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_allow_round_trips_through_proto() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-tool
+display_name: MCP Tool
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          tool:
+            glob: read_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let rules = profile.endpoints[0].rules.as_ref().expect("rules present");
+        let allow = rules[0].allow.as_ref().expect("allow present");
+        assert!(allow.tool.is_some(), "tool should be parsed");
+        assert_eq!(allow.tool.as_ref().unwrap().glob, "read_*");
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        let rt_allow = from_proto.endpoints[0]
+            .rules
+            .as_ref()
+            .expect("rules survive")[0]
+            .allow
+            .as_ref()
+            .expect("allow survives");
+        assert!(
+            rt_allow.params.contains_key("name"),
+            "tool should be lowered to params.name in proto: {rt_allow:?}"
+        );
+        assert_eq!(rt_allow.params["name"].glob, "read_*");
+        assert!(
+            rt_allow.tool.is_none(),
+            "tool should be None after round-trip"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_deny_round_trips_through_proto() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-deny-tool
+display_name: MCP Deny Tool
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    deny_rules:
+      - method: 'tools/call'
+        tool:
+          glob: dangerous_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let deny_rules = profile.endpoints[0]
+            .deny_rules
+            .as_ref()
+            .expect("deny_rules present");
+        assert!(deny_rules[0].tool.is_some(), "tool should be parsed");
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        let rt_deny = from_proto.endpoints[0]
+            .deny_rules
+            .as_ref()
+            .expect("deny_rules survive")[0]
+            .clone();
+        assert!(
+            rt_deny.params.contains_key("name"),
+            "deny tool should be lowered to params.name in proto"
+        );
+        assert_eq!(rt_deny.params["name"].glob, "dangerous_*");
+    }
+
+    #[test]
+    fn validate_mcp_tool_and_params_name_rejected() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-both
+display_name: MCP Both
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          tool:
+            glob: read_*
+          params:
+            name:
+              glob: write_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("must use either tool or params.name, not both")),
+            "expected mutual exclusivity error, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_prevents_classify_as_deny_all() {
+        let allow = L7AllowProfile {
+            method: String::new(),
+            path: String::new(),
+            command: String::new(),
+            query: HashMap::new(),
+            operation_type: String::new(),
+            operation_name: String::new(),
+            fields: vec![],
+            params: HashMap::new(),
+            tool: Some(L7QueryMatcherProfile {
+                glob: "read_*".to_string(),
+                any: vec![],
+            }),
+        };
+        assert!(
+            !allow.is_effectively_empty(),
+            "allow with tool selector should not be classified as deny-all"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_explicit_broad_method_without_allow_all() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-broad
+display_name: MCP Broad
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    rules:
+      - allow:
+          method: 'tools/call'
+          params:
+            name:
+              glob: read_*
+      - allow:
+          method: 'tools/call'
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("allows every tool call and conflicts")),
+            "explicit broad method should be detected even without allow_all_known_mcp_methods: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_glob_broad_method_detected() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-glob
+display_name: MCP Glob
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          params:
+            name:
+              glob: read_*
+      - allow:
+          method: 'tools/*'
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("allows every tool call and conflicts")),
+            "glob method tools/* should be detected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_deny_rule_broad_method_conflict() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-deny-broad
+display_name: MCP Deny Broad
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          params:
+            name:
+              glob: read_*
+    deny_rules:
+      - method: 'tools/call'
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("denies every tool call and conflicts")),
+            "deny rule with broad method should be detected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_deny_rule_with_tool_selector_ok() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-deny-ok
+display_name: MCP Deny OK
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          params:
+            name:
+              glob: '*'
+    deny_rules:
+      - method: 'tools/call'
+        tool:
+          glob: dangerous_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("denies every tool call")),
+            "deny rule with tool selector should not trigger conflict: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_scalar_matcher_round_trips_through_proto() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-scalar-tool
+display_name: MCP Scalar Tool
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    rules:
+      - allow:
+          method: tools/call
+          tool: search_web
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("scalar tool matcher should parse");
+
+        let rules = profile.endpoints[0].rules.as_ref().expect("rules present");
+        let allow = rules[0].allow.as_ref().expect("allow present");
+        assert_eq!(
+            allow.tool.as_ref().unwrap().glob,
+            "search_web",
+            "scalar string should deserialize to glob field"
+        );
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        let rt_allow = from_proto.endpoints[0]
+            .rules
+            .as_ref()
+            .expect("rules survive")[0]
+            .allow
+            .as_ref()
+            .expect("allow survives");
+        assert_eq!(
+            rt_allow.params["name"].glob, "search_web",
+            "scalar tool should lower to params.name in proto"
+        );
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == "error")
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "scalar tool matcher should produce no validation errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_deny_tool_and_params_name_rejected() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-deny-both
+display_name: MCP Deny Both
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    deny_rules:
+      - method: tools/call
+        tool:
+          glob: dangerous_*
+        params:
+          name:
+            glob: also_dangerous_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("either tool or params.name")),
+            "deny rule with both tool and params.name should be rejected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_method_must_be_tools_call_with_tool_selector() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-bad-method
+display_name: MCP Bad Method
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    rules:
+      - allow:
+          method: resources/read
+          tool:
+            glob: read_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("method must be tools/call")),
+            "tool selector with wrong method should be rejected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_deny_method_must_be_tools_call_with_tool_selector() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-deny-bad-method
+display_name: MCP Deny Bad Method
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    deny_rules:
+      - method: resources/read
+        tool:
+          glob: dangerous_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("method must be tools/call")),
+            "deny rule with tool selector and wrong method should be rejected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_method_required_without_allow_all() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-no-method
+display_name: MCP No Method
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    rules:
+      - allow:
+          tool:
+            glob: read_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("method is required")),
+            "missing method without allow_all should be rejected: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_before_lowering_catches_tool_params_conflict() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-both
+display_name: MCP Both
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    rules:
+      - allow:
+          method: tools/call
+          tool:
+            glob: read_*
+          params:
+            name:
+              glob: write_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = profile.validate_before_lowering("profile.yaml");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("either tool or params.name")),
+            "pre-lowering validation should catch tool + params.name conflict: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_before_lowering_ok_with_tool_only() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-tool-only
+display_name: MCP Tool Only
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    rules:
+      - allow:
+          method: tools/call
+          tool:
+            glob: read_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = profile.validate_before_lowering("profile.yaml");
+        assert!(
+            diagnostics.is_empty(),
+            "tool-only rule should pass pre-lowering validation: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_before_lowering_deny_catches_conflict() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-deny-both
+display_name: MCP Deny Both
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    deny_rules:
+      - method: tools/call
+        tool:
+          glob: dangerous_*
+        params:
+          name:
+            glob: also_dangerous_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = profile.validate_before_lowering("profile.yaml");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("either tool or params.name")),
+            "deny rule with both should be caught before lowering: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_deny_rules_without_protocol() {
+        let profile = parse_profile_yaml(
+            r"
+id: deny-no-protocol
+display_name: Deny No Protocol
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.example.com
+    port: 443
+    deny_rules:
+      - method: POST
+binaries:
+  - /usr/bin/app
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("deny_rules require protocol")),
+            "expected lint to reject deny_rules without protocol, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_before_lowering_catches_empty_rules() {
+        let profile = parse_profile_yaml(
+            r"
+id: empty-rules
+display_name: Empty Rules
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: mcp
+    rules: []
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = profile.validate_before_lowering("profile.yaml");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("rules list cannot be empty")),
+            "pre-lowering should catch empty rules list: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_before_lowering_catches_empty_deny_rules() {
+        let profile = parse_profile_yaml(
+            r"
+id: empty-deny-rules
+display_name: Empty Deny Rules
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          method: tools/call
+    deny_rules: []
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = profile.validate_before_lowering("profile.yaml");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("deny_rules list cannot be empty")),
+            "pre-lowering should catch empty deny_rules list: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_unsupported_params_key() {
+        let profile = parse_profile_yaml(
+            r"
+id: bad-params
+display_name: Bad Params
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          method: tools/call
+          params:
+            arguments:
+              glob: '*'
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("MCP tool argument matching is not supported yet")),
+            "expected unsupported params key error: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_matcher_glob_and_any_rejected() {
+        let profile = parse_profile_yaml(
+            r"
+id: glob-and-any
+display_name: Glob And Any
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          method: tools/call
+          tool:
+            glob: read_*
+            any:
+              - write_data
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("cannot specify both glob and any")),
+            "expected glob+any mutual exclusion error: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_matcher_empty_rejected() {
+        let yaml = r"
+id: empty-matcher
+display_name: Empty Matcher
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          method: tools/call
+          tool: ''
+binaries:
+  - /usr/bin/example-agent
+";
+        let profile = parse_profile_yaml(yaml).expect("profile should parse");
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("matcher must specify glob or any")),
+            "expected empty matcher error: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_wildcard_without_strict_tool_names() {
+        let profile = parse_profile_yaml(
+            r"
+id: wildcard-no-strict
+display_name: Wildcard No Strict
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+      strict_tool_names: false
+    rules:
+      - allow:
+          method: tools/call
+          tool:
+            glob: '*'
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("wildcard tool-name matchers require mcp.strict_tool_names")),
+            "expected wildcard policy error: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_wildcard_with_strict_tool_names_ok() {
+        let profile = parse_profile_yaml(
+            r"
+id: wildcard-strict
+display_name: Wildcard Strict
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+      strict_tool_names: true
+    rules:
+      - allow:
+          method: tools/call
+          tool:
+            glob: '*'
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            !diagnostics.iter().any(|d| d
+                .message
+                .contains("wildcard tool-name matchers require mcp.strict_tool_names")),
+            "wildcard with strict_tool_names enabled should be OK: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_method_glob_restricted_to_tools() {
+        let profile = parse_profile_yaml(
+            r"
+id: bad-method-glob
+display_name: Bad Method Glob
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          method: 'resources/*'
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("MCP method globs are only valid for the tools/ method family")),
+            "expected method glob restriction error: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_path_rejected() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-path
+display_name: MCP Path
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    mcp:
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          method: tools/call
+          path: /api/tools
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("must use method/tool, not path/query")),
+            "expected path rejection for MCP: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_tool_on_non_mcp_rejected() {
+        let profile = parse_profile_yaml(
+            r"
+id: rest-tool
+display_name: REST Tool
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    rules:
+      - allow:
+          method: GET
+          tool:
+            glob: read_*
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("MCP tool matching is only valid for protocol mcp")),
+            "expected tool-on-non-mcp rejection: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_options_on_non_mcp_rejected() {
+        let profile = parse_profile_yaml(
+            r"
+id: rest-mcp-opts
+display_name: REST MCP Options
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    mcp:
+      strict_tool_names: true
+    rules:
+      - allow:
+          method: GET
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("mcp options are only valid for protocol mcp")),
+            "expected mcp-options-on-non-mcp rejection: {diagnostics:?}"
         );
     }
 }

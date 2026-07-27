@@ -215,11 +215,7 @@ pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpi
     denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
     redacted_target: &str,
 ) -> Result<()> {
-    let context = Some(crate::l7::rest::DenyResponseContext {
-        host: Some(&ctx.host),
-        port: Some(ctx.port),
-        binary: Some(&ctx.binary_path),
-    });
+    let context = Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx));
     if let Some(denial) = denial {
         crate::l7::rest::send_middleware_deny_response(
             req,
@@ -562,9 +558,7 @@ mod tests {
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
             secret_resolver: None,
-            activity_tx: None,
-            dynamic_credentials: None,
-            token_grant_resolver: None,
+            ..Default::default()
         };
         let req = crate::l7::provider::L7Request {
             action: "POST".into(),
@@ -602,8 +596,6 @@ mod tests {
 
     #[tokio::test]
     async fn middleware_failure_uses_platform_response_without_policy_guidance() {
-        let _proposals =
-            openshell_core::proposals::test_helpers::ProposalsFlagGuard::set(true).await;
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 443,
@@ -612,9 +604,7 @@ mod tests {
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
             secret_resolver: None,
-            activity_tx: None,
-            dynamic_credentials: None,
-            token_grant_resolver: None,
+            ..Default::default()
         };
         let req = crate::l7::provider::L7Request {
             action: "POST".into(),

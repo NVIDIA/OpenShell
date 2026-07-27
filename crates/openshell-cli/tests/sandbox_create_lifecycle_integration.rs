@@ -726,7 +726,7 @@ struct TestServer {
     endpoint: String,
     tls: TlsOptions,
     openshell: TestOpenShell,
-    _dir: TempDir,
+    dir: TempDir,
 }
 
 async fn run_server() -> TestServer {
@@ -775,7 +775,7 @@ async fn run_server() -> TestServer {
         endpoint,
         tls,
         openshell,
-        _dir: dir,
+        dir,
     }
 }
 
@@ -1907,4 +1907,78 @@ async fn sandbox_create_env_rejects_invalid_key_name() {
         msg.contains("BAD-NAME"),
         "error should mention invalid key, got: {msg}"
     );
+}
+
+async fn run_cli_sandbox_create(
+    server: &TestServer,
+    name: &str,
+    extra_args: &[&str],
+) -> std::process::Output {
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let tls_dir = xdg_dir.path().join("openshell/gateways/openshell/mtls");
+    fs::create_dir_all(&tls_dir).unwrap();
+    for filename in ["ca.crt", "tls.crt", "tls.key"] {
+        fs::copy(server.dir.path().join(filename), tls_dir.join(filename)).unwrap();
+    }
+
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"))
+        .args([
+            "--gateway",
+            "openshell",
+            "--gateway-endpoint",
+            &server.endpoint,
+            "sandbox",
+            "create",
+            "--name",
+            name,
+            "--no-tty",
+            "--no-auto-providers",
+        ])
+        .args(extra_args)
+        .env("XDG_CONFIG_HOME", xdg_dir.path())
+        .env("HOME", xdg_dir.path())
+        .env("OPENSHELL_PROVISION_TIMEOUT", "5")
+        .output()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn sandbox_create_json_stdout_is_parseable_with_progress_events() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .vm_slow_progress_before_ready
+        .store(true, Ordering::SeqCst);
+
+    let result = run_cli_sandbox_create(&server, "json-progress", &["--output=json"]).await;
+    assert!(
+        result.status.success(),
+        "sandbox create failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8(result.stdout).expect("stdout should be UTF-8");
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .unwrap_or_else(|err| panic!("stdout should contain only JSON: {err}\n{stdout}"));
+}
+
+#[tokio::test]
+async fn sandbox_create_yaml_stdout_is_parseable_with_progress_events() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .vm_slow_progress_before_ready
+        .store(true, Ordering::SeqCst);
+
+    let result = run_cli_sandbox_create(&server, "yaml-progress", &["--output=yaml"]).await;
+    assert!(
+        result.status.success(),
+        "sandbox create failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8(result.stdout).expect("stdout should be UTF-8");
+    serde_yml::from_str::<serde_yml::Value>(&stdout)
+        .unwrap_or_else(|err| panic!("stdout should contain only YAML: {err}\n{stdout}"));
 }

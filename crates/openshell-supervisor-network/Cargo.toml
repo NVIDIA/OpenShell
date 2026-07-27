@@ -50,7 +50,6 @@ uuid = { workspace = true }
 webpki-roots = { workspace = true }
 
 [dev-dependencies]
-openshell-core = { path = "../openshell-core", features = ["test-helpers"] }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 tempfile = "3"
 tonic = { workspace = true }
@@ -59,8 +58,10 @@ tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-[target.'cfg(unix)'.dev-dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(unix)'.dev-dependencies]
 
 [lints]
 workspace = true

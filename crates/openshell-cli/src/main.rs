@@ -157,19 +157,30 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
 /// and setting it on `TlsOptions`. For OIDC, automatically refreshes the token
 /// if it's near expiry.
 fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
-    let Some(meta) = get_gateway_metadata(gateway_name) else {
-        return;
-    };
+    let _ = apply_auth_with_status(tls, gateway_name);
+}
+
+/// Apply stored authentication and return a user-facing preparation failure,
+/// if the CLI already knows the credentials cannot be used.
+fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<String> {
+    let meta = get_gateway_metadata(gateway_name)?;
     match meta.auth_mode.as_deref() {
         Some("cloudflare_jwt") => {
             if let Some(token) = load_edge_token(gateway_name) {
                 tls.edge_token = Some(token);
+                None
+            } else {
+                Some(format!(
+                    "edge credentials are missing; run `openshell gateway login {gateway_name}`"
+                ))
             }
         }
         Some("oidc") => {
             let Some(bundle) = openshell_bootstrap::oidc_token::load_oidc_token(gateway_name)
             else {
-                return;
+                return Some(format!(
+                    "OIDC credentials are missing; run `openshell gateway login {gateway_name}`"
+                ));
             };
             if openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
                 let insecure = std::env::var("OPENSHELL_GATEWAY_INSECURE")
@@ -178,7 +189,11 @@ fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
                 // so the async refresh can run within the sync apply_auth call.
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
-                        openshell_cli::oidc_auth::oidc_refresh_token(&bundle, insecure),
+                        openshell_cli::oidc_auth::oidc_refresh_token(
+                            &bundle,
+                            meta.oidc_scopes.as_deref(),
+                            insecure,
+                        ),
                     )
                 }) {
                     Ok(refreshed) => {
@@ -187,19 +202,24 @@ fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
                             &refreshed,
                         );
                         tls.oidc_token = Some(refreshed.access_token);
+                        None
                     }
                     Err(e) => {
                         tracing::warn!("OIDC token refresh failed: {e}");
                         // Use the expired token anyway — server will reject it
                         // with a clear error prompting re-login.
                         tls.oidc_token = Some(bundle.access_token);
+                        Some(format!(
+                            "OIDC token refresh failed; run `openshell gateway login {gateway_name}`"
+                        ))
                     }
                 }
             } else {
                 tls.oidc_token = Some(bundle.access_token);
+                None
             }
         }
-        _ => {}
+        _ => None,
     }
 }
 
@@ -562,7 +582,11 @@ enum Commands {
 
     /// Show gateway status and information.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Status,
+    Status {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
 
     /// Manage inference configuration.
     #[command(after_help = INFERENCE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
@@ -1414,6 +1438,10 @@ enum SandboxCommands {
         #[arg(long, value_parser = ["manual", "auto"], default_value = "manual")]
         approval_mode: String,
 
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["editor", "command", "no_keep", "forward"])]
+        output: OutputFormat,
+
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(last = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -1427,8 +1455,12 @@ enum SandboxCommands {
         name: Option<String>,
 
         /// Print only the active policy YAML (same policy as the default view; stdout only).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "output")]
         policy_only: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// List sandboxes.
@@ -2250,11 +2282,24 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------
         // Top-level status
         // -----------------------------------------------------------
-        Some(Commands::Status) => {
+        Some(Commands::Status { output }) => {
             if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
                 let mut tls = tls.with_gateway_name(&ctx.name);
-                apply_auth(&mut tls, &ctx.name);
-                run::gateway_status(&ctx.name, &ctx.endpoint, &tls).await?;
+                let auth_error = apply_auth_with_status(&mut tls, &ctx.name);
+                run::gateway_status(
+                    &ctx.name,
+                    &ctx.endpoint,
+                    output.as_str(),
+                    &tls,
+                    auth_error.as_deref(),
+                )
+                .await?;
+            } else if openshell_cli::output::print_output_single(
+                output.as_str(),
+                &(),
+                |()| serde_json::json!({"status": "not_configured"}),
+            )? {
+                // Structured output handled.
             } else {
                 println!("{}", "Gateway Status".cyan().bold());
                 println!();
@@ -2865,6 +2910,7 @@ async fn main() -> Result<()> {
                     labels,
                     envs,
                     approval_mode,
+                    output,
                     command,
                 } => {
                     // Resolve --tty / --no-tty into an Option<bool> override.
@@ -2951,6 +2997,7 @@ async fn main() -> Result<()> {
                             labels: labels_map,
                             environment: env_map,
                             approval_mode: &approval_mode,
+                            output: output.as_str(),
                         },
                         &cli.workspace,
                         &tls,
@@ -3010,10 +3057,21 @@ async fn main() -> Result<()> {
                         | SandboxCommands::Download { .. } => {
                             unreachable!()
                         }
-                        SandboxCommands::Get { name, policy_only } => {
+                        SandboxCommands::Get {
+                            name,
+                            policy_only,
+                            output,
+                        } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                            run::sandbox_get(endpoint, &name, policy_only, &cli.workspace, &tls)
-                                .await?;
+                            run::sandbox_get(
+                                endpoint,
+                                &name,
+                                policy_only,
+                                output.as_str(),
+                                &cli.workspace,
+                                &tls,
+                            )
+                            .await?;
                         }
                         SandboxCommands::List {
                             limit,
@@ -3863,7 +3921,7 @@ mod tests {
             .expect("global gateway flag should parse with subcommands");
 
         assert_eq!(cli.gateway.as_deref(), Some("demo"));
-        assert!(matches!(cli.command, Some(Commands::Status)));
+        assert!(matches!(cli.command, Some(Commands::Status { .. })));
     }
 
     #[test]
@@ -4147,6 +4205,25 @@ mod tests {
             apply_auth(&mut tls, "edge-gateway");
 
             assert_eq!(tls.edge_token.as_deref(), Some("token-123"));
+        });
+    }
+
+    #[test]
+    fn apply_auth_reports_missing_edge_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            store_gateway_metadata(
+                "edge-gateway",
+                &edge_metadata("edge-gateway", "https://gw.example.com"),
+            )
+            .unwrap();
+
+            let mut tls = TlsOptions::default();
+            let error = apply_auth_with_status(&mut tls, "edge-gateway")
+                .expect("missing credentials should be reported");
+
+            assert!(error.contains("edge credentials are missing"));
+            assert!(!tls.is_bearer_auth());
         });
     }
 
@@ -4984,6 +5061,25 @@ mod tests {
             result.is_err(),
             "--approval-mode auto_on_low_risk should be rejected until added to the value parser"
         );
+    }
+
+    #[test]
+    fn sandbox_create_output_conflicts_with_side_effect_args() {
+        for (label, extra_args) in [
+            ("--editor", &["--editor", "code"][..]),
+            ("trailing command", &["--", "claude"][..]),
+            ("--no-keep", &["--no-keep"][..]),
+            ("--forward", &["--forward", "8080"][..]),
+        ] {
+            let args = ["openshell", "sandbox", "create", "--output", "json"]
+                .into_iter()
+                .chain(extra_args.iter().copied());
+            let result = Cli::try_parse_from(args);
+            assert!(
+                result.is_err(),
+                "structured output should conflict with {label}"
+            );
+        }
     }
 
     #[test]

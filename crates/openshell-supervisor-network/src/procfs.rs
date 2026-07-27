@@ -9,6 +9,9 @@
 use miette::Result;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
+use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -38,6 +41,46 @@ pub struct SocketOwner {
 pub struct TcpPeerSocketOwners {
     pub inode: u64,
     pub owners: Vec<SocketOwner>,
+}
+
+/// TCP endpoints for a workload connection accepted by the sandbox proxy.
+///
+/// `/proc/<pid>/net/tcp{,6}` reports the socket from the workload side, so its
+/// local endpoint should match `workload` and its remote endpoint should match
+/// `proxy`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkloadProxyTcpConnection {
+    pub workload: SocketAddr,
+    pub proxy: SocketAddr,
+}
+
+impl WorkloadProxyTcpConnection {
+    pub fn new(workload: SocketAddr, proxy: SocketAddr) -> Self {
+        Self { workload, proxy }
+    }
+}
+
+impl std::fmt::Display for WorkloadProxyTcpConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} -> {}", self.workload, self.proxy)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcTcpAddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcTcpAddressFamily {
+    fn table_name(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "tcp",
+            Self::Ipv6 => "tcp6",
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -116,11 +159,14 @@ pub fn binary_path(pid: i32) -> Result<PathBuf> {
 /// Resolve the binary path of the TCP peer inside a sandbox network namespace.
 ///
 /// Uses `/proc/<entrypoint_pid>/net/tcp` to find the socket inode for the given
-/// ephemeral port, then scans the entrypoint process tree to find which PID owns
-/// that socket, and finally reads `/proc/<pid>/exe` to get the binary path.
+/// connection tuple, then scans the entrypoint process tree to find which PID
+/// owns that socket, and finally reads `/proc/<pid>/exe` to get the binary path.
 #[cfg(target_os = "linux")]
-pub fn resolve_tcp_peer_binary(entrypoint_pid: u32, peer_port: u16) -> Result<PathBuf> {
-    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_port)?;
+pub fn resolve_tcp_peer_binary(
+    entrypoint_pid: u32,
+    connection: WorkloadProxyTcpConnection,
+) -> Result<PathBuf> {
+    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, connection)?;
     binary_path(owner.pid.cast_signed())
 }
 
@@ -132,17 +178,20 @@ pub fn resolve_tcp_peer_binary(entrypoint_pid: u32, peer_port: u16) -> Result<Pa
 #[cfg(target_os = "linux")]
 pub fn resolve_tcp_peer_socket_owners(
     entrypoint_pid: u32,
-    peer_port: u16,
+    connection: WorkloadProxyTcpConnection,
 ) -> Result<TcpPeerSocketOwners> {
-    let inode = parse_proc_net_tcp(entrypoint_pid, peer_port)?;
+    let inode = parse_proc_net_tcp(entrypoint_pid, connection)?;
     let owners = find_socket_inode_owners(inode, entrypoint_pid)?;
     Ok(TcpPeerSocketOwners { inode, owners })
 }
 
 /// Resolve exactly one owner for the TCP peer, failing closed on ambiguity.
 #[cfg(target_os = "linux")]
-fn resolve_single_tcp_peer_owner(entrypoint_pid: u32, peer_port: u16) -> Result<SocketOwner> {
-    let socket_owners = resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)?;
+fn resolve_single_tcp_peer_owner(
+    entrypoint_pid: u32,
+    connection: WorkloadProxyTcpConnection,
+) -> Result<SocketOwner> {
+    let socket_owners = resolve_tcp_peer_socket_owners(entrypoint_pid, connection)?;
     match socket_owners.owners.as_slice() {
         [owner] => Ok(owner.clone()),
         owners => {
@@ -164,8 +213,11 @@ fn resolve_single_tcp_peer_owner(entrypoint_pid: u32, peer_port: u16) -> Result<
 ///
 /// Needed for the ancestor walk: we must know the PID to walk `/proc/<pid>/status` `PPid` chain.
 #[cfg(target_os = "linux")]
-pub fn resolve_tcp_peer_identity(entrypoint_pid: u32, peer_port: u16) -> Result<(PathBuf, u32)> {
-    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_port)?;
+pub fn resolve_tcp_peer_identity(
+    entrypoint_pid: u32,
+    connection: WorkloadProxyTcpConnection,
+) -> Result<(PathBuf, u32)> {
+    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, connection)?;
     let path = binary_path(owner.pid.cast_signed())?;
     Ok((path, owner.pid))
 }
@@ -274,7 +326,7 @@ pub fn collect_cmdline_paths(pid: u32, stop_pid: u32, exclude: &[PathBuf]) -> Ve
 }
 
 /// Parse `/proc/<pid>/net/tcp` (and `/proc/<pid>/net/tcp6`) to find the socket
-/// inode for a given local port.
+/// inode for a complete local-to-remote TCP tuple.
 ///
 /// Checks both IPv4 and IPv6 tables because some clients (notably gRPC C-core)
 /// use `AF_INET6` sockets with IPv4-mapped addresses even for IPv4 connections.
@@ -288,52 +340,96 @@ pub fn collect_cmdline_paths(pid: u32, stop_pid: u32, exclude: &[PathBuf]) -> Ve
 /// - State `01` = ESTABLISHED
 /// - Inode is field index 9 (0-indexed)
 #[cfg(target_os = "linux")]
-fn parse_proc_net_tcp(pid: u32, peer_port: u16) -> Result<u64> {
+fn parse_proc_net_tcp(pid: u32, connection: WorkloadProxyTcpConnection) -> Result<u64> {
     // Check IPv4 first (most common), then IPv6.
-    for suffix in &["tcp", "tcp6"] {
-        let path = format!("/proc/{pid}/net/{suffix}");
+    for address_family in [ProcTcpAddressFamily::Ipv4, ProcTcpAddressFamily::Ipv6] {
+        let path = format!("/proc/{pid}/net/{}", address_family.table_name());
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
 
-        for line in content.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 10 {
-                continue;
-            }
-
-            // Parse local_address to extract port.
-            // IPv4 format: AABBCCDD:PORT
-            // IPv6 format: 00000000000000000000000000000000:PORT
-            let local_addr = fields[1];
-            let local_port = match local_addr.rsplit_once(':') {
-                Some((_, port_hex)) => u16::from_str_radix(port_hex, 16).unwrap_or(0),
-                None => continue,
-            };
-
-            // Check state is ESTABLISHED (01)
-            let state = fields[3];
-            if state != "01" {
-                continue;
-            }
-
-            if local_port == peer_port {
-                let inode: u64 = fields[9]
-                    .parse()
-                    .map_err(|_| miette::miette!("Failed to parse inode from {}", fields[9]))?;
-                if inode == 0 {
-                    continue;
-                }
-                return Ok(inode);
-            }
+        if let Some(inode) = find_proc_net_tcp_inode(&content, address_family, connection)? {
+            return Ok(inode);
         }
     }
 
     Err(miette::miette!(
-        "No ESTABLISHED TCP connection found for port {} in /proc/{}/net/tcp{{,6}}",
-        peer_port,
-        pid
+        "No ESTABLISHED TCP connection found for {connection} in /proc/{pid}/net/tcp{{,6}}"
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn find_proc_net_tcp_inode(
+    content: &str,
+    address_family: ProcTcpAddressFamily,
+    connection: WorkloadProxyTcpConnection,
+) -> Result<Option<u64>> {
+    for line in content.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 10 || fields[3] != "01" {
+            continue;
+        }
+
+        let Some(local_addr) = parse_proc_socket_addr(fields[1], address_family) else {
+            continue;
+        };
+        let Some(remote_addr) = parse_proc_socket_addr(fields[2], address_family) else {
+            continue;
+        };
+
+        if socket_addrs_match(local_addr, connection.workload)
+            && socket_addrs_match(remote_addr, connection.proxy)
+        {
+            let inode: u64 = fields[9]
+                .parse()
+                .map_err(|_| miette::miette!("Failed to parse inode from {}", fields[9]))?;
+            if inode != 0 {
+                return Ok(Some(inode));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_socket_addr(value: &str, address_family: ProcTcpAddressFamily) -> Option<SocketAddr> {
+    let (address, port) = value.rsplit_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+
+    let ip = match address_family {
+        ProcTcpAddressFamily::Ipv4 => {
+            let address = u32::from_str_radix(address, 16).ok()?;
+            IpAddr::V4(Ipv4Addr::from(address.to_le_bytes()))
+        }
+        ProcTcpAddressFamily::Ipv6 => {
+            if address.len() != 32 {
+                return None;
+            }
+            let mut bytes = [0u8; 16];
+            for (index, chunk) in address.as_bytes().chunks_exact(8).enumerate() {
+                let chunk = std::str::from_utf8(chunk).ok()?;
+                let word = u32::from_str_radix(chunk, 16).ok()?;
+                bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            IpAddr::V6(Ipv6Addr::from(bytes))
+        }
+    };
+
+    Some(SocketAddr::new(ip, port))
+}
+
+#[cfg(target_os = "linux")]
+fn socket_addrs_match(left: SocketAddr, right: SocketAddr) -> bool {
+    left.port() == right.port() && normalize_ip(left.ip()) == normalize_ip(right.ip())
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ipv6) => ipv6.to_ipv4_mapped().map_or(IpAddr::V6(ipv6), IpAddr::V4),
+        ipv4 @ IpAddr::V4(_) => ipv4,
+    }
 }
 
 /// Scan `/proc` to find every PID that owns a given socket inode.
@@ -758,6 +854,38 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn parse_proc_socket_addr_decodes_ipv4_and_mapped_ipv6() {
+        let ipv4 = parse_proc_socket_addr("0100007F:C350", ProcTcpAddressFamily::Ipv4).unwrap();
+        let mapped_ipv6 = parse_proc_socket_addr(
+            "0000000000000000FFFF00000100007F:C350",
+            ProcTcpAddressFamily::Ipv6,
+        )
+        .unwrap();
+
+        assert_eq!(ipv4, "127.0.0.1:50000".parse().unwrap());
+        assert!(socket_addrs_match(ipv4, mapped_ipv6));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn find_proc_net_tcp_inode_matches_complete_tuple() {
+        let content = "\
+  sl  local_address rem_address   st tx_queue:rx_queue tr:tm->when retrnsmt uid timeout inode\n\
+   0: 0100007F:C350 0100007F:1F91 01 00000000:00000000 00:00000000 00000000 1000 0 11111\n\
+   1: 0100007F:C350 0100007F:1F90 01 00000000:00000000 00:00000000 00000000 1000 0 22222\n";
+        let connection = WorkloadProxyTcpConnection::new(
+            "127.0.0.1:50000".parse().unwrap(),
+            "127.0.0.1:8080".parse().unwrap(),
+        );
+
+        let inode =
+            find_proc_net_tcp_inode(content, ProcTcpAddressFamily::Ipv4, connection).unwrap();
+
+        assert_eq!(inode, Some(22222));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn resolve_tcp_peer_socket_owners_returns_all_forked_socket_holders() {
         use std::net::{TcpListener, TcpStream};
         use std::time::{Duration, Instant};
@@ -774,9 +902,10 @@ mod tests {
         }
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let listener_port = listener.local_addr().unwrap().port();
-        let stream = TcpStream::connect(("127.0.0.1", listener_port)).expect("connect");
-        let peer_port = stream.local_addr().unwrap().port();
+        let proxy_addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(proxy_addr).expect("connect");
+        let workload_addr = stream.local_addr().unwrap();
+        let connection = WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         let (_accepted, _) = listener.accept().expect("accept");
 
         // libc/syscall FFI requires unsafe
@@ -797,7 +926,7 @@ mod tests {
         let entrypoint_pid = std::process::id();
         let deadline = Instant::now() + Duration::from_secs(5);
         let owners = loop {
-            let owners = resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)
+            let owners = resolve_tcp_peer_socket_owners(entrypoint_pid, connection)
                 .expect("resolve socket owners");
             let owner_pids = owners
                 .owners

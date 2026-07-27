@@ -101,6 +101,9 @@ impl std::str::FromStr for Mode {
 }
 
 /// `OpenShell` Sandbox - process isolation and monitoring.
+// CLI flags are naturally boolean switches; grouping them into structs would
+// only obscure the clap definition.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 #[command(name = "openshell-sandbox")]
 #[command(version = openshell_core::VERSION)]
@@ -200,6 +203,32 @@ struct Args {
     /// Shared TLS work directory between the network init container and sidecar.
     #[arg(long, env = "OPENSHELL_PROXY_TLS_DIR", default_value = SIDECAR_TLS_DIR)]
     sidecar_tls_dir: String,
+
+    // Corporate upstream proxy. Operator-owned egress boundary: accepted
+    // only as command-line arguments (no `env =`), because the driver
+    // controls the supervisor's argv while a sandbox image could bake
+    // matching `ENV` values.
+    /// Corporate forward proxy URL (`http://host:port`) for upstream TLS egress.
+    #[arg(long)]
+    upstream_proxy: Option<String>,
+
+    /// Comma-separated `NO_PROXY` list for the corporate proxy.
+    #[arg(long)]
+    upstream_no_proxy: Option<String>,
+
+    /// Path to the root-only file holding corporate proxy credentials (`user:pass`).
+    #[arg(long)]
+    upstream_proxy_auth_file: Option<String>,
+
+    /// Acknowledge that proxy credentials travel as cleartext Basic auth over
+    /// the plain-TCP connection to the `http://` proxy.
+    #[arg(long)]
+    upstream_proxy_auth_allow_insecure: bool,
+
+    /// Send the destination hostname in CONNECT instead of a validated IP
+    /// (for proxies whose ACLs filter on hostnames).
+    #[arg(long)]
+    upstream_proxy_connect_by_hostname: bool,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -581,6 +610,14 @@ fn main() -> Result<()> {
         // is not yet initialized at this point (run_sandbox hasn't been called).
         // The shorthand layer will render it in fallback format.
 
+        let upstream_proxy_args = openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs {
+            https_proxy: args.upstream_proxy,
+            no_proxy: args.upstream_no_proxy,
+            proxy_auth_file: args.upstream_proxy_auth_file,
+            proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure,
+            proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname,
+        };
+
         run_sandbox(
             command,
             args.workdir,
@@ -598,6 +635,7 @@ fn main() -> Result<()> {
             ocsf_enabled,
             args.mode.network,
             args.mode.process,
+            upstream_proxy_args,
         )
         .await
     })?;

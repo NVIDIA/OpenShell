@@ -345,6 +345,38 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_PODMAN_TLS_CA` | `--podman-tls-ca` | unset | Host path to the CA certificate mounted for sandbox mTLS. |
 | `OPENSHELL_PODMAN_TLS_CERT` | `--podman-tls-cert` | unset | Host path to the client certificate mounted for sandbox mTLS. |
 | `OPENSHELL_PODMAN_TLS_KEY` | `--podman-tls-key` | unset | Host path to the client private key mounted for sandbox mTLS. |
+| `OPENSHELL_SANDBOX_HTTPS_PROXY` | `--sandbox-https-proxy` | unset | Corporate forward proxy URL for the supervisor's upstream TLS dials, chained with HTTP CONNECT. Only credential-free `http://host:port` URLs are supported (scheme and port required). Plain-HTTP requests always dial directly. |
+| `OPENSHELL_SANDBOX_NO_PROXY` | `--sandbox-no-proxy` | unset | Comma-separated `NO_PROXY` list (hostnames, domain suffixes, IPs, CIDRs, each with an optional `:port` qualifier) dialed directly instead of through the corporate proxy. IP/CIDR entries also match hostnames through their validated DNS resolution. |
+| `OPENSHELL_SANDBOX_PROXY_AUTH_FILE` | `--sandbox-proxy-auth-file` | unset | Path to a file containing the proxy credentials as `user:pass`. Staged as a root-only Podman secret so credentials never appear in config or container metadata. Requires the insecure-auth acknowledgement below. |
+| `OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE` | `--sandbox-proxy-auth-allow-insecure` | unset | Explicit acknowledgement (`true`) that the credential is sent as cleartext Basic auth over the plain-TCP connection to the `http://` proxy. Required when the auth file is set; rejected when it is not. |
+| `OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME` | `--sandbox-proxy-connect-by-hostname` | unset | Send the destination hostname in CONNECT requests instead of a validated IP. Last resort for proxies whose ACLs filter on hostnames: the proxy then resolves the name itself, so sandbox SSRF/`allowed_ips` validation no longer binds the connection. |
+
+Through the gateway, the same settings are the `https_proxy`, `no_proxy`,
+`proxy_auth_file`, `proxy_auth_allow_insecure`, and
+`proxy_connect_by_hostname` keys under `[openshell.drivers.podman]`; see
+`docs/reference/gateway-config.mdx`.
+
+This is an operator-owned egress boundary: the driver passes the settings on
+the supervisor's command line, so sandbox and template environment — and any
+`ENV` baked into the sandbox image — cannot override them, and the
+conventional `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` variables a sandbox
+controls do not steer it. Credentials must be supplied through
+`proxy_auth_file`; an inline `user:pass@` in the URL is rejected at startup.
+
+Basic auth over an `http://` proxy is cleartext on the wire: anyone on the
+network path between the sandbox host and the proxy can recover the
+credential. Setting `proxy_auth_file` therefore requires
+`proxy_auth_allow_insecure = true`; both the driver and the in-container
+supervisor reject credentials without that explicit acknowledgement.
+
+CONNECT requests target a validated resolved IP by default, so the proxy
+performs no DNS resolution and the tunnel stays bound to the address that
+passed the sandbox's SSRF and `allowed_ips` checks; the hostname still
+travels inside the tunnel (TLS SNI, application `Host`). In split-horizon
+networks, point the gateway host at the corporate resolver. Set
+`proxy_connect_by_hostname = true` only when the proxy's ACLs filter on
+hostnames and reject IP CONNECT targets — it re-opens proxy-side DNS
+resolution, making the proxy's ACLs the effective egress control.
 
 ## Rootless-Specific Adaptations
 

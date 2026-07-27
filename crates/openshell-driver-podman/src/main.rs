@@ -103,6 +103,36 @@ struct Args {
     /// Host path to the client private key for sandbox mTLS.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_KEY")]
     podman_tls_key: Option<PathBuf>,
+
+    /// Corporate forward proxy URL for the supervisor's upstream TLS dials,
+    /// in explicit `http://host:port` form (scheme and port required).
+    /// Credentials must not be embedded in the URL; use
+    /// `--sandbox-proxy-auth-file` instead.
+    #[arg(long, env = "OPENSHELL_SANDBOX_HTTPS_PROXY")]
+    sandbox_https_proxy: Option<String>,
+
+    /// Comma-separated `NO_PROXY` list injected alongside the proxy URL.
+    #[arg(long, env = "OPENSHELL_SANDBOX_NO_PROXY")]
+    sandbox_no_proxy: Option<String>,
+
+    /// Path to a file containing the corporate proxy credentials as
+    /// `user:pass`. Delivered to the supervisor through a root-only secret
+    /// mount so the credentials never appear in config or container metadata.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_AUTH_FILE")]
+    sandbox_proxy_auth_file: Option<String>,
+
+    /// Explicit acknowledgement (`true`) that the proxy credential is sent
+    /// as cleartext Basic auth over the plain-TCP connection to the http://
+    /// proxy. Required when `--sandbox-proxy-auth-file` is set.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE")]
+    sandbox_proxy_auth_allow_insecure: Option<bool>,
+
+    /// Send the destination hostname in CONNECT requests to the corporate
+    /// proxy instead of a validated IP. Only for proxies whose ACLs filter
+    /// on hostnames: the proxy then resolves the name itself, so sandbox
+    /// SSRF/`allowed_ips` validation no longer binds the connection.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME")]
+    sandbox_proxy_connect_by_hostname: Option<bool>,
 }
 
 #[tokio::main]
@@ -133,6 +163,11 @@ async fn main() -> Result<()> {
         guest_tls_cert: args.podman_tls_cert,
         guest_tls_key: args.podman_tls_key,
         sandbox_pids_limit: args.sandbox_pids_limit,
+        https_proxy: args.sandbox_https_proxy,
+        no_proxy: args.sandbox_no_proxy,
+        proxy_auth_file: args.sandbox_proxy_auth_file,
+        proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
+        proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
         ..PodmanComputeConfig::default()
     })
     .await

@@ -113,11 +113,23 @@ openshell status -g staging
 
 ## Inspect Gateway Status
 
-Use `openshell status` for a live gateway check. It verifies that the CLI can
-reach the running gateway, then reports health and the gateway version:
+Use `openshell status` for a live gateway check. It reports gateway
+reachability, authentication, and the gateway version independently:
 
 ```shell
 openshell status
+```
+
+`Status: Connected` means the public health endpoint responded.
+`Authentication: Authenticated` confirms the configured credentials also
+passed the gateway authentication layer. If authentication fails while status
+remains connected, run `openshell gateway login <name>` to refresh the stored
+credentials.
+
+For automation or scripting, use `--output json` or `--output yaml` to get machine-readable output:
+
+```shell
+openshell status --output json
 ```
 
 Use `openshell gateway info` when you need elevated runtime details such as

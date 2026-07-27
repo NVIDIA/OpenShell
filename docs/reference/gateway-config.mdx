@@ -391,6 +391,66 @@ sandbox_pids_limit      = 2048
 # but increase process churn (each check spawns a conmon subprocess).
 # Set to 0 to disable health checks entirely. Default: 10.
 health_check_interval_secs = 10
+# Corporate forward proxy for sandbox egress. When set, the in-container
+# supervisor chains policy-approved TLS tunnels through this proxy with HTTP
+# CONNECT instead of dialing destinations directly. Plain-HTTP requests are
+# not proxied and always dial the destination directly. Only http:// proxy
+# URLs in explicit http://host:port form are supported: the scheme and port
+# are both required, and a URL carrying a path, query, or fragment is
+# rejected rather than silently truncated.
+# NO_PROXY entries (hostnames, domain suffixes, IPs, CIDRs, each with an
+# optional :port qualifier) are dialed directly. A port-qualified entry only
+# bypasses that destination port. IP and CIDR entries also match hostnames
+# through their validated DNS resolution; such a match dials directly only
+# the resolved addresses inside the entry. This is an operator-owned egress
+# boundary:
+# sandbox and template environment cannot override it, and the conventional
+# HTTPS_PROXY/HTTP_PROXY/NO_PROXY variables a sandbox sets do not affect it.
+#
+# The CONNECT request sent to the proxy targets a validated resolved IP,
+# not the hostname, so the proxy performs no DNS resolution of its own and
+# the tunnel stays bound to the address that passed the sandbox's SSRF and
+# allowed_ips validation. The hostname still travels inside the tunnel (TLS
+# SNI, application Host), so destination servers behave normally. In
+# split-horizon networks, point the gateway host at the corporate resolver
+# so internal names validate to their internal addresses. If the proxy's
+# ACLs filter on hostnames and reject IP CONNECT targets, set
+# proxy_connect_by_hostname = true as a last resort: the proxy then
+# resolves the name itself, so a name that resolves differently at the
+# proxy (split-horizon DNS, rebinding) can reach destinations the sandbox
+# policy never approved, and the proxy's own ACLs become the effective
+# egress control for proxied TLS.
+#
+# Configuration is fail-closed: an invalid proxy URL is rejected at gateway
+# startup, setting no_proxy, proxy_auth_file, or proxy_connect_by_hostname
+# without a proxy URL is rejected as well, and a set-but-invalid value
+# reaching a sandbox (for example an unreadable or malformed auth file) is
+# fatal to that sandbox's supervisor instead of silently falling back to
+# direct or unauthenticated egress.
+#
+# Credentials must NOT be embedded in the URL (an inline user:pass@ is
+# rejected at startup, since it would be stored here and exposed in container
+# metadata). Instead point proxy_auth_file at a file containing "user:pass";
+# the gateway delivers it to the supervisor through a root-only secret mount.
+# The credential must use the user:pass form (non-empty user, no control
+# characters); the same validation runs at sandbox-create time and in the
+# supervisor, so a credential accepted here is never rejected in-container.
+# Keep gateway.toml and the auth file owner-readable only (mode 0600).
+#
+# WARNING: the supervisor sends the credential as a Proxy-Authorization:
+# Basic header over the plain-TCP connection to the http:// proxy. Basic
+# auth is base64, not encryption: anyone on the network path between the
+# sandbox host and the proxy can recover the credential. Because of that,
+# proxy_auth_file requires the explicit acknowledgement
+# proxy_auth_allow_insecure = true; without it the configuration is
+# rejected at gateway startup. Only opt in when the path to the proxy is a
+# trusted network segment.
+# https_proxy               = "http://proxy.corp.com:8080"
+# no_proxy                  = "*.svc.cluster.local,10.0.0.0/8"
+# proxy_auth_file           = "/etc/openshell/secrets/proxy-auth"
+# proxy_auth_allow_insecure = true
+# Last resort for hostname-filtering proxy ACLs; see the warning above.
+# proxy_connect_by_hostname = true
 ```
 
 ### MicroVM

@@ -1724,16 +1724,21 @@ mod tests {
             .with_span_events(FmtSpan::CLOSE);
 
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::subscriber::with_default(subscriber, || {
+            // Other parallel tests may register this callsite while no subscriber
+            // is active. Refresh the process-wide cache after installing this
+            // thread-local subscriber so the span cannot remain disabled.
+            tracing::callsite::rebuild_interest_cache();
 
-        let req = Request::builder()
-            .uri("/test-path")
-            .header("x-request-id", "trace-test-id-12345")
-            .body(Empty::<Bytes>::new())
-            .unwrap();
-        let span = make_request_span(&req);
-        drop(span.enter());
-        drop(span);
+            let req = Request::builder()
+                .uri("/test-path")
+                .header("x-request-id", "trace-test-id-12345")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let span = make_request_span(&req);
+            drop(span.enter());
+            drop(span);
+        });
 
         let output = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
         assert!(
