@@ -11,7 +11,7 @@ use crate::l7::{EnforcementMode, L7RequestInfo};
 use crate::opa::TunnelPolicyEngine;
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use miette::{IntoDiagnostic, Result, miette};
-use openshell_core::secrets::SecretResolver;
+use openshell_core::secrets::{SecretResolver, contains_reserved_credential_marker};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SeverityId, StatusId,
     ocsf_emit,
@@ -67,6 +67,7 @@ pub(super) struct RelayOptions<'a> {
     pub(super) resolver: Option<&'a SecretResolver>,
     pub(super) inspector: Option<InspectionOptions<'a>>,
     pub(super) compression: WebSocketCompression,
+    pub(super) deny_uninspected_credentials: bool,
 }
 
 /// Relay an upgraded WebSocket connection with optional client text inspection,
@@ -250,6 +251,17 @@ where
                 }
             },
             OPCODE_BINARY => {
+                if options.deny_uninspected_credentials {
+                    emit_uninspected_credential_denial(
+                        host,
+                        port,
+                        options.policy_name,
+                        "websocket-binary",
+                    );
+                    return Err(miette!(
+                        "websocket binary frame denied for credentialed endpoint"
+                    ));
+                }
                 if !frame.fin {
                     fragments = FragmentState::Binary;
                 }
@@ -492,6 +504,15 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     };
     let mut text = String::from_utf8(message_payload)
         .map_err(|_| miette!("websocket text message is not valid UTF-8"))?;
+    if options.deny_uninspected_credentials
+        && options.resolver.is_none()
+        && contains_reserved_credential_marker(&text)
+    {
+        emit_uninspected_credential_denial(host, port, options.policy_name, "websocket-text");
+        return Err(miette!(
+            "websocket credential placeholder denied because rewrite is disabled"
+        ));
+    }
     let replacements = if let Some(resolver) = options.resolver {
         resolver
             .rewrite_websocket_text_placeholders(&mut text)
@@ -527,6 +548,23 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
         return write_masked_frame_with_rsv(writer, OPCODE_TEXT, 0x40, &compressed_payload).await;
     }
     write_masked_frame(writer, OPCODE_TEXT, text.as_bytes()).await
+}
+
+fn emit_uninspected_credential_denial(host: &str, port: u16, policy_name: &str, surface: &str) {
+    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Traffic)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .firewall_rule(policy_name, "l7-websocket")
+        .message(format!(
+            "WebSocket credential traffic denied for {host}:{port}"
+        ))
+        .build();
+    ocsf_emit!(event);
+    crate::l7::emit_uninspected_credential_finding(host, policy_name, surface);
 }
 
 fn inspect_websocket_text_message(
@@ -1228,6 +1266,7 @@ network_policies:
             resolver: Some(&resolver),
             inspector: None,
             compression: WebSocketCompression::None,
+            deny_uninspected_credentials: false,
         };
         let result = relay_client_to_server(
             &mut relay_read,
@@ -1242,6 +1281,35 @@ network_policies:
         let mut output = Vec::new();
         upstream_read.read_to_end(&mut output).await.unwrap();
         result.map(|()| output)
+    }
+
+    async fn run_client_to_server_guarded(input: Vec<u8>) -> (Result<()>, Vec<u8>) {
+        let (mut client_write, mut relay_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);
+        let (mut relay_write, mut upstream_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);
+
+        client_write.write_all(&input).await.unwrap();
+        drop(client_write);
+
+        let options = RelayOptions {
+            policy_name: "test-policy",
+            resolver: None,
+            inspector: None,
+            compression: WebSocketCompression::None,
+            deny_uninspected_credentials: true,
+        };
+        let result = relay_client_to_server(
+            &mut relay_read,
+            &mut relay_write,
+            "gateway.example.test",
+            443,
+            &options,
+        )
+        .await;
+        drop(relay_write);
+
+        let mut output = Vec::new();
+        upstream_read.read_to_end(&mut output).await.unwrap();
+        (result, output)
     }
 
     async fn run_client_to_server_with_graphql_policy(
@@ -1293,6 +1361,7 @@ network_policies:
                 graphql_policy: true,
             }),
             compression: WebSocketCompression::None,
+            deny_uninspected_credentials: false,
         };
         let result = relay_client_to_server(
             &mut relay_read,
@@ -1322,6 +1391,7 @@ network_policies:
             resolver: Some(&resolver),
             inspector: None,
             compression: WebSocketCompression::PermessageDeflate,
+            deny_uninspected_credentials: false,
         };
         let result = relay_client_to_server(
             &mut relay_read,
@@ -1559,6 +1629,7 @@ network_policies:
                     resolver: Some(&resolver),
                     inspector: None,
                     compression: WebSocketCompression::None,
+                    deny_uninspected_credentials: false,
                 },
             )
             .await
@@ -1791,6 +1862,40 @@ network_policies:
             .expect("binary frame should pass through");
 
         assert_eq!(output, frame);
+    }
+
+    #[tokio::test]
+    async fn credentialed_endpoint_denies_binary_frame_without_opt_in() {
+        let frame = masked_frame(true, OPCODE_BINARY, &[0, 1, 2, 3, 255]);
+
+        let (result, output) = run_client_to_server_guarded(frame).await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("binary frame denied")
+        );
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn credentialed_endpoint_denies_text_placeholder_without_rewrite() {
+        let frame = masked_frame(
+            true,
+            OPCODE_TEXT,
+            br#"{"token":"openshell:resolve:env:API_TOKEN"}"#,
+        );
+
+        let (result, output) = run_client_to_server_guarded(frame).await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("rewrite is disabled")
+        );
+        assert!(output.is_empty());
     }
 
     #[tokio::test]

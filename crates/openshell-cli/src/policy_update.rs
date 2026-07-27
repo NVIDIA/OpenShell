@@ -368,6 +368,9 @@ fn apply_add_endpoint_options(
             ));
         }
         match option {
+            "allow-uninspected-credentials" => {
+                endpoint.allow_uninspected_credentials = true;
+            }
             "websocket-credential-rewrite" => {
                 ensure_websocket_credential_rewrite_protocol(spec, endpoint)?;
                 endpoint.websocket_credential_rewrite = true;
@@ -379,7 +382,7 @@ fn apply_add_endpoint_options(
             _ => {
                 let Some(allowed_ip) = option.strip_prefix("allowed-ip=") else {
                     return Err(miette!(
-                        "--add-endpoint options segment supports only 'websocket-credential-rewrite', 'request-body-credential-rewrite', and 'allowed-ip=<CIDR-or-IP>'; got '{option}' in '{spec}'"
+                        "--add-endpoint options segment supports only 'allow-uninspected-credentials', 'websocket-credential-rewrite', 'request-body-credential-rewrite', and 'allowed-ip=<CIDR-or-IP>'; got '{option}' in '{spec}'"
                     ));
                 };
                 let allowed_ip = allowed_ip.trim();
@@ -602,6 +605,25 @@ mod tests {
         let endpoint = &rule.endpoints[0];
         assert_eq!(endpoint.protocol, "rest");
         assert!(endpoint.request_body_credential_rewrite);
+    }
+
+    #[test]
+    fn parse_add_endpoint_enables_allow_uninspected_credentials() {
+        let plan = build_policy_update_plan(
+            &["api.vendor.example:443::::allow-uninspected-credentials".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        assert!(rule.endpoints[0].allow_uninspected_credentials);
     }
 
     #[test]

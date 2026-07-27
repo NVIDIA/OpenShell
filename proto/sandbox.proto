@@ -175,6 +175,13 @@ message NetworkEndpoint {
   uint32 json_rpc_max_body_bytes = 22;
   // MCP-only policy and inspection options. Only used when protocol is "mcp".
   McpOptions mcp = 23;
+  // Explicitly permits credential-bearing traffic to use paths that OpenShell
+  // cannot inspect or rewrite. Defaults to false. This is a security-sensitive
+  // escape hatch and must be explicitly approved.
+  bool allow_uninspected_credentials = 24;
+  // Internal gateway-derived marker indicating that this endpoint belongs to
+  // an attached credentialed provider. User-authored values are ignored.
+  bool provider_credentialed = 25;
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more
