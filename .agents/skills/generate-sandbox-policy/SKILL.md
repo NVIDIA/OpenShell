@@ -218,9 +218,9 @@ Is L7 inspection needed?
 
 Add `network_middlewares` only when the user asks to inspect, transform, redact, or independently authorize admitted HTTP requests or client WebSocket text messages. Middleware runs after network and L7 policy admission and before provider credential injection.
 
-- Use a built-in name such as `openshell/regex` without gateway registration.
+- Use `openshell/regex` without gateway registration for fixed-pattern redaction of UTF-8 HTTP request bodies or complete client-to-upstream WebSocket text messages.
 - Use an operator-owned middleware name only when it is already registered under `[[openshell.supervisor.middleware]]` and reachable from both the gateway and sandbox supervisors.
-- Confirm that a requested WebSocket implementation exposes a `WEBSOCKET_MESSAGE/PRE_CREDENTIALS` binding. WebSocket middleware runs for both `ws://` and `wss://`, receives complete client text messages only, and does not inspect binary or upstream-to-client messages.
+- Confirm that a requested WebSocket implementation exposes a `WEBSOCKET_MESSAGE/PRE_CREDENTIALS` binding. `openshell/regex` exposes this binding. WebSocket middleware runs for both `ws://` and `wss://`, receives complete client text messages only, and does not inspect binary or upstream-to-client messages.
 - Treat `fail_open` on WebSocket as a session-scoped bypass: if the stage stream fails, OpenShell disables it for later messages on that connection and emits a state-change finding. Prefer `fail_closed` for required redaction or authorization.
 - Default `on_error` to `fail_closed`. Use `fail_open` only when bypassing the stage preserves the user's stated security requirement.
 - Assign unique `order` values across the complete policy. Lower values run first, and at most 10 configs may be selected.

@@ -11,9 +11,12 @@ use miette::{Result, miette};
 use openshell_core::middleware::{SupervisorMiddlewareEndpoint, WebSocketResponseStream};
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse, WebSocketEvaluationRequest,
+    HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, SupervisorMiddlewarePhase,
+    ValidateConfigRequest, ValidateConfigResponse, WebSocketDirection, WebSocketEvaluationRequest,
+    WebSocketEvaluationResponse, WebSocketMessageType, WebSocketPreflightAction,
+    WebSocketPreflightDecision, web_socket_evaluation_request, web_socket_evaluation_response,
 };
+use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
 pub use regex::{NAME as BUILTIN_REGEX, RegexConfig, RegexMode};
@@ -46,6 +49,129 @@ fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpReque
 #[derive(Debug, Default)]
 pub struct BuiltinMiddlewareService;
 
+impl BuiltinMiddlewareService {
+    fn websocket_stream<S>(mut requests: S) -> WebSocketResponseStream
+    where
+        S: Stream<Item = std::result::Result<WebSocketEvaluationRequest, Status>>
+            + Send
+            + Unpin
+            + 'static,
+    {
+        let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut config = None;
+            let mut started = false;
+            let mut next_sequence = 1u64;
+
+            while let Some(request) = requests.next().await {
+                let request = match request {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let _ = responses_tx.send(Err(error)).await;
+                        break;
+                    }
+                };
+                let response = match request.request {
+                    Some(web_socket_evaluation_request::Request::Preflight(preflight))
+                        if config.is_none() && !started =>
+                    {
+                        if preflight.middleware_name != BUILTIN_REGEX {
+                            Err(Status::invalid_argument(
+                                "unknown built-in WebSocket middleware",
+                            ))
+                        } else if preflight.phase
+                            != SupervisorMiddlewarePhase::PreCredentials as i32
+                            || preflight.direction != WebSocketDirection::ClientToUpstream as i32
+                        {
+                            Err(Status::invalid_argument(
+                                "unsupported built-in WebSocket binding",
+                            ))
+                        } else {
+                            let selected_config = preflight.config.unwrap_or_default();
+                            match regex::validate_config(&selected_config) {
+                                Ok(()) => {
+                                    config = Some(selected_config);
+                                    Ok(Some(WebSocketEvaluationResponse {
+                                        response: Some(
+                                            web_socket_evaluation_response::Response::PreflightDecision(
+                                                WebSocketPreflightDecision {
+                                                    action: WebSocketPreflightAction::Inspect as i32,
+                                                },
+                                            ),
+                                        ),
+                                    }))
+                                }
+                                Err(error) => Err(Status::invalid_argument(error.to_string())),
+                            }
+                        }
+                    }
+                    Some(web_socket_evaluation_request::Request::SessionStart(_))
+                        if config.is_some() && !started =>
+                    {
+                        started = true;
+                        Ok(None)
+                    }
+                    Some(web_socket_evaluation_request::Request::Message(message)) if started => {
+                        if message.sequence != next_sequence {
+                            Err(Status::invalid_argument(
+                                "WebSocket message sequence is not monotonic",
+                            ))
+                        } else if message.direction != WebSocketDirection::ClientToUpstream as i32
+                            || message.message_type != WebSocketMessageType::Text as i32
+                        {
+                            Err(Status::invalid_argument(
+                                "openshell/regex supports only client-to-upstream WebSocket text messages",
+                            ))
+                        } else {
+                            let selected_config =
+                                config.as_ref().expect("started stream has config");
+                            match regex::evaluate_websocket_text(
+                                message.sequence,
+                                &message.payload,
+                                selected_config,
+                            ) {
+                                Ok(result) => {
+                                    next_sequence = next_sequence.saturating_add(1);
+                                    Ok(Some(WebSocketEvaluationResponse {
+                                        response: Some(
+                                            web_socket_evaluation_response::Response::MessageResult(
+                                                result,
+                                            ),
+                                        ),
+                                    }))
+                                }
+                                Err(error) => Err(Status::invalid_argument(error.to_string())),
+                            }
+                        }
+                    }
+                    Some(web_socket_evaluation_request::Request::SessionEnd(_))
+                        if config.is_some() =>
+                    {
+                        break;
+                    }
+                    _ => Err(Status::failed_precondition(
+                        "invalid built-in WebSocket session lifecycle",
+                    )),
+                };
+
+                match response {
+                    Ok(Some(response)) => {
+                        if responses_tx.send(Ok(response)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = responses_tx.send(Err(error)).await;
+                        break;
+                    }
+                }
+            }
+        });
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(responses_rx))
+    }
+}
+
 #[tonic::async_trait]
 impl SupervisorMiddleware for BuiltinMiddlewareService {
     type EvaluateWebSocketStream = WebSocketResponseStream;
@@ -57,7 +183,7 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
         Ok(Response::new(MiddlewareManifest {
             name: BUILTIN_REGEX.into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
-            bindings: vec![regex::describe()],
+            bindings: regex::describe(),
         }))
     }
 
@@ -92,11 +218,9 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
 
     async fn evaluate_web_socket(
         &self,
-        _request: Request<tonic::Streaming<WebSocketEvaluationRequest>>,
+        request: Request<tonic::Streaming<WebSocketEvaluationRequest>>,
     ) -> Result<Response<Self::EvaluateWebSocketStream>, Status> {
-        Err(Status::unimplemented(
-            "built-in middleware does not advertise WebSocket support",
-        ))
+        Ok(Response::new(Self::websocket_stream(request.into_inner())))
     }
 }
 
@@ -122,10 +246,10 @@ impl SupervisorMiddlewareEndpoint for BuiltinMiddlewareService {
 
     async fn open_websocket(
         &self,
-        _receiver: tokio::sync::mpsc::Receiver<WebSocketEvaluationRequest>,
+        receiver: tokio::sync::mpsc::Receiver<WebSocketEvaluationRequest>,
     ) -> Result<WebSocketResponseStream, Status> {
-        Err(Status::unimplemented(
-            "built-in middleware does not advertise WebSocket support",
+        Ok(Self::websocket_stream(
+            tokio_stream::wrappers::ReceiverStream::new(receiver).map(Ok),
         ))
     }
 }
@@ -155,7 +279,7 @@ mod tests {
             .await
             .expect("describe")
             .into_inner();
-        assert_eq!(manifest.bindings.len(), 1);
+        assert_eq!(manifest.bindings.len(), 2);
         assert_eq!(
             manifest.bindings[0].operation,
             SupervisorMiddlewareOperation::HttpRequest as i32
@@ -165,6 +289,17 @@ mod tests {
             SupervisorMiddlewarePhase::PreCredentials as i32
         );
         assert_eq!(manifest.bindings[0].max_body_bytes, 256 * 1024);
+        assert_eq!(manifest.bindings[0].max_message_bytes, 0);
+        assert_eq!(
+            manifest.bindings[1].operation,
+            SupervisorMiddlewareOperation::WebsocketMessage as i32
+        );
+        assert_eq!(
+            manifest.bindings[1].phase,
+            SupervisorMiddlewarePhase::PreCredentials as i32
+        );
+        assert_eq!(manifest.bindings[1].max_body_bytes, 0);
+        assert_eq!(manifest.bindings[1].max_message_bytes, 256 * 1024);
     }
 
     #[test]
@@ -239,5 +374,58 @@ mod tests {
         assert!(!result.has_body);
         assert_eq!(result.body, body.as_bytes());
         assert!(result.findings.is_empty());
+    }
+
+    #[test]
+    fn regex_websocket_text_reuses_findings_and_metadata_semantics() {
+        let payload =
+            br#"{"type":"response.create","input":"sk-ABCDEFGHIJKLMNOP sk-QRSTUVWXYZabcdef"}"#;
+        let result = regex::evaluate_websocket_text(7, payload, &prost_types::Struct::default())
+            .expect("evaluate WebSocket text");
+
+        assert_eq!(result.sequence, 7);
+        assert_eq!(result.decision, Decision::Allow as i32);
+        assert!(result.has_replacement);
+        assert_eq!(
+            String::from_utf8(result.replacement).expect("replacement UTF-8"),
+            r#"{"type":"response.create","input":"[REDACTED] [REDACTED]"}"#
+        );
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].r#type, "regex.openai");
+        assert_eq!(result.findings[0].count, 2);
+        assert_eq!(
+            result.metadata.get("regex_matches_replaced"),
+            Some(&"2".to_string())
+        );
+    }
+
+    #[test]
+    fn regex_websocket_no_match_returns_no_replacement_or_findings() {
+        let result = regex::evaluate_websocket_text(
+            1,
+            br#"{"type":"response.create","input":"public"}"#,
+            &prost_types::Struct::default(),
+        )
+        .expect("evaluate WebSocket text");
+
+        assert!(!result.has_replacement);
+        assert!(result.replacement.is_empty());
+        assert!(result.findings.is_empty());
+        assert!(result.metadata.is_empty());
+    }
+
+    #[test]
+    fn regex_websocket_rejects_invalid_utf8_and_oversize_messages() {
+        assert!(
+            regex::evaluate_websocket_text(1, &[0xff], &prost_types::Struct::default()).is_err()
+        );
+        assert!(
+            regex::evaluate_websocket_text(
+                1,
+                &vec![b'a'; 256 * 1024 + 1],
+                &prost_types::Struct::default(),
+            )
+            .is_err()
+        );
     }
 }

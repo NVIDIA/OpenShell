@@ -4026,6 +4026,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn builtin_regex_redacts_ordered_websocket_text_messages() {
+        let runner = builtin_runner();
+        let chain = [entry("regex-redactor", OnError::FailClosed)];
+        let preflight = runner
+            .preflight_websocket(
+                &chain,
+                WebSocketPreflightInput {
+                    session_id: "builtin-regex-session".into(),
+                    request_id: "request".into(),
+                    sandbox_id: "sandbox".into(),
+                    scheme: "wss".into(),
+                    host: "api.openai.com".into(),
+                    port: 443,
+                    path: "/v1/responses".into(),
+                    requested_subprotocols: vec!["realtime".into()],
+                },
+            )
+            .await
+            .expect("preflight");
+        assert!(preflight.allowed);
+        assert_eq!(
+            preflight.invocations[0].outcome,
+            WebSocketInvocationOutcome::Inspect
+        );
+        let mut session = preflight.session.expect("built-in chose to inspect");
+        assert!(session.start("realtime").await.allowed);
+
+        let original = br#"{"type":"response.create","response":{"input":"sk-ABCDEFGHIJKLMNOP"}}"#;
+        let redacted = session.evaluate_text(original.to_vec()).await;
+        assert!(redacted.allowed);
+        assert_eq!(
+            String::from_utf8(redacted.payload).expect("transformed UTF-8"),
+            r#"{"type":"response.create","response":{"input":"[REDACTED]"}}"#
+        );
+        assert_eq!(redacted.invocations[0].sequence, Some(1));
+        assert!(redacted.invocations[0].transformed);
+        assert_eq!(redacted.findings.len(), 1);
+        assert_eq!(redacted.findings[0].middleware, "regex-redactor");
+        assert_eq!(redacted.findings[0].finding.r#type, "regex.openai");
+        assert_eq!(
+            redacted.metadata["regex-redactor"]["regex_matches_replaced"],
+            "1"
+        );
+
+        let unchanged = session
+            .evaluate_text(br#"{"type":"response.cancel"}"#.to_vec())
+            .await;
+        assert!(unchanged.allowed);
+        assert_eq!(unchanged.payload, br#"{"type":"response.cancel"}"#);
+        assert_eq!(unchanged.invocations[0].sequence, Some(2));
+        assert!(!unchanged.invocations[0].transformed);
+        assert!(unchanged.findings.is_empty());
+        assert!(unchanged.metadata.is_empty());
+
+        let oversized = session.evaluate_text(vec![b'a'; 256 * 1024 + 1]).await;
+        assert!(!oversized.allowed);
+        assert_eq!(
+            oversized.reason,
+            "middleware_failed: request_message_over_capacity"
+        );
+        session
+            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .await;
+    }
+
+    #[tokio::test]
     async fn in_process_websocket_endpoint_redacts_openai_event() {
         let service = OpenAiRedactionService::default();
         let runner = ChainRunner::from_endpoint(Arc::new(service));

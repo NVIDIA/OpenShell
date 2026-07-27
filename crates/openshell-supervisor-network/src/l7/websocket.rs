@@ -2945,6 +2945,99 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn parsed_relay_uses_builtin_regex_for_complete_client_text_messages() {
+        use openshell_supervisor_middleware::{ChainEntry, MiddlewareRegistry, OnError};
+
+        let registry = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("connect built-in middleware");
+        let runner = openshell_supervisor_middleware::ChainRunner::from_registry(registry);
+        let preflight = runner
+            .preflight_websocket(
+                &[ChainEntry {
+                    name: "regex-redactor".into(),
+                    implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                }],
+                openshell_supervisor_middleware::WebSocketPreflightInput {
+                    session_id: "builtin-regex-session".into(),
+                    request_id: "request".into(),
+                    sandbox_id: "sandbox".into(),
+                    scheme: "wss".into(),
+                    host: "api.openai.com".into(),
+                    port: 443,
+                    path: "/v1/responses".into(),
+                    requested_subprotocols: Vec::new(),
+                },
+            )
+            .await
+            .expect("preflight");
+        let mut session = preflight.session.expect("built-in inspects session");
+        assert!(session.start("").await.allowed);
+
+        let original = br#"{"type":"response.create","response":{"input":"sk-ABCDEFGHIJKLMNOP"}}"#;
+        let (mut client_app, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, mut upstream_app) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            relay_with_options(
+                &mut relay_client,
+                &mut relay_upstream,
+                Vec::new(),
+                "api.openai.com",
+                443,
+                RelayOptions {
+                    policy_name: "openai",
+                    resolver: None,
+                    generation_guard: None,
+                    inspector: None,
+                    compression: WebSocketCompression::None,
+                    middleware_session: Some(session),
+                    middleware_context: None,
+                },
+            )
+            .await
+        });
+
+        let split = original
+            .windows(b"sk-ABC".len())
+            .position(|window| window == b"sk-ABC")
+            .expect("token prefix")
+            + b"sk-ABC".len();
+        client_app
+            .write_all(&masked_frame(false, OPCODE_TEXT, &original[..split]))
+            .await
+            .expect("send initial event fragment");
+        client_app
+            .write_all(&masked_frame(true, OPCODE_CONTINUATION, &original[split..]))
+            .await
+            .expect("send final event fragment");
+        let upstream_frame = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_one_frame(&mut upstream_app),
+        )
+        .await
+        .expect("upstream receives event");
+        let upstream_text = decode_masked_text_frame(&upstream_frame);
+        assert_eq!(
+            upstream_text,
+            r#"{"type":"response.create","response":{"input":"[REDACTED]"}}"#
+        );
+
+        drop(client_app);
+        drop(upstream_app);
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .expect("relay finishes after disconnect")
+            .expect("join relay")
+            .expect("relay");
+    }
+
+    #[tokio::test]
     #[ignore = "PR 2 adds return-path inspection and completes this full-duplex fixture"]
     async fn pr2_full_duplex_external_middleware_vertical_slice() {
         // PR 2 should extend the real relay fixture above with controllable
