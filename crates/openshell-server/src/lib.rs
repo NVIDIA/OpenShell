@@ -443,17 +443,11 @@ pub(crate) async fn run_server(
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
 
-    let gateway_listener_addresses =
-        gateway_listener_addresses(config.bind_address, state.compute.gateway_bind_addresses());
-    let mut gateway_listeners = Vec::with_capacity(gateway_listener_addresses.len());
-    for address in gateway_listener_addresses {
-        let listener = TcpListener::bind(address)
-            .await
-            .map_err(|e| Error::transport(format!("failed to bind to {address}: {e}")))?;
-        let local_addr = listener.local_addr().unwrap_or(address);
-        info!(address = %local_addr, "Server listening");
-        gateway_listeners.push((listener, local_addr));
-    }
+    let gateway_listeners = bind_gateway_listeners(
+        config.bind_address,
+        state.compute.gateway_bind_addresses(),
+    )
+    .await?;
 
     // Bind the unauthenticated health endpoint on a separate port when configured.
     if let Some(health_bind_address) = config.health_bind_address {
@@ -567,6 +561,23 @@ fn gateway_listener_addresses(
         }
     }
     addresses
+}
+
+async fn bind_gateway_listeners(
+    bind_address: SocketAddr,
+    extra_addresses: &[SocketAddr],
+) -> Result<Vec<(TcpListener, SocketAddr)>> {
+    let addresses = gateway_listener_addresses(bind_address, extra_addresses);
+    let mut listeners = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let listener = TcpListener::bind(address)
+            .await
+            .map_err(|e| Error::transport(format!("failed to bind to {address}: {e}")))?;
+        let local_addr = listener.local_addr().unwrap_or(address);
+        info!(address = %local_addr, "Server listening");
+        listeners.push((listener, local_addr));
+    }
+    Ok(listeners)
 }
 
 fn listener_covers(existing: SocketAddr, requested: SocketAddr) -> bool {
