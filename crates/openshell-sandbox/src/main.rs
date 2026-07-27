@@ -163,6 +163,11 @@ struct Args {
     #[arg(long, env = openshell_core::sandbox_env::SSH_SOCKET_PATH)]
     ssh_socket_path: Option<String>,
 
+    /// Assert that a managed local driver launched this supervisor and the
+    /// gateway must require managed agent identity.
+    #[arg(long)]
+    managed_local_identity: bool,
+
     /// Path to YAML inference routes for standalone routing.
     /// When set, inference routes are loaded from this file instead of
     /// fetching a bundle from the gateway.
@@ -629,6 +634,7 @@ fn main() -> Result<()> {
             args.policy_rules,
             args.policy_data,
             args.ssh_socket_path,
+            args.managed_local_identity,
             args.health_check,
             args.health_port,
             args.inference_routes,
@@ -719,6 +725,14 @@ mod tests {
     fn mode_rejects_empty_value() {
         let err = "".parse::<Mode>().unwrap_err();
         assert!(err.contains("at least one"));
+    }
+
+    #[test]
+    fn managed_local_identity_is_an_argv_flag() {
+        let args = Args::try_parse_from(["openshell-sandbox", "--managed-local-identity"])
+            .expect("managed local identity flag should parse");
+
+        assert!(args.managed_local_identity);
     }
 
     #[cfg(target_os = "linux")]

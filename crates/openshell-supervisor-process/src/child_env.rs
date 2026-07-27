@@ -4,42 +4,43 @@
 use std::path::Path;
 
 use openshell_core::policy::SandboxPolicy;
+use openshell_core::sandbox_env::ResolvedAgentIdentity;
 
 const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1";
 
-/// Identity environment shared by direct and SSH-launched agent children.
-///
-/// Image and fixed identities are normalized into numeric policy fields before
-/// process preparation, while the separately resolved presentation name is
-/// retained in supervisor memory and never exposed as protected metadata.
-pub fn identity_env_vars(policy: &SandboxPolicy) -> [(&'static str, String); 3] {
+/// Identity presentation for successfully resolved local managed identities.
+pub fn identity_env_vars(policy: &SandboxPolicy) -> Option<[(&'static str, String); 3]> {
     #[cfg(unix)]
-    let presentation_user = crate::identity::resolved_presentation_user();
+    let identity = crate::identity::managed_local_resolved_identity(policy);
     #[cfg(not(unix))]
-    let presentation_user = None;
-    identity_env_vars_with_presentation(policy, presentation_user)
+    let identity = None;
+    identity_env_vars_with_resolved(policy, identity)
 }
 
-fn identity_env_vars_with_presentation(
+fn identity_env_vars_with_resolved(
     policy: &SandboxPolicy,
-    presentation_user: Option<&str>,
-) -> [(&'static str, String); 3] {
-    let user = presentation_user
-        .filter(|user| !user.is_empty())
-        .or_else(|| {
-            policy
+    identity: Option<&ResolvedAgentIdentity>,
+) -> Option<[(&'static str, String); 3]> {
+    let identity = identity.filter(|identity| {
+        policy
+            .process
+            .run_as_user
+            .as_deref()
+            .and_then(|uid| uid.parse().ok())
+            == Some(identity.uid)
+            && policy
                 .process
-                .run_as_user
+                .run_as_group
                 .as_deref()
-                .filter(|user| !user.is_empty())
-        })
-        .unwrap_or("sandbox")
-        .to_string();
-    [
+                .and_then(|gid| gid.parse().ok())
+                == Some(identity.gid)
+    })?;
+    let user = identity.presentation_user.clone();
+    Some([
         ("HOME", "/sandbox".to_string()),
         ("USER", user.clone()),
         ("LOGNAME", user),
-    ]
+    ])
 }
 
 pub fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
@@ -83,7 +84,7 @@ mod tests {
     use std::process::Stdio;
 
     #[test]
-    fn identity_env_uses_sandbox_home_and_numeric_presentation() {
+    fn unmanaged_identity_does_not_change_child_presentation() {
         let policy = SandboxPolicy {
             version: 1,
             filesystem: openshell_core::policy::FilesystemPolicy::default(),
@@ -95,14 +96,7 @@ mod tests {
             },
         };
 
-        assert_eq!(
-            identity_env_vars(&policy),
-            [
-                ("HOME", "/sandbox".to_string()),
-                ("USER", "1234".to_string()),
-                ("LOGNAME", "1234".to_string()),
-            ]
-        );
+        assert_eq!(identity_env_vars_with_resolved(&policy, None), None);
     }
 
     #[test]
@@ -119,12 +113,47 @@ mod tests {
         };
 
         assert_eq!(
-            identity_env_vars_with_presentation(&policy, Some("app")),
-            [
+            identity_env_vars_with_resolved(
+                &policy,
+                Some(&ResolvedAgentIdentity {
+                    uid: 1234,
+                    gid: 2345,
+                    presentation_user: "app".into(),
+                    source: openshell_core::sandbox_env::IdentitySource::Image,
+                    image_id: Some("sha256:test".into()),
+                }),
+            ),
+            Some([
                 ("HOME", "/sandbox".to_string()),
                 ("USER", "app".to_string()),
                 ("LOGNAME", "app".to_string()),
-            ]
+            ])
+        );
+    }
+
+    #[test]
+    fn resolved_identity_must_match_policy_to_change_presentation() {
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: openshell_core::policy::FilesystemPolicy::default(),
+            network: openshell_core::policy::NetworkPolicy::default(),
+            landlock: openshell_core::policy::LandlockPolicy::default(),
+            process: openshell_core::policy::ProcessPolicy {
+                run_as_user: Some("9999".into()),
+                run_as_group: Some("2345".into()),
+            },
+        };
+        let identity = ResolvedAgentIdentity {
+            uid: 1234,
+            gid: 2345,
+            presentation_user: "app".into(),
+            source: openshell_core::sandbox_env::IdentitySource::Image,
+            image_id: Some("sha256:test".into()),
+        };
+
+        assert_eq!(
+            identity_env_vars_with_resolved(&policy, Some(&identity)),
+            None
         );
     }
 

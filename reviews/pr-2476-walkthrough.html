@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PR #2476 Walkthrough - Preserve OCI image user identity</title>
+<style>
+  :root {
+    --bg:#0b0f14; --panel:#121923; --panel2:#182230; --ink:#e7edf5; --muted:#99a7b7;
+    --line:#2a3645; --blue:#67b0ff; --green:#49c66f; --amber:#e1ad45; --red:#ff7067;
+    --purple:#c59aff; --teal:#4fd1c5; --blue-bg:#102234; --green-bg:#11271a;
+    --amber-bg:#2a210e; --red-bg:#2a1516;
+  }
+  * { box-sizing:border-box; }
+  html { scroll-behavior:smooth; }
+  body { margin:0; color:var(--ink); background:var(--bg);
+    font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  a { color:var(--blue); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  header { padding:36px 40px 29px; border-bottom:1px solid var(--line);
+    background:radial-gradient(circle at 78% 0%,#192d42 0%,transparent 36%),linear-gradient(180deg,#111923 0%,#0b0f14 100%); }
+  header .wrap, main, footer { max-width:1180px; margin:0 auto; }
+  h1 { margin:0 0 8px; font-size:29px; line-height:1.25; letter-spacing:-.4px; }
+  h2 { margin:44px 0 8px; padding-top:11px; border-top:1px solid var(--line);
+    font-size:21px; line-height:1.3; }
+  h3 { margin:24px 0 7px; font-size:16px; color:#d1deeb; }
+  p { margin:8px 0 13px; }
+  .sub, .lead, .small { color:var(--muted); }
+  .sub { margin:3px 0; font-size:14px; }
+  .lead { margin-top:5px; }
+  .small { font-size:12.5px; }
+  code { color:var(--ink); background:var(--panel2); border-radius:5px; padding:1px 6px;
+    font:12.5px/1.5 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; }
+  main { padding:29px 40px 88px; }
+  footer { padding:25px 40px 60px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+  .badges { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
+  .badge, .tag { display:inline-block; border:1px solid var(--line); border-radius:999px;
+    background:var(--panel); color:var(--muted); white-space:nowrap; }
+  .badge { padding:3px 10px; font-size:12px; }
+  .tag { padding:1px 8px; font-size:11px; }
+  .green { color:var(--green); border-color:#2c6840; }
+  .blue { color:var(--blue); border-color:#28527d; }
+  .amber { color:var(--amber); border-color:#68531e; }
+  .purple { color:var(--purple); border-color:#503b77; }
+  .red { color:var(--red); border-color:#6b2e2a; }
+  .card, .figure { margin:16px 0; padding:18px 22px; background:var(--panel);
+    border:1px solid var(--line); border-radius:12px; }
+  .tldr { border-left:3px solid var(--blue); font-size:15.5px; }
+  .note, .warn, .success, .danger { margin:15px 0; padding:12px 16px; border-radius:8px; }
+  .note { background:var(--blue-bg); border:1px solid #28527d; border-left:3px solid var(--blue); }
+  .warn { background:var(--amber-bg); border:1px solid #68531e; border-left:3px solid var(--amber); }
+  .success { background:var(--green-bg); border:1px solid #2c6840; border-left:3px solid var(--green); }
+  .danger { background:var(--red-bg); border:1px solid #6b2e2a; border-left:3px solid var(--red); }
+  .grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; margin:16px 0; }
+  .grid.two { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .mini { padding:16px 18px; border:1px solid var(--line); border-radius:10px; background:var(--panel); }
+  .mini h3 { margin:0 0 5px; }
+  .mini p { margin:4px 0; color:var(--muted); }
+  table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+  th, td { padding:9px 11px; border:1px solid var(--line); vertical-align:top; text-align:left; }
+  th { background:var(--panel2); color:#d1deeb; font-weight:600; }
+  td.center, th.center { text-align:center; }
+  pre { margin:13px 0; padding:14px 16px; overflow:auto; background:#05080c;
+    border:1px solid var(--line); border-radius:10px; font:12.5px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; }
+  pre code { padding:0; background:none; }
+  .toc { columns:2; column-gap:36px; }
+  .toc ol { margin:0; padding-left:23px; }
+  .toc li { margin:4px 0; break-inside:avoid; }
+  figure { margin:17px 0; }
+  figcaption { margin-top:9px; color:var(--muted); font-size:13px; text-align:center; }
+  svg { display:block; width:100%; max-width:1080px; height:auto; margin:0 auto; }
+  .steps { counter-reset:step; margin:15px 0; padding:0; list-style:none; }
+  .steps li { position:relative; min-height:52px; margin:0 0 11px; padding:11px 15px 11px 53px;
+    background:var(--panel); border:1px solid var(--line); border-radius:9px; }
+  .steps li::before { counter-increment:step; content:counter(step); position:absolute; left:14px; top:12px;
+    width:25px; height:25px; border-radius:50%; color:var(--blue); border:1px solid #28527d;
+    background:var(--blue-bg); display:grid; place-items:center; font-size:12px; font-weight:700; }
+  details { margin:12px 0; background:var(--panel); border:1px solid var(--line); border-radius:9px; }
+  summary { padding:11px 15px; cursor:pointer; color:#d1deeb; font-weight:600; }
+  details > div { padding:0 15px 14px; }
+  .file { overflow-wrap:anywhere; }
+  .legend { display:flex; flex-wrap:wrap; gap:16px; margin:7px 0 0; color:var(--muted); font-size:12px; }
+  .legend span { display:inline-flex; align-items:center; gap:6px; }
+  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+  @media (max-width:760px) {
+    header { padding:27px 20px 22px; } main { padding:22px 20px 65px; } footer { padding:22px 20px 45px; }
+    h1 { font-size:23px; } .grid, .grid.two { grid-template-columns:1fr; } .toc { columns:1; }
+    .wide, figure { overflow-x:auto; } svg { min-width:760px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>Preserve OCI image user identity</h1>
+    <p class="sub">A reviewer walkthrough of <a href="https://github.com/NVIDIA/OpenShell/pull/2476"><strong>OpenShell PR #2476</strong></a> - <code>feat(sandbox): honor OCI image user identity</code></p>
+    <p class="sub">Issue <a href="https://github.com/NVIDIA/OpenShell/issues/2331">#2331</a> &#183; base <code>main</code> &#8592; head <code>mgrossman/image-user-identity</code></p>
+    <div class="badges">
+      <span class="badge blue">Docker + Podman</span>
+      <span class="badge green">non-root agent</span>
+      <span class="badge purple">fail-closed handshake</span>
+      <span class="badge">23 implementation/docs files</span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section>
+    <div class="card tldr">
+      <strong>TL;DR.</strong> Docker and Podman now preserve a sandbox image's non-root OCI <code>USER</code> for the
+      <em>agent children</em>, while deliberately starting the OpenShell supervisor as <code>0:0</code>. The supervisor
+      resolves the image declaration against the exact inspected image filesystem, persists that numeric identity,
+      reports it to the gateway, and waits for an exact protocol acknowledgement before launching user code. Operators
+      can select an explicit fixed UID/GID instead when external storage requires a stable principal. The implementation
+      treats image identity as a cross-component security protocol, not as trusted environment configuration.
+    </div>
+  </section>
+
+  <section id="contents">
+    <h2 style="border-top:none;margin-top:18px;">Contents</h2>
+    <div class="card toc">
+      <ol>
+        <li><a href="#problem">Problem and invariant</a></li>
+        <li><a href="#identities">The identities in one sandbox</a></li>
+        <li><a href="#modes">Image and fixed modes</a></li>
+        <li><a href="#flow">End-to-end startup flow</a></li>
+        <li><a href="#trust">Trust and compatibility gates</a></li>
+        <li><a href="#resolution">OCI USER resolution</a></li>
+        <li><a href="#fork">Safe child privilege drop</a></li>
+        <li><a href="#readiness">Two-signal readiness</a></li>
+        <li><a href="#mounts">External mount boundary</a></li>
+        <li><a href="#scope">Runtime scope and compatibility</a></li>
+        <li><a href="#verification">Verification status</a></li>
+        <li><a href="#files">Review map</a></li>
+      </ol>
+    </div>
+  </section>
+
+  <section id="problem">
+    <h2>1. Problem and invariant</h2>
+    <p class="lead">A community image may already define the correct non-root application user. OpenShell needs to use
+      that identity without surrendering the privileges required to establish the sandbox boundary.</p>
+    <div class="grid two">
+      <div class="mini" style="border-color:#6b2e2a;">
+        <h3 style="color:var(--red);">Prior mismatch</h3>
+        <p>The local runtime overrides the image entrypoint with <code>openshell-sandbox</code>. If it also ignores OCI
+          <code>USER</code>, the eventual agent can run under an identity unrelated to the image's ownership model.</p>
+      </div>
+      <div class="mini" style="border-color:#2c6840;">
+        <h3 style="color:var(--green);">New invariant</h3>
+        <p>The supervisor starts as root, but every direct or SSH-launched agent child uses one gateway-validated,
+          persisted, non-root numeric identity derived from the selected immutable image or fixed operator config.</p>
+      </div>
+    </div>
+    <div class="danger"><strong>Non-goal.</strong> This does not run agent code as root and does not make Dockerfile
+      <code>USER</code> control the supervisor. Root exists only in the trusted supervisor process so it can prepare
+      namespaces, mounts, ownership, policy enforcement, relay sockets, and the final privilege drop.</div>
+  </section>
+
+  <section id="identities">
+    <h2>2. The identities in one sandbox</h2>
+    <div class="grid">
+      <div class="mini">
+        <h3>Container engine</h3>
+        <p>Docker or rootless Podman creates the workload and owns host/user-namespace mappings.</p>
+      </div>
+      <div class="mini">
+        <h3>Supervisor: <code>0:0</code></h3>
+        <p>Trusted OpenShell control process. The driver explicitly overrides OCI <code>USER</code> for this process.</p>
+      </div>
+      <div class="mini">
+        <h3>Agent: image or fixed ID</h3>
+        <p>Untrusted requested command. It gets the resolved UID/GID, no supplementary groups, and sandbox policy.</p>
+      </div>
+    </div>
+    <figure class="figure">
+      <svg viewBox="0 0 1080 330" role="img" aria-label="Container engine, root supervisor, and non-root agent trust levels">
+        <defs>
+          <marker id="identity-arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#49c66f"/></marker>
+        </defs>
+        <rect x="20" y="20" width="1040" height="290" rx="14" fill="#0f1822" stroke="#28527d"/>
+        <text x="44" y="50" fill="#67b0ff" font-size="13" font-weight="700">DOCKER / PODMAN WORKLOAD</text>
+        <rect x="78" y="78" width="924" height="195" rx="12" fill="#121923" stroke="#2a3645"/>
+        <text x="101" y="106" fill="#99a7b7" font-size="12" font-weight="700">SELECTED IMMUTABLE IMAGE ROOTFS</text>
+        <rect x="122" y="133" width="300" height="104" rx="10" fill="#2a210e" stroke="#68531e"/>
+        <text x="272" y="165" fill="#e1ad45" font-size="14" text-anchor="middle" font-weight="700">OpenShell supervisor</text>
+        <text x="272" y="190" fill="#e7edf5" font-size="13" text-anchor="middle">UID/GID 0:0</text>
+        <text x="272" y="215" fill="#99a7b7" font-size="11.5" text-anchor="middle">trusted setup and enforcement</text>
+        <rect x="658" y="133" width="300" height="104" rx="10" fill="#11271a" stroke="#2c6840"/>
+        <text x="808" y="165" fill="#49c66f" font-size="14" text-anchor="middle" font-weight="700">Agent child</text>
+        <text x="808" y="190" fill="#e7edf5" font-size="13" text-anchor="middle">resolved non-root UID/GID</text>
+        <text x="808" y="215" fill="#99a7b7" font-size="11.5" text-anchor="middle">untrusted user command</text>
+        <line x1="422" y1="184" x2="656" y2="184" stroke="#49c66f" stroke-width="2.2" marker-end="url(#identity-arrow)"/>
+        <text x="539" y="163" fill="#49c66f" font-size="11.5" text-anchor="middle">clear groups, setgid, setuid, exec</text>
+        <text x="539" y="208" fill="#99a7b7" font-size="11" text-anchor="middle">same identity for direct + SSH paths</text>
+      </svg>
+      <figcaption>The image supplies one filesystem, but the trusted supervisor and untrusted agent intentionally run as different users.</figcaption>
+    </figure>
+  </section>
+
+  <section id="modes">
+    <h2>3. Image and fixed modes</h2>
+    <table>
+      <tr><th>Mode</th><th>Identity source</th><th>Account records</th><th>External storage</th></tr>
+      <tr><td><code>image</code> (default)</td><td>Immutable image ID plus raw OCI <code>Config.User</code>.</td><td>Required only when a name or implicit primary group must be resolved.</td><td>Creator-selected bind and named-volume mounts are rejected.</td></tr>
+      <tr><td><code>fixed</code></td><td>Operator-configured <code>fixed_uid</code> and <code>fixed_gid</code>.</td><td>Not required; both IDs are already numeric.</td><td>Allowed subject to existing mount and bind-enable checks.</td></tr>
+    </table>
+    <p>Docker pins container creation to the inspected image ID. Podman inspects the selected result, then creates with
+      pull policy <code>never</code> and that immutable ID. A mutable tag cannot change between identity inspection and
+      root filesystem selection.</p>
+    <div class="note"><strong>Why fixed mode exists.</strong> An image-selected UID is local to that image's ownership
+      assumptions. Shared or host storage needs an operator-controlled principal whose ownership contract exists outside
+      the image, so the two concerns are represented as explicit modes.</div>
+  </section>
+
+  <section id="flow">
+    <h2>4. End-to-end startup flow</h2>
+    <ol class="steps">
+      <li><strong>The gateway records intent.</strong> Creating a Docker or Podman sandbox persists
+        <code>managed_identity_required = true</code>. Creator-supplied <code>run_as_user</code> and
+        <code>run_as_group</code> are rejected.</li>
+      <li><strong>The driver selects an immutable rootfs.</strong> It pulls or resolves the requested image, inspects its
+        immutable ID and OCI <code>Config.User</code>, and validates the selected identity mode.</li>
+      <li><strong>The driver starts only the supervisor as root.</strong> It overrides the runtime user to
+        <code>0:0</code>, appends <code>--managed-local-identity</code>, and injects protected source/image metadata after
+        image and request environment values.</li>
+      <li><strong>The supervisor verifies two independent authorities.</strong> The driver argv assertion must exactly
+        agree with the gateway's persisted marker. Either mismatch aborts startup.</li>
+      <li><strong>The supervisor resolves and persists identity.</strong> It safely parses image account files when
+        needed, rejects root or malformed inputs, and binds the record to image ID and source inputs in
+        <code>/var/lib/openshell/agent-identity.json</code>.</li>
+      <li><strong>The local SSH target binds first.</strong> This creates the root-only Unix socket needed by later relay
+        requests, but no remote relay is exposed and no user child exists yet.</li>
+      <li><strong>The gateway validates the handshake.</strong> <code>SupervisorHello</code> reports the resolved record.
+        The gateway validates and atomically persists it, queues <code>SessionAccepted</code>, then publishes the session
+        to relay callers.</li>
+      <li><strong>The supervisor requires an exact acknowledgement.</strong> User code launches only when
+        <code>resolved_identity_version</code> exactly equals the version it reported.</li>
+      <li><strong>The child drops privilege.</strong> The parent prepares all fallible identity state before fork; the
+        child clears groups, calls numeric credential syscalls, applies sandboxing, and execs the command.</li>
+    </ol>
+
+    <figure class="figure">
+      <svg viewBox="0 0 1080 440" role="img" aria-label="Managed local identity startup sequence">
+        <defs><marker id="flow-arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#67b0ff"/></marker></defs>
+        <g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif">
+          <text x="100" y="30" fill="#67b0ff" font-size="13" text-anchor="middle" font-weight="700">Gateway</text>
+          <text x="350" y="30" fill="#c59aff" font-size="13" text-anchor="middle" font-weight="700">Driver</text>
+          <text x="610" y="30" fill="#e1ad45" font-size="13" text-anchor="middle" font-weight="700">Root supervisor</text>
+          <text x="900" y="30" fill="#49c66f" font-size="13" text-anchor="middle" font-weight="700">Agent child</text>
+          <line x1="100" y1="44" x2="100" y2="410" stroke="#28527d" stroke-dasharray="5 5"/>
+          <line x1="350" y1="44" x2="350" y2="410" stroke="#503b77" stroke-dasharray="5 5"/>
+          <line x1="610" y1="44" x2="610" y2="410" stroke="#68531e" stroke-dasharray="5 5"/>
+          <line x1="900" y1="44" x2="900" y2="410" stroke="#2c6840" stroke-dasharray="5 5"/>
+
+          <line x1="102" y1="78" x2="347" y2="78" stroke="#67b0ff" marker-end="url(#flow-arrow)"/>
+          <text x="225" y="68" fill="#e7edf5" font-size="11" text-anchor="middle">CreateSandbox + persisted marker</text>
+          <line x1="352" y1="120" x2="607" y2="120" stroke="#67b0ff" marker-end="url(#flow-arrow)"/>
+          <text x="480" y="110" fill="#e7edf5" font-size="11" text-anchor="middle">start 0:0 + flag + protected metadata</text>
+          <rect x="480" y="143" width="260" height="54" rx="8" fill="#2a210e" stroke="#68531e"/>
+          <text x="610" y="164" fill="#e1ad45" font-size="11" text-anchor="middle">resolve + persist identity</text>
+          <text x="610" y="183" fill="#99a7b7" font-size="10.5" text-anchor="middle">bind root-only SSH socket</text>
+          <line x1="607" y1="230" x2="103" y2="230" stroke="#67b0ff" marker-end="url(#flow-arrow)"/>
+          <text x="355" y="220" fill="#e7edf5" font-size="11" text-anchor="middle">SupervisorHello(identity version 1)</text>
+          <rect x="24" y="252" width="152" height="53" rx="8" fill="#102234" stroke="#28527d"/>
+          <text x="100" y="273" fill="#67b0ff" font-size="10.5" text-anchor="middle">validate + persist</text>
+          <text x="100" y="291" fill="#99a7b7" font-size="10" text-anchor="middle">queue acceptance first</text>
+          <line x1="103" y1="329" x2="607" y2="329" stroke="#49c66f" marker-end="url(#flow-arrow)"/>
+          <text x="355" y="319" fill="#49c66f" font-size="11" text-anchor="middle">SessionAccepted(resolved_identity_version=1)</text>
+          <line x1="613" y1="374" x2="897" y2="374" stroke="#49c66f" stroke-width="2" marker-end="url(#flow-arrow)"/>
+          <text x="755" y="364" fill="#49c66f" font-size="11" text-anchor="middle">drop to resolved UID/GID + exec</text>
+          <text x="900" y="402" fill="#99a7b7" font-size="10.5" text-anchor="middle">no supplementary groups</text>
+        </g>
+      </svg>
+      <figcaption>The child launch gate opens only after the gateway acknowledges the exact identity schema version.</figcaption>
+    </figure>
+  </section>
+
+  <section id="trust">
+    <h2>5. Trust and compatibility gates</h2>
+    <p class="lead">No single environment variable can authorize managed identity. Each layer proves a different fact.</p>
+    <table>
+      <tr><th>Gate</th><th>Owner</th><th>What it proves</th><th>Failure behavior</th></tr>
+      <tr><td>Creation marker</td><td>Gateway persistence</td><td>This sandbox was created under the managed local identity contract.</td><td>Unmarked sandboxes ignore protected identity metadata.</td></tr>
+      <tr><td><code>--managed-local-identity</code></td><td>Docker/Podman driver argv</td><td>The launching runtime understands and selected the contract.</td><td>Flag/marker mismatch aborts startup.</td></tr>
+      <tr><td>Protected metadata</td><td>Driver environment assembly</td><td>Source, image ID, raw image user, or fixed IDs belong to the selected runtime input.</td><td>Image/template/request values cannot override them.</td></tr>
+      <tr><td>Persisted identity record</td><td>Supervisor state</td><td>A restart uses exactly the first accepted image/source identity.</td><td>Changed source inputs or identity abort restart.</td></tr>
+      <tr><td>Exact version acknowledgement</td><td>Gateway session protocol</td><td>The gateway understood and persisted the same identity schema.</td><td>Missing or mismatched version is permanent rejection.</td></tr>
+    </table>
+    <div class="success"><strong>Rolling-version behavior.</strong> Managed launch fails closed when the gateway, driver,
+      and supervisor do not agree on this protocol. Existing unmarked legacy containers retain their old behavior rather
+      than being reinterpreted during upgrade.</div>
+    <h3>Session lifetime</h3>
+    <table>
+      <tr><th>Event</th><th>Supervisor behavior</th><th>Gateway readiness</th></tr>
+      <tr><td>Temporary disconnect / unavailable gateway</td><td>Reconnect with bounded exponential backoff; keep the child running.</td><td>Demote to Provisioning until reconnected.</td></tr>
+      <tr><td>Permanent protocol or identity rejection</td><td>Stop reconnecting and terminate the agent child.</td><td>Do not publish Ready.</td></tr>
+      <tr><td>Initial acceptance timeout</td><td>Fail startup before direct user code launches.</td><td>Do not publish Ready.</td></tr>
+    </table>
+    <p class="small">Permanent rejection emits a High-severity OCSF network event and a corresponding detection finding.
+      Transient reconnect failures remain Low-severity operational events.</p>
+  </section>
+
+  <section id="resolution">
+    <h2>6. OCI USER resolution</h2>
+    <p class="lead">Image mode accepts the common OCI forms, then converts them to one numeric UID/GID pair.</p>
+    <table>
+      <tr><th>OCI <code>Config.User</code></th><th>Resolution</th><th>Account-file requirement</th></tr>
+      <tr><td><code>app</code></td><td>Look up user and use its primary GID.</td><td><code>/etc/passwd</code></td></tr>
+      <tr><td><code>1001</code></td><td>Use UID; look up its primary GID.</td><td>Matching passwd row</td></tr>
+      <tr><td><code>app:workers</code></td><td>Look up user and group independently.</td><td><code>/etc/passwd</code> and <code>/etc/group</code></td></tr>
+      <tr><td><code>1001:1002</code></td><td>Use both numeric values directly.</td><td>None</td></tr>
+    </table>
+    <p>The parser opens bounded regular account files without following symlinks and does not invoke NSS for image
+      identity resolution. Empty, malformed, missing, ambiguous, control-character-containing, or root-resolving values
+      fail startup. OpenShell does not create users or rewrite the image's account database.</p>
+    <pre><code>identity record = {
+  version: 1,
+  source: "image" | "fixed",
+  immutable_image_id: "...",
+  image_user: "app:workers" | null,
+  uid: 1001,
+  gid: 1002,
+  supplementary_gids: []
+}</code></pre>
+  </section>
+
+  <section id="fork">
+    <h2>7. Safe child privilege drop</h2>
+    <p class="lead">The code deliberately minimizes work between <code>fork</code> and <code>exec</code>, where allocator,
+      lock, and NSS activity is unsafe in a multithreaded process.</p>
+    <div class="grid two">
+      <div class="mini">
+        <h3>Parent, before fork</h3>
+        <p>Resolve named credentials and NSS state, validate namespace UID/GID maps, compute supplementary-group
+          transition, prepare child environment, and validate all fallible identity inputs.</p>
+      </div>
+      <div class="mini">
+        <h3>Child, after fork</h3>
+        <p>Apply only precomputed direct syscalls: clear and verify supplementary groups, call <code>setgid</code>, call
+          <code>setuid</code>, clear the capability bounding set, apply sandbox restrictions, and exec.</p>
+      </div>
+    </div>
+    <div class="note"><strong>Direct and SSH parity.</strong> The initial entrypoint and every SSH child use the same
+      prepared credential model. Managed children receive <code>HOME=/sandbox</code>, numeric presentation variables where
+      appropriate, and no supplementary groups.</div>
+    <p>Filesystem preparation changes ownership only on the <code>/sandbox</code> directory itself. It does not recursively
+      chown image content or nested mounts. Missing final writable directories use descriptor-relative no-follow
+      operations to reject symlink races.</p>
+  </section>
+
+  <section id="readiness">
+    <h2>8. Two-signal readiness</h2>
+    <p class="lead">A running container is not sufficient: managed sandboxes are Ready only when the runtime and the
+      identity-authenticated supervisor session are both ready.</p>
+    <table>
+      <tr><th class="center">Runtime ready</th><th class="center">Session accepted</th><th>Public phase</th><th>Meaning</th></tr>
+      <tr><td class="center">No</td><td class="center">No</td><td><span class="tag amber">Provisioning</span></td><td>Container and identity channel are still starting.</td></tr>
+      <tr><td class="center">Yes</td><td class="center">No</td><td><span class="tag amber">Provisioning</span></td><td>Container runs, but identity has not been accepted.</td></tr>
+      <tr><td class="center">No</td><td class="center">Yes</td><td><span class="tag amber">Provisioning</span></td><td>Session arrived first; runtime has not independently reported ready.</td></tr>
+      <tr><td class="center">Yes</td><td class="center">Yes</td><td><span class="tag green">Ready</span></td><td>Both independent dependencies are satisfied.</td></tr>
+    </table>
+    <p><code>SandboxStatus.runtime_ready</code> persists the compute signal so either event order works. Docker emits an
+      explicit <code>RuntimeReady</code> condition. Drivers without that condition retain a phase-based fallback. Terminal
+      Error and Deleting states remain authoritative and cannot be promoted by a connected supervisor session.</p>
+  </section>
+
+  <section id="mounts">
+    <h2>9. External mount boundary</h2>
+    <table>
+      <tr><th>Mount class</th><th>Image mode</th><th>Fixed mode</th></tr>
+      <tr><td>Driver-owned workspace and tmpfs</td><td><span class="tag green">allowed</span></td><td><span class="tag green">allowed</span></td></tr>
+      <tr><td>Podman read-only image mount</td><td><span class="tag green">allowed, ID-pinned</span></td><td><span class="tag green">allowed, ID-pinned</span></td></tr>
+      <tr><td>Creator-selected named volume</td><td><span class="tag red">rejected</span></td><td><span class="tag amber">normal checks apply</span></td></tr>
+      <tr><td>Creator-selected host bind</td><td><span class="tag red">rejected</span></td><td><span class="tag amber">requires enable_bind_mounts</span></td></tr>
+      <tr><td>Identity/account/control paths</td><td><span class="tag red">always protected</span></td><td><span class="tag red">always protected</span></td></tr>
+    </table>
+    <p>Read-only access does not make external storage safe for an arbitrary image-selected principal. The restrictions
+      are therefore scoped to Docker/Podman managed identity mounts. Kubernetes mount validation and identity behavior
+      remain unchanged.</p>
+  </section>
+
+  <section id="scope">
+    <h2>10. Runtime scope and compatibility</h2>
+    <table>
+      <tr><th>Runtime</th><th>Behavior after this change</th></tr>
+      <tr><td>Docker</td><td>Default image identity or explicit fixed identity; supervisor starts root and emits independent runtime readiness.</td></tr>
+      <tr><td>Podman</td><td>Equivalent identity modes and protected environment tombstones; rootless UID/GID must be representable in host subordinate maps.</td></tr>
+      <tr><td>Kubernetes / OpenShift</td><td>Retains configured, SCC-assigned, or existing default numeric identity. It does not participate in this handshake.</td></tr>
+      <tr><td>VM</td><td>Retains configured guest UID/GID defaults and strips managed-local metadata.</td></tr>
+      <tr><td>Legacy/offline container</td><td>Without both gateway marker and driver assertion, retains legacy policy-derived behavior.</td></tr>
+    </table>
+    <div class="warn"><strong>Rootless Podman constraint.</strong> A valid container UID/GID can still be unavailable in
+      the host user's subordinate ID mapping. That platform mapping remains an operator responsibility.</div>
+  </section>
+
+  <section id="verification">
+    <h2>11. Verification status</h2>
+    <table>
+      <tr><th>Check</th><th>Status in local review snapshot</th></tr>
+      <tr><td><code>mise run pre-commit</code></td><td><span class="tag green">passed</span> Formatting, lint, license checks, and configured Rust tests.</td></tr>
+      <tr><td>Workspace all-target compilation</td><td><span class="tag green">passed</span></td></tr>
+      <tr><td>Linux supervisor/sandbox compilation</td><td><span class="tag green">passed</span> Checked in the Linux CI image.</td></tr>
+      <tr><td>Docker image-mode E2E</td><td><span class="tag green">passed</span> Includes custom OCI identities and invalid/root identity rejection.</td></tr>
+      <tr><td>Docker fixed-mode E2E</td><td><span class="tag green">passed</span> Includes configured identity and external-volume behavior.</td></tr>
+      <tr><td>Podman image/fixed E2E</td><td><span class="tag amber">CI coverage added</span> Not runnable locally because Podman is unavailable.</td></tr>
+    </table>
+    <p class="small">The focused E2E assertions cover UID, GID, <code>HOME</code>, image-user forms, fixed mode, invalid
+      identity rejection, root diagnostics, and the external-storage mode boundary.</p>
+  </section>
+
+  <section id="files">
+    <h2>12. Review map</h2>
+    <p class="lead">Review in protocol order. The critical questions cross file boundaries.</p>
+    <div class="wide">
+      <table>
+        <tr><th>Review stage</th><th>Primary files</th><th>Question to answer</th></tr>
+        <tr><td>1. Contract</td><td class="file"><code>architecture/{sandbox.md,compute-runtimes.md}</code></td><td>Are trust ownership, identity modes, readiness, and compatibility boundaries explicit?</td></tr>
+        <tr><td>2. Wire/state model</td><td class="file"><code>proto/openshell.proto</code>, <code>openshell-core/src/sandbox_env.rs</code></td><td>Are the persisted marker, resolved record, runtime signal, and exact acknowledgement sufficient?</td></tr>
+        <tr><td>3. Driver authority</td><td class="file"><code>openshell-driver-docker/src/lib.rs</code>, <code>openshell-driver-podman/src/{driver.rs,container.rs}</code></td><td>Is image selection pinned, metadata protected, root supervisor explicit, and mode/mount policy aligned?</td></tr>
+        <tr><td>4. Launch authorization</td><td class="file"><code>openshell-sandbox/src/{main.rs,lib.rs}</code></td><td>Must driver assertion and gateway marker agree before managed metadata is interpreted?</td></tr>
+        <tr><td>5. Identity resolution</td><td class="file"><code>openshell-supervisor-process/src/identity.rs</code></td><td>Do account parsing, persistence, restart matching, and root rejection fail closed?</td></tr>
+        <tr><td>6. Privilege boundary</td><td class="file"><code>openshell-supervisor-process/src/{process.rs,ssh.rs,child_env.rs}</code></td><td>Is all unsafe post-fork work removed and do direct/SSH children receive identical credentials?</td></tr>
+        <tr><td>7. Session lifecycle</td><td class="file"><code>openshell-supervisor-process/src/{run.rs,supervisor_session.rs}</code></td><td>Does exact acceptance gate launch, do transient failures reconnect, and do permanent failures terminate?</td></tr>
+        <tr><td>8. Gateway ordering</td><td class="file"><code>openshell-server/src/{supervisor_session.rs,compute/mod.rs}</code></td><td>Is acceptance queued before relay publication, and does Ready require both independent signals?</td></tr>
+        <tr><td>9. Proof</td><td class="file"><code>e2e/rust/tests/{custom_image.rs,driver_config_volume.rs}</code>, <code>.github/workflows/e2e-test.yml</code></td><td>Do image and fixed lanes prove identity, failure diagnostics, and storage restrictions on both runtimes?</td></tr>
+      </table>
+    </div>
+
+    <div class="card">
+      <strong>High-value reviewer questions</strong>
+      <ol>
+        <li>Can image, template, request, or policy input spoof managed identity or opt another runtime into it?</li>
+        <li>Can any relay or agent child become reachable before identity persistence and exact acknowledgement?</li>
+        <li>Can a mutable image tag select a different rootfs than the one whose OCI user was inspected?</li>
+        <li>Can named-user lookup, supplementary groups, or namespace validation perform unsafe work after fork?</li>
+        <li>Can event ordering mark a managed sandbox Ready with only the container or only the session ready?</li>
+        <li>Can image-selected identity access creator-controlled external storage without fixed mode?</li>
+        <li>Do Kubernetes, VM, and existing legacy sandboxes preserve their previous behavior?</li>
+      </ol>
+    </div>
+  </section>
+</main>
+
+<footer>
+  Generated from <a href="https://github.com/NVIDIA/OpenShell/pull/2476">PR #2476</a>, issue
+  <a href="https://github.com/NVIDIA/OpenShell/issues/2331">#2331</a>, and the reviewed OpenShell implementation.
+  This is a self-contained offline artifact with inline CSS and SVG and no external runtime dependencies.
+</footer>
+</body>
+</html>

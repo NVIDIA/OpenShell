@@ -206,42 +206,18 @@ fn parse_pids_max(contents: &str) -> RuntimePidLimitStatus {
 }
 
 #[cfg(target_os = "linux")]
-fn drop_capability_bounding_set() -> Result<()> {
-    let clear_result = capctl::caps::bounding::clear();
-    let remaining = capctl::caps::bounding::probe();
-
-    validate_capability_bounding_set_clear(
-        clear_result,
-        remaining,
-        capctl::caps::bounding::clear_unknown,
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn validate_capability_bounding_set_clear(
+fn validate_child_capability_bounding_set_clear(
     clear_result: capctl::Result<()>,
     remaining: capctl::caps::CapSet,
     clear_unknown: impl FnOnce() -> capctl::Result<()>,
-) -> Result<()> {
+) -> std::io::Result<()> {
     match clear_result {
         Ok(()) if remaining.is_empty() => Ok(()),
-        Ok(()) => Err(miette::miette!(
-            "Failed to clear child capability bounding set: capabilities remain raised: {remaining:?}"
-        )),
-        Err(err) if err.code() == libc::EPERM && remaining.is_empty() => match clear_unknown() {
-            Ok(()) => {
-                debug!(
-                    "CAP_SETPCAP is unavailable, but the child capability bounding set is already empty"
-                );
-                Ok(())
-            }
-            Err(unknown_err) => Err(miette::miette!(
-                "Failed to clear unknown child capability bounding set entries: {unknown_err}"
-            )),
-        },
-        Err(err) => Err(miette::miette!(
-            "Failed to clear child capability bounding set: {err}"
-        )),
+        Ok(()) => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        Err(error) if error.code() == libc::EPERM && remaining.is_empty() => {
+            clear_unknown().map_err(std::io::Error::from)
+        }
+        Err(error) => Err(std::io::Error::from(error)),
     }
 }
 
@@ -606,8 +582,10 @@ impl ProcessHandle {
 
         // Apply identity last so image, request, and provider environment
         // cannot replace the supervisor-selected child identity presentation.
-        for (key, value) in child_env::identity_env_vars(policy) {
-            cmd.env(key, value);
+        if let Some(identity_env) = child_env::identity_env_vars(policy) {
+            for (key, value) in identity_env {
+                cmd.env(key, value);
+            }
         }
 
         // Probe Landlock availability and emit OCSF logs from the parent
@@ -626,6 +604,11 @@ impl ProcessHandle {
         #[cfg(target_os = "linux")]
         let prepared_sandbox = prepare_child_sandbox(policy, workdir, enforcement_mode)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
+        let privilege_drop = if enforcement_mode.uses_privileged_process_setup() {
+            Some(prepare_privilege_drop(policy)?)
+        } else {
+            None
+        };
         #[cfg(target_os = "linux")]
         let supervisor_identity_mount = if enforcement_mode.uses_privileged_process_setup() {
             supervisor_identity_mount_from_env().map_err(|err| {
@@ -641,7 +624,6 @@ impl ProcessHandle {
         // SAFETY: pre_exec runs after fork but before exec in the child process.
         // setpgid and setns are async-signal-safe and safe to call in this context.
         {
-            let policy = policy.clone();
             // Wrap in Option so we can .take() it out of the FnMut closure.
             // pre_exec is only called once (after fork, before exec).
             #[cfg(target_os = "linux")]
@@ -667,12 +649,8 @@ impl ProcessHandle {
                         mount.enter_for_child()?;
                     }
 
-                    // Drop privileges. initgroups/setgid/setuid need access to
-                    // /etc/group and /etc/passwd which would be blocked if
-                    // Landlock were already enforced.
-                    if enforcement_mode.uses_privileged_process_setup() {
-                        drop_privileges(&policy)
-                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    if let Some(plan) = privilege_drop.as_ref() {
+                        plan.apply()?;
                     }
 
                     harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -751,8 +729,10 @@ impl ProcessHandle {
             }
         }
 
-        for (key, value) in child_env::identity_env_vars(policy) {
-            cmd.env(key, value);
+        if let Some(identity_env) = child_env::identity_env_vars(policy) {
+            for (key, value) in identity_env {
+                cmd.env(key, value);
+            }
         }
 
         // Set up process group for signal handling (non-interactive mode only).
@@ -885,8 +865,8 @@ pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
 
     // Numeric UID — no passwd entry required; kernel resolves directly.
     if let Ok(uid) = identity.parse::<u32>() {
-        let driver_resolved =
-            std::env::var_os(openshell_core::sandbox_env::IDENTITY_SOURCE).is_some();
+        let driver_resolved = crate::identity::managed_local_resolved_identity(policy)
+            .is_some_and(|resolved| resolved.uid == uid);
         if uid == 0 {
             return Err(miette::miette!("sandbox UID must not be 0"));
         }
@@ -969,8 +949,8 @@ pub fn validate_sandbox_group(policy: &SandboxPolicy) -> Result<()> {
     let identity = policy.process.run_as_group.as_deref().unwrap_or("sandbox");
 
     if let Ok(gid) = identity.parse::<u32>() {
-        let driver_resolved =
-            std::env::var_os(openshell_core::sandbox_env::IDENTITY_SOURCE).is_some();
+        let driver_resolved = crate::identity::managed_local_resolved_identity(policy)
+            .is_some_and(|resolved| resolved.gid == gid);
         if gid == 0 {
             return Err(miette::miette!("sandbox GID must not be 0"));
         }
@@ -1131,9 +1111,10 @@ pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
 
     // Driver-selected identities own the workspace mount point itself. Never
     // traverse descendants because they may contain image data or nested mounts.
-    if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok()
-        || std::env::var(openshell_core::sandbox_env::IDENTITY_SOURCE).is_ok()
-    {
+    if should_chown_sandbox_home(
+        std::env::var_os(openshell_core::sandbox_env::SANDBOX_UID).is_some(),
+        crate::identity::managed_local_resolved_identity(policy).is_some(),
+    ) {
         let sandbox_home = Path::new("/sandbox");
         if chown_sandbox_home(sandbox_home, uid, gid)? {
             info!(
@@ -1147,16 +1128,140 @@ pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+const fn should_chown_sandbox_home(
+    sandbox_uid_present: bool,
+    managed_local_identity: bool,
+) -> bool {
+    sandbox_uid_present || managed_local_identity
+}
+
 #[cfg(not(unix))]
 pub fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
     Ok(())
 }
 
-// `effective_gid`/`effective_uid` are intentionally parallel names (same role
-// for different identifiers) and the noise from renaming would obscure intent.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SupplementaryGroupPlan {
+    Preserve,
+    Replace(Vec<libc::gid_t>),
+}
+
+/// Fully resolved privilege transition prepared before `fork`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrivilegeDropPlan {
+    target_uid: libc::uid_t,
+    target_gid: libc::gid_t,
+    set_uid: bool,
+    supplementary_groups: SupplementaryGroupPlan,
+    groups_were_empty: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl PrivilegeDropPlan {
+    /// Apply only precomputed credential changes in the post-fork child.
+    pub(crate) fn apply(&self) -> std::io::Result<()> {
+        if let SupplementaryGroupPlan::Replace(groups) = &self.supplementary_groups {
+            #[allow(unsafe_code)]
+            let result =
+                unsafe { libc::syscall(libc::SYS_setgroups, groups.len(), groups.as_ptr()) };
+            if result < 0 {
+                let error = std::io::Error::last_os_error();
+                if !(groups.is_empty()
+                    && self.groups_were_empty
+                    && error.raw_os_error() == Some(libc::EPERM))
+                {
+                    return Err(error);
+                }
+            }
+            if groups.is_empty() {
+                #[allow(unsafe_code)]
+                let remaining = unsafe {
+                    libc::syscall(
+                        libc::SYS_getgroups,
+                        0_usize,
+                        std::ptr::null_mut::<libc::gid_t>(),
+                    )
+                };
+                if remaining < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if remaining != 0 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                }
+            }
+        }
+
+        #[allow(unsafe_code)]
+        if unsafe { libc::syscall(libc::SYS_getegid) as libc::gid_t } != self.target_gid {
+            #[allow(unsafe_code)]
+            if unsafe { libc::syscall(libc::SYS_setgid, self.target_gid) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[allow(unsafe_code)]
+        if unsafe { libc::syscall(libc::SYS_getegid) as libc::gid_t } != self.target_gid {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        #[allow(unsafe_code)]
+        if unsafe { libc::syscall(libc::SYS_geteuid) as libc::uid_t } == 0 {
+            drop_capability_bounding_set_for_child()?;
+        }
+
+        if self.set_uid {
+            #[allow(unsafe_code)]
+            if unsafe { libc::syscall(libc::SYS_geteuid) as libc::uid_t } != self.target_uid {
+                #[allow(unsafe_code)]
+                if unsafe { libc::syscall(libc::SYS_setuid, self.target_uid) } < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            #[allow(unsafe_code)]
+            if unsafe { libc::syscall(libc::SYS_geteuid) as libc::uid_t } != self.target_uid {
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            }
+
+            #[allow(unsafe_code)]
+            let reacquired_root = unsafe { libc::syscall(libc::SYS_setuid, 0_u32) } == 0;
+            if reacquired_root && self.target_uid != 0 {
+                return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn drop_capability_bounding_set_for_child() -> std::io::Result<()> {
+    let clear_result = capctl::caps::bounding::clear();
+    let remaining = capctl::caps::bounding::probe();
+    validate_child_capability_bounding_set_clear(
+        clear_result,
+        remaining,
+        capctl::caps::bounding::clear_unknown,
+    )
+}
+
+/// Resolve all identity and supplementary-group state in the parent process.
+#[cfg(target_os = "linux")]
 #[allow(clippy::similar_names)]
-pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
+pub(crate) fn prepare_privilege_drop(policy: &SandboxPolicy) -> Result<PrivilegeDropPlan> {
+    prepare_privilege_drop_with_managed_identity(
+        policy,
+        crate::identity::managed_local_resolved_identity(policy).is_some(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::similar_names)]
+fn prepare_privilege_drop_with_managed_identity(
+    policy: &SandboxPolicy,
+    managed_local_identity: bool,
+) -> Result<PrivilegeDropPlan> {
     let user_name = match policy.process.run_as_user.as_deref() {
         Some(name) if !name.is_empty() => Some(name),
         _ => None,
@@ -1176,9 +1281,16 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
             let mut fallback = policy.clone();
             fallback.process.run_as_user = Some("sandbox".into());
             fallback.process.run_as_group = Some("sandbox".into());
-            return drop_privileges(&fallback);
+            return prepare_privilege_drop_with_managed_identity(&fallback, false);
         }
-        return Ok(());
+
+        return Ok(PrivilegeDropPlan {
+            target_uid: nix::unistd::geteuid().as_raw(),
+            target_gid: nix::unistd::getegid().as_raw(),
+            set_uid: false,
+            supplementary_groups: SupplementaryGroupPlan::Preserve,
+            groups_were_empty: true,
+        });
     }
 
     // Resolve UID: numeric values are used directly; names resolve via passwd.
@@ -1216,8 +1328,119 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
         },
     };
 
-    #[cfg(target_os = "linux")]
     crate::identity::validate_user_namespace_mappings(target_uid.as_raw(), target_gid.as_raw())?;
+
+    let current_groups = nix::unistd::getgroups().into_diagnostic()?;
+
+    // Resolve the user record for initgroups only when identity is name-based.
+    // Numeric UIDs may not have a /etc/passwd entry; skip the lookup rather than
+    // failing with a spurious "user record not found" error.
+    let user_name_is_numeric = user_name.is_some_and(|n| n.parse::<u32>().is_ok());
+    let user = if user_name.is_some() && !user_name_is_numeric {
+        Some(
+            User::from_uid(target_uid)
+                .into_diagnostic()?
+                .ok_or_else(|| {
+                    miette::miette!("Failed to resolve user record for UID {target_uid}")
+                })?,
+        )
+    } else {
+        None
+    };
+
+    let supplementary_groups = if managed_local_identity && user_name_is_numeric {
+        SupplementaryGroupPlan::Replace(Vec::new())
+    } else if let Some(ref user) = user
+        && target_uid != nix::unistd::geteuid()
+    {
+        let user_cstr =
+            CString::new(user.name.clone()).map_err(|_| miette::miette!("Invalid user name"))?;
+        let groups = nix::unistd::getgrouplist(user_cstr.as_c_str(), target_gid)
+            .into_diagnostic()?
+            .into_iter()
+            .map(Gid::as_raw)
+            .collect();
+        SupplementaryGroupPlan::Replace(groups)
+    } else {
+        SupplementaryGroupPlan::Preserve
+    };
+
+    Ok(PrivilegeDropPlan {
+        target_uid: target_uid.as_raw(),
+        target_gid: target_gid.as_raw(),
+        set_uid: user_name.is_some(),
+        supplementary_groups,
+        groups_were_empty: current_groups.is_empty(),
+    })
+}
+
+/// Compatibility wrapper for callers outside the live Linux spawn paths.
+#[cfg(target_os = "linux")]
+pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
+    prepare_privilege_drop(policy)?.apply().into_diagnostic()
+}
+
+// Non-Linux platforms retain the previous privilege-drop implementation.
+#[cfg(all(unix, not(target_os = "linux")))]
+#[allow(clippy::similar_names)]
+pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
+    let user_name = match policy.process.run_as_user.as_deref() {
+        Some(name) if !name.is_empty() => Some(name),
+        _ => None,
+    };
+    let group_name = match policy.process.run_as_group.as_deref() {
+        Some(name) if !name.is_empty() => Some(name),
+        _ => None,
+    };
+
+    // If no user/group is configured and we are running as root, fall back to
+    // "sandbox:sandbox" instead of silently keeping root.  This covers the
+    // local/dev-mode path where policies are loaded from disk and never pass
+    // through the server-side `ensure_sandbox_process_identity` normalization.
+    // For non-root runtimes, the no-op is safe -- we are already unprivileged.
+    if user_name.is_none() && group_name.is_none() {
+        if nix::unistd::geteuid().is_root() {
+            let mut fallback = policy.clone();
+            fallback.process.run_as_user = Some("sandbox".into());
+            fallback.process.run_as_group = Some("sandbox".into());
+            return drop_privileges(&fallback);
+        }
+        return Ok(());
+    }
+
+    // Resolve UID: numeric values are used directly; names resolve via passwd.
+    let target_uid = match user_name {
+        Some(name) if name.parse::<u32>().is_ok() => Uid::from_raw(name.parse().into_diagnostic()?),
+        Some(name) => {
+            User::from_name(name)
+                .into_diagnostic()?
+                .ok_or_else(|| miette::miette!("Sandbox user not found: {name}"))?
+                .uid
+        }
+        None => nix::unistd::geteuid(),
+    };
+    // Resolve group: if a numeric GID is configured use it directly.
+    // Otherwise try name resolution, then fall back to current user's primary group.
+    let target_gid = match group_name {
+        Some(name) if name.parse::<u32>().is_ok() => Gid::from_raw(name.parse().into_diagnostic()?),
+        Some(name) => {
+            Group::from_name(name)
+                .into_diagnostic()?
+                .ok_or_else(|| miette::miette!("Sandbox group not found: {name}"))?
+                .gid
+        }
+        None => match target_uid.as_raw() {
+            0 => nix::unistd::getegid(),
+            _ => Group::from_gid(
+                User::from_uid(target_uid)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("Failed to resolve user from UID {target_uid}"))?
+                    .gid,
+            )
+            .into_diagnostic()?
+            .map_or_else(nix::unistd::getegid, |g| g.gid),
+        },
+    };
 
     // Resolve the user record for initgroups only when identity is name-based.
     // Numeric UIDs may not have a /etc/passwd entry; skip the lookup rather than
@@ -1236,13 +1459,6 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
         None
     };
 
-    // Resolved image/fixed identities are normalized to numeric UID/GID and
-    // must never inherit supervisor supplementary groups. Legacy named policy
-    // identities retain their existing initgroups behavior.
-    #[cfg(target_os = "linux")]
-    if user_name_is_numeric || group_name_is_numeric {
-        clear_supplementary_groups()?;
-    }
     if !user_name_is_numeric
         && !group_name_is_numeric
         && let Some(ref user) = user
@@ -1284,11 +1500,6 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
         ));
     }
 
-    #[cfg(target_os = "linux")]
-    if nix::unistd::geteuid().is_root() {
-        drop_capability_bounding_set()?;
-    }
-
     if user_name.is_some() {
         if target_uid != nix::unistd::geteuid() {
             nix::unistd::setuid(target_uid).into_diagnostic()?;
@@ -1317,39 +1528,6 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn clear_supplementary_groups() -> Result<()> {
-    let before = rustix::process::getgroups().into_diagnostic()?;
-    let clear_result =
-        rustix::thread::set_thread_groups(&[]).map_err(rustix::io::Errno::raw_os_error);
-    validate_supplementary_group_clear(clear_result, before.is_empty(), true)?;
-    let remaining = rustix::process::getgroups().into_diagnostic()?;
-    if !remaining.is_empty() {
-        return Err(miette::miette!(
-            "supplementary group clear verification failed: groups remain: {remaining:?}"
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn validate_supplementary_group_clear(
-    clear_result: std::result::Result<(), i32>,
-    groups_were_empty: bool,
-    allow_denied_when_empty: bool,
-) -> Result<()> {
-    match clear_result {
-        Ok(()) => Ok(()),
-        Err(error) if error == libc::EPERM && groups_were_empty && allow_denied_when_empty => {
-            debug!("setgroups is denied, but the supplementary group list is already empty");
-            Ok(())
-        }
-        Err(error) => Err(miette::miette!(
-            "failed to clear supplementary groups before privilege drop: {error}"
-        )),
-    }
 }
 
 /// Process exit status.
@@ -1463,7 +1641,7 @@ mod tests {
         let remaining = capctl::caps::CapSet::empty();
 
         assert!(
-            validate_capability_bounding_set_clear(
+            validate_child_capability_bounding_set_clear(
                 Err(capctl::Error::from_code(libc::EPERM)),
                 remaining,
                 || Ok(()),
@@ -1478,19 +1656,13 @@ mod tests {
         let mut remaining = capctl::caps::CapSet::empty();
         remaining.add(capctl::caps::Cap::CHOWN);
 
-        let result = validate_capability_bounding_set_clear(
+        let result = validate_child_capability_bounding_set_clear(
             Err(capctl::Error::from_code(libc::EPERM)),
             remaining,
             || panic!("unknown capabilities should not be checked when known caps remain"),
         );
 
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Failed to clear child capability bounding set")
-        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EPERM));
     }
 
     #[test]
@@ -1499,17 +1671,11 @@ mod tests {
         let mut remaining = capctl::caps::CapSet::empty();
         remaining.add(capctl::caps::Cap::CHOWN);
 
-        let result = validate_capability_bounding_set_clear(Ok(()), remaining, || {
+        let result = validate_child_capability_bounding_set_clear(Ok(()), remaining, || {
             panic!("unknown capabilities should not be checked when known caps remain")
         });
 
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("capabilities remain raised")
-        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EINVAL));
     }
 
     #[test]
@@ -1517,19 +1683,13 @@ mod tests {
     fn capability_bounding_set_clear_rejects_unknown_eperm() {
         let remaining = capctl::caps::CapSet::empty();
 
-        let result = validate_capability_bounding_set_clear(
+        let result = validate_child_capability_bounding_set_clear(
             Err(capctl::Error::from_code(libc::EPERM)),
             remaining,
             || Err(capctl::Error::from_code(libc::EPERM)),
         );
 
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Failed to clear unknown child capability bounding set entries")
-        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EPERM));
     }
 
     #[test]
@@ -1596,11 +1756,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         {
             if nix::unistd::geteuid().is_root() && !capability_bounding_set_clear_available() {
-                let msg = format!("{}", result.unwrap_err());
-                assert!(
-                    msg.contains("Failed to clear child capability bounding set"),
-                    "unexpected failure: {msg}"
-                );
+                assert!(result.is_err());
                 return;
             }
         }
@@ -1628,6 +1784,7 @@ mod tests {
             run_as_user: None,
             run_as_group: Some(current_group.name),
         });
+        let privilege_drop = prepare_privilege_drop(&policy).expect("prepare privilege drop");
 
         let mut cmd = std::process::Command::new(std::env::current_exe().expect("current exe"));
         cmd.arg("capability_probe_child")
@@ -1638,9 +1795,7 @@ mod tests {
             .stderr(StdStdio::piped());
 
         unsafe {
-            cmd.pre_exec(move || {
-                drop_privileges(&policy).map_err(|err| std::io::Error::other(err.to_string()))
-            });
+            cmd.pre_exec(move || privilege_drop.apply());
         }
 
         let output = cmd.output().expect("spawn child status probe");
@@ -2011,19 +2166,83 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn supplementary_group_clear_accepts_success() {
-        assert!(
-            validate_supplementary_group_clear(Ok(()), true, cfg!(target_os = "linux")).is_ok()
+    fn managed_numeric_identity_plan_clears_supplementary_groups() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(nix::unistd::geteuid().as_raw().to_string()),
+            run_as_group: Some(nix::unistd::getegid().as_raw().to_string()),
+        });
+
+        let plan = prepare_privilege_drop_with_managed_identity(&policy, true).unwrap();
+        assert_eq!(
+            plan.supplementary_groups,
+            SupplementaryGroupPlan::Replace(Vec::new())
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn supplementary_group_clear_accepts_linux_eperm_only_when_already_empty() {
-        assert!(validate_supplementary_group_clear(Err(libc::EPERM), true, true).is_ok());
-        assert!(validate_supplementary_group_clear(Err(libc::EPERM), false, true).is_err());
-        assert!(validate_supplementary_group_clear(Err(libc::EPERM), true, false).is_err());
+    fn unmanaged_numeric_identity_plan_preserves_supplementary_groups() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(nix::unistd::geteuid().as_raw().to_string()),
+            run_as_group: Some(nix::unistd::getegid().as_raw().to_string()),
+        });
+
+        let plan = prepare_privilege_drop_with_managed_identity(&policy, false).unwrap();
+        assert_eq!(plan.supplementary_groups, SupplementaryGroupPlan::Preserve);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privilege_drop_preparation_rejects_unknown_identity() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("__nonexistent_pre_exec_user_42__".into()),
+            run_as_group: None,
+        });
+
+        assert!(prepare_privilege_drop(&policy).is_err());
+    }
+
+    #[test]
+    fn workspace_chown_requires_driver_uid_or_installed_managed_identity() {
+        assert!(!should_chown_sandbox_home(false, false));
+        assert!(should_chown_sandbox_home(true, false));
+        assert!(should_chown_sandbox_home(false, true));
+    }
+
+    #[test]
+    fn raw_identity_source_probe() {
+        if std::env::var_os("OPENSHELL_TEST_RAW_IDENTITY_SOURCE").is_none() {
+            return;
+        }
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("1".into()),
+            run_as_group: Some("1".into()),
+        });
+
+        assert!(validate_sandbox_user(&policy).is_err());
+        assert!(validate_sandbox_group(&policy).is_err());
+        assert!(!should_chown_sandbox_home(false, false));
+    }
+
+    #[test]
+    fn raw_identity_source_is_not_managed_authorization() {
+        let output = std::process::Command::new(std::env::current_exe().expect("current exe"))
+            .arg("raw_identity_source_probe")
+            .arg("--nocapture")
+            .env(openshell_core::sandbox_env::IDENTITY_SOURCE, "image")
+            .env("OPENSHELL_TEST_RAW_IDENTITY_SOURCE", "1")
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped())
+            .output()
+            .expect("spawn raw identity source probe");
+        assert!(
+            output.status.success(),
+            "raw identity source probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[tokio::test]

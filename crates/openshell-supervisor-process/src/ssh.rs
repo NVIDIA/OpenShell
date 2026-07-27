@@ -6,7 +6,9 @@
 use crate::child_env;
 #[cfg(target_os = "linux")]
 use crate::managed_children;
-use crate::process::{ProcessEnforcementMode, drop_privileges, is_supervisor_only_env_var};
+#[cfg(not(target_os = "linux"))]
+use crate::process::drop_privileges;
+use crate::process::{ProcessEnforcementMode, is_supervisor_only_env_var};
 use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
@@ -681,10 +683,28 @@ impl Default for PtyRequest {
     }
 }
 
-/// Derive session presentation from the resolved identity with legacy fallback.
-fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
-    let identity = child_env::identity_env_vars(policy);
-    (identity[1].1.clone(), identity[0].1.clone())
+/// Derive session presentation without changing legacy unmanaged behavior.
+fn session_user_and_home(policy: &SandboxPolicy) -> (String, String, bool) {
+    if let Some(identity) = child_env::identity_env_vars(policy) {
+        return (identity[1].1.clone(), identity[0].1.clone(), true);
+    }
+
+    match policy.process.run_as_user.as_deref() {
+        Some(user) if !user.is_empty() => {
+            if user.parse::<u32>().is_ok() {
+                return (user.to_string(), "/sandbox".to_string(), false);
+            }
+            let home = nix::unistd::User::from_name(user)
+                .ok()
+                .flatten()
+                .map_or_else(
+                    || format!("/home/{user}"),
+                    |resolved| resolved.dir.to_string_lossy().into_owned(),
+                );
+            (user.to_string(), home, false)
+        }
+        _ => ("sandbox".to_string(), "/sandbox".to_string(), false),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -692,6 +712,7 @@ fn apply_child_env(
     cmd: &mut Command,
     session_home: &str,
     session_user: &str,
+    managed_identity: bool,
     term: &str,
     proxy_url: Option<&str>,
     ca_file_paths: Option<&(PathBuf, PathBuf)>,
@@ -702,6 +723,8 @@ fn apply_child_env(
 
     cmd.env_clear()
         .env(openshell_core::sandbox_env::SANDBOX, "1")
+        .env("HOME", session_home)
+        .env("USER", session_user)
         .env("SHELL", "/bin/bash")
         .env("PATH", &path)
         .env("TERM", term);
@@ -731,10 +754,12 @@ fn apply_child_env(
         cmd.env(key, value);
     }
 
-    // Identity environment is authoritative over user/provider input.
-    cmd.env("HOME", session_home)
-        .env("USER", session_user)
-        .env("LOGNAME", session_user);
+    if managed_identity {
+        // Managed identity presentation is authoritative over user/provider input.
+        cmd.env("HOME", session_home)
+            .env("USER", session_user)
+            .env("LOGNAME", session_user);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -790,11 +815,12 @@ fn spawn_pty_shell(
 
     // Derive USER and HOME from the policy's run_as_user when available,
     // falling back to "sandbox" / "/sandbox" for backward compatibility.
-    let (session_user, session_home) = session_user_and_home(policy);
+    let (session_user, session_home, managed_identity) = session_user_and_home(policy);
     apply_child_env(
         &mut cmd,
         &session_home,
         &session_user,
+        managed_identity,
         term,
         proxy_url.as_deref(),
         ca_file_paths.as_deref(),
@@ -942,11 +968,12 @@ fn spawn_pipe_exec(
         },
     );
 
-    let (session_user, session_home) = session_user_and_home(policy);
+    let (session_user, session_home, managed_identity) = session_user_and_home(policy);
     apply_child_env(
         &mut cmd,
         &session_home,
         &session_user,
+        managed_identity,
         "dumb",
         proxy_url.as_deref(),
         ca_file_paths.as_deref(),
@@ -1079,10 +1106,10 @@ fn spawn_pipe_exec(
 
 mod unsafe_pty {
     #[cfg(not(target_os = "linux"))]
+    use super::drop_privileges;
+    #[cfg(not(target_os = "linux"))]
     use super::sandbox;
-    use super::{
-        Command, ProcessEnforcementMode, RawFd, SandboxPolicy, Winsize, drop_privileges, setsid,
-    };
+    use super::{Command, ProcessEnforcementMode, RawFd, SandboxPolicy, Winsize, setsid};
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
 
@@ -1136,6 +1163,16 @@ mod unsafe_pty {
         } else {
             None
         };
+        #[cfg(target_os = "linux")]
+        let privilege_drop = if enforcement_mode.uses_privileged_process_setup() {
+            Some(
+                crate::process::prepare_privilege_drop(&policy).map_err(|err| {
+                    anyhow::anyhow!("failed to prepare child privilege drop: {err}")
+                })?,
+            )
+        } else {
+            None
+        };
         unsafe {
             cmd.pre_exec(move || {
                 setsid().map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -1147,6 +1184,8 @@ mod unsafe_pty {
                     enforcement_mode,
                     #[cfg(target_os = "linux")]
                     supervisor_identity_mount,
+                    #[cfg(target_os = "linux")]
+                    privilege_drop.as_ref(),
                     #[cfg(target_os = "linux")]
                     prepared.take(),
                 )
@@ -1184,6 +1223,16 @@ mod unsafe_pty {
         } else {
             None
         };
+        #[cfg(target_os = "linux")]
+        let privilege_drop = if enforcement_mode.uses_privileged_process_setup() {
+            Some(
+                crate::process::prepare_privilege_drop(&policy).map_err(|err| {
+                    anyhow::anyhow!("failed to prepare child privilege drop: {err}")
+                })?,
+            )
+        } else {
+            None
+        };
         unsafe {
             cmd.pre_exec(move || {
                 enter_netns_and_sandbox(
@@ -1192,6 +1241,8 @@ mod unsafe_pty {
                     enforcement_mode,
                     #[cfg(target_os = "linux")]
                     supervisor_identity_mount,
+                    #[cfg(target_os = "linux")]
+                    privilege_drop.as_ref(),
                     #[cfg(target_os = "linux")]
                     prepared.take(),
                 )
@@ -1207,8 +1258,11 @@ mod unsafe_pty {
         #[cfg(target_os = "linux")] supervisor_identity_mount: Option<
             &crate::process::SupervisorIdentityMountNamespace,
         >,
+        #[cfg(target_os = "linux")] privilege_drop: Option<&crate::process::PrivilegeDropPlan>,
         #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
     ) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        let _ = (policy, enforcement_mode);
         // Enter network namespace before dropping privileges.
         // This ensures SSH shell processes are isolated to the same
         // network namespace as the entrypoint, forcing all traffic
@@ -1230,8 +1284,11 @@ mod unsafe_pty {
             mount.enter_for_child()?;
         }
 
-        // Drop privileges. initgroups/setgid/setuid need /etc/group and
-        // /etc/passwd which would be blocked if Landlock were already enforced.
+        #[cfg(target_os = "linux")]
+        if let Some(plan) = privilege_drop {
+            plan.apply()?;
+        }
+        #[cfg(not(target_os = "linux"))]
         if enforcement_mode.uses_privileged_process_setup() {
             drop_privileges(policy).map_err(|err| std::io::Error::other(err.to_string()))?;
         }
@@ -1648,10 +1705,11 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home, managed) = session_user_and_home(&policy);
         assert_eq!(user, "1000");
         // Numeric UID has no passwd entry — defaults to /sandbox.
         assert_eq!(home, "/sandbox");
+        assert!(!managed);
     }
 
     #[test]
@@ -1669,9 +1727,10 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home, managed) = session_user_and_home(&policy);
         assert_eq!(user, "sandbox");
-        assert_eq!(home, "/sandbox");
+        assert!(!home.is_empty());
+        assert!(!managed);
     }
 
     #[test]
@@ -1689,9 +1748,10 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home, managed) = session_user_and_home(&policy);
         assert_eq!(user, "sandbox");
         assert_eq!(home, "/sandbox");
+        assert!(!managed);
     }
 
     #[test]
@@ -1709,9 +1769,10 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home, managed) = session_user_and_home(&policy);
         assert_eq!(user, "sandbox");
         assert_eq!(home, "/sandbox");
+        assert!(!managed);
     }
 
     #[test]
@@ -1729,9 +1790,55 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home, managed) = session_user_and_home(&policy);
         assert_eq!(user, "1000660000");
         assert_eq!(home, "/sandbox");
+        assert!(!managed);
+    }
+
+    #[test]
+    fn ssh_child_env_only_makes_managed_identity_authoritative() {
+        let user_environment = HashMap::from([
+            ("HOME".to_string(), "/legacy-home".to_string()),
+            ("USER".to_string(), "legacy-user".to_string()),
+            ("LOGNAME".to_string(), "legacy-logname".to_string()),
+        ]);
+
+        for (managed, expected_home, expected_user, expected_logname) in [
+            (false, "/legacy-home", "legacy-user", "legacy-logname"),
+            (true, "/sandbox", "managed-user", "managed-user"),
+        ] {
+            let mut cmd = Command::new("/usr/bin/env");
+            cmd.stdout(Stdio::piped());
+            apply_child_env(
+                &mut cmd,
+                "/sandbox",
+                "managed-user",
+                managed,
+                "dumb",
+                None,
+                None,
+                &HashMap::new(),
+                &user_environment,
+            );
+            let output = cmd.output().unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == format!("HOME={expected_home}"))
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == format!("USER={expected_user}"))
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == format!("LOGNAME={expected_logname}"))
+            );
+        }
     }
 
     /// `install_pre_exec_no_pty` runs drop_privileges and succeeds when the

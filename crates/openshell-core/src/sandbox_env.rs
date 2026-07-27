@@ -133,6 +133,15 @@ pub const IMAGE_ID: &str = "OPENSHELL_IMAGE_ID";
 /// Current schema version for resolved agent identity exchange.
 pub const RESOLVED_AGENT_IDENTITY_VERSION: u32 = 1;
 
+/// Return true when an OCI `Config.User` token explicitly selects UID or GID 0.
+#[must_use]
+pub fn oci_user_explicitly_selects_root(value: &str) -> bool {
+    value.split(':').take(2).any(|token| {
+        let token = token.trim();
+        token == "root" || token.parse::<u32>() == Ok(0)
+    })
+}
+
 /// Source used to select the agent process identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -226,6 +235,16 @@ mod tests {
         let proto = crate::proto::ResolvedAgentIdentity::from(&identity);
         assert_eq!(proto.source, "fixed");
         assert_eq!(proto.image_id, "sha256:fixed-image");
+    }
+
+    #[test]
+    fn explicit_oci_root_tokens_are_detected() {
+        for value in ["root", "0", "00:1000", "app:root", "1000:0"] {
+            assert!(oci_user_explicitly_selects_root(value), "{value}");
+        }
+        for value in ["app", "1000", "app:staff", "1000:1000"] {
+            assert!(!oci_user_explicitly_selects_root(value), "{value}");
+        }
     }
 }
 

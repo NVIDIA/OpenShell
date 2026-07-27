@@ -166,7 +166,9 @@ impl Drop for Fixture {
 #[tokio::test]
 #[serial_test::serial]
 async fn passwdless_numeric_user_preserves_declared_identity() {
-    require_image_identity_mode();
+    if !image_identity_mode_enabled() {
+        return;
+    }
     let output = run_fixture(
         "numeric",
         NUMERIC_DOCKERFILE,
@@ -185,7 +187,9 @@ async fn passwdless_numeric_user_preserves_declared_identity() {
 #[tokio::test]
 #[serial_test::serial]
 async fn named_user_uses_passwd_primary_group() {
-    require_image_identity_mode();
+    if !image_identity_mode_enabled() {
+        return;
+    }
     let output = run_fixture("named", NAMED_DOCKERFILE, &[], &["sh", "-lc", PROBE_SCRIPT])
         .await
         .expect("run named-user image");
@@ -198,8 +202,33 @@ async fn named_user_uses_passwd_primary_group() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn fixed_identity_preserves_configured_identity() {
+    let Some((uid, gid)) = fixed_identity_config() else {
+        return;
+    };
+    let output = run_fixture(
+        "fixed",
+        NUMERIC_DOCKERFILE,
+        &[],
+        &["sh", "-lc", PROBE_SCRIPT],
+    )
+    .await
+    .expect("run fixed-identity image");
+
+    assert_probe(
+        &output,
+        &format!(
+            "OPENSHELL_IDENTITY_PROBE uid={uid} gid={gid} groups={gid} home=/sandbox user={uid} logname={uid} passwd=absent group=absent marker=numeric-image-marker write=sandbox-write-ok"
+        ),
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn missing_and_root_user_declarations_fail_provisioning() {
-    require_image_identity_mode();
+    if !image_identity_mode_enabled() {
+        return;
+    }
     for (name, dockerfile, expected) in [
         (
             "missing-user",
@@ -209,9 +238,7 @@ async fn missing_and_root_user_declarations_fail_provisioning() {
         (
             "root-user",
             ROOT_USER_DOCKERFILE,
-            // Local-driver watcher conditions intentionally do not include
-            // supervisor stderr; the stable E2E contract is terminal failure.
-            "sandbox entered error phase while provisioning",
+            "OCI Config.User must not explicitly select root",
         ),
     ] {
         let error = run_fixture(name, dockerfile, &[], &["true"])
@@ -228,7 +255,9 @@ async fn missing_and_root_user_declarations_fail_provisioning() {
 #[tokio::test]
 #[serial_test::serial]
 async fn image_identity_rejects_external_bind_and_named_volume_mounts() {
-    require_image_identity_mode();
+    if !image_identity_mode_enabled() {
+        return;
+    }
     let bind_directory = tempfile::tempdir().expect("create rejected bind source");
     let bind_source = path_string(bind_directory.path()).expect("bind source path is UTF-8");
     let driver = local_driver();
@@ -355,12 +384,23 @@ fn assert_probe(output: &str, expected: &str) {
     assert_eq!(record, expected, "unexpected identity probe record");
 }
 
-fn require_image_identity_mode() {
-    assert_eq!(
-        std::env::var("OPENSHELL_E2E_IDENTITY_SOURCE").as_deref(),
-        Ok("image"),
-        "custom image identity tests require an explicitly image-mode gateway"
-    );
+fn image_identity_mode_enabled() -> bool {
+    std::env::var("OPENSHELL_E2E_IDENTITY_SOURCE").as_deref() == Ok("image")
+}
+
+fn fixed_identity_config() -> Option<(u32, u32)> {
+    if std::env::var("OPENSHELL_E2E_IDENTITY_SOURCE").as_deref() != Ok("fixed") {
+        return None;
+    }
+    let uid = std::env::var("OPENSHELL_E2E_FIXED_UID")
+        .expect("fixed mode must export OPENSHELL_E2E_FIXED_UID")
+        .parse()
+        .expect("fixed UID must be numeric");
+    let gid = std::env::var("OPENSHELL_E2E_FIXED_GID")
+        .expect("fixed mode must export OPENSHELL_E2E_FIXED_GID")
+        .parse()
+        .expect("fixed GID must be numeric");
+    Some((uid, gid))
 }
 
 fn local_driver() -> String {

@@ -34,7 +34,11 @@ rejects bind and named-volume mounts that could have incompatible ownership.
 Both local drivers override the image entrypoint and OCI user so the supervisor
 starts as `0:0`. They pass the inspected image metadata or fixed IDs through
 driver-owned environment entries that template, request, and image environment
-values cannot replace. The supervisor then resolves the identity once and
+values cannot replace. They also pass a driver-owned
+`--managed-local-identity` argv assertion. The supervisor requires that
+assertion to agree with the gateway's creation marker; either mismatch fails
+startup, closing mixed-version paths that could otherwise fall back to legacy
+identity behavior. The supervisor then resolves the identity once and
 normalizes the process policy to its numeric UID and GID before launching any
 agent child.
 
@@ -49,9 +53,12 @@ does not require account-file entries, but still rejects UID or GID 0.
 The first successful resolution is persisted at
 `/var/lib/openshell/agent-identity.json` and bound to the immutable image ID,
 identity source, and source-specific inputs. A restart fails if those inputs do
-not match the persisted record. Managed children receive no supplementary
-groups: child setup clears and verifies the group list before `setgid` and
-`setuid`, and aborts the launch if it cannot prove the list is empty.
+not match the persisted record. Before each fork, the parent resolves credential
+identity and any NSS state, validates the UID/GID namespace maps, and computes
+the supplementary-group transition. The post-fork child applies only the
+precomputed credential syscalls. Managed children receive no supplementary
+groups; launch aborts unless child setup can clear and verify the group list
+before `setgid` and `setuid`.
 
 The gateway persists `SandboxStatus.managed_identity_required = true` when it
 creates a Docker- or Podman-managed sandbox. This creation-time marker is the
@@ -61,15 +68,21 @@ interpret Docker/Podman source and image metadata. Kubernetes masks and VM
 strips those environment keys as defense in depth, so an image cannot opt either
 runtime into this protocol.
 
-Before exposing SSH or launching the direct entrypoint, a marked supervisor
-sends the resolved identity in `SupervisorHello`. The gateway validates the
-schema version, source, non-empty immutable image ID, non-root UID/GID, and
-empty supplementary-group list. It atomically stores the first identity in
+The supervisor first binds the SSH Unix socket in its root-only directory, then
+opens the managed supervisor session and sends the resolved identity in
+`SupervisorHello`. Binding creates the local relay target but does not expose a
+relay or launch an agent child. The gateway validates the schema version,
+source, non-empty immutable image ID, non-root UID/GID, and empty
+supplementary-group list. It atomically stores the first identity in
 `SandboxStatus.resolved_identity`; later sessions must match it exactly. The
-supervisor proceeds only after `SessionAccepted`, and fails closed if the
-gateway rejects the identity or does not accept it before the startup timeout.
-The supervisor also emits an informational OCSF configuration-state event with
-the resolved source, image ID, UID, GID, and empty supplementary-group list.
+supervisor exposes the relay and launches the direct entrypoint only after
+`SessionAccepted.resolved_identity_version` exactly acknowledges the reported
+schema version. Rejection, a mismatched acknowledgement, or failure to accept
+before the startup timeout fails startup. After acceptance, transient session
+disconnects reconnect with backoff; permanent rejection terminates the agent
+child. The supervisor also emits an informational OCSF configuration-state
+event with the resolved source, image ID, UID, GID, and empty
+supplementary-group list.
 
 Filesystem preparation changes ownership only where required. For a
 driver-selected identity, it changes the `/sandbox` directory itself but never
@@ -88,14 +101,18 @@ The implementation lives in
    command.
 2. The supervisor loads policy and runtime settings from local files or the
    gateway, depending on mode.
-3. For a marked local sandbox, it resolves and persists the numeric agent
-   identity. It then prepares filesystem access, process restrictions, network
+3. For a managed local sandbox, it requires the driver's argv assertion to
+   match the gateway's creation marker, then resolves and persists the numeric
+   agent identity. It prepares filesystem access, process restrictions, network
    namespace routing, trust stores, provider credentials, and inference routes.
-4. It starts the policy proxy and opens the outbound supervisor session. A
-   marked sandbox waits for gateway identity acceptance.
-5. It starts the local SSH server and launches the agent command. Direct and SSH
-   children drop to the same resolved identity before executing user code.
-6. The supervisor session carries connect, exec, file sync, config polling, and
+4. It starts the policy proxy and binds the root-only SSH socket.
+5. It opens the managed supervisor session. The gateway persists the identity
+   and returns the exact schema-version acknowledgement before relay exposure
+   or agent child launch.
+6. It launches the direct agent command; subsequent SSH requests can launch
+   additional children. Both paths drop to the same resolved identity before
+   executing user code.
+7. The supervisor session carries connect, exec, file sync, config polling, and
    log traffic for the lifetime of the sandbox.
 
 ## Isolation Layers
@@ -370,5 +387,6 @@ engine with a gateway policy revision.
 - Existing raw byte streams are connection scoped. Dynamic policy changes apply
   to new connections or the next parsed HTTP request where the proxy can safely
   re-evaluate.
-- If the supervisor relay drops, the sandbox can keep running, but connect and
-  exec operations fail until the supervisor registers again.
+- Supervisor sessions reconnect after transient failures. A permanent managed
+  session rejection terminates the agent child; a legacy sandbox can keep
+  running without its relay, but connect and exec fail.

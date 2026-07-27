@@ -3583,6 +3583,30 @@ mod tests {
     }
 
     #[test]
+    fn driver_config_allows_local_identity_sensitive_mount_targets() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [{
+                    "name": "user-data",
+                    "persistent_volume_claim": {"claim_name": "pvc-user-data"}
+                }],
+                "containers": {
+                    "agent": {
+                        "volume_mounts": [{
+                            "name": "user-data",
+                            "mount_path": "/etc/passwd"
+                        }]
+                    }
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        KubernetesSandboxDriverConfig::from_template(&template)
+            .expect("local-driver identity mount restrictions must not affect Kubernetes");
+    }
+
+    #[test]
     fn driver_config_rejects_kubernetes_static_protected_mount_targets() {
         let spec = SandboxSpec {
             template: Some(SandboxTemplate {

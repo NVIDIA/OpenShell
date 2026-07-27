@@ -600,6 +600,15 @@ impl PodmanComputeDriver {
                 "sandbox image '{image}' must declare a non-empty OCI Config.User when identity_source = 'image'"
             )));
         }
+        if self.config.identity_source == IdentitySource::Image
+            && openshell_core::sandbox_env::oci_user_explicitly_selects_root(
+                &sandbox_image.config.user,
+            )
+        {
+            return Err(ComputeDriverError::Precondition(format!(
+                "sandbox image '{image}' OCI Config.User must not explicitly select root"
+            )));
+        }
 
         let mut image_mount_ids = BTreeMap::new();
         for image in container::podman_driver_image_mount_sources(

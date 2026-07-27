@@ -219,9 +219,8 @@ pub async fn run_process(
 
     let ssh_socket_path: Option<std::path::PathBuf> = ssh_socket_path.map(std::path::PathBuf::from);
 
-    // A marked sandbox must persist its exact identity at the gateway before
-    // exposing either the SSH child-launch path or the direct entrypoint path.
-    if managed_identity_required {
+    // Validate managed session inputs before exposing any local services.
+    let managed_session = if managed_identity_required {
         let identity = resolved_identity.clone().ok_or_else(|| {
             miette::miette!(
                 "gateway requires managed agent identity, but no resolved identity is available"
@@ -234,17 +233,15 @@ pub async fn run_process(
                 "gateway requires managed agent identity, but supervisor session metadata is incomplete (endpoint, sandbox ID, and SSH socket are required)"
             ));
         };
-        let (_session, ready) = crate::supervisor_session::spawn(
+        Some((
             endpoint.to_string(),
             id.to_string(),
             socket.clone(),
-            ssh_netns_fd,
-            None,
-            Some(identity),
-        );
-        info!("supervisor session task spawned");
-        await_managed_identity_acceptance(ready).await?;
-    }
+            identity,
+        ))
+    } else {
+        None
+    };
 
     if let Some(listen_path) = ssh_socket_path.clone() {
         let policy_clone = policy.clone();
@@ -318,6 +315,27 @@ pub async fn run_process(
         }
     }
 
+    // A managed session starts only after SSH has bound its relay target. The
+    // direct entrypoint remains gated on the gateway identity acknowledgement.
+    let managed_session_handle = if let Some((endpoint, id, socket, identity)) = managed_session {
+        let (session, ready) = crate::supervisor_session::spawn(
+            endpoint,
+            id,
+            socket,
+            ssh_netns_fd,
+            None,
+            Some(identity),
+        );
+        info!("supervisor session task spawned");
+        if let Err(error) = await_managed_identity_acceptance(ready).await {
+            session.abort();
+            return Err(error);
+        }
+        Some(session)
+    } else {
+        None
+    };
+
     // Legacy sessions preserve the prior ordering: bind SSH first, then start
     // the gateway relay session without blocking entrypoint launch.
     if !managed_identity_required
@@ -378,26 +396,41 @@ pub async fn run_process(
             .build()
     );
 
-    // Wait for process with optional timeout
-    let result = if timeout_secs > 0 {
-        if let Ok(result) = timeout(Duration::from_secs(timeout_secs), handle.wait()).await {
-            result
-        } else {
-            ocsf_emit!(
-                ProcessActivityBuilder::new(ocsf_ctx())
-                    .activity(ActivityId::Close)
-                    .action(ActionId::Denied)
-                    .disposition(DispositionId::Blocked)
-                    .severity(SeverityId::Critical)
-                    .status(StatusId::Failure)
-                    .message("Process timed out, killing")
-                    .build()
-            );
-            handle.kill()?;
-            return Ok(124); // Standard timeout exit code
+    // Managed sessions are part of the child lifetime. Legacy sessions remain
+    // detached from entrypoint supervision.
+    let result = if let Some(mut session) = managed_session_handle {
+        tokio::select! {
+            biased;
+            result = wait_for_entrypoint(&mut handle, timeout_secs) => {
+                session.abort();
+                let _ = session.await;
+                result
+            }
+            session_result = &mut session => {
+                let reason = managed_session_terminal_reason(session_result);
+                if let Err(error) = handle.kill() {
+                    tracing::warn!(error = %error, "Failed to terminate entrypoint after supervisor session ended");
+                }
+                return Err(miette::miette!(reason));
+            }
         }
     } else {
-        handle.wait().await
+        wait_for_entrypoint(&mut handle, timeout_secs).await
+    };
+
+    let Some(result) = result else {
+        ocsf_emit!(
+            ProcessActivityBuilder::new(ocsf_ctx())
+                .activity(ActivityId::Close)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Critical)
+                .status(StatusId::Failure)
+                .message("Process timed out, killing")
+                .build()
+        );
+        handle.kill()?;
+        return Ok(124); // Standard timeout exit code
     };
 
     let status = result.into_diagnostic()?;
@@ -417,14 +450,38 @@ pub async fn run_process(
     Ok(status.code())
 }
 
+async fn wait_for_entrypoint(
+    handle: &mut ProcessHandle,
+    timeout_secs: u64,
+) -> Option<std::io::Result<crate::process::ProcessStatus>> {
+    if timeout_secs > 0 {
+        timeout(Duration::from_secs(timeout_secs), handle.wait())
+            .await
+            .ok()
+    } else {
+        Some(handle.wait().await)
+    }
+}
+
+fn managed_session_terminal_reason(
+    result: Result<Result<(), String>, tokio::task::JoinError>,
+) -> String {
+    match result {
+        Ok(Err(reason)) => reason,
+        Ok(Ok(())) => "managed supervisor session ended unexpectedly".to_string(),
+        Err(error) => error.to_string(),
+    }
+}
+
 async fn await_managed_identity_acceptance(
-    ready: tokio::sync::oneshot::Receiver<()>,
+    ready: tokio::sync::oneshot::Receiver<Result<(), String>>,
 ) -> Result<()> {
     match timeout(MANAGED_IDENTITY_SESSION_TIMEOUT, ready).await {
-        Ok(Ok(())) => {
+        Ok(Ok(Ok(()))) => {
             info!("managed agent identity accepted by gateway");
             Ok(())
         }
+        Ok(Ok(Err(reason))) => Err(miette::miette!(reason)),
         Ok(Err(_)) => Err(miette::miette!(
             "supervisor session ended before managed agent identity was accepted"
         )),
@@ -554,35 +611,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_identity_gate_blocks_ssh_and_direct_setup_until_acceptance() {
+    async fn managed_identity_gate_blocks_direct_setup_until_acceptance() {
         let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
         let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
-        let ssh_setup = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let direct_setup = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ssh_setup_task = Arc::clone(&ssh_setup);
         let direct_setup_task = Arc::clone(&direct_setup);
 
         let gated_setup = tokio::spawn(async move {
             waiting_tx.send(()).unwrap();
             await_managed_identity_acceptance(accept_rx).await.unwrap();
-            ssh_setup_task.store(true, Ordering::Release);
             direct_setup_task.store(true, Ordering::Release);
         });
 
         waiting_rx.await.unwrap();
         tokio::task::yield_now().await;
-        assert!(!ssh_setup.load(Ordering::Acquire));
         assert!(!direct_setup.load(Ordering::Acquire));
 
-        accept_tx.send(()).unwrap();
+        accept_tx.send(Ok(())).unwrap();
         gated_setup.await.unwrap();
-        assert!(ssh_setup.load(Ordering::Acquire));
         assert!(direct_setup.load(Ordering::Acquire));
     }
 
     #[tokio::test]
     async fn managed_identity_gate_fails_when_session_ends_before_acceptance() {
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         drop(tx);
         let error = await_managed_identity_acceptance(rx)
             .await
@@ -591,6 +643,34 @@ mod tests {
             error
                 .to_string()
                 .contains("before managed agent identity was accepted")
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_identity_gate_propagates_permanent_rejection() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Err("resolved identity does not match".to_string()))
+            .unwrap();
+
+        let error = await_managed_identity_acceptance(rx)
+            .await
+            .expect_err("rejection must keep launch gate closed");
+        assert_eq!(error.to_string(), "resolved identity does not match");
+    }
+
+    #[test]
+    fn managed_session_terminal_result_preserves_permanent_reason() {
+        let reason =
+            managed_session_terminal_reason(Ok(Err("persisted identity mismatch".to_string())));
+
+        assert_eq!(reason, "persisted identity mismatch");
+    }
+
+    #[test]
+    fn clean_managed_session_termination_is_unexpected() {
+        assert_eq!(
+            managed_session_terminal_reason(Ok(Ok(()))),
+            "managed supervisor session ended unexpectedly"
         );
     }
 }

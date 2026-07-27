@@ -133,6 +133,12 @@ pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
             ));
         }
     }
+    Ok(())
+}
+
+/// Reject mount targets that overlap managed local identity inputs or state.
+pub fn validate_local_identity_mount_target(target: &str) -> Result<(), String> {
+    let path = Path::new(target);
     for sensitive in IDENTITY_SENSITIVE_MOUNT_TARGETS {
         let sensitive = Path::new(sensitive);
         if path_is_or_under(path, sensitive) || path_is_or_under(sensitive, path) {
@@ -195,10 +201,11 @@ mod tests {
     }
 
     #[test]
-    fn container_target_rejects_identity_sensitive_paths_and_descendants() {
+    fn local_identity_target_rejects_sensitive_paths_and_descendants() {
         for &sensitive in IDENTITY_SENSITIVE_MOUNT_TARGETS {
             for target in [sensitive.to_string(), format!("{sensitive}/shadowed")] {
-                let err = validate_container_mount_target(&target).unwrap_err();
+                validate_container_mount_target(&target).unwrap();
+                let err = validate_local_identity_mount_target(&target).unwrap_err();
 
                 assert!(
                     err.contains("overlaps identity-sensitive path"),
@@ -213,9 +220,10 @@ mod tests {
     }
 
     #[test]
-    fn container_target_rejects_identity_sensitive_path_ancestors() {
+    fn local_identity_target_rejects_sensitive_path_ancestors() {
         for target in ["/etc", "/var", "/var/lib", "/proc", "/proc/self"] {
-            let err = validate_container_mount_target(target).unwrap_err();
+            validate_container_mount_target(target).unwrap();
+            let err = validate_local_identity_mount_target(target).unwrap_err();
 
             assert!(
                 err.contains("overlaps identity-sensitive path"),
@@ -225,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn container_target_allows_identity_path_prefix_near_misses() {
+    fn local_identity_target_allows_sensitive_path_prefix_near_misses() {
         for target in [
             "/etc-agent",
             "/etc/passwd-cache",
@@ -237,7 +245,7 @@ mod tests {
             "/proc/self/gid_map-backup",
             "/proc/self/setgroups-backup",
         ] {
-            validate_container_mount_target(target)
+            validate_local_identity_mount_target(target)
                 .unwrap_or_else(|err| panic!("unexpected error for {target}: {err}"));
         }
     }

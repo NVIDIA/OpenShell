@@ -4,6 +4,7 @@
 //! Safe image identity resolution and creation-time persistence.
 
 use miette::{Context, IntoDiagnostic, Result};
+use openshell_core::policy::SandboxPolicy;
 use openshell_core::sandbox_env::{IdentitySource, ResolvedAgentIdentity};
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
 use std::ffi::{OsStr, OsString};
@@ -132,12 +133,32 @@ pub fn resolve_and_persist_agent_identity() -> Result<Option<ResolvedAgentIdenti
     Ok(identity)
 }
 
-/// Presentation name selected during image/fixed identity resolution.
+/// Installed local identity when it matches the normalized process policy.
 #[must_use]
-pub fn resolved_presentation_user() -> Option<&'static str> {
-    RESOLVED_IDENTITY
-        .get()
-        .map(|identity| identity.presentation_user.as_str())
+pub fn managed_local_resolved_identity(
+    policy: &SandboxPolicy,
+) -> Option<&'static ResolvedAgentIdentity> {
+    managed_local_resolved_identity_from(policy, RESOLVED_IDENTITY.get())
+}
+
+fn managed_local_resolved_identity_from<'a>(
+    policy: &SandboxPolicy,
+    identity: Option<&'a ResolvedAgentIdentity>,
+) -> Option<&'a ResolvedAgentIdentity> {
+    identity.filter(|identity| {
+        policy
+            .process
+            .run_as_user
+            .as_deref()
+            .and_then(|uid| uid.parse().ok())
+            == Some(identity.uid)
+            && policy
+                .process
+                .run_as_group
+                .as_deref()
+                .and_then(|gid| gid.parse().ok())
+                == Some(identity.gid)
+    })
 }
 
 /// Resolve an OCI `USER` declaration using alternate account-file paths.
@@ -360,11 +381,7 @@ fn parse_oci_user(value: &str) -> Result<(&str, Option<&str>)> {
 }
 
 fn validate_identity_token(value: &str, kind: &str) -> Result<()> {
-    if value.len() > MAX_ACCOUNT_FIELD_SIZE
-        || value
-            .bytes()
-            .any(|byte| byte == b'\0' || byte == b'\n' || byte == b'\r')
-    {
+    if value.len() > MAX_ACCOUNT_FIELD_SIZE || value.chars().any(char::is_control) {
         return Err(miette::miette!("OCI USER {kind} field is invalid"));
     }
     Ok(())
@@ -544,9 +561,9 @@ fn parse_account_lines<T>(
         let fields: Vec<&str> = line.split(':').collect();
         if fields.len() != expected_fields
             || fields[0].is_empty()
-            || fields
-                .iter()
-                .any(|field| field.len() > MAX_ACCOUNT_FIELD_SIZE)
+            || fields.iter().any(|field| {
+                field.len() > MAX_ACCOUNT_FIELD_SIZE || field.chars().any(char::is_control)
+            })
         {
             return Err(miette::miette!(
                 "malformed account entry in {} at line {line_number}",
@@ -1148,6 +1165,7 @@ mod tests {
             "app:",
             "app:staff:extra",
             " app",
+            "app\u{7}",
             "root",
             "rootish",
             "1234",
@@ -1167,6 +1185,9 @@ mod tests {
             "staff:x:2345:\n",
         );
         assert!(resolve_image_identity_at("app", "sha256:test", &passwd, &group).is_err());
+
+        std::fs::write(&passwd, "app\u{7}:x:1234:1235::/home/app:/bin/sh\n").unwrap();
+        assert!(resolve_image_identity_at("app\u{7}", "sha256:test", &passwd, &group).is_err());
 
         std::fs::write(
             &passwd,

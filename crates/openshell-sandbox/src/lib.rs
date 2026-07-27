@@ -89,6 +89,18 @@ fn resolve_identity_if_required<T>(
     )
 }
 
+fn validate_managed_local_identity_launch(
+    driver_managed_local_identity: bool,
+    gateway_managed_identity_required: bool,
+) -> Result<()> {
+    if driver_managed_local_identity != gateway_managed_identity_required {
+        return Err(miette::miette!(
+            "managed local identity launch mismatch: driver flag is {driver_managed_local_identity}, gateway marker is {gateway_managed_identity_required}"
+        ));
+    }
+    Ok(())
+}
+
 /// Run a command in the sandbox.
 ///
 /// # Errors
@@ -110,6 +122,7 @@ pub async fn run_sandbox(
     policy_rules: Option<String>,
     policy_data: Option<String>,
     ssh_socket_path: Option<String>,
+    managed_local_identity: bool,
     _health_check: bool,
     _health_port: u16,
     inference_routes: Option<String>,
@@ -201,6 +214,8 @@ pub async fn run_sandbox(
         )
         .await?
     };
+
+    validate_managed_local_identity_launch(managed_local_identity, managed_identity_required)?;
 
     // Only the gateway-persisted creation marker authorizes protected local
     // identity metadata. Unmarked legacy/offline sandboxes deliberately ignore
@@ -3544,6 +3559,14 @@ filesystem_policy:
         })
         .unwrap();
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn managed_local_identity_launch_requires_driver_and_gateway_agreement() {
+        assert!(validate_managed_local_identity_launch(false, false).is_ok());
+        assert!(validate_managed_local_identity_launch(true, true).is_ok());
+        assert!(validate_managed_local_identity_launch(true, false).is_err());
+        assert!(validate_managed_local_identity_launch(false, true).is_err());
     }
 
     // ---- Initial policy acknowledgement tests ----

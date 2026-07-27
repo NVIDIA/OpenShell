@@ -1567,6 +1567,33 @@ fn driver_config_rejects_reserved_mount_targets() {
 }
 
 #[test]
+fn driver_config_rejects_local_identity_sensitive_mount_targets() {
+    for target in ["/etc", "/etc/passwd", "/var/lib/openshell/state"] {
+        let mut sandbox = test_sandbox();
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = Some(json_struct(serde_json::json!({
+            "mounts": [{
+                "type": "volume",
+                "source": "work-nfs",
+                "target": target
+            }]
+        })));
+
+        let err = build_container_create_body(&sandbox, &fixed_runtime_config()).unwrap_err();
+        assert!(
+            err.message().contains("identity-sensitive path"),
+            "expected {target} to be rejected, got {err}"
+        );
+    }
+}
+
+#[test]
 fn docker_local_volume_with_bind_option_is_bind_backed() {
     let volume = inspected_volume(
         "local",
@@ -1651,14 +1678,17 @@ fn managed_container_label_filters_include_gateway_namespace() {
 }
 
 #[test]
-fn build_container_create_body_clears_inherited_cmd() {
+fn build_container_create_body_sets_managed_local_identity_launch_flag() {
     let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
 
     assert_eq!(
         create_body.entrypoint,
         Some(vec![SUPERVISOR_MOUNT_PATH.to_string()])
     );
-    assert_eq!(create_body.cmd, Some(Vec::new()));
+    assert_eq!(
+        create_body.cmd,
+        Some(vec![MANAGED_LOCAL_IDENTITY_FLAG.to_string()])
+    );
     assert_eq!(
         create_body
             .labels
@@ -2220,11 +2250,15 @@ fn driver_status_keeps_running_sandboxes_provisioning_with_stable_message() {
         "Container is running; waiting for supervisor relay"
     );
     assert_eq!(running_status.conditions, running_later_status.conditions);
+    assert_eq!(running_status.conditions[1].r#type, "RuntimeReady");
+    assert_eq!(running_status.conditions[1].status, "true");
 
     let exited_status = driver_status_from_summary(&exited, "demo", false);
     assert_eq!(exited_status.conditions[0].status, "False");
     assert_eq!(exited_status.conditions[0].reason, "ContainerExited");
     assert_eq!(exited_status.conditions[0].message, "Container exited");
+    assert_eq!(exited_status.conditions[1].r#type, "RuntimeReady");
+    assert_eq!(exited_status.conditions[1].status, "false");
 
     // With a live supervisor session, a RUNNING container flips Ready=True
     // so ExecSandbox and other "sandbox must be ready" gates can proceed.

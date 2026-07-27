@@ -68,6 +68,14 @@ const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str =
 const SUPERVISOR_MOUNT_DIR: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
 /// Full path to the supervisor binary inside sandbox containers.
 const SUPERVISOR_BINARY_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
+const MANAGED_LOCAL_IDENTITY_FLAG: &str = "--managed-local-identity";
+const PROTECTED_IDENTITY_ENVIRONMENT: [&str; 5] = [
+    openshell_core::sandbox_env::IDENTITY_SOURCE,
+    openshell_core::sandbox_env::IMAGE_USER,
+    openshell_core::sandbox_env::IMAGE_ID,
+    openshell_core::sandbox_env::SANDBOX_UID,
+    openshell_core::sandbox_env::SANDBOX_GID,
+];
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -188,6 +196,7 @@ struct ContainerSpec {
     image: String,
     labels: BTreeMap<String, String>,
     env: BTreeMap<String, String>,
+    unsetenv: Vec<String>,
     volumes: Vec<NamedVolume>,
     image_volumes: Vec<ImageVolume>,
     hostname: String,
@@ -433,13 +442,7 @@ fn build_env(
             user_env.insert(k.clone(), v.clone());
         }
     }
-    for key in [
-        openshell_core::sandbox_env::IDENTITY_SOURCE,
-        openshell_core::sandbox_env::IMAGE_USER,
-        openshell_core::sandbox_env::IMAGE_ID,
-        openshell_core::sandbox_env::SANDBOX_UID,
-        openshell_core::sandbox_env::SANDBOX_GID,
-    ] {
+    for key in PROTECTED_IDENTITY_ENVIRONMENT {
         user_env.remove(key);
     }
     env.extend(user_env.clone());
@@ -850,6 +853,7 @@ fn validate_podman_driver_mounts(
             }
         };
         driver_mounts::validate_container_mount_target(target)?;
+        driver_mounts::validate_local_identity_mount_target(target)?;
         let normalized_target = driver_mounts::normalize_mount_target(target);
         if !targets.insert(normalized_target.clone()) {
             return Err(format!(
@@ -1012,6 +1016,13 @@ pub fn build_provisioned_container_spec_with_token_and_gpu_devices(
                 .to_string(),
         ));
     }
+    if config.identity_source == IdentitySource::Image
+        && openshell_core::sandbox_env::oci_user_explicitly_selects_root(&images.sandbox_user)
+    {
+        return Err(ComputeDriverError::Precondition(
+            "sandbox image OCI Config.User must not explicitly select root".to_string(),
+        ));
+    }
 
     let requested_image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
@@ -1071,6 +1082,12 @@ pub fn build_provisioned_container_spec_with_token_and_gpu_devices(
         image: images.sandbox_id.clone(),
         labels,
         env,
+        // Remove every protected image Config.Env entry before applying the
+        // authoritative values above, including mode-inapplicable keys.
+        unsetenv: PROTECTED_IDENTITY_ENVIRONMENT
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         volumes,
         // Side-load the supervisor binary from a standalone OCI image.
         // Podman resolves image_volumes at the libpod layer, mounting the
@@ -1086,10 +1103,14 @@ pub fn build_provisioned_container_spec_with_token_and_gpu_devices(
         // Without this, the container would run the entrypoint binary with
         // the supervisor path as an argument instead of executing it directly.
         entrypoint: vec![SUPERVISOR_BINARY_PATH.into()],
-        // Operator-owned corporate proxy flags. The workload command is not
-        // part of argv (the supervisor takes it from the reserved command
-        // env var), so these flags are the whole command list.
-        command: upstream_proxy_cli_args(config),
+        // The local-identity launch assertion and operator-owned corporate
+        // proxy flags travel on argv. The workload command remains in the
+        // reserved environment variable.
+        command: {
+            let mut args = vec![MANAGED_LOCAL_IDENTITY_FLAG.to_string()];
+            args.extend(upstream_proxy_cli_args(config));
+            args
+        },
         // Force the supervisor to run as root (UID 0). Sandbox images may
         // set a non-root USER directive (e.g. `USER sandbox`), but the
         // supervisor needs root to create network namespaces, set up the
@@ -1926,6 +1947,16 @@ mod tests {
     }
 
     #[test]
+    fn container_spec_sets_managed_local_identity_launch_flag() {
+        let spec = build_container_spec(&test_sandbox("test-id", "test-name"), &test_config());
+
+        assert_eq!(
+            spec_command(&spec),
+            vec![MANAGED_LOCAL_IDENTITY_FLAG.to_string()]
+        );
+    }
+
+    #[test]
     fn container_spec_sandbox_env_cannot_influence_proxy_argv() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
@@ -2223,6 +2254,14 @@ mod tests {
         )
         .unwrap();
         let env = spec["env"].as_object().unwrap();
+        let unsetenv = spec["unsetenv"].as_array().unwrap();
+
+        for key in PROTECTED_IDENTITY_ENVIRONMENT {
+            assert!(
+                unsetenv.iter().any(|value| value.as_str() == Some(key)),
+                "image identity key {key} must be removed from image environment"
+            );
+        }
 
         assert_eq!(
             env[openshell_core::sandbox_env::IDENTITY_SOURCE].as_str(),
@@ -2887,6 +2926,24 @@ mod tests {
         let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
 
         assert!(err.to_string().contains("reserved OpenShell path"));
+    }
+
+    #[test]
+    fn driver_config_rejects_local_identity_sensitive_mount_targets() {
+        for target in ["/etc", "/etc/passwd", "/var/lib/openshell/state"] {
+            let sandbox = sandbox_with_mount(serde_json::json!({
+                "type": "volume",
+                "source": "work-nfs",
+                "target": target
+            }));
+
+            let err = try_build_container_spec_with_token(&sandbox, &fixed_test_config(), None)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("identity-sensitive path"),
+                "expected {target} to be rejected, got {err}"
+            );
+        }
     }
 
     #[test]

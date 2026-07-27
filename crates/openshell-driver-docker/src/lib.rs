@@ -75,6 +75,7 @@ const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_P
 const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
 const SANDBOX_COMMAND: &str = "sleep infinity";
+const MANAGED_LOCAL_IDENTITY_FLAG: &str = "--managed-local-identity";
 const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
@@ -1666,6 +1667,16 @@ fn validate_docker_image_metadata(
             "docker image '{image}' must declare a non-empty OCI Config.User when identity_source = 'image'"
         )));
     }
+    if identity.source == IdentitySource::Image
+        && metadata
+            .user
+            .as_deref()
+            .is_some_and(openshell_core::sandbox_env::oci_user_explicitly_selects_root)
+    {
+        return Err(Status::failed_precondition(format!(
+            "docker image '{image}' OCI Config.User must not explicitly select root"
+        )));
+    }
     Ok(())
 }
 
@@ -2076,6 +2087,8 @@ fn validate_docker_driver_mounts(
             }
         };
         driver_mounts::validate_container_mount_target(target)
+            .map_err(Status::failed_precondition)?;
+        driver_mounts::validate_local_identity_mount_target(target)
             .map_err(Status::failed_precondition)?;
         let normalized_target = driver_mounts::normalize_mount_target(target);
         if !targets.insert(normalized_target.clone()) {
@@ -2585,9 +2598,9 @@ fn build_container_create_body_with_gpu_devices(
         user: Some("0".to_string()),
         env: Some(build_environment(sandbox, config, image)),
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
-        // Clear the image CMD so Docker does not append inherited args to the
-        // supervisor entrypoint.
-        cmd: Some(Vec::new()),
+        // The argv-only flag binds local-driver launch intent to the gateway's
+        // persisted managed-identity marker. Older supervisors reject it.
+        cmd: Some(vec![MANAGED_LOCAL_IDENTITY_FLAG.to_string()]),
         labels: Some(labels),
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,
@@ -3029,19 +3042,39 @@ fn driver_status_from_summary(
 ) -> DriverSandboxStatus {
     let state = summary.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
     let (ready, reason, message, deleting) = container_ready_condition(state, supervisor_connected);
+    let runtime_ready = state == ContainerSummaryStateEnum::RUNNING;
 
     DriverSandboxStatus {
         sandbox_name: summary_container_name(summary).unwrap_or_else(|| sandbox_name.to_string()),
         instance_id: summary.id.clone().unwrap_or_default(),
         agent_fd: String::new(),
         sandbox_fd: String::new(),
-        conditions: vec![DriverCondition {
-            r#type: "Ready".to_string(),
-            status: ready.to_string(),
-            reason: reason.to_string(),
-            message: message.to_string(),
-            last_transition_time: String::new(),
-        }],
+        conditions: vec![
+            DriverCondition {
+                r#type: "Ready".to_string(),
+                status: ready.to_string(),
+                reason: reason.to_string(),
+                message: message.to_string(),
+                last_transition_time: String::new(),
+            },
+            DriverCondition {
+                r#type: "RuntimeReady".to_string(),
+                status: runtime_ready.to_string(),
+                reason: if runtime_ready {
+                    "ContainerRunning"
+                } else {
+                    reason
+                }
+                .to_string(),
+                message: if runtime_ready {
+                    "Container runtime is running"
+                } else {
+                    message
+                }
+                .to_string(),
+                last_transition_time: String::new(),
+            },
+        ],
         deleting,
     }
 }

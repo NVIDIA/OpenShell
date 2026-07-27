@@ -17,14 +17,14 @@ use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, RelayOpenResult, SupervisorHeartbeat,
-    SupervisorHello, SupervisorMessage, TcpRelayTarget, gateway_message, relay_open,
-    supervisor_message,
+    GatewayMessage, RelayFrame, RelayInit, RelayOpen, RelayOpenResult, SessionAccepted,
+    SupervisorHeartbeat, SupervisorHello, SupervisorMessage, TcpRelayTarget, gateway_message,
+    relay_open, supervisor_message,
 };
 use openshell_core::sandbox_env::ResolvedAgentIdentity as RuntimeResolvedAgentIdentity;
 use openshell_ocsf::{
-    ActivityId, ConnectionInfo, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext,
-    SeverityId, StatusId, ocsf_emit,
+    ActivityId, ConnectionInfo, DetectionFindingBuilder, Endpoint, FindingInfo,
+    NetworkActivityBuilder, OcsfEvent, SandboxContext, SeverityId, StatusId, ocsf_emit,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -35,6 +35,87 @@ use openshell_core::grpc_client;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+pub type SessionTask = tokio::task::JoinHandle<Result<(), String>>;
+pub type SessionReadiness = oneshot::Receiver<Result<(), String>>;
+
+#[derive(Debug)]
+enum SessionError {
+    Transient(String),
+    Permanent(String),
+}
+
+impl SessionError {
+    fn transient(reason: impl Into<String>) -> Self {
+        Self::Transient(reason.into())
+    }
+
+    fn permanent(reason: impl Into<String>) -> Self {
+        Self::Permanent(reason.into())
+    }
+
+    fn is_permanent(&self) -> bool {
+        matches!(self, Self::Permanent(_))
+    }
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(reason) | Self::Permanent(reason) => f.write_str(reason),
+        }
+    }
+}
+
+fn is_permanent_status(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::InvalidArgument
+            | tonic::Code::NotFound
+            | tonic::Code::AlreadyExists
+            | tonic::Code::PermissionDenied
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::OutOfRange
+            | tonic::Code::Unimplemented
+            | tonic::Code::DataLoss
+            | tonic::Code::Unauthenticated
+    )
+}
+
+fn session_status_error(status: tonic::Status) -> SessionError {
+    if is_permanent_status(status.code()) {
+        SessionError::permanent(status.message())
+    } else {
+        SessionError::transient(format!("connect_supervisor RPC failed: {status}"))
+    }
+}
+
+fn accept_session(
+    message: GatewayMessage,
+    managed_identity: bool,
+) -> Result<SessionAccepted, SessionError> {
+    match message.payload {
+        Some(gateway_message::Payload::SessionAccepted(accepted)) => {
+            if managed_identity
+                && accepted.resolved_identity_version
+                    != openshell_core::sandbox_env::RESOLVED_AGENT_IDENTITY_VERSION
+            {
+                return Err(SessionError::permanent(format!(
+                    "gateway acknowledged resolved identity version {}; expected {}",
+                    accepted.resolved_identity_version,
+                    openshell_core::sandbox_env::RESOLVED_AGENT_IDENTITY_VERSION
+                )));
+            }
+            Ok(accepted)
+        }
+        Some(gateway_message::Payload::SessionRejected(rejected)) => {
+            Err(SessionError::permanent(rejected.reason))
+        }
+        _ => Err(SessionError::permanent(
+            "expected SessionAccepted or SessionRejected",
+        )),
+    }
+}
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
 /// to treating the whole string as a domain if parsing fails.
@@ -83,16 +164,58 @@ fn session_failed_event(
     endpoint: &str,
     attempt: u64,
     error: &str,
+    reconnecting: bool,
 ) -> OcsfEvent {
+    let action = if reconnecting {
+        "reconnecting"
+    } else {
+        "stopping"
+    };
     NetworkActivityBuilder::new(ctx)
         .activity(ActivityId::Fail)
-        .severity(SeverityId::Low)
+        .severity(if reconnecting {
+            SeverityId::Low
+        } else {
+            SeverityId::High
+        })
         .status(StatusId::Failure)
         .dst_endpoint(ocsf_gateway_endpoint(endpoint))
         .message(format!(
-            "supervisor session failed, reconnecting (attempt {attempt}): {error}"
+            "supervisor session failed, {action} (attempt {attempt}): {error}"
         ))
         .build()
+}
+
+fn session_rejected_finding_event(ctx: &SandboxContext, attempt: u64, error: &str) -> OcsfEvent {
+    let attempt = attempt.to_string();
+    DetectionFindingBuilder::new(ctx)
+        .activity(ActivityId::Open)
+        .severity(SeverityId::High)
+        .is_alert(true)
+        .finding_info(
+            FindingInfo::new("supervisor-session-rejected", "Supervisor Session Rejected")
+                .with_desc("Gateway permanently rejected the supervisor identity or protocol"),
+        )
+        .evidence_pairs(&[("attempt", &attempt), ("reason", error)])
+        .message(format!(
+            "supervisor session permanently rejected (attempt {attempt}): {error}"
+        ))
+        .build()
+}
+
+fn propagate_permanent_error(
+    error: &SessionError,
+    ready_tx: &mut Option<oneshot::Sender<Result<(), String>>>,
+) -> Option<String> {
+    if !error.is_permanent() {
+        return None;
+    }
+
+    let reason = error.to_string();
+    if let Some(ready_tx) = ready_tx.take() {
+        let _ = ready_tx.send(Err(reason.clone()));
+    }
+    Some(reason)
 }
 
 fn relay_target_endpoint(open: &RelayOpen) -> Option<Endpoint> {
@@ -216,14 +339,14 @@ trait TargetStream: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T> TargetStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
-fn map_stream_message<T>(
+fn map_session_message<T>(
     message: Result<Option<T>, tonic::Status>,
     eof_error: &'static str,
-) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<T, SessionError> {
     match message {
         Ok(Some(msg)) => Ok(msg),
-        Ok(None) => Err(eof_error.into()),
-        Err(e) => Err(format!("stream error: {e}").into()),
+        Ok(None) => Err(SessionError::transient(eof_error)),
+        Err(status) => Err(session_status_error(status)),
     }
 }
 
@@ -238,7 +361,7 @@ pub fn spawn(
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
     resolved_identity: Option<RuntimeResolvedAgentIdentity>,
-) -> (tokio::task::JoinHandle<()>, oneshot::Receiver<()>) {
+) -> (SessionTask, SessionReadiness) {
     let (ready_tx, ready_rx) = oneshot::channel();
     let handle = tokio::spawn(run_session_loop(
         endpoint,
@@ -259,8 +382,8 @@ async fn run_session_loop(
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
     resolved_identity: Option<RuntimeResolvedAgentIdentity>,
-    mut ready_tx: Option<oneshot::Sender<()>>,
-) {
+    mut ready_tx: Option<oneshot::Sender<Result<(), String>>>,
+) -> Result<(), String> {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
 
@@ -282,16 +405,29 @@ async fn run_session_loop(
                 let event =
                     session_closed_event(openshell_ocsf::ctx::ctx(), &endpoint, &sandbox_id);
                 ocsf_emit!(event);
-                break;
+                return Ok(());
             }
             Err(e) => {
+                let permanent = e.is_permanent();
                 let event = session_failed_event(
                     openshell_ocsf::ctx::ctx(),
                     &endpoint,
                     attempt,
                     &e.to_string(),
+                    !permanent,
                 );
                 ocsf_emit!(event);
+                if permanent {
+                    let finding = session_rejected_finding_event(
+                        openshell_ocsf::ctx::ctx(),
+                        attempt,
+                        &e.to_string(),
+                    );
+                    ocsf_emit!(finding);
+                }
+                if let Some(reason) = propagate_permanent_error(&e, &mut ready_tx) {
+                    return Err(reason);
+                }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
@@ -306,15 +442,15 @@ async fn run_single_session(
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
     resolved_identity: Option<&RuntimeResolvedAgentIdentity>,
-    ready_tx: &mut Option<oneshot::Sender<()>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ready_tx: &mut Option<oneshot::Sender<Result<(), String>>>,
+) -> Result<(), SessionError> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
     // every relay rides the same TCP+TLS+HTTP/2 connection — no new TLS
     // handshake per relay.
     let channel = grpc_client::connect_channel_pub(endpoint)
         .await
-        .map_err(|e| format!("connect failed: {e}"))?;
+        .map_err(|e| SessionError::transient(format!("connect failed: {e}")))?;
     let mut client = OpenShellClient::new(channel.clone());
 
     // Create the outbound message stream.
@@ -331,32 +467,25 @@ async fn run_single_session(
         ))),
     })
     .await
-    .map_err(|_| "failed to queue hello")?;
+    .map_err(|_| SessionError::transient("failed to queue hello"))?;
 
     // Open the bidirectional stream.
     let response = client
         .connect_supervisor(outbound)
         .await
-        .map_err(|e| format!("connect_supervisor RPC failed: {e}"))?;
+        .map_err(session_status_error)?;
     let mut inbound = response.into_inner();
 
     // Wait for SessionAccepted.
-    let accepted = match map_stream_message(
+    let first = map_session_message(
         inbound.message().await,
         "stream closed before session accepted",
-    )?
-    .payload
-    {
-        Some(gateway_message::Payload::SessionAccepted(a)) => a,
-        Some(gateway_message::Payload::SessionRejected(r)) => {
-            return Err(format!("session rejected: {}", r.reason).into());
-        }
-        _ => return Err("expected SessionAccepted or SessionRejected".into()),
-    };
+    )?;
+    let accepted = accept_session(first, resolved_identity.is_some())?;
 
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
     if let Some(ready_tx) = ready_tx.take() {
-        let _ = ready_tx.send(());
+        let _ = ready_tx.send(Ok(()));
     }
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
@@ -374,7 +503,7 @@ async fn run_single_session(
     loop {
         tokio::select! {
             msg = inbound.message() => {
-                let msg = map_stream_message(msg, "gateway closed stream")?;
+                let msg = map_session_message(msg, "gateway closed stream")?;
                 handle_gateway_message(
                     &msg,
                     sandbox_id,
@@ -392,7 +521,7 @@ async fn run_single_session(
                     )),
                 };
                 if tx.send(hb).await.is_err() {
-                    return Err("outbound channel closed".into());
+                    return Err(SessionError::transient("outbound channel closed"));
                 }
             }
         }
@@ -739,6 +868,16 @@ fn normalize_tcp_target_host(target: &TcpRelayTarget) -> Result<String, String> 
 mod target_tests {
     use super::*;
 
+    fn accepted(identity_version: u32) -> GatewayMessage {
+        GatewayMessage {
+            payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
+                session_id: "session".to_string(),
+                heartbeat_interval_secs: 15,
+                resolved_identity_version: identity_version,
+            })),
+        }
+    }
+
     fn tcp(host: &str, port: u32) -> TcpRelayTarget {
         TcpRelayTarget {
             host: host.to_string(),
@@ -812,6 +951,89 @@ mod target_tests {
     fn legacy_supervisor_hello_omits_resolved_identity() {
         let hello = supervisor_hello("sbx", "instance", None);
         assert!(hello.resolved_identity.is_none());
+    }
+
+    #[test]
+    fn managed_session_requires_exact_identity_acknowledgement() {
+        let version = openshell_core::sandbox_env::RESOLVED_AGENT_IDENTITY_VERSION;
+        accept_session(accepted(version), true).expect("exact version must be accepted");
+
+        let error = accept_session(accepted(0), true)
+            .expect_err("legacy acknowledgement must not release managed launch gate");
+        assert!(error.is_permanent());
+        assert_eq!(
+            error.to_string(),
+            format!("gateway acknowledged resolved identity version 0; expected {version}")
+        );
+    }
+
+    #[test]
+    fn legacy_session_ignores_identity_acknowledgement_version() {
+        accept_session(accepted(0), false).expect("legacy session must remain compatible");
+    }
+
+    #[test]
+    fn explicit_rejection_is_permanent_and_preserves_reason() {
+        let message = GatewayMessage {
+            payload: Some(gateway_message::Payload::SessionRejected(
+                openshell_core::proto::SessionRejected {
+                    reason: "resolved identity rejected".to_string(),
+                },
+            )),
+        };
+
+        let error = accept_session(message, true).expect_err("rejection must be permanent");
+        assert!(error.is_permanent());
+        assert_eq!(error.to_string(), "resolved identity rejected");
+    }
+
+    #[test]
+    fn tonic_status_classification_preserves_permanent_reason() {
+        let permanent = session_status_error(tonic::Status::failed_precondition(
+            "persisted identity mismatch",
+        ));
+        assert!(permanent.is_permanent());
+        assert_eq!(permanent.to_string(), "persisted identity mismatch");
+
+        let transient = session_status_error(tonic::Status::unavailable("gateway restarting"));
+        assert!(!transient.is_permanent());
+    }
+
+    #[tokio::test]
+    async fn permanent_error_before_acceptance_reaches_readiness_and_terminal_result() {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let mut ready_tx = Some(ready_tx);
+        let error = SessionError::permanent("resolved identity rejected");
+
+        let terminal = propagate_permanent_error(&error, &mut ready_tx)
+            .expect("permanent error must terminate the session loop");
+
+        assert_eq!(terminal, "resolved identity rejected");
+        assert_eq!(
+            ready_rx.await.expect("readiness sender must respond"),
+            Err("resolved identity rejected".to_string())
+        );
+    }
+
+    #[test]
+    fn permanent_error_after_acceptance_preserves_terminal_reason() {
+        let mut ready_tx = None;
+        let error = SessionError::permanent("persisted identity mismatch");
+
+        assert_eq!(
+            propagate_permanent_error(&error, &mut ready_tx).as_deref(),
+            Some("persisted identity mismatch")
+        );
+    }
+
+    #[test]
+    fn transient_error_does_not_produce_terminal_result() {
+        let (ready_tx, _ready_rx) = oneshot::channel();
+        let mut ready_tx = Some(ready_tx);
+        let error = SessionError::transient("gateway restarting");
+
+        assert_eq!(propagate_permanent_error(&error, &mut ready_tx), None);
+        assert!(ready_tx.is_some());
     }
 
     #[test]
@@ -927,8 +1149,8 @@ mod ocsf_event_tests {
     }
 
     #[test]
-    fn session_failed_emits_network_fail_low() {
-        let event = session_failed_event(&ctx(), "https://gw:443", 3, "connect refused");
+    fn transient_session_failure_emits_low_reconnecting_event() {
+        let event = session_failed_event(&ctx(), "https://gw:443", 3, "connect refused", true);
         let na = network_activity(&event);
         assert_eq!(na.base.activity_id, ActivityId::Fail.as_u8());
         assert_eq!(na.base.severity, SeverityId::Low);
@@ -936,6 +1158,30 @@ mod ocsf_event_tests {
         let msg = na.base.message.as_deref().unwrap_or_default();
         assert!(msg.contains("attempt 3"), "message: {msg}");
         assert!(msg.contains("connect refused"), "message: {msg}");
+        assert!(msg.contains("reconnecting"), "message: {msg}");
+    }
+
+    #[test]
+    fn permanent_session_failure_emits_high_stopping_event_and_finding() {
+        let event = session_failed_event(
+            &ctx(),
+            "https://gw:443",
+            2,
+            "resolved identity rejected",
+            false,
+        );
+        let na = network_activity(&event);
+        assert_eq!(na.base.severity, SeverityId::High);
+        let msg = na.base.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("stopping"), "message: {msg}");
+
+        let finding = session_rejected_finding_event(&ctx(), 2, "resolved identity rejected");
+        let OcsfEvent::DetectionFinding(finding) = finding else {
+            panic!("expected DetectionFinding");
+        };
+        assert_eq!(finding.base.severity, SeverityId::High);
+        assert_eq!(finding.finding_info.uid, "supervisor-session-rejected");
+        assert_eq!(finding.is_alert, Some(true));
     }
 
     #[test]
@@ -1010,10 +1256,25 @@ mod ocsf_event_tests {
     }
 
     #[test]
-    fn map_stream_message_treats_eof_as_reconnectable_error() {
-        let err = map_stream_message::<SupervisorMessage>(Ok(None), "gateway closed stream")
+    fn map_session_message_treats_eof_as_reconnectable_error() {
+        let err = map_session_message::<SupervisorMessage>(Ok(None), "gateway closed stream")
             .expect_err("eof should force reconnect");
+        assert!(!err.is_permanent());
         assert_eq!(err.to_string(), "gateway closed stream");
+    }
+
+    #[test]
+    fn map_session_message_preserves_permanent_stream_status() {
+        let err = map_session_message::<SupervisorMessage>(
+            Err(tonic::Status::failed_precondition(
+                "persisted identity mismatch",
+            )),
+            "gateway closed stream",
+        )
+        .expect_err("permanent stream status must stop reconnecting");
+
+        assert!(err.is_permanent());
+        assert_eq!(err.to_string(), "persisted identity mismatch");
     }
 
     #[cfg(target_os = "linux")]

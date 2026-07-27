@@ -89,6 +89,12 @@ container engine starts. Docker implements this flow in
 `crates/openshell-driver-podman/src/container.rs`. Supervisor resolution and
 persistence live in `crates/openshell-supervisor-process/src/identity.rs`.
 
+The gateway marks each newly created Docker or Podman sandbox as requiring
+managed identity. The driver independently appends the driver-owned
+`--managed-local-identity` argument to the supervisor command. The supervisor
+requires the argument and gateway marker to agree; an image, environment
+variable, or policy cannot opt into or out of the contract.
+
 ```mermaid
 sequenceDiagram
     participant Gateway
@@ -101,12 +107,22 @@ sequenceDiagram
     Driver->>Engine: Resolve or pull requested image
     Driver->>Engine: Inspect selected image
     Engine-->>Driver: Immutable image ID + OCI Config.User
-    Driver->>Engine: Create by immutable ID with root supervisor
+    Driver->>Engine: Create by immutable ID as root with managed identity flag
     Engine->>Supervisor: Start in selected image rootfs
-    Supervisor->>Supervisor: Resolve and persist UID/GID
-    Supervisor->>Gateway: ConnectSupervisor(resolved identity)
-    Gateway-->>Supervisor: Persisted identity accepted
+    Supervisor->>Gateway: Load policy and managed-identity marker
+    Supervisor->>Supervisor: Assert driver argument equals gateway marker
+    Supervisor->>Supervisor: Resolve and persist versioned UID/GID record
+    Supervisor->>Supervisor: Bind root-only SSH relay socket
+    par Independent readiness signals
+        Engine-->>Driver: Workload runtime is running
+        Driver-->>Gateway: Runtime readiness
+    and Managed identity handshake
+        Supervisor->>Gateway: SupervisorHello(identity version N)
+        Gateway->>Gateway: Validate exact version and persist identity
+        Gateway-->>Supervisor: SessionAccepted(resolved_identity_version=N)
+    end
     Supervisor->>Agent: Clear groups, setgid, setuid, exec
+    Gateway->>Gateway: Publish Ready after both signals
 ```
 
 Docker inspects a local hit or the result of a pull and passes the returned image
@@ -121,7 +137,7 @@ Both drivers insert the identity source, immutable image ID, and required
 identity inputs after image and request environment, so the sandbox image cannot
 override them. Docker sets the container user to `0`; Podman sets it to `0:0`.
 Those values apply only to the supervisor, which needs root for namespace,
-mount, network, filesystem, and privilege-drop setup.
+mount, network, filesystem, SSH relay binding, and privilege-drop setup.
 
 ### Identity Modes
 
@@ -143,16 +159,33 @@ files.
 Before the first agent starts, the supervisor stores the resolved identity in
 `/var/lib/openshell/agent-identity.json`, bound to the immutable image ID and,
 for image mode, the raw OCI user declaration. It reports the same versioned
-record to the gateway. The gateway persists the source, image ID, UID, GID, and
-empty supplementary-group set and rejects a missing or changed record on later
-connections. Restarts reuse the persisted identity rather than resolving a
-mutable tag again.
+record to the gateway. Before sending the record, the root supervisor binds the
+SSH relay socket in its root-only directory; no agent child exists and the
+gateway relay is not active yet. The gateway persists the source, image ID, UID,
+GID, and empty supplementary-group set and rejects a missing or changed record
+on later connections. Restarts reuse the persisted identity rather than
+resolving a mutable tag again.
 
-The gateway marks new Docker and Podman sandboxes as requiring this managed
-identity and rejects creator-supplied `process.run_as_user` or
+Managed sessions use an exact-version acknowledgement. The gateway accepts only
+its current `ResolvedAgentIdentity` schema version and returns that version in
+`SessionAccepted.resolved_identity_version`; the supervisor proceeds only when
+the acknowledgement exactly matches its own version. There is no version-range
+negotiation or downgrade. Mixed gateway and supervisor versions therefore fail
+closed during rolling upgrades: a managed agent child does not start against an
+incompatible gateway, and an incompatible reconnect permanently rejects and
+terminates an already running workload.
+
+Managed readiness requires both runtime readiness and an accepted supervisor
+session. A transient session disconnect demotes readiness while the supervisor
+reconnects with backoff; it does not terminate the workload. A permanent session
+rejection terminates the workload. Initial startup also fails closed if the
+gateway does not accept the session before its bounded startup timeout.
+
+The gateway rejects creator-supplied `process.run_as_user` or
 `process.run_as_group`; those policy fields cannot override the runtime's
-selection. Existing containers without the creation marker retain their legacy
-policy-derived identity and are not reinterpreted during upgrade.
+selection. Existing containers created without the gateway marker and argv
+assertion retain their legacy policy-derived identity and are not reinterpreted
+during upgrade.
 
 ### External Mount Boundary
 
@@ -171,6 +204,10 @@ Requested named volumes must already exist, and the driver inspects them to
 detect bind-backed storage. User mounts cannot replace the driver-owned
 workspace root, supervisor, token, or TLS paths, and cannot overlap
 identity-sensitive account, identity-state, or UID/GID-map paths.
+
+The identity-sensitive target restrictions are specific to Docker and Podman
+driver-config mounts. They do not change Kubernetes mount validation or the
+Kubernetes identity model.
 
 Host bind mounts remain an unsafe operator override because they place gateway
 host filesystem state inside the sandbox and can negate workspace isolation and

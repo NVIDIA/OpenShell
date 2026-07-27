@@ -137,6 +137,19 @@ impl SupervisorSessionRegistry {
         }
     }
 
+    /// Queue the acceptance before making the session available to relay callers.
+    async fn queue_acceptance_and_register(
+        &self,
+        sandbox_id: String,
+        session_id: String,
+        tx: mpsc::Sender<GatewayMessage>,
+        shutdown: oneshot::Sender<()>,
+        accepted: GatewayMessage,
+    ) -> Result<bool, mpsc::error::SendError<GatewayMessage>> {
+        tx.send(accepted).await?;
+        Ok(self.register(sandbox_id, session_id, tx, shutdown))
+    }
+
     /// Report whether a live supervisor session is registered for a sandbox.
     ///
     /// Used by compute drivers that need to surface "supervisor relay ready"
@@ -488,7 +501,7 @@ async fn validate_and_persist_supervisor_identity(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     incoming: Option<&ResolvedAgentIdentity>,
-) -> Result<(), Status> {
+) -> Result<u32, Status> {
     let _guard = state.compute.sandbox_sync_guard().await;
     for _ in 0..IDENTITY_CAS_RETRY_LIMIT {
         let sandbox = require_persisted_sandbox(&state.store, sandbox_id).await?;
@@ -509,7 +522,7 @@ async fn validate_and_persist_supervisor_identity(
                     "sandbox has a persisted identity without the managed identity requirement",
                 ));
             }
-            return Ok(());
+            return Ok(0);
         }
 
         let Some(identity) = incoming else {
@@ -525,7 +538,7 @@ async fn validate_and_persist_supervisor_identity(
                     "supervisor resolved identity does not match the persisted identity",
                 ));
             }
-            return Ok(());
+            return Ok(identity.version);
         }
 
         let expected_resource_version = sandbox
@@ -543,7 +556,7 @@ async fn validate_and_persist_supervisor_identity(
             Ok(updated) => {
                 state.sandbox_index.update_from_sandbox(&updated);
                 state.sandbox_watch_bus.notify(sandbox_id);
-                return Ok(());
+                return Ok(identity.version);
             }
             Err(crate::persistence::PersistenceError::Conflict { .. }) => {
                 tokio::task::yield_now().await;
@@ -709,25 +722,41 @@ pub async fn handle_connect_supervisor(
     if let Some(principal) = principal.as_ref() {
         crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
     }
-    validate_and_persist_supervisor_identity(state, &sandbox_id, hello.resolved_identity.as_ref())
-        .await?;
+    let resolved_identity_version = validate_and_persist_supervisor_identity(
+        state,
+        &sandbox_id,
+        hello.resolved_identity.as_ref(),
+    )
+    .await?;
 
     let session_id = Uuid::new_v4().to_string();
+    // Step 2: Queue SessionAccepted before publishing the outbound channel.
+    // Once registered, relay callers can enqueue behind it but never ahead of it.
+    let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let accepted = GatewayMessage {
+        payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
+            session_id: session_id.clone(),
+            heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
+            resolved_identity_version,
+        })),
+    };
+    let superseded = state
+        .supervisor_sessions
+        .queue_acceptance_and_register(
+            sandbox_id.clone(),
+            session_id.clone(),
+            tx.clone(),
+            shutdown_tx,
+            accepted,
+        )
+        .await
+        .map_err(|_| Status::internal("failed to send session accepted"))?;
     info!(
         sandbox_id = %sandbox_id,
         session_id = %session_id,
         instance_id = %hello.instance_id,
         "supervisor session: accepted"
-    );
-
-    // Step 2: Create the outbound channel and register the session.
-    let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let superseded = state.supervisor_sessions.register(
-        sandbox_id.clone(),
-        session_id.clone(),
-        tx.clone(),
-        shutdown_tx,
     );
     if superseded {
         info!(
@@ -737,22 +766,7 @@ pub async fn handle_connect_supervisor(
         );
     }
 
-    // Step 3: Send SessionAccepted.
-    let accepted = GatewayMessage {
-        payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
-            session_id: session_id.clone(),
-            heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
-        })),
-    };
-    if tx.send(accepted).await.is_err() {
-        // Only evict ourselves — a faster reconnect may already have
-        // superseded this registration.
-        state
-            .supervisor_sessions
-            .remove_if_current(&sandbox_id, &session_id);
-        return Err(Status::internal("failed to send session accepted"));
-    }
-
+    // Step 3: Reissue relay requests that were pending on a superseded session.
     if superseded {
         state
             .supervisor_sessions
@@ -1354,6 +1368,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_message_is_queued_before_registered_session_can_receive_relays() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel::<GatewayMessage>(4);
+        let accepted = GatewayMessage {
+            payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
+                session_id: "s1".to_string(),
+                heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
+                resolved_identity_version: 0,
+            })),
+        };
+
+        registry
+            .queue_acceptance_and_register(
+                "sbx".to_string(),
+                "s1".to_string(),
+                tx,
+                make_shutdown(),
+                accepted,
+            )
+            .await
+            .unwrap();
+        registry
+            .open_relay("sbx", Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            rx.recv().await.unwrap().payload,
+            Some(gateway_message::Payload::SessionAccepted(_))
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap().payload,
+            Some(gateway_message::Payload::RelayOpen(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_acceptance_does_not_register_session() {
+        let registry = SupervisorSessionRegistry::new();
+        let (tx, rx) = mpsc::channel::<GatewayMessage>(1);
+        drop(rx);
+
+        let result = registry
+            .queue_acceptance_and_register(
+                "sbx".to_string(),
+                "s1".to_string(),
+                tx,
+                make_shutdown(),
+                GatewayMessage {
+                    payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
+                        session_id: "s1".to_string(),
+                        heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
+                        resolved_identity_version: 0,
+                    })),
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(!registry.has_session("sbx"));
+    }
+
+    #[tokio::test]
     async fn replay_pending_relays_reissues_open_to_superseding_session() {
         let registry = SupervisorSessionRegistry::new();
         let (tx_old, mut rx_old) = mpsc::channel::<GatewayMessage>(4);
@@ -1493,9 +1570,11 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let identity = image_identity();
-        validate_and_persist_supervisor_identity(&state, "sbx-identity", Some(&identity))
-            .await
-            .expect("first hello must persist before acceptance");
+        let acknowledged_version =
+            validate_and_persist_supervisor_identity(&state, "sbx-identity", Some(&identity))
+                .await
+                .expect("first hello must persist before acceptance");
+        assert_eq!(acknowledged_version, identity.version);
 
         let stored = state
             .store
@@ -1565,9 +1644,10 @@ mod tests {
                 .put_message(&sandbox_record(id, name))
                 .await
                 .unwrap();
-            validate_and_persist_supervisor_identity(&state, id, None)
+            let acknowledged_version = validate_and_persist_supervisor_identity(&state, id, None)
                 .await
                 .expect("unmarked sandbox may omit identity");
+            assert_eq!(acknowledged_version, 0);
             let error = validate_and_persist_supervisor_identity(&state, id, Some(&identity))
                 .await
                 .expect_err("unmarked sandbox must reject supplied identity");

@@ -462,6 +462,8 @@ message SandboxStatus {
   openshell.sandbox.v1.ResolvedAgentIdentity resolved_identity = 8;
   // Whether this sandbox requires gateway-authorized managed runtime identity.
   bool managed_identity_required = 9;
+  // Whether the latest compute-driver status snapshot reported the runtime Ready.
+  bool runtime_ready = 10;
 }
 
 // User-facing sandbox condition derived from driver-native conditions.
@@ -1617,6 +1619,9 @@ message SessionAccepted {
   string session_id = 1;
   // Recommended heartbeat interval in seconds.
   uint32 heartbeat_interval_secs = 2;
+  // Managed identity schema version validated and persisted by the gateway.
+  // Zero means no managed identity was acknowledged (legacy session).
+  uint32 resolved_identity_version = 3;
 }
 
 // Gateway rejects the supervisor session.

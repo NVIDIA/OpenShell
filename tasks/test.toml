@@ -68,6 +68,13 @@ run = [
   "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker",
 ]
 
+["e2e:rust:fixed"]
+description = "Run Rust CLI e2e tests against a fixed-identity Docker gateway"
+env = { OPENSHELL_E2E_IDENTITY_SOURCE = "fixed", OPENSHELL_E2E_FIXED_UID = "3456", OPENSHELL_E2E_FIXED_GID = "3457" }
+run = [
+  "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker",
+]
+
 ["e2e:websocket-conformance"]
 description = "Run focused WebSocket conformance e2e tests against a Docker-backed gateway"
 run = [
@@ -90,6 +97,11 @@ run = "e2e/with-docker-gateway.sh uv run pytest -o python_files='test_*.py' -m '
 
 ["e2e:podman"]
 description = "Run Rust CLI e2e tests against a Podman-backed gateway"
+run = "e2e/rust/e2e-podman.sh"
+
+["e2e:podman:fixed"]
+description = "Run Rust CLI e2e tests against a fixed-identity Podman gateway"
+env = { OPENSHELL_E2E_IDENTITY_SOURCE = "fixed", OPENSHELL_E2E_FIXED_UID = "3456", OPENSHELL_E2E_FIXED_GID = "3457" }
 run = "e2e/rust/e2e-podman.sh"
 
 ["e2e:podman:rootless"]

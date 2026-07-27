@@ -1740,9 +1740,23 @@ impl ComputeRuntime {
         if current_phase == SandboxPhase::Deleting || current_phase == SandboxPhase::Error {
             return Ok(());
         }
-        if !connected && current_phase != SandboxPhase::Ready {
+        let status = existing.status.as_ref();
+        let managed_identity_required =
+            status.is_some_and(|status| status.managed_identity_required);
+        let runtime_ready = status.is_some_and(|status| status.runtime_ready);
+        let target_phase = if connected {
+            if !managed_identity_required || runtime_ready {
+                SandboxPhase::Ready
+            } else if current_phase == SandboxPhase::Ready {
+                SandboxPhase::Provisioning
+            } else {
+                return Ok(());
+            }
+        } else if current_phase == SandboxPhase::Ready {
+            SandboxPhase::Provisioning
+        } else {
             return Ok(());
-        }
+        };
         let expected_resource_version = sandbox_resource_version(&existing);
 
         // Use CAS to update sandbox phase based on supervisor session state
@@ -1750,13 +1764,14 @@ impl ComputeRuntime {
             .store
             .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
                 let sandbox_name = sandbox.object_name().to_string();
-                if connected {
+                if target_phase == SandboxPhase::Ready {
                     ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
-                    sandbox.set_phase(SandboxPhase::Ready as i32);
+                } else if connected {
+                    ensure_runtime_not_ready_status(&mut sandbox.status, &sandbox_name);
                 } else {
                     ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
-                    sandbox.set_phase(SandboxPhase::Provisioning as i32);
                 }
+                sandbox.set_phase(target_phase as i32);
             })
             .await;
 
@@ -2418,6 +2433,7 @@ fn public_status_from_driver(
     status: &DriverSandboxStatus,
     phase: SandboxPhase,
     current_policy_version: u32,
+    runtime_ready: bool,
 ) -> SandboxStatus {
     SandboxStatus {
         sandbox_name: status.sandbox_name.clone(),
@@ -2433,6 +2449,7 @@ fn public_status_from_driver(
         current_policy_version,
         resolved_identity: None,
         managed_identity_required: false,
+        runtime_ready,
     }
 }
 
@@ -2446,26 +2463,53 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
         .status
         .as_ref()
         .is_some_and(|status| status.managed_identity_required);
-    let mut phase = incoming
+    let previous_runtime_ready = sandbox
         .status
         .as_ref()
-        .map_or(old_phase, |status| derive_phase(Some(status)));
+        .is_some_and(|status| status.runtime_ready);
+    let driver_phase = incoming
+        .status
+        .as_ref()
+        .map(|status| derive_phase(Some(status)));
+    let runtime_ready = incoming
+        .status
+        .as_ref()
+        .map_or(previous_runtime_ready, runtime_ready_from_driver_status);
+    let mut phase = driver_phase.unwrap_or(old_phase);
     let sandbox_name = &incoming.name;
-    let supervisor_promoted =
-        session_connected && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown);
-    if supervisor_promoted {
+    let terminal_phase = matches!(phase, SandboxPhase::Error | SandboxPhase::Deleting);
+    let mut supervisor_ready = false;
+    let mut awaiting_managed_session = false;
+    if managed_identity_required && !terminal_phase {
+        if runtime_ready && session_connected {
+            phase = SandboxPhase::Ready;
+            supervisor_ready = true;
+        } else if runtime_ready {
+            phase = SandboxPhase::Provisioning;
+            awaiting_managed_session = true;
+        } else if phase == SandboxPhase::Ready {
+            phase = SandboxPhase::Provisioning;
+        }
+    } else if !managed_identity_required
+        && session_connected
+        && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown)
+    {
+        // Preserve legacy Kubernetes, VM, and unmanaged-driver readiness behavior.
         phase = SandboxPhase::Ready;
+        supervisor_ready = true;
     }
 
     let cpv = sandbox.current_policy_version();
     let mut status = incoming
         .status
         .as_ref()
-        .map(|status| public_status_from_driver(status, phase, cpv))
+        .map(|status| public_status_from_driver(status, phase, cpv, runtime_ready))
         .or_else(|| sandbox.status.clone());
     rewrite_user_facing_conditions(&mut status, sandbox.spec.as_ref());
-    if supervisor_promoted {
+    if supervisor_ready {
         ensure_supervisor_ready_status(&mut status, sandbox_name);
+    } else if awaiting_managed_session {
+        ensure_supervisor_not_ready_status(&mut status, sandbox_name);
     }
 
     if let Some(status) = status.as_mut()
@@ -2515,6 +2559,17 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
     sandbox.set_current_policy_version(cpv);
 }
 
+fn runtime_ready_from_driver_status(status: &DriverSandboxStatus) -> bool {
+    status
+        .conditions
+        .iter()
+        .find(|condition| condition.r#type == "RuntimeReady")
+        .map_or_else(
+            || derive_phase(Some(status)) == SandboxPhase::Ready,
+            |condition| condition.status.eq_ignore_ascii_case("true"),
+        )
+}
+
 fn ensure_supervisor_ready_status(status: &mut Option<SandboxStatus>, sandbox_name: &str) {
     upsert_ready_condition(
         status,
@@ -2538,6 +2593,20 @@ fn ensure_supervisor_not_ready_status(status: &mut Option<SandboxStatus>, sandbo
             status: "False".to_string(),
             reason: "DependenciesNotReady".to_string(),
             message: "Supervisor session disconnected".to_string(),
+            last_transition_time: String::new(),
+        },
+    );
+}
+
+fn ensure_runtime_not_ready_status(status: &mut Option<SandboxStatus>, sandbox_name: &str) {
+    upsert_ready_condition(
+        status,
+        sandbox_name,
+        SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: "DependenciesNotReady".to_string(),
+            message: "Sandbox runtime not ready".to_string(),
             last_transition_time: String::new(),
         },
     );
@@ -3630,6 +3699,73 @@ mod tests {
                 .as_ref()
                 .is_some_and(|status| status.managed_identity_required)
         );
+        assert!(sandbox.status.as_ref().unwrap().runtime_ready);
+    }
+
+    #[test]
+    fn managed_driver_ready_waits_for_supervisor_session() {
+        let mut sandbox = sandbox_record("sb-managed", "managed", SandboxPhase::Provisioning);
+        sandbox.status.as_mut().unwrap().managed_identity_required = true;
+
+        apply_driver_snapshot(
+            &mut sandbox,
+            &ready_driver_sandbox("sb-managed", "managed"),
+            false,
+        );
+
+        assert_eq!(
+            SandboxPhase::try_from(sandbox.phase()).unwrap(),
+            SandboxPhase::Provisioning
+        );
+        let ready = sandbox
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.r#type == "Ready")
+            })
+            .unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.message, "Supervisor session disconnected");
+        assert!(sandbox.status.as_ref().unwrap().runtime_ready);
+    }
+
+    #[test]
+    fn managed_driver_terminal_error_is_preserved_without_session() {
+        let mut sandbox = sandbox_record("sb-managed", "managed", SandboxPhase::Provisioning);
+        sandbox.status.as_mut().unwrap().managed_identity_required = true;
+        let mut failed = ready_driver_sandbox("sb-managed", "managed");
+        failed.status = Some(make_driver_status(make_driver_condition(
+            "ImagePullBackOff",
+            "Failed to pull image",
+        )));
+
+        apply_driver_snapshot(&mut sandbox, &failed, false);
+
+        assert_eq!(
+            SandboxPhase::try_from(sandbox.phase()).unwrap(),
+            SandboxPhase::Error
+        );
+        assert!(!sandbox.status.as_ref().unwrap().runtime_ready);
+    }
+
+    #[test]
+    fn unmanaged_driver_ready_does_not_wait_for_supervisor_session() {
+        let mut sandbox = sandbox_record("sb-legacy", "legacy", SandboxPhase::Provisioning);
+
+        apply_driver_snapshot(
+            &mut sandbox,
+            &ready_driver_sandbox("sb-legacy", "legacy"),
+            false,
+        );
+
+        assert_eq!(
+            SandboxPhase::try_from(sandbox.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        assert!(sandbox.status.as_ref().unwrap().runtime_ready);
     }
 
     #[test]
@@ -5109,6 +5245,7 @@ mod tests {
                 last_transition_time: String::new(),
             }],
             current_policy_version: 7,
+            runtime_ready: true,
             ..Default::default()
         });
         sandbox.set_phase(SandboxPhase::Ready as i32);
@@ -5137,6 +5274,7 @@ mod tests {
             SandboxPhase::Ready
         );
         assert_eq!(stored.current_policy_version(), 7);
+        assert!(stored.status.as_ref().unwrap().runtime_ready);
         let ready = stored
             .status
             .as_ref()
@@ -5150,6 +5288,182 @@ mod tests {
         assert_eq!(ready.status, "True");
         assert_eq!(ready.reason, "DependenciesReady");
         assert_eq!(ready.message, "Pod is Ready");
+    }
+
+    #[tokio::test]
+    async fn managed_runtime_ready_then_session_connected_promotes_to_ready() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        sandbox.status.as_mut().unwrap().managed_identity_required = true;
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .apply_sandbox_update(ready_driver_sandbox("sb-1", "sandbox-a"))
+            .await
+            .unwrap();
+
+        let waiting = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(waiting.phase()).unwrap(),
+            SandboxPhase::Provisioning
+        );
+        assert!(waiting.status.as_ref().unwrap().runtime_ready);
+
+        register_test_supervisor_session(&runtime, "sb-1");
+        runtime.supervisor_session_connected("sb-1").await.unwrap();
+
+        let ready = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(ready.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        assert!(ready.status.as_ref().unwrap().runtime_ready);
+    }
+
+    #[tokio::test]
+    async fn managed_session_connected_then_runtime_ready_promotes_to_ready() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        sandbox.status.as_mut().unwrap().managed_identity_required = true;
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        register_test_supervisor_session(&runtime, "sb-1");
+        runtime.supervisor_session_connected("sb-1").await.unwrap();
+
+        let waiting = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(waiting.phase()).unwrap(),
+            SandboxPhase::Provisioning
+        );
+        assert!(!waiting.status.as_ref().unwrap().runtime_ready);
+
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(make_driver_status(make_driver_condition(
+                    "Starting",
+                    "Runtime is starting",
+                ))),
+                workspace: "default".to_string(),
+            })
+            .await
+            .unwrap();
+        let still_waiting = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(still_waiting.phase()).unwrap(),
+            SandboxPhase::Provisioning
+        );
+        assert!(!still_waiting.status.as_ref().unwrap().runtime_ready);
+
+        runtime
+            .apply_sandbox_update(ready_driver_sandbox("sb-1", "sandbox-a"))
+            .await
+            .unwrap();
+
+        let ready = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(ready.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        assert!(ready.status.as_ref().unwrap().runtime_ready);
+    }
+
+    #[tokio::test]
+    async fn managed_disconnect_and_reconnect_preserve_runtime_readiness() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        let status = sandbox.status.as_mut().unwrap();
+        status.managed_identity_required = true;
+        status.runtime_ready = true;
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .supervisor_session_disconnected("sb-1")
+            .await
+            .unwrap();
+
+        let disconnected = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(disconnected.phase()).unwrap(),
+            SandboxPhase::Provisioning
+        );
+        assert!(disconnected.status.as_ref().unwrap().runtime_ready);
+
+        runtime.supervisor_session_connected("sb-1").await.unwrap();
+
+        let reconnected = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(reconnected.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        assert!(reconnected.status.as_ref().unwrap().runtime_ready);
+    }
+
+    #[tokio::test]
+    async fn managed_terminal_driver_error_is_not_promoted_by_connected_session() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        sandbox.status.as_mut().unwrap().managed_identity_required = true;
+        runtime.store.put_message(&sandbox).await.unwrap();
+        register_test_supervisor_session(&runtime, "sb-1");
+
+        let mut failed = ready_driver_sandbox("sb-1", "sandbox-a");
+        failed.status = Some(make_driver_status(make_driver_condition(
+            "ImagePullBackOff",
+            "Failed to pull image",
+        )));
+        runtime.apply_sandbox_update(failed).await.unwrap();
+        runtime.supervisor_session_connected("sb-1").await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Error
+        );
+        assert!(!stored.status.as_ref().unwrap().runtime_ready);
     }
 
     #[tokio::test]
