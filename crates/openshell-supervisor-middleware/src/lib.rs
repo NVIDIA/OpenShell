@@ -17,13 +17,13 @@ pub use websocket::{
 use std::collections::HashMap;
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use miette::{Result, miette};
 use prost::Message;
 
+use openshell_core::middleware::SupervisorMiddlewareEndpoint;
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
     Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestTarget,
@@ -32,22 +32,61 @@ use openshell_core::proto::{
     ValidateConfigRequest,
 };
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
-use tonic::Request;
+use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
 
-/// Concrete response stream used by object-safe middleware service handles.
-pub type WebSocketResponseStream = Pin<
-    Box<
-        dyn futures::Stream<
-                Item = std::result::Result<
-                    openshell_core::proto::WebSocketEvaluationResponse,
-                    tonic::Status,
-                >,
-            > + Send
-            + 'static,
-    >,
->;
-type MiddlewareService =
+pub use openshell_core::middleware::WebSocketResponseStream;
+pub type MiddlewareService =
     dyn SupervisorMiddleware<EvaluateWebSocketStream = WebSocketResponseStream>;
+pub type MiddlewareServiceEndpoint = dyn SupervisorMiddlewareEndpoint;
+
+struct GeneratedMiddlewareEndpoint {
+    service: Arc<MiddlewareService>,
+}
+
+#[tonic::async_trait]
+impl SupervisorMiddlewareEndpoint for GeneratedMiddlewareEndpoint {
+    async fn describe(
+        &self,
+        request: Request<()>,
+    ) -> std::result::Result<TonicResponse<MiddlewareManifest>, TonicStatus> {
+        self.service.describe(request).await
+    }
+
+    async fn validate_config(
+        &self,
+        request: Request<ValidateConfigRequest>,
+    ) -> std::result::Result<
+        TonicResponse<openshell_core::proto::ValidateConfigResponse>,
+        TonicStatus,
+    > {
+        self.service.validate_config(request).await
+    }
+
+    async fn evaluate_http_request(
+        &self,
+        request: Request<HttpRequestEvaluation>,
+    ) -> std::result::Result<TonicResponse<openshell_core::proto::HttpRequestResult>, TonicStatus>
+    {
+        self.service.evaluate_http_request(request).await
+    }
+
+    async fn open_websocket(
+        &self,
+        _receiver: tokio::sync::mpsc::Receiver<openshell_core::proto::WebSocketEvaluationRequest>,
+    ) -> std::result::Result<WebSocketResponseStream, TonicStatus> {
+        Err(TonicStatus::unimplemented(
+            "middleware service does not expose an in-process WebSocket stream",
+        ))
+    }
+}
+
+/// Adapt a generated in-process service that only implements unary operations.
+///
+/// Services that advertise WebSocket support must implement
+/// [`SupervisorMiddlewareEndpoint`] directly.
+pub fn http_only_endpoint(service: Arc<MiddlewareService>) -> Arc<MiddlewareServiceEndpoint> {
+    Arc::new(GeneratedMiddlewareEndpoint { service })
+}
 
 const MAX_QUEUED_MIDDLEWARE_WORK: usize = MAX_CONCURRENT_MIDDLEWARE_WORK;
 
@@ -352,8 +391,7 @@ struct MiddlewareServiceState {
     /// single-service test constructor leaves this empty and uses the manifest
     /// name after Describe.
     attachment_name: Option<String>,
-    service: Arc<MiddlewareService>,
-    remote: Option<remote::RemoteMiddlewareService>,
+    endpoint: Arc<MiddlewareServiceEndpoint>,
     manifest: OnceCell<MiddlewareManifest>,
     diagnostic_policy: MiddlewareDiagnosticPolicy,
     operator_max_body_bytes: Option<usize>,
@@ -782,7 +820,7 @@ impl MiddlewareRegistry {
     /// Describe in-process services, then connect and validate every
     /// operator-provided service registration.
     pub async fn connect_services(
-        in_process_services: Vec<Arc<MiddlewareService>>,
+        in_process_services: Vec<Arc<MiddlewareServiceEndpoint>>,
         registrations: Vec<SupervisorMiddlewareService>,
     ) -> Result<Self> {
         let mut services = Vec::with_capacity(in_process_services.len() + registrations.len());
@@ -827,8 +865,7 @@ impl MiddlewareRegistry {
                 .map_err(|_| miette!("middleware manifest cache initialized twice"))?;
             services.push(Arc::new(MiddlewareServiceState {
                 attachment_name: Some(attachment_name),
-                service,
-                remote: None,
+                endpoint: service,
                 manifest: manifest_cell,
                 diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                 operator_max_body_bytes: None,
@@ -852,12 +889,13 @@ impl MiddlewareRegistry {
                         registration.name
                     )
                 })?;
-            let remote_service = remote::RemoteMiddlewareService::connect(
-                &registration.name,
-                &registration.grpc_endpoint,
-            )
-            .await?;
-            let service = Arc::new(remote_service.clone());
+            let service = Arc::new(
+                remote::RemoteMiddlewareService::connect(
+                    &registration.name,
+                    &registration.grpc_endpoint,
+                )
+                .await?,
+            );
             let manifest = call_with_timeout(
                 operator_timeout,
                 "Describe",
@@ -879,8 +917,7 @@ impl MiddlewareRegistry {
                 .map_err(|_| miette!("middleware manifest cache initialized twice"))?;
             services.push(Arc::new(MiddlewareServiceState {
                 attachment_name: Some(registration.name.clone()),
-                service,
-                remote: Some(remote_service),
+                endpoint: service,
                 manifest: manifest_cell,
                 diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
                 operator_max_body_bytes: (operator_max_body_bytes != 0)
@@ -965,12 +1002,15 @@ impl Default for ChainRunner {
 
 impl ChainRunner {
     pub fn new(service: Arc<MiddlewareService>) -> Self {
+        Self::from_endpoint(http_only_endpoint(service))
+    }
+
+    pub fn from_endpoint(endpoint: Arc<MiddlewareServiceEndpoint>) -> Self {
         Self {
             registry: Arc::new(MiddlewareRegistry {
                 services: Arc::new(vec![Arc::new(MiddlewareServiceState {
                     attachment_name: None,
-                    service,
-                    remote: None,
+                    endpoint,
                     manifest: OnceCell::new(),
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                     operator_max_body_bytes: None,
@@ -999,7 +1039,7 @@ impl ChainRunner {
                     call_with_timeout(
                         state.operator_timeout,
                         "Describe",
-                        state.service.describe(Request::new(())),
+                        state.endpoint.describe(Request::new(())),
                     )
                     .await
                     .map(tonic::Response::into_inner)
@@ -1135,7 +1175,7 @@ impl ChainRunner {
             state.operator_timeout,
             "ValidateConfig",
             state
-                .service
+                .endpoint
                 .validate_config(Request::new(ValidateConfigRequest {
                     config: Some(config),
                     middleware_name: middleware_name.into(),
@@ -1302,7 +1342,7 @@ impl ChainRunner {
                 entry.timeout.min(remaining),
                 "EvaluateHttpRequest",
                 service
-                    .service
+                    .endpoint
                     .evaluate_http_request(Request::new(evaluation)),
             )
             .await
@@ -1608,6 +1648,7 @@ pub(crate) fn safe_reason(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::{Stream, StreamExt};
     use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
         SupervisorMiddleware, SupervisorMiddlewareServer,
     };
@@ -1617,7 +1658,7 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
 
     fn builtin_runner() -> ChainRunner {
-        ChainRunner::new(
+        ChainRunner::from_endpoint(
             services()
                 .into_iter()
                 .next()
@@ -1848,9 +1889,12 @@ mod tests {
             result: allow_result(),
         });
 
-        let error = MiddlewareRegistry::connect_services(vec![first, second], Vec::new())
-            .await
-            .expect_err("duplicate injected middleware name must fail registry construction");
+        let error = MiddlewareRegistry::connect_services(
+            vec![http_only_endpoint(first), http_only_endpoint(second)],
+            Vec::new(),
+        )
+        .await
+        .expect_err("duplicate injected middleware name must fail registry construction");
         assert!(
             error
                 .to_string()
@@ -2569,8 +2613,7 @@ mod tests {
             services: Arc::new(vec![
                 Arc::new(MiddlewareServiceState {
                     attachment_name: Some(builtin_name.clone()),
-                    service: builtin_service,
-                    remote: None,
+                    endpoint: builtin_service,
                     manifest: builtin_manifest_cell,
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                     operator_max_body_bytes: None,
@@ -2578,8 +2621,7 @@ mod tests {
                 }),
                 Arc::new(MiddlewareServiceState {
                     attachment_name: Some(registration_name.clone()),
-                    service,
-                    remote: None,
+                    endpoint: http_only_endpoint(service),
                     manifest: manifest_cell,
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
                     operator_max_body_bytes: Some(operator_max_body_bytes),
@@ -3799,58 +3841,17 @@ mod tests {
         messages: Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    #[tonic::async_trait]
-    impl SupervisorMiddleware for OpenAiRedactionService {
-        type EvaluateWebSocketStream = WebSocketResponseStream;
-
-        async fn describe(
-            &self,
-            _request: Request<()>,
-        ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
-            Ok(tonic::Response::new(MiddlewareManifest {
-                name: "test/openai-websocket-redactor".into(),
-                service_version: "test".into(),
-                bindings: vec![MiddlewareBinding {
-                    operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
-                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_body_bytes: 0,
-                    timeout: "1s".into(),
-                    max_message_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
-                }],
-            }))
-        }
-
-        async fn validate_config(
-            &self,
-            _request: Request<ValidateConfigRequest>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
-            tonic::Status,
-        > {
-            Ok(tonic::Response::new(
-                openshell_core::proto::ValidateConfigResponse {
-                    valid: true,
-                    reason: String::new(),
-                },
-            ))
-        }
-
-        async fn evaluate_http_request(
-            &self,
-            _request: Request<HttpRequestEvaluation>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::HttpRequestResult>,
-            tonic::Status,
-        > {
-            Err(tonic::Status::unimplemented(
-                "WebSocket-only test middleware",
-            ))
-        }
-
-        async fn evaluate_web_socket(
-            &self,
-            request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+    impl OpenAiRedactionService {
+        fn websocket_stream<S>(&self, mut requests: S) -> WebSocketResponseStream
+        where
+            S: Stream<
+                    Item = std::result::Result<
+                        openshell_core::proto::WebSocketEvaluationRequest,
+                        tonic::Status,
+                    >,
+                > + Send
+                + Unpin
+                + 'static,
         {
             use openshell_core::proto::{
                 WebSocketEvaluationResponse, WebSocketMessageResult, WebSocketPreflightAction,
@@ -3858,14 +3859,13 @@ mod tests {
                 web_socket_evaluation_response,
             };
 
-            let mut requests = request.into_inner();
             let preflight = Arc::clone(&self.preflight);
             let skip = self.skip;
             let close_on_first_message = self.close_on_first_message;
             let messages = Arc::clone(&self.messages);
             let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
-                while let Ok(Some(request)) = requests.message().await {
+                while let Some(Ok(request)) = requests.next().await {
                     let response = match request.request {
                         Some(web_socket_evaluation_request::Request::Preflight(value)) => {
                             *preflight.lock().expect("preflight lock") = Some(value);
@@ -3919,10 +3919,154 @@ mod tests {
                     }
                 }
             });
-            Ok(tonic::Response::new(Box::pin(
-                tokio_stream::wrappers::ReceiverStream::new(responses_rx),
-            )))
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(responses_rx))
         }
+    }
+
+    #[tonic::async_trait]
+    impl SupervisorMiddleware for OpenAiRedactionService {
+        type EvaluateWebSocketStream = WebSocketResponseStream;
+
+        async fn describe(
+            &self,
+            _request: Request<()>,
+        ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
+            Ok(tonic::Response::new(MiddlewareManifest {
+                name: "test/openai-websocket-redactor".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_body_bytes: 0,
+                    timeout: "1s".into(),
+                    max_message_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
+                }],
+            }))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: Request<ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: Request<HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented(
+                "WebSocket-only test middleware",
+            ))
+        }
+
+        async fn evaluate_web_socket(
+            &self,
+            request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+        {
+            Ok(tonic::Response::new(
+                self.websocket_stream(request.into_inner()),
+            ))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl SupervisorMiddlewareEndpoint for OpenAiRedactionService {
+        async fn describe(
+            &self,
+            request: Request<()>,
+        ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
+            SupervisorMiddleware::describe(self, request).await
+        }
+
+        async fn validate_config(
+            &self,
+            request: Request<ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            SupervisorMiddleware::validate_config(self, request).await
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            request: Request<HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            SupervisorMiddleware::evaluate_http_request(self, request).await
+        }
+
+        async fn open_websocket(
+            &self,
+            receiver: tokio::sync::mpsc::Receiver<
+                openshell_core::proto::WebSocketEvaluationRequest,
+            >,
+        ) -> std::result::Result<WebSocketResponseStream, tonic::Status> {
+            Ok(
+                self.websocket_stream(
+                    tokio_stream::wrappers::ReceiverStream::new(receiver).map(Ok),
+                ),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn in_process_websocket_endpoint_redacts_openai_event() {
+        let service = OpenAiRedactionService::default();
+        let runner = ChainRunner::from_endpoint(Arc::new(service));
+        let chain = [ChainEntry {
+            name: "openai-redactor".into(),
+            implementation: "test/openai-websocket-redactor".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        }];
+        let preflight = runner
+            .preflight_websocket(
+                &chain,
+                WebSocketPreflightInput {
+                    session_id: "in-process-session".into(),
+                    request_id: "request".into(),
+                    sandbox_id: "sandbox".into(),
+                    scheme: "wss".into(),
+                    host: "api.openai.com".into(),
+                    port: 443,
+                    path: "/v1/responses".into(),
+                    requested_subprotocols: vec!["realtime".into()],
+                },
+            )
+            .await
+            .expect("preflight");
+        assert!(preflight.allowed);
+        let mut session = preflight.session.expect("middleware chose to inspect");
+        assert!(session.start("realtime").await.allowed);
+
+        let original = br#"{"type":"response.create","response":{"input":"customer-secret"}}"#;
+        let outcome = session.evaluate_text(original.to_vec()).await;
+        assert!(outcome.allowed);
+        assert_eq!(
+            String::from_utf8(outcome.payload).expect("transformed UTF-8"),
+            r#"{"type":"response.create","response":{"input":"[REDACTED]"}}"#
+        );
+        assert!(outcome.invocations[0].transformed);
+        session
+            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .await;
     }
 
     #[tokio::test]

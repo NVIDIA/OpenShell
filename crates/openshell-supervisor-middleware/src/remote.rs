@@ -4,8 +4,8 @@
 use std::time::Duration;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_core::middleware::{SupervisorMiddlewareEndpoint, WebSocketResponseStream};
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
-use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
     HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
     ValidateConfigResponse, WebSocketEvaluationRequest,
@@ -55,28 +55,10 @@ impl RemoteMiddlewareService {
                 .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
         })
     }
-
-    pub async fn open_websocket(
-        &self,
-        receiver: tokio::sync::mpsc::Receiver<WebSocketEvaluationRequest>,
-    ) -> std::result::Result<
-        tonic::Streaming<openshell_core::proto::WebSocketEvaluationResponse>,
-        Status,
-    > {
-        let mut client = self.client.clone();
-        client
-            .evaluate_web_socket(Request::new(tokio_stream::wrappers::ReceiverStream::new(
-                receiver,
-            )))
-            .await
-            .map(Response::into_inner)
-    }
 }
 
 #[tonic::async_trait]
-impl SupervisorMiddleware for RemoteMiddlewareService {
-    type EvaluateWebSocketStream = crate::WebSocketResponseStream;
-
+impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
     async fn describe(
         &self,
         request: Request<()>,
@@ -101,12 +83,17 @@ impl SupervisorMiddleware for RemoteMiddlewareService {
         client.evaluate_http_request(request).await
     }
 
-    async fn evaluate_web_socket(
+    async fn open_websocket(
         &self,
-        _request: Request<tonic::Streaming<WebSocketEvaluationRequest>>,
-    ) -> std::result::Result<Response<Self::EvaluateWebSocketStream>, Status> {
-        Err(Status::unimplemented(
-            "remote middleware streams are initiated by the registry",
-        ))
+        receiver: tokio::sync::mpsc::Receiver<WebSocketEvaluationRequest>,
+    ) -> std::result::Result<WebSocketResponseStream, Status> {
+        let mut client = self.client.clone();
+        let responses = client
+            .evaluate_web_socket(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+            .await?
+            .into_inner();
+        Ok(Box::pin(responses))
     }
 }

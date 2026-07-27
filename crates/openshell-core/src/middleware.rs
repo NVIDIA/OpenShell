@@ -1,9 +1,51 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Platform-wide supervisor middleware limits.
+//! Supervisor middleware endpoint contract and platform-wide limits.
 
+use std::pin::Pin;
 use std::time::Duration;
+
+use tokio::sync::mpsc;
+use tonic::{Request, Response, Status};
+
+use crate::proto::{
+    HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
+    ValidateConfigResponse, WebSocketEvaluationRequest, WebSocketEvaluationResponse,
+};
+
+/// Transport-neutral response stream for one WebSocket middleware stage.
+pub type WebSocketResponseStream = Pin<
+    Box<
+        dyn tokio_stream::Stream<Item = Result<WebSocketEvaluationResponse, Status>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// A middleware implementation reachable either in-process or over a transport.
+///
+/// Capability is defined by the implementation's manifest. The endpoint hides
+/// whether invocations are direct calls or serialized gRPC requests.
+#[tonic::async_trait]
+pub trait SupervisorMiddlewareEndpoint: Send + Sync {
+    async fn describe(&self, request: Request<()>) -> Result<Response<MiddlewareManifest>, Status>;
+
+    async fn validate_config(
+        &self,
+        request: Request<ValidateConfigRequest>,
+    ) -> Result<Response<ValidateConfigResponse>, Status>;
+
+    async fn evaluate_http_request(
+        &self,
+        request: Request<HttpRequestEvaluation>,
+    ) -> Result<Response<HttpRequestResult>, Status>;
+
+    async fn open_websocket(
+        &self,
+        requests: mpsc::Receiver<WebSocketEvaluationRequest>,
+    ) -> Result<WebSocketResponseStream, Status>;
+}
 
 /// Default timeout for one supervisor middleware RPC.
 pub const DEFAULT_MIDDLEWARE_TIMEOUT: Duration = Duration::from_millis(500);

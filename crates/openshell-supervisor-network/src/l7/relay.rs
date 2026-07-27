@@ -2351,12 +2351,14 @@ mod tests {
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
 
     fn install_builtin_middleware(engine: &OpaEngine) {
-        engine.set_middleware_runner_for_tests(openshell_supervisor_middleware::ChainRunner::new(
-            openshell_supervisor_middleware_builtins::services()
-                .into_iter()
-                .next()
-                .expect("built-in middleware service"),
-        ));
+        engine.set_middleware_runner_for_tests(
+            openshell_supervisor_middleware::ChainRunner::from_endpoint(
+                openshell_supervisor_middleware_builtins::services()
+                    .into_iter()
+                    .next()
+                    .expect("built-in middleware service"),
+            ),
+        );
     }
 
     fn assert_middleware_failure_response(response: &str, policy_name: &str) {
@@ -3621,7 +3623,7 @@ network_policies:
 
         // A single unresolved (0-limit) entry must not drag the chain limit to
         // zero: the buffer limit reflects only the resolved built-in.
-        let mixed = ChainRunner::new(
+        let mixed = ChainRunner::from_endpoint(
             openshell_supervisor_middleware_builtins::services()
                 .into_iter()
                 .next()
@@ -4240,16 +4242,16 @@ network_policies:
             middleware_relay_context("openshell/regex", "fail_closed");
         let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
             vec![
-                Arc::new(LimitService {
+                openshell_supervisor_middleware::http_only_endpoint(Arc::new(LimitService {
                     name: "test/redactor",
                     max_body_bytes: 8192,
                     replacement: Some(b"[SCRUBBED BY TEST REDACTOR]"),
-                }),
-                Arc::new(LimitService {
+                })),
+                openshell_supervisor_middleware::http_only_endpoint(Arc::new(LimitService {
                     name: "test/guard",
                     max_body_bytes: 16,
                     replacement: None,
-                }),
+                })),
             ],
             Vec::new(),
         )

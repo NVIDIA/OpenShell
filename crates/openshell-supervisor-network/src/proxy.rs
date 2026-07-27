@@ -5937,7 +5937,7 @@ network_policies:
             secret_resolver: None,
             ..Default::default()
         };
-        let runner = openshell_supervisor_middleware::ChainRunner::new(
+        let runner = openshell_supervisor_middleware::ChainRunner::from_endpoint(
             openshell_supervisor_middleware_builtins::services()
                 .into_iter()
                 .next()
@@ -8908,7 +8908,7 @@ network_policies:
             secret_resolver: None,
             ..Default::default()
         };
-        let runner = openshell_supervisor_middleware::ChainRunner::new(
+        let runner = openshell_supervisor_middleware::ChainRunner::from_endpoint(
             openshell_supervisor_middleware_builtins::services()
                 .into_iter()
                 .next()

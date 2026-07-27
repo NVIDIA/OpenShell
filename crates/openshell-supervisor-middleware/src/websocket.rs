@@ -4,10 +4,11 @@
 //! Forward-direction WebSocket middleware session runner.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::join_all;
+use futures::{StreamExt, future::join_all};
 use prost::Message as _;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -102,7 +103,7 @@ pub struct WebSocketMessageOutcome {
 struct WebSocketStage {
     entry: DescribedChainEntry,
     sender: mpsc::Sender<WebSocketEvaluationRequest>,
-    responses: tonic::Streaming<openshell_core::proto::WebSocketEvaluationResponse>,
+    responses: super::WebSocketResponseStream,
     active: bool,
 }
 
@@ -115,7 +116,7 @@ pub struct WebSocketSession {
 enum OpenStage {
     Inspect(Box<WebSocketStage>, WebSocketInvocation),
     Skip(WebSocketInvocation),
-    Failed(DescribedChainEntry, &'static str),
+    Failed(DescribedChainEntry, String),
 }
 
 impl ChainRunner {
@@ -184,7 +185,7 @@ impl ChainRunner {
                 }
                 OpenStage::Skip(invocation) => invocations.push(invocation),
                 OpenStage::Failed(entry, reason) => {
-                    let invocation = failure_invocation(&entry, None, 0, reason);
+                    let invocation = failure_invocation(&entry, None, 0, &reason);
                     if entry.entry.on_error == OnError::FailClosed {
                         fail_closed_reason
                             .get_or_insert_with(|| format!("middleware_failed: {reason}"));
@@ -220,8 +221,11 @@ impl ChainRunner {
 }
 
 impl WebSocketSession {
-    pub async fn reserve_message(&self) -> miette::Result<super::MiddlewareAdmission> {
-        self.runner.reserve_middleware_work().await
+    pub fn reserve_message(
+        &self,
+    ) -> impl Future<Output = miette::Result<super::MiddlewareAdmission>> + Send + 'static {
+        let runner = self.runner.clone();
+        async move { runner.reserve_middleware_work().await }
     }
 
     pub async fn start(&mut self, selected_subprotocol: &str) -> WebSocketSessionStartOutcome {
@@ -374,7 +378,7 @@ impl WebSocketSession {
                     .send(request)
                     .await
                     .map_err(|_| tonic::Status::unavailable("request stream closed"))?;
-                stage.responses.message().await
+                stage.responses.next().await.transpose()
             })
             .await;
             let result = match response {
@@ -413,12 +417,16 @@ impl WebSocketSession {
                     }
                     continue;
                 }
-                Ok(Err(_)) => {
+                Ok(Err(error)) => {
+                    let reason = stage.entry.service.as_ref().map_or_else(
+                        || "binding_not_described".to_string(),
+                        |service| service.diagnostic_policy.error_reason(&error),
+                    );
                     if let Some(outcome) = handle_stage_failure(
                         stage,
                         sequence,
                         original_size,
-                        "external_service_error",
+                        &reason,
                         &current,
                         &findings,
                         &metadata,
@@ -542,11 +550,10 @@ impl WebSocketSession {
 
 async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) -> OpenStage {
     let Some(service) = entry.service.as_ref() else {
-        return OpenStage::Failed(entry, "binding_not_described");
+        return OpenStage::Failed(entry, "binding_not_described".into());
     };
-    let Some(remote) = service.remote.clone() else {
-        return OpenStage::Failed(entry, "websocket_stream_not_available");
-    };
+    let endpoint = Arc::clone(&service.endpoint);
+    let diagnostic_policy = service.diagnostic_policy;
     let preflight = WebSocketPreflight {
         session_id: input.session_id,
         phase: SupervisorMiddlewarePhase::PreCredentials as i32,
@@ -566,7 +573,7 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
         config: Some(entry.entry.config.clone()),
     };
     if validate_preflight_envelope(&preflight).is_err() {
-        return OpenStage::Failed(entry, "preflight_envelope_over_capacity");
+        return OpenStage::Failed(entry, "preflight_envelope_over_capacity".into());
     }
 
     let timeout = entry.timeout.min(MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT);
@@ -578,24 +585,26 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
             })
             .await
             .map_err(|_| tonic::Status::unavailable("request stream closed"))?;
-        let mut responses = remote.open_websocket(receiver).await?;
-        let response = responses.message().await?;
+        let mut responses = endpoint.open_websocket(receiver).await?;
+        let response = responses.next().await.transpose()?;
         Ok::<_, tonic::Status>((sender, responses, response))
     })
     .await;
 
     let (sender, responses, response) = match opened {
         Ok(Ok(opened)) => opened,
-        Ok(Err(_)) => return OpenStage::Failed(entry, "external_service_error"),
-        Err(_) => return OpenStage::Failed(entry, "middleware_timeout"),
+        Ok(Err(error)) => {
+            return OpenStage::Failed(entry, diagnostic_policy.error_reason(&error));
+        }
+        Err(_) => return OpenStage::Failed(entry, "middleware_timeout".into()),
     };
     let Some(response) = response else {
-        return OpenStage::Failed(entry, "missing_preflight_decision");
+        return OpenStage::Failed(entry, "missing_preflight_decision".into());
     };
     let Some(web_socket_evaluation_response::Response::PreflightDecision(decision)) =
         response.response
     else {
-        return OpenStage::Failed(entry, "invalid_preflight_decision");
+        return OpenStage::Failed(entry, "invalid_preflight_decision".into());
     };
     match WebSocketPreflightAction::try_from(decision.action) {
         Ok(WebSocketPreflightAction::Inspect) => {
@@ -632,7 +641,7 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
             OpenStage::Skip(invocation)
         }
         Ok(WebSocketPreflightAction::Unspecified) | Err(_) => {
-            OpenStage::Failed(entry, "invalid_preflight_decision")
+            OpenStage::Failed(entry, "invalid_preflight_decision".into())
         }
     }
 }
@@ -749,7 +758,7 @@ fn handle_stage_failure(
     stage: &mut WebSocketStage,
     sequence: u64,
     original_size: usize,
-    reason: &'static str,
+    reason: &str,
     current: &[u8],
     findings: &[NamespacedFinding],
     metadata: &BTreeMap<String, BTreeMap<String, String>>,
@@ -822,7 +831,7 @@ fn failure_invocation(
     entry: &DescribedChainEntry,
     sequence: Option<u64>,
     original_size: usize,
-    _reason: &'static str,
+    _reason: &str,
 ) -> WebSocketInvocation {
     let outcome = match entry.entry.on_error {
         OnError::FailOpen => WebSocketInvocationOutcome::FailOpen,

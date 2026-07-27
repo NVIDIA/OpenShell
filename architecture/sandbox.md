@@ -77,11 +77,14 @@ host selectors choose the chain independently of the network rule that admitted
 the request. Policy-local map keys identify configs, while built-in names or
 operator-owned registration names identify implementations.
 
-Built-ins run in-process; operator services use the same bounded gRPC contract.
-`openshell-policy` validates policy-owned structure, and the active middleware
-registry validates implementation-owned config. The generic registry and chain
-runner live in `openshell-supervisor-middleware`; first-party implementations
-live in `openshell-supervisor-middleware-builtins`.
+Built-ins run in-process; operator services use gRPC. Both implement the same
+transport-neutral endpoint contract, including bidirectional WebSocket
+sessions, so a manifest advertises capabilities independently of transport.
+The chain runner owns shared sequencing, deadlines, backpressure, and response
+validation. `openshell-policy` validates policy-owned structure, and the active
+middleware registry validates implementation-owned config. The generic
+registry and chain runner live in `openshell-supervisor-middleware`; first-party
+implementations live in `openshell-supervisor-middleware-builtins`.
 
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.

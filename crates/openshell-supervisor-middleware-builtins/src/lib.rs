@@ -5,29 +5,21 @@
 
 mod regex;
 
-use std::pin::Pin;
 use std::sync::Arc;
 
 use miette::{Result, miette};
+use openshell_core::middleware::{SupervisorMiddlewareEndpoint, WebSocketResponseStream};
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
     HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse, WebSocketEvaluationRequest, WebSocketEvaluationResponse,
+    ValidateConfigResponse, WebSocketEvaluationRequest,
 };
 use tonic::{Request, Response, Status};
 
 pub use regex::{NAME as BUILTIN_REGEX, RegexConfig, RegexMode};
 
 /// Return the first-party services that the gateway and supervisor install.
-type WebSocketResponseStream = Pin<
-    Box<
-        dyn tokio_stream::Stream<Item = std::result::Result<WebSocketEvaluationResponse, Status>>
-            + Send,
-    >,
->;
-
-pub fn services()
--> Vec<Arc<dyn SupervisorMiddleware<EvaluateWebSocketStream = WebSocketResponseStream>>> {
+pub fn services() -> Vec<Arc<dyn SupervisorMiddlewareEndpoint>> {
     vec![Arc::new(BuiltinMiddlewareService)]
 }
 
@@ -108,6 +100,36 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
     }
 }
 
+#[tonic::async_trait]
+impl SupervisorMiddlewareEndpoint for BuiltinMiddlewareService {
+    async fn describe(&self, request: Request<()>) -> Result<Response<MiddlewareManifest>, Status> {
+        SupervisorMiddleware::describe(self, request).await
+    }
+
+    async fn validate_config(
+        &self,
+        request: Request<ValidateConfigRequest>,
+    ) -> Result<Response<ValidateConfigResponse>, Status> {
+        SupervisorMiddleware::validate_config(self, request).await
+    }
+
+    async fn evaluate_http_request(
+        &self,
+        request: Request<HttpRequestEvaluation>,
+    ) -> Result<Response<HttpRequestResult>, Status> {
+        SupervisorMiddleware::evaluate_http_request(self, request).await
+    }
+
+    async fn open_websocket(
+        &self,
+        _receiver: tokio::sync::mpsc::Receiver<WebSocketEvaluationRequest>,
+    ) -> Result<WebSocketResponseStream, Status> {
+        Err(Status::unimplemented(
+            "built-in middleware does not advertise WebSocket support",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,8 +151,7 @@ mod tests {
 
     #[tokio::test]
     async fn service_describes_regex_binding() {
-        let manifest = BuiltinMiddlewareService
-            .describe(Request::new(()))
+        let manifest = SupervisorMiddleware::describe(&BuiltinMiddlewareService, Request::new(()))
             .await
             .expect("describe")
             .into_inner();
