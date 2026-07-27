@@ -108,10 +108,19 @@ connection metadata agrees. When request paths overlap, a path endpoint with a
 higher specificity rank deterministically overrides broader request-processing
 metadata. Equally specific overlapping endpoints must agree.
 
+Gateway mutation paths validate the complete effective candidate before
+persistence when the affected sandbox scope is known. Direct replacements,
+incremental merges and approvals, provider attachment, and profile fanout reject
+ambiguity atomically, without creating an invalid revision or partially
+activating an update. Supervisor validation remains the defense-in-depth
+boundary for startup, concurrent changes, and sources outside those mutations.
+
 The `[openshell.gateway] policy_validation_failure_mode` configuration controls
-rejected generations. It defaults to `fail_closed`, which publishes a quarantine
-generation, denies new egress, invalidates existing relays, and leaves the
-previous policy inactive. Operators may explicitly select
+candidates rejected by supervisor runtime validation. Gateway preflight
+rejections never become generations and leave the active policy unchanged. The
+runtime mode defaults to `fail_closed`, which publishes a quarantine generation,
+denies new egress, invalidates existing relays, and leaves the previous policy
+inactive. Operators may explicitly select
 `retain_last_valid`, which keeps the previous generation active. With no
 previous valid generation, the effective mode remains `fail_closed` regardless
 of the configured mode. The gateway distributes this startup configuration to
