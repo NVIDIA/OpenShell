@@ -12,7 +12,9 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 | Job | Runner | Verifies |
 |---|---|---|
 | `macos` | `macos-latest-xlarge` | `install.sh` resolves the Homebrew formula, brew installs the cask, and `openshell status` reaches the brew-services–backed local gateway with the VM driver. |
-| `ubuntu` | `ubuntu-latest` | `install.sh` installs the Debian package, the post-install systemd user service starts, and `openshell status` reaches the local gateway with the Docker driver. |
+| `ubuntu-deb-native-docker` | `ubuntu-latest` | `install.sh` auto-detects the Debian package when both snapd and native Docker are present, installs the deb, the post-install systemd user service starts, and `openshell status` reaches the local gateway with the Docker driver. Once snapd 2.77 is released to `latest/stable`, `install.sh` should install the `openshell` snap here instead, even with native Docker present. This job should then be renamed to `ubuntu-snap-native-docker`, and its purpose will be to verify that the openshell snap installs and works when a native (non-snap) Docker is already present on the system. |
+| `ubuntu-deb` | `ubuntu-latest` | `install.sh` installs the Debian package after snapd is fully removed (forcing the deb path), starts the systemd user service, and `openshell status` reaches the local gateway with the Docker driver. |
+| `ubuntu-snap-without-docker` | `ubuntu-latest` | `install.sh` auto-detects and installs both the `openshell` and `docker` snaps from the Snap Store when snapd is present and there is no Docker daemon on the system, the gateway daemon starts with auto-connected interfaces, and `openshell status` reaches the local gateway. |
 | `fedora` | `fedora:latest` container | `install.sh` installs the RPM packages, the local gateway starts under Podman, and `openshell status` succeeds. |
 | `kubernetes` | `ubuntu-latest` + kind | `helm install oci://ghcr.io/nvidia/openshell/helm-chart --version 0.0.0-dev` succeeds in a kind cluster, the gateway pod becomes Ready, port-forward exposes 8080, and the released CLI registers the in-cluster gateway and runs `openshell status` against it. |
 
@@ -107,8 +109,9 @@ Loopback registration auto-derives the gateway name to `openshell` if `--name` i
 
 | Symptom | Likely cause | Where to look |
 |---|---|---|
-| `macos`/`ubuntu`/`fedora` job fails on `install.sh` | Latest tagged release missing an asset, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
-| `macos`/`ubuntu`/`fedora` job fails on `openshell status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `OPENSHELL_DRIVERS` env in the "Ensure …" step. |
+| `macos`/`ubuntu-deb-native-docker`/`ubuntu-deb`/`fedora` job fails on `install.sh` | Latest tagged release missing an asset, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
+| `macos`/`ubuntu-deb-native-docker`/`ubuntu-deb`/`fedora` job fails on `openshell status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `OPENSHELL_DRIVERS` env in the "Ensure …" step. |
+| `ubuntu-snap-without-docker` job fails on `openshell status` | Snap gateway daemon did not start. | `snap services openshell` and `snap logs openshell.gateway` in the job log. |
 | `kubernetes` job fails on `helm install --wait` | Chart did not deploy in 5 min — usually image pull failure or readiness probe failing. | "Diagnostics on failure" step dumps `helm status`, manifest, pod describe, pod logs. |
 | `kubernetes` job fails on `kubectl wait` | Gateway pod stuck `CrashLoopBackOff` or `ImagePullBackOff`. | Diagnostics dump; check `:dev` image existence at `ghcr.io/nvidia/openshell/gateway`. |
 | `kubernetes` job fails on `openshell gateway add` or `status` | Port-forward not reachable, or CLI/gateway proto mismatch. | `port-forward.log` and `openshell gateway list` in the diagnostics dump. |
