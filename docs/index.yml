@@ -29,3 +29,6 @@ navigation:
   title: "Security"
 - folder: resources
   title: "Resources"
+  contents:
+  - page: "Manage custom properties for organizations"
+    path: resources/organization-custom-properties.mdx

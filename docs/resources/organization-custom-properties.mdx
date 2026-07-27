@@ -1,0 +1,75 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Manage custom properties for organizations"
+description: "Add metadata to organizations in your enterprise and use that metadata to target repositories with rulesets."
+keywords: "GitHub, Enterprise, Organizations, Custom Properties, Rulesets"
+position: 1
+---
+
+<Note>
+For GitHub Enterprise Server, this feature is available starting with version 3.21.
+</Note>
+
+Custom properties are structured metadata fields that you can add to repositories and organizations to improve governance and automation across your environment.
+
+## Allowed characters
+
+Custom property names and values must follow these rules:
+
+- Names may only contain letters, numbers, underscores, hyphens, dollar signs, and hash signs.
+- Values may contain printable ASCII characters except double quotation marks.
+
+## Add a custom property
+
+You can add custom properties to your enterprise and set values for those properties for organizations in your enterprise.
+
+<Steps>
+  <Step title="Open your enterprise settings">
+    Navigate to your enterprise, then select the Organizations tab.
+  </Step>
+  <Step title="Open custom properties">
+    In the left sidebar, click Custom properties.
+  </Step>
+  <Step title="Create the property">
+    Click New property in the upper-right corner.
+  </Step>
+  <Step title="Enter property details">
+    Enter a name for the property. The name cannot contain spaces and cannot exceed 75 characters.
+    Optionally add a description.
+  </Step>
+  <Step title="Choose the property type">
+    Under Type, select the type of property you want to add.
+  </Step>
+  <Step title="Set optional permissions and defaults">
+    Optionally allow organization actors to set the property, or require the property for all organizations and provide a default value.
+  </Step>
+  <Step title="Save the property">
+    Click Save property.
+  </Step>
+</Steps>
+
+## Set values for organizations
+
+You, and any users with the Edit custom properties values at the organization level permission, can set values for custom properties for organizations in your enterprise.
+
+<Steps>
+  <Step title="Open the enterprise organizations view">
+    Navigate to your enterprise, then select the Organizations tab.
+  </Step>
+  <Step title="Open custom properties">
+    In the left sidebar, click Custom properties.
+  </Step>
+  <Step title="Select the value editing view">
+    Click the Set values tab.
+  </Step>
+  <Step title="Choose organizations">
+    Select one or more organizations from the list.
+  </Step>
+  <Step title="Edit property values">
+    Click Edit properties and choose a value for each property you want to set.
+  </Step>
+  <Step title="Save changes">
+    Click Save changes.
+  </Step>
+</Steps>
