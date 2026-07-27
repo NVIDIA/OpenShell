@@ -730,8 +730,15 @@ type NetworkEndpoint struct {
 	// endpointless provider profile. Profiles that already define endpoints
 	// continue to use those profile endpoints as their credential boundary.
 	CredentialBinding *NetworkCredentialBinding `protobuf:"bytes,24,opt,name=credential_binding,json=credentialBinding,proto3" json:"credential_binding,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Explicitly permits credential-bearing traffic to use paths that OpenShell
+	// cannot inspect or rewrite. Defaults to false. This is a security-sensitive
+	// escape hatch and must be explicitly approved.
+	AllowUninspectedCredentials bool `protobuf:"varint,25,opt,name=allow_uninspected_credentials,json=allowUninspectedCredentials,proto3" json:"allow_uninspected_credentials,omitempty"`
+	// Internal gateway-derived marker indicating that this endpoint belongs to
+	// an attached credentialed provider. User-authored values are ignored.
+	ProviderCredentialed bool `protobuf:"varint,26,opt,name=provider_credentialed,json=providerCredentialed,proto3" json:"provider_credentialed,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *NetworkEndpoint) Reset() {
@@ -930,6 +937,20 @@ func (x *NetworkEndpoint) GetCredentialBinding() *NetworkCredentialBinding {
 		return x.CredentialBinding
 	}
 	return nil
+}
+
+func (x *NetworkEndpoint) GetAllowUninspectedCredentials() bool {
+	if x != nil {
+		return x.AllowUninspectedCredentials
+	}
+	return false
+}
+
+func (x *NetworkEndpoint) GetProviderCredentialed() bool {
+	if x != nil {
+		return x.ProviderCredentialed
+	}
+	return false
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more
@@ -2080,7 +2101,8 @@ const file_sandbox_proto_rawDesc = "" +
 	"\ainclude\x18\x01 \x03(\tR\ainclude\x12\x18\n" +
 	"\aexclude\x18\x02 \x03(\tR\aexclude\"6\n" +
 	"\x18NetworkCredentialBinding\x12\x1a\n" +
-	"\bprovider\x18\x01 \x01(\tR\bprovider\"\xe3\t\n" +
+	"\bprovider\x18\x01 \x01(\tR\bprovider\"\xdc\n" +
+	"\n" +
 	"\x0fNetworkEndpoint\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x1a\n" +
@@ -2108,7 +2130,9 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x0esigning_region\x18\x15 \x01(\tR\rsigningRegion\x124\n" +
 	"\x17json_rpc_max_body_bytes\x18\x16 \x01(\rR\x13jsonRpcMaxBodyBytes\x122\n" +
 	"\x03mcp\x18\x17 \x01(\v2 .openshell.sandbox.v1.McpOptionsR\x03mcp\x12]\n" +
-	"\x12credential_binding\x18\x18 \x01(\v2..openshell.sandbox.v1.NetworkCredentialBindingR\x11credentialBinding\x1ar\n" +
+	"\x12credential_binding\x18\x18 \x01(\v2..openshell.sandbox.v1.NetworkCredentialBindingR\x11credentialBinding\x12B\n" +
+	"\x1dallow_uninspected_credentials\x18\x19 \x01(\bR\x1ballowUninspectedCredentials\x123\n" +
+	"\x15provider_credentialed\x18\x1a \x01(\bR\x14providerCredentialed\x1ar\n" +
 	"\x1cGraphqlPersistedQueriesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
 	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.GraphqlOperationR\x05value:\x028\x01\"\xb6\x01\n" +

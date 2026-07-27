@@ -130,6 +130,8 @@ func TestConverterCoversAllProtoFields_NetworkEndpoint(t *testing.T) {
 		"path":                            true,
 		"websocket_credential_rewrite":    true,
 		"request_body_credential_rewrite": true,
+		"allow_uninspected_credentials":   true,
+		"provider_credentialed":           true,
 		"advisor_proposed":                true,
 		"credential_signing":              true,
 		"signing_service":                 true,

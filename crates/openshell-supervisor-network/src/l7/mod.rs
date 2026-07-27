@@ -127,6 +127,10 @@ pub struct L7EndpointConfig {
     /// Opt-in rewrite of credential placeholders in supported textual REST
     /// request bodies before forwarding upstream.
     pub request_body_credential_rewrite: bool,
+    /// Explicit opt-in to credential-bearing traffic that cannot be inspected.
+    pub allow_uninspected_credentials: bool,
+    /// Internal gateway-derived credential provenance for this endpoint.
+    pub provider_credentialed: bool,
     /// When true, client-to-server GraphQL-over-WebSocket operation messages
     /// are classified with the same operation policy used by GraphQL-over-HTTP.
     pub websocket_graphql_policy: bool,
@@ -210,6 +214,9 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         get_object_bool(val, "websocket_credential_rewrite").unwrap_or(false);
     let request_body_credential_rewrite =
         get_object_bool(val, "request_body_credential_rewrite").unwrap_or(false);
+    let allow_uninspected_credentials =
+        get_object_bool(val, "allow_uninspected_credentials").unwrap_or(false);
+    let provider_credentialed = get_object_bool(val, "provider_credentialed").unwrap_or(false);
     let websocket_graphql_policy =
         protocol == L7Protocol::Websocket && endpoint_has_graphql_policy(val);
     let graphql_max_body_bytes = get_object_u64(val, "graphql_max_body_bytes")
@@ -265,11 +272,31 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         allow_encoded_slash,
         websocket_credential_rewrite,
         request_body_credential_rewrite,
+        allow_uninspected_credentials,
+        provider_credentialed,
         websocket_graphql_policy,
         credential_signing,
         signing_service,
         signing_region,
     })
+}
+
+pub(crate) fn emit_uninspected_credential_finding(host: &str, policy_name: &str, surface: &str) {
+    let event = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(openshell_ocsf::SeverityId::High)
+        .finding_info(openshell_ocsf::FindingInfo::new(
+            "openshell.credentials.traffic_uninspectable",
+            "Credential-bearing traffic cannot be inspected",
+        ))
+        .evidence_pairs(&[
+            ("policy", policy_name),
+            ("host", host),
+            ("surface", surface),
+            ("disposition", "denied"),
+        ])
+        .message("Uninspected credential-bearing traffic denied")
+        .build();
+    openshell_ocsf::ocsf_emit!(event);
 }
 
 impl L7EndpointConfig {
@@ -283,6 +310,10 @@ impl L7EndpointConfig {
         } else {
             self.path.chars().filter(|c| *c != '*').count()
         }
+    }
+
+    pub fn deny_uninspected_body_credentials(&self, has_resolver: bool) -> bool {
+        !self.allow_uninspected_credentials && (self.provider_credentialed || has_resolver)
     }
 }
 
@@ -299,6 +330,34 @@ pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
         Some("skip") => TlsMode::Skip,
         // "terminate" and "passthrough" are deprecated aliases (logged by parse_l7_config); fall through to Auto.
         _ => TlsMode::Auto,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EndpointCredentialGuard {
+    pub provider_credentialed: bool,
+    pub allow_uninspected_credentials: bool,
+    pub has_l7_protocol: bool,
+    pub tls: TlsMode,
+}
+
+impl EndpointCredentialGuard {
+    pub fn blocks_uninspected(self) -> bool {
+        self.provider_credentialed && !self.allow_uninspected_credentials
+    }
+
+    pub fn blocks_connect(self) -> bool {
+        self.blocks_uninspected() && (!self.has_l7_protocol || self.tls == TlsMode::Skip)
+    }
+}
+
+pub fn parse_endpoint_credential_guard(val: &regorus::Value) -> EndpointCredentialGuard {
+    EndpointCredentialGuard {
+        provider_credentialed: get_object_bool(val, "provider_credentialed").unwrap_or(false),
+        allow_uninspected_credentials: get_object_bool(val, "allow_uninspected_credentials")
+            .unwrap_or(false),
+        has_l7_protocol: get_object_str(val, "protocol").is_some(),
+        tls: parse_tls_mode(val),
     }
 }
 
@@ -1694,6 +1753,43 @@ mod tests {
         let val =
             regorus::Value::from_json_str(r#"{"host": "api.example.com", "port": 443}"#).unwrap();
         assert!(parse_l7_config(&val).is_none());
+    }
+
+    #[test]
+    fn parse_endpoint_credential_guard_handles_l4_and_opt_in() {
+        let guarded = regorus::Value::from_json_str(
+            r#"{"host":"api.example.com","ports":[443],"provider_credentialed":true}"#,
+        )
+        .unwrap();
+        let guard = parse_endpoint_credential_guard(&guarded);
+        assert!(guard.blocks_connect());
+
+        let opted_in = regorus::Value::from_json_str(
+            r#"{"host":"api.example.com","ports":[443],"provider_credentialed":true,"allow_uninspected_credentials":true}"#,
+        )
+        .unwrap();
+        assert!(!parse_endpoint_credential_guard(&opted_in).blocks_connect());
+    }
+
+    #[test]
+    fn generic_resolver_enables_rest_body_backstop_without_provider_marker() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol":"rest","host":"api.example.com","ports":[443]}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(!config.deny_uninspected_body_credentials(false));
+        assert!(config.deny_uninspected_body_credentials(true));
+
+        let opted_in = regorus::Value::from_json_str(
+            r#"{"protocol":"rest","host":"api.example.com","ports":[443],"allow_uninspected_credentials":true}"#,
+        )
+        .unwrap();
+        assert!(
+            !parse_l7_config(&opted_in)
+                .unwrap()
+                .deny_uninspected_body_credentials(true)
+        );
     }
 
     #[test]

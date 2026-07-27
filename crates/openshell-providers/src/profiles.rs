@@ -195,6 +195,10 @@ pub struct DiscoveryProfile {
 // GraphqlOperation, or NetworkBinary, add it here and in both conversion
 // directions unless the import/lint path explicitly rejects it.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Endpoint profile mirrors independent policy schema toggles."
+)]
 pub struct EndpointProfile {
     pub host: String,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -221,6 +225,8 @@ pub struct EndpointProfile {
     pub websocket_credential_rewrite: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub request_body_credential_rewrite: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_uninspected_credentials: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub persisted_queries: String,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -651,6 +657,21 @@ impl ProviderTypeProfile {
         }
         diagnostics
     }
+
+    /// Whether attaching this profile makes its network endpoints credentialed.
+    ///
+    /// Profiles do not currently map individual credentials to individual
+    /// endpoints, so the safe interpretation is that any declared credential
+    /// can be used with every endpoint in the same profile. Endpoint signing is
+    /// also credential-bearing even when placement metadata is implicit.
+    #[must_use]
+    pub fn has_credentialed_endpoints(&self) -> bool {
+        !self.credentials.is_empty()
+            || self
+                .endpoints
+                .iter()
+                .any(|endpoint| !endpoint.credential_signing.trim().is_empty())
+    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -1074,6 +1095,8 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
         request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
+        allow_uninspected_credentials: endpoint.allow_uninspected_credentials,
+        provider_credentialed: false,
         advisor_proposed: false,
         persisted_queries: endpoint.persisted_queries.clone(),
         graphql_persisted_queries: endpoint
@@ -1123,6 +1146,7 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
         request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
+        allow_uninspected_credentials: endpoint.allow_uninspected_credentials,
         persisted_queries: endpoint.persisted_queries.clone(),
         graphql_persisted_queries: endpoint
             .graphql_persisted_queries
@@ -2188,6 +2212,27 @@ pub fn validate_profile_set(
                         }
                     }
                 }
+            }
+
+            if profile.has_credentialed_endpoints()
+                && !endpoint.allow_uninspected_credentials
+                && (endpoint.protocol.trim().is_empty()
+                    || endpoint.tls.trim().eq_ignore_ascii_case("skip"))
+            {
+                let mode = if endpoint.protocol.trim().is_empty() {
+                    "L4-only"
+                } else {
+                    "tls: skip"
+                };
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}].allow_uninspected_credentials"),
+                    format!(
+                        "credentialed endpoint '{}:{}' uses {mode}; configure L7 inspection or explicitly set allow_uninspected_credentials: true",
+                        endpoint.host, endpoint.port
+                    ),
+                ));
             }
         }
 
@@ -3338,6 +3383,8 @@ endpoints:
   - host: alpha.default.svc.cluster.local
     port: 80
     path: /v1/**
+    protocol: rest
+    access: full
 ",
         )
         .expect("profile should parse");
@@ -3378,6 +3425,8 @@ endpoints:
   - host: alpha.default.svc.cluster.local
     port: 80
     path: /v1/**
+    protocol: rest
+    access: full
 ",
         )
         .expect("profile should parse");
@@ -3470,6 +3519,7 @@ endpoints:
       - method: POST
         path: /admin/**
     allow_encoded_slash: true
+    allow_uninspected_credentials: true
 binaries:
   - path: /usr/bin/custom
     harness: true
@@ -3503,6 +3553,8 @@ binaries:
         assert_eq!(rest_ep.tls, "terminate");
         assert_eq!(rest_ep.allowed_ips, vec!["10.0.0.0/24"]);
         assert!(rest_ep.allow_encoded_slash);
+        assert!(rest_ep.allow_uninspected_credentials);
+        assert!(!rest_ep.provider_credentialed);
         assert_eq!(
             rest_ep
                 .rules
@@ -3521,7 +3573,91 @@ binaries:
         assert_eq!(reprotoo.endpoints[1].rules.len(), 1);
         assert_eq!(reprotoo.endpoints[1].deny_rules.len(), 1);
         assert_eq!(reprotoo.endpoints[1].ports, vec![443, 8443]);
+        assert!(reprotoo.endpoints[1].allow_uninspected_credentials);
+        assert!(!reprotoo.endpoints[1].provider_credentialed);
         assert!(reprotoo.binaries[0].harness);
+    }
+
+    #[test]
+    fn profile_classifies_declared_credentials_and_signing_as_credentialed() {
+        let with_declared_credential = parse_profile_yaml(
+            r"
+id: credentialed
+display_name: Credentialed
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+endpoints:
+  - host: api.example.com
+    port: 443
+",
+        )
+        .expect("profile should parse");
+        assert!(with_declared_credential.has_credentialed_endpoints());
+
+        let with_signing = parse_profile_yaml(
+            r"
+id: signed
+display_name: Signed
+credentials: []
+endpoints:
+  - host: s3.example.com
+    port: 443
+    credential_signing: sigv4
+",
+        )
+        .expect("profile should parse");
+        assert!(with_signing.has_credentialed_endpoints());
+
+        let plain = parse_profile_yaml(
+            r"
+id: plain
+display_name: Plain
+credentials: []
+endpoints:
+  - host: pypi.org
+    port: 443
+",
+        )
+        .expect("profile should parse");
+        assert!(!plain.has_credentialed_endpoints());
+    }
+
+    #[test]
+    fn credentialed_profile_requires_opt_in_for_l4_endpoint() {
+        let profile = parse_profile_yaml(
+            r"
+id: raw
+display_name: Raw
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+endpoints:
+  - host: raw.example.com
+    port: 443
+",
+        )
+        .expect("profile should parse");
+        let diagnostics = validate_profile_set(&[("raw.yaml".to_string(), profile)]);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "endpoints[0].allow_uninspected_credentials"
+        }));
+
+        let opted_in = parse_profile_yaml(
+            r"
+id: raw
+display_name: Raw
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+endpoints:
+  - host: raw.example.com
+    port: 443
+    allow_uninspected_credentials: true
+",
+        )
+        .expect("profile should parse");
+        assert!(validate_profile_set(&[("raw.yaml".to_string(), opted_in)]).is_empty());
     }
 
     #[test]

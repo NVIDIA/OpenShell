@@ -384,6 +384,7 @@ Incrementally merge live network policy changes into the current sandbox policy.
 Notes:
 
 - The sandbox name defaults to the last-used sandbox.
+- `--add-endpoint` options are comma-separated: `allowed-ip=<CIDR-or-IP>`, `websocket-credential-rewrite`, `request-body-credential-rewrite`, and `allow-uninspected-credentials`. The last option is a security-sensitive exception for provider-credentialed L4-only, `tls: skip`, or otherwise uninspectable traffic.
 - `--add-allow` and `--add-deny` operate on REST and WebSocket endpoints. Use full YAML for JSON-RPC, MCP, SQL, or other policy structure.
 - `--wait` cannot be combined with `--dry-run`.
 - Use `policy set` when replacing the full policy or changing static sections.

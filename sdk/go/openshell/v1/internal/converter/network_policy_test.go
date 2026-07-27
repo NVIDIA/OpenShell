@@ -33,6 +33,8 @@ func TestNetworkPolicyRuleFromProto(t *testing.T) {
 				Path:                         "/api/v1",
 				WebsocketCredentialRewrite:   true,
 				RequestBodyCredentialRewrite: false,
+				AllowUninspectedCredentials:  true,
+				ProviderCredentialed:         true,
 				AdvisorProposed:              true,
 				CredentialSigning:            "sigv4",
 				SigningService:               "bedrock",
@@ -110,6 +112,8 @@ func TestNetworkPolicyRuleFromProto(t *testing.T) {
 	assert.Equal(t, "/api/v1", ep.Path)
 	assert.True(t, ep.WebsocketCredentialRewrite)
 	assert.False(t, ep.RequestBodyCredentialRewrite)
+	assert.True(t, ep.AllowUninspectedCredentials)
+	assert.True(t, ep.ProviderCredentialed)
 	assert.True(t, ep.AdvisorProposed)
 	assert.Equal(t, "sigv4", ep.CredentialSigning)
 	assert.Equal(t, "bedrock", ep.SigningService)
@@ -188,6 +192,8 @@ func TestNetworkPolicyRuleRoundTrip(t *testing.T) {
 				Path:                         "/graphql",
 				WebsocketCredentialRewrite:   false,
 				RequestBodyCredentialRewrite: true,
+				AllowUninspectedCredentials:  true,
+				ProviderCredentialed:         true,
 				AdvisorProposed:              false,
 				CredentialSigning:            "sigv4",
 				SigningService:               "bedrock",
@@ -257,6 +263,8 @@ func TestNetworkPolicyRuleRoundTrip(t *testing.T) {
 	assert.Equal(t, original.Endpoints[0].AllowedIPs, roundTrip.Endpoints[0].AllowedIPs)
 	assert.Equal(t, original.Endpoints[0].AllowEncodedSlash, roundTrip.Endpoints[0].AllowEncodedSlash)
 	assert.Equal(t, original.Endpoints[0].GraphqlMaxBodyBytes, roundTrip.Endpoints[0].GraphqlMaxBodyBytes)
+	assert.Equal(t, original.Endpoints[0].AllowUninspectedCredentials, roundTrip.Endpoints[0].AllowUninspectedCredentials)
+	assert.Equal(t, original.Endpoints[0].ProviderCredentialed, roundTrip.Endpoints[0].ProviderCredentialed)
 	assert.Equal(t, original.Endpoints[0].AdvisorProposed, roundTrip.Endpoints[0].AdvisorProposed)
 	assert.Equal(t, original.Endpoints[0].CredentialSigning, roundTrip.Endpoints[0].CredentialSigning)
 	assert.Equal(t, original.Endpoints[0].SigningService, roundTrip.Endpoints[0].SigningService)

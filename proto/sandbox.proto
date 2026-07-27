@@ -186,6 +186,13 @@ message NetworkEndpoint {
   // endpointless provider profile. Profiles that already define endpoints
   // continue to use those profile endpoints as their credential boundary.
   NetworkCredentialBinding credential_binding = 24;
+  // Explicitly permits credential-bearing traffic to use paths that OpenShell
+  // cannot inspect or rewrite. Defaults to false. This is a security-sensitive
+  // escape hatch and must be explicitly approved.
+  bool allow_uninspected_credentials = 25;
+  // Internal gateway-derived marker indicating that this endpoint belongs to
+  // an attached credentialed provider. User-authored values are ignored.
+  bool provider_credentialed = 26;
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more
