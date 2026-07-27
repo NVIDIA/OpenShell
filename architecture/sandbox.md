@@ -238,9 +238,12 @@ loopback always dial directly; add driver-injected host aliases (e.g.
 proxy cannot reach the container host. `NO_PROXY` matching is port-aware and
 resolution-aware: an entry with a `:port` qualifier only bypasses that port,
 and IP/CIDR entries also match hostnames through their validated resolved
-addresses, with the direct dial limited to the addresses the entry contains. Only `http://` proxy URLs in explicit
-`http://host:port` form are supported — the scheme and port are both
-required, and a path, query, or fragment is rejected. Local DNS resolution
+addresses, with the direct dial limited to the addresses the entry contains. `http://` and `https://` proxy URLs in explicit
+`scheme://host:port` form are supported — the scheme and port are both
+required, and a path, query, or fragment is rejected. For an `https://` proxy
+the supervisor wraps the connection to the proxy in TLS before the CONNECT
+handshake, verifying the proxy certificate against the built-in and system
+roots plus the optional operator CA bundle (see below). Local DNS resolution
 and SSRF validation still run before the proxied dial, and the CONNECT
 target sent to the corporate proxy is a validated resolved address, so the
 proxy performs no DNS resolution of its own and the tunnel stays bound to
@@ -257,15 +260,30 @@ enhancement and out of scope.) The workload child's proxy variables are
 unaffected — they are always rewritten to point at the local policy proxy.
 
 The configuration is fail-closed: a setting that is present but invalid — an
-empty value, an unsupported or malformed proxy URL, an unreadable auth file,
-a malformed credential, or an auth file or `NO_PROXY` list set while no proxy
-URL is configured — is fatal to supervisor startup instead of being treated
-as unset, so a misconfiguration can never silently degrade to direct dialing
-or unauthenticated proxy access. Only an omitted argument means "no proxy".
-The driver validates the same rules at sandbox-create time through
-validators shared with the supervisor
+empty value, an unsupported or malformed proxy URL, an unreadable auth file or
+CA bundle, a malformed credential, or an auth file, `NO_PROXY` list, or CA
+bundle set while no proxy URL is configured — is fatal to supervisor startup
+instead of being treated as unset, so a misconfiguration can never silently
+degrade to direct dialing or unauthenticated proxy access. Only an omitted
+argument means "no proxy". The driver validates the same rules at
+sandbox-create time through validators shared with the supervisor
 (`openshell_core::driver_utils::parse_upstream_proxy_url` and
 `parse_upstream_proxy_credential`).
+
+An optional operator CA bundle (`--upstream-proxy-ca-bundle`, a PEM path the
+driver bind-mounts read-only into the sandbox) extends the trust boundary for
+corporate proxies. A CA certificate is not secret, so unlike the auth file it
+travels as a plain read-only bind mount rather than a driver secret. It is
+trusted in two places: the TLS handshake with an `https://` proxy, and —
+because a TLS-intercepting proxy (mitmproxy, squid `ssl-bump`) re-signs
+tunneled server certificates with the same CA — the sandbox combined trust
+bundle (`write_ca_files`) and the L7 upstream re-encryption store
+(`build_upstream_client_config`). Folding it into both means intercepted
+upstream handshakes succeed and sandbox workload processes trust the re-signed
+certificates; trusting it only for the proxy-listener handshake would leave
+every intercepted upstream connection failing. The bundle is valid with either
+an `http://` or `https://` proxy (an intercepting proxy can be reached over
+plain HTTP) and is fail-closed: an unreadable or certificate-free file is fatal.
 
 Proxy credentials are never embedded in the URL: an inline `user:pass@` is
 rejected because it would be stored in `gateway.toml` and exposed in container
