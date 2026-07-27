@@ -974,8 +974,7 @@ async fn policy_reload_updates_both_adapters_and_closes_existing_http_tunnel() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn ambiguous_policy_update_fails_closed_without_contacting_upstream() {
+async fn ambiguous_policy_update_is_rejected_without_replacing_active_policy() {
     let server = KeepAliveHttpServer::start()
         .await
         .expect("start keep-alive HTTP server");
@@ -1014,6 +1013,9 @@ async fn ambiguous_policy_update_fails_closed_without_contacting_upstream() {
     let before = parse_json_line(&before);
     assert_eq!(before["connect"], 200, "CONNECT before update: {before}");
     assert_eq!(before["forward"], 200, "forward before update: {before}");
+    let history_before = run_cli(&["policy", "list", &guard.name])
+        .await
+        .expect("list policy history before rejected update");
     let connections_before_rejection = server.connection_count();
 
     let update_error = run_cli(&[
@@ -1027,77 +1029,36 @@ async fn ambiguous_policy_update_fails_closed_without_contacting_upstream() {
         "120",
     ])
     .await
-    .expect_err("ambiguous policy must report a failed revision");
+    .expect_err("ambiguous policy must be rejected before persistence");
     assert!(
         update_error.contains("ambiguity validation failed"),
         "policy update should explain the ambiguity:\n{update_error}"
     );
 
-    let quarantined = guard
-        .exec(&["python3", "-c", &status_script])
+    let history_after = run_cli(&["policy", "list", &guard.name])
         .await
-        .expect("exercise both adapters in fail-closed quarantine");
-    let quarantined = parse_json_line(&quarantined);
+        .expect("list policy history after rejected update");
     assert_eq!(
-        quarantined["connect"], 403,
-        "CONNECT in quarantine: {quarantined}"
-    );
-    assert_eq!(
-        quarantined["forward"], 403,
-        "forward in quarantine: {quarantined}"
-    );
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(
-        server.connection_count(),
-        connections_before_rejection,
-        "quarantined requests must not contact the upstream server"
+        history_after, history_before,
+        "rejected policy must not create a revision"
     );
 
-    let logs = wait_for_sandbox_logs(&guard.name, |logs| {
-        logs.contains("configured_mode=fail_closed effective_mode=fail_closed")
-            && logs.contains("previous policy IS NOT active")
-            && logs.contains("conflicting metadata")
-            && logs.contains("tls")
-    })
-    .await
-    .expect("fetch sandbox logs after rejection");
-    assert!(
-        logs.contains("configured_mode=fail_closed effective_mode=fail_closed"),
-        "OCSF logs should state the effective validation posture:\n{logs}"
-    );
-    assert!(
-        logs.contains("previous policy IS NOT active"),
-        "OCSF logs should state that the previous policy is inactive:\n{logs}"
-    );
-    assert!(
-        logs.contains("conflicting metadata") && logs.contains("tls"),
-        "OCSF logs should contain the overlap rationale:\n{logs}"
-    );
-
-    run_cli(&[
-        "policy",
-        "set",
-        &guard.name,
-        "--policy",
-        &valid_policy_path,
-        "--wait",
-        "--timeout",
-        "120",
-    ])
-    .await
-    .expect("valid policy should exit quarantine");
-    let recovered = guard
+    let after_rejection = guard
         .exec(&["python3", "-c", &status_script])
         .await
-        .expect("exercise both adapters after recovery");
-    let recovered = parse_json_line(&recovered);
+        .expect("exercise both adapters after rejected update");
+    let after_rejection = parse_json_line(&after_rejection);
     assert_eq!(
-        recovered["connect"], 200,
-        "CONNECT after recovery: {recovered}"
+        after_rejection["connect"], 200,
+        "CONNECT should keep using the active valid policy: {after_rejection}"
     );
     assert_eq!(
-        recovered["forward"], 200,
-        "forward after recovery: {recovered}"
+        after_rejection["forward"], 200,
+        "forward HTTP should keep using the active valid policy: {after_rejection}"
+    );
+    assert!(
+        server.connection_count() > connections_before_rejection,
+        "active-policy requests should still contact the upstream server"
     );
 
     guard.cleanup().await;
