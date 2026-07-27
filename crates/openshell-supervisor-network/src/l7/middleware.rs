@@ -92,6 +92,9 @@ pub fn emit_websocket_preflight_events(
     if outcome.saturated {
         emit_websocket_saturation(ctx);
     }
+    if outcome.session_capacity_exhausted {
+        emit_middleware_session_capacity_exhausted(ctx);
+    }
 }
 
 pub(super) fn emit_websocket_session_start_events(
@@ -260,6 +263,23 @@ fn emit_websocket_saturation(ctx: &L7EvalContext) {
             ("operation", "websocket_message"),
         ])
         .message("WebSocket middleware work waited for admission capacity")
+        .build();
+    ocsf_emit!(event);
+}
+
+fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext) {
+    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(SeverityId::Medium)
+        .finding_info(FindingInfo::new(
+            "openshell.middleware.session_capacity_exhausted",
+            "Supervisor middleware session capacity exhausted",
+        ))
+        .evidence_pairs(&[
+            ("policy", ctx.policy_name.as_str()),
+            ("host", ctx.host.as_str()),
+            ("operation", "websocket_message"),
+        ])
+        .message("Persistent middleware session admission was refused at process capacity")
         .build();
     ocsf_emit!(event);
 }

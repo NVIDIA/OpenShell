@@ -49,6 +49,7 @@ one `MiddlewareRegistry`.
 |---|---:|---|
 | Concurrent buffered work | 32 | Shared by HTTP requests, WebSocket messages, and WebSocket preflight. One permit covers one complete unit of work. |
 | Admission waiters | 32 | Additional work is shed when both the active budget and waiter budget are full. |
+| Persistent middleware sessions | 32 | Shared process-wide session budget for streaming middleware protocols. WebSocket preflight uses immediate admission before opening streams and retains one permit while any stage remains active. |
 | HTTP body or WebSocket text message | 4 MiB | Platform maximum for input and replacement payloads. Service, operator, and stage limits may narrow it. |
 | Middleware configs and stages | 10 | At most 10 configs in policy and 10 selected stages in one chain. |
 | Selector patterns | 32 | Combined include and exclude patterns per middleware config. |
@@ -67,6 +68,15 @@ The work semaphore bounds aggregate buffered middleware input to approximately
 `32 × 4 MiB`, plus bounded envelope and parser overhead. It is a concurrency
 safety valve, not rate limiting or a promise that 32 simultaneous maximum-size
 messages are inexpensive.
+
+The persistent session semaphore is independent from the work semaphore. One
+WebSocket middleware session consumes one permit regardless of its active-stage
+fan-out, which is separately capped at 10 stages. All-skip preflight releases
+the permit immediately. A retained session releases it at connection end or as
+soon as its last active stage is disabled. Session admission does not wait:
+capacity exhaustion follows each selected config's `on_error` behavior before
+any stream opens. The protocol-neutral registry ownership allows future
+streaming HTTP middleware to use the same process-wide budget.
 
 ## Egress Framing and Inspection
 
@@ -132,8 +142,6 @@ of potential queue growth.
 The current limits grew with individual features and are not yet a complete
 resource model. Known gaps include:
 
-- Long-lived WebSocket middleware sessions do not have an independent
-  process-wide session or stream budget.
 - GraphQL, MCP, and JSON-RPC policy body limits have defaults but no common
   platform maximum.
 - A positive token-cache TTL override replaces the response-derived one-hour

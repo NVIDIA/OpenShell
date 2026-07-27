@@ -4,7 +4,6 @@
 //! Forward-direction WebSocket middleware session runner.
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +24,8 @@ use super::{
     MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_CONFIG_BYTES, MAX_MIDDLEWARE_CONTEXT_BYTES,
     MAX_MIDDLEWARE_FINDING_BYTES, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_METADATA_BYTES,
     MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT, MAX_MIDDLEWARE_REASON_BYTES,
-    MIDDLEWARE_GRPC_MESSAGE_BYTES, MiddlewareDenial, NamespacedFinding, OnError,
+    MIDDLEWARE_GRPC_MESSAGE_BYTES, MiddlewareDenial, MiddlewareSessionAdmission,
+    MiddlewareSessionPermit, MiddlewareWorkAdmission, NamespacedFinding, OnError,
     is_stable_reason_code, middleware_denial_reason,
 };
 
@@ -78,6 +78,7 @@ pub struct WebSocketPreflightResult {
     pub session: Option<WebSocketSession>,
     pub invocations: Vec<WebSocketInvocation>,
     pub saturated: bool,
+    pub session_capacity_exhausted: bool,
 }
 
 #[derive(Debug)]
@@ -100,17 +101,42 @@ pub struct WebSocketMessageOutcome {
     pub platform_oversize: bool,
 }
 
-struct WebSocketStage {
-    entry: DescribedChainEntry,
+struct WebSocketStageTransport {
     sender: mpsc::Sender<WebSocketEvaluationRequest>,
     responses: super::WebSocketResponseStream,
-    active: bool,
+}
+
+struct WebSocketStage {
+    entry: DescribedChainEntry,
+    transport: Option<WebSocketStageTransport>,
+}
+
+impl WebSocketStage {
+    fn is_active(&self) -> bool {
+        self.transport.is_some()
+    }
+
+    fn disable(&mut self) {
+        self.transport.take();
+    }
 }
 
 pub struct WebSocketSession {
     runner: ChainRunner,
     stages: Vec<WebSocketStage>,
     next_sequence: u64,
+    session_admission: Option<MiddlewareSessionPermit>,
+}
+
+/// Whether a WebSocket text message needs the shared short-lived work budget.
+///
+/// A fully disabled fail-open session returns `Bypass` without touching the
+/// work semaphore. Other parsed WebSocket features may continue processing the
+/// original payload independently.
+#[derive(Debug)]
+pub enum WebSocketMessageAdmission {
+    Bypass,
+    Inspect(MiddlewareWorkAdmission),
 }
 
 enum OpenStage {
@@ -120,32 +146,6 @@ enum OpenStage {
 }
 
 impl ChainRunner {
-    pub async fn reserve_middleware_work(&self) -> miette::Result<super::MiddlewareAdmission> {
-        if let Ok(permit) = Arc::clone(&self.registry.admission).try_acquire_owned() {
-            Ok(super::MiddlewareAdmission {
-                _work: permit,
-                saturated: false,
-            })
-        } else {
-            let waiter = Arc::clone(&self.registry.admission_waiters)
-                .try_acquire_owned()
-                .map_err(|_| {
-                    miette::miette!(
-                        "middleware admission queue is full; refusing additional buffered work"
-                    )
-                })?;
-            let permit = Arc::clone(&self.registry.admission)
-                .acquire_owned()
-                .await
-                .map_err(|_| miette::miette!("middleware admission semaphore closed"))?;
-            drop(waiter);
-            Ok(super::MiddlewareAdmission {
-                _work: permit,
-                saturated: true,
-            })
-        }
-    }
-
     pub async fn preflight_websocket(
         &self,
         entries: &[ChainEntry],
@@ -160,13 +160,20 @@ impl ChainRunner {
                 session: None,
                 invocations: Vec::new(),
                 saturated: false,
+                session_capacity_exhausted: false,
             });
         }
 
         // One permit covers the complete concurrent preflight fan-out. Permit
         // wait is deliberate backpressure and is excluded from every deadline.
-        let permit = self.reserve_middleware_work().await?;
-        let saturated = permit.saturated();
+        let preflight_work = self.reserve_middleware_work().await?;
+        let saturated = preflight_work.saturated();
+        let session_admission = match self.try_reserve_middleware_session() {
+            MiddlewareSessionAdmission::Admitted(admission) => admission,
+            MiddlewareSessionAdmission::AtCapacity => {
+                return Ok(session_capacity_exhausted(described, saturated));
+            }
+        };
         let opened = join_all(
             described
                 .into_iter()
@@ -203,29 +210,85 @@ impl ChainRunner {
                 session: None,
                 invocations,
                 saturated,
+                session_capacity_exhausted: false,
+            });
+        }
+
+        if stages.is_empty() {
+            drop(session_admission);
+            return Ok(WebSocketPreflightResult {
+                allowed: true,
+                reason: String::new(),
+                session: None,
+                invocations,
+                saturated,
+                session_capacity_exhausted: false,
             });
         }
 
         Ok(WebSocketPreflightResult {
             allowed: true,
             reason: String::new(),
-            session: (!stages.is_empty()).then_some(WebSocketSession {
+            session: Some(WebSocketSession {
                 runner: self.clone(),
                 stages,
                 next_sequence: 1,
+                session_admission: Some(session_admission),
             }),
             invocations,
             saturated,
+            session_capacity_exhausted: false,
         })
     }
 }
 
+fn session_capacity_exhausted(
+    described: Vec<DescribedChainEntry>,
+    saturated: bool,
+) -> WebSocketPreflightResult {
+    let reason = "middleware_session_capacity_exhausted";
+    let mut fail_closed = false;
+    let invocations = described
+        .iter()
+        .map(|entry| {
+            fail_closed |= entry.entry.on_error == OnError::FailClosed;
+            failure_invocation(entry, None, 0, reason)
+        })
+        .collect();
+    WebSocketPreflightResult {
+        allowed: !fail_closed,
+        reason: if fail_closed {
+            format!("middleware_failed: {reason}")
+        } else {
+            String::new()
+        },
+        session: None,
+        invocations,
+        saturated,
+        session_capacity_exhausted: true,
+    }
+}
+
 impl WebSocketSession {
-    pub fn reserve_message(
-        &self,
-    ) -> impl Future<Output = miette::Result<super::MiddlewareAdmission>> + Send + 'static {
-        let runner = self.runner.clone();
-        async move { runner.reserve_middleware_work().await }
+    fn has_active_stages(&self) -> bool {
+        self.stages.iter().any(WebSocketStage::is_active)
+    }
+
+    fn reconcile_lifecycle(&mut self) {
+        if !self.has_active_stages() {
+            self.session_admission.take();
+        }
+    }
+
+    pub async fn admit_message(&mut self) -> miette::Result<WebSocketMessageAdmission> {
+        self.reconcile_lifecycle();
+        if !self.has_active_stages() {
+            return Ok(WebSocketMessageAdmission::Bypass);
+        }
+        self.runner
+            .reserve_middleware_work()
+            .await
+            .map(WebSocketMessageAdmission::Inspect)
     }
 
     pub async fn start(&mut self, selected_subprotocol: &str) -> WebSocketSessionStartOutcome {
@@ -239,9 +302,9 @@ impl WebSocketSession {
         let mut invocations = Vec::new();
         let mut fail_closed = None;
         for stage in &mut self.stages {
-            if !stage.active {
+            let Some(transport) = stage.transport.as_mut() else {
                 continue;
-            }
+            };
             let request = WebSocketEvaluationRequest {
                 request: Some(web_socket_evaluation_request::Request::SessionStart(
                     WebSocketSessionStart {
@@ -249,9 +312,10 @@ impl WebSocketSession {
                     },
                 )),
             };
-            let sent = tokio::time::timeout(stage.entry.timeout, stage.sender.send(request)).await;
+            let sent =
+                tokio::time::timeout(stage.entry.timeout, transport.sender.send(request)).await;
             if !matches!(sent, Ok(Ok(()))) {
-                stage.active = false;
+                stage.disable();
                 let reason = "session_start_send_failed";
                 let mut invocation = failure_invocation(&stage.entry, None, 0, reason);
                 invocation.stage_disabled = true;
@@ -261,6 +325,7 @@ impl WebSocketSession {
                 invocations.push(invocation);
             }
         }
+        self.reconcile_lifecycle();
         WebSocketSessionStartOutcome {
             allowed: fail_closed.is_none(),
             reason: fail_closed.unwrap_or_default(),
@@ -269,43 +334,38 @@ impl WebSocketSession {
     }
 
     pub async fn evaluate_text(&mut self, payload: Vec<u8>) -> WebSocketMessageOutcome {
-        let admission = self.reserve_message().await.ok();
-        self.evaluate_text_admitted(payload, admission).await
+        if payload.len() > MAX_MIDDLEWARE_BODY_BYTES {
+            return platform_oversize_outcome(payload);
+        }
+        match self.admit_message().await {
+            Ok(WebSocketMessageAdmission::Bypass) => bypassed_message_outcome(payload),
+            Ok(WebSocketMessageAdmission::Inspect(admission)) => {
+                self.evaluate_text_admitted(payload, admission).await
+            }
+            Err(_) => admission_failure_outcome(payload),
+        }
     }
 
     pub async fn evaluate_text_admitted(
         &mut self,
         payload: Vec<u8>,
-        admission: Option<super::MiddlewareAdmission>,
+        admission: MiddlewareWorkAdmission,
+    ) -> WebSocketMessageOutcome {
+        let outcome = self.evaluate_text_admitted_inner(payload, admission).await;
+        self.reconcile_lifecycle();
+        outcome
+    }
+
+    async fn evaluate_text_admitted_inner(
+        &mut self,
+        payload: Vec<u8>,
+        admission: MiddlewareWorkAdmission,
     ) -> WebSocketMessageOutcome {
         if payload.len() > MAX_MIDDLEWARE_BODY_BYTES {
-            return WebSocketMessageOutcome {
-                allowed: false,
-                reason: "websocket_message_over_platform_capacity".to_string(),
-                payload,
-                findings: Vec::new(),
-                metadata: BTreeMap::new(),
-                invocations: Vec::new(),
-                denial: None,
-                saturated: false,
-                platform_oversize: true,
-            };
+            return platform_oversize_outcome(payload);
         }
 
-        let Some(permit) = admission else {
-            return WebSocketMessageOutcome {
-                allowed: false,
-                reason: "middleware_admission_over_capacity".to_string(),
-                payload,
-                findings: Vec::new(),
-                metadata: BTreeMap::new(),
-                invocations: Vec::new(),
-                denial: None,
-                saturated: true,
-                platform_oversize: false,
-            };
-        };
-        let saturated = permit.saturated();
+        let saturated = admission.saturated();
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         let chain_deadline = Instant::now() + MAX_MIDDLEWARE_CHAIN_TIMEOUT;
@@ -315,7 +375,7 @@ impl WebSocketSession {
         let mut invocations = Vec::new();
 
         for stage in &mut self.stages {
-            if !stage.active {
+            if !stage.is_active() {
                 continue;
             }
             let original_size = current.len();
@@ -345,7 +405,7 @@ impl WebSocketSession {
                 let mut invocation =
                     failure_invocation(&stage.entry, Some(sequence), original_size, reason);
                 let fail_closed = stage.entry.entry.on_error == OnError::FailClosed;
-                stage.active = false;
+                stage.disable();
                 invocation.stage_disabled = true;
                 invocations.push(invocation);
                 if fail_closed {
@@ -372,15 +432,21 @@ impl WebSocketSession {
                     },
                 )),
             };
-            let response = tokio::time::timeout(stage_timeout, async {
-                stage
-                    .sender
-                    .send(request)
-                    .await
-                    .map_err(|_| tonic::Status::unavailable("request stream closed"))?;
-                stage.responses.next().await.transpose()
-            })
-            .await;
+            let response = {
+                let transport = stage
+                    .transport
+                    .as_mut()
+                    .expect("active WebSocket stage has transport");
+                tokio::time::timeout(stage_timeout, async {
+                    transport
+                        .sender
+                        .send(request)
+                        .await
+                        .map_err(|_| tonic::Status::unavailable("request stream closed"))?;
+                    transport.responses.next().await.transpose()
+                })
+                .await
+            };
             let result = match response {
                 Ok(Ok(Some(response))) => match response.response {
                     Some(web_socket_evaluation_response::Response::MessageResult(result)) => result,
@@ -545,6 +611,49 @@ impl WebSocketSession {
 
     pub async fn end(mut self, reason: WebSocketSessionEndReason) {
         end_stages(&mut self.stages, reason).await;
+        self.reconcile_lifecycle();
+    }
+}
+
+fn platform_oversize_outcome(payload: Vec<u8>) -> WebSocketMessageOutcome {
+    WebSocketMessageOutcome {
+        allowed: false,
+        reason: "websocket_message_over_platform_capacity".to_string(),
+        payload,
+        findings: Vec::new(),
+        metadata: BTreeMap::new(),
+        invocations: Vec::new(),
+        denial: None,
+        saturated: false,
+        platform_oversize: true,
+    }
+}
+
+fn admission_failure_outcome(payload: Vec<u8>) -> WebSocketMessageOutcome {
+    WebSocketMessageOutcome {
+        allowed: false,
+        reason: "middleware_admission_over_capacity".to_string(),
+        payload,
+        findings: Vec::new(),
+        metadata: BTreeMap::new(),
+        invocations: Vec::new(),
+        denial: None,
+        saturated: true,
+        platform_oversize: false,
+    }
+}
+
+fn bypassed_message_outcome(payload: Vec<u8>) -> WebSocketMessageOutcome {
+    WebSocketMessageOutcome {
+        allowed: true,
+        reason: String::new(),
+        payload,
+        findings: Vec::new(),
+        metadata: BTreeMap::new(),
+        invocations: Vec::new(),
+        denial: None,
+        saturated: false,
+        platform_oversize: false,
     }
 }
 
@@ -620,9 +729,7 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
             OpenStage::Inspect(
                 Box::new(WebSocketStage {
                     entry,
-                    sender,
-                    responses,
-                    active: true,
+                    transport: Some(WebSocketStageTransport { sender, responses }),
                 }),
                 invocation,
             )
@@ -765,7 +872,7 @@ fn handle_stage_failure(
     invocations: &mut Vec<WebSocketInvocation>,
     saturated: bool,
 ) -> Option<WebSocketMessageOutcome> {
-    stage.active = false;
+    stage.disable();
     let mut invocation = failure_invocation(&stage.entry, Some(sequence), original_size, reason);
     invocation.stage_disabled = true;
     invocations.push(invocation);
@@ -853,13 +960,12 @@ fn failure_invocation(
 
 async fn end_stages(stages: &mut [WebSocketStage], reason: WebSocketSessionEndReason) {
     for stage in stages {
-        if stage.active {
+        if let Some(transport) = stage.transport.take() {
             let _ = tokio::time::timeout(
                 Duration::from_millis(10),
-                stage.sender.send(session_end_request(reason)),
+                transport.sender.send(session_end_request(reason)),
             )
             .await;
-            stage.active = false;
         }
     }
 }

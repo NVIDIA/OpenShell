@@ -59,6 +59,12 @@ pub const MAX_MIDDLEWARE_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Process-wide safety valve for concurrently buffered middleware work.
 pub const MAX_CONCURRENT_MIDDLEWARE_WORK: usize = 32;
+/// Process-wide safety valve for retained streaming middleware sessions.
+///
+/// A session consumes one permit regardless of its protocol or stage fan-out.
+/// Persistent middleware protocols must acquire from this shared budget before
+/// opening streams and retain the permit while any stage remains active.
+pub const MAX_CONCURRENT_MIDDLEWARE_SESSIONS: usize = 32;
 
 /// Largest number of middleware configurations accepted in one sandbox policy.
 pub const MAX_MIDDLEWARE_CONFIGS: usize = 10;

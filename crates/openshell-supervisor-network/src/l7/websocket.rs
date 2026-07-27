@@ -127,14 +127,14 @@ struct TextMessageAssembly {
     payload: Vec<u8>,
     compressed: bool,
     fragment_count: usize,
-    admission: Option<openshell_supervisor_middleware::MiddlewareAdmission>,
+    admission: Option<openshell_supervisor_middleware::MiddlewareWorkAdmission>,
     total_deadline: tokio::time::Instant,
 }
 
 impl TextMessageAssembly {
     fn new(
         compressed: bool,
-        admission: Option<openshell_supervisor_middleware::MiddlewareAdmission>,
+        admission: Option<openshell_supervisor_middleware::MiddlewareWorkAdmission>,
     ) -> Self {
         Self {
             payload: Vec::new(),
@@ -237,7 +237,7 @@ impl TextMessageAssembly {
     ) -> (
         Vec<u8>,
         bool,
-        Option<openshell_supervisor_middleware::MiddlewareAdmission>,
+        Option<openshell_supervisor_middleware::MiddlewareWorkAdmission>,
     ) {
         (self.payload, self.compressed, self.admission)
     }
@@ -409,10 +409,19 @@ where
                         ),
                     ));
                 }
-                let admission = if let Some(session) = options.middleware_session.as_ref() {
-                    Some(session.reserve_message().await.map_err(|error| {
+                let admission = if let Some(session) = options.middleware_session.as_mut() {
+                    let message_admission = session.admit_message().await.map_err(|error| {
                         terminate(WebSocketTerminationCause::MiddlewareFailure, error)
-                    })?)
+                    })?;
+                    match message_admission {
+                        openshell_supervisor_middleware::WebSocketMessageAdmission::Bypass => {
+                            options.middleware_session.take();
+                            None
+                        }
+                        openshell_supervisor_middleware::WebSocketMessageAdmission::Inspect(
+                            admission,
+                        ) => Some(admission),
+                    }
                 } else {
                     None
                 };
@@ -818,7 +827,7 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &FrameHeader,
     payload: Vec<u8>,
-    admission: Option<openshell_supervisor_middleware::MiddlewareAdmission>,
+    admission: Option<openshell_supervisor_middleware::MiddlewareWorkAdmission>,
     force_reframe: bool,
     compressed: bool,
     host: &str,
@@ -853,6 +862,12 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
 
     let mut middleware_transformed = false;
     if let Some(session) = options.middleware_session.as_mut() {
+        let admission = admission.ok_or_else(|| {
+            terminate(
+                WebSocketTerminationCause::MiddlewareFailure,
+                miette!("websocket middleware message missing work admission"),
+            )
+        })?;
         let outcome = session
             .evaluate_text_admitted(text.into_bytes(), admission)
             .await;
@@ -2367,6 +2382,7 @@ network_policies:
     #[derive(Clone, Default)]
     struct OpenAiWebSocketRedactor {
         observed: Option<tokio::sync::mpsc::UnboundedSender<ObservedWebSocketRequest>>,
+        close_on_first_message: bool,
     }
 
     #[tonic::async_trait]
@@ -2428,6 +2444,7 @@ network_policies:
             };
             let mut requests = request.into_inner();
             let observed = self.observed.clone();
+            let close_on_first_message = self.close_on_first_message;
             let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 while let Ok(Some(request)) = requests.message().await {
@@ -2448,6 +2465,9 @@ network_policies:
                                 let _ = observed.send(ObservedWebSocketRequest::Message(
                                     message.payload.clone(),
                                 ));
+                            }
+                            if close_on_first_message {
+                                break;
                             }
                             let text =
                                 String::from_utf8(message.payload).expect("OpenAI event UTF-8");
@@ -2531,6 +2551,7 @@ network_policies:
         let server = tonic::transport::Server::builder()
             .add_service(SupervisorMiddlewareServer::new(OpenAiWebSocketRedactor {
                 observed: Some(observed_tx),
+                ..Default::default()
             }))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                 let _ = shutdown_rx.await;
@@ -2937,6 +2958,143 @@ network_policies:
         drop(client_app);
         drop(upstream_app);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay).await;
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware")
+            .expect("serve middleware");
+    }
+
+    #[tokio::test]
+    async fn fully_disabled_session_bypasses_saturated_work_budget_without_rpc() {
+        use openshell_core::proto::SupervisorMiddlewareService;
+        use openshell_supervisor_middleware::{ChainEntry, MiddlewareRegistry, OnError};
+
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind WebSocket middleware");
+        let address = listener.local_addr().expect("middleware address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tonic::transport::Server::builder()
+            .add_service(SupervisorMiddlewareServer::new(OpenAiWebSocketRedactor {
+                observed: Some(observed_tx),
+                close_on_first_message: true,
+            }))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let server_task = tokio::spawn(server);
+        let registry = MiddlewareRegistry::connect_services(
+            Vec::new(),
+            vec![SupervisorMiddlewareService {
+                name: "openai-redactor".into(),
+                grpc_endpoint: format!("http://{address}"),
+                max_body_bytes: 0,
+                timeout: "2s".into(),
+            }],
+        )
+        .await
+        .expect("connect middleware");
+        let runner = openshell_supervisor_middleware::ChainRunner::from_registry(registry);
+        let preflight = runner
+            .preflight_websocket(
+                &[ChainEntry {
+                    name: "redact-openai".into(),
+                    implementation: "openai-redactor".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailOpen,
+                }],
+                openshell_supervisor_middleware::WebSocketPreflightInput {
+                    session_id: "disabled-session".into(),
+                    request_id: "request".into(),
+                    sandbox_id: "sandbox".into(),
+                    scheme: "wss".into(),
+                    host: "api.openai.com".into(),
+                    port: 443,
+                    path: "/v1/responses".into(),
+                    requested_subprotocols: Vec::new(),
+                },
+            )
+            .await
+            .expect("preflight");
+        let mut session = preflight.session.expect("middleware inspects session");
+        assert!(session.start("").await.allowed);
+        assert!(matches!(
+            observed_rx.recv().await,
+            Some(ObservedWebSocketRequest::SessionStart)
+        ));
+
+        let failed = session
+            .evaluate_text(br#"{"type":"response.create"}"#.to_vec())
+            .await;
+        assert!(failed.allowed);
+        assert!(failed.invocations[0].stage_disabled);
+        assert!(matches!(
+            observed_rx.recv().await,
+            Some(ObservedWebSocketRequest::Message(_))
+        ));
+
+        let mut occupied_work = Vec::new();
+        for _ in 0..openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_WORK {
+            occupied_work.push(
+                runner
+                    .reserve_middleware_work()
+                    .await
+                    .expect("fill middleware work budget"),
+            );
+        }
+
+        let original = r#"{"type":"response.cancel","reason":"keep-original"}"#;
+        let client_frame = masked_frame(true, OPCODE_TEXT, original.as_bytes());
+        let (mut client_app, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, mut upstream_app) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            relay_with_options(
+                &mut relay_client,
+                &mut relay_upstream,
+                Vec::new(),
+                "api.openai.com",
+                443,
+                RelayOptions {
+                    policy_name: "openai",
+                    resolver: None,
+                    generation_guard: None,
+                    inspector: None,
+                    compression: WebSocketCompression::None,
+                    middleware_session: Some(session),
+                    middleware_context: None,
+                },
+            )
+            .await
+        });
+
+        client_app
+            .write_all(&client_frame)
+            .await
+            .expect("send bypassed event");
+        client_app.flush().await.expect("flush bypassed event");
+        let upstream_frame = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_one_frame(&mut upstream_app),
+        )
+        .await
+        .expect("fully disabled session bypasses saturated work");
+        assert_eq!(decode_masked_text_frame(&upstream_frame), original);
+        assert!(
+            observed_rx.try_recv().is_err(),
+            "fully disabled session must not make another middleware RPC"
+        );
+
+        drop(occupied_work);
+        drop(client_app);
+        drop(upstream_app);
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .expect("relay finishes after disconnect")
+            .expect("join relay")
+            .expect("relay");
         let _ = shutdown_tx.send(());
         server_task
             .await

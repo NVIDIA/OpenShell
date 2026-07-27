@@ -8,8 +8,8 @@ mod remote;
 mod websocket;
 
 pub use websocket::{
-    WebSocketInvocation, WebSocketInvocationOutcome, WebSocketMessageOutcome,
-    WebSocketPreflightInput, WebSocketPreflightResult, WebSocketSession,
+    WebSocketInvocation, WebSocketInvocationOutcome, WebSocketMessageAdmission,
+    WebSocketMessageOutcome, WebSocketPreflightInput, WebSocketPreflightResult, WebSocketSession,
     WebSocketSessionStartOutcome,
 };
 
@@ -95,21 +95,36 @@ const MAX_QUEUED_MIDDLEWARE_WORK: usize = MAX_CONCURRENT_MIDDLEWARE_WORK;
 /// Callers that buffer request or message bodies acquire this guard first and
 /// retain it through evaluation, bounding aggregate buffered middleware input.
 #[derive(Debug)]
-pub struct MiddlewareAdmission {
+pub struct MiddlewareWorkAdmission {
     _work: OwnedSemaphorePermit,
     saturated: bool,
 }
 
-impl MiddlewareAdmission {
+impl MiddlewareWorkAdmission {
     pub fn saturated(&self) -> bool {
         self.saturated
     }
 }
 
+/// One slot in the shared persistent middleware session budget.
+///
+/// Protocol-specific session runners retain this guard while at least one
+/// streaming stage remains active. The generic registry owns admission so
+/// future streaming HTTP middleware can share the same process-wide bound.
+#[derive(Debug)]
+struct MiddlewareSessionPermit {
+    _session: OwnedSemaphorePermit,
+}
+
+enum MiddlewareSessionAdmission {
+    Admitted(MiddlewareSessionPermit),
+    AtCapacity,
+}
+
 pub use openshell_core::middleware::{
-    DEFAULT_MIDDLEWARE_TIMEOUT, MAX_CONCURRENT_MIDDLEWARE_WORK, MAX_MIDDLEWARE_CHAIN_FINDINGS,
-    MAX_MIDDLEWARE_CHAIN_STAGES, MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_CONFIGS,
-    MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT,
+    DEFAULT_MIDDLEWARE_TIMEOUT, MAX_CONCURRENT_MIDDLEWARE_SESSIONS, MAX_CONCURRENT_MIDDLEWARE_WORK,
+    MAX_MIDDLEWARE_CHAIN_FINDINGS, MAX_MIDDLEWARE_CHAIN_STAGES, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
+    MAX_MIDDLEWARE_CONFIGS, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT,
     MAX_MIDDLEWARE_SELECTOR_PATTERNS, MAX_MIDDLEWARE_TIMEOUT, MIN_MIDDLEWARE_TIMEOUT,
     middleware_timeout_or_default, parse_middleware_timeout,
 };
@@ -463,8 +478,9 @@ pub struct MiddlewareRegistry {
     services: Arc<Vec<Arc<MiddlewareServiceState>>>,
     registered_services: Arc<Vec<RegisteredMiddlewareService>>,
     middleware_names: Arc<HashSet<String>>,
-    admission: Arc<Semaphore>,
-    admission_waiters: Arc<Semaphore>,
+    work_admission: Arc<Semaphore>,
+    work_admission_waiters: Arc<Semaphore>,
+    session_admission: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for MiddlewareRegistry {
@@ -476,7 +492,11 @@ impl std::fmt::Debug for MiddlewareRegistry {
             .field("middleware_count", &self.middleware_names.len())
             .field(
                 "available_work_permits",
-                &self.admission.available_permits(),
+                &self.work_admission.available_permits(),
+            )
+            .field(
+                "available_session_permits",
+                &self.session_admission.available_permits(),
             )
             .finish()
     }
@@ -493,8 +513,9 @@ impl Default for MiddlewareRegistry {
             services: Arc::new(Vec::new()),
             registered_services: Arc::new(Vec::new()),
             middleware_names: Arc::new(HashSet::new()),
-            admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
-            admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
+            work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
+            work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
+            session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
         }
     }
 }
@@ -931,8 +952,9 @@ impl MiddlewareRegistry {
             services: Arc::new(services),
             registered_services: Arc::new(registered_services),
             middleware_names: Arc::new(middleware_names),
-            admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
-            admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
+            work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
+            work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
+            session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
         })
     }
 
@@ -1018,8 +1040,9 @@ impl ChainRunner {
                 })]),
                 registered_services: Arc::new(Vec::new()),
                 middleware_names: Arc::new(HashSet::new()),
-                admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
-                admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
+                work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
+                work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
+                session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
             }),
         }
     }
@@ -1028,6 +1051,48 @@ impl ChainRunner {
         Self {
             registry: Arc::new(registry),
         }
+    }
+
+    /// Reserve one unit of short-lived middleware work.
+    ///
+    /// The bounded waiter queue provides backpressure for work expected to
+    /// complete promptly, such as HTTP evaluations, WebSocket messages, and
+    /// streaming-session preflight.
+    pub async fn reserve_middleware_work(&self) -> Result<MiddlewareWorkAdmission> {
+        if let Ok(permit) = Arc::clone(&self.registry.work_admission).try_acquire_owned() {
+            Ok(MiddlewareWorkAdmission {
+                _work: permit,
+                saturated: false,
+            })
+        } else {
+            let waiter = Arc::clone(&self.registry.work_admission_waiters)
+                .try_acquire_owned()
+                .map_err(|_| {
+                    miette!("middleware admission queue is full; refusing additional buffered work")
+                })?;
+            let permit = Arc::clone(&self.registry.work_admission)
+                .acquire_owned()
+                .await
+                .map_err(|_| miette!("middleware admission semaphore closed"))?;
+            drop(waiter);
+            Ok(MiddlewareWorkAdmission {
+                _work: permit,
+                saturated: true,
+            })
+        }
+    }
+
+    /// Attempt to reserve one persistent middleware session without waiting.
+    ///
+    /// Long-lived sessions have no useful queueing bound because their release
+    /// time is unrelated to middleware latency. Protocol-specific runners apply
+    /// their own `on_error` semantics when the shared session budget is full.
+    fn try_reserve_middleware_session(&self) -> MiddlewareSessionAdmission {
+        Arc::clone(&self.registry.session_admission)
+            .try_acquire_owned()
+            .map_or(MiddlewareSessionAdmission::AtCapacity, |permit| {
+                MiddlewareSessionAdmission::Admitted(MiddlewareSessionPermit { _session: permit })
+            })
     }
 
     async fn manifests(&self) -> Result<Vec<(Arc<MiddlewareServiceState>, MiddlewareManifest)>> {
@@ -1252,7 +1317,7 @@ impl ChainRunner {
         entries: &[DescribedChainEntry],
         input: HttpRequestInput,
         transformed_body_policy: TransformedBodyPolicy<'_>,
-        admission: Option<MiddlewareAdmission>,
+        admission: Option<MiddlewareWorkAdmission>,
     ) -> Result<ChainOutcome> {
         ensure_chain_capacity(entries.len())?;
         let mut headers = input.headers.clone();
@@ -1648,7 +1713,7 @@ pub(crate) fn safe_reason(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::{Stream, StreamExt};
+    use futures::{FutureExt, Stream, StreamExt};
     use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
         SupervisorMiddleware, SupervisorMiddlewareServer,
     };
@@ -2630,8 +2695,9 @@ mod tests {
             ]),
             registered_services: Arc::new(vec![RegisteredMiddlewareService { registration }]),
             middleware_names: Arc::new(HashSet::from([builtin_name, registration_name])),
-            admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
-            admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
+            work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
+            work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
+            session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
         }
     }
 
@@ -3923,6 +3989,19 @@ mod tests {
         }
     }
 
+    fn websocket_preflight_input(session_id: impl Into<String>) -> WebSocketPreflightInput {
+        WebSocketPreflightInput {
+            session_id: session_id.into(),
+            request_id: "request".into(),
+            sandbox_id: "sandbox".into(),
+            scheme: "wss".into(),
+            host: "api.openai.com".into(),
+            port: 443,
+            path: "/v1/responses".into(),
+            requested_subprotocols: Vec::new(),
+        }
+    }
+
     #[tonic::async_trait]
     impl SupervisorMiddleware for OpenAiRedactionService {
         type EvaluateWebSocketStream = WebSocketResponseStream;
@@ -4278,16 +4357,33 @@ mod tests {
         assert_eq!(first.invocations.len(), 1);
         assert!(first.invocations[0].failed);
         assert!(first.invocations[0].stage_disabled);
+        assert_eq!(
+            runner.registry.session_admission.available_permits(),
+            MAX_CONCURRENT_MIDDLEWARE_SESSIONS,
+            "the final disabled stage must release persistent session capacity"
+        );
+
+        let mut work = Vec::new();
+        for _ in 0..MAX_CONCURRENT_MIDDLEWARE_WORK {
+            work.push(
+                runner
+                    .reserve_middleware_work()
+                    .await
+                    .expect("fill middleware work budget"),
+            );
+        }
 
         let second = session
             .evaluate_text(br#"{"type":"response.cancel"}"#.to_vec())
-            .await;
+            .now_or_never()
+            .expect("fully disabled session must bypass without waiting for work admission");
         assert!(second.allowed);
         assert!(
             second.invocations.is_empty(),
             "disabled stage must not be called again in this session"
         );
         assert_eq!(message_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(work);
 
         session
             .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
@@ -4297,6 +4393,74 @@ mod tests {
             .await
             .expect("join test middleware")
             .expect("serve middleware");
+    }
+
+    #[tokio::test]
+    async fn mixed_websocket_session_keeps_message_admission_while_one_stage_is_active() {
+        let broken = Arc::new(OpenAiRedactionService {
+            close_on_first_message: true,
+            ..Default::default()
+        });
+        let mut endpoints = services();
+        endpoints.push(broken);
+        let runner = ChainRunner::from_registry(
+            MiddlewareRegistry::connect_services(endpoints, Vec::new())
+                .await
+                .expect("connect mixed middleware services"),
+        );
+        let broken_entry = ChainEntry {
+            name: "best-effort-remote".into(),
+            implementation: "test/openai-websocket-redactor".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailOpen,
+        };
+        let mut regex_entry = entry("required-regex", OnError::FailClosed);
+        regex_entry.order = 1;
+        let preflight = runner
+            .preflight_websocket(
+                &[broken_entry, regex_entry],
+                websocket_preflight_input("mixed-active"),
+            )
+            .await
+            .expect("mixed preflight");
+        let mut session = preflight.session.expect("both stages inspect");
+        assert!(session.start("").await.allowed);
+
+        let first = session
+            .evaluate_text(br#"{"input":"sk-ABCDEFGHIJKLMNOP"}"#.to_vec())
+            .await;
+        assert!(first.allowed);
+        assert!(first.invocations[0].stage_disabled);
+        assert_eq!(
+            first.invocations[1].outcome,
+            WebSocketInvocationOutcome::Allow
+        );
+
+        let mut work = Vec::new();
+        for _ in 0..MAX_CONCURRENT_MIDDLEWARE_WORK {
+            work.push(
+                runner
+                    .reserve_middleware_work()
+                    .await
+                    .expect("fill middleware work budget"),
+            );
+        }
+        assert!(
+            session.admit_message().now_or_never().is_none(),
+            "an active remaining stage must still wait for message work admission"
+        );
+        drop(work);
+
+        let second = session
+            .evaluate_text(br#"{"input":"sk-QRSTUVWXYZabcdef"}"#.to_vec())
+            .await;
+        assert!(second.allowed);
+        assert_eq!(second.invocations.len(), 1);
+        assert_eq!(
+            second.invocations[0].config_name, "required-regex",
+            "disabled stage must stay bypassed while the active stage continues"
+        );
     }
 
     #[tokio::test]
@@ -4319,7 +4483,7 @@ mod tests {
                 runner.reserve_middleware_work().await
             }));
         }
-        while runner.registry.admission_waiters.available_permits() != 0 {
+        while runner.registry.work_admission_waiters.available_permits() != 0 {
             tokio::task::yield_now().await;
         }
 
@@ -4392,10 +4556,116 @@ mod tests {
             WebSocketInvocationOutcome::Skip
         );
         assert_eq!(message_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            runner.registry.session_admission.available_permits(),
+            MAX_CONCURRENT_MIDDLEWARE_SESSIONS,
+            "all-skip preflight must not retain session capacity"
+        );
         let _ = shutdown_tx.send(());
         server_task
             .await
             .expect("join middleware")
             .expect("serve middleware");
+    }
+
+    #[tokio::test]
+    async fn websocket_session_budget_caps_idle_inspecting_sessions_and_releases_on_end() {
+        let runner = builtin_runner();
+        let chain = [entry("regex-redactor", OnError::FailClosed)];
+        let mut sessions = Vec::new();
+        for index in 0..MAX_CONCURRENT_MIDDLEWARE_SESSIONS {
+            let preflight = runner
+                .preflight_websocket(
+                    &chain,
+                    websocket_preflight_input(format!("session-{index}")),
+                )
+                .await
+                .expect("admit inspecting session");
+            assert!(preflight.allowed);
+            sessions.push(preflight.session.expect("built-in inspects session"));
+        }
+        assert_eq!(runner.registry.session_admission.available_permits(), 0);
+
+        let overflow = runner
+            .preflight_websocket(&chain, websocket_preflight_input("overflow"))
+            .await
+            .expect("capacity exhaustion is a typed preflight outcome");
+        assert!(!overflow.allowed);
+        assert!(overflow.session.is_none());
+        assert!(overflow.session_capacity_exhausted);
+        assert_eq!(
+            overflow.invocations[0].outcome,
+            WebSocketInvocationOutcome::FailClosed
+        );
+
+        sessions
+            .pop()
+            .expect("retained session")
+            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .await;
+        assert_eq!(runner.registry.session_admission.available_permits(), 1);
+
+        let replacement = runner
+            .preflight_websocket(&chain, websocket_preflight_input("replacement"))
+            .await
+            .expect("released session capacity is reusable");
+        assert!(replacement.allowed);
+        assert!(replacement.session.is_some());
+    }
+
+    #[tokio::test]
+    async fn websocket_session_capacity_exhaustion_honors_mixed_on_error() {
+        let runner = builtin_runner();
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_MIDDLEWARE_SESSIONS {
+            match runner.try_reserve_middleware_session() {
+                MiddlewareSessionAdmission::Admitted(admission) => held.push(admission),
+                MiddlewareSessionAdmission::AtCapacity => {
+                    panic!("session budget exhausted before platform limit")
+                }
+            }
+        }
+
+        let mut first = entry("best-effort-a", OnError::FailOpen);
+        first.order = 1;
+        let mut second = entry("best-effort-b", OnError::FailOpen);
+        second.order = 2;
+        let all_fail_open = runner
+            .preflight_websocket(
+                &[first.clone(), second.clone()],
+                websocket_preflight_input("all-fail-open"),
+            )
+            .await
+            .expect("all-fail-open capacity outcome");
+        assert!(all_fail_open.allowed);
+        assert!(all_fail_open.session.is_none());
+        assert!(all_fail_open.session_capacity_exhausted);
+        assert!(
+            all_fail_open
+                .invocations
+                .iter()
+                .all(|invocation| invocation.outcome == WebSocketInvocationOutcome::FailOpen)
+        );
+
+        second.on_error = OnError::FailClosed;
+        let mixed = runner
+            .preflight_websocket(&[first, second], websocket_preflight_input("mixed"))
+            .await
+            .expect("mixed capacity outcome");
+        assert!(!mixed.allowed);
+        assert!(mixed.session.is_none());
+        assert!(mixed.session_capacity_exhausted);
+        assert_eq!(
+            mixed
+                .invocations
+                .iter()
+                .map(|invocation| invocation.outcome)
+                .collect::<Vec<_>>(),
+            [
+                WebSocketInvocationOutcome::FailOpen,
+                WebSocketInvocationOutcome::FailClosed,
+            ]
+        );
+        drop(held);
     }
 }
