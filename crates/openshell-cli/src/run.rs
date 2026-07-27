@@ -3315,6 +3315,7 @@ async fn sandbox_exec_interactive_grpc(
 
     let mut exit_code = 0i32;
     let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
 
     while let Some(event) = stream.next().await {
         let event = event.into_diagnostic()?;
@@ -3325,7 +3326,7 @@ async fn sandbox_exec_interactive_grpc(
                 handle.flush().into_diagnostic()?;
             }
             Some(exec_sandbox_event::Payload::Stderr(err)) => {
-                let mut handle = stdout.lock();
+                let mut handle = stderr.lock();
                 handle.write_all(&err.data).into_diagnostic()?;
                 handle.flush().into_diagnostic()?;
             }

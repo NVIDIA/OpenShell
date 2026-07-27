@@ -1440,7 +1440,13 @@ fn truncate_for_display(s: &str) -> String {
     if s.len() <= 80 {
         s.to_string()
     } else {
-        format!("{}...", &s[..77])
+        // Back off to a char boundary: slicing at a fixed byte index panics
+        // on multi-byte UTF-8 (e.g. non-ASCII characters in policy paths).
+        let mut end = 77;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     }
 }
 
@@ -1461,6 +1467,21 @@ pub use openshell_core::paths::normalize_path;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_for_display_handles_multi_byte_utf8_without_panicking() {
+        // Byte index 77 falls inside the multi-byte 'é'.
+        let s = format!("/{}{}", "a".repeat(75), "é".repeat(100));
+        let truncated = truncate_for_display(&s);
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.len() <= 80);
+    }
+
+    #[test]
+    fn truncate_for_display_leaves_short_strings_untouched() {
+        let s = "short path";
+        assert_eq!(truncate_for_display(s), s);
+    }
 
     /// Verify that the serialized YAML uses `filesystem_policy` (not
     /// `filesystem`) so it can be fed back to `parse_sandbox_policy`.

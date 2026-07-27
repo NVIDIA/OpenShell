@@ -64,6 +64,6 @@ depends = ["ci"]
 hide = true
 
 ["pre-commit"]
-description = "Alias for ci"
-depends = ["ci"]
+description = "Run lint, formatting, and license checks"
+depends = ["lint"]
 hide = true

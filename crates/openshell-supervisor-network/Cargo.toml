@@ -58,8 +58,10 @@ tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-[target.'cfg(unix)'.dev-dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(unix)'.dev-dependencies]
 
 [lints]
 workspace = true
