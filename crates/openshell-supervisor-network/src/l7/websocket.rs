@@ -8,7 +8,7 @@
 
 use crate::l7::relay::{L7EvalContext, evaluate_l7_request};
 use crate::l7::{EnforcementMode, L7RequestInfo};
-use crate::opa::TunnelPolicyEngine;
+use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::secrets::SecretResolver;
@@ -65,9 +65,10 @@ impl WebSocketTerminationCause {
                 openshell_core::proto::WebSocketSessionEndReason::PeerDisconnect
             }
             Self::PolicyReload => openshell_core::proto::WebSocketSessionEndReason::PolicyReload,
-            Self::MiddlewareDenial | Self::PolicyDenial => {
+            Self::MiddlewareDenial => {
                 openshell_core::proto::WebSocketSessionEndReason::MiddlewareDenial
             }
+            Self::PolicyDenial => openshell_core::proto::WebSocketSessionEndReason::PolicyDenial,
             Self::MiddlewareFailure => {
                 openshell_core::proto::WebSocketSessionEndReason::MiddlewareFailure
             }
@@ -260,6 +261,7 @@ pub(super) struct InspectionOptions<'a> {
 pub(super) struct RelayOptions<'a> {
     pub(super) policy_name: &'a str,
     pub(super) resolver: Option<&'a SecretResolver>,
+    pub(super) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(super) inspector: Option<InspectionOptions<'a>>,
     pub(super) compression: WebSocketCompression,
     pub(super) middleware_session: Option<openshell_supervisor_middleware::WebSocketSession>,
@@ -385,6 +387,16 @@ where
         if let Err(e) = validate_frame_header(&frame, &fragments, options.compression) {
             emit_protocol_failure(host, port, options.policy_name, protocol_failure_class(&e));
             return Err(terminate(WebSocketTerminationCause::ProtocolError, e));
+        }
+
+        if matches!(
+            frame.opcode,
+            OPCODE_TEXT | OPCODE_BINARY | OPCODE_CONTINUATION
+        ) && let Some(guard) = options.generation_guard
+            && let Err(error) = guard.ensure_current()
+        {
+            crate::l7::relay::emit_policy_reload(guard, host, port, options.policy_name);
+            return Err(terminate(WebSocketTerminationCause::PolicyReload, error));
         }
 
         match frame.opcode {
@@ -1664,6 +1676,10 @@ network_policies:
             EndReason::MiddlewareDenial
         );
         assert_eq!(
+            WebSocketTerminationCause::PolicyDenial.session_end_reason(),
+            EndReason::PolicyDenial
+        );
+        assert_eq!(
             WebSocketTerminationCause::MiddlewareFailure.session_end_reason(),
             EndReason::MiddlewareFailure
         );
@@ -1779,6 +1795,7 @@ network_policies:
         let mut options = RelayOptions {
             policy_name: "test-policy",
             resolver: Some(&resolver),
+            generation_guard: None,
             inspector: None,
             compression: WebSocketCompression::None,
             middleware_session: None,
@@ -1841,6 +1858,7 @@ network_policies:
         let mut options = RelayOptions {
             policy_name: "graphql_ws",
             resolver,
+            generation_guard: Some(tunnel_engine.generation_guard()),
             inspector: Some(InspectionOptions {
                 engine: &tunnel_engine,
                 ctx: &ctx,
@@ -1881,6 +1899,7 @@ network_policies:
         let mut options = RelayOptions {
             policy_name: "test-policy",
             resolver: Some(&resolver),
+            generation_guard: None,
             inspector: None,
             compression: WebSocketCompression::PermessageDeflate,
             middleware_session: None,
@@ -2309,6 +2328,7 @@ network_policies:
                 RelayOptions {
                     policy_name: "test-policy",
                     resolver: Some(&resolver),
+                    generation_guard: None,
                     inspector: None,
                     compression: WebSocketCompression::None,
                     middleware_session: None,
@@ -2337,8 +2357,17 @@ network_policies:
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay).await;
     }
 
+    #[derive(Debug)]
+    enum ObservedWebSocketRequest {
+        SessionStart,
+        Message(Vec<u8>),
+        SessionEnd(openshell_core::proto::WebSocketSessionEndReason),
+    }
+
     #[derive(Clone, Default)]
-    struct OpenAiWebSocketRedactor;
+    struct OpenAiWebSocketRedactor {
+        observed: Option<tokio::sync::mpsc::UnboundedSender<ObservedWebSocketRequest>>,
+    }
 
     #[tonic::async_trait]
     impl SupervisorMiddleware for OpenAiWebSocketRedactor {
@@ -2398,6 +2427,7 @@ network_policies:
                 web_socket_evaluation_request, web_socket_evaluation_response,
             };
             let mut requests = request.into_inner();
+            let observed = self.observed.clone();
             let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 while let Ok(Some(request)) = requests.message().await {
@@ -2414,6 +2444,11 @@ network_policies:
                             })
                         }
                         Some(web_socket_evaluation_request::Request::Message(message)) => {
+                            if let Some(observed) = &observed {
+                                let _ = observed.send(ObservedWebSocketRequest::Message(
+                                    message.payload.clone(),
+                                ));
+                            }
                             let text =
                                 String::from_utf8(message.payload).expect("OpenAI event UTF-8");
                             let deny = text.contains("deny-me");
@@ -2446,6 +2481,23 @@ network_policies:
                                 ),
                             })
                         }
+                        Some(web_socket_evaluation_request::Request::SessionStart(_)) => {
+                            if let Some(observed) = &observed {
+                                let _ = observed.send(ObservedWebSocketRequest::SessionStart);
+                            }
+                            None
+                        }
+                        Some(web_socket_evaluation_request::Request::SessionEnd(end)) => {
+                            if let Some(observed) = &observed
+                                && let Ok(reason) =
+                                    openshell_core::proto::WebSocketSessionEndReason::try_from(
+                                        end.reason,
+                                    )
+                            {
+                                let _ = observed.send(ObservedWebSocketRequest::SessionEnd(reason));
+                            }
+                            None
+                        }
                         _ => None,
                     };
                     if let Some(response) = response
@@ -2459,6 +2511,302 @@ network_policies:
         }
     }
 
+    async fn recording_middleware_session(
+        scheme: &str,
+    ) -> (
+        openshell_supervisor_middleware::WebSocketSession,
+        tokio::sync::mpsc::UnboundedReceiver<ObservedWebSocketRequest>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<std::result::Result<(), tonic::transport::Error>>,
+    ) {
+        use openshell_core::proto::SupervisorMiddlewareService;
+        use openshell_supervisor_middleware::{ChainEntry, MiddlewareRegistry, OnError};
+
+        let (observed_tx, observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind WebSocket middleware");
+        let address = listener.local_addr().expect("middleware address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tonic::transport::Server::builder()
+            .add_service(SupervisorMiddlewareServer::new(OpenAiWebSocketRedactor {
+                observed: Some(observed_tx),
+            }))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let server_task = tokio::spawn(server);
+        let registry = MiddlewareRegistry::connect_services(
+            Vec::new(),
+            vec![SupervisorMiddlewareService {
+                name: "openai-redactor".into(),
+                grpc_endpoint: format!("http://{address}"),
+                max_body_bytes: 0,
+                timeout: "2s".into(),
+            }],
+        )
+        .await
+        .expect("connect middleware");
+        let runner = openshell_supervisor_middleware::ChainRunner::from_registry(registry);
+        let preflight = runner
+            .preflight_websocket(
+                &[ChainEntry {
+                    name: "redact-openai".into(),
+                    implementation: "openai-redactor".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                }],
+                openshell_supervisor_middleware::WebSocketPreflightInput {
+                    session_id: "session".into(),
+                    request_id: "request".into(),
+                    sandbox_id: "sandbox".into(),
+                    scheme: scheme.into(),
+                    host: "api.openai.com".into(),
+                    port: if scheme == "wss" { 443 } else { 80 },
+                    path: "/v1/responses".into(),
+                    requested_subprotocols: Vec::new(),
+                },
+            )
+            .await
+            .expect("preflight");
+
+        (
+            preflight.session.expect("middleware inspects session"),
+            observed_rx,
+            shutdown_tx,
+            server_task,
+        )
+    }
+
+    async fn assert_middleware_only_relay_observes_reload(scheme: &str, fragmented: bool) {
+        use openshell_supervisor_middleware::MiddlewareRegistry;
+
+        let (session, mut observed, shutdown_tx, server_task) =
+            recording_middleware_session(scheme).await;
+        let engine = std::sync::Arc::new(
+            OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").expect("test policy"),
+        );
+        let generation_guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("generation guard");
+        let (mut client_app, mut relay_client) = tokio::io::duplex(1);
+        let (mut relay_upstream, mut upstream_app) = tokio::io::duplex(4096);
+        let port = if scheme == "wss" { 443 } else { 80 };
+        let relay = tokio::spawn(async move {
+            crate::l7::relay::handle_upgrade(
+                &mut relay_client,
+                &mut relay_upstream,
+                Vec::new(),
+                "api.openai.com",
+                port,
+                crate::l7::relay::UpgradeRelayOptions {
+                    websocket_request: true,
+                    generation_guard: Some(&generation_guard),
+                    ctx: Some(&L7EvalContext {
+                        host: "api.openai.com".into(),
+                        port,
+                        policy_name: "rest-api".into(),
+                        ..Default::default()
+                    }),
+                    policy_name: "rest-api".into(),
+                    middleware_session: Some(session),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+
+        assert!(matches!(
+            observed.recv().await,
+            Some(ObservedWebSocketRequest::SessionStart)
+        ));
+        if fragmented {
+            client_app
+                .write_all(&masked_frame(false, OPCODE_TEXT, b"stale-"))
+                .await
+                .expect("send initial fragment");
+        }
+
+        engine
+            .replace_middleware_registry(MiddlewareRegistry::default())
+            .expect("invalidate generation");
+        let mut stale_frame = if fragmented {
+            masked_frame(true, OPCODE_CONTINUATION, b"message")
+        } else {
+            masked_frame(true, OPCODE_TEXT, b"stale-message")
+        };
+        stale_frame.truncate(6);
+        client_app
+            .write_all(&stale_frame)
+            .await
+            .expect("send stale data frame");
+
+        let upstream_close = read_one_frame(&mut upstream_app).await;
+        assert_eq!(upstream_close[0] & 0x0f, OPCODE_CLOSE);
+        assert_eq!(
+            u16::from_be_bytes(
+                decode_masked_payload(&upstream_close)[..2]
+                    .try_into()
+                    .expect("upstream close code"),
+            ),
+            1012
+        );
+        let client_close = read_one_frame(&mut client_app).await;
+        assert_eq!(client_close[0] & 0x0f, OPCODE_CLOSE);
+        assert_eq!(
+            u16::from_be_bytes(client_close[2..4].try_into().expect("client close code")),
+            1012
+        );
+        let error = relay
+            .await
+            .expect("join relay")
+            .expect_err("stale generation must terminate relay");
+        assert!(error.to_string().contains("policy generation is stale"));
+        match observed.recv().await {
+            Some(ObservedWebSocketRequest::SessionEnd(
+                openshell_core::proto::WebSocketSessionEndReason::PolicyReload,
+            )) => {}
+            Some(ObservedWebSocketRequest::Message(payload)) => {
+                panic!("stale message leaked {} bytes to middleware", payload.len());
+            }
+            other => panic!("unexpected middleware lifecycle event: {other:?}"),
+        }
+        assert!(
+            observed.try_recv().is_err(),
+            "stale data must not reach middleware"
+        );
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware server")
+            .expect("middleware server");
+    }
+
+    #[tokio::test]
+    async fn middleware_only_rest_wss_relay_observes_policy_reload() {
+        assert_middleware_only_relay_observes_reload("wss", false).await;
+    }
+
+    #[tokio::test]
+    async fn middleware_only_rest_ws_relay_stops_fragment_after_policy_reload() {
+        assert_middleware_only_relay_observes_reload("ws", true).await;
+    }
+
+    #[tokio::test]
+    async fn graphql_policy_denial_reports_policy_denial_to_middleware() {
+        let (mut session, mut observed, shutdown_tx, server_task) =
+            recording_middleware_session("wss").await;
+        assert!(session.start("").await.allowed);
+        assert!(matches!(
+            observed.recv().await,
+            Some(ObservedWebSocketRequest::SessionStart)
+        ));
+
+        let engine = OpaEngine::from_strings(TEST_POLICY, GRAPHQL_WS_POLICY)
+            .expect("GraphQL WebSocket policy should load");
+        let network_input = NetworkInput {
+            host: "realtime.graphql.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let generation = engine
+            .evaluate_network_action_with_generation(&network_input)
+            .expect("network action should evaluate")
+            .1;
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(generation)
+            .expect("tunnel engine");
+        let ctx = L7EvalContext {
+            host: "realtime.graphql.test".into(),
+            port: 443,
+            policy_name: "graphql_ws".into(),
+            binary_path: "/usr/bin/node".into(),
+            ..Default::default()
+        };
+        let (mut client_app, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, mut upstream_app) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            relay_with_options(
+                &mut relay_client,
+                &mut relay_upstream,
+                Vec::new(),
+                "realtime.graphql.test",
+                443,
+                RelayOptions {
+                    policy_name: "graphql_ws",
+                    resolver: None,
+                    generation_guard: Some(tunnel_engine.generation_guard()),
+                    inspector: Some(InspectionOptions {
+                        engine: &tunnel_engine,
+                        ctx: &ctx,
+                        enforcement: EnforcementMode::Enforce,
+                        target: "/graphql".into(),
+                        query_params: HashMap::new(),
+                        graphql_policy: true,
+                    }),
+                    compression: WebSocketCompression::None,
+                    middleware_session: Some(session),
+                    middleware_context: Some(&ctx),
+                },
+            )
+            .await
+        });
+
+        let payload =
+            br#"{"type":"subscribe","id":"1","payload":{"query":"query Admin { adminAuditLog }"}}"#;
+        client_app
+            .write_all(&masked_frame(true, OPCODE_TEXT, payload))
+            .await
+            .expect("send policy-denied message");
+
+        let upstream_close = read_one_frame(&mut upstream_app).await;
+        assert_eq!(
+            u16::from_be_bytes(
+                decode_masked_payload(&upstream_close)[..2]
+                    .try_into()
+                    .expect("upstream close code"),
+            ),
+            1008
+        );
+        let client_close = read_one_frame(&mut client_app).await;
+        assert_eq!(
+            u16::from_be_bytes(client_close[2..4].try_into().expect("client close code")),
+            1008
+        );
+        let error = relay
+            .await
+            .expect("join relay")
+            .expect_err("policy denial must terminate relay");
+        assert!(
+            error
+                .to_string()
+                .contains("websocket GraphQL message denied")
+        );
+        match observed.recv().await {
+            Some(ObservedWebSocketRequest::SessionEnd(
+                openshell_core::proto::WebSocketSessionEndReason::PolicyDenial,
+            )) => {}
+            Some(ObservedWebSocketRequest::Message(payload)) => {
+                panic!(
+                    "built-in policy denial leaked {} bytes to middleware",
+                    payload.len()
+                );
+            }
+            other => panic!("unexpected middleware lifecycle event: {other:?}"),
+        }
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware server")
+            .expect("middleware server");
+    }
+
     #[tokio::test]
     async fn parsed_relay_sends_redacted_openai_event_to_upstream() {
         use openshell_core::proto::SupervisorMiddlewareService;
@@ -2470,7 +2818,9 @@ network_policies:
         let address = listener.local_addr().expect("middleware address");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let server = tonic::transport::Server::builder()
-            .add_service(SupervisorMiddlewareServer::new(OpenAiWebSocketRedactor))
+            .add_service(SupervisorMiddlewareServer::new(
+                OpenAiWebSocketRedactor::default(),
+            ))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                 let _ = shutdown_rx.await;
             });
@@ -2526,6 +2876,7 @@ network_policies:
                 RelayOptions {
                     policy_name: "openai",
                     resolver: None,
+                    generation_guard: None,
                     inspector: None,
                     compression: WebSocketCompression::None,
                     middleware_session: Some(session),

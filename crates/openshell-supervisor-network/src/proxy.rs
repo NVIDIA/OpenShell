@@ -5164,6 +5164,7 @@ async fn handle_forward_proxy(
                     ..Default::default()
                 }
             };
+            upgrade_options.generation_guard = Some(&forward_generation_guard);
             upgrade_options.websocket.permessage_deflate = websocket_permessage_deflate;
             upgrade_options.middleware_session = middleware_session.take();
             upgrade_options.selected_subprotocol = websocket_subprotocol;
@@ -6424,6 +6425,7 @@ network_policies:
         );
         assert!(options.websocket.credential_rewrite);
         assert!(options.secret_resolver.is_some());
+        assert!(options.generation_guard.is_some());
         assert!(options.engine.is_some());
         assert!(options.ctx.is_some());
         assert!(matches!(
@@ -6462,6 +6464,41 @@ network_policies:
             options.websocket.message_policy,
             crate::l7::relay::WebSocketMessagePolicy::None
         ));
+    }
+
+    #[test]
+    fn rest_websocket_upgrade_carries_guard_without_message_inspector() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            "network_policies: {}\n",
+        )
+        .expect("test policy");
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .expect("tunnel engine");
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ..Default::default()
+        };
+        let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);
+        let options = crate::l7::relay::upgrade_options(
+            &config,
+            &ctx,
+            true,
+            "/ws",
+            &std::collections::HashMap::new(),
+            Some(&tunnel_engine),
+        );
+
+        assert!(matches!(
+            options.websocket.message_policy,
+            crate::l7::relay::WebSocketMessagePolicy::None
+        ));
+        assert!(options.generation_guard.is_some());
+        assert!(options.engine.is_some());
     }
 
     #[tokio::test]

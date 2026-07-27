@@ -72,6 +72,7 @@ pub(crate) struct UpgradeRelayOptions<'a> {
     pub(crate) websocket_request: bool,
     pub(crate) websocket: WebSocketUpgradeBehavior,
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
+    pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) engine: Option<&'a TunnelPolicyEngine>,
     pub(crate) ctx: Option<&'a L7EvalContext>,
     pub(crate) enforcement: EnforcementMode,
@@ -805,6 +806,7 @@ where
             crate::l7::websocket::RelayOptions {
                 policy_name: &options.policy_name,
                 resolver,
+                generation_guard: options.generation_guard,
                 inspector,
                 compression,
                 middleware_session: options.middleware_session.take(),
@@ -867,6 +869,7 @@ pub(crate) fn upgrade_options<'a>(
         } else {
             None
         },
+        generation_guard: engine.map(TunnelPolicyEngine::generation_guard),
         engine,
         ctx: engine.map(|_| ctx),
         enforcement: config.enforcement,
@@ -1096,23 +1099,9 @@ where
                     return Ok(());
                 }
             };
-            let req_with_auth =
-                match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
-                    Ok(req) => req,
-                    Err(e) => {
-                        warn!(
-                            host = %ctx.host,
-                            port = ctx.port,
-                            error = %e,
-                            "Token grant failed in L7 relay"
-                        );
-                        write_bad_gateway_response(client).await?;
-                        return Ok(());
-                    }
-                };
             let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
                 let preflight = websocket_middleware_preflight(
-                    &req_with_auth,
+                    &req,
                     chain,
                     engine.middleware_runner(),
                     ctx,
@@ -1136,6 +1125,20 @@ where
             } else {
                 None
             };
+            let req_with_auth =
+                match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
+                    Ok(req) => req,
+                    Err(e) => {
+                        warn!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            error = %e,
+                            "Token grant failed in L7 relay"
+                        );
+                        write_bad_gateway_response(client).await?;
+                        return Ok(());
+                    }
+                };
 
             // Forward request to upstream and relay response
             let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
@@ -1221,6 +1224,16 @@ fn close_if_stale(guard: &PolicyGenerationGuard, ctx: &L7EvalContext) -> bool {
         return false;
     }
 
+    emit_policy_reload(guard, &ctx.host, ctx.port, &ctx.policy_name);
+    true
+}
+
+pub(crate) fn emit_policy_reload(
+    guard: &PolicyGenerationGuard,
+    host: &str,
+    port: u16,
+    policy_name: &str,
+) {
     ocsf_emit!(
         NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
@@ -1228,18 +1241,17 @@ fn close_if_stale(guard: &PolicyGenerationGuard, ctx: &L7EvalContext) -> bool {
             .disposition(DispositionId::Blocked)
             .severity(SeverityId::Medium)
             .status(StatusId::Failure)
-            .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-            .firewall_rule(&ctx.policy_name, "l7")
+            .dst_endpoint(Endpoint::from_domain(host, port))
+            .firewall_rule(policy_name, "l7")
             .message(format!(
                 "L7 tunnel closed after policy reload [host:{} port:{} captured_generation:{} current_generation:{}]",
-                ctx.host,
-                ctx.port,
+                host,
+                port,
                 guard.captured_generation(),
                 guard.current_generation(),
             ))
             .build()
     );
-    true
 }
 
 async fn relay_jsonrpc<C, U>(
@@ -2538,6 +2550,293 @@ network_policies:
         };
 
         (generation_guard, ctx, fixture)
+    }
+
+    #[derive(Clone)]
+    struct ControllableWebSocketPreflight {
+        seen: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Notify>,
+        action: openshell_core::proto::WebSocketPreflightAction,
+    }
+
+    #[tonic::async_trait]
+    impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
+        for ControllableWebSocketPreflight
+    {
+        type EvaluateWebSocketStream = openshell_supervisor_middleware::WebSocketResponseStream;
+
+        async fn describe(
+            &self,
+            _request: tonic::Request<()>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::MiddlewareManifest>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::MiddlewareManifest {
+                    name: "test/controllable-websocket-preflight".into(),
+                    service_version: "test".into(),
+                    bindings: vec![openshell_core::proto::MiddlewareBinding {
+                        operation:
+                            openshell_core::proto::SupervisorMiddlewareOperation::WebsocketMessage
+                                as i32,
+                        phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
+                            as i32,
+                        timeout: "2s".into(),
+                        max_message_bytes:
+                            openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES as u64,
+                        ..Default::default()
+                    }],
+                },
+            ))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: tonic::Request<openshell_core::proto::ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("WebSocket-only middleware"))
+        }
+
+        async fn evaluate_web_socket(
+            &self,
+            request: tonic::Request<
+                tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>,
+            >,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+        {
+            use openshell_core::proto::{
+                WebSocketEvaluationResponse, WebSocketPreflightDecision,
+                web_socket_evaluation_request, web_socket_evaluation_response,
+            };
+            use tokio_stream::wrappers::ReceiverStream;
+
+            let mut requests = request.into_inner();
+            let seen = self.seen.clone();
+            let release = Arc::clone(&self.release);
+            let action = self.action;
+            let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Ok(Some(request)) = requests.message().await {
+                    if matches!(
+                        request.request,
+                        Some(web_socket_evaluation_request::Request::Preflight(_))
+                    ) {
+                        let _ = seen.send(());
+                        release.notified().await;
+                        let _ = responses_tx
+                            .send(Ok(WebSocketEvaluationResponse {
+                                response: Some(
+                                    web_socket_evaluation_response::Response::PreflightDecision(
+                                        WebSocketPreflightDecision {
+                                            action: action as i32,
+                                        },
+                                    ),
+                                ),
+                            }))
+                            .await;
+                    }
+                }
+            });
+            Ok(tonic::Response::new(Box::pin(ReceiverStream::new(
+                responses_rx,
+            ))))
+        }
+    }
+
+    async fn assert_websocket_preflight_precedes_token_grant(
+        action: openshell_core::proto::WebSocketPreflightAction,
+        admitted: bool,
+    ) {
+        use openshell_core::proto::SupervisorMiddlewareService;
+        use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddlewareServer;
+        use openshell_supervisor_middleware::{ChainRunner, MiddlewareRegistry};
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind middleware");
+        let address = listener.local_addr().expect("middleware address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tonic::transport::Server::builder()
+            .add_service(SupervisorMiddlewareServer::new(
+                ControllableWebSocketPreflight {
+                    seen: seen_tx,
+                    release: Arc::clone(&release),
+                    action,
+                },
+            ))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let server_task = tokio::spawn(server);
+        let registry = MiddlewareRegistry::connect_services(
+            Vec::new(),
+            vec![SupervisorMiddlewareService {
+                name: "preflight-service".into(),
+                grpc_endpoint: format!("http://{address}"),
+                max_body_bytes: 0,
+                timeout: "2s".into(),
+            }],
+        )
+        .await
+        .expect("connect middleware");
+
+        let data = r#"
+network_middlewares:
+  websocket-preflight:
+    middleware: preflight-service
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  rest_api:
+    name: rest_api
+    endpoints:
+      - host: api.example.test
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/v1/**"
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("test policy");
+        engine.set_middleware_runner_for_tests(ChainRunner::from_registry(registry));
+        let input = NetworkInput {
+            host: "api.example.test".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .expect("endpoint config");
+        let config = crate::l7::parse_l7_config(&endpoint_config.expect("configured endpoint"))
+            .expect("REST config");
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(generation)
+            .expect("tunnel engine");
+        let provider_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
+        let fixture =
+            crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::success(
+                provider_key,
+                "grant-token",
+            );
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            dynamic_credentials: Some(fixture.dynamic_credentials()),
+            token_grant_resolver: Some(fixture.resolver()),
+            ..Default::default()
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_rest(
+                &config,
+                &tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /v1/ws HTTP/1.1\r\nHost: api.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .expect("send upgrade request");
+        seen_rx.recv().await.expect("preflight reached middleware");
+        fixture.assert_no_requests();
+        release.notify_one();
+
+        if admitted {
+            let mut forwarded = Vec::new();
+            let mut buffer = [0u8; 512];
+            while !forwarded.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = upstream.read(&mut buffer).await.expect("read upstream");
+                assert!(count > 0, "upstream closed before request headers");
+                forwarded.extend_from_slice(&buffer[..count]);
+            }
+            let forwarded = String::from_utf8_lossy(&forwarded);
+            assert!(forwarded.contains("Authorization: Bearer grant-token\r\n"));
+            upstream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("reject upgrade");
+            let mut response = [0u8; 512];
+            let count = app.read(&mut response).await.expect("read client response");
+            assert!(
+                String::from_utf8_lossy(&response[..count]).contains("400 Bad Request"),
+                "unexpected client response"
+            );
+            fixture.assert_one_request(provider_key);
+        } else {
+            let mut byte = [0u8; 1];
+            let count = upstream.read(&mut byte).await.expect("upstream close");
+            assert_eq!(count, 0, "denied preflight must not reach upstream");
+            fixture.assert_no_requests();
+        }
+
+        drop(app);
+        relay
+            .await
+            .expect("join REST relay")
+            .expect("REST relay result");
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware server")
+            .expect("middleware server");
+    }
+
+    #[tokio::test]
+    async fn denied_websocket_preflight_has_no_token_grant_side_effects() {
+        assert_websocket_preflight_precedes_token_grant(
+            openshell_core::proto::WebSocketPreflightAction::Unspecified,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn admitted_websocket_preflight_precedes_token_grant() {
+        assert_websocket_preflight_precedes_token_grant(
+            openshell_core::proto::WebSocketPreflightAction::Inspect,
+            true,
+        )
+        .await;
     }
 
     fn jsonrpc_test_relay_context() -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
