@@ -413,7 +413,7 @@ openshell logs <sandbox-name>
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
 | Docker GPU e2e fails before GPU sandbox comparison | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
-| Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | Set `GATEWAY_WORKLOAD` as shown in Step 5, then run `kubectl -n openshell logs "${GATEWAY_WORKLOAD}" -c openshell-gateway` |
+| Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | Set `GATEWAY_WORKLOAD` as shown in Step 6, then run `kubectl -n openshell logs "${GATEWAY_WORKLOAD}" -c openshell-gateway` |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
 | Edge or OIDC gateway returns `Unauthenticated` | Stored login expired, audience/scopes mismatch, or gateway auth configuration changed | `openshell gateway info`, `openshell gateway login <name>`, gateway auth logs |
 | Gateway fails before serving health after enabling an interceptor | Interceptor endpoint unavailable or manifest/binding validation failed | Gateway and interceptor logs; interceptor socket; `binding_policy`, phases, and failure policy |
