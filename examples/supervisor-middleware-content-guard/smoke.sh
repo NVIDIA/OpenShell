@@ -260,6 +260,10 @@ fail() {
   exit 1
 }
 
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
+}
+
 run_setup_step() {
   local label="$1"
   shift
@@ -279,7 +283,7 @@ cargo_target_dir() {
     --format-version=1 \
     --no-deps \
     --manifest-path "$manifest_path" \
-    | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+    | jq -er '.target_directory'
 }
 
 start_middleware() {
@@ -431,6 +435,10 @@ wait_until_stopped() {
 }
 
 cd "$ROOT"
+require_command cargo
+require_command curl
+require_command jq
+require_command openssl
 ROOT_TARGET_DIR="$(cargo_target_dir "$ROOT/Cargo.toml")"
 EXAMPLE_TARGET_DIR="$(cargo_target_dir "$EXAMPLE_DIR/Cargo.toml")"
 GATEWAY_BIN="$ROOT_TARGET_DIR/debug/openshell-gateway"

@@ -13,6 +13,10 @@ Supervisor middleware is a research preview. Its policy and service contracts ma
 
 This example implements an operator-run supervisor middleware service. It scans UTF-8 HTTP request bodies for configured literal strings, then either replaces every match or denies the request. Findings report only aggregate counts and never include configured terms or request content.
 
+## Prerequisites
+
+Install `cargo`, `curl`, `jq`, and `openssl` on the host before running the smoke script.
+
 ## Run the smoke example
 
 Run the end-to-end smoke suite to build and start a local gateway, start the content-guard service, create a sandbox, and send the same request body to two destinations:
