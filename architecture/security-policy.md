@@ -239,4 +239,8 @@ the HTTP relay have succeeded so a later denial cannot coexist with an allowed
 record for the same request.
 
 Never log secrets, credentials, bearer tokens, or query parameters in OCSF
-messages. OCSF JSONL output may be shipped to external systems.
+messages. OCSF JSONL output may be shipped to external systems. The FORWARD
+HTTP proxy redacts query strings at emit sites (`?[redacted]`) in OCSF URL
+fields, messages, parse-error details, and client-facing 403 bodies so
+on-disk shorthand/JSONL logs stay clean even before agent-facing denial
+read-path redaction.

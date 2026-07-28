@@ -384,13 +384,10 @@ fn read_recent_denial_lines(log_dir: &Path, limit: usize) -> Vec<String> {
                 continue;
             }
             // Defense-in-depth: redact query strings before truncation. The
-            // FORWARD deny path in `proxy.rs` populates the OCSF `message`
-            // and URL with the raw request path including `?query=...`, which
-            // the shorthand layer then renders verbatim. Stripping queries
-            // here means the agent never sees the secret even if an upstream
-            // emit site forgets to redact (TODO: harden the emit sites in
-            // proxy.rs FORWARD path so the on-disk shorthand log itself is
-            // clean — tracked separately). Redact first so truncation cannot
+            // FORWARD path in `proxy.rs` redacts query strings at emit sites
+            // (`redact_path_for_logging` / `redact_uri_for_logging`), but this
+            // read path still strips queries so a forgotten emit site cannot
+            // surface secrets to the agent. Redact first so truncation cannot
             // slice mid-secret.
             let redacted = redact_query_strings(line);
             let surfaced = truncate_at_char_boundary(&redacted, MAX_DENIAL_LINE_BYTES);

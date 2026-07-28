@@ -3418,6 +3418,25 @@ fn extract_host_from_uri(uri: &str) -> String {
     }
 }
 
+/// Redact query-string contents from a request path for OCSF messages and
+/// client-facing deny responses. Keeps a `?[redacted]` marker so operators can
+/// still see that a query was present without shipping secrets to logs.
+fn redact_path_for_logging(path: &str) -> String {
+    match path.split_once('?') {
+        Some((base, _)) => format!("{base}?[redacted]"),
+        None => path.to_string(),
+    }
+}
+
+/// Redact query-string contents from an absolute-form proxy URI used in error
+/// messages. Same marker convention as [`redact_path_for_logging`].
+fn redact_uri_for_logging(uri: &str) -> String {
+    match uri.split_once('?') {
+        Some((base, _)) => format!("{base}?[redacted]"),
+        None => uri.to_string(),
+    }
+}
+
 /// Parse an absolute-form proxy request URI into its components.
 ///
 /// For example, `"http://10.86.8.223:8000/screenshot/"` yields
@@ -3430,17 +3449,23 @@ fn extract_host_from_uri(uri: &str) -> String {
 /// - Query strings (preserved in path)
 fn parse_proxy_uri(uri: &str) -> Result<(String, String, u16, String)> {
     // Extract scheme
-    let (scheme, rest) = uri
-        .split_once("://")
-        .ok_or_else(|| miette::miette!("Missing scheme in proxy URI: {uri}"))?;
+    let (scheme, rest) = uri.split_once("://").ok_or_else(|| {
+        miette::miette!(
+            "Missing scheme in proxy URI: {}",
+            redact_uri_for_logging(uri)
+        )
+    })?;
     let scheme = scheme.to_ascii_lowercase();
 
     // Split authority from path
     let (authority, path) = if rest.starts_with('[') {
         // IPv6: [::1]:port/path
-        let bracket_end = rest
-            .find(']')
-            .ok_or_else(|| miette::miette!("Unclosed IPv6 bracket in URI: {uri}"))?;
+        let bracket_end = rest.find(']').ok_or_else(|| {
+            miette::miette!(
+                "Unclosed IPv6 bracket in URI: {}",
+                redact_uri_for_logging(uri)
+            )
+        })?;
         let after_bracket = &rest[bracket_end + 1..];
         after_bracket.find('/').map_or((rest, "/"), |slash_pos| {
             (
@@ -3457,15 +3482,15 @@ fn parse_proxy_uri(uri: &str) -> Result<(String, String, u16, String)> {
     // Parse host and port from authority
     let (host, port) = if authority.starts_with('[') {
         // IPv6: [::1]:port or [::1]
-        let bracket_end = authority
-            .find(']')
-            .ok_or_else(|| miette::miette!("Unclosed IPv6 bracket: {uri}"))?;
+        let bracket_end = authority.find(']').ok_or_else(|| {
+            miette::miette!("Unclosed IPv6 bracket: {}", redact_uri_for_logging(uri))
+        })?;
         let host = &authority[1..bracket_end]; // strip brackets
         let port_str = &authority[bracket_end + 1..];
         let port = if let Some(port_str) = port_str.strip_prefix(':') {
-            port_str
-                .parse::<u16>()
-                .map_err(|_| miette::miette!("Invalid port in URI: {uri}"))?
+            port_str.parse::<u16>().map_err(|_| {
+                miette::miette!("Invalid port in URI: {}", redact_uri_for_logging(uri))
+            })?
         } else {
             match scheme.as_str() {
                 "https" => 443,
@@ -3476,7 +3501,7 @@ fn parse_proxy_uri(uri: &str) -> Result<(String, String, u16, String)> {
     } else if let Some((h, p)) = authority.rsplit_once(':') {
         let port = p
             .parse::<u16>()
-            .map_err(|_| miette::miette!("Invalid port in URI: {uri}"))?;
+            .map_err(|_| miette::miette!("Invalid port in URI: {}", redact_uri_for_logging(uri)))?;
         (h.to_string(), port)
     } else {
         let port = match scheme.as_str() {
@@ -3487,7 +3512,10 @@ fn parse_proxy_uri(uri: &str) -> Result<(String, String, u16, String)> {
     };
 
     if host.is_empty() {
-        return Err(miette::miette!("Empty host in URI: {uri}"));
+        return Err(miette::miette!(
+            "Empty host in URI: {}",
+            redact_uri_for_logging(uri)
+        ));
     }
 
     let path = if path.is_empty() { "/" } else { path };
@@ -3825,7 +3853,10 @@ async fn handle_forward_proxy(
                 .activity(ActivityId::Fail)
                 .severity(SeverityId::Low)
                 .status(StatusId::Failure)
-                .message(format!("FORWARD parse error for {target_uri}: {e}"))
+                .message(format!(
+                    "FORWARD parse error for {}: {e}",
+                    redact_uri_for_logging(target_uri)
+                ))
                 .build();
             ocsf_emit!(event);
             respond(client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
@@ -3968,7 +3999,7 @@ async fn handle_forward_proxy(
                     .status(StatusId::Failure)
                     .http_request(HttpRequest::new(
                         method,
-                        OcsfUrl::new("http", &host_lc, &path, port),
+                        OcsfUrl::new("http", &host_lc, &redact_path_for_logging(&path), port),
                     ))
                     .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                     .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
@@ -3977,7 +4008,10 @@ async fn handle_forward_proxy(
                             .with_cmd_line(&cmdline_str),
                     )
                     .firewall_rule("-", "opa")
-                    .message(format!("FORWARD denied {method} {host_lc}:{port}{path}"))
+                    .message(format!(
+                        "FORWARD denied {method} {host_lc}:{port}{}",
+                        redact_path_for_logging(&path)
+                    ))
                     .build();
                 ocsf_emit!(event);
             }
@@ -3997,7 +4031,10 @@ async fn handle_forward_proxy(
                     403,
                     "Forbidden",
                     "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                    &format!(
+                        "{method} {host_lc}:{port}{} not permitted by policy",
+                        redact_path_for_logging(&path)
+                    ),
                 ),
             )
             .await?;
@@ -4036,7 +4073,10 @@ async fn handle_forward_proxy(
                     403,
                     "Forbidden",
                     "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                    &format!(
+                        "{method} {host_lc}:{port}{} not permitted by policy",
+                        redact_path_for_logging(&path)
+                    ),
                 ),
             )
             .await?;
@@ -4118,7 +4158,10 @@ async fn handle_forward_proxy(
                     403,
                     "Forbidden",
                     "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                    &format!(
+                        "{method} {host_lc}:{port}{} not permitted by policy",
+                        redact_path_for_logging(&path)
+                    ),
                 ),
             )
             .await?;
@@ -4143,7 +4186,10 @@ async fn handle_forward_proxy(
                         403,
                         "Forbidden",
                         "policy_denied",
-                        &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                        &format!(
+                            "{method} {host_lc}:{port}{} not permitted by policy",
+                            redact_path_for_logging(&path)
+                        ),
                     ),
                 )
                 .await?;
@@ -4215,7 +4261,10 @@ async fn handle_forward_proxy(
                     403,
                     "Forbidden",
                     "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} did not match an L7 endpoint path"),
+                    &format!(
+                        "{method} {host_lc}:{port}{} did not match an L7 endpoint path",
+                        redact_path_for_logging(&path)
+                    ),
                 ),
             )
             .await?;
@@ -4230,7 +4279,7 @@ async fn handle_forward_proxy(
                 .status(StatusId::Failure)
                 .http_request(HttpRequest::new(
                     method,
-                    OcsfUrl::new("http", &host_lc, &path, port),
+                    OcsfUrl::new("http", &host_lc, &redact_path_for_logging(&path), port),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
@@ -4240,7 +4289,8 @@ async fn handle_forward_proxy(
                 )
                 .firewall_rule(policy_str, "l7")
                 .message(format!(
-                    "FORWARD_L7 denied unsupported h2c upgrade for {method} {host_lc}:{port}{path}"
+                    "FORWARD_L7 denied unsupported h2c upgrade for {method} {host_lc}:{port}{}",
+                    redact_path_for_logging(&path)
                 ))
                 .status_detail(crate::l7::rest::UNSUPPORTED_H2C_UPGRADE_DETAIL)
                 .build();
@@ -4450,11 +4500,12 @@ async fn handle_forward_proxy(
                             "FORWARD_L7"
                         };
                     format!(
-                        "{message_prefix} {decision_str} {method} {host_lc}:{port}{path} reason={reason}"
+                        "{message_prefix} {decision_str} {method} {host_lc}:{port}{} reason={reason}",
+                        redact_path_for_logging(&path)
                     )
                 },
                 |jsonrpc_info| {
-                    let endpoint = format!("{host_lc}:{port}{path}");
+                    let endpoint = format!("{host_lc}:{port}{}", redact_path_for_logging(&path));
                     crate::l7::relay::jsonrpc_log_message(
                         decision_str,
                         method,
@@ -4472,7 +4523,7 @@ async fn handle_forward_proxy(
                 .severity(severity)
                 .http_request(HttpRequest::new(
                     method,
-                    OcsfUrl::new("http", &host_lc, &path, port),
+                    OcsfUrl::new("http", &host_lc, &redact_path_for_logging(&path), port),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
@@ -4506,7 +4557,10 @@ async fn handle_forward_proxy(
                     403,
                     "Forbidden",
                     "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} denied by L7 policy: {reason}"),
+                    &format!(
+                        "{method} {host_lc}:{port}{} denied by L7 policy: {reason}",
+                        redact_path_for_logging(&path)
+                    ),
                 ),
             )
             .await?;
@@ -4553,7 +4607,7 @@ async fn handle_forward_proxy(
                         .status(StatusId::Failure)
                         .http_request(HttpRequest::new(
                             method,
-                            OcsfUrl::new("http", &host_lc, &path, port),
+                            OcsfUrl::new("http", &host_lc, &redact_path_for_logging(&path), port),
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
@@ -4610,7 +4664,12 @@ async fn handle_forward_proxy(
                                 .status(StatusId::Failure)
                                 .http_request(HttpRequest::new(
                                     method,
-                                    OcsfUrl::new("http", &host_lc, &path, port),
+                                    OcsfUrl::new(
+                                        "http",
+                                        &host_lc,
+                                        &redact_path_for_logging(&path),
+                                        port,
+                                    ),
                                 ))
                                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                                 .src_endpoint(Endpoint::from_ip(
@@ -4665,7 +4724,7 @@ async fn handle_forward_proxy(
                         .status(StatusId::Failure)
                         .http_request(HttpRequest::new(
                             method,
-                            OcsfUrl::new("http", &host_lc, &path, port),
+                            OcsfUrl::new("http", &host_lc, &redact_path_for_logging(&path), port),
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
@@ -4722,7 +4781,7 @@ async fn handle_forward_proxy(
                         .status(StatusId::Failure)
                         .http_request(HttpRequest::new(
                             method,
-                            OcsfUrl::new("http", &host_lc, &path, port),
+                            OcsfUrl::new("http", &host_lc, &redact_path_for_logging(&path), port),
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
@@ -4776,7 +4835,7 @@ async fn handle_forward_proxy(
                         .status(StatusId::Failure)
                         .http_request(HttpRequest::new(
                             method,
-                            OcsfUrl::new("http", &host_lc, &path, port),
+                            OcsfUrl::new("http", &host_lc, &redact_path_for_logging(&path), port),
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
@@ -4834,7 +4893,10 @@ async fn handle_forward_proxy(
                 403,
                 "Forbidden",
                 "policy_denied",
-                &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                &format!(
+                    "{method} {host_lc}:{port}{} not permitted by policy",
+                    redact_path_for_logging(&path)
+                ),
             ),
         )
         .await?;
@@ -4855,7 +4917,7 @@ async fn handle_forward_proxy(
                 .status(StatusId::Failure)
                 .http_request(HttpRequest::new(
                     method,
-                    OcsfUrl::new("http", &host_lc, &path, port),
+                    OcsfUrl::new("http", &host_lc, &redact_path_for_logging(&path), port),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
@@ -4909,7 +4971,10 @@ async fn handle_forward_proxy(
                 403,
                 "Forbidden",
                 "policy_denied",
-                &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                &format!(
+                    "{method} {host_lc}:{port}{} not permitted by policy",
+                    redact_path_for_logging(&path)
+                ),
             ),
         )
         .await?;
@@ -5029,7 +5094,10 @@ async fn handle_forward_proxy(
                 403,
                 "Forbidden",
                 "policy_denied",
-                &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                &format!(
+                    "{method} {host_lc}:{port}{} not permitted by policy",
+                    redact_path_for_logging(&path)
+                ),
             ),
         )
         .await?;
@@ -5062,7 +5130,7 @@ async fn handle_forward_proxy(
             .status(StatusId::Success)
             .http_request(HttpRequest::new(
                 method,
-                OcsfUrl::new("http", &host_lc, &path, port),
+                OcsfUrl::new("http", &host_lc, &redact_path_for_logging(&path), port),
             ))
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
             .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
@@ -5071,7 +5139,10 @@ async fn handle_forward_proxy(
                     .with_cmd_line(&cmdline_str),
             )
             .firewall_rule(policy_str, "opa")
-            .message(format!("FORWARD allowed {method} {host_lc}:{port}{path}"))
+            .message(format!(
+                "FORWARD allowed {method} {host_lc}:{port}{}",
+                redact_path_for_logging(&path)
+            ))
             .build();
         ocsf_emit!(event);
     }
@@ -8414,6 +8485,48 @@ network_policies:
     fn test_parse_proxy_uri_with_query() {
         let (_, _, _, path) = parse_proxy_uri("http://host:80/api?key=val&foo=bar").unwrap();
         assert_eq!(path, "/api?key=val&foo=bar");
+    }
+
+    #[test]
+    fn redact_path_for_logging_strips_query_secrets() {
+        let redacted = redact_path_for_logging("/v1/tokens?access_token=secret-abc&x=1");
+        assert_eq!(redacted, "/v1/tokens?[redacted]");
+        assert!(!redacted.contains("secret-abc"));
+        assert!(!redacted.contains("access_token"));
+        assert_eq!(redact_path_for_logging("/v1/tokens"), "/v1/tokens");
+    }
+
+    #[test]
+    fn redact_uri_for_logging_strips_query_secrets() {
+        let redacted =
+            redact_uri_for_logging("http://api.example.com/oauth?client_secret=super-secret");
+        assert_eq!(redacted, "http://api.example.com/oauth?[redacted]");
+        assert!(!redacted.contains("super-secret"));
+        assert!(!redacted.contains("client_secret"));
+    }
+
+    #[test]
+    fn parse_proxy_uri_errors_do_not_embed_query_secrets() {
+        let err = parse_proxy_uri("not-a-uri?token=leaked-secret-999").unwrap_err();
+        let msg = format!("{err}");
+        assert!(!msg.contains("leaked-secret-999"));
+        assert!(!msg.contains("token=leaked"));
+        assert!(msg.contains("?[redacted]"));
+    }
+
+    #[test]
+    fn ocsf_url_from_redacted_path_keeps_marker_not_secret() {
+        let path = "/callback?code=oauth-code-xyz";
+        let url = OcsfUrl::new(
+            "http",
+            "api.example.com",
+            &redact_path_for_logging(path),
+            80,
+        );
+        let display = url.to_display_string();
+        assert!(!display.contains("oauth-code-xyz"));
+        assert!(display.contains("?[redacted]"));
+        assert!(display.contains("/callback"));
     }
 
     #[test]
