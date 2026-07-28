@@ -195,11 +195,11 @@ def test_provider_credentials_available_as_env_vars(
             assert value != "sk-e2e-test-key-12345"
 
 
-def test_generic_provider_credentials_available_as_env_vars(
+def test_profileless_provider_credentials_fail_closed(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """Generic provider env vars are placeholders, not raw secrets."""
+    """Profileless credentials are withheld because they have no endpoint binding."""
     with provider(
         sandbox_client._stub,
         name="e2e-test-generic-provider-env",
@@ -225,8 +225,8 @@ def test_generic_provider_credentials_available_as_env_vars(
             result = sb.exec_python(read_generic_env_vars)
             assert result.exit_code == 0, result.stderr
             token, url = result.stdout.strip().split("|")
-            assert _is_placeholder_for_env_key(token, "CUSTOM_SERVICE_TOKEN")
-            assert _is_placeholder_for_env_key(url, "CUSTOM_SERVICE_URL")
+            assert token == "NOT_SET"
+            assert url == "NOT_SET"
 
 
 def test_nvidia_provider_injects_nvidia_api_key_env_var(
@@ -269,15 +269,15 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
     with provider(
         stub,
         name=provider_name,
-        provider_type="generic",
-        credentials={"CUSTOM_ATTACH_TOKEN": "token-attach-detach"},
+        provider_type="nvidia",
+        credentials={"NVIDIA_API_KEY": "token-attach-detach"},
     ):
         spec = datamodel_pb2.SandboxSpec(policy=_default_policy(), providers=[])
 
         def read_attach_token() -> str:
             import os
 
-            return os.environ.get("CUSTOM_ATTACH_TOKEN", "NOT_SET")
+            return os.environ.get("NVIDIA_API_KEY", "NOT_SET")
 
         def exec_token(sb: Sandbox) -> str:
             result = sb.exec_python(read_attach_token)
@@ -292,7 +292,7 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                 if expected == "NOT_SET":
                     matched = last == expected
                 else:
-                    matched = _is_placeholder_for_env_key(last, "CUSTOM_ATTACH_TOKEN")
+                    matched = _is_placeholder_for_env_key(last, "NVIDIA_API_KEY")
                 if matched:
                     return
                 time.sleep(2)
@@ -310,7 +310,7 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                 )
                 wait_for_token(
                     sb,
-                    "openshell:resolve:env:CUSTOM_ATTACH_TOKEN",
+                    "openshell:resolve:env:NVIDIA_API_KEY",
                 )
 
                 stub.DetachSandboxProvider(
