@@ -40,7 +40,6 @@ impl MinWorkspaceRole {
 #[derive(Debug)]
 pub struct AuthorizedWorkspace {
     /// Resolved workspace name (empty string normalized to `"default"`).
-    #[allow(dead_code)]
     pub workspace: String,
     /// How the caller was authorized.
     pub grant: AuthGrant,

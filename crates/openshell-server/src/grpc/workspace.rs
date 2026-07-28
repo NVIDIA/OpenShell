@@ -279,7 +279,7 @@ pub(super) async fn handle_list_workspaces(
         Some(subject) => {
             let all: Vec<Workspace> = state
                 .store
-                .list_messages_with_membership(member_type, subject, u32::MAX, 0)
+                .list_messages_with_membership(member_type, subject, MAX_PAGE_SIZE, 0)
                 .await
                 .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?;
             crate::persistence::filter_by_labels(all, &req.label_selector, limit, req.offset)

@@ -148,17 +148,17 @@ async fn handle_create_sandbox_inner(
     }
     crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
 
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
-        .await?
-        .ensure_active()?;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &request.workspace,
         MinWorkspaceRole::User,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .ensure_active()?;
 
     let _sandbox_sync_guard = if spec.providers.is_empty() {
         None
@@ -272,17 +272,17 @@ pub(super) async fn handle_get_sandbox(
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::User,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
 
     let sandbox = state
         .store
@@ -326,18 +326,18 @@ pub(super) async fn handle_list_sandboxes(
                 .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
         }
     } else {
-        let workspace =
-            super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
-                .await?
-                .name;
-        authorize_workspace(
+        let authz = authorize_workspace(
             &state.store,
             &state.admin_role,
             &principal,
-            &workspace,
+            &request.workspace,
             MinWorkspaceRole::User,
         )
         .await?;
+        let workspace =
+            super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+                .await?
+                .name;
         if request.label_selector.is_empty() {
             state
                 .store
@@ -370,17 +370,17 @@ pub(super) async fn handle_list_sandbox_providers(
 ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::User,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     let sandbox = sandbox_by_name(state, &workspace, &req.sandbox_name).await?;
     let providers = providers_for_sandbox(state, &sandbox, &workspace).await?;
     Ok(Response::new(ListSandboxProvidersResponse { providers }))
@@ -392,17 +392,17 @@ pub(super) async fn handle_attach_sandbox_provider(
 ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
-        .await?
-        .ensure_active()?;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &request.workspace,
         MinWorkspaceRole::User,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .ensure_active()?;
     if request.provider_name.is_empty() {
         return Err(Status::invalid_argument("provider_name is required"));
     }
@@ -522,17 +522,17 @@ pub(super) async fn handle_detach_sandbox_provider(
 ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &request.workspace,
         MinWorkspaceRole::User,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     if request.provider_name.is_empty() {
         return Err(Status::invalid_argument("provider_name is required"));
     }
@@ -630,17 +630,17 @@ async fn handle_delete_sandbox_inner(
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::User,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
 
     let result = state.compute.delete_sandbox(&workspace, &name).await?;
     if result.deleted {
