@@ -29,14 +29,14 @@ let
   mkDistroProfile =
     name: distro:
     pkgs.writeText "openshell-test-guest-${name}" ''
-      TEST_VM_IMAGE_DRV=${builtins.unsafeDiscardStringContext distro.image.drvPath}
-      TEST_VM_IMAGE_URL=${pkgs.lib.escapeShellArg distro.imageUrl}
-      TEST_VM_IMAGE_HASH=${pkgs.lib.escapeShellArg distro.imageHash}
-      TEST_VM_OS_ID=${pkgs.lib.escapeShellArg distro.osId}
-      TEST_VM_OS_VERSION=${pkgs.lib.escapeShellArg distro.osVersion}
-      TEST_VM_PACKAGE_FAMILY=${pkgs.lib.escapeShellArg distro.packageFamily}
-      export TEST_VM_IMAGE_DRV TEST_VM_IMAGE_URL TEST_VM_IMAGE_HASH
-      export TEST_VM_OS_ID TEST_VM_OS_VERSION TEST_VM_PACKAGE_FAMILY
+      TEST_GUEST_IMAGE_DRV=${builtins.unsafeDiscardStringContext distro.image.drvPath}
+      TEST_GUEST_IMAGE_URL=${pkgs.lib.escapeShellArg distro.imageUrl}
+      TEST_GUEST_IMAGE_HASH=${pkgs.lib.escapeShellArg distro.imageHash}
+      TEST_GUEST_OS_ID=${pkgs.lib.escapeShellArg distro.osId}
+      TEST_GUEST_OS_VERSION=${pkgs.lib.escapeShellArg distro.osVersion}
+      TEST_GUEST_PACKAGE_FAMILY=${pkgs.lib.escapeShellArg distro.packageFamily}
+      export TEST_GUEST_IMAGE_DRV TEST_GUEST_IMAGE_URL TEST_GUEST_IMAGE_HASH
+      export TEST_GUEST_OS_ID TEST_GUEST_OS_VERSION TEST_GUEST_PACKAGE_FAMILY
     '';
 
   distroCatalog = pkgs.linkFarm "openshell-test-guest-distros" (
@@ -65,21 +65,21 @@ let
   ];
 
   runtimeEnvironment = ''
-    export OPENSHELL_TEST_VM_RUNTIME=1
-    export OPENSHELL_TEST_VM_DISTROS=${distroCatalog}
-    export OPENSHELL_TEST_VM_CONFIGURATIONS=${configurationCatalog}
-    export OPENSHELL_TEST_VM_CACHE_LIB=${./cache-lib.sh}
-    export OPENSHELL_TEST_VM_CACHE_SEAL=${./cache-seal.sh}
-    export OPENSHELL_TEST_VM_RUNNER=${./run.sh}
-    export TEST_VM_BASH=${pkgs.bash}/bin/bash
-    export TEST_VM_QEMU=${qemuBinary}
-    export TEST_VM_FIRMWARE_CODE=${pkgs.OVMF.firmware}
-    export TEST_VM_FIRMWARE_VARS=${pkgs.OVMF.variables}
-    export TEST_VM_MACHINE=${if isAarch64 then "virt" else "q35"}
-    export TEST_VM_ACCELERATOR=${if isDarwin then "hvf" else "kvm"}
-    export TEST_VM_ARCHITECTURE=${architecture}
-    export TEST_VM_ANSIBLE_VERSION=${pkgs.python3Packages.ansible-core.version}
-    export TEST_VM_CACHE_GENERATION=1
+    export OPENSHELL_TEST_GUEST_RUNTIME=1
+    export OPENSHELL_TEST_GUEST_DISTROS=${distroCatalog}
+    export OPENSHELL_TEST_GUEST_CONFIGURATIONS=${configurationCatalog}
+    export OPENSHELL_TEST_GUEST_CACHE_LIB=${./cache-lib.sh}
+    export OPENSHELL_TEST_GUEST_CACHE_SEAL=${./cache-seal.sh}
+    export OPENSHELL_TEST_GUEST_RUNNER=${./run.sh}
+    export TEST_GUEST_BASH=${pkgs.bash}/bin/bash
+    export TEST_GUEST_QEMU=${qemuBinary}
+    export TEST_GUEST_FIRMWARE_CODE=${pkgs.OVMF.firmware}
+    export TEST_GUEST_FIRMWARE_VARS=${pkgs.OVMF.variables}
+    export TEST_GUEST_MACHINE=${if isAarch64 then "virt" else "q35"}
+    export TEST_GUEST_ACCELERATOR=${if isDarwin then "hvf" else "kvm"}
+    export TEST_GUEST_ARCHITECTURE=${architecture}
+    export TEST_GUEST_ANSIBLE_VERSION=${pkgs.python3Packages.ansible-core.version}
+    export TEST_GUEST_CACHE_GENERATION=1
   '';
 
   runner = pkgs.writeShellApplication {

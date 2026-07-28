@@ -25,10 +25,10 @@ With no COMMAND, the runner opens an interactive SSH session.
 EOF
 }
 
-if [ "${OPENSHELL_TEST_VM_RUNTIME:-}" != 1 ] ||
-	[ ! -d "${OPENSHELL_TEST_VM_DISTROS:-}" ] ||
-	[ ! -d "${OPENSHELL_TEST_VM_CONFIGURATIONS:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_VM_CACHE_LIB:-}" ]; then
+if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ] ||
+	[ ! -d "${OPENSHELL_TEST_GUEST_DISTROS:-}" ] ||
+	[ ! -d "${OPENSHELL_TEST_GUEST_CONFIGURATIONS:-}" ] ||
+	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ]; then
 	echo "run this script through 'nix run .#test-guest -- ...'" >&2
 	exit 2
 fi
@@ -91,11 +91,11 @@ done
 
 if [ "${list}" -eq 1 ]; then
 	echo "Distros:"
-	for entry in "${OPENSHELL_TEST_VM_DISTROS}"/*; do
+	for entry in "${OPENSHELL_TEST_GUEST_DISTROS}"/*; do
 		printf '  %s\n' "${entry##*/}"
 	done
 	echo "Configurations:"
-	for entry in "${OPENSHELL_TEST_VM_CONFIGURATIONS}"/*; do
+	for entry in "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}"/*; do
 		printf '  %s\n' "${entry##*/}"
 	done
 	exit 0
@@ -107,17 +107,17 @@ if [ -z "${distro}" ]; then
 	exit 2
 fi
 if [[ ! ${distro} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-	[ ! -r "${OPENSHELL_TEST_VM_DISTROS}/${distro}" ]; then
+	[ ! -r "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}" ]; then
 	echo "unknown distro: ${distro}" >&2
 	exit 2
 fi
 # Distro profiles contain only trusted values generated into the Nix store.
 # shellcheck disable=SC1090
-. "${OPENSHELL_TEST_VM_DISTROS}/${distro}"
+. "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}"
 
 for item in "${configurations[@]}"; do
 	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-		[ ! -r "${OPENSHELL_TEST_VM_CONFIGURATIONS}/${item}" ]; then
+		[ ! -r "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
 		echo "unknown configuration: ${item:-<empty>}" >&2
 		exit 2
 	fi
@@ -137,10 +137,10 @@ for package in "${packages[@]}"; do
 		echo "package does not exist: ${package}" >&2
 		exit 2
 	fi
-	case "${TEST_VM_PACKAGE_FAMILY}:${package}" in
+	case "${TEST_GUEST_PACKAGE_FAMILY}:${package}" in
 	deb:*.deb | rpm:*.rpm) ;;
 	*)
-		echo "${package} does not match the ${TEST_VM_PACKAGE_FAMILY} package family" >&2
+		echo "${package} does not match the ${TEST_GUEST_PACKAGE_FAMILY} package family" >&2
 		exit 2
 		;;
 	esac
@@ -169,34 +169,34 @@ done
 
 test_vm_cpu=host
 ssh_wait_seconds=180
-if [ "${TEST_VM_ACCELERATOR}" = kvm ] &&
+if [ "${TEST_GUEST_ACCELERATOR}" = kvm ] &&
 	{ [ ! -c /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
 	echo "==> /dev/kvm is unavailable; falling back to QEMU/TCG"
-	TEST_VM_ACCELERATOR=tcg
+	TEST_GUEST_ACCELERATOR=tcg
 	test_vm_cpu=max
 	ssh_wait_seconds=600
 fi
 
 # shellcheck disable=SC1090
-. "${OPENSHELL_TEST_VM_CACHE_LIB}"
+. "${OPENSHELL_TEST_GUEST_CACHE_LIB}"
 
 prepared_image=0
-TEST_VM_IMAGE=
-if [ -n "${OPENSHELL_TEST_VM_IMAGE_OVERRIDE:-}" ]; then
-	if [ ! -f "${OPENSHELL_TEST_VM_IMAGE_OVERRIDE}" ]; then
-		echo "prepared guest image does not exist: ${OPENSHELL_TEST_VM_IMAGE_OVERRIDE}" >&2
+TEST_GUEST_IMAGE=
+if [ -n "${OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE:-}" ]; then
+	if [ ! -f "${OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE}" ]; then
+		echo "prepared guest image does not exist: ${OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE}" >&2
 		exit 2
 	fi
-	TEST_VM_IMAGE=${OPENSHELL_TEST_VM_IMAGE_OVERRIDE}
+	TEST_GUEST_IMAGE=${OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE}
 	prepared_image=1
 	echo "==> Using explicit prepared guest image"
-elif [ "${OPENSHELL_TEST_VM_CACHE_DISABLE:-0}" -ne 1 ]; then
+elif [ "${OPENSHELL_TEST_GUEST_CACHE_DISABLE:-0}" -ne 1 ]; then
 	cache_root=$(test_vm_cache_root)
 	cache_key=$(test_vm_cache_key "${distro}" "${configurations[@]}")
 	if test_vm_cache_local_entry_valid \
 		"${cache_root}" "${cache_key}" "${distro}" "${configurations[@]}"; then
 		cache_entry=$(test_vm_cache_entry_dir "${cache_root}" "${cache_key}")
-		TEST_VM_IMAGE="${cache_entry}/disk.qcow2"
+		TEST_GUEST_IMAGE="${cache_entry}/disk.qcow2"
 		prepared_image=1
 		echo "==> Cache local hit: ${cache_entry}"
 	fi
@@ -204,7 +204,7 @@ fi
 
 if [ "${prepared_image}" -eq 0 ]; then
 	echo "==> Realizing the pinned ${distro} cloud image"
-	TEST_VM_IMAGE=$(nix build --no-link --print-out-paths "${TEST_VM_IMAGE_DRV}^out")
+	TEST_GUEST_IMAGE=$(nix build --no-link --print-out-paths "${TEST_GUEST_IMAGE_DRV}^out")
 fi
 
 umask 077
@@ -215,6 +215,7 @@ overlay=${run_dir}/disk.qcow2
 seed=${run_dir}/seed.iso
 vars=${run_dir}/firmware-vars.fd
 private_key=${run_dir}/id_ed25519
+ssh_control_path=${run_dir}/ssh-control
 serial_log=${run_dir}/serial.log
 qemu_log=${run_dir}/qemu.log
 qemu_pid=
@@ -285,29 +286,30 @@ EOF
 	xorriso -as mkisofs -quiet -output "${seed}" -volid cidata -joliet -rock user-data meta-data
 )
 
-qemu-img create -q -f qcow2 -F qcow2 -b "${TEST_VM_IMAGE}" "${overlay}"
+qemu-img create -q -f qcow2 -F qcow2 -b "${TEST_GUEST_IMAGE}" "${overlay}"
 if [ "${prepared_image}" -eq 0 ]; then
 	qemu-img resize -q "${overlay}" +16G
 fi
-cp "${TEST_VM_FIRMWARE_VARS}" "${vars}"
+cp "${TEST_GUEST_FIRMWARE_VARS}" "${vars}"
 chmod 0600 "${vars}"
 
 for attempt in $(seq 1 5); do
 	ssh_port=${requested_ssh_port:-$(pick_free_port)}
 	: >"${qemu_log}"
-	echo "==> Booting ${distro} (${TEST_VM_ARCHITECTURE}) with QEMU/${TEST_VM_ACCELERATOR}"
-	"${TEST_VM_QEMU}" \
+	echo "==> Booting ${distro} (${TEST_GUEST_ARCHITECTURE}) with QEMU/${TEST_GUEST_ACCELERATOR}"
+	"${TEST_GUEST_QEMU}" \
 		-name "openshell-test-${distro}" \
-		-machine "${TEST_VM_MACHINE},accel=${TEST_VM_ACCELERATOR}" \
+		-machine "${TEST_GUEST_MACHINE},accel=${TEST_GUEST_ACCELERATOR}" \
 		-cpu "${test_vm_cpu}" \
 		-smp 4 \
 		-m 4096 \
-		-drive "if=pflash,format=raw,readonly=on,file=${TEST_VM_FIRMWARE_CODE}" \
+		-drive "if=pflash,format=raw,readonly=on,file=${TEST_GUEST_FIRMWARE_CODE}" \
 		-drive "if=pflash,format=raw,file=${vars}" \
 		-drive "if=none,format=qcow2,file=${overlay},id=osdisk" \
-		-device virtio-blk-pci,drive=osdisk \
+		-device virtio-blk-pci,drive=osdisk,bootindex=1 \
 		-drive "if=none,format=raw,readonly=on,file=${seed},id=seed" \
 		-device virtio-blk-pci,drive=seed \
+		-boot strict=on \
 		-netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22" \
 		-device virtio-net-pci,netdev=net0 \
 		-display none \
@@ -317,7 +319,7 @@ for attempt in $(seq 1 5); do
 		>/dev/null 2>"${qemu_log}" &
 	qemu_pid=$!
 
-	sleep 1
+	sleep 0.25
 	if kill -0 "${qemu_pid}" 2>/dev/null; then
 		break
 	fi
@@ -342,6 +344,9 @@ ssh_args=(
 	-p "${ssh_port}"
 	-o BatchMode=yes
 	-o ConnectTimeout=5
+	-o ControlMaster=auto
+	-o ControlPersist=60
+	-o "ControlPath=${ssh_control_path}"
 	-o LogLevel=ERROR
 	-o StrictHostKeyChecking=no
 	-o UserKnownHostsFile=/dev/null
@@ -352,6 +357,9 @@ scp_args=(
 	-P "${ssh_port}"
 	-o BatchMode=yes
 	-o ConnectTimeout=5
+	-o ControlMaster=auto
+	-o ControlPersist=60
+	-o "ControlPath=${ssh_control_path}"
 	-o LogLevel=ERROR
 	-o StrictHostKeyChecking=no
 	-o UserKnownHostsFile=/dev/null
@@ -359,18 +367,18 @@ scp_args=(
 
 echo "==> Waiting up to ${ssh_wait_seconds} seconds for SSH on 127.0.0.1:${ssh_port}"
 ssh_ready=0
-for _ in $(seq 1 "$((ssh_wait_seconds / 2))"); do
+for _ in $(seq 1 "$((ssh_wait_seconds * 4))"); do
 	if ! kill -0 "${qemu_pid}" 2>/dev/null; then
 		wait "${qemu_pid}" || true
 		qemu_pid=
 		echo "QEMU exited before SSH became ready" >&2
 		exit 1
 	fi
-	if ssh "${ssh_args[@]}" openshell@127.0.0.1 true 2>/dev/null; then
+	if ssh "${ssh_args[@]}" -o ConnectTimeout=1 openshell@127.0.0.1 true 2>/dev/null; then
 		ssh_ready=1
 		break
 	fi
-	sleep 2
+	sleep 0.25
 done
 if [ "${ssh_ready}" -ne 1 ]; then
 	echo "SSH did not become ready within ${ssh_wait_seconds} seconds" >&2
@@ -381,12 +389,10 @@ echo "==> Validating ${distro}"
 # Profile values come from the trusted Nix-generated catalog.
 # shellcheck disable=SC2029
 ssh "${ssh_args[@]}" openshell@127.0.0.1 \
-	"set -eu; . /etc/os-release; test \"\${ID}\" = '${TEST_VM_OS_ID}'; case \"\${VERSION_ID}\" in '${TEST_VM_OS_VERSION}'*) ;; *) exit 1 ;; esac; test \"\$(uname -m)\" = '${TEST_VM_ARCHITECTURE}'"
+	"set -eu; set +e; sudo cloud-init status --wait >/dev/null; status=\$?; set -e; [ \"\${status}\" -eq 0 ] || [ \"\${status}\" -eq 2 ]; . /etc/os-release; test \"\${ID}\" = '${TEST_GUEST_OS_ID}'; case \"\${VERSION_ID}\" in '${TEST_GUEST_OS_VERSION}'*) ;; *) exit 1 ;; esac; test \"\$(uname -m)\" = '${TEST_GUEST_ARCHITECTURE}'"
 # cloud-init returns 2 when it completes with recoverable errors. Fedora can
 # report that status for an initial transient-hostname warning even though the
 # requested user and SSH configuration were applied successfully.
-ssh "${ssh_args[@]}" openshell@127.0.0.1 \
-	'sudo cloud-init status --wait >/dev/null; status=$?; [ "$status" -eq 0 ] || [ "$status" -eq 2 ]'
 
 cat >"${ansible_config}" <<EOF
 [defaults]
@@ -407,7 +413,7 @@ if [ "${prepared_image}" -eq 0 ]; then
 	for item in "${configurations[@]}"; do
 		echo "==> Applying configuration: ${item}"
 		ANSIBLE_CONFIG="${ansible_config}" ANSIBLE_NOCOLOR=1 \
-			ansible-playbook "${OPENSHELL_TEST_VM_CONFIGURATIONS}/${item}"
+			ansible-playbook "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}"
 	done
 else
 	echo "==> Reusing cached configuration: ${configurations[*]:-base image}"
@@ -422,7 +428,7 @@ for package in "${packages[@]}"; do
 	remote_package="/home/openshell/${package_name}"
 	echo "==> Installing package: ${package_name}"
 	scp "${scp_args[@]}" "${package}" "openshell@127.0.0.1:${remote_package}"
-	case "${TEST_VM_PACKAGE_FAMILY}" in
+	case "${TEST_GUEST_PACKAGE_FAMILY}" in
 	deb)
 		# The remote path uses a restricted package filename.
 		# shellcheck disable=SC2029
@@ -466,12 +472,18 @@ else
 fi
 
 echo "==> Shutting down ${distro}"
-ssh "${ssh_args[@]}" openshell@127.0.0.1 'sudo systemctl poweroff' >/dev/null 2>&1 || true
-for _ in $(seq 1 30); do
-	if ! kill -0 "${qemu_pid}" 2>/dev/null; then
-		wait "${qemu_pid}" || true
-		qemu_pid=
-		break
-	fi
-	sleep 1
-done
+if [ "${keep}" -eq 1 ]; then
+	ssh "${ssh_args[@]}" openshell@127.0.0.1 'sudo systemctl poweroff' >/dev/null 2>&1 || true
+	for _ in $(seq 1 120); do
+		if ! kill -0 "${qemu_pid}" 2>/dev/null; then
+			wait "${qemu_pid}" || true
+			qemu_pid=
+			break
+		fi
+		sleep 0.25
+	done
+else
+	kill "${qemu_pid}" 2>/dev/null || true
+	wait "${qemu_pid}" 2>/dev/null || true
+	qemu_pid=
+fi

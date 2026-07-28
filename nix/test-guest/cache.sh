@@ -26,18 +26,18 @@ Publishing is explicit and requires both --repository and --push.
 EOF
 }
 
-if [ "${OPENSHELL_TEST_VM_RUNTIME:-}" != 1 ] ||
-	[ ! -d "${OPENSHELL_TEST_VM_DISTROS:-}" ] ||
-	[ ! -d "${OPENSHELL_TEST_VM_CONFIGURATIONS:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_VM_CACHE_LIB:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_VM_CACHE_SEAL:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_VM_RUNNER:-}" ]; then
+if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ] ||
+	[ ! -d "${OPENSHELL_TEST_GUEST_DISTROS:-}" ] ||
+	[ ! -d "${OPENSHELL_TEST_GUEST_CONFIGURATIONS:-}" ] ||
+	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ] ||
+	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_SEAL:-}" ] ||
+	[ ! -r "${OPENSHELL_TEST_GUEST_RUNNER:-}" ]; then
 	echo "run this script through 'nix run .#test-guest-cache -- ...'" >&2
 	exit 2
 fi
 
 # shellcheck disable=SC1090
-. "${OPENSHELL_TEST_VM_CACHE_LIB}"
+. "${OPENSHELL_TEST_GUEST_CACHE_LIB}"
 
 require_value() {
 	if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
@@ -47,7 +47,7 @@ require_value() {
 }
 
 distro=
-repository=${OPENSHELL_TEST_VM_CACHE_REPOSITORY:-}
+repository=${OPENSHELL_TEST_GUEST_CACHE_REPOSITORY:-}
 cache_dir=
 push=0
 configurations=()
@@ -96,18 +96,18 @@ if [ -z "${distro}" ]; then
 	exit 2
 fi
 if [[ ! ${distro} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-	[ ! -r "${OPENSHELL_TEST_VM_DISTROS}/${distro}" ]; then
+	[ ! -r "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}" ]; then
 	echo "unknown distro: ${distro}" >&2
 	exit 2
 fi
 
 # Distro profiles contain only trusted values generated into the Nix store.
 # shellcheck disable=SC1090
-. "${OPENSHELL_TEST_VM_DISTROS}/${distro}"
+. "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}"
 
 for item in "${configurations[@]}"; do
 	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-		[ ! -r "${OPENSHELL_TEST_VM_CONFIGURATIONS}/${item}" ]; then
+		[ ! -r "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
 		echo "unknown configuration: ${item:-<empty>}" >&2
 		exit 2
 	fi
@@ -123,8 +123,8 @@ if [[ ${repository} == *[[:space:]]* ]] || [[ ${repository} == *@* ]]; then
 fi
 
 if [ -n "${cache_dir}" ]; then
-	OPENSHELL_TEST_VM_CACHE_DIR=${cache_dir}
-	export OPENSHELL_TEST_VM_CACHE_DIR
+	OPENSHELL_TEST_GUEST_CACHE_DIR=${cache_dir}
+	export OPENSHELL_TEST_GUEST_CACHE_DIR
 fi
 
 umask 077
@@ -288,7 +288,7 @@ build_local() {
 	done
 	prepare_args+=(
 		--copy
-		"${OPENSHELL_TEST_VM_CACHE_SEAL}:/usr/local/sbin/openshell-test-guest-cache-seal"
+		"${OPENSHELL_TEST_GUEST_CACHE_SEAL}:/usr/local/sbin/openshell-test-guest-cache-seal"
 		--
 		sudo
 		/usr/local/sbin/openshell-test-guest-cache-seal
@@ -296,7 +296,7 @@ build_local() {
 
 	echo "==> Cache miss: preparing ${distro} ($(test_vm_cache_oci_architecture))"
 	TMPDIR="${build_stage}/prepare-tmp" \
-		"${TEST_VM_BASH}" "${OPENSHELL_TEST_VM_RUNNER}" "${prepare_args[@]}"
+		"${TEST_GUEST_BASH}" "${OPENSHELL_TEST_GUEST_RUNNER}" "${prepare_args[@]}"
 
 	shopt -s nullglob
 	run_dirs=("${build_stage}/prepare-tmp/openshell-test-guest"/run.*)
@@ -329,8 +329,8 @@ build_local() {
 
 	echo "==> Validating fresh boot from prepared cache disk"
 	TMPDIR="${build_stage}/validate-tmp" \
-		OPENSHELL_TEST_VM_IMAGE_OVERRIDE="${prepared_disk}" \
-		"${TEST_VM_BASH}" "${OPENSHELL_TEST_VM_RUNNER}" "${validate_args[@]}"
+		OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE="${prepared_disk}" \
+		"${TEST_GUEST_BASH}" "${OPENSHELL_TEST_GUEST_RUNNER}" "${validate_args[@]}"
 
 	configuration_json=$(jq -cn --args '$ARGS.positional' "${configurations[@]}")
 	disk_sha=$(test_vm_cache_sha256 "${prepared_disk}")
@@ -341,14 +341,14 @@ build_local() {
 	created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 	jq -n \
-		--argjson schema "${TEST_VM_CACHE_SCHEMA_VERSION}" \
+		--argjson schema "${TEST_GUEST_CACHE_SCHEMA_VERSION}" \
 		--arg key "${cache_key}" \
 		--arg distro "${distro}" \
-		--arg os_version "${TEST_VM_OS_VERSION}" \
+		--arg os_version "${TEST_GUEST_OS_VERSION}" \
 		--arg architecture "$(test_vm_cache_oci_architecture)" \
-		--arg base_image_url "${TEST_VM_IMAGE_URL}" \
-		--arg base_image_hash "${TEST_VM_IMAGE_HASH}" \
-		--arg disk_layout "${TEST_VM_CACHE_DISK_LAYOUT}" \
+		--arg base_image_url "${TEST_GUEST_IMAGE_URL}" \
+		--arg base_image_hash "${TEST_GUEST_IMAGE_HASH}" \
+		--arg disk_layout "${TEST_GUEST_CACHE_DISK_LAYOUT}" \
 		--arg disk_sha256 "${disk_sha}" \
 		--arg created "${created}" \
 		--argjson virtual_size "${virtual_size}" \
@@ -400,10 +400,10 @@ push_remote() {
 	(
 		cd "${push_dir}"
 		oras push \
-			--artifact-type "${TEST_VM_CACHE_ARTIFACT_TYPE}" \
+			--artifact-type "${TEST_GUEST_CACHE_ARTIFACT_TYPE}" \
 			"${remote_ref}" \
-			"metadata.json:${TEST_VM_CACHE_METADATA_TYPE}" \
-			"disk.qcow2.zst:${TEST_VM_CACHE_DISK_TYPE}"
+			"metadata.json:${TEST_GUEST_CACHE_METADATA_TYPE}" \
+			"disk.qcow2.zst:${TEST_GUEST_CACHE_DISK_TYPE}"
 	)
 	rm -rf "${push_dir}"
 	echo "==> Cache push complete: ${remote_ref}"
