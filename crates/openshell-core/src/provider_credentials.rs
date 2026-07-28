@@ -426,6 +426,11 @@ impl ProviderCredentialState {
             dynamic_credentials,
         });
         inner.current_resolver = current_resolver.map(Arc::new);
+        if static_credential_identities(&inner.static_credential_bindings)
+            != static_credential_identities(&static_credential_bindings)
+        {
+            inner.generations.clear();
+        }
         if let Some(resolver) = generation_resolver {
             inner.generations.push_back(Arc::new(resolver));
             while inner.generations.len() > MAX_RETAINED_CREDENTIAL_GENERATIONS {
@@ -507,6 +512,11 @@ fn validate_static_credential_bindings(
         ));
     }
     for binding in bindings.values() {
+        if binding.credential_identity.is_empty() {
+            return Err(binding_error(
+                "static credential binding has no provider credential identity",
+            ));
+        }
         if binding.endpoints.is_empty() {
             return Err(binding_error(
                 "static credential binding has no authorized endpoints",
@@ -524,6 +534,15 @@ fn validate_static_credential_bindings(
         }
     }
     Ok(())
+}
+
+fn static_credential_identities(
+    bindings: &HashMap<String, StaticCredentialBinding>,
+) -> HashMap<&str, &str> {
+    bindings
+        .iter()
+        .map(|(key, binding)| (key.as_str(), binding.credential_identity.as_str()))
+        .collect()
 }
 
 fn binding_error(message: &str) -> StaticCredentialBindingError {
@@ -568,6 +587,7 @@ mod tests {
                 port,
                 path: path.to_string(),
             }],
+            credential_identity: "provider-a:API_KEY".to_string(),
         }
     }
 
@@ -642,17 +662,135 @@ mod tests {
         )
         .expect("initial bindings");
 
+        let dynamic_credentials = HashMap::from([(
+            "dynamic".to_string(),
+            crate::proto::ProviderProfileCredential::default(),
+        )]);
         let result = state.install_bound_environment(
             2,
             HashMap::from([("API_KEY".to_string(), "new".to_string())]),
             HashMap::new(),
-            HashMap::new(),
+            dynamic_credentials,
             HashMap::new(),
             Vec::new(),
         );
         assert!(result.is_err());
         assert!(state.snapshot().child_env.is_empty());
         assert!(state.resolver().is_none());
+        assert!(state.snapshot().dynamic_credentials.contains_key("dynamic"));
+    }
+
+    #[test]
+    fn retained_generation_survives_rotation_of_same_provider_credential() {
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("API_KEY".to_string(), "old".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "API_KEY".to_string(),
+                binding("api.example.com", 443, "/**"),
+            )]),
+            Vec::new(),
+        )
+        .expect("initial bindings");
+
+        state
+            .install_bound_environment(
+                2,
+                HashMap::from([("API_KEY".to_string(), "new".to_string())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([(
+                    "API_KEY".to_string(),
+                    binding("api.example.com", 443, "/**"),
+                )]),
+                Vec::new(),
+            )
+            .expect("rotated bindings");
+
+        let resolver = state
+            .resolver_for_endpoint("api.example.com", 443, "/v1")
+            .expect("resolver");
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            Some("old")
+        );
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn replacing_provider_with_reused_key_purges_retained_generation() {
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("API_KEY".to_string(), "provider-a-secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("API_KEY".to_string(), binding("a.example.com", 443, "/**"))]),
+            Vec::new(),
+        )
+        .expect("initial bindings");
+        let mut replacement_binding = binding("b.example.com", 443, "/**");
+        replacement_binding.credential_identity = "provider-b:API_KEY".to_string();
+
+        state
+            .install_bound_environment(
+                2,
+                HashMap::from([("API_KEY".to_string(), "provider-b-secret".to_string())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([("API_KEY".to_string(), replacement_binding)]),
+                Vec::new(),
+            )
+            .expect("replacement bindings");
+
+        let resolver = state
+            .resolver_for_endpoint("b.example.com", 443, "/v1")
+            .expect("resolver");
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            None,
+            "a placeholder issued by another provider identity must fail closed"
+        );
+    }
+
+    #[test]
+    fn detach_then_attach_with_reused_key_cannot_resolve_detached_secret() {
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("API_KEY".to_string(), "provider-a-secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("API_KEY".to_string(), binding("a.example.com", 443, "/**"))]),
+            Vec::new(),
+        )
+        .expect("initial bindings");
+        state.revoke_static_provider_environment(2);
+
+        let mut replacement_binding = binding("b.example.com", 443, "/**");
+        replacement_binding.credential_identity = "provider-b:API_KEY".to_string();
+        state
+            .install_bound_environment(
+                3,
+                HashMap::from([("API_KEY".to_string(), "provider-b-secret".to_string())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([("API_KEY".to_string(), replacement_binding)]),
+                Vec::new(),
+            )
+            .expect("replacement bindings");
+
+        let resolver = state
+            .resolver_for_endpoint("b.example.com", 443, "/v1")
+            .expect("resolver");
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            None,
+            "a placeholder issued before detach must not resolve to a replacement provider"
+        );
     }
 
     #[test]

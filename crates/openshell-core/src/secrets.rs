@@ -42,7 +42,7 @@ pub fn contains_reserved_credential_marker(value: &str) -> bool {
 
 /// Error returned when a placeholder cannot be resolved or a resolved secret
 /// contains prohibited characters.
-#[derive(Debug)]
+#[derive(Debug, miette::Diagnostic)]
 pub struct UnresolvedPlaceholderError {
     pub location: &'static str, // "header", "query_param", "path"
     reason: UnresolvedPlaceholderReason,
@@ -82,6 +82,8 @@ impl fmt::Display for UnresolvedPlaceholderError {
     }
 }
 
+impl std::error::Error for UnresolvedPlaceholderError {}
+
 fn unresolved(location: &'static str) -> UnresolvedPlaceholderError {
     UnresolvedPlaceholderError {
         location,
@@ -120,6 +122,7 @@ pub struct RewriteTargetResult {
 pub struct SecretResolver {
     by_placeholder: HashMap<String, SecretValue>,
     denied_env_keys: std::collections::HashSet<String>,
+    no_revision_fallback_env_keys: std::collections::HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -241,6 +244,7 @@ impl SecretResolver {
                 Some(Self {
                     by_placeholder,
                     denied_env_keys: std::collections::HashSet::new(),
+                    no_revision_fallback_env_keys: std::collections::HashSet::new(),
                 }),
             )
         }
@@ -249,9 +253,12 @@ impl SecretResolver {
     pub fn merge<'a>(resolvers: impl IntoIterator<Item = &'a Self>) -> Option<Self> {
         let mut by_placeholder = HashMap::new();
         let mut denied_env_keys = std::collections::HashSet::new();
+        let mut no_revision_fallback_env_keys = std::collections::HashSet::new();
         for resolver in resolvers {
             by_placeholder.extend(resolver.by_placeholder.clone());
             denied_env_keys.extend(resolver.denied_env_keys.iter().cloned());
+            no_revision_fallback_env_keys
+                .extend(resolver.no_revision_fallback_env_keys.iter().cloned());
         }
         if by_placeholder.is_empty() {
             None
@@ -259,6 +266,7 @@ impl SecretResolver {
             Some(Self {
                 by_placeholder,
                 denied_env_keys,
+                no_revision_fallback_env_keys,
             })
         }
     }
@@ -289,6 +297,7 @@ impl SecretResolver {
         Self {
             by_placeholder,
             denied_env_keys,
+            no_revision_fallback_env_keys: bound_keys.clone(),
         }
     }
 
@@ -318,7 +327,15 @@ impl SecretResolver {
             // Once an old generation ages out, the revision number is only a
             // namespace marker. Fall back by key to the current credential so
             // long-running child processes survive provider credential refresh.
+            // Endpoint-bound credentials are the exception: a revision belongs
+            // to one provider identity, so falling back by key after replacement
+            // would let the old process obtain the replacement provider's secret.
             let key = revisioned_placeholder_env_key(value).or_else(|| alias_env_key(value))?;
+            if revisioned_placeholder_env_key(value).is_some()
+                && self.no_revision_fallback_env_keys.contains(key)
+            {
+                return None;
+            }
             let canonical = placeholder_for_env_key(key);
             self.by_placeholder.get(&canonical)?
         };
@@ -340,6 +357,25 @@ impl SecretResolver {
                 None
             }
         }
+    }
+
+    /// Resolve a placeholder while preserving endpoint-denial information.
+    ///
+    /// `None` means the credential is genuinely unavailable. An endpoint-bound
+    /// key denied by the scoped resolver returns a typed mismatch so callers
+    /// can emit the security denial instead of treating it as missing config.
+    pub fn resolve_placeholder_checked(
+        &self,
+        value: &str,
+        location: &'static str,
+    ) -> Result<Option<&str>, UnresolvedPlaceholderError> {
+        if placeholder_env_key(value).is_some_and(|key| self.denied_env_keys.contains(key)) {
+            return Err(UnresolvedPlaceholderError {
+                location,
+                reason: UnresolvedPlaceholderReason::EndpointMismatch,
+            });
+        }
+        Ok(self.resolve_placeholder(value))
     }
 
     pub fn expires_at_ms_for_placeholder(&self, placeholder: &str) -> Option<i64> {

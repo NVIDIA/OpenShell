@@ -623,10 +623,17 @@ pub(super) async fn resolve_provider_environment_with_catalog(
                 env.entry(key.clone()).or_insert_with(|| value.clone());
                 static_credential_keys.insert(key.clone());
                 if let Some(endpoints) = &profile_endpoints {
+                    let provider_identity = provider.object_id();
+                    if provider_identity.is_empty() {
+                        return Err(Status::failed_precondition(format!(
+                            "provider '{name}' has no stable object identity"
+                        )));
+                    }
                     static_credential_bindings.insert(
                         key.clone(),
                         StaticCredentialBinding {
                             endpoints: endpoints.clone(),
+                            credential_identity: format!("{provider_identity}:{key}"),
                         },
                     );
                 }

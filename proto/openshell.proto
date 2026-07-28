@@ -1739,6 +1739,10 @@ message StaticCredentialEndpointBinding {
 // Endpoint allowlist for one static provider credential environment variable.
 message StaticCredentialBinding {
   repeated StaticCredentialEndpointBinding endpoints = 1;
+  // Stable identity of the provider credential that produced this binding.
+  // Supervisors use it to retain old revision placeholders only across
+  // rotations of the same provider credential.
+  string credential_identity = 2;
 }
 
 // Get sandbox provider environment response.
@@ -1753,8 +1757,10 @@ message GetSandboxProviderEnvironmentResponse {
   // Maps endpoint-bound provider metadata to credential metadata.
   // Supervisor uses this to inject Authorization headers for token grant credentials.
   map<string, ProviderProfileCredential> dynamic_credentials = 4;
-  // Endpoint allowlists for static credential environment variables. Every
-  // static credential in `environment` has a complete binding.
+  // Endpoint allowlists for static credential environment variables. Metadata
+  // can be incomplete when a provider profile is invalid; capable supervisors
+  // reject all static material in that snapshot while preserving independently
+  // endpoint-bound dynamic credentials.
   map<string, StaticCredentialBinding> static_credential_bindings = 5;
   // Environment variables that contain provider configuration rather than
   // credentials and therefore do not require endpoint-scoped resolution.

@@ -1824,20 +1824,7 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     )
     .await?;
 
-    if supports_static_credential_bindings {
-        for key in &provider_environment.static_credential_keys {
-            let Some(binding) = provider_environment.static_credential_bindings.get(key) else {
-                return Err(Status::failed_precondition(
-                    "static provider credentials require a provider profile with network endpoints",
-                ));
-            };
-            if binding.endpoints.is_empty() {
-                return Err(Status::failed_precondition(
-                    "static provider credentials require at least one provider profile endpoint",
-                ));
-            }
-        }
-    } else {
+    if !supports_static_credential_bindings {
         for key in &provider_environment.static_credential_keys {
             provider_environment.environment.remove(key);
             provider_environment.credential_expires_at_ms.remove(key);
@@ -7026,6 +7013,95 @@ mod tests {
 
         assert!(!response.environment.contains_key("GITHUB_TOKEN"));
         assert!(response.static_credential_bindings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_static_binding_does_not_suppress_valid_dynamic_credentials() {
+        use openshell_core::proto::{
+            GetSandboxProviderEnvironmentRequest, ProviderCredentialTokenGrant, ProviderProfile,
+            ProviderProfileCategory, ProviderProfileCredential, StoredProviderProfile,
+        };
+
+        let state = test_server_state().await;
+        let mut invalid_static = test_provider("invalid-static", "profile-without-endpoints");
+        invalid_static.credentials =
+            HashMap::from([("INVALID_TOKEN".to_string(), "static-secret".to_string())]);
+        let dynamic = test_provider("dynamic", "custom-dynamic");
+        let dynamic_profile = StoredProviderProfile {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "profile-custom-dynamic".to_string(),
+                name: "custom-dynamic".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            profile: Some(ProviderProfile {
+                id: "custom-dynamic".to_string(),
+                display_name: "Custom Dynamic".to_string(),
+                category: ProviderProfileCategory::Other as i32,
+                credentials: vec![ProviderProfileCredential {
+                    name: "access_token".to_string(),
+                    auth_style: "bearer".to_string(),
+                    header_name: "authorization".to_string(),
+                    token_grant: Some(ProviderCredentialTokenGrant {
+                        token_endpoint: "https://auth.example.test/token".to_string(),
+                        audience: "api://default".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.dynamic.example.test".to_string(),
+                    port: 443,
+                    path: "/**".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+
+        state.store.put_message(&invalid_static).await.unwrap();
+        state.store.put_message(&dynamic).await.unwrap();
+        state.store.put_message(&dynamic_profile).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-mixed-provider-env",
+                "mixed-provider-env",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["invalid-static".to_string(), "dynamic".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-mixed-provider-env".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .expect("mixed snapshot must be returned")
+        .into_inner();
+
+        assert_eq!(
+            response.environment.get("INVALID_TOKEN"),
+            Some(&"static-secret".to_string())
+        );
+        assert!(
+            !response
+                .static_credential_bindings
+                .contains_key("INVALID_TOKEN"),
+            "incomplete static metadata must reach the supervisor for fail-closed rejection"
+        );
+        assert!(
+            !response.dynamic_credentials.is_empty(),
+            "valid dynamic credentials must survive an unrelated static binding failure"
+        );
     }
 
     #[tokio::test]
