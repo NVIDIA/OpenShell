@@ -18,7 +18,6 @@ use openshell_ocsf::{
 };
 use std::collections::HashMap;
 use std::future::Future;
-use std::io::{Error as IoError, ErrorKind as IoErrorKind};
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -79,10 +78,155 @@ impl WebSocketTerminationCause {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameFailureClass {
+    MessageAssemblyIdleTimeout,
+    MessageAssemblyTotalTimeout,
+    InvalidUtf8,
+    InvalidFragmentation,
+    InvalidCloseFrame,
+    InvalidControlFrame,
+    InvalidLength,
+    ReservedOpcode,
+    UnmaskedClientFrame,
+    RsvBits,
+    ProtocolError,
+}
+
+impl FrameFailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MessageAssemblyIdleTimeout => "message_assembly_idle_timeout",
+            Self::MessageAssemblyTotalTimeout => "message_assembly_total_timeout",
+            Self::InvalidUtf8 => "invalid_utf8",
+            Self::InvalidFragmentation => "invalid_fragmentation",
+            Self::InvalidCloseFrame => "invalid_close_frame",
+            Self::InvalidControlFrame => "invalid_control_frame",
+            Self::InvalidLength => "invalid_length",
+            Self::ReservedOpcode => "reserved_opcode",
+            Self::UnmaskedClientFrame => "unmasked_client_frame",
+            Self::RsvBits => "rsv_bits",
+            Self::ProtocolError => "protocol_error",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct WebSocketTermination {
     cause: WebSocketTerminationCause,
+    failure_class: Option<FrameFailureClass>,
     error: miette::Report,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssemblyTimeoutKind {
+    Idle,
+    Total,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameErrorKind {
+    PeerDisconnect,
+    Protocol(FrameFailureClass),
+    InvalidUtf8,
+    MessageTooBig,
+    AssemblyTimeout(AssemblyTimeoutKind),
+}
+
+#[derive(Debug)]
+struct FrameError {
+    kind: FrameErrorKind,
+    error: miette::Report,
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl FrameError {
+    fn peer_io(context: &str, error: std::io::Error) -> Self {
+        Self {
+            kind: FrameErrorKind::PeerDisconnect,
+            error: miette!("{context}: {error}"),
+        }
+    }
+
+    fn peer_disconnect(error: miette::Report) -> Self {
+        Self {
+            kind: FrameErrorKind::PeerDisconnect,
+            error,
+        }
+    }
+
+    fn protocol(failure_class: FrameFailureClass, error: miette::Report) -> Self {
+        Self {
+            kind: FrameErrorKind::Protocol(failure_class),
+            error,
+        }
+    }
+
+    fn invalid_utf8(error: miette::Report) -> Self {
+        Self {
+            kind: FrameErrorKind::InvalidUtf8,
+            error,
+        }
+    }
+
+    fn message_too_big(error: miette::Report) -> Self {
+        Self {
+            kind: FrameErrorKind::MessageTooBig,
+            error,
+        }
+    }
+
+    fn assembly_timeout(kind: AssemblyTimeoutKind) -> Self {
+        let error = match kind {
+            AssemblyTimeoutKind::Idle => {
+                miette!("websocket text message assembly idle timeout")
+            }
+            AssemblyTimeoutKind::Total => {
+                miette!("websocket text message assembly total timeout")
+            }
+        };
+        Self {
+            kind: FrameErrorKind::AssemblyTimeout(kind),
+            error,
+        }
+    }
+}
+
+impl From<FrameError> for WebSocketTermination {
+    fn from(frame_error: FrameError) -> Self {
+        let (cause, failure_class) = match frame_error.kind {
+            FrameErrorKind::PeerDisconnect => (WebSocketTerminationCause::PeerDisconnect, None),
+            FrameErrorKind::Protocol(failure_class) => (
+                WebSocketTerminationCause::ProtocolError,
+                Some(failure_class),
+            ),
+            FrameErrorKind::InvalidUtf8 => (
+                WebSocketTerminationCause::InvalidUtf8,
+                Some(FrameFailureClass::InvalidUtf8),
+            ),
+            FrameErrorKind::MessageTooBig => (
+                WebSocketTerminationCause::MessageTooBig,
+                Some(FrameFailureClass::InvalidLength),
+            ),
+            FrameErrorKind::AssemblyTimeout(kind) => (
+                WebSocketTerminationCause::ProtocolError,
+                Some(match kind {
+                    AssemblyTimeoutKind::Idle => FrameFailureClass::MessageAssemblyIdleTimeout,
+                    AssemblyTimeoutKind::Total => FrameFailureClass::MessageAssemblyTotalTimeout,
+                }),
+            ),
+        };
+        Self {
+            cause,
+            failure_class,
+            error: frame_error.error,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -92,9 +236,14 @@ enum WebSocketDecompressionError {
 }
 
 type WebSocketRelayResult<T> = std::result::Result<T, WebSocketTermination>;
+type FrameResult<T> = std::result::Result<T, FrameError>;
 
 fn terminate(cause: WebSocketTerminationCause, error: miette::Report) -> WebSocketTermination {
-    WebSocketTermination { cause, error }
+    WebSocketTermination {
+        cause,
+        failure_class: None,
+        error,
+    }
 }
 
 #[derive(Debug)]
@@ -152,7 +301,7 @@ impl TextMessageAssembly {
         &self,
         reader: &mut R,
         buffer: &mut [u8],
-    ) -> std::io::Result<usize> {
+    ) -> FrameResult<usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
@@ -160,18 +309,14 @@ impl TextMessageAssembly {
         tokio::select! {
             biased;
             () = tokio::time::sleep_until(self.total_deadline) => {
-                Err(IoError::new(
-                    IoErrorKind::TimedOut,
-                    "websocket text message assembly total timeout",
-                ))
+                Err(FrameError::assembly_timeout(AssemblyTimeoutKind::Total))
             }
             () = tokio::time::sleep_until(idle_deadline) => {
-                Err(IoError::new(
-                    IoErrorKind::TimedOut,
-                    "websocket text message assembly idle timeout",
-                ))
+                Err(FrameError::assembly_timeout(AssemblyTimeoutKind::Idle))
             }
-            result = reader.read(buffer) => result,
+            result = reader.read(buffer) => {
+                result.map_err(|error| FrameError::peer_io("websocket client read failed", error))
+            },
         }
     }
 
@@ -179,15 +324,14 @@ impl TextMessageAssembly {
         &self,
         reader: &mut R,
         buffer: &mut [u8],
-    ) -> std::io::Result<()> {
+    ) -> FrameResult<()> {
         let mut filled = 0;
         while filled < buffer.len() {
             let read = self.read_some(reader, &mut buffer[filled..]).await?;
             if read == 0 {
-                return Err(IoError::new(
-                    IoErrorKind::UnexpectedEof,
-                    "websocket payload ended before declared length",
-                ));
+                return Err(FrameError::peer_disconnect(miette!(
+                    "websocket payload ended before declared length"
+                )));
             }
             filled += read;
         }
@@ -198,41 +342,44 @@ impl TextMessageAssembly {
         &mut self,
         reader: &mut R,
         frame: &FrameHeader,
-    ) -> Result<()> {
+    ) -> FrameResult<()> {
         let next = read_masked_payload(reader, frame, Some(self)).await?;
         append_text_fragment(&mut self.payload, next)
     }
 
-    fn ensure_payload_fits(&self, frame: &FrameHeader) -> Result<()> {
-        let frame_len = usize::try_from(frame.payload_len)
-            .map_err(|_| miette!("websocket text frame is too large to buffer"))?;
-        let complete_len = self
-            .payload
-            .len()
-            .checked_add(frame_len)
-            .ok_or_else(|| miette!("websocket text message length overflow"))?;
+    fn ensure_payload_fits(&self, frame: &FrameHeader) -> FrameResult<()> {
+        let frame_len = usize::try_from(frame.payload_len).map_err(|_| {
+            FrameError::message_too_big(miette!("websocket text frame is too large to buffer"))
+        })?;
+        let complete_len = self.payload.len().checked_add(frame_len).ok_or_else(|| {
+            FrameError::message_too_big(miette!("websocket text message length overflow"))
+        })?;
         if complete_len > MAX_TEXT_MESSAGE_BYTES {
-            return Err(miette!(
+            return Err(FrameError::message_too_big(miette!(
                 "websocket text message exceeds {MAX_TEXT_MESSAGE_BYTES} byte limit"
-            ));
+            )));
         }
         Ok(())
     }
 
-    fn add_fragment(&mut self) -> Result<()> {
+    fn add_fragment(&mut self) -> FrameResult<()> {
         self.fragment_count = self.fragment_count.saturating_add(1);
         if self.fragment_count > MAX_MESSAGE_FRAGMENTS {
-            return Err(miette!(
-                "websocket message exceeds {MAX_MESSAGE_FRAGMENTS} fragment limit"
+            return Err(FrameError::protocol(
+                FrameFailureClass::InvalidFragmentation,
+                miette!("websocket message exceeds {MAX_MESSAGE_FRAGMENTS} fragment limit"),
             ));
         }
         Ok(())
     }
 
-    async fn within_total<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
+    async fn within_total<T>(
+        &self,
+        future: impl Future<Output = FrameResult<T>>,
+    ) -> FrameResult<T> {
         tokio::time::timeout_at(self.total_deadline, future)
             .await
-            .map_err(|_| miette!("websocket text message assembly total timeout"))?
+            .map_err(|_| FrameError::assembly_timeout(AssemblyTimeoutKind::Total))?
     }
 
     fn into_parts(
@@ -324,6 +471,9 @@ where
         result = client_to_server => result,
         result = server_to_client => result,
     };
+    if let Err(termination) = &result {
+        observe_termination(host, port, options.policy_name, termination);
+    }
     if let Err(termination) = &result
         && let Some(code) = termination.cause.close_code()
     {
@@ -363,10 +513,7 @@ where
         };
         let Some(frame) = read_frame_header(reader, assembly)
             .await
-            .inspect_err(|e| {
-                emit_protocol_failure(host, port, options.policy_name, protocol_failure_class(e));
-            })
-            .map_err(|error| terminate(WebSocketTerminationCause::ProtocolError, error))?
+            .map_err(WebSocketTermination::from)?
         else {
             let _ = writer.shutdown().await;
             return Ok(if close_seen {
@@ -377,20 +524,15 @@ where
         };
 
         if close_seen {
-            let error = miette!("websocket frame received after close frame");
-            emit_protocol_failure(
-                host,
-                port,
-                options.policy_name,
-                protocol_failure_class(&error),
-            );
-            return Err(terminate(WebSocketTerminationCause::ProtocolError, error));
+            return Err(FrameError::protocol(
+                FrameFailureClass::InvalidCloseFrame,
+                miette!("websocket frame received after close frame"),
+            )
+            .into());
         }
 
-        if let Err(e) = validate_frame_header(&frame, &fragments, options.compression) {
-            emit_protocol_failure(host, port, options.policy_name, protocol_failure_class(&e));
-            return Err(terminate(WebSocketTerminationCause::ProtocolError, e));
-        }
+        validate_frame_header(&frame, &fragments, options.compression)
+            .map_err(WebSocketTermination::from)?;
 
         if matches!(
             frame.opcode,
@@ -405,12 +547,10 @@ where
         match frame.opcode {
             OPCODE_TEXT => {
                 if frame.payload_len > MAX_TEXT_MESSAGE_BYTES as u64 {
-                    return Err(terminate(
-                        WebSocketTerminationCause::MessageTooBig,
-                        miette!(
-                            "websocket text message exceeds {MAX_TEXT_MESSAGE_BYTES} byte limit"
-                        ),
-                    ));
+                    return Err(FrameError::message_too_big(miette!(
+                        "websocket text message exceeds {MAX_TEXT_MESSAGE_BYTES} byte limit"
+                    ))
+                    .into());
                 }
                 let admission = if let Some(session) = options.middleware_session.as_mut() {
                     let message_admission = session.admit_message().await.map_err(|error| {
@@ -433,70 +573,35 @@ where
                 assembly
                     .read_payload(reader, &frame)
                     .await
-                    .inspect_err(|e| {
-                        emit_protocol_failure(
-                            host,
-                            port,
-                            options.policy_name,
-                            protocol_failure_class(e),
-                        );
-                    })
-                    .map_err(|error| terminate(WebSocketTerminationCause::ProtocolError, error))?;
+                    .map_err(WebSocketTermination::from)?;
                 if frame.fin {
                     let (payload, compressed, admission) = assembly.into_parts();
                     relay_text_payload(
                         writer, &frame, payload, admission, false, compressed, host, port, options,
                     )
-                    .await
-                    .inspect_err(|termination| {
-                        observe_termination(host, port, options.policy_name, termination);
-                    })?;
+                    .await?;
                 } else {
                     fragments = FragmentState::Text(assembly);
                 }
             }
             OPCODE_CONTINUATION => {
                 if let FragmentState::Text(assembly) = &mut fragments {
-                    if let Err(error) = assembly.add_fragment() {
-                        emit_protocol_failure(
-                            host,
-                            port,
-                            options.policy_name,
-                            protocol_failure_class(&error),
-                        );
-                        return Err(terminate(WebSocketTerminationCause::ProtocolError, error));
-                    }
+                    assembly
+                        .add_fragment()
+                        .map_err(WebSocketTermination::from)?;
                     if frame.payload_len > MAX_TEXT_MESSAGE_BYTES as u64 {
-                        return Err(terminate(
-                            WebSocketTerminationCause::MessageTooBig,
-                            miette!(
-                                "websocket text message exceeds {MAX_TEXT_MESSAGE_BYTES} byte limit"
-                            ),
-                        ));
+                        return Err(FrameError::message_too_big(miette!(
+                            "websocket text message exceeds {MAX_TEXT_MESSAGE_BYTES} byte limit"
+                        ))
+                        .into());
                     }
-                    if let Err(error) = assembly.ensure_payload_fits(&frame) {
-                        emit_protocol_failure(
-                            host,
-                            port,
-                            options.policy_name,
-                            protocol_failure_class(&error),
-                        );
-                        return Err(terminate(WebSocketTerminationCause::MessageTooBig, error));
-                    }
+                    assembly
+                        .ensure_payload_fits(&frame)
+                        .map_err(WebSocketTermination::from)?;
                     assembly
                         .read_payload(reader, &frame)
                         .await
-                        .inspect_err(|e| {
-                            emit_protocol_failure(
-                                host,
-                                port,
-                                options.policy_name,
-                                protocol_failure_class(e),
-                            );
-                        })
-                        .map_err(|error| {
-                            terminate(WebSocketTerminationCause::ProtocolError, error)
-                        })?;
+                        .map_err(WebSocketTermination::from)?;
                     if frame.fin {
                         let FragmentState::Text(assembly) =
                             std::mem::replace(&mut fragments, FragmentState::None)
@@ -515,10 +620,7 @@ where
                             port,
                             options,
                         )
-                        .await
-                        .inspect_err(|termination| {
-                            observe_termination(host, port, options.policy_name, termination);
-                        })?;
+                        .await?;
                     }
                 } else if let FragmentState::Binary {
                     fragment_count,
@@ -527,26 +629,17 @@ where
                 {
                     *fragment_count = fragment_count.saturating_add(1);
                     if *fragment_count > MAX_MESSAGE_FRAGMENTS {
-                        return Err(terminate(
-                            WebSocketTerminationCause::ProtocolError,
+                        return Err(FrameError::protocol(
+                            FrameFailureClass::InvalidFragmentation,
                             miette!(
                                 "websocket message exceeds {MAX_MESSAGE_FRAGMENTS} fragment limit"
                             ),
-                        ));
+                        )
+                        .into());
                     }
                     copy_raw_frame_payload(reader, writer, &frame)
                         .await
-                        .inspect_err(|e| {
-                            emit_protocol_failure(
-                                host,
-                                port,
-                                options.policy_name,
-                                protocol_failure_class(e),
-                            );
-                        })
-                        .map_err(|error| {
-                            terminate(WebSocketTerminationCause::PeerDisconnect, error)
-                        })?;
+                        .map_err(WebSocketTermination::from)?;
                     let fragment_size = usize::try_from(frame.payload_len).unwrap_or(usize::MAX);
                     for record in coverage.iter_mut() {
                         record.original_size = record.original_size.saturating_add(fragment_size);
@@ -562,15 +655,11 @@ where
                         }
                     }
                 } else {
-                    let e =
-                        miette!("websocket continuation frame without active fragmented message");
-                    emit_protocol_failure(
-                        host,
-                        port,
-                        options.policy_name,
-                        protocol_failure_class(&e),
-                    );
-                    return Err(terminate(WebSocketTerminationCause::ProtocolError, e));
+                    return Err(FrameError::protocol(
+                        FrameFailureClass::InvalidFragmentation,
+                        miette!("websocket continuation frame without active fragmented message"),
+                    )
+                    .into());
                 }
             }
             OPCODE_BINARY => {
@@ -587,15 +676,7 @@ where
                     .unwrap_or_default();
                 copy_raw_frame_payload(reader, writer, &frame)
                     .await
-                    .inspect_err(|e| {
-                        emit_protocol_failure(
-                            host,
-                            port,
-                            options.policy_name,
-                            protocol_failure_class(e),
-                        );
-                    })
-                    .map_err(|error| terminate(WebSocketTerminationCause::PeerDisconnect, error))?;
+                    .map_err(WebSocketTermination::from)?;
                 if frame.fin
                     && let Some(ctx) = options.middleware_context
                 {
@@ -623,23 +704,7 @@ where
                         relay_control_frame(reader, writer, &frame, None).await
                     }
                 };
-                control_result
-                    .inspect_err(|e| {
-                        emit_protocol_failure(
-                            host,
-                            port,
-                            options.policy_name,
-                            protocol_failure_class(e),
-                        );
-                    })
-                    .map_err(|error| {
-                        let cause = if is_text_assembly_timeout(&error) {
-                            WebSocketTerminationCause::ProtocolError
-                        } else {
-                            WebSocketTerminationCause::PeerDisconnect
-                        };
-                        terminate(cause, error)
-                    })?;
+                control_result.map_err(WebSocketTermination::from)?;
                 if frame.opcode == OPCODE_CLOSE {
                     close_seen = true;
                 }
@@ -653,41 +718,36 @@ async fn read_exact_for_assembly<R: AsyncRead + Unpin>(
     reader: &mut R,
     buffer: &mut [u8],
     assembly: Option<&TextMessageAssembly>,
-) -> std::io::Result<()> {
+) -> FrameResult<()> {
     match assembly {
         Some(assembly) => assembly.read_exact(reader, buffer).await,
-        None => reader.read_exact(buffer).await.map(|_| ()),
+        None => reader
+            .read_exact(buffer)
+            .await
+            .map(|_| ())
+            .map_err(|error| FrameError::peer_io("websocket client read failed", error)),
     }
 }
 
 async fn read_frame_header<R: AsyncRead + Unpin>(
     reader: &mut R,
     assembly: Option<&TextMessageAssembly>,
-) -> Result<Option<FrameHeader>> {
+) -> FrameResult<Option<FrameHeader>> {
     let mut first = [0u8; 1];
     let first_read = match assembly {
         Some(assembly) => assembly.read_some(reader, &mut first).await,
-        None => reader.read(&mut first).await,
+        None => reader
+            .read(&mut first)
+            .await
+            .map_err(|error| FrameError::peer_io("websocket client read failed", error)),
     };
     let first = match first_read {
         Ok(0) => return Ok(None),
         Ok(_) => first[0],
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::BrokenPipe
-            ) =>
-        {
-            return Ok(None);
-        }
-        Err(e) => return Err(miette!("{e}")),
+        Err(error) => return Err(error),
     };
     let mut second = [0u8; 1];
-    read_exact_for_assembly(reader, &mut second, assembly)
-        .await
-        .map_err(|e| miette!("malformed websocket frame header: {e}"))?;
+    read_exact_for_assembly(reader, &mut second, assembly).await?;
     let second = second[0];
 
     let mut raw_header = vec![first, second];
@@ -696,31 +756,32 @@ async fn read_frame_header<R: AsyncRead + Unpin>(
         0..=125 => u64::from(len_code),
         126 => {
             let mut bytes = [0u8; 2];
-            read_exact_for_assembly(reader, &mut bytes, assembly)
-                .await
-                .map_err(|e| miette!("malformed websocket extended length: {e}"))?;
+            read_exact_for_assembly(reader, &mut bytes, assembly).await?;
             raw_header.extend_from_slice(&bytes);
             let len = u64::from(u16::from_be_bytes(bytes));
             if len < 126 {
-                return Err(miette!(
-                    "websocket frame uses non-minimal 16-bit extended length"
+                return Err(FrameError::protocol(
+                    FrameFailureClass::InvalidLength,
+                    miette!("websocket frame uses non-minimal 16-bit extended length"),
                 ));
             }
             len
         }
         127 => {
             let mut bytes = [0u8; 8];
-            read_exact_for_assembly(reader, &mut bytes, assembly)
-                .await
-                .map_err(|e| miette!("malformed websocket extended length: {e}"))?;
+            read_exact_for_assembly(reader, &mut bytes, assembly).await?;
             if bytes[0] & 0x80 != 0 {
-                return Err(miette!("websocket frame uses non-canonical 64-bit length"));
+                return Err(FrameError::protocol(
+                    FrameFailureClass::InvalidLength,
+                    miette!("websocket frame uses non-canonical 64-bit length"),
+                ));
             }
             raw_header.extend_from_slice(&bytes);
             let len = u64::from_be_bytes(bytes);
             if u16::try_from(len).is_ok() {
-                return Err(miette!(
-                    "websocket frame uses non-minimal 64-bit extended length"
+                return Err(FrameError::protocol(
+                    FrameFailureClass::InvalidLength,
+                    miette!("websocket frame uses non-minimal 64-bit extended length"),
                 ));
             }
             len
@@ -731,9 +792,7 @@ async fn read_frame_header<R: AsyncRead + Unpin>(
     let masked = second & 0x80 != 0;
     let mask_key = if masked {
         let mut key = [0u8; 4];
-        read_exact_for_assembly(reader, &mut key, assembly)
-            .await
-            .map_err(|e| miette!("malformed websocket mask key: {e}"))?;
+        read_exact_for_assembly(reader, &mut key, assembly).await?;
         raw_header.extend_from_slice(&key);
         Some(key)
     } else {
@@ -755,14 +814,18 @@ fn validate_frame_header(
     frame: &FrameHeader,
     fragments: &FragmentState,
     compression: WebSocketCompression,
-) -> Result<()> {
+) -> FrameResult<()> {
     if !valid_rsv_bits(frame, fragments, compression) {
-        return Err(miette!(
-            "websocket frame has unsupported RSV bits or extension state"
+        return Err(FrameError::protocol(
+            FrameFailureClass::RsvBits,
+            miette!("websocket frame has unsupported RSV bits or extension state"),
         ));
     }
     if !frame.masked {
-        return Err(miette!("websocket client frame is not masked"));
+        return Err(FrameError::protocol(
+            FrameFailureClass::UnmaskedClientFrame,
+            miette!("websocket client frame is not masked"),
+        ));
     }
     if !matches!(
         frame.opcode,
@@ -773,26 +836,37 @@ fn validate_frame_header(
             | OPCODE_PING
             | OPCODE_PONG
     ) {
-        return Err(miette!("websocket frame uses reserved opcode"));
+        return Err(FrameError::protocol(
+            FrameFailureClass::ReservedOpcode,
+            miette!("websocket frame uses reserved opcode"),
+        ));
     }
     if matches!(frame.opcode, OPCODE_CLOSE | OPCODE_PING | OPCODE_PONG) {
         if !frame.fin {
-            return Err(miette!("websocket control frame is fragmented"));
+            return Err(FrameError::protocol(
+                FrameFailureClass::InvalidControlFrame,
+                miette!("websocket control frame is fragmented"),
+            ));
         }
         if frame.payload_len > 125 {
-            return Err(miette!("websocket control frame exceeds 125 bytes"));
+            return Err(FrameError::protocol(
+                FrameFailureClass::InvalidControlFrame,
+                miette!("websocket control frame exceeds 125 bytes"),
+            ));
         }
     }
     if matches!(frame.opcode, OPCODE_TEXT | OPCODE_BINARY)
         && !matches!(fragments, FragmentState::None)
     {
-        return Err(miette!(
-            "websocket data frame started before previous fragmented message completed"
+        return Err(FrameError::protocol(
+            FrameFailureClass::InvalidFragmentation,
+            miette!("websocket data frame started before previous fragmented message completed"),
         ));
     }
     if matches!(frame.opcode, OPCODE_CONTINUATION) && matches!(fragments, FragmentState::None) {
-        return Err(miette!(
-            "websocket continuation frame without active fragmented message"
+        return Err(FrameError::protocol(
+            FrameFailureClass::InvalidFragmentation,
+            miette!("websocket continuation frame without active fragmented message"),
         ));
     }
     if (frame.opcode == OPCODE_BINARY
@@ -800,8 +874,11 @@ fn validate_frame_header(
             && matches!(fragments, FragmentState::Binary { .. })))
         && frame.payload_len > MAX_RAW_FRAME_PAYLOAD_BYTES
     {
-        return Err(miette!(
-            "websocket binary frame exceeds {MAX_RAW_FRAME_PAYLOAD_BYTES} byte relay limit"
+        return Err(FrameError::protocol(
+            FrameFailureClass::InvalidLength,
+            miette!(
+                "websocket binary frame exceeds {MAX_RAW_FRAME_PAYLOAD_BYTES} byte relay limit"
+            ),
         ));
     }
     Ok(())
@@ -825,34 +902,35 @@ async fn read_masked_payload<R: AsyncRead + Unpin>(
     reader: &mut R,
     frame: &FrameHeader,
     assembly: Option<&TextMessageAssembly>,
-) -> Result<Vec<u8>> {
-    let payload_len = usize::try_from(frame.payload_len)
-        .map_err(|_| miette!("websocket text frame is too large to buffer"))?;
+) -> FrameResult<Vec<u8>> {
+    let payload_len = usize::try_from(frame.payload_len).map_err(|_| {
+        FrameError::message_too_big(miette!("websocket text frame is too large to buffer"))
+    })?;
     if payload_len > MAX_TEXT_MESSAGE_BYTES {
-        return Err(miette!(
+        return Err(FrameError::message_too_big(miette!(
             "websocket text message exceeds {MAX_TEXT_MESSAGE_BYTES} byte limit"
-        ));
+        )));
     }
     let mut payload = vec![0u8; payload_len];
-    read_exact_for_assembly(reader, &mut payload, assembly)
-        .await
-        .map_err(|e| miette!("malformed websocket payload: {e}"))?;
-    let mask_key = frame
-        .mask_key
-        .ok_or_else(|| miette!("websocket client frame is not masked"))?;
+    read_exact_for_assembly(reader, &mut payload, assembly).await?;
+    let mask_key = frame.mask_key.ok_or_else(|| {
+        FrameError::protocol(
+            FrameFailureClass::UnmaskedClientFrame,
+            miette!("websocket client frame is not masked"),
+        )
+    })?;
     apply_mask(&mut payload, mask_key);
     Ok(payload)
 }
 
-fn append_text_fragment(buffer: &mut Vec<u8>, next: Vec<u8>) -> Result<()> {
-    let new_len = buffer
-        .len()
-        .checked_add(next.len())
-        .ok_or_else(|| miette!("websocket text message length overflow"))?;
+fn append_text_fragment(buffer: &mut Vec<u8>, next: Vec<u8>) -> FrameResult<()> {
+    let new_len = buffer.len().checked_add(next.len()).ok_or_else(|| {
+        FrameError::message_too_big(miette!("websocket text message length overflow"))
+    })?;
     if new_len > MAX_TEXT_MESSAGE_BYTES {
-        return Err(miette!(
+        return Err(FrameError::message_too_big(miette!(
             "websocket text message exceeds {MAX_TEXT_MESSAGE_BYTES} byte limit"
-        ));
+        )));
     }
     buffer.extend_from_slice(&next);
     Ok(())
@@ -873,20 +951,19 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     let message_payload = if compressed {
         decompress_permessage_deflate(&payload).map_err(|error| match error {
             WebSocketDecompressionError::MessageTooBig(error) => {
-                terminate(WebSocketTerminationCause::MessageTooBig, error)
+                WebSocketTermination::from(FrameError::message_too_big(error))
             }
-            WebSocketDecompressionError::Protocol(error) => {
-                terminate(WebSocketTerminationCause::ProtocolError, error)
-            }
+            WebSocketDecompressionError::Protocol(error) => WebSocketTermination::from(
+                FrameError::protocol(FrameFailureClass::ProtocolError, error),
+            ),
         })?
     } else {
         payload
     };
     let mut text = String::from_utf8(message_payload).map_err(|_| {
-        terminate(
-            WebSocketTerminationCause::InvalidUtf8,
-            miette!("websocket text message is not valid UTF-8"),
-        )
+        WebSocketTermination::from(FrameError::invalid_utf8(miette!(
+            "websocket text message is not valid UTF-8"
+        )))
     })?;
 
     // Built-in transport/GraphQL inspection sees the original unresolved
@@ -912,10 +989,10 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
         }
         if !outcome.allowed {
             if outcome.platform_oversize {
-                return Err(terminate(
-                    WebSocketTerminationCause::MessageTooBig,
-                    miette!("websocket message over middleware platform capacity"),
-                ));
+                return Err(FrameError::message_too_big(miette!(
+                    "websocket message over middleware platform capacity"
+                ))
+                .into());
             }
             let cause = if outcome.denial.is_some() {
                 WebSocketTerminationCause::MiddlewareDenial
@@ -965,10 +1042,10 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
         })?;
         let mut payload = text.into_bytes();
         let mask_key = frame.mask_key.ok_or_else(|| {
-            terminate(
-                WebSocketTerminationCause::ProtocolError,
+            WebSocketTermination::from(FrameError::protocol(
+                FrameFailureClass::UnmaskedClientFrame,
                 miette!("websocket client frame is not masked"),
-            )
+            ))
         })?;
         apply_mask(&mut payload, mask_key);
         writer.write_all(&payload).await.map_err(|error| {
@@ -990,8 +1067,12 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
         emit_rewrite_event(host, port, options.policy_name, replacements);
     }
     if compressed {
-        let compressed_payload = compress_permessage_deflate(text.as_bytes())
-            .map_err(|error| terminate(WebSocketTerminationCause::ProtocolError, error))?;
+        let compressed_payload = compress_permessage_deflate(text.as_bytes()).map_err(|error| {
+            WebSocketTermination::from(FrameError::protocol(
+                FrameFailureClass::ProtocolError,
+                error,
+            ))
+        })?;
         return write_masked_frame_with_rsv(writer, OPCODE_TEXT, 0x40, &compressed_payload)
             .await
             .map_err(|error| terminate(WebSocketTerminationCause::PeerDisconnect, error));
@@ -1209,23 +1290,28 @@ async fn relay_control_frame<R, W>(
     writer: &mut W,
     frame: &FrameHeader,
     assembly: Option<&TextMessageAssembly>,
-) -> Result<()>
+) -> FrameResult<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let raw_payload_len = usize::try_from(frame.payload_len)
-        .map_err(|_| miette!("websocket control frame payload length overflow"))?;
+    let raw_payload_len = usize::try_from(frame.payload_len).map_err(|_| {
+        FrameError::protocol(
+            FrameFailureClass::InvalidControlFrame,
+            miette!("websocket control frame payload length overflow"),
+        )
+    })?;
     let mut raw_payload = vec![0u8; raw_payload_len];
-    read_exact_for_assembly(reader, &mut raw_payload, assembly)
-        .await
-        .map_err(|e| miette!("malformed websocket control payload: {e}"))?;
+    read_exact_for_assembly(reader, &mut raw_payload, assembly).await?;
 
     if frame.opcode == OPCODE_CLOSE {
         let mut payload = raw_payload.clone();
-        let mask_key = frame
-            .mask_key
-            .ok_or_else(|| miette!("websocket client frame is not masked"))?;
+        let mask_key = frame.mask_key.ok_or_else(|| {
+            FrameError::protocol(
+                FrameFailureClass::UnmaskedClientFrame,
+                miette!("websocket client frame is not masked"),
+            )
+        })?;
         apply_mask(&mut payload, mask_key);
         validate_close_payload(&payload)?;
     }
@@ -1233,16 +1319,23 @@ where
     writer
         .write_all(&frame.raw_header)
         .await
-        .into_diagnostic()?;
-    writer.write_all(&raw_payload).await.into_diagnostic()?;
-    writer.flush().await.into_diagnostic()?;
+        .map_err(|error| FrameError::peer_io("websocket upstream write failed", error))?;
+    writer
+        .write_all(&raw_payload)
+        .await
+        .map_err(|error| FrameError::peer_io("websocket upstream write failed", error))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| FrameError::peer_io("websocket upstream flush failed", error))?;
     Ok(())
 }
 
-fn validate_close_payload(payload: &[u8]) -> Result<()> {
+fn validate_close_payload(payload: &[u8]) -> FrameResult<()> {
     if payload.len() == 1 {
-        return Err(miette!(
-            "websocket close frame payload cannot be exactly one byte"
+        return Err(FrameError::protocol(
+            FrameFailureClass::InvalidCloseFrame,
+            miette!("websocket close frame payload cannot be exactly one byte"),
         ));
     }
     if payload.len() < 2 {
@@ -1251,10 +1344,15 @@ fn validate_close_payload(payload: &[u8]) -> Result<()> {
 
     let code = u16::from_be_bytes([payload[0], payload[1]]);
     if !valid_close_code(code) {
-        return Err(miette!("websocket close frame uses invalid close code"));
+        return Err(FrameError::protocol(
+            FrameFailureClass::InvalidCloseFrame,
+            miette!("websocket close frame uses invalid close code"),
+        ));
     }
     if std::str::from_utf8(&payload[2..]).is_err() {
-        return Err(miette!("websocket close frame reason is not valid UTF-8"));
+        return Err(FrameError::invalid_utf8(miette!(
+            "websocket close frame reason is not valid UTF-8"
+        )));
     }
     Ok(())
 }
@@ -1267,7 +1365,7 @@ async fn copy_raw_frame_payload<R, W>(
     reader: &mut R,
     writer: &mut W,
     frame: &FrameHeader,
-) -> Result<()>
+) -> FrameResult<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -1275,21 +1373,32 @@ where
     writer
         .write_all(&frame.raw_header)
         .await
-        .into_diagnostic()?;
+        .map_err(|error| FrameError::peer_io("websocket upstream write failed", error))?;
     let mut remaining = frame.payload_len;
     let mut buf = [0u8; COPY_BUF_SIZE];
     while remaining > 0 {
         let to_read = usize::try_from(remaining)
             .unwrap_or(buf.len())
             .min(buf.len());
-        let n = reader.read(&mut buf[..to_read]).await.into_diagnostic()?;
+        let n = reader
+            .read(&mut buf[..to_read])
+            .await
+            .map_err(|error| FrameError::peer_io("websocket client read failed", error))?;
         if n == 0 {
-            return Err(miette!("websocket payload ended before declared length"));
+            return Err(FrameError::peer_disconnect(miette!(
+                "websocket payload ended before declared length"
+            )));
         }
-        writer.write_all(&buf[..n]).await.into_diagnostic()?;
+        writer
+            .write_all(&buf[..n])
+            .await
+            .map_err(|error| FrameError::peer_io("websocket upstream write failed", error))?;
         remaining -= n as u64;
     }
-    writer.flush().await.into_diagnostic()?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| FrameError::peer_io("websocket upstream flush failed", error))?;
     Ok(())
 }
 
@@ -1564,78 +1673,43 @@ fn graphql_log_summary(info: &crate::l7::graphql::GraphqlRequestInfo) -> String 
     format!(" graphql_ops={}", ops.join(";"))
 }
 
-fn protocol_failure_class(error: &miette::Report) -> &'static str {
-    let msg = error.to_string().to_ascii_lowercase();
-    if msg.contains("text message assembly idle timeout") {
-        "message_assembly_idle_timeout"
-    } else if msg.contains("text message assembly total timeout") {
-        "message_assembly_total_timeout"
-    } else if msg.contains("credential") {
-        "credential_resolution_failed"
-    } else if msg.contains("utf-8") {
-        "invalid_utf8"
-    } else if msg.contains("fragment limit") {
-        "invalid_fragmentation"
-    } else if msg.contains("close frame") || msg.contains("after close") {
-        "invalid_close_frame"
-    } else if msg.contains("control frame") {
-        "invalid_control_frame"
-    } else if msg.contains("length")
-        || msg.contains("too large")
-        || msg.contains("exceeds")
-        || msg.contains("overflow")
-    {
-        "invalid_length"
-    } else if msg.contains("continuation") || msg.contains("fragmented") {
-        "invalid_fragmentation"
-    } else if msg.contains("reserved opcode") {
-        "reserved_opcode"
-    } else if msg.contains("not masked") {
-        "unmasked_client_frame"
-    } else if msg.contains("rsv") {
-        "rsv_bits"
-    } else if msg.contains("malformed") {
-        "malformed_frame"
-    } else {
-        "protocol_error"
-    }
-}
-
-fn is_text_assembly_timeout(error: &miette::Report) -> bool {
-    error
-        .to_string()
-        .to_ascii_lowercase()
-        .contains("text message assembly")
-}
-
 fn observe_termination(
     host: &str,
     port: u16,
     policy_name: &str,
     termination: &WebSocketTermination,
 ) {
-    if matches!(
-        termination.cause,
-        WebSocketTerminationCause::InvalidUtf8
-            | WebSocketTerminationCause::ProtocolError
-            | WebSocketTerminationCause::MessageTooBig
-    ) {
-        emit_protocol_failure(
-            host,
-            port,
-            policy_name,
-            protocol_failure_class(&termination.error),
-        );
+    if let Some(failure_class) = termination.failure_class {
+        emit_protocol_failure(host, port, policy_name, failure_class);
     }
 }
 
-fn emit_protocol_failure(host: &str, port: u16, policy_name: &str, failure_class: &str) {
+fn emit_protocol_failure(
+    host: &str,
+    port: u16,
+    policy_name: &str,
+    failure_class: FrameFailureClass,
+) {
+    ocsf_emit!(protocol_failure_event(
+        host,
+        port,
+        policy_name,
+        failure_class
+    ));
+}
+
+fn protocol_failure_event(
+    host: &str,
+    port: u16,
+    policy_name: &str,
+    failure_class: FrameFailureClass,
+) -> openshell_ocsf::OcsfEvent {
     let policy_name = if policy_name.is_empty() {
         "-"
     } else {
         policy_name
     };
-    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -1644,9 +1718,8 @@ fn emit_protocol_failure(host: &str, port: u16, policy_name: &str, failure_class
         .dst_endpoint(Endpoint::from_domain(host, port))
         .firewall_rule(policy_name, "l7-websocket")
         .message(protocol_failure_message(host, port))
-        .status_detail(failure_class)
-        .build();
-    ocsf_emit!(event);
+        .status_detail(failure_class.as_str())
+        .build()
 }
 
 fn protocol_failure_message(host: &str, port: u16) -> String {
@@ -2635,6 +2708,194 @@ network_policies:
             shutdown_tx,
             server_task,
         )
+    }
+
+    async fn assert_invalid_close_termination(payload: Vec<u8>, expected_close_code: u16) {
+        let (mut session, mut observed, shutdown_tx, server_task) =
+            recording_middleware_session("wss").await;
+        assert!(session.start("").await.allowed);
+        assert!(matches!(
+            observed.recv().await,
+            Some(ObservedWebSocketRequest::SessionStart)
+        ));
+
+        let (mut client_app, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, mut upstream_app) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            relay_with_options(
+                &mut relay_client,
+                &mut relay_upstream,
+                Vec::new(),
+                "api.openai.com",
+                443,
+                RelayOptions {
+                    policy_name: "rest-api",
+                    resolver: None,
+                    generation_guard: None,
+                    inspector: None,
+                    compression: WebSocketCompression::None,
+                    middleware_session: Some(session),
+                    middleware_context: None,
+                },
+            )
+            .await
+        });
+
+        client_app
+            .write_all(&masked_frame(true, OPCODE_CLOSE, &payload))
+            .await
+            .expect("send invalid close frame");
+        client_app.flush().await.expect("flush invalid close frame");
+
+        let upstream_close = read_one_frame(&mut upstream_app).await;
+        assert_eq!(upstream_close[0] & 0x0f, OPCODE_CLOSE);
+        assert_eq!(
+            u16::from_be_bytes(
+                decode_masked_payload(&upstream_close)[..2]
+                    .try_into()
+                    .expect("upstream close code"),
+            ),
+            expected_close_code
+        );
+        let client_close = read_one_frame(&mut client_app).await;
+        assert_eq!(client_close[0] & 0x0f, OPCODE_CLOSE);
+        assert_eq!(
+            u16::from_be_bytes(client_close[2..4].try_into().expect("client close code")),
+            expected_close_code
+        );
+
+        relay
+            .await
+            .expect("join relay")
+            .expect_err("invalid close frame must terminate relay");
+        assert!(matches!(
+            observed.recv().await,
+            Some(ObservedWebSocketRequest::SessionEnd(
+                openshell_core::proto::WebSocketSessionEndReason::ProtocolError,
+            ))
+        ));
+        assert!(
+            observed.try_recv().is_err(),
+            "control-frame failure must not invoke middleware"
+        );
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware server")
+            .expect("middleware server");
+    }
+
+    #[tokio::test]
+    async fn invalid_close_frames_close_both_peers_and_report_protocol_session_end() {
+        assert_invalid_close_termination(vec![0x03], 1002).await;
+        assert_invalid_close_termination(close_payload(1005, b""), 1002).await;
+        assert_invalid_close_termination(close_payload(1000, &[0xff]), 1007).await;
+    }
+
+    #[test]
+    fn invalid_close_frames_have_stable_telemetry_classes() {
+        let cases = [
+            (
+                vec![0x03],
+                WebSocketTerminationCause::ProtocolError,
+                FrameFailureClass::InvalidCloseFrame,
+                1002,
+            ),
+            (
+                close_payload(1005, b""),
+                WebSocketTerminationCause::ProtocolError,
+                FrameFailureClass::InvalidCloseFrame,
+                1002,
+            ),
+            (
+                close_payload(1000, &[0xff]),
+                WebSocketTerminationCause::InvalidUtf8,
+                FrameFailureClass::InvalidUtf8,
+                1007,
+            ),
+        ];
+
+        for (payload, expected_cause, expected_class, expected_close_code) in cases {
+            let frame_error =
+                validate_close_payload(&payload).expect_err("close payload must be invalid");
+            let termination = WebSocketTermination::from(frame_error);
+            assert_eq!(termination.cause, expected_cause);
+            assert_eq!(termination.failure_class, Some(expected_class));
+            assert_eq!(termination.cause.close_code(), Some(expected_close_code));
+
+            let event =
+                protocol_failure_event("gateway.example.test", 443, "test-policy", expected_class);
+            assert_eq!(
+                event.base().status_detail.as_deref(),
+                Some(expected_class.as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_control_payload_eof_is_peer_disconnect_without_generated_close() {
+        let (mut session, mut observed, shutdown_tx, server_task) =
+            recording_middleware_session("wss").await;
+        assert!(session.start("").await.allowed);
+        assert!(matches!(
+            observed.recv().await,
+            Some(ObservedWebSocketRequest::SessionStart)
+        ));
+
+        let (mut client_app, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, mut upstream_app) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            relay_with_options(
+                &mut relay_client,
+                &mut relay_upstream,
+                Vec::new(),
+                "api.openai.com",
+                443,
+                RelayOptions {
+                    policy_name: "rest-api",
+                    resolver: None,
+                    generation_guard: None,
+                    inspector: None,
+                    compression: WebSocketCompression::None,
+                    middleware_session: Some(session),
+                    middleware_context: None,
+                },
+            )
+            .await
+        });
+
+        client_app
+            .write_all(&[0x80 | OPCODE_CLOSE, 0x80 | 2, 0x37, 0xfa, 0x21, 0x3d])
+            .await
+            .expect("send truncated close frame");
+        drop(client_app);
+
+        let mut upstream_output = Vec::new();
+        upstream_app
+            .read_to_end(&mut upstream_output)
+            .await
+            .expect("read upstream shutdown");
+        assert!(
+            upstream_output.is_empty(),
+            "peer EOF must not generate an upstream close frame"
+        );
+        relay
+            .await
+            .expect("join relay")
+            .expect_err("truncated payload must end relay");
+        assert!(matches!(
+            observed.recv().await,
+            Some(ObservedWebSocketRequest::SessionEnd(
+                openshell_core::proto::WebSocketSessionEndReason::PeerDisconnect,
+            ))
+        ));
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware server")
+            .expect("middleware server");
     }
 
     #[tokio::test]
