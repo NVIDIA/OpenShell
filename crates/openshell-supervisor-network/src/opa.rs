@@ -1118,7 +1118,13 @@ fn normalize_endpoint_ports(data: &mut serde_json::Value) {
                 continue;
             };
 
-            // If "ports" already exists and is non-empty, keep it.
+            // If "ports" already exists, filter out zero values so OPA never
+            // sees a zero port. An all-zero array becomes empty and falls back
+            // to scalar "port" promotion below.
+            if let Some(ports) = ep_obj.get_mut("ports").and_then(|v| v.as_array_mut()) {
+                ports.retain(|p| p.as_u64().is_some_and(|n| n > 0));
+            }
+
             let has_ports = ep_obj
                 .get("ports")
                 .and_then(|v| v.as_array())
@@ -7704,5 +7710,81 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
         }
+    }
+
+    #[test]
+    fn normalize_endpoint_ports_filters_zero_values() {
+        let mut data = serde_json::json!({
+            "network_policies": {
+                "p": {
+                    "endpoints": [
+                        {"host": "h1.test", "ports": [0, 443]},
+                        {"host": "h2.test", "ports": [0]},
+                        {"host": "h3.test", "port": 0},
+                        {"host": "h4.test", "port": 8080},
+                    ]
+                }
+            }
+        });
+        normalize_endpoint_ports(&mut data);
+        let endpoints = data["network_policies"]["p"]["endpoints"]
+            .as_array()
+            .unwrap();
+
+        // Mixed array: zero removed, positive kept.
+        assert_eq!(endpoints[0]["ports"], serde_json::json!([443]));
+        // All-zero array: becomes empty, no fallback port.
+        assert_eq!(endpoints[1]["ports"], serde_json::json!([]));
+        assert!(endpoints[1].get("port").is_none());
+        // Zero scalar port: not promoted, removed.
+        assert!(endpoints[2].get("ports").is_none());
+        assert!(endpoints[2].get("port").is_none());
+        // Positive scalar port: promoted to ports array.
+        assert_eq!(endpoints[3]["ports"], serde_json::json!([8080]));
+        assert!(endpoints[3].get("port").is_none());
+    }
+
+    #[test]
+    fn normalize_endpoint_ports_skips_non_object_endpoints() {
+        let mut data = serde_json::json!({
+            "network_policies": {
+                "p": {
+                    "endpoints": [
+                        "not-an-object",
+                        {"host": "h.test", "port": 443},
+                        42,
+                    ]
+                }
+            }
+        });
+        normalize_endpoint_ports(&mut data);
+        let endpoints = data["network_policies"]["p"]["endpoints"]
+            .as_array()
+            .unwrap();
+
+        // Non-object entries are left untouched rather than panicking.
+        assert_eq!(endpoints[0], serde_json::json!("not-an-object"));
+        assert_eq!(endpoints[1]["ports"], serde_json::json!([443]));
+        assert_eq!(endpoints[2], serde_json::json!(42));
+    }
+
+    #[test]
+    fn normalize_endpoint_ports_empty_array_after_filtering() {
+        let mut data = serde_json::json!({
+            "network_policies": {
+                "p": {
+                    "endpoints": [
+                        {"host": "h.test", "ports": [0], "port": 8080},
+                    ]
+                }
+            }
+        });
+        normalize_endpoint_ports(&mut data);
+        let endpoints = data["network_policies"]["p"]["endpoints"]
+            .as_array()
+            .unwrap();
+        // Zero-only ports array becomes empty; scalar port is promoted.
+        assert_eq!(endpoints[0]["ports"], serde_json::json!([8080]));
+        assert!(endpoints[0].get("port").is_none());
     }
 }

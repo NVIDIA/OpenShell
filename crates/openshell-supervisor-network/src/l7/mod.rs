@@ -1649,6 +1649,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validate_l7_policies_rejects_non_object_endpoint() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [
+                        "not-an-object",
+                        {"host": "api.example.com", "port": 443, "protocol": "rest"},
+                        42,
+                    ],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("endpoint entry must be an object")),
+            "expected non-object endpoint error: {errors:?}"
+        );
+        // The valid object endpoint should not produce an error.
+        assert!(
+            !errors.iter().any(|e| e.contains("api.example.com")),
+            "valid endpoint should not be blamed: {errors:?}"
+        );
+    }
+
+    #[test]
     fn parse_l7_config_rest_enforce() {
         let val = regorus::Value::from_json_str(
             r#"{"protocol": "rest", "tls": "terminate", "enforcement": "enforce", "host": "api.example.com", "port": 443}"#,
