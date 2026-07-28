@@ -63,6 +63,8 @@ pub enum KubernetesDriverError {
     #[error("{0}")]
     Precondition(String),
     #[error("{0}")]
+    Unavailable(String),
+    #[error("{0}")]
     Message(String),
 }
 
@@ -81,6 +83,7 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
             KubernetesDriverError::AlreadyExists => Self::AlreadyExists,
             KubernetesDriverError::InvalidArgument(m) => Self::InvalidArgument(m),
             KubernetesDriverError::Precondition(m) => Self::Precondition(m),
+            KubernetesDriverError::Unavailable(m) => Self::Unavailable(m),
             KubernetesDriverError::Message(m) => Self::Message(m),
         }
     }
@@ -90,6 +93,8 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// This prevents gRPC handlers from blocking indefinitely when the k8s
 /// API server is unreachable or slow.
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
+const CLAIM_CREATE_RECONCILE_ATTEMPTS: usize = 3;
+const CLAIM_CREATE_RECONCILE_DELAY: Duration = Duration::from_millis(250);
 const WARM_POOL_CACHE_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 const SANDBOX_GROUP: &str = "agents.x-k8s.io";
@@ -1248,12 +1253,12 @@ impl KubernetesComputeDriver {
 
         let claim_api = Self::sandbox_claim_api(self.client.clone(), target_namespace);
         let claim = sandbox_claim_to_k8s_object(sandbox, &warm_pool.name, &claim_api.resource);
-        match tokio::time::timeout(
+        let create_result = tokio::time::timeout(
             KUBE_API_TIMEOUT,
             claim_api.api.create(&PostParams::default(), &claim),
         )
-        .await
-        {
+        .await;
+        match create_result {
             Ok(Ok(_result)) => {
                 info!(
                     sandbox_id = %sandbox.id,
@@ -1274,8 +1279,17 @@ impl KubernetesComputeDriver {
                 );
                 Ok(false)
             }
-            Ok(Err(err)) if matches!(&err, KubeError::Api(api) if api.code == 409) => {
-                Err(KubernetesDriverError::from_kube(err))
+            Ok(Err(err)) if claim_create_result_is_ambiguous(&err) => {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    sandbox_name = %sandbox.name,
+                    namespace = %target_namespace,
+                    warm_pool = %warm_pool.name,
+                    error = %err,
+                    "SandboxClaim create result is ambiguous; reconciling by name"
+                );
+                self.reconcile_sandbox_claim_create(&claim_api.api, &claim)
+                    .await
             }
             Ok(Err(err)) => {
                 warn!(
@@ -1284,7 +1298,7 @@ impl KubernetesComputeDriver {
                     namespace = %target_namespace,
                     warm_pool = %warm_pool.name,
                     error = %err,
-                    "Failed to create SandboxClaim; falling back to direct Sandbox"
+                    "SandboxClaim create was definitively rejected; falling back to direct Sandbox"
                 );
                 Ok(false)
             }
@@ -1294,11 +1308,106 @@ impl KubernetesComputeDriver {
                     sandbox_name = %sandbox.name,
                     namespace = %target_namespace,
                     timeout_secs = KUBE_API_TIMEOUT.as_secs(),
-                    "Timed out creating SandboxClaim; falling back to direct Sandbox"
+                    "Timed out creating SandboxClaim; reconciling by name"
                 );
-                Ok(false)
+                self.reconcile_sandbox_claim_create(&claim_api.api, &claim)
+                    .await
             }
         }
+    }
+
+    async fn reconcile_sandbox_claim_create(
+        &self,
+        api: &Api<DynamicObject>,
+        desired: &DynamicObject,
+    ) -> Result<bool, KubernetesDriverError> {
+        let name = desired.metadata.name.as_deref().ok_or_else(|| {
+            KubernetesDriverError::InvalidArgument("SandboxClaim name is required".to_string())
+        })?;
+
+        for attempt in 1..=CLAIM_CREATE_RECONCILE_ATTEMPTS {
+            match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(name)).await {
+                Ok(Ok(existing)) => {
+                    validate_existing_sandbox_claim(desired, &existing)?;
+                    info!(
+                        sandbox_claim = %name,
+                        attempt,
+                        "Reconciled existing SandboxClaim after ambiguous create"
+                    );
+                    return Ok(true);
+                }
+                Ok(Err(KubeError::Api(err))) if err.code == 404 => {
+                    debug!(
+                        sandbox_claim = %name,
+                        attempt,
+                        "SandboxClaim not visible after ambiguous create; retrying idempotent create"
+                    );
+                    match tokio::time::timeout(
+                        KUBE_API_TIMEOUT,
+                        api.create(&PostParams::default(), desired),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            info!(
+                                sandbox_claim = %name,
+                                attempt,
+                                "Created SandboxClaim while reconciling ambiguous create"
+                            );
+                            return Ok(true);
+                        }
+                        Ok(Err(err)) if claim_create_result_is_ambiguous(&err) => {
+                            debug!(
+                                sandbox_claim = %name,
+                                attempt,
+                                error = %err,
+                                "Idempotent SandboxClaim create remains ambiguous"
+                            );
+                        }
+                        Ok(Err(err)) => {
+                            warn!(
+                                sandbox_claim = %name,
+                                attempt,
+                                error = %err,
+                                "Idempotent SandboxClaim create was rejected after an ambiguous write"
+                            );
+                        }
+                        Err(_) => {
+                            warn!(
+                                sandbox_claim = %name,
+                                attempt,
+                                timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                                "Idempotent SandboxClaim create timed out"
+                            );
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        sandbox_claim = %name,
+                        attempt,
+                        error = %err,
+                        "Failed to reconcile ambiguous SandboxClaim create"
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        sandbox_claim = %name,
+                        attempt,
+                        timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                        "Timed out reconciling ambiguous SandboxClaim create"
+                    );
+                }
+            }
+
+            if attempt < CLAIM_CREATE_RECONCILE_ATTEMPTS {
+                tokio::time::sleep(CLAIM_CREATE_RECONCILE_DELAY).await;
+            }
+        }
+
+        Err(KubernetesDriverError::Unavailable(format!(
+            "SandboxClaim '{name}' create result remains unknown; preserving provisioning state for reconciliation"
+        )))
     }
 
     async fn delete_sandbox_claim(&self, sandbox_id: &str) -> Result<bool, String> {
@@ -3079,6 +3188,66 @@ fn sandbox_claim_to_k8s_object(
         }
     });
     obj
+}
+
+fn claim_create_result_is_ambiguous(err: &KubeError) -> bool {
+    match err {
+        KubeError::Api(response) => {
+            response.code == 408 || response.code == 409 || response.code >= 500
+        }
+        _ => true,
+    }
+}
+
+fn validate_existing_sandbox_claim(
+    desired: &DynamicObject,
+    existing: &DynamicObject,
+) -> Result<(), KubernetesDriverError> {
+    let desired_name = desired.metadata.name.as_deref().unwrap_or_default();
+    let existing_name = existing.metadata.name.as_deref().unwrap_or_default();
+    if desired_name.is_empty() || existing_name != desired_name {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "existing SandboxClaim name '{existing_name}' does not match requested claim '{desired_name}'"
+        )));
+    }
+
+    for key in [
+        LABEL_MANAGED_BY,
+        LABEL_SANDBOX_ID,
+        LABEL_SANDBOX_NAME,
+        LABEL_SANDBOX_WORKSPACE,
+        LABEL_ALLOCATION,
+    ] {
+        let expected = desired
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(key))
+            .map(String::as_str)
+            .unwrap_or_default();
+        let actual = existing
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(key))
+            .map(String::as_str)
+            .unwrap_or_default();
+        if expected.is_empty() || actual != expected {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "existing SandboxClaim '{desired_name}' has conflicting {key} metadata"
+            )));
+        }
+    }
+
+    let expected_pool = string_at(&desired.data, &["spec", "warmPoolRef", "name"]);
+    let actual_pool = string_at(&existing.data, &["spec", "warmPoolRef", "name"]);
+    if expected_pool.is_none() || actual_pool != expected_pool {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "existing SandboxClaim '{desired_name}' targets a different warm pool"
+        )));
+    }
+
+    Ok(())
 }
 
 fn enabled_warm_pool_from_object(obj: DynamicObject) -> Option<EnabledWarmPool> {
@@ -5409,6 +5578,73 @@ mod tests {
             string_at(&claim.data, &["spec", "sandboxTemplateRef", "name"]),
             None
         );
+    }
+
+    #[test]
+    fn sandbox_claim_create_classifies_conflict_and_server_errors_as_ambiguous() {
+        assert!(claim_create_result_is_ambiguous(&kube_api_error(
+            409,
+            "already exists"
+        )));
+        assert!(claim_create_result_is_ambiguous(&kube_api_error(
+            408,
+            "request timeout"
+        )));
+        assert!(claim_create_result_is_ambiguous(&kube_api_error(
+            500,
+            "internal error"
+        )));
+        assert!(!claim_create_result_is_ambiguous(&kube_api_error(
+            403,
+            "forbidden"
+        )));
+        assert!(!claim_create_result_is_ambiguous(&kube_api_error(
+            422, "invalid"
+        )));
+    }
+
+    #[test]
+    fn existing_sandbox_claim_is_idempotent_only_for_same_identity_and_pool() {
+        let resource = KubernetesComputeDriver::extension_resource(SANDBOX_CLAIM_KIND);
+        let sandbox = Sandbox {
+            id: "sandbox-id".to_string(),
+            name: "dev".to_string(),
+            workspace: "workspace-a".to_string(),
+            ..Default::default()
+        };
+        let desired = sandbox_claim_to_k8s_object(&sandbox, "pool-a", &resource);
+        let mut existing = desired.clone();
+        existing.metadata.uid = Some("claim-uid".to_string());
+
+        validate_existing_sandbox_claim(&desired, &existing)
+            .expect("same claim identity should be idempotent");
+
+        existing
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(LABEL_SANDBOX_ID.to_string(), "other-id".to_string());
+        let err = validate_existing_sandbox_claim(&desired, &existing)
+            .expect_err("different sandbox identity must conflict");
+        assert!(matches!(err, KubernetesDriverError::Precondition(_)));
+    }
+
+    #[test]
+    fn existing_sandbox_claim_rejects_different_pool() {
+        let resource = KubernetesComputeDriver::extension_resource(SANDBOX_CLAIM_KIND);
+        let sandbox = Sandbox {
+            id: "sandbox-id".to_string(),
+            name: "dev".to_string(),
+            workspace: "workspace-a".to_string(),
+            ..Default::default()
+        };
+        let desired = sandbox_claim_to_k8s_object(&sandbox, "pool-a", &resource);
+        let existing = sandbox_claim_to_k8s_object(&sandbox, "pool-b", &resource);
+
+        let err = validate_existing_sandbox_claim(&desired, &existing)
+            .expect_err("different warm pool must conflict");
+        assert!(matches!(err, KubernetesDriverError::Precondition(_)));
     }
 
     #[test]

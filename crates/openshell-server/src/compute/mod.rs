@@ -773,6 +773,18 @@ impl ComputeRuntime {
                 self.sandbox_index.remove_sandbox(sandbox.object_id());
                 Err(Status::failed_precondition(status.message().to_string()))
             }
+            Err(status) if status.code() == Code::Unavailable => {
+                // The driver may have committed the backend create. Keep the
+                // durable Provisioning row so its watcher can reconcile the
+                // accepted resource instead of allowing a new sandbox ID to
+                // reuse the same name.
+                warn!(
+                    sandbox_id = %sandbox.object_id(),
+                    error = %status,
+                    "sandbox create outcome is ambiguous; preserving provisioning state"
+                );
+                Err(Status::unavailable(status.message().to_string()))
+            }
             Err(err) => {
                 let _ = self
                     .store
@@ -3074,6 +3086,7 @@ mod tests {
     struct TestDriver {
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
+        create_error: Option<Code>,
     }
 
     #[tonic::async_trait]
@@ -3146,6 +3159,9 @@ mod tests {
             &self,
             _request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
+            if let Some(code) = self.create_error {
+                return Err(Status::new(code, "controlled create error"));
+            }
             Ok(tonic::Response::new(CreateSandboxResponse {}))
         }
 
@@ -3440,6 +3456,38 @@ mod tests {
         };
         sandbox.set_phase(phase as i32);
         sandbox
+    }
+
+    #[tokio::test]
+    async fn ambiguous_create_preserves_provisioning_record() {
+        let runtime = test_runtime(Arc::new(TestDriver {
+            create_error: Some(Code::Unavailable),
+            ..Default::default()
+        }))
+        .await;
+        let sandbox = sandbox_record("sb-ambiguous", "sandbox-a", SandboxPhase::Provisioning);
+
+        let err = runtime
+            .create_sandbox(sandbox, None)
+            .await
+            .expect_err("ambiguous create should remain unavailable");
+
+        assert_eq!(err.code(), Code::Unavailable);
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-ambiguous")
+            .await
+            .unwrap()
+            .expect("provisioning record must be retained");
+        assert_eq!(stored.phase(), SandboxPhase::Provisioning as i32);
+        assert_eq!(stored.object_name(), "sandbox-a");
+        assert_eq!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
+                .as_deref(),
+            Some("sb-ambiguous")
+        );
     }
 
     fn ssh_session_record(id: &str, sandbox_id: &str) -> SshSession {
@@ -5725,6 +5773,7 @@ mod tests {
                 }),
                 workspace: "default".to_string(),
             }],
+            ..Default::default()
         }))
         .await;
 
@@ -5789,6 +5838,7 @@ mod tests {
                 })),
                 workspace: "default".to_string(),
             }],
+            ..Default::default()
         }))
         .await;
 

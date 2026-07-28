@@ -232,6 +232,17 @@ or gateway-side claim mapping beyond the same live Kubernetes ownership and
 metadata consistency checks used by the direct path. If an operator grants
 untrusted principals write access to those objects, both warm and direct
 activation require a broader common proof model.
+Warm claim creation is idempotent by the deterministic claim name. After a
+create timeout, transport failure, server error, or conflict, the driver reads
+that name back and retries the same claim create when it is not yet visible. It
+never switches to direct Sandbox creation after an ambiguous claim write. An
+existing claim is accepted only when its OpenShell identity, workspace,
+allocation marker, and warm-pool reference match the request. If Kubernetes
+still cannot determine whether the claim exists, the driver returns
+`Unavailable` and the gateway retains the durable `Provisioning` record. This
+prevents another create from assigning a new sandbox ID to the same name while
+the original Kubernetes write may still be live; the normal driver watcher can
+subsequently reconcile an accepted claim.
 The Kubernetes driver can optionally run a separate ConfigMap profile
 reconciler that turns admin-authored TOML profiles into generated
 `SandboxTemplate` and `SandboxWarmPool` resources. That reconciler is
