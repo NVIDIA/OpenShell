@@ -8,11 +8,7 @@ links:
   - https://github.com/NVIDIA/OpenShell/issues/1734
   - https://github.com/NVIDIA/OpenShell/issues/1919
   - https://github.com/NVIDIA/OpenShell/issues/2010
-  - https://github.com/NVIDIA/OpenShell/issues/2426
-  - https://github.com/NVIDIA/OpenShell/issues/2428
-  - https://github.com/NVIDIA/OpenShell/issues/2431
   - https://github.com/NVIDIA/OpenShell/pull/2027
-  - https://github.com/NVIDIA/OpenShell/pull/2477
 ---
 
 # RFC 0009 - Supervisor Middleware
@@ -21,9 +17,8 @@ links:
 
 | Date | References | Change |
 |------|------------|--------|
-| 2026-07-17 | [#2010](https://github.com/NVIDIA/OpenShell/issues/2010), [PR #2027](https://github.com/NVIDIA/OpenShell/pull/2027) | Implemented the initial accepted design for unary HTTP request middleware, including built-in and operator-run services, ordered chains, bounded payloads, failure policy, and observability. |
-| 2026-07-25 | [#2428](https://github.com/NVIDIA/OpenShell/issues/2428), [PR #2477](https://github.com/NVIDIA/OpenShell/pull/2477) | Extended the design with WebSocket upgrade preflight and client-to-upstream complete text-message evaluation. |
-| 2026-07-28 | [#2426](https://github.com/NVIDIA/OpenShell/issues/2426), [#2431](https://github.com/NVIDIA/OpenShell/issues/2431), [PR #2477](https://github.com/NVIDIA/OpenShell/pull/2477) | Aligned the protocol APIs around request-scoped HTTP evaluation and phase-specific WebSocket sessions: renamed the shared operator limit to `max_payload_bytes`, renamed the streaming RPC to `EvaluateWebSocketSession`, named its stream envelopes `WebSocketSessionEvent` and `WebSocketSessionEventResult`, added diagnostics to preflight decisions, and reserved a separate `EvaluateHttpRequestStream` contract for streaming HTTP/1.x and HTTP/2 requests. |
+| 2026-07-17 | [#2010](https://github.com/NVIDIA/OpenShell/issues/2010) | Added unary HTTP request middleware with built-in and operator-run services. |
+| 2026-07-28 | [#2428](https://github.com/NVIDIA/OpenShell/issues/2428) | Added WebSocket preflight and text-message evaluation, and aligned the middleware API names, limits, and diagnostics. |
 
 ## Summary
 
