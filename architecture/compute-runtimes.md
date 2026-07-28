@@ -139,9 +139,10 @@ driver then supplies one authoritative identity input to the supervisor:
 For Docker and Podman, policy values take precedence independently. An omitted
 `run_as_user` or `run_as_group` falls back to the corresponding identity from
 the image. The supervisor resolves names from the image's `/etc/passwd` and
-`/etc/group`, converts the result to a numeric UID/GID, and uses the same
-privilege-drop path for direct and SSH children. It does not rewrite the account
-files.
+`/etc/group` before readiness, preserves declared name or numeric components,
+and uses the same privilege-drop path for direct and SSH children. When a
+declaration omits the group, the supervisor fills it with the user's numeric
+primary GID. It does not rewrite the account files.
 
 Sandbox creation fails before the workload becomes ready when a required image
 identity is absent, malformed, unknown, ambiguous, or resolves to UID/GID 0.

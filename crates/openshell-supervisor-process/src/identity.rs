@@ -108,46 +108,58 @@ fn resolve_oci_process_identity_at(
         .process
         .run_as_user
         .as_deref()
-        .filter(|value| !value.is_empty());
+        .is_some_and(|value| !value.is_empty());
     let explicit_group = policy
         .process
         .run_as_group
         .as_deref()
-        .filter(|value| !value.is_empty());
+        .is_some_and(|value| !value.is_empty());
 
-    if let (Some(user), Some(group)) = (explicit_user, explicit_group) {
-        let uid = resolve_user(user, passwd_path)?;
-        let gid = resolve_group(group, group_path)?;
-        install_numeric_identity(policy, uid, gid, "explicit policy")?;
+    if explicit_user && explicit_group {
         return Ok(());
     }
 
     let (oci_user, oci_group) = split_oci_declaration(declaration);
-    let uid = match explicit_user {
-        Some(user) => resolve_user(user, passwd_path)?,
-        None => resolve_required_oci_user(oci_user, passwd_path, declaration)?.0,
+    let needs_primary_gid = !explicit_group && oci_group.is_none();
+    let resolved_user = if !explicit_user || needs_primary_gid {
+        Some(resolve_required_oci_user(
+            oci_user,
+            passwd_path,
+            declaration,
+            needs_primary_gid,
+        )?)
+    } else {
+        None
     };
-    let gid = match explicit_group {
-        Some(group) => resolve_group(group, group_path)?,
-        None => match oci_group {
-            Some(group) if !group.is_empty() => resolve_group(group, group_path)?,
+
+    if !explicit_user {
+        policy.process.run_as_user = Some(oci_user.to_string());
+    }
+
+    if !explicit_group {
+        policy.process.run_as_group = Some(match oci_group {
+            Some(group) if !group.is_empty() => {
+                validate_oci_group(group, group_path, declaration)?;
+                group.to_string()
+            }
             Some(_) => {
                 return Err(miette::miette!(
                     "OCI USER '{declaration}' has an empty group component"
                 ));
             }
-            None => resolve_required_oci_user(oci_user, passwd_path, declaration)?
-                .1
+            None => resolved_user
+                .and_then(|(_, primary_gid)| primary_gid)
                 .ok_or_else(|| {
                     miette::miette!(
                         "OCI USER '{declaration}' uses a numeric UID without an explicit group, \
                          but /etc/passwd has no matching primary GID"
                     )
-                })?,
-        },
-    };
+                })?
+                .to_string(),
+        });
+    }
 
-    install_numeric_identity(policy, uid, gid, declaration)
+    Ok(())
 }
 
 fn split_oci_declaration(declaration: &str) -> (&str, Option<&str>) {
@@ -160,6 +172,7 @@ fn resolve_required_oci_user(
     user: &str,
     passwd_path: &Path,
     declaration: &str,
+    require_primary_gid: bool,
 ) -> Result<(u32, Option<u32>)> {
     if user.is_empty() {
         return Err(miette::miette!(
@@ -174,53 +187,52 @@ fn resolve_required_oci_user(
         if uid == 0 {
             return Err(miette::miette!("OCI USER '{declaration}' selects UID 0"));
         }
-        let primary_gid = find_passwd_by_uid(passwd_path, uid)?.map(|entry| entry.gid);
+        let primary_gid = if require_primary_gid {
+            find_passwd_by_uid(passwd_path, uid)?.map(|entry| entry.gid)
+        } else {
+            None
+        };
+        if primary_gid == Some(0) {
+            return Err(miette::miette!(
+                "OCI USER '{declaration}' resolves to prohibited primary GID 0"
+            ));
+        }
         return Ok((uid, primary_gid));
     }
     let entry = find_passwd_by_name(passwd_path, user)?
         .ok_or_else(|| miette::miette!("OCI USER name '{user}' was not found in /etc/passwd"))?;
-    Ok((entry.uid, Some(entry.gid)))
-}
-
-fn resolve_user(value: &str, passwd_path: &Path) -> Result<u32> {
-    validate_component(value, "user")?;
-    if value == "root" {
-        return Err(miette::miette!("process user must not select root"));
-    }
-    if let Ok(uid) = value.parse::<u32>() {
-        return Ok(uid);
-    }
-    Ok(find_passwd_by_name(passwd_path, value)?
-        .ok_or_else(|| miette::miette!("process user '{value}' was not found in /etc/passwd"))?
-        .uid)
-}
-
-fn resolve_group(value: &str, group_path: &Path) -> Result<u32> {
-    validate_component(value, "group")?;
-    if value == "root" {
-        return Err(miette::miette!("process group must not select root"));
-    }
-    if let Ok(gid) = value.parse::<u32>() {
-        return Ok(gid);
-    }
-    Ok(find_group_by_name(group_path, value)?
-        .ok_or_else(|| miette::miette!("process group '{value}' was not found in /etc/group"))?
-        .gid)
-}
-
-fn install_numeric_identity(
-    policy: &mut SandboxPolicy,
-    uid: u32,
-    gid: u32,
-    source: &str,
-) -> Result<()> {
-    if uid == 0 || gid == 0 {
+    if entry.uid == 0 {
         return Err(miette::miette!(
-            "process identity from '{source}' resolves to prohibited UID/GID {uid}:{gid}"
+            "OCI USER '{declaration}' resolves to prohibited UID 0"
         ));
     }
-    policy.process.run_as_user = Some(uid.to_string());
-    policy.process.run_as_group = Some(gid.to_string());
+    if require_primary_gid && entry.gid == 0 {
+        return Err(miette::miette!(
+            "OCI USER '{declaration}' resolves to prohibited primary GID 0"
+        ));
+    }
+    Ok((entry.uid, require_primary_gid.then_some(entry.gid)))
+}
+
+fn validate_oci_group(value: &str, group_path: &Path, declaration: &str) -> Result<()> {
+    validate_component(value, "OCI group")?;
+    if value == "root" {
+        return Err(miette::miette!(
+            "OCI USER '{declaration}' selects root group"
+        ));
+    }
+    let gid = if let Ok(gid) = value.parse::<u32>() {
+        gid
+    } else {
+        find_group_by_name(group_path, value)?
+            .ok_or_else(|| miette::miette!("OCI group '{value}' was not found in /etc/group"))?
+            .gid
+    };
+    if gid == 0 {
+        return Err(miette::miette!(
+            "OCI USER '{declaration}' resolves to prohibited GID 0"
+        ));
+    }
     Ok(())
 }
 
@@ -430,9 +442,10 @@ mod tests {
         );
         let cases = [
             (Some("2000"), Some("2001"), "root", "2000", "2001"),
-            (Some("2000"), None, "app:staff", "2000", "1235"),
-            (None, Some("2001"), "app:root", "1234", "2001"),
-            (None, None, "app", "1234", "1235"),
+            (Some("2000"), None, "app:staff", "2000", "staff"),
+            (None, Some("2001"), "app:root", "app", "2001"),
+            (None, None, "app:staff", "app", "staff"),
+            (None, None, "app", "app", "1235"),
         ];
         for (user, group_name, declaration, expected_uid, expected_gid) in cases {
             let mut policy = policy(user, group_name);
@@ -444,11 +457,30 @@ mod tests {
 
     #[test]
     fn numeric_pair_does_not_require_account_entries() {
-        let (_dir, passwd, group) = account_files("", "");
+        let dir = tempdir().unwrap();
+        let passwd = dir.path().join("missing-passwd");
+        let group = dir.path().join("missing-group");
         let mut policy = policy(None, None);
         resolve_oci_process_identity_at(&mut policy, "1234:1235", &passwd, &group).unwrap();
         assert_eq!(policy.process.run_as_user.as_deref(), Some("1234"));
         assert_eq!(policy.process.run_as_group.as_deref(), Some("1235"));
+    }
+
+    #[test]
+    fn explicit_identity_is_preserved_without_inspecting_oci_or_accounts() {
+        let dir = tempdir().unwrap();
+        let mut policy = policy(Some("sandbox"), Some("sandbox"));
+
+        resolve_oci_process_identity_at(
+            &mut policy,
+            "root:root",
+            &dir.path().join("missing-passwd"),
+            &dir.path().join("missing-group"),
+        )
+        .unwrap();
+
+        assert_eq!(policy.process.run_as_user.as_deref(), Some("sandbox"));
+        assert_eq!(policy.process.run_as_group.as_deref(), Some("sandbox"));
     }
 
     #[test]
@@ -511,9 +543,33 @@ mod tests {
 
         let mut explicit_user = policy(Some("1234"), None);
         resolve_oci_process_identity_at(&mut explicit_user, "root:staff", &passwd, &group).unwrap();
+        assert_eq!(explicit_user.process.run_as_user.as_deref(), Some("1234"));
+        assert_eq!(explicit_user.process.run_as_group.as_deref(), Some("staff"));
 
         let mut explicit_group = policy(None, Some("1235"));
         resolve_oci_process_identity_at(&mut explicit_group, "app:root", &passwd, &group).unwrap();
+        assert_eq!(explicit_group.process.run_as_user.as_deref(), Some("app"));
+        assert_eq!(explicit_group.process.run_as_group.as_deref(), Some("1235"));
+    }
+
+    #[test]
+    fn named_oci_components_mapping_to_root_are_rejected() {
+        let (_dir, passwd, group) = account_files(
+            "root_alias:x:0:1235::/root:/bin/sh\napp:x:1234:1235::/home/app:/bin/sh\n",
+            "root_alias:x:0:\nstaff:x:1235:\n",
+        );
+
+        let mut root_user = policy(None, None);
+        assert!(
+            resolve_oci_process_identity_at(&mut root_user, "root_alias:staff", &passwd, &group)
+                .is_err()
+        );
+
+        let mut root_group = policy(None, None);
+        assert!(
+            resolve_oci_process_identity_at(&mut root_group, "app:root_alias", &passwd, &group)
+                .is_err()
+        );
     }
 
     #[cfg(unix)]

@@ -81,8 +81,8 @@ cat examples/sandbox-policy-quickstart/policy.yaml
 ```yaml
 version: 1
 
-# Default sandbox filesystem and process settings.
-# These static fields are required when using `openshell policy set`
+# Default sandbox filesystem settings.
+# These filesystem fields are required when using `openshell policy set`
 # because it replaces the entire policy.
 filesystem_policy:
   include_workdir: true
@@ -90,9 +90,6 @@ filesystem_policy:
   read_write: [/sandbox, /tmp, /dev/null]
 landlock:
   compatibility: best_effort
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
 
 network_policies:
   github_api:

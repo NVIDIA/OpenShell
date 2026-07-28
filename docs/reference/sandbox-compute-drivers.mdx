@@ -427,9 +427,10 @@ whose passwd entry supplies its primary GID, and an accountless numeric pair
 such as `1234:1235`.
 
 The driver pins container creation to the immutable image ID it inspected. The
-supervisor resolves any required names inside that image, then uses the numeric
-UID/GID for both direct and SSH children. It does not modify `/etc/passwd` or
-`/etc/group`.
+supervisor validates any required names inside that image and preserves the
+declared name or numeric components for both direct and SSH children. When
+`USER` omits the group, the supervisor uses the user's numeric primary GID. It
+does not modify `/etc/passwd` or `/etc/group`.
 
 Sandbox creation fails before readiness if a required `USER` component is
 missing, malformed, unknown, ambiguous, or resolves to UID/GID 0. An image

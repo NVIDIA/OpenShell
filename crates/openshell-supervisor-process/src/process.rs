@@ -866,8 +866,13 @@ impl Drop for ProcessHandle {
 pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
     let identity = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
 
-    // Numeric UID — no passwd entry required; kernel resolves directly.
-    if openshell_policy::is_valid_sandbox_identity(identity) && identity.parse::<u32>().is_ok() {
+    // Explicit policy identities were range-checked before the runtime policy
+    // reached the supervisor. OCI-derived numeric identities may use system
+    // account IDs, so this completed-runtime check only prohibits root.
+    if let Ok(uid) = identity.parse::<u32>() {
+        if uid == 0 {
+            return Err(miette::miette!("process user must not select UID 0"));
+        }
         openshell_ocsf::ocsf_emit!(
             openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::Informational)
@@ -934,7 +939,10 @@ pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
 pub fn validate_sandbox_group(policy: &SandboxPolicy) -> Result<()> {
     let identity = policy.process.run_as_group.as_deref().unwrap_or("sandbox");
 
-    if openshell_policy::is_valid_sandbox_identity(identity) && identity.parse::<u32>().is_ok() {
+    if let Ok(gid) = identity.parse::<u32>() {
+        if gid == 0 {
+            return Err(miette::miette!("process group must not select GID 0"));
+        }
         openshell_ocsf::ocsf_emit!(
             openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::Informational)
@@ -1547,6 +1555,34 @@ mod tests {
                 || msg.contains("No such file or directory"),
             "expected unknown user/group lookup failure (…not found… or ENOENT): {msg}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn completed_runtime_identity_accepts_non_root_system_ids() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("101".into()),
+            run_as_group: Some("102".into()),
+        });
+
+        assert!(validate_sandbox_user(&policy).is_ok());
+        assert!(validate_sandbox_group(&policy).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn completed_runtime_identity_rejects_numeric_root() {
+        let root_user = policy_with_process(ProcessPolicy {
+            run_as_user: Some("0".into()),
+            run_as_group: Some("102".into()),
+        });
+        let root_group = policy_with_process(ProcessPolicy {
+            run_as_user: Some("101".into()),
+            run_as_group: Some("0".into()),
+        });
+
+        assert!(validate_sandbox_user(&root_user).is_err());
+        assert!(validate_sandbox_group(&root_group).is_err());
     }
 
     #[test]

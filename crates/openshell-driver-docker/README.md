@@ -23,8 +23,9 @@ captures its immutable image ID and raw OCI `Config.User`. Container creation
 uses that image ID, preventing a mutable tag from changing between inspection
 and launch. The supervisor runs as root, resolves omitted policy identity fields
 from the image declaration, and drops only agent children to the resulting
-numeric UID/GID. Explicit `process.run_as_user` and `process.run_as_group`
-values take precedence independently.
+identity. Named OCI components remain names after validation; a missing group
+is filled with the user's numeric primary GID. Explicit `process.run_as_user`
+and `process.run_as_group` values take precedence independently.
 
 Docker containers join an OpenShell-managed bridge network. The driver injects
 `host.openshell.internal` and `host.docker.internal` so supervisors have stable
