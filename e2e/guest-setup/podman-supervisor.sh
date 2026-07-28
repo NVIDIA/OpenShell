@@ -28,6 +28,10 @@ if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
 	echo "ERROR: XDG_RUNTIME_DIR is required to locate the rootless Podman socket" >&2
 	exit 1
 fi
+if ! command -v socat >/dev/null 2>&1; then
+	echo "ERROR: socat is required by the Podman guest configuration" >&2
+	exit 1
+fi
 
 # Build through the user API service so the gateway driver sees the image in
 # the same Podman store even though the E2E launcher overrides XDG_DATA_HOME.
@@ -36,9 +40,6 @@ podman_remote=(podman --url "unix://${XDG_RUNTIME_DIR}/podman/podman.sock")
 # Rootless netavark isolates its bridge from the VM host network namespace.
 # Relay the bridge gateway through a Unix socket so supervisors can call the
 # host gateway while the host-side E2E process still reaches its forwarded port.
-if ! command -v socat >/dev/null 2>&1; then
-	sudo env DEBIAN_FRONTEND=noninteractive apt-get install -qq -y socat
-fi
 relay_socket=/home/openshell/.cache/openshell-e2e/podman-gateway.sock
 rm -f "${relay_socket}"
 socat "UNIX-LISTEN:${relay_socket},fork" TCP:127.0.0.1:8080 &

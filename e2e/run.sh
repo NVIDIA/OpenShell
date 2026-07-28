@@ -479,9 +479,9 @@ umask 077
 state_root=/home/openshell/.cache/openshell-e2e
 config_path=\${state_root}/gateway.toml
 jwt_root=\${state_root}/gateway-jwt
-sudo chown "\$(id -u):\$(id -g)" "\${state_root}"
+sudo chown -R "\$(id -u):\$(id -g)" /home/openshell/.cache
 chmod 0700 "\${state_root}"
-mkdir -p "\${state_root}/xdg/config" "\${state_root}/xdg/data" "\${state_root}/xdg/state" "\${jwt_root}"
+mkdir -p "\${state_root}/xdg/cache" "\${state_root}/xdg/config" "\${state_root}/xdg/data" "\${state_root}/xdg/state" "\${jwt_root}"
 printf '%s' '${config_payload}' | base64 --decode >"\${config_path}"
 printf '%s' '${jwt_signing_payload}' | base64 --decode >"\${jwt_root}/signing.pem"
 printf '%s' '${jwt_public_payload}' | base64 --decode >"\${jwt_root}/public.pem"
@@ -489,6 +489,7 @@ printf '%s' '${jwt_kid_payload}' | base64 --decode >"\${jwt_root}/kid"
 chmod 0600 "\${config_path}"
 chmod 0600 "\${jwt_root}/signing.pem" "\${jwt_root}/public.pem" "\${jwt_root}/kid"
 export XDG_CONFIG_HOME=\${state_root}/xdg/config
+export XDG_CACHE_HOME=\${state_root}/xdg/cache
 export XDG_DATA_HOME=\${state_root}/xdg/data
 export XDG_STATE_HOME=\${state_root}/xdg/state
 if [ -n '${guest_setup_path}' ]; then
@@ -538,13 +539,40 @@ EOF
 fi
 export OPENSHELL_E2E_RUNTIME_LOG="${runtime_log}"
 
+probe_gateway() {
+	python3 - "${OPENSHELL_BIN}" "${1}" <<'PY'
+import os
+import subprocess
+import sys
+
+with open(sys.argv[2], "wb") as output:
+    try:
+        result = subprocess.run(
+            [sys.argv[1], "status"],
+            env={**os.environ, "NO_COLOR": "1"},
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit(124)
+raise SystemExit(result.returncode)
+PY
+}
+
 wait_for_gateway() {
+	local started_at=${SECONDS}
 	local elapsed=0
 	local process_status
 	local probe_log="${run_dir}/gateway-probe.log"
 
 	echo "==> Waiting up to ${gateway_ready_timeout}s for gateway readiness"
-	while [ "${elapsed}" -lt "${gateway_ready_timeout}" ]; do
+	while :; do
+		elapsed=$((SECONDS - started_at))
+		if [ "${elapsed}" -ge "${gateway_ready_timeout}" ]; then
+			break
+		fi
 		if ! kill -0 "${child_pid}" 2>/dev/null; then
 			wait "${child_pid}"
 			process_status=$?
@@ -555,13 +583,12 @@ wait_for_gateway() {
 			fi
 			return "${process_status}"
 		fi
-		if NO_COLOR=1 "${OPENSHELL_BIN}" status >"${probe_log}" 2>&1 &&
+		if probe_gateway "${probe_log}" &&
 			grep -q "Connected" "${probe_log}"; then
 			echo "==> Gateway ready after ${elapsed}s"
 			return 0
 		fi
 		sleep 1
-		elapsed=$((elapsed + 1))
 	done
 
 	echo "ERROR: gateway did not become ready within ${gateway_ready_timeout}s" >&2
