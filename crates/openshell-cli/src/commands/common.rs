@@ -180,8 +180,7 @@ pub fn short_hash(hash: &str) -> &str {
     // Slice at the 13th character boundary so multi-byte UTF-8 cannot panic.
     hash.char_indices()
         .nth(12)
-        .map(|(idx, _)| &hash[..idx])
-        .unwrap_or(hash)
+        .map_or(hash, |(idx, _)| &hash[..idx])
 }
 
 pub fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
