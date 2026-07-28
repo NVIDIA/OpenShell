@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
+use std::ops::Range;
 
 use clap::Parser;
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
@@ -83,8 +84,6 @@ impl GuardConfig {
         if unique_terms.is_empty() {
             return Err("config.terms must contain at least one string".into());
         }
-        let mut terms: Vec<_> = unique_terms.into_iter().collect();
-        terms.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
 
         let replacement = optional_string_field(config, "replacement")?
             .unwrap_or(DEFAULT_REPLACEMENT)
@@ -95,7 +94,7 @@ impl GuardConfig {
 
         Ok(Self {
             mode,
-            terms,
+            terms: unique_terms.into_iter().collect(),
             replacement,
         })
     }
@@ -172,20 +171,7 @@ fn validate_phase(phase: i32) -> Result<(), String> {
 }
 
 fn evaluate(config: &GuardConfig, body: &str) -> HttpRequestResult {
-    let mut transformed = body.to_string();
-    let mut match_count = 0_u32;
-    let mut matched_term_count = 0_u32;
-    for term in &config.terms {
-        let count = u32::try_from(transformed.matches(term).count()).unwrap_or(u32::MAX);
-        if count == 0 {
-            continue;
-        }
-        match_count = match_count.saturating_add(count);
-        matched_term_count = matched_term_count.saturating_add(1);
-        if config.mode == Mode::Redact {
-            transformed = transformed.replace(term, &config.replacement);
-        }
-    }
+    let (ranges, match_count, matched_term_count) = find_match_ranges(body, &config.terms);
 
     if match_count == 0 {
         return allow_result();
@@ -214,7 +200,7 @@ fn evaluate(config: &GuardConfig, body: &str) -> HttpRequestResult {
         Mode::Redact => HttpRequestResult {
             decision: Decision::Allow as i32,
             reason: String::new(),
-            body: transformed.into_bytes(),
+            body: redact_ranges(body, &ranges, &config.replacement).into_bytes(),
             has_body: true,
             header_mutations: Vec::new(),
             findings: vec![finding],
@@ -232,6 +218,63 @@ fn evaluate(config: &GuardConfig, body: &str) -> HttpRequestResult {
             reason_code: "content_match".into(),
         },
     }
+}
+
+fn find_match_ranges(body: &str, terms: &[String]) -> (Vec<Range<usize>>, u32, u32) {
+    let mut ranges = Vec::new();
+    let mut match_count = 0_u32;
+    let mut matched_term_count = 0_u32;
+
+    for term in terms {
+        let mut term_matched = false;
+        for (start, _) in body.char_indices() {
+            if body[start..].starts_with(term) {
+                ranges.push(start..start + term.len());
+                match_count = match_count.saturating_add(1);
+                term_matched = true;
+            }
+        }
+        if term_matched {
+            matched_term_count = matched_term_count.saturating_add(1);
+        }
+    }
+
+    ranges.sort_unstable_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| right.end.cmp(&left.end))
+    });
+    (
+        merge_overlapping_ranges(ranges),
+        match_count,
+        matched_term_count,
+    )
+}
+
+fn merge_overlapping_ranges(ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && range.start < previous.end
+        {
+            previous.end = previous.end.max(range.end);
+            continue;
+        }
+        merged.push(range);
+    }
+    merged
+}
+
+fn redact_ranges(body: &str, ranges: &[Range<usize>], replacement: &str) -> String {
+    let mut transformed = String::with_capacity(body.len());
+    let mut cursor = 0;
+    for range in ranges {
+        transformed.push_str(&body[cursor..range.start]);
+        transformed.push_str(replacement);
+        cursor = range.end;
+    }
+    transformed.push_str(&body[cursor..]);
+    transformed
 }
 
 fn allow_result() -> HttpRequestResult {
@@ -311,19 +354,42 @@ mod tests {
     }
 
     #[test]
-    fn redact_replaces_longest_overlapping_term_first() {
-        let config = GuardConfig::parse(Some(&config(
-            "redact",
-            &["abc", "abcdef"],
-            Some("[FILTERED]"),
-        )))
-        .expect("valid config");
+    fn redact_merges_partially_overlapping_terms() {
+        let config =
+            GuardConfig::parse(Some(&config("redact", &["aba", "bab"], Some("[FILTERED]"))))
+                .expect("valid config");
 
-        let result = evaluate(&config, "abcdef");
+        let result = evaluate(&config, "abab");
 
         assert_eq!(String::from_utf8(result.body).unwrap(), "[FILTERED]");
-        assert_eq!(result.findings[0].count, 1);
+        assert_eq!(result.findings[0].count, 2);
+        assert_eq!(result.metadata["matched_term_count"], "2");
+    }
+
+    #[test]
+    fn redact_merges_self_overlapping_matches() {
+        let config = GuardConfig::parse(Some(&config("redact", &["aba"], Some("[FILTERED]"))))
+            .expect("valid config");
+
+        let result = evaluate(&config, "ababa");
+
+        assert_eq!(String::from_utf8(result.body).unwrap(), "[FILTERED]");
+        assert_eq!(result.findings[0].count, 2);
         assert_eq!(result.metadata["matched_term_count"], "1");
+    }
+
+    #[test]
+    fn redact_keeps_adjacent_matches_separate() {
+        let config = GuardConfig::parse(Some(&config("redact", &["abc"], Some("[FILTERED]"))))
+            .expect("valid config");
+
+        let result = evaluate(&config, "abcabc");
+
+        assert_eq!(
+            String::from_utf8(result.body).unwrap(),
+            "[FILTERED][FILTERED]"
+        );
+        assert_eq!(result.findings[0].count, 2);
     }
 
     #[test]

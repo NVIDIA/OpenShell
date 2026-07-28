@@ -14,7 +14,7 @@ Supervisor middleware is a research preview. Its policy and service contracts ma
 This example implements an operator-run supervisor middleware service. It scans UTF-8 HTTP request bodies for configured literal strings, then either replaces every match or denies the request. Findings report only aggregate counts and never include configured terms or request content.
 
 > [!WARNING]
-> This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It handles only UTF-8 request bodies and case-sensitive literal terms, applies redaction longest term first, and does not address the encodings, transformations, normalization, streaming, or adversarial inputs that a production content guard must handle.
+> This intentionally simple implementation demonstrates the supervisor middleware service contract. It is not a complete or reliable content guard and must not be used as a security control. It handles only UTF-8 request bodies and case-sensitive literal terms, merges overlapping literal match ranges before redaction, and does not address the encodings, transformations, normalization, streaming, or adversarial inputs that a production content guard must handle.
 
 ## Prerequisites
 
@@ -92,7 +92,7 @@ The echoed JSON body contains `[FILTERED]` instead of the configured term.
 | Field | Required | Description |
 | --- | --- | --- |
 | `mode` | No | `redact` (default) replaces matches; `deny` rejects the request. |
-| `terms` | Yes | Non-empty list of non-empty, case-sensitive literal strings, processed longest first. |
+| `terms` | Yes | Non-empty list of non-empty, case-sensitive literal strings. Overlapping match ranges are merged before redaction. |
 | `replacement` | No | Replacement text for `redact`; defaults to `[REDACTED]` and is invalid with `deny`. |
 
 To exercise denial, change the policy config to:
