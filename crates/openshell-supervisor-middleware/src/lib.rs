@@ -88,7 +88,12 @@ pub fn http_only_endpoint(service: Arc<MiddlewareService>) -> Arc<MiddlewareServ
     Arc::new(GeneratedMiddlewareEndpoint { service })
 }
 
-const MAX_QUEUED_MIDDLEWARE_WORK: usize = MAX_CONCURRENT_MIDDLEWARE_WORK;
+/// Maximum short-lived middleware work items allowed to wait for active
+/// capacity.
+///
+/// Waiters do not buffer request or message bodies, so the queue can absorb a
+/// larger burst without increasing the active payload-memory bound.
+pub const MAX_QUEUED_MIDDLEWARE_WORK: usize = MAX_CONCURRENT_MIDDLEWARE_WORK * 2;
 
 /// One slot in the shared middleware work budget.
 ///
@@ -103,6 +108,32 @@ pub struct MiddlewareWorkAdmission {
 impl MiddlewareWorkAdmission {
     pub fn saturated(&self) -> bool {
         self.saturated
+    }
+}
+
+/// Result of attempting to enter the bounded middleware work queue.
+///
+/// Active-capacity saturation is ordinary backpressure: callers that obtain a
+/// waiter slot eventually receive [`Self::Admitted`]. [`Self::QueueExhausted`]
+/// is immediate load shedding after both active capacity and the waiter queue
+/// are full.
+#[derive(Debug)]
+pub enum MiddlewareWorkAdmissionOutcome {
+    Admitted(MiddlewareWorkAdmission),
+    QueueExhausted,
+}
+
+impl MiddlewareWorkAdmissionOutcome {
+    /// Preserve the existing failure behavior for protocols whose outer layer
+    /// already translates middleware admission errors into a stable response
+    /// or typed termination.
+    pub fn into_admission(self) -> Result<MiddlewareWorkAdmission> {
+        match self {
+            Self::Admitted(admission) => Ok(admission),
+            Self::QueueExhausted => Err(miette!(
+                "middleware admission queue is full; refusing additional buffered work"
+            )),
+        }
     }
 }
 
@@ -1063,28 +1094,37 @@ impl ChainRunner {
     /// The bounded waiter queue provides backpressure for work expected to
     /// complete promptly, such as HTTP evaluations, WebSocket messages, and
     /// streaming-session preflight.
-    pub async fn reserve_middleware_work(&self) -> Result<MiddlewareWorkAdmission> {
+    pub async fn reserve_middleware_work(&self) -> Result<MiddlewareWorkAdmissionOutcome> {
         if let Ok(permit) = Arc::clone(&self.registry.work_admission).try_acquire_owned() {
-            Ok(MiddlewareWorkAdmission {
-                _work: permit,
-                saturated: false,
-            })
+            Ok(MiddlewareWorkAdmissionOutcome::Admitted(
+                MiddlewareWorkAdmission {
+                    _work: permit,
+                    saturated: false,
+                },
+            ))
         } else {
-            let waiter = Arc::clone(&self.registry.work_admission_waiters)
-                .try_acquire_owned()
-                .map_err(|_| {
-                    miette!("middleware admission queue is full; refusing additional buffered work")
-                })?;
+            let Ok(waiter) = Arc::clone(&self.registry.work_admission_waiters).try_acquire_owned()
+            else {
+                return Ok(MiddlewareWorkAdmissionOutcome::QueueExhausted);
+            };
             let permit = Arc::clone(&self.registry.work_admission)
                 .acquire_owned()
                 .await
                 .map_err(|_| miette!("middleware admission semaphore closed"))?;
             drop(waiter);
-            Ok(MiddlewareWorkAdmission {
-                _work: permit,
-                saturated: true,
-            })
+            Ok(MiddlewareWorkAdmissionOutcome::Admitted(
+                MiddlewareWorkAdmission {
+                    _work: permit,
+                    saturated: true,
+                },
+            ))
         }
+    }
+
+    /// Reserve middleware work for a caller whose established external
+    /// behavior treats queue exhaustion as a middleware processing failure.
+    pub async fn reserve_middleware_work_admission(&self) -> Result<MiddlewareWorkAdmission> {
+        self.reserve_middleware_work().await?.into_admission()
     }
 
     /// Attempt to reserve one persistent middleware session without waiting.
@@ -1314,7 +1354,7 @@ impl ChainRunner {
         let admission = if entries.is_empty() {
             None
         } else {
-            Some(self.reserve_middleware_work().await?)
+            Some(self.reserve_middleware_work_admission().await?)
         };
         self.evaluate_described_with_policy_admitted(
             entries,
@@ -4768,7 +4808,7 @@ mod tests {
         for _ in 0..MAX_CONCURRENT_MIDDLEWARE_WORK {
             work.push(
                 runner
-                    .reserve_middleware_work()
+                    .reserve_middleware_work_admission()
                     .await
                     .expect("fill middleware work budget"),
             );
@@ -4842,7 +4882,7 @@ mod tests {
         for _ in 0..MAX_CONCURRENT_MIDDLEWARE_WORK {
             work.push(
                 runner
-                    .reserve_middleware_work()
+                    .reserve_middleware_work_admission()
                     .await
                     .expect("fill middleware work budget"),
             );
@@ -4871,7 +4911,7 @@ mod tests {
         for _ in 0..MAX_CONCURRENT_MIDDLEWARE_WORK {
             active.push(
                 runner
-                    .reserve_middleware_work()
+                    .reserve_middleware_work_admission()
                     .await
                     .expect("active admission"),
             );
@@ -4891,16 +4931,95 @@ mod tests {
         let overflow = runner
             .reserve_middleware_work()
             .await
-            .expect_err("work beyond the bounded waiter queue must be shed");
-        assert!(overflow.to_string().contains("admission queue is full"));
+            .expect("admission outcome");
+        assert!(matches!(
+            overflow,
+            MiddlewareWorkAdmissionOutcome::QueueExhausted
+        ));
+        runner
+            .reserve_middleware_work_admission()
+            .await
+            .expect_err("WebSocket callers retain their existing failure path");
 
         drop(active);
         for waiter in waiters {
-            waiter
+            let admission = waiter
                 .await
                 .expect("waiter task")
                 .expect("queued admission after capacity is released");
+            assert!(matches!(
+                admission,
+                MiddlewareWorkAdmissionOutcome::Admitted(_)
+            ));
         }
+        assert_eq!(
+            runner.registry.work_admission.available_permits(),
+            MAX_CONCURRENT_MIDDLEWARE_WORK
+        );
+        assert_eq!(
+            runner.registry.work_admission_waiters.available_permits(),
+            MAX_QUEUED_MIDDLEWARE_WORK
+        );
+
+        let mut recovered = Vec::new();
+        for _ in 0..MAX_CONCURRENT_MIDDLEWARE_WORK {
+            recovered.push(
+                runner
+                    .reserve_middleware_work_admission()
+                    .await
+                    .expect("recovered active admission"),
+            );
+        }
+        assert_eq!(recovered.len(), MAX_CONCURRENT_MIDDLEWARE_WORK);
+    }
+
+    #[tokio::test]
+    async fn websocket_queue_exhaustion_remains_a_protocol_failure() {
+        let runner = builtin_runner();
+        let chain = [entry("regex-redactor", OnError::FailClosed)];
+        let preflight = runner
+            .preflight_websocket(&chain, websocket_preflight_input("established"))
+            .await
+            .expect("initial preflight");
+        let mut session = preflight.session.expect("built-in inspects session");
+        assert!(session.start("").await.allowed);
+
+        let mut active = Vec::new();
+        for _ in 0..MAX_CONCURRENT_MIDDLEWARE_WORK {
+            active.push(
+                runner
+                    .reserve_middleware_work_admission()
+                    .await
+                    .expect("fill active work"),
+            );
+        }
+        let mut waiters = Vec::new();
+        for _ in 0..MAX_QUEUED_MIDDLEWARE_WORK {
+            let runner = runner.clone();
+            waiters.push(tokio::spawn(async move {
+                runner.reserve_middleware_work().await
+            }));
+        }
+        while runner.registry.work_admission_waiters.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let preflight_overflow = runner
+            .preflight_websocket(&chain, websocket_preflight_input("preflight-overflow"))
+            .await;
+        assert!(
+            preflight_overflow.is_err(),
+            "preflight exhaustion remains an outer HTTP failure"
+        );
+        session
+            .admit_message()
+            .await
+            .expect_err("established message exhaustion remains a typed termination input");
+
+        for waiter in waiters {
+            waiter.abort();
+        }
+        drop(active);
     }
 
     #[tokio::test]

@@ -2225,14 +2225,36 @@ pub(crate) async fn send_middleware_failure_response<C: AsyncWrite + Unpin>(
     send_forbidden_json(policy_name, body, client).await
 }
 
+/// Send a platform-owned availability response when shared middleware work
+/// admission is exhausted before the request body is buffered.
+pub(crate) async fn send_middleware_unavailable_response<C: AsyncWrite + Unpin>(
+    req: &L7Request,
+    policy_name: &str,
+    client: &mut C,
+    redacted_target: Option<&str>,
+    context: Option<DenyResponseContext<'_>>,
+) -> Result<()> {
+    let body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    send_json_response(policy_name, body, client, "503 Service Unavailable").await
+}
+
 async fn send_forbidden_json<C: AsyncWrite + Unpin>(
     policy_name: &str,
     body: serde_json::Value,
     client: &mut C,
 ) -> Result<()> {
+    send_json_response(policy_name, body, client, "403 Forbidden").await
+}
+
+async fn send_json_response<C: AsyncWrite + Unpin>(
+    policy_name: &str,
+    body: serde_json::Value,
+    client: &mut C,
+    status: &str,
+) -> Result<()> {
     let body_bytes = body.to_string();
     let response = format!(
-        "HTTP/1.1 403 Forbidden\r\n\
+        "HTTP/1.1 {status}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          X-OpenShell-Policy: {}\r\n\

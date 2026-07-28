@@ -19,6 +19,11 @@ pub enum MiddlewareApplyResult {
     Denied {
         denial: Option<openshell_supervisor_middleware::MiddlewareDenial>,
     },
+    /// The platform's shared active-work and waiter capacities were both full.
+    ///
+    /// This is platform load shedding, not a selected middleware-stage failure,
+    /// so callers must not apply a stage's `on_error` policy.
+    AdmissionExhausted,
 }
 
 /// How traffic a middleware chain can never inspect (h2c, non-HTTP TCP,
@@ -344,6 +349,27 @@ fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext) {
     ocsf_emit!(event);
 }
 
+fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
+    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(SeverityId::Medium)
+        .finding_info(FindingInfo::new(
+            "openshell.middleware.admission_exhausted",
+            "Supervisor middleware admission exhausted",
+        ))
+        .evidence_pairs(&[
+            ("policy", ctx.policy_name.as_str()),
+            ("host", ctx.host.as_str()),
+            ("operation", "http_request"),
+            ("disposition", "shed"),
+        ])
+        .message("HTTP request shed because middleware work admission was exhausted")
+        .build()
+}
+
+fn emit_middleware_admission_exhausted(ctx: &L7EvalContext) {
+    ocsf_emit!(middleware_admission_exhausted_event(ctx));
+}
+
 /// Largest body-buffering limit across the entries that actually resolved to a
 /// registered binding. Buffering for the most capable stage lets every stage
 /// that can handle the body run; stages whose own limit is smaller are failed
@@ -400,6 +426,20 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
     let chain = runner.describe_chain(&chain).await?;
+    let admission = if chain.is_empty() {
+        None
+    } else {
+        let outcome = runner.reserve_middleware_work().await?;
+        match outcome {
+            openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::Admitted(
+                admission,
+            ) => Some(admission),
+            openshell_supervisor_middleware::MiddlewareWorkAdmissionOutcome::QueueExhausted => {
+                emit_middleware_admission_exhausted(ctx);
+                return Ok(MiddlewareApplyResult::AdmissionExhausted);
+            }
+        }
+    };
     let Some(max_body_bytes) = middleware_chain_body_limit(&chain) else {
         // No entry resolved to a registered binding, so nothing inspects the
         // body. Apply each entry's `on_error` policy without buffering (an
@@ -414,7 +454,14 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
             String::new(),
             Vec::new(),
         );
-        let outcome = runner.evaluate_described(&chain, input).await?;
+        let outcome = runner
+            .evaluate_described_with_policy_admitted(
+                &chain,
+                input,
+                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+                admission,
+            )
+            .await?;
         emit_middleware_events(ctx, &req, &outcome);
         return Ok(if outcome.allowed {
             MiddlewareApplyResult::Allowed(req)
@@ -424,10 +471,10 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
             }
         });
     };
-    // Reserve shared middleware capacity before reading any request body.
-    // Keeping the guard through evaluation bounds aggregate buffered input
-    // across HTTP requests and WebSocket messages.
-    let admission = runner.reserve_middleware_work().await?;
+    // Admission was reserved above, before reading any request body. Keeping
+    // the guard through evaluation bounds aggregate buffered input across HTTP
+    // requests and WebSocket messages.
+    let admission = admission.expect("resolved middleware chain reserved work admission");
     let buffered = match crate::l7::rest::buffer_request_body_for_middleware(
         &req,
         client,
@@ -506,6 +553,24 @@ pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpi
         )
         .await
     }
+}
+
+pub async fn send_middleware_admission_exhausted_response<
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+>(
+    req: &crate::l7::provider::L7Request,
+    client: &mut C,
+    ctx: &L7EvalContext,
+    redacted_target: &str,
+) -> Result<()> {
+    crate::l7::rest::send_middleware_unavailable_response(
+        req,
+        &ctx.policy_name,
+        client,
+        Some(redacted_target),
+        Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
+    )
+    .await
 }
 
 pub(super) fn middleware_request_input(
@@ -815,10 +880,34 @@ fn emit_middleware_events(
 #[cfg(test)]
 mod tests {
     use super::{
-        safe_middleware_headers, send_middleware_rejection_response, websocket_coverage_events,
+        middleware_admission_exhausted_event, safe_middleware_headers,
+        send_middleware_rejection_response, websocket_coverage_events,
     };
     use crate::l7::relay::L7EvalContext;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn admission_exhaustion_event_contains_only_platform_context() {
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "api-policy".into(),
+            binary_path: "DO_NOT_LOG_BINARY".into(),
+            ..Default::default()
+        };
+
+        let serialized = serde_json::to_string(&middleware_admission_exhausted_event(&ctx))
+            .expect("serialize admission event");
+        assert!(serialized.contains("openshell.middleware.admission_exhausted"));
+        assert!(serialized.contains("api-policy"));
+        assert!(serialized.contains("api.example.test"));
+        assert!(serialized.contains("http_request"));
+        assert!(serialized.contains("shed"));
+        assert!(!serialized.contains("DO_NOT_LOG_BINARY"));
+        assert!(!serialized.contains("middleware_config"));
+        assert!(!serialized.contains("request_body"));
+        assert!(!serialized.contains("query"));
+    }
 
     #[test]
     fn websocket_coverage_events_distinguish_selection_from_message_support() {

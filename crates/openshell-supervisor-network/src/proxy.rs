@@ -4950,6 +4950,12 @@ async fn handle_forward_proxy(
                 respond(client, &response).await?;
                 return Ok(());
             }
+            crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
+                emit_activity_simple(activity_tx, true, "middleware");
+                let response = build_middleware_unavailable_response(&l7_ctx.policy_name);
+                respond(client, &response).await?;
+                return Ok(());
+            }
         };
     }
 
@@ -5294,6 +5300,14 @@ fn build_middleware_deny_response(
 }
 
 fn build_middleware_failure_response(policy_name: &str) -> Vec<u8> {
+    build_middleware_platform_response(policy_name, "403 Forbidden")
+}
+
+fn build_middleware_unavailable_response(policy_name: &str) -> Vec<u8> {
+    build_middleware_platform_response(policy_name, "503 Service Unavailable")
+}
+
+fn build_middleware_platform_response(policy_name: &str, status: &str) -> Vec<u8> {
     let body = serde_json::json!({
         "error": "middleware_failed",
         "detail": "Request could not be processed by configured middleware",
@@ -5301,7 +5315,7 @@ fn build_middleware_failure_response(policy_name: &str) -> Vec<u8> {
     });
     let body_str = body.to_string();
     format!(
-        "HTTP/1.1 403 Forbidden\r\n\
+        "HTTP/1.1 {status}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
@@ -5511,6 +5525,28 @@ network_policies: {}
         assert!(body.get("rule_missing").is_none());
         assert!(body.get("next_steps").is_none());
         assert!(body.get("agent_guidance").is_none());
+    }
+
+    #[test]
+    fn middleware_unavailable_response_is_complete_and_has_no_retry_hint() {
+        let response = build_middleware_unavailable_response("api-policy");
+        let response = String::from_utf8(response).expect("UTF-8 error response");
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(!response.to_ascii_lowercase().contains("retry-after"));
+        let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .expect("Content-Length");
+        assert_eq!(content_length, body.len());
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
+        assert_eq!(body["error"], "middleware_failed");
+        assert_eq!(body["policy"], "api-policy");
+        assert!(body.get("middleware").is_none());
+        assert!(body.get("reason_code").is_none());
     }
 
     #[test]
@@ -5969,6 +6005,9 @@ network_policies:
             }
             crate::l7::middleware::MiddlewareApplyResult::Allowed(_) => {
                 panic!("policy-invalid transformed request must be denied")
+            }
+            crate::l7::middleware::MiddlewareApplyResult::AdmissionExhausted => {
+                panic!("test middleware work admission must be available")
             }
         }
     }

@@ -150,7 +150,7 @@ OCSF NET:OTHER [INFO] WEBSOCKET_MIDDLEWARE_COVERAGE state=binding_not_selected c
 OCSF NET:OTHER [INFO] WEBSOCKET_MIDDLEWARE_COVERAGE state=unsupported_message_type config=api-redactor implementation=openshell/regex sequence=4 message_type=binary input_bytes=512
 ```
 
-A fail-open stream error emits both a middleware failure and `openshell.middleware.websocket_stage_disabled`. The latter records that OpenShell will bypass that stage for later messages on the same connection. Waiting for saturated admission capacity also emits a detection finding without payload content; work beyond the bounded wait queue is rejected before its payload is buffered.
+A fail-open stream error emits both a middleware failure and `openshell.middleware.websocket_stage_disabled`. The latter records that OpenShell will bypass that stage for later messages on the same connection. Waiting for saturated admission capacity also emits a detection finding without payload content. When both active capacity and the bounded wait queue are full, HTTP work is rejected before its payload is buffered, returns `503 Service Unavailable`, and emits `openshell.middleware.admission_exhausted`.
 
 Proxy and SSH servers ready:
 

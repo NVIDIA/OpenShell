@@ -206,7 +206,7 @@ impl ChainRunner {
 
         // One permit covers the complete concurrent preflight fan-out. Permit
         // wait is deliberate backpressure and is excluded from every deadline.
-        let preflight_work = self.reserve_middleware_work().await?;
+        let preflight_work = self.reserve_middleware_work_admission().await?;
         let saturated = preflight_work.saturated();
         let session_admission = match self.try_reserve_middleware_session() {
             MiddlewareSessionAdmission::Admitted(admission) => admission,
@@ -377,7 +377,7 @@ impl WebSocketSession {
             return Ok(WebSocketMessageAdmission::Bypass);
         }
         self.runner
-            .reserve_middleware_work()
+            .reserve_middleware_work_admission()
             .await
             .map(WebSocketMessageAdmission::Inspect)
     }

@@ -2123,7 +2123,7 @@ network_policies:
     async fn stalled_initial_text_payload_releases_middleware_admission() {
         let runner = openshell_supervisor_middleware::ChainRunner::default();
         let admission = runner
-            .reserve_middleware_work()
+            .reserve_middleware_work_admission()
             .await
             .expect("reserve middleware work");
         let (client, mut reader) = tokio::io::duplex(8);
@@ -2143,7 +2143,7 @@ network_policies:
         assert!(error.to_string().contains("assembly idle timeout"));
 
         runner
-            .reserve_middleware_work()
+            .reserve_middleware_work_admission()
             .await
             .expect("timed-out initial payload releases admission");
         drop(client);
@@ -2153,7 +2153,7 @@ network_policies:
     async fn stalled_continuation_payload_releases_middleware_admission() {
         let runner = openshell_supervisor_middleware::ChainRunner::default();
         let admission = runner
-            .reserve_middleware_work()
+            .reserve_middleware_work_admission()
             .await
             .expect("reserve middleware work");
         let (mut client, mut reader) = tokio::io::duplex(8);
@@ -2179,7 +2179,7 @@ network_policies:
         assert!(error.to_string().contains("assembly idle timeout"));
 
         runner
-            .reserve_middleware_work()
+            .reserve_middleware_work_admission()
             .await
             .expect("timed-out continuation releases admission");
         drop(client);
@@ -2189,7 +2189,7 @@ network_policies:
     async fn missing_continuation_header_releases_middleware_admission() {
         let runner = openshell_supervisor_middleware::ChainRunner::default();
         let admission = runner
-            .reserve_middleware_work()
+            .reserve_middleware_work_admission()
             .await
             .expect("reserve middleware work");
         let (client, mut reader) = tokio::io::duplex(8);
@@ -2211,7 +2211,7 @@ network_policies:
         assert!(error.to_string().contains("assembly idle timeout"));
 
         runner
-            .reserve_middleware_work()
+            .reserve_middleware_work_admission()
             .await
             .expect("missing continuation releases admission");
         drop(client);
@@ -2221,7 +2221,7 @@ network_policies:
     async fn text_assembly_total_deadline_does_not_reset_on_input_progress() {
         let runner = openshell_supervisor_middleware::ChainRunner::default();
         let admission = runner
-            .reserve_middleware_work()
+            .reserve_middleware_work_admission()
             .await
             .expect("reserve middleware work");
         let (mut client, mut reader) = tokio::io::duplex(8);
@@ -2255,7 +2255,7 @@ network_policies:
         assert!(error.to_string().contains("assembly total timeout"));
 
         runner
-            .reserve_middleware_work()
+            .reserve_middleware_work_admission()
             .await
             .expect("total timeout releases admission");
     }
@@ -2267,7 +2267,7 @@ network_policies:
         let mut stalled = Vec::new();
         for _ in 0..openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_WORK {
             let admission = runner
-                .reserve_middleware_work()
+                .reserve_middleware_work_admission()
                 .await
                 .expect("fill shared middleware work budget");
             let (client, mut reader) = tokio::io::duplex(8);
@@ -2282,7 +2282,8 @@ network_policies:
         assert!(stalled.iter().all(|task| !task.is_finished()));
 
         let later_runner = runner.clone();
-        let later_work = tokio::spawn(async move { later_runner.reserve_middleware_work().await });
+        let later_work =
+            tokio::spawn(async move { later_runner.reserve_middleware_work_admission().await });
         wait_for_stalled_task(&later_work).await;
 
         tokio::time::advance(TEXT_MESSAGE_ASSEMBLY_IDLE_TIMEOUT + StdDuration::from_millis(1))
@@ -3469,7 +3470,7 @@ network_policies:
         for _ in 0..openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_WORK {
             occupied_work.push(
                 runner
-                    .reserve_middleware_work()
+                    .reserve_middleware_work_admission()
                     .await
                     .expect("fill middleware work budget"),
             );

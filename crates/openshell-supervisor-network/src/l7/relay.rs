@@ -509,6 +509,23 @@ where
                     .await?;
                     return Ok(());
                 }
+                MiddlewareApplyResult::AdmissionExhausted => {
+                    let unavailable_request = crate::l7::provider::L7Request {
+                        action: request_info.action.clone(),
+                        target: redacted_target.clone(),
+                        query_params: request_info.query_params.clone(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_admission_exhausted_response(
+                        &unavailable_request,
+                        client,
+                        ctx,
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             };
             let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
                 let preflight = websocket_middleware_preflight(
@@ -1111,6 +1128,23 @@ where
                     .await?;
                     return Ok(());
                 }
+                MiddlewareApplyResult::AdmissionExhausted => {
+                    let unavailable_request = crate::l7::provider::L7Request {
+                        action: request_info.action.clone(),
+                        target: redacted_target.clone(),
+                        query_params: request_info.query_params.clone(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_admission_exhausted_response(
+                        &unavailable_request,
+                        client,
+                        ctx,
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             };
             let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
                 let preflight = websocket_middleware_preflight(
@@ -1432,6 +1466,23 @@ where
                     .await?;
                     return Ok(());
                 }
+                MiddlewareApplyResult::AdmissionExhausted => {
+                    let unavailable_request = crate::l7::provider::L7Request {
+                        action: request_info.action.clone(),
+                        target: redacted_target.clone(),
+                        query_params: request_info.query_params.clone(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_admission_exhausted_response(
+                        &unavailable_request,
+                        client,
+                        ctx,
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             };
             // Future MCP response/SSE introspection or rewrite would hook here
             // before returning upstream bytes. The current policy schema has no
@@ -1651,6 +1702,23 @@ where
                         client,
                         ctx,
                         denial.as_ref(),
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                MiddlewareApplyResult::AdmissionExhausted => {
+                    let unavailable_request = crate::l7::provider::L7Request {
+                        action: request_info.action.clone(),
+                        target: redacted_target.clone(),
+                        query_params: request_info.query_params.clone(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_admission_exhausted_response(
+                        &unavailable_request,
+                        client,
+                        ctx,
                         &redacted_target,
                     )
                     .await?;
@@ -2289,6 +2357,23 @@ where
                     .await?;
                     return Ok(());
                 }
+                MiddlewareApplyResult::AdmissionExhausted => {
+                    let unavailable_request = crate::l7::provider::L7Request {
+                        action: "HTTP".into(),
+                        target: redacted_target.clone(),
+                        query_params: std::collections::HashMap::new(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_admission_exhausted_response(
+                        &unavailable_request,
+                        client,
+                        ctx,
+                        &redacted_target,
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
         } else {
             req
@@ -2395,6 +2480,35 @@ mod tests {
         assert!(body.get("rule_missing").is_none());
         assert!(body.get("next_steps").is_none());
         assert!(body.get("agent_guidance").is_none());
+    }
+
+    fn assert_middleware_unavailable_response(response: &str, policy_name: &str) {
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{response}"
+        );
+        assert!(!response.contains("100 Continue"), "{response}");
+        assert!(!response.to_ascii_lowercase().contains("retry-after"));
+        let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .expect("Content-Length");
+        assert_eq!(content_length, body.len());
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
+        assert_eq!(body["error"], "middleware_failed");
+        assert_eq!(
+            body["detail"],
+            "Request could not be processed by configured middleware"
+        );
+        assert_eq!(body["policy"], policy_name);
+        assert!(body.get("middleware").is_none());
+        assert!(body.get("reason_code").is_none());
+        assert!(body.get("rule_missing").is_none());
+        assert!(body.get("next_steps").is_none());
     }
 
     fn rest_token_grant_relay_context(
@@ -3238,6 +3352,94 @@ network_policies:
             .expect("relay should finish")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn l7_rest_exhausted_middleware_admission_returns_503_before_body_or_upstream() {
+        let (config, tunnel_engine, ctx) = middleware_relay_context("openshell/regex", "fail_open");
+        let runner = tunnel_engine.middleware_runner().clone();
+
+        let mut active = Vec::new();
+        for _ in 0..openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_WORK {
+            active.push(
+                runner
+                    .reserve_middleware_work_admission()
+                    .await
+                    .expect("fill active middleware work"),
+            );
+        }
+        let mut waiters = Vec::new();
+        for _ in 0..openshell_supervisor_middleware::MAX_QUEUED_MIDDLEWARE_WORK {
+            let runner = runner.clone();
+            waiters.push(Box::pin(
+                async move { runner.reserve_middleware_work().await },
+            ));
+        }
+        for waiter in &mut waiters {
+            assert!(
+                futures::poll!(waiter.as_mut()).is_pending(),
+                "every bounded waiter slot must be occupied"
+            );
+        }
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        // The declared body is within the built-in regex HTTP capability, but
+        // the client intentionally withholds it behind Expect: 100-continue.
+        // Queue exhaustion must be answered before buffering begins.
+        app.write_all(
+            b"POST /v1/messages HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 32\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .expect("send headers without body");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should shed immediately")
+            .expect("join relay")
+            .expect("relay returns a complete HTTP response");
+
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read_to_end(&mut response),
+        )
+        .await
+        .expect("client should receive 503 without sending its body")
+        .expect("read client response");
+        let response = String::from_utf8(response).expect("UTF-8 response");
+        assert_middleware_unavailable_response(&response, "rest_api");
+
+        let mut upstream_bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read_to_end(&mut upstream_bytes),
+        )
+        .await
+        .expect("upstream side should close")
+        .expect("read upstream");
+        assert!(
+            upstream_bytes.is_empty(),
+            "admission-exhausted request must not reach upstream"
+        );
+
+        drop(waiters);
+        drop(active);
+        runner
+            .reserve_middleware_work_admission()
+            .await
+            .expect("work capacity recovers after saturation fixture");
     }
 
     #[tokio::test]
@@ -4341,6 +4543,9 @@ network_policies:
             }
             MiddlewareApplyResult::Denied { .. } => {
                 panic!("body within the largest stage limit must not fail the chain")
+            }
+            MiddlewareApplyResult::AdmissionExhausted => {
+                panic!("test middleware work admission must be available")
             }
         }
     }

@@ -48,7 +48,7 @@ one `MiddlewareRegistry`.
 | Resource | Current bound | Scope and behavior |
 |---|---:|---|
 | Concurrent buffered work | 32 | Shared by HTTP requests, WebSocket messages, and WebSocket preflight. One permit covers one complete unit of work. |
-| Admission waiters | 32 | Additional work is shed when both the active budget and waiter budget are full. |
+| Admission waiters | 64 | Additional work is shed when both the active budget and waiter budget are full. HTTP receives a complete 503 response before its body is buffered. |
 | Persistent middleware sessions | 32 | Shared process-wide session budget for streaming middleware protocols. WebSocket preflight uses immediate admission before opening streams and retains one permit while any stage remains active. |
 | HTTP body or WebSocket text message | 4 MiB | Platform maximum for input and replacement payloads. Service, operator, and stage limits may narrow it. |
 | Middleware configs and stages | 10 | At most 10 configs in policy and 10 selected stages in one chain. |
