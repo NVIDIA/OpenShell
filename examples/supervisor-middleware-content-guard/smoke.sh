@@ -272,9 +272,19 @@ run_setup_step() {
   fi
 }
 
+cargo_target_dir() {
+  local manifest_path="$1"
+
+  cargo metadata \
+    --format-version=1 \
+    --no-deps \
+    --manifest-path "$manifest_path" \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+}
+
 start_middleware() {
   printf 'INFO starting content guard service at %s:%s\n' "$SERVICE_HOST" "$MIDDLEWARE_PORT"
-  "$EXAMPLE_DIR/target/debug/supervisor-middleware-content-guard" \
+  "$MIDDLEWARE_BIN" \
     --bind "0.0.0.0:$MIDDLEWARE_PORT" >"$MIDDLEWARE_LOG" 2>&1 &
   MIDDLEWARE_PID=$!
 }
@@ -304,7 +314,7 @@ wait_for_middleware() {
 
 start_gateway() {
   printf 'INFO starting gateway\n'
-  env -u OPENSHELL_DRIVERS "$ROOT/target/debug/openshell-gateway" \
+  env -u OPENSHELL_DRIVERS "$GATEWAY_BIN" \
     --config "$GATEWAY_CONFIG" \
     --bind-address 127.0.0.1 \
     --port "$GATEWAY_PORT" \
@@ -337,7 +347,7 @@ create_sandbox() {
   CLI=(
     env
     -u OPENSHELL_SANDBOX_POLICY
-    "$ROOT/target/debug/openshell"
+    "$CLI_BIN"
     --gateway-endpoint "$GATEWAY_ENDPOINT"
   )
   run_setup_step \
@@ -421,6 +431,11 @@ wait_until_stopped() {
 }
 
 cd "$ROOT"
+ROOT_TARGET_DIR="$(cargo_target_dir "$ROOT/Cargo.toml")"
+EXAMPLE_TARGET_DIR="$(cargo_target_dir "$EXAMPLE_DIR/Cargo.toml")"
+GATEWAY_BIN="$ROOT_TARGET_DIR/debug/openshell-gateway"
+CLI_BIN="$ROOT_TARGET_DIR/debug/openshell"
+MIDDLEWARE_BIN="$EXAMPLE_TARGET_DIR/debug/supervisor-middleware-content-guard"
 run_setup_step "building gateway" cargo build --quiet -p openshell-server --bin openshell-gateway
 run_setup_step "building content guard" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
 run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell

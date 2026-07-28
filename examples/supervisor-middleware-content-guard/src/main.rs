@@ -56,7 +56,7 @@ impl GuardConfig {
             return Err(format!("unsupported config field '{field}'"));
         }
 
-        let mode = match string_field(config, "mode").unwrap_or("redact") {
+        let mode = match optional_string_field(config, "mode")?.unwrap_or("redact") {
             "redact" => Mode::Redact,
             "deny" => Mode::Deny,
             _ => return Err("config.mode must be 'redact' or 'deny'".into()),
@@ -84,7 +84,7 @@ impl GuardConfig {
             return Err("config.terms must contain at least one string".into());
         }
 
-        let replacement = string_field(config, "replacement")
+        let replacement = optional_string_field(config, "replacement")?
             .unwrap_or(DEFAULT_REPLACEMENT)
             .to_string();
         if mode == Mode::Deny && config.fields.contains_key("replacement") {
@@ -99,14 +99,14 @@ impl GuardConfig {
     }
 }
 
-fn string_field<'a>(config: &'a Struct, name: &str) -> Option<&'a str> {
-    config
-        .fields
-        .get(name)
-        .and_then(|value| match value.kind.as_ref() {
-            Some(Kind::StringValue(value)) => Some(value.as_str()),
-            _ => None,
-        })
+fn optional_string_field<'a>(config: &'a Struct, name: &str) -> Result<Option<&'a str>, String> {
+    let Some(value) = config.fields.get(name) else {
+        return Ok(None);
+    };
+    match value.kind.as_ref() {
+        Some(Kind::StringValue(value)) => Ok(Some(value.as_str())),
+        _ => Err(format!("config.{name} must be a string")),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -345,5 +345,34 @@ mod tests {
             )))
             .is_err()
         );
+    }
+
+    #[test]
+    fn validation_rejects_non_string_optional_fields() {
+        for field in ["mode", "replacement"] {
+            let mut config = config("redact", &["prototype-secret"], None);
+            config.fields.insert(
+                field.into(),
+                Value {
+                    kind: Some(Kind::BoolValue(true)),
+                },
+            );
+
+            assert_eq!(
+                GuardConfig::parse(Some(&config)),
+                Err(format!("config.{field} must be a string"))
+            );
+        }
+    }
+
+    #[test]
+    fn missing_optional_fields_use_defaults() {
+        let mut config = config("redact", &["prototype-secret"], None);
+        config.fields.remove("mode");
+
+        let parsed = GuardConfig::parse(Some(&config)).expect("valid config");
+
+        assert_eq!(parsed.mode, Mode::Redact);
+        assert_eq!(parsed.replacement, DEFAULT_REPLACEMENT);
     }
 }
