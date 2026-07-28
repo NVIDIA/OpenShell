@@ -35,6 +35,13 @@ if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ] ||
 	exit 2
 fi
 
+require_value() {
+	if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+		echo "$1 requires a value" >&2
+		exit 2
+	fi
+}
+
 distro=
 requested_ssh_port=
 keep=0
@@ -48,23 +55,28 @@ guest_command=()
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 	--distro)
-		distro=${2:-}
+		require_value "$@"
+		distro=$2
 		shift 2
 		;;
 	--with)
-		configurations+=("${2:-}")
+		require_value "$@"
+		configurations+=("$2")
 		shift 2
 		;;
 	--install)
-		packages+=("${2:-}")
+		require_value "$@"
+		packages+=("$2")
 		shift 2
 		;;
 	--copy)
-		copies+=("${2:-}")
+		require_value "$@"
+		copies+=("$2")
 		shift 2
 		;;
 	--ssh-port)
-		requested_ssh_port=${2:-}
+		require_value "$@"
+		requested_ssh_port=$2
 		shift 2
 		;;
 	--forward-port)
@@ -434,6 +446,7 @@ ssh_args=(
 	-o ControlMaster=auto
 	-o ControlPersist=60
 	-o "ControlPath=${ssh_control_path}"
+	-o IdentitiesOnly=yes
 	-o LogLevel=ERROR
 	-o StrictHostKeyChecking=no
 	-o UserKnownHostsFile=/dev/null
@@ -447,6 +460,7 @@ scp_args=(
 	-o ControlMaster=auto
 	-o ControlPersist=60
 	-o "ControlPath=${ssh_control_path}"
+	-o IdentitiesOnly=yes
 	-o LogLevel=ERROR
 	-o StrictHostKeyChecking=no
 	-o UserKnownHostsFile=/dev/null

@@ -241,6 +241,10 @@ is_remote_miss() {
 }
 
 pull_remote() {
+	local requested_ref=${1:-${pull_ref}}
+	local trusted_digest=${2:-${pull_digest}}
+	local install_local=${3:-1}
+	local expected_local_sha=${4:-}
 	local pull_dir
 	local pull_log
 	local compressed_size
@@ -250,17 +254,17 @@ pull_remote() {
 	pull_dir=$(mktemp -d "${cache_root}/staging/pull.${cache_key}.XXXXXX")
 	pull_log="${pull_dir}/oras.log"
 
-	resolved_digest=$(oras resolve "${pull_ref}") || {
+	resolved_digest=$(oras resolve "${requested_ref}") || {
 		rm -rf "${pull_dir}"
 		return 2
 	}
-	if [ "${resolved_digest}" != "${pull_digest}" ]; then
+	if [ "${resolved_digest}" != "${trusted_digest}" ]; then
 		echo "OCI cache manifest digest does not match trusted digest" >&2
 		rm -rf "${pull_dir}"
 		return 2
 	fi
 
-	if ! oras pull --output "${pull_dir}" "${pull_ref}" >"${pull_log}" 2>&1; then
+	if ! oras pull --output "${pull_dir}" "${requested_ref}" >"${pull_log}" 2>&1; then
 		if is_remote_miss "${pull_log}"; then
 			rm -rf "${pull_dir}"
 			return 1
@@ -298,6 +302,11 @@ pull_remote() {
 			-o "${pull_dir}/disk.qcow2"
 	)
 	expected_sha=$(jq -r '.disk_sha256' "${pull_dir}/metadata.json")
+	if [ -n "${expected_local_sha}" ] && [ "${expected_sha}" != "${expected_local_sha}" ]; then
+		echo "OCI cache disk checksum does not match the local cache entry" >&2
+		rm -rf "${pull_dir}"
+		return 2
+	fi
 	actual_sha=$(test_vm_cache_sha256 "${pull_dir}/disk.qcow2")
 	if [ "${expected_sha}" != "${actual_sha}" ]; then
 		echo "OCI cache disk checksum does not match metadata" >&2
@@ -310,10 +319,14 @@ pull_remote() {
 		return 2
 	fi
 
-	install_entry \
-		"${pull_dir}/disk.qcow2" "${pull_dir}/metadata.json" "${resolved_digest}"
+	if [ "${install_local}" -eq 1 ]; then
+		install_entry \
+			"${pull_dir}/disk.qcow2" "${pull_dir}/metadata.json" "${resolved_digest}"
+	fi
 	rm -rf "${pull_dir}"
-	echo "==> Cache remote hit: ${pull_ref}"
+	if [ "${install_local}" -eq 1 ]; then
+		echo "==> Cache remote hit: ${requested_ref}"
+	fi
 }
 
 build_local() {
@@ -426,6 +439,8 @@ build_local() {
 }
 
 push_remote() {
+	local existing_ref
+	local local_disk_sha
 	local push_dir
 	local manifest_log
 	local published_digest
@@ -433,8 +448,15 @@ push_remote() {
 	manifest_log="${push_dir}/manifest.log"
 
 	if oras manifest fetch "${remote_ref}" >"${manifest_log}" 2>&1; then
-		echo "==> Cache already published: ${remote_ref}"
 		published_digest=$(oras resolve "${remote_ref}")
+		existing_ref="${repository}@${published_digest}"
+		local_disk_sha=$(jq -r '.disk_sha256' "${entry_dir}/metadata.json")
+		if ! pull_remote "${existing_ref}" "${published_digest}" 0 "${local_disk_sha}"; then
+			echo "existing OCI cache artifact failed validation: ${remote_ref}" >&2
+			rm -rf "${push_dir}"
+			return 1
+		fi
+		echo "==> Cache already published and validated: ${remote_ref}"
 		echo "==> Cache immutable reference: ${repository}@${published_digest}"
 		rm -rf "${push_dir}"
 		return
