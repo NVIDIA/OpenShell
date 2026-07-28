@@ -243,7 +243,10 @@ flowchart TD
         Middleware -- No --> Creds["Resolve static placeholders<br/>and token grants"]
         MwEval --> MwAllowed{"Middleware allowed?"}
         MwAllowed -- No --> MwDeny["Local middleware deny<br/>no credential injection"]
-        MwAllowed -- Yes --> Creds
+        MwAllowed -- Yes --> Recheck["Re-parse transformed protocol body<br/>and re-evaluate request policy"]
+        Recheck --> PostMwAllowed{"Allowed under endpoint<br/>enforcement mode?"}
+        PostMwAllowed -- No --> PostMwDeny["Local policy deny<br/>no credential injection"]
+        PostMwAllowed -- Yes --> Creds
         Creds --> Rewrite["Inject credentials into configured slots"]
         Rewrite --> HttpDial["Connect or reuse upstream"]
         HttpDial --> HttpResponse["Write request and relay response"]
@@ -261,7 +264,9 @@ Read this as two phases. The top half chooses the relay shape from the adapter
 surface and endpoint enforcement. The `HTTP relay request loop` only receives a
 parsed HTTP request. Supervisor middleware is not another policy funnel; it is
 an optional request-path hook after HTTP policy allows the request and before
-OpenShell-managed credential injection.
+OpenShell-managed credential injection. When middleware changes a request
+body, the relay re-parses body-dependent protocol inputs and re-evaluates
+request policy before credential injection or upstream write.
 
 Relay rules:
 
@@ -276,6 +281,11 @@ Relay rules:
 - Middleware can allow, deny, replace the bounded request body, add approved
   headers, and emit audit-safe findings/metadata. External middleware must not
   receive OpenShell-managed credentials.
+- Middleware mutation cannot bypass request policy. After a body replacement,
+  the relay re-parses and re-evaluates body-dependent GraphQL, JSON-RPC, and MCP
+  policy inputs before credential injection or upstream write. A policy
+  mismatch follows the endpoint's configured enforcement mode; a malformed or
+  unclassifiable transformed protocol body fails closed even in audit mode.
 - Credential injection includes static placeholder rewrite and endpoint-bound
   dynamic token grants. Token grants run after policy allow and before upstream
   write; failures deny without forwarding the request.

@@ -154,16 +154,23 @@ flowchart TD
     Policy --> Hook["HTTP_REQUEST / PRE_CREDENTIALS middleware"]
     Hook --> Outcome{"Middleware outcome"}
     Outcome -- "deny" --> Deny["Local deny, no credential injection"]
-    Outcome -- "allow / mutate" --> Creds["Credential injection"]
+    Outcome -- "allow / mutate" --> Recheck["Re-parse transformed body and re-evaluate policy"]
+    Recheck --> Allowed{"Allowed under endpoint enforcement mode?"}
+    Allowed -- "no" --> PolicyDeny["Local policy deny, no credential injection"]
+    Allowed -- "yes" --> Creds["Credential injection"]
     Creds --> Upstream["Upstream write"]
 ```
 
 The proposed middleware chain is selected by admitted destination host, runs in
 deterministic order, buffers bounded request bodies, applies `fail_open` or
 `fail_closed`, emits audit-safe findings, and runs before OpenShell-managed
-credentials are injected. It can inspect WebSocket upgrade requests because
-they are HTTP requests, but it does not inspect post-upgrade WebSocket frames
-in v1.
+credentials are injected. Middleware-transformed GraphQL, JSON-RPC, and MCP
+bodies are re-parsed and re-evaluated before credential injection or upstream
+write, so a mutation cannot bypass request policy. Policy mismatches retain the
+endpoint's audit or enforce behavior, while malformed transformed protocol
+bodies fail closed in either mode. Middleware can inspect WebSocket upgrade
+requests because they are HTTP requests, but it does not inspect post-upgrade
+WebSocket frames in v1.
 
 RFC 0005 should account for this by treating middleware as part of the shared
 request processing plan. CONNECT and forward HTTP should not each learn how to

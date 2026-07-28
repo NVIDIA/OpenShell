@@ -416,10 +416,13 @@ supervisor middleware, and before upstream write.
 1. Authorization selects the endpoint and computes a credential injection plan.
 2. Supervisor middleware runs on the admitted request before credentials are
    visible.
-3. The HTTP relay resolves credentials only when it has an allowed request.
-4. Static placeholder values are resolved and redacted from logs.
-5. Endpoint-bound token grants obtain or reuse a dynamic access token.
-6. The final upstream request or WebSocket frame is rewritten immediately
+3. If middleware replaces the body, the relay re-parses body-dependent
+   protocol inputs and re-evaluates request policy.
+4. The HTTP relay resolves credentials only when it still has an allowed
+   request under the endpoint's enforcement mode.
+5. Static placeholder values are resolved and redacted from logs.
+6. Endpoint-bound token grants obtain or reuse a dynamic access token.
+7. The final upstream request or WebSocket frame is rewritten immediately
    before write.
 
 Both L4-only HTTP and HTTP-inspected paths can inject credentials. The
@@ -473,7 +476,17 @@ For v1, the operation is `HTTP_REQUEST / PRE_CREDENTIALS`:
 5. A deny short-circuits before credential injection or upstream write.
 6. An allow can replace the request body, add approved headers, emit findings,
    and pass metadata forward.
-7. The transformed request then enters credential injection and upstream write.
+7. When the body changes, the relay re-parses and re-evaluates body-dependent
+   request policy inputs.
+8. The transformed request enters credential injection and upstream write only
+   after that re-evaluation admits it under the endpoint's enforcement mode.
+
+The re-evaluation uses the original request method, path, and query because v1
+middleware cannot mutate them. It re-derives the GraphQL operation, JSON-RPC
+method, and MCP method or tool name from the transformed body. A policy mismatch
+preserves the endpoint's audit or enforce behavior. A malformed or
+unclassifiable transformed protocol body fails closed in both modes because the
+relay can no longer prove which operation it would forward.
 
 Middleware selection is independent from the matched endpoint policy. It is a
 request processing plan selected by admitted destination host, order, and

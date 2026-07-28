@@ -125,9 +125,16 @@ it must not be hidden inside the structural refactor commits.
 - Land only after the supervisor middleware dependency is available.
 - Run `HTTP_REQUEST / PRE_CREDENTIALS` after request allow and before static or
   dynamic credential injection.
+- Re-parse middleware-transformed bodies and re-evaluate GraphQL, JSON-RPC, and
+  MCP policy inputs before credential injection or upstream write. Preserve the
+  endpoint's audit or enforce behavior for policy mismatches, and fail closed
+  on malformed transformed protocol bodies in either mode.
 - Preserve ordering, body caps, `fail_open`/`fail_closed`, safe headers,
   findings, metadata, and rejection of middleware-introduced credential
   placeholders.
+- Test allowed requests that middleware rewrites into denied GraphQL, JSON-RPC,
+  and MCP operations, including audit-mode forwarding and fail-closed malformed
+  replacements.
 
 Each subphase must be independently testable and shippable; Phase 5 is not a
 single flag-day cutover.
