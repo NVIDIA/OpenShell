@@ -27,6 +27,7 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 | `scripts/agents/gator/Dockerfile` | Gator sandbox image source. Local launches build this image through OpenShell. |
 | `scripts/agents/gator/policy.yaml` | Sandbox policy for the gator agent. |
 | `scripts/agents/gator/bin/gh` | Gator-specific `gh` wrapper and same-SHA duplicate-post guard. |
+| `scripts/agents/gator/bin/review-feedback-ledger` | Builds the cross-SHA ledger of Gator inline threads, replies, and resolutions. |
 | `scripts/agents/gator/prompts/gator.md` | Rendered top-level prompt template baked into the payload. |
 | `scripts/agents/gator/skills/gator-gate/SKILL.md` | In-sandbox gator state-machine skill. |
 | `scripts/agents/gator/logs/` | Background launch and supervisor logs. |
@@ -283,6 +284,7 @@ Read that file directly. Important markers:
 - `OpenAI Codex v...` plus `model: ...` confirms the Codex CLI and model actually used.
 - `OPENSHELL_AGENT_RESULT {...}` is the bounded-cycle sentinel. In watch mode, the supervisor sleeps and relaunches after this line.
 - `openshell-agent: still running watch cycle ...` is a heartbeat during long active model cycles.
+- `review_feedback_lookup_failed` means Gator could not build the required cross-SHA feedback ledger and deliberately skipped a context-free review.
 
 ### Inspect Active Sandboxes
 

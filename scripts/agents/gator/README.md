@@ -37,6 +37,7 @@ The launcher:
 - Enables `providers_v2_enabled`, `agent_policy_proposals_enabled`, and `proposal_approval_mode=auto` at gateway scope.
 - Uses the gator image policy copied to `/etc/openshell/policy.yaml`.
 - Installs the gator-specific `gh` wrapper from `gator/bin/gh` as `/usr/local/bin/gh` to prevent duplicate same-head-SHA gator dispositions.
+- Installs `gator/bin/review-feedback-ledger` as `/usr/local/bin/review-feedback-ledger` so every new-head review receives Gator inline threads, trusted replies, and resolution state.
 - Bakes `scripts/agents/gator/skills/gator-gate/SKILL.md` into `/etc/openshell/agent-payload`.
 - Bakes `.claude/agents/principal-engineer-reviewer.md` so the selected harness can run a deterministic independent reviewer execution through `/etc/openshell/agent-payload/runtime/subagent.sh principal-engineer-reviewer < task.md`.
 - For `--harness codex`, optionally bakes a host Codex executable as `/etc/openshell/agent-payload/runtime/harnesses/codex/codex`.
@@ -49,3 +50,10 @@ Set `GATOR_CODEX_ACCESS_CREDENTIAL_KEY` or pass `--codex-access-key` if the gato
 Use `--once` for a single reconciliation cycle. Use `--poll-interval <seconds>` to change the default 15-minute watch cadence.
 
 The launcher preserves existing gateway-owned Codex refresh material by default so multiple gator sandboxes do not overwrite each other's refresh-token lineage from host Codex auth. If gateway rotation fails, the launcher automatically resets gateway refresh material from host Codex auth and retries once. After `codex logout && codex login`, you can also pass `--reset-refresh` to force that reset before rotation.
+
+## Tests
+
+```shell
+bash scripts/agents/gator/bin/gh_guard_test.sh
+bash scripts/agents/gator/bin/review_feedback_ledger_test.sh
+```

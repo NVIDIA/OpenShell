@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  review-feedback-ledger OWNER REPO PR_NUMBER
+  review-feedback-ledger --input GRAPHQL_RESPONSE.json
+EOF
+}
+
+read_pages() {
+    if [[ "${1:-}" == "--input" ]]; then
+        [[ "$#" -eq 2 && -r "$2" ]] || {
+            usage
+            return 2
+        }
+        cat "$2"
+        return
+    fi
+
+    [[ "$#" -eq 3 ]] || {
+        usage
+        return 2
+    }
+
+    local owner="$1"
+    local repo="$2"
+    local pr_number="$3"
+    [[ "$owner" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+        echo "invalid repository owner" >&2
+        return 2
+    }
+    [[ "$repo" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+        echo "invalid repository name" >&2
+        return 2
+    }
+    [[ "$pr_number" =~ ^[0-9]+$ ]] || {
+        echo "invalid PR number" >&2
+        return 2
+    }
+
+    gh api graphql --paginate \
+        -f owner="$owner" \
+        -f repo="$repo" \
+        -F number="$pr_number" \
+        -f query='
+query(
+  $owner: String!
+  $repo: String!
+  $number: Int!
+  $endCursor: String
+) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      author {
+        login
+      }
+      reviewThreads(first: 100, after: $endCursor) {
+        nodes {
+          id
+          isResolved
+          isOutdated
+          path
+          line
+          resolvedBy {
+            login
+          }
+          comments(first: 100) {
+            nodes {
+              databaseId
+              author {
+                login
+              }
+              authorAssociation
+              body
+              createdAt
+              updatedAt
+              url
+              commit {
+                oid
+              }
+              replyTo {
+                databaseId
+              }
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+}'
+}
+
+read_pages "$@" | jq -s '
+    def pull_request:
+        .data.repository.pullRequest;
+    def is_gator_thread:
+        (.comments.nodes[0].body // "") | startswith("> **gator-agent**");
+    {
+        schema_version: 1,
+        pr_author: ([.[] | pull_request.author.login][0] // null),
+        threads: (
+            [
+                .[]
+                | pull_request.reviewThreads.nodes[]?
+                | select((.comments.nodes | length) > 0)
+                | select(is_gator_thread)
+                | {
+                    thread_id: .id,
+                    is_resolved: .isResolved,
+                    is_outdated: .isOutdated,
+                    path,
+                    line,
+                    resolved_by: (.resolvedBy.login // null),
+                    comments: [
+                        .comments.nodes[]
+                        | {
+                            id: .databaseId,
+                            author: (.author.login // null),
+                            author_association: .authorAssociation,
+                            body,
+                            created_at: .createdAt,
+                            updated_at: .updatedAt,
+                            url,
+                            commit_oid: (.commit.oid // null),
+                            reply_to: (.replyTo.databaseId // null)
+                        }
+                    ]
+                }
+            ]
+            | unique_by(.thread_id)
+        )
+    }
+    | if .pr_author == null then
+        error("pull request not found in GraphQL response")
+      else
+        .
+      end
+'

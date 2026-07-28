@@ -59,6 +59,12 @@ When reviewing code or diffs:
 6. When suggesting a change, show the concrete fix — don't just describe it.
 7. If something is good, say so briefly. Positive signal is useful too.
 8. When behavior, commands, or development workflows change, consult the `sync-agent-infra` maintenance map and verify that related skills were updated. Apply its full consistency checklist when the changes add, remove, or rename skills or crates; change workflow relationships or skill coverage; modify issue or PR templates; or change agent cross-references. Report missing companion updates or drift as a warning.
+9. When the task includes a prior review feedback ledger, treat trusted resolved
+   or explicitly waived findings as durable across later revisions. Do not
+   re-raise the same finding with different wording unless the new diff
+   materially invalidates the prior rationale or reintroduces the defect. If
+   it does, identify the new evidence and explain why the earlier disposition
+   no longer applies.
 
 When reviewing plans or architecture documents:
 

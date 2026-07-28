@@ -98,6 +98,29 @@ The disposition must mention the relevant trusted human response by author or ti
 
 If the current head SHA already has a marked gator disposition and the same-SHA rule prevents a public response, still inspect the trusted response internally. The cycle summary and `OPENSHELL_AGENT_RESULT` reason should say that a trusted author or maintainer response was seen and whether it appears to require a new commit, maintainer override, or no action. Do not describe the response as third-party when the actor is the PR author or a verified maintainer.
 
+### Durable review dispositions
+
+A resolved or explicitly waived finding is a durable review disposition across later head SHAs. A new commit permits a fresh review; it does not erase trusted feedback history.
+
+Before every fresh reviewer run, collect Gator-originated inline review threads, replies, resolution state, resolver, and commit context:
+
+```bash
+review-feedback-ledger NVIDIA OpenShell <pr-number> \
+  > /tmp/gator-review-feedback-ledger.json
+jq -e '.schema_version == 1 and (.threads | type == "array")' \
+  /tmp/gator-review-feedback-ledger.json >/dev/null
+```
+
+Treat the ledger as required reviewer input, not optional background:
+
+- Verify whether the PR author, resolver, or replying actor is trusted under the rules above.
+- A Gator thread resolved by a verified maintainer is addressed. If the resolver is only the PR author, inspect the trusted reply and latest diff to decide whether the finding was fixed; resolution alone does not grant a non-maintainer author waiver authority.
+- Preserve a verified maintainer's reply as the rationale. An explicit rejection such as "invalid", "intentional", "fine as implemented", or "won't fix" is a waiver, not an unanswered request.
+- An unresolved thread with an explicit verified-maintainer waiver is also waived. A non-maintainer author's disagreement remains context for review but does not override a maintainer-required change.
+- Do not re-raise a resolved or waived finding, or a semantically equivalent finding with different wording, merely because the head SHA changed.
+- Re-raise it only when the new diff materially invalidates the prior rationale or reintroduces the defect. State what changed since the resolution and why the earlier disposition no longer applies.
+- If the ledger lookup or validation fails, do not run a context-free reviewer. Return a transient supervised result. Use `github_transport_eof` for the transport failures described above; otherwise use `review_feedback_lookup_failed`.
+
 ## Labels
 
 There must be at most one `gator:*` label on an issue or PR at any time.
@@ -533,13 +556,15 @@ Use the `principal-engineer-reviewer` sub-agent. Include:
 
 - PR title, body, linked issues, labels, and files
 - Full diff or enough chunked diff context to review all changes
+- The complete JSON from `/tmp/gator-review-feedback-ledger.json`
+- An explicit instruction to honor trusted resolved and waived findings as durable across head SHAs, including semantically equivalent findings with different wording
 - Instruction to focus on correctness, regressions, security, maintainability, and missing tests
 - Instruction to check whether direct UX changes update the Fern docs under `docs/` and navigation when needed
 - Instruction to classify each actionable finding as either line-specific or general
 - For each line-specific finding, instruction to return the exact repository path, current-head diff line, side (`RIGHT` for an added/context line or `LEFT` for a deleted line), severity, and concise comment body
 - Instruction not to rely on local test execution
 
-When running inside the `scripts/agents/gator` sandbox launcher, invoke the reviewer command specified in the sandbox prompt. Use `task.md` for the subagent input. Put the PR metadata, linked issue context, and diff/file context in `task.md`, save the reviewer output, and use it as the independent review result. The main gator process remains responsible for labels, comments, docs gates, and CI monitoring. If the reviewer command exits nonzero or the saved reviewer output is absent or unusable, stop the cycle with the `reviewer_subagent_failed` transient result described above without changing GitHub labels or posting a public disposition.
+When running inside the `scripts/agents/gator` sandbox launcher, invoke the reviewer command specified in the sandbox prompt. Use `task.md` for the subagent input. Put the review feedback ledger, PR metadata, linked issue context, and diff/file context in `task.md`, save the reviewer output, and use it as the independent review result. The main gator process remains responsible for labels, comments, docs gates, and CI monitoring. Before posting, compare every proposed finding with the ledger and remove semantically equivalent resolved or waived findings unless the output identifies material new evidence that invalidates the earlier disposition. If the reviewer command exits nonzero or the saved reviewer output is absent or unusable, stop the cycle with the `reviewer_subagent_failed` transient result described above without changing GitHub labels or posting a public disposition.
 
 Post findings using these rules:
 
@@ -583,7 +608,7 @@ For validated PRs with direct user-facing UX changes, require Fern docs updates 
 
 If no blocking findings remain, decide whether E2E labels are needed, then move to `gator:watch-pipeline`.
 
-When resuming a PR already in `gator:in-review`, check whether gator review findings or trusted maintainer review comments are still unanswered. Ignore unacknowledged third-party comments and reviews. If the PR author has pushed commits, compare the latest commit SHA with the last gator-reviewed SHA; run a fresh review only when the SHA changed. If the PR author replied without pushing a new commit, do not re-review, repost findings, or post a same-SHA disposition; inspect the response internally and wait for a new commit or maintainer override. If CI changes state without a new commit, do not post a same-SHA CI update.
+When resuming a PR already in `gator:in-review`, check the review feedback ledger to determine whether gator findings or trusted maintainer review comments are still unanswered. Ignore unacknowledged third-party comments and reviews. If the PR author has pushed commits, compare the latest commit SHA with the last gator-reviewed SHA; run a fresh review only when the SHA changed, and carry every durable resolved or waived disposition into that review. If the PR author replied without pushing a new commit, do not re-review, repost findings, or post a same-SHA disposition; inspect the response internally and wait for a new commit or maintainer override. If CI changes state without a new commit, do not post a same-SHA CI update.
 
 If review feedback is waiting on the PR author for more than 48 business hours, post a single author nudge. Use the latest of these timestamps as the TTL start:
 
