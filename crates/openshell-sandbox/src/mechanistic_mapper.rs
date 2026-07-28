@@ -474,6 +474,15 @@ mod tests {
     }
 
     #[test]
+    fn test_security_notes_ephemeral_range_inclusive_boundary() {
+        // 49151 is just below the IANA ephemeral range; 49152 is the first
+        // ephemeral port and must be flagged.
+        assert!(!generate_security_notes("api.example.com", 49151, false).contains("ephemeral"));
+        assert!(generate_security_notes("api.example.com", 49152, false).contains("ephemeral"));
+        assert!(generate_security_notes("api.example.com", 65535, false).contains("ephemeral"));
+    }
+
+    #[test]
     fn test_security_notes_internal_ip_uses_canonical_classifier() {
         // RFC 1918 is 172.16.0.0/12 only: the old starts_with("172.") prefix
         // wrongly flagged 172.15/172.32 and missed CGNAT (100.64.0.0/10). #1777.

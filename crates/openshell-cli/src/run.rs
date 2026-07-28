@@ -6500,6 +6500,19 @@ pub async fn sandbox_policy_list_global(
     Ok(())
 }
 
+fn truncate_error_message(error: &str, max_bytes: usize) -> String {
+    if error.len() <= max_bytes {
+        return error.to_string();
+    }
+    // Back off to a char boundary: byte-index slicing panics on multi-byte
+    // UTF-8 in server-supplied error messages.
+    let mut end = max_bytes;
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &error[..end])
+}
+
 fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicyRevision]) {
     println!(
         "{:<8} {:<14} {:<12} {:<24} ERROR",
@@ -6507,22 +6520,8 @@ fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicy
     );
     for rev in revisions {
         let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
-        let hash_short = if rev.policy_hash.len() >= 12 {
-            &rev.policy_hash[..12]
-        } else {
-            &rev.policy_hash
-        };
-        let error_short = if rev.load_error.len() > 40 {
-            // Back off to a char boundary: byte-index slicing panics on
-            // multi-byte UTF-8 in server-supplied error messages.
-            let mut end = 40;
-            while !rev.load_error.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}...", &rev.load_error[..end])
-        } else {
-            rev.load_error.clone()
-        };
+        let hash_short = short_hash(&rev.policy_hash);
+        let error_short = truncate_error_message(&rev.load_error, 40);
         println!(
             "{:<8} {:<14} {:<12} {:<24} {}",
             rev.version,
@@ -8391,5 +8390,29 @@ mod tests {
         assert_eq!(json["policy_source"], "sandbox");
         assert!(json["revision"].is_null());
         assert!(json["policy"].is_null());
+    }
+
+    #[test]
+    fn truncate_error_message_leaves_short_input_unchanged() {
+        assert_eq!(
+            super::truncate_error_message("short error", 40),
+            "short error"
+        );
+    }
+
+    #[test]
+    fn truncate_error_message_backs_off_to_char_boundary() {
+        // 39 'a' + one 2-byte 'é' means byte 40 splits the multibyte char.
+        let error = "a".repeat(39) + "é";
+        let truncated = super::truncate_error_message(&error, 40);
+        assert!(
+            truncated.ends_with("..."),
+            "expected ellipsis, got {truncated:?}"
+        );
+        assert!(
+            !truncated.contains("é"),
+            "expected char boundary backoff, got {truncated:?}"
+        );
+        assert_eq!(truncated.len(), 39 + 3); // 39 ASCII chars + "..."
     }
 }

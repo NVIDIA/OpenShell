@@ -174,7 +174,14 @@ pub fn truncate_display(value: &str, max_width: usize) -> String {
 }
 
 pub fn short_hash(hash: &str) -> &str {
-    if hash.len() >= 12 { &hash[..12] } else { hash }
+    if hash.chars().count() <= 12 {
+        return hash;
+    }
+    // Slice at the 13th character boundary so multi-byte UTF-8 cannot panic.
+    hash.char_indices()
+        .nth(12)
+        .map(|(idx, _)| &hash[..idx])
+        .unwrap_or(hash)
 }
 
 pub fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
@@ -974,5 +981,28 @@ mod tests {
 
         let err = parse_duration_to_ms("\u{20ac}").expect_err("missing number should error");
         assert!(err.to_string().contains("invalid duration"));
+    }
+
+    #[test]
+    fn short_hash_returns_first_12_characters() {
+        assert_eq!(short_hash("abcdefghijkl"), "abcdefghijkl");
+        assert_eq!(short_hash("abcdefghijklm"), "abcdefghijkl");
+    }
+
+    #[test]
+    fn short_hash_leaves_short_input_unchanged() {
+        assert_eq!(short_hash("abc"), "abc");
+        assert_eq!(short_hash(""), "");
+    }
+
+    #[test]
+    fn short_hash_handles_multibyte_characters() {
+        // "aaaaaaaaaaaaé" is 14 bytes (12 'a' + one 2-byte 'é') and 13 chars.
+        // The old byte-slice at 12 would split 'é' and panic.
+        assert_eq!(short_hash("aaaaaaaaaaaaé"), "aaaaaaaaaaaa");
+        // A 12-char hash ending in a multi-byte char is returned unchanged.
+        assert_eq!(short_hash("aaaaaaaaaaaé"), "aaaaaaaaaaaé");
+        // All-multi-byte input still slices on a character boundary.
+        assert_eq!(short_hash("ééééééééééééé"), "éééééééééééé");
     }
 }
