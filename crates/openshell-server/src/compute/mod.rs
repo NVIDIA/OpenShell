@@ -663,10 +663,11 @@ impl ComputeRuntime {
     pub(crate) fn spawn_sandbox_claim_activation(
         &self,
         activator: Arc<dyn SupervisorBootstrapActivator>,
+        registration_rx: watch::Receiver<u64>,
         shutdown_rx: watch::Receiver<bool>,
     ) {
         if let Some(controller) = self.sandbox_claim_activation.clone() {
-            controller.spawn(activator, shutdown_rx);
+            controller.spawn(activator, registration_rx, shutdown_rx);
         }
     }
 

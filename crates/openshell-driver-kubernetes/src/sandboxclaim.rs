@@ -67,17 +67,21 @@ impl SandboxClaimActivationController {
     pub fn spawn(
         &self,
         activator: Arc<dyn SupervisorBootstrapActivator>,
+        registration_rx: watch::Receiver<u64>,
         shutdown_rx: watch::Receiver<bool>,
     ) {
         let controller = self.clone();
         tokio::spawn(async move {
-            controller.run(activator, shutdown_rx).await;
+            controller
+                .run(activator, registration_rx, shutdown_rx)
+                .await;
         });
     }
 
     async fn run(
         self,
         activator: Arc<dyn SupervisorBootstrapActivator>,
+        mut registration_rx: watch::Receiver<u64>,
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
         loop {
@@ -113,6 +117,7 @@ impl SandboxClaimActivationController {
             let mut activation_tasks = JoinSet::new();
             let mut in_flight = HashSet::new();
             let mut completed = HashSet::new();
+            let mut registration_notifications_open = true;
 
             info!(
                 namespace = %self.namespace,
@@ -126,6 +131,27 @@ impl SandboxClaimActivationController {
                     changed = shutdown_rx.changed() => {
                         if changed.is_err() || *shutdown_rx.borrow() {
                             return;
+                        }
+                    }
+                    changed = registration_rx.changed(), if registration_notifications_open => {
+                        if changed.is_err() {
+                            registration_notifications_open = false;
+                        } else {
+                            invalidate_claim_activation_state(
+                                &mut activation_tasks,
+                                &mut in_flight,
+                                &mut completed,
+                            );
+                            resync_claim_activations(
+                                &list_api,
+                                &managed_selector,
+                                &mut activation_tasks,
+                                &mut in_flight,
+                                &completed,
+                                self.clone(),
+                                activator.clone(),
+                            )
+                            .await;
                         }
                     }
                     event = stream.try_next() => match event {
@@ -173,35 +199,16 @@ impl SandboxClaimActivationController {
                         }
                     },
                     _ = resync.tick() => {
-                        match tokio::time::timeout(
-                            KUBE_API_TIMEOUT,
-                            list_api.list(&ListParams::default().labels(&managed_selector)),
+                        resync_claim_activations(
+                            &list_api,
+                            &managed_selector,
+                            &mut activation_tasks,
+                            &mut in_flight,
+                            &completed,
+                            self.clone(),
+                            activator.clone(),
                         )
-                        .await
-                        {
-                            Ok(Ok(claims)) => {
-                                for claim in claims.items {
-                                    schedule_claim_activation(
-                                        &mut activation_tasks,
-                                        &mut in_flight,
-                                        &completed,
-                                        self.clone(),
-                                        activator.clone(),
-                                        claim,
-                                    );
-                                }
-                            }
-                            Ok(Err(err)) => warn!(
-                                namespace = %self.namespace,
-                                error = %err,
-                                "Failed to resync SandboxClaims for warm-pool activation"
-                            ),
-                            Err(_) => warn!(
-                                namespace = %self.namespace,
-                                timeout_seconds = KUBE_API_TIMEOUT.as_secs(),
-                                "Timed out resyncing SandboxClaims for warm-pool activation"
-                            ),
-                        }
+                        .await;
                     }
                     task_result = activation_tasks.join_next(), if !activation_tasks.is_empty() => {
                         match task_result {
@@ -465,6 +472,57 @@ impl SandboxClaimActivationController {
                 controlled.len()
             )),
         }
+    }
+}
+
+fn invalidate_claim_activation_state(
+    tasks: &mut JoinSet<(String, bool)>,
+    in_flight: &mut HashSet<String>,
+    completed: &mut HashSet<String>,
+) {
+    tasks.abort_all();
+    *tasks = JoinSet::new();
+    in_flight.clear();
+    completed.clear();
+}
+
+async fn resync_claim_activations(
+    list_api: &Api<DynamicObject>,
+    managed_selector: &str,
+    tasks: &mut JoinSet<(String, bool)>,
+    in_flight: &mut HashSet<String>,
+    completed: &HashSet<String>,
+    controller: SandboxClaimActivationController,
+    activator: Arc<dyn SupervisorBootstrapActivator>,
+) {
+    match tokio::time::timeout(
+        KUBE_API_TIMEOUT,
+        list_api.list(&ListParams::default().labels(managed_selector)),
+    )
+    .await
+    {
+        Ok(Ok(claims)) => {
+            for claim in claims.items {
+                schedule_claim_activation(
+                    tasks,
+                    in_flight,
+                    completed,
+                    controller.clone(),
+                    activator.clone(),
+                    claim,
+                );
+            }
+        }
+        Ok(Err(err)) => warn!(
+            namespace = %controller.namespace,
+            error = %err,
+            "Failed to resync SandboxClaims for warm-pool activation"
+        ),
+        Err(_) => warn!(
+            namespace = %controller.namespace,
+            timeout_seconds = KUBE_API_TIMEOUT.as_secs(),
+            "Timed out resyncing SandboxClaims for warm-pool activation"
+        ),
     }
 }
 
@@ -887,6 +945,19 @@ mod tests {
             begin_claim_activation(&mut in_flight, &completed, &claim).as_deref(),
             Some("claim-a")
         );
+    }
+
+    #[test]
+    fn registration_change_invalidates_claim_activation_state() {
+        let mut tasks = JoinSet::new();
+        let mut in_flight = HashSet::from(["claim-in-flight".to_string()]);
+        let mut completed = HashSet::from(["claim-complete".to_string()]);
+
+        invalidate_claim_activation_state(&mut tasks, &mut in_flight, &mut completed);
+
+        assert!(tasks.is_empty());
+        assert!(in_flight.is_empty());
+        assert!(completed.is_empty());
     }
 
     fn sandbox_cr(name: &str, uid: &str, sandbox_id: &str, version: &'static str) -> DynamicObject {

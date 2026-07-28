@@ -17,6 +17,8 @@ use std::sync::Arc;
 use tonic::Status;
 use tracing::{info, warn};
 
+const ACTIVATION_SESSION_RETRY_ATTEMPTS: usize = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct WarmPodActivationTarget {
@@ -105,30 +107,46 @@ pub async fn activate_warm_pod<V>(
 where
     V: WarmPodActivationValidator + ?Sized,
 {
-    let pending = state
-        .supervisor_pod_registrations
-        .pending_identity(&target.instance_id)?;
-    let activation_result = async {
-        let validated = validator.validate(&target, &pending).await?;
-        ensure_validated_activation_matches_pending(&target, &pending, &validated)?;
-        mint_pod_activation(state, &validated.sandbox_id, "WarmPodActivation").await
-    }
-    .await;
-    let activation = match activation_result {
-        Ok(activation) => activation,
-        Err(status) => {
-            let stream_status = clone_status(&status);
-            state
-                .supervisor_pod_registrations
-                .fail_pending(&target.instance_id, stream_status)?;
-            return Err(status);
+    for _ in 0..ACTIVATION_SESSION_RETRY_ATTEMPTS {
+        let pending = state
+            .supervisor_pod_registrations
+            .pending_identity(&target.instance_id)?;
+        let activation_result = async {
+            let validated = validator.validate(&target, &pending.identity).await?;
+            ensure_validated_activation_matches_pending(&target, &pending.identity, &validated)?;
+            mint_pod_activation(state, &validated.sandbox_id, "WarmPodActivation").await
         }
-    };
+        .await;
+        let activation = match activation_result {
+            Ok(activation) => activation,
+            Err(status) => {
+                let stream_status = clone_status(&status);
+                match state.supervisor_pod_registrations.fail_if_session(
+                    &target.instance_id,
+                    pending.session_id,
+                    stream_status,
+                ) {
+                    Ok(()) => return Err(status),
+                    Err(replaced) if replaced.code() == tonic::Code::Aborted => continue,
+                    Err(delivery) => return Err(delivery),
+                }
+            }
+        };
 
-    state
-        .supervisor_pod_registrations
-        .activate(&target.instance_id, activation)?;
-    Ok(())
+        match state.supervisor_pod_registrations.activate_if_session(
+            &target.instance_id,
+            pending.session_id,
+            activation,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(replaced) if replaced.code() == tonic::Code::Aborted => {}
+            Err(status) => return Err(status),
+        }
+    }
+
+    Err(Status::aborted(
+        "supervisor registration changed repeatedly during activation",
+    ))
 }
 
 fn clone_status(status: &Status) -> Status {
@@ -233,6 +251,8 @@ mod tests {
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
     use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio_stream::StreamExt;
 
@@ -247,6 +267,32 @@ mod tests {
             _target: &WarmPodActivationTarget,
             _pending: &SupervisorBootstrapIdentity,
         ) -> Result<ValidatedWarmPodActivation, Status> {
+            Ok(self.validated.clone())
+        }
+    }
+
+    struct ReplaceRegistrationOnceValidator {
+        state: Arc<ServerState>,
+        replaced: AtomicBool,
+        replacement_stream:
+            Mutex<Option<crate::supervisor_pod_registration::PendingRegistrationStream>>,
+        validated: ValidatedWarmPodActivation,
+    }
+
+    #[async_trait]
+    impl WarmPodActivationValidator for ReplaceRegistrationOnceValidator {
+        async fn validate(
+            &self,
+            _target: &WarmPodActivationTarget,
+            _pending: &SupervisorBootstrapIdentity,
+        ) -> Result<ValidatedWarmPodActivation, Status> {
+            if !self.replaced.swap(true, Ordering::SeqCst) {
+                let stream = self
+                    .state
+                    .supervisor_pod_registrations
+                    .register_pending(pending_identity())?;
+                *self.replacement_stream.lock().unwrap() = Some(stream);
+            }
             Ok(self.validated.clone())
         }
     }
@@ -420,6 +466,95 @@ mod tests {
             .expect_err("duplicate activation must fail");
 
         assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn same_pod_uid_can_reregister_after_activation() {
+        let state = state_with_issuer().await;
+        let mut first_stream = state
+            .supervisor_pod_registrations
+            .register_pending(pending_identity())
+            .expect("register first process");
+        let validator = StaticValidator {
+            validated: validated_activation("sandbox-a"),
+        };
+
+        activate_warm_pod(&state, &validator, activation_target("sandbox-a"))
+            .await
+            .expect("activate first process");
+        let first = first_stream.next().await.unwrap().unwrap();
+
+        let mut restarted_stream = state
+            .supervisor_pod_registrations
+            .register_pending(pending_identity())
+            .expect("same pod UID must reregister");
+        activate_warm_pod(&state, &validator, activation_target("sandbox-a"))
+            .await
+            .expect("activate restarted process");
+        let restarted = restarted_stream.next().await.unwrap().unwrap();
+
+        assert_eq!(first.sandbox_id, restarted.sandbox_id);
+        assert!(!restarted.token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacement_pod_uid_can_activate_existing_sandbox() {
+        let state = state_with_issuer().await;
+        let mut replacement_identity = pending_identity();
+        replacement_identity.instance_id = "pod-uid-b".to_string();
+        replacement_identity.instance_name = "warm-pod-b".to_string();
+        let mut stream = state
+            .supervisor_pod_registrations
+            .register_pending(replacement_identity)
+            .expect("register replacement pod");
+        let validator = StaticValidator {
+            validated: ValidatedWarmPodActivation {
+                instance_id: "pod-uid-b".to_string(),
+                instance_name: "warm-pod-b".to_string(),
+                ..validated_activation("sandbox-a")
+            },
+        };
+        let target = WarmPodActivationTarget {
+            instance_id: "pod-uid-b".to_string(),
+            ..activation_target("sandbox-a")
+        };
+
+        activate_warm_pod(&state, &validator, target)
+            .await
+            .expect("activate replacement pod");
+        let activation = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(activation.sandbox_id, "sandbox-a");
+        assert!(!activation.token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn activation_retries_when_registration_changes_during_validation() {
+        let state = state_with_issuer().await;
+        let old_stream = state
+            .supervisor_pod_registrations
+            .register_pending(pending_identity())
+            .expect("register old process");
+        let validator = ReplaceRegistrationOnceValidator {
+            state: state.clone(),
+            replaced: AtomicBool::new(false),
+            replacement_stream: Mutex::new(None),
+            validated: validated_activation("sandbox-a"),
+        };
+
+        activate_warm_pod(&state, &validator, activation_target("sandbox-a"))
+            .await
+            .expect("replacement session should activate");
+        let mut replacement_stream = validator
+            .replacement_stream
+            .lock()
+            .unwrap()
+            .take()
+            .expect("replacement stream");
+        let activation = replacement_stream.next().await.unwrap().unwrap();
+
+        assert_eq!(activation.sandbox_id, "sandbox-a");
+        drop(old_stream);
     }
 
     #[tokio::test]

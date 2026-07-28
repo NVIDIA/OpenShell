@@ -235,14 +235,20 @@ activation require a broader common proof model.
 Claim activation is level-triggered rather than dependent on a single watch
 event. The controller periodically relists OpenShell-managed claims and retries
 failed watch streams, because a claim can become visible before its selected
-`Sandbox`, pod, or outbound supervisor registration. It reconciles different claims
-concurrently, deduplicates work by claim UID, and caps concurrency so one late
-registration or slow Kubernetes lookup cannot block activation for the
-namespace or create unbounded work.
+`Sandbox`, pod, or outbound supervisor registration. A newly authenticated
+warm-pod registration clears completed-claim hints and triggers an immediate
+relist, so both a restarted process with the same pod UID and a replacement pod
+with a new UID can reactivate against an existing claim. It reconciles different
+claims concurrently, deduplicates work by claim UID, and caps concurrency so
+one late registration or slow Kubernetes lookup cannot block activation for
+the namespace or create unbounded work.
 The gateway retains activated pod-UID tombstones for one hour to reject
 duplicate registration and activation races, then prunes them opportunistically
 on registry access so long-running gateways do not accumulate one entry per
-historical pod.
+historical pod. A new authenticated registration supersedes its pod-UID
+tombstone and receives a new local session ID. Activation and failure delivery
+are conditional on that session ID, preventing work started for an old process
+from consuming or terminating its replacement stream.
 Warm claim creation is idempotent by the deterministic claim name. After a
 create timeout, transport failure, server error, or conflict, the driver reads
 that name back and retries the same claim create when it is not yet visible. It

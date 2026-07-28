@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
@@ -25,10 +25,22 @@ use tracing::{debug, info, warn};
 
 const ACTIVATED_TOMBSTONE_TTL: Duration = Duration::from_secs(60 * 60);
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SupervisorPodRegistrationRegistry {
     inner: Mutex<Inner>,
     next_session_id: AtomicU64,
+    registration_generation: watch::Sender<u64>,
+}
+
+impl Default for SupervisorPodRegistrationRegistry {
+    fn default() -> Self {
+        let (registration_generation, _) = watch::channel(0);
+        Self {
+            inner: Mutex::new(Inner::default()),
+            next_session_id: AtomicU64::new(0),
+            registration_generation,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -45,10 +57,21 @@ struct PendingRegistration {
     registered_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingRegistrationSnapshot {
+    pub identity: SupervisorBootstrapIdentity,
+    pub session_id: u64,
+}
+
 impl SupervisorPodRegistrationRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.registration_generation.subscribe()
     }
 
     #[allow(clippy::result_large_err)]
@@ -73,11 +96,7 @@ impl SupervisorPodRegistrationRegistry {
         let replaced = {
             let mut inner = self.inner.lock().expect("pending pod registry poisoned");
             prune_activated_tombstones(&mut inner, now);
-            if inner.activated_instance_id.contains_key(&instance_id) {
-                return Err(Status::already_exists(
-                    "supervisor instance has already been activated",
-                ));
-            }
+            inner.activated_instance_id.remove(&instance_id);
             inner
                 .pending_by_instance_id
                 .insert(
@@ -91,6 +110,8 @@ impl SupervisorPodRegistrationRegistry {
                 )
                 .is_some()
         };
+        self.registration_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
 
         if replaced {
             info!(
@@ -122,7 +143,7 @@ impl SupervisorPodRegistrationRegistry {
     pub(crate) fn pending_identity(
         &self,
         instance_id: &str,
-    ) -> Result<SupervisorBootstrapIdentity, Status> {
+    ) -> Result<PendingRegistrationSnapshot, Status> {
         let mut inner = self.inner.lock().expect("pending pod registry poisoned");
         prune_activated_tombstones(&mut inner, Instant::now());
         if inner.activated_instance_id.contains_key(instance_id) {
@@ -133,14 +154,18 @@ impl SupervisorPodRegistrationRegistry {
         inner
             .pending_by_instance_id
             .get(instance_id)
-            .map(|pending| pending.identity.clone())
+            .map(|pending| PendingRegistrationSnapshot {
+                identity: pending.identity.clone(),
+                session_id: pending.session_id,
+            })
             .ok_or_else(|| Status::not_found("pending supervisor registration not found"))
     }
 
     #[allow(clippy::result_large_err)]
-    pub(crate) fn activate(
+    pub(crate) fn activate_if_session(
         &self,
         instance_id: &str,
+        session_id: u64,
         activation: PodActivationMessage,
     ) -> Result<(), Status> {
         let now = Instant::now();
@@ -152,7 +177,7 @@ impl SupervisorPodRegistrationRegistry {
                     "supervisor instance has already been activated",
                 ));
             }
-            let Some(pending) = inner.pending_by_instance_id.remove(instance_id) else {
+            let Some(current) = inner.pending_by_instance_id.get(instance_id) else {
                 debug!(
                     instance_id = %instance_id,
                     "no pending supervisor registration to activate"
@@ -161,6 +186,15 @@ impl SupervisorPodRegistrationRegistry {
                     "pending supervisor registration not found",
                 ));
             };
+            if current.session_id != session_id {
+                return Err(Status::aborted(
+                    "pending supervisor registration was replaced",
+                ));
+            }
+            let pending = inner
+                .pending_by_instance_id
+                .remove(instance_id)
+                .expect("pending registration checked above");
             inner
                 .activated_instance_id
                 .insert(instance_id.to_string(), now);
@@ -191,13 +225,28 @@ impl SupervisorPodRegistrationRegistry {
     }
 
     #[allow(clippy::result_large_err)]
-    pub(crate) fn fail_pending(&self, instance_id: &str, status: Status) -> Result<(), Status> {
+    pub(crate) fn fail_if_session(
+        &self,
+        instance_id: &str,
+        session_id: u64,
+        status: Status,
+    ) -> Result<(), Status> {
         let pending = {
             let mut inner = self.inner.lock().expect("pending pod registry poisoned");
             prune_activated_tombstones(&mut inner, Instant::now());
             if inner.activated_instance_id.contains_key(instance_id) {
                 return Err(Status::already_exists(
                     "supervisor instance has already been activated",
+                ));
+            }
+            let Some(current) = inner.pending_by_instance_id.get(instance_id) else {
+                return Err(Status::not_found(
+                    "pending supervisor registration not found",
+                ));
+            };
+            if current.session_id != session_id {
+                return Err(Status::aborted(
+                    "pending supervisor registration was replaced",
                 ));
             }
             inner.pending_by_instance_id.remove(instance_id)
@@ -317,6 +366,16 @@ mod tests {
         }
     }
 
+    fn activation() -> PodActivationMessage {
+        PodActivationMessage {
+            sandbox_id: "sandbox-a".to_string(),
+            sandbox_name: "sandbox-a".to_string(),
+            token: "token-a".to_string(),
+            token_expires_at_ms: 123,
+            startup_metadata: HashMap::default(),
+        }
+    }
+
     #[test]
     fn dropping_stream_removes_pending_registration() {
         let registry = Arc::new(SupervisorPodRegistrationRegistry::new());
@@ -356,15 +415,9 @@ mod tests {
             .register_pending(bootstrap_identity("pod-uid-a"))
             .expect("register pending");
 
-        let activation = PodActivationMessage {
-            sandbox_id: "sandbox-a".to_string(),
-            sandbox_name: "sandbox-a".to_string(),
-            token: "token-a".to_string(),
-            token_expires_at_ms: 123,
-            startup_metadata: HashMap::default(),
-        };
+        let pending = registry.pending_identity("pod-uid-a").unwrap();
         registry
-            .activate("pod-uid-a", activation)
+            .activate_if_session("pod-uid-a", pending.session_id, activation())
             .expect("activate");
         assert_eq!(registry.pending_count(), 0);
         assert_eq!(registry.activated_count(), 1);
@@ -381,49 +434,36 @@ mod tests {
     #[test]
     fn activation_for_unknown_pod_uid_returns_not_found() {
         let registry = Arc::new(SupervisorPodRegistrationRegistry::new());
-        let activation = PodActivationMessage {
-            sandbox_id: "sandbox-a".to_string(),
-            sandbox_name: "sandbox-a".to_string(),
-            token: "token-a".to_string(),
-            token_expires_at_ms: 123,
-            startup_metadata: HashMap::default(),
-        };
-
         let err = registry
-            .activate("pod-uid-a", activation)
+            .activate_if_session("pod-uid-a", 0, activation())
             .expect_err("unknown pod UID must fail");
 
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
-    async fn activation_tombstone_rejects_duplicate_activation_and_registration() {
+    async fn activation_tombstone_rejects_duplicate_activation_until_reregistration() {
         let registry = Arc::new(SupervisorPodRegistrationRegistry::new());
         let mut stream = registry
             .register_pending(bootstrap_identity("pod-uid-a"))
             .expect("register pending");
 
-        let activation = PodActivationMessage {
-            sandbox_id: "sandbox-a".to_string(),
-            sandbox_name: "sandbox-a".to_string(),
-            token: "token-a".to_string(),
-            token_expires_at_ms: 123,
-            startup_metadata: HashMap::default(),
-        };
+        let pending = registry.pending_identity("pod-uid-a").unwrap();
         registry
-            .activate("pod-uid-a", activation.clone())
+            .activate_if_session("pod-uid-a", pending.session_id, activation())
             .expect("activate");
         let _ = stream.next().await.expect("activation message");
 
         let err = registry
-            .activate("pod-uid-a", activation)
+            .activate_if_session("pod-uid-a", pending.session_id, activation())
             .expect_err("duplicate activation must fail");
         assert_eq!(err.code(), tonic::Code::AlreadyExists);
 
-        let Err(err) = registry.register_pending(bootstrap_identity("pod-uid-a")) else {
-            panic!("activated pod UID must not register again");
-        };
-        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        let replacement = registry
+            .register_pending(bootstrap_identity("pod-uid-a"))
+            .expect("new registration supersedes tombstone");
+        assert_eq!(registry.activated_count(), 0);
+        drop(replacement);
     }
 
     #[test]
@@ -457,17 +497,80 @@ mod tests {
             .expect("register pending");
         drop(stream);
 
-        let activation = PodActivationMessage {
-            sandbox_id: "sandbox-a".to_string(),
-            sandbox_name: "sandbox-a".to_string(),
-            token: "token-a".to_string(),
-            token_expires_at_ms: 123,
-            startup_metadata: HashMap::default(),
-        };
         let err = registry
-            .activate("pod-uid-a", activation)
+            .activate_if_session("pod-uid-a", 0, activation())
             .expect_err("closed stream should remove pending registration");
 
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn stale_session_cannot_activate_replacement_stream() {
+        let registry = Arc::new(SupervisorPodRegistrationRegistry::new());
+        let old_stream = registry
+            .register_pending(bootstrap_identity("pod-uid-a"))
+            .expect("register old");
+        let old = registry.pending_identity("pod-uid-a").unwrap();
+        let mut replacement_stream = registry
+            .register_pending(bootstrap_identity("pod-uid-a"))
+            .expect("register replacement");
+        let replacement = registry.pending_identity("pod-uid-a").unwrap();
+
+        let err = registry
+            .activate_if_session("pod-uid-a", old.session_id, activation())
+            .expect_err("stale session must not activate replacement");
+        assert_eq!(err.code(), tonic::Code::Aborted);
+        assert_eq!(registry.pending_count(), 1);
+
+        registry
+            .activate_if_session("pod-uid-a", replacement.session_id, activation())
+            .expect("activate replacement");
+        assert!(replacement_stream.next().await.unwrap().is_ok());
+        drop(old_stream);
+    }
+
+    #[tokio::test]
+    async fn stale_session_cannot_fail_replacement_stream() {
+        let registry = Arc::new(SupervisorPodRegistrationRegistry::new());
+        let old_stream = registry
+            .register_pending(bootstrap_identity("pod-uid-a"))
+            .expect("register old");
+        let old = registry.pending_identity("pod-uid-a").unwrap();
+        let mut replacement_stream = registry
+            .register_pending(bootstrap_identity("pod-uid-a"))
+            .expect("register replacement");
+        let replacement = registry.pending_identity("pod-uid-a").unwrap();
+
+        let err = registry
+            .fail_if_session(
+                "pod-uid-a",
+                old.session_id,
+                Status::permission_denied("stale failure"),
+            )
+            .expect_err("stale session must not fail replacement");
+        assert_eq!(err.code(), tonic::Code::Aborted);
+
+        registry
+            .activate_if_session("pod-uid-a", replacement.session_id, activation())
+            .expect("activate replacement");
+        assert!(replacement_stream.next().await.unwrap().is_ok());
+        drop(old_stream);
+    }
+
+    #[tokio::test]
+    async fn registrations_increment_coalescing_generation() {
+        let registry = Arc::new(SupervisorPodRegistrationRegistry::new());
+        let mut generation = registry.subscribe();
+
+        let first = registry
+            .register_pending(bootstrap_identity("pod-uid-a"))
+            .expect("register first");
+        let second = registry
+            .register_pending(bootstrap_identity("pod-uid-b"))
+            .expect("register second");
+
+        generation.changed().await.expect("generation change");
+        assert_eq!(*generation.borrow_and_update(), 2);
+        drop((first, second));
     }
 }
