@@ -35,7 +35,7 @@ Provider profile policy composition is controlled by the gateway-level `provider
 openshell settings set --global --key providers_v2_enabled --value true
 ```
 
-When the setting is disabled or unset, providers keep the existing credential-only behavior. Sandboxes still receive provider credential placeholders, but attached provider profiles do not add network policy entries to the effective policy.
+When the setting is disabled or unset, attached provider profiles do not add network policy entries to the effective policy. Static provider credential placeholders still use the profile endpoints as a resolution boundary.
 
 To disable provider profile policy composition, delete the setting:
 
@@ -44,7 +44,7 @@ openshell settings delete --global --key providers_v2_enabled
 ```
 
 <Note>
-The feature flag controls provider-derived policy layers. OpenShell still supports placeholder environment variables for provider credentials, and provider profiles can also declare dynamic token grants that the sandbox proxy resolves on demand for matching HTTP endpoints.
+The feature flag controls provider-derived policy layers. It does not disable endpoint binding for static credential placeholders. Provider profiles can also declare dynamic token grants that the sandbox proxy resolves on demand for matching HTTP endpoints.
 </Note>
 
 ## Available Features
@@ -62,6 +62,7 @@ Providers v2 currently includes these user-facing features:
 - Credential refresh configuration with `openshell provider refresh status|configure|rotate|delete`.
 - Credential expiry metadata with `openshell provider update --credential-expires-at`; values accept Unix epoch milliseconds or ISO/RFC3339 timestamps.
 - Dynamic token grants that use the sandbox's SPIFFE JWT-SVID as an OAuth2 client assertion and inject short-lived tokens into supported headers for matching profile endpoints.
+- Endpoint-bound static credential placeholders. The sandbox proxy resolves a static credential only for request hosts, ports, and paths declared by its provider profile.
 
 ## Roadmap
 
@@ -70,7 +71,7 @@ The following Providers v2 design items are not part of the current behavior:
 | Roadmap item | Current behavior |
 |---|---|
 | General profile-driven credential placement | Static `auth_style`, `header_name`, `query_param`, and `path_template` placement metadata is stored and validated, but static credential injection still depends on environment placeholders generated from provider credentials. Dynamic `token_grant` credentials support `bearer` and `header` placement for matching HTTP endpoints. |
-| Endpoint and binary scoped credential injection | Provider profile endpoints and binaries affect policy composition. Dynamic token grants are endpoint-scoped. Static placeholder injection is not yet restricted by profile endpoint or binary metadata. |
+| Binary-scoped credential injection | Provider profile binaries affect policy composition but do not yet restrict placeholder resolution by calling binary. Static and dynamic credentials are endpoint-scoped. |
 | Credential verification on create | `openshell provider create` does not yet probe provider verification endpoints or expose `--no-verify`. |
 | Automatic credential scope extraction | OpenShell does not yet inspect upstream provider responses to discover credential scopes. |
 | Inference mounting from attached providers | `inference_capable` is profile metadata. Attaching an inference-capable provider does not yet create `inference.local` routes. |
@@ -445,6 +446,8 @@ Use an ISO/RFC3339 timestamp or Unix epoch milliseconds. Use `0` as the timestam
 
 OpenShell skips expired provider credentials when it builds a sandbox provider environment. Running sandboxes also reject expired retained credential generations during placeholder resolution, so stale placeholders fail closed instead of forwarding unresolved or expired credential material.
 
+The gateway sends a complete host, port, and path binding for every static credential key. Supervisors reject incomplete binding metadata and clear previously active provider material when a refresh fails validation. A credential used at a different endpoint returns HTTP 403 and produces secret-safe security telemetry.
+
 ## Configure Credential Refresh
 
 Refresh configuration is stored separately from the current injectable credential value. The gateway refresh worker reads refresh state, mints a new short-lived token for supported strategies, writes the token back to the provider record, and updates credential expiry metadata.
@@ -585,7 +588,7 @@ openshell sandbox create \
   -- claude
 ```
 
-When `providers_v2_enabled=true`, each attached provider with a matching profile contributes a provider policy layer to the sandbox effective policy. The base policy is the user-authored sandbox policy that you can edit and apply. The effective policy is the composed policy that the sandbox enforces: base policy plus provider policy layers. When the setting is disabled, the sandbox receives provider credentials but not provider-derived policy entries.
+When `providers_v2_enabled=true`, each attached provider with a matching profile contributes a provider policy layer to the sandbox effective policy. The base policy is the user-authored sandbox policy that you can edit and apply. The effective policy is the composed policy that the sandbox enforces: base policy plus provider policy layers. When the setting is disabled, the sandbox still receives endpoint-bound provider credentials but not provider-derived policy entries.
 
 Updating a custom provider profile affects every provider instance whose `type` matches that profile ID. Provider instances are not rewritten, and sandbox-authored policies are not modified. Running sandboxes observe the updated provider-derived policy on their next config sync. If a gateway-global policy is active, provider-derived policy layers remain suppressed.
 
@@ -730,9 +733,9 @@ Provider attach and detach update the persisted sandbox provider list. Running s
 
 The policy effect applies to future effective policy reads after the sandbox observes the update. The credential environment effect applies only to new process launches after the update is observed, such as later SSH, exec, or SFTP sessions.
 
-Already-running processes keep the environment they started with. OpenShell does not mutate a live process environment after provider attach, detach, or credential update. If a long-running process needs a newly attached provider credential placeholder, restart that process or launch a new process after the sandbox has observed the provider update.
+Already-running processes keep the placeholder environment they started with. OpenShell does not mutate a live process environment after provider attach, detach, or credential update. The proxy resolves existing placeholders against current credentials and bindings, so rotation, expiry, endpoint changes, and detach take effect without restarting the process. If a long-running process needs a newly attached provider credential placeholder, restart that process or launch a new process after the sandbox has observed the provider update.
 
-Detaching a provider removes its provider policy layer from future effective policy reads and removes its credential placeholders from future process environments. It does not remove environment variables from already-running processes.
+Detaching a provider removes its provider policy layer from future effective policy reads, revokes resolution for its existing placeholders, and removes its credential placeholders from future process environments. It does not remove the placeholder strings from already-running process environments.
 
 OpenShell rejects provider updates and refresh configuration when they would make two providers attached to the same sandbox expose the same active credential environment key. It also rejects attached provider sets with ambiguous dynamic token grants at equal host/path specificity. Use provider-specific credential names and make one dynamic grant selector more specific when one sandbox needs multiple providers with overlapping upstream concepts.
 

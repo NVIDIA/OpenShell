@@ -122,7 +122,15 @@ Bare `KEY` reads the value from the environment variable of that name and avoids
 
 Other credential sources are `--from-gcloud-adc` for compatible profiles and `--runtime-credentials` when the gateway or sandbox resolves the required credentials at runtime.
 
-Profile-backed provider policy and composition are controlled by the gateway-global `providers_v2_enabled` setting:
+Static provider credentials resolve only for hosts, ports, and paths declared by
+the provider profile. Use `provider profile export` to inspect that boundary
+when a placeholder is present but requests receive
+`credential_endpoint_mismatch`. A profileless static provider fails closed
+because the gateway cannot construct a binding.
+
+Profile-backed provider policy composition is controlled by the gateway-global
+`providers_v2_enabled` setting. Static credential endpoint binding remains
+active even when policy composition is disabled:
 
 ```bash
 openshell settings get --global
