@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::sandbox::SandboxGuard;
-use tempfile::NamedTempFile;
+use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -157,7 +157,10 @@ fn write_binding_profile(
     host: &str,
     port: u16,
 ) -> Result<NamedTempFile, String> {
-    let mut file = NamedTempFile::new().map_err(|e| format!("create provider profile: {e}"))?;
+    let mut file = TempFileBuilder::new()
+        .suffix(".yaml")
+        .tempfile()
+        .map_err(|e| format!("create provider profile: {e}"))?;
     let profile = format!(
         r#"id: {id}
 display_name: {display_name}
@@ -208,13 +211,13 @@ network_policies:
     endpoints:
       - host: host.openshell.internal
         port: {port}
-        allowed_ips: ["10.0.0.0/8", "172.0.0.0/8", "192.168.0.0/16", "fc00::/7"]
+        path: /allowed/**
         protocol: rest
         access: full
         enforcement: enforce
       - host: host.docker.internal
         port: {port}
-        allowed_ips: ["10.0.0.0/8", "172.0.0.0/8", "192.168.0.0/16", "fc00::/7"]
+        path: /allowed/**
         protocol: rest
         access: full
         enforcement: enforce
@@ -447,12 +450,18 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
     .await
     .expect("run endpoint-binding requests");
 
+    let logs = wait_for_sandbox_logs(&guard.name, |logs| {
+        logs.contains("openshell.provider_credential.endpoint_mismatch")
+            && logs.contains("credential_endpoint_mismatch")
+    })
+    .await
+    .expect("fetch endpoint mismatch logs");
     assert!(
         guard
             .create_output
             .contains(r#"ALLOWED={"authorized":true}"#),
-        "credential should resolve at the bound endpoint:\n{}",
-        guard.create_output
+        "credential should resolve at the bound endpoint:\n{}\nlogs:\n{logs}",
+        guard.create_output,
     );
     assert!(
         guard.create_output.contains("DENIED=403"),
@@ -460,12 +469,6 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
         guard.create_output
     );
 
-    let logs = wait_for_sandbox_logs(&guard.name, |logs| {
-        logs.contains("openshell.provider_credential.endpoint_mismatch")
-            && logs.contains("credential_endpoint_mismatch")
-    })
-    .await
-    .expect("fetch endpoint mismatch logs");
     assert!(
         logs.contains("openshell.provider_credential.endpoint_mismatch")
             && logs.contains("credential_endpoint_mismatch"),
