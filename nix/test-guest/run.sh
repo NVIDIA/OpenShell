@@ -425,6 +425,11 @@ else
 	echo "==> Reusing cached configuration: ${configurations[*]:-base image}"
 fi
 
+# Configuration may change the test user's groups. Close the SSH control
+# connection established before provisioning so subsequent commands start with
+# the guest's current credentials.
+ssh "${ssh_args[@]}" -O exit openshell@127.0.0.1 >/dev/null 2>&1 || true
+
 for package in "${packages[@]}"; do
 	package_name=$(basename "${package}")
 	if [[ ! ${package_name} =~ ^[A-Za-z0-9._+~-]+$ ]]; then

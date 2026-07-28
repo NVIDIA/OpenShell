@@ -22,9 +22,11 @@
         update_cache: true
       when: ansible_facts.distribution == "Ubuntu"
 
-    - name: Install Podman
+    - name: Install Podman dependencies
       ansible.builtin.package:
-        name: podman
+        name:
+          - podman
+          - socat
         state: present
 
     - name: Enable the rootless Podman API socket
