@@ -1697,9 +1697,6 @@ async fn handle_update_config_inner(
         require_platform_admin(&state.admin_role, principal)?;
         String::new()
     } else {
-        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-            .await?
-            .name;
         let min_role = if sandbox_caller {
             MinWorkspaceRole::User
         } else {
@@ -1709,11 +1706,13 @@ async fn handle_update_config_inner(
             &state.store,
             &state.admin_role,
             principal,
-            &workspace,
+            &req.workspace,
             min_role,
         )
         .await?;
-        workspace
+        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+            .await?
+            .name
     };
     if sandbox_caller {
         validate_sandbox_caller_update(&req)?;
@@ -2330,18 +2329,17 @@ pub(super) async fn handle_get_sandbox_policy_status(
         require_platform_admin(&state.admin_role, &principal)?;
         String::new()
     } else {
-        let ws = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-            .await?
-            .name;
-        authorize_workspace(
+        let authz = authorize_workspace(
             &state.store,
             &state.admin_role,
             &principal,
-            &ws,
+            &req.workspace,
             MinWorkspaceRole::User,
         )
         .await?;
-        ws
+        super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+            .await?
+            .name
     };
 
     let (policy_id, active_version) = if req.global {
@@ -2399,18 +2397,17 @@ pub(super) async fn handle_list_sandbox_policies(
         require_platform_admin(&state.admin_role, &principal)?;
         String::new()
     } else {
-        let ws = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-            .await?
-            .name;
-        authorize_workspace(
+        let authz = authorize_workspace(
             &state.store,
             &state.admin_role,
             &principal,
-            &ws,
+            &req.workspace,
             MinWorkspaceRole::User,
         )
         .await?;
-        ws
+        super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+            .await?
+            .name
     };
 
     let policy_id = if req.global {
@@ -2954,17 +2951,17 @@ pub(super) async fn handle_get_draft_policy(
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
     authorize_sandbox_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::User,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3035,17 +3032,17 @@ async fn handle_approve_draft_chunk_inner(
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3147,17 +3144,17 @@ async fn handle_reject_draft_chunk_inner(
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3257,17 +3254,17 @@ async fn handle_approve_all_draft_chunks_inner(
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3391,17 +3388,17 @@ pub(super) async fn handle_edit_draft_chunk(
 ) -> Result<Response<EditDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3467,17 +3464,17 @@ async fn handle_undo_draft_chunk_inner(
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3564,17 +3561,17 @@ pub(super) async fn handle_clear_draft_chunks(
 ) -> Result<Response<ClearDraftChunksResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3612,17 +3609,17 @@ pub(super) async fn handle_get_draft_history(
 ) -> Result<Response<GetDraftHistoryResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::User,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }

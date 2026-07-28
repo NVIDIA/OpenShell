@@ -1355,17 +1355,17 @@ pub(super) async fn handle_create_provider(
 ) -> Result<Response<ProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .ensure_active()?;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .ensure_active()?;
     let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
             "custom",
@@ -1413,17 +1413,17 @@ pub(super) async fn handle_get_provider(
 ) -> Result<Response<ProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::User,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     let provider = get_provider_record(state.store.as_ref(), &workspace, &req.name).await?;
 
     Ok(Response::new(ProviderResponse {
@@ -1453,18 +1453,17 @@ pub(super) async fn handle_list_providers(
             .map_err(|e| Status::internal(format!("list providers failed: {e}")))?;
         all.into_iter().map(redact_provider_credentials).collect()
     } else {
-        let workspace =
-            super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
-                .await?
-                .name;
-        authorize_workspace(
+        let authz = authorize_workspace(
             &state.store,
             &state.admin_role,
             &principal,
-            &workspace,
+            &request.workspace,
             MinWorkspaceRole::User,
         )
         .await?;
+        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+            .await?
+            .name;
         list_provider_records(state.store.as_ref(), &workspace, limit, request.offset).await?
     };
 
@@ -2391,17 +2390,17 @@ pub(super) async fn handle_update_provider(
 ) -> Result<Response<ProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
             "custom",
@@ -2449,17 +2448,17 @@ pub(super) async fn handle_get_provider_refresh_status(
 ) -> Result<Response<GetProviderRefreshStatusResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &request.workspace,
         MinWorkspaceRole::User,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     if request.provider.trim().is_empty() {
         return Err(Status::invalid_argument("provider is required"));
     }
@@ -2502,17 +2501,17 @@ pub(super) async fn handle_configure_provider_refresh(
 ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &request.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();
     if provider_name.is_empty() {
@@ -2800,17 +2799,17 @@ pub(super) async fn handle_rotate_provider_credential(
 ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &request.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();
     if provider_name.is_empty() {
@@ -2868,17 +2867,17 @@ pub(super) async fn handle_delete_provider_refresh(
 ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &request.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();
     if provider_name.is_empty() {
@@ -2945,17 +2944,17 @@ pub(super) async fn handle_delete_provider(
 ) -> Result<Response<DeleteProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     let name = req.name;
     let provider_profile = provider_profile_for_name(state.store.as_ref(), &workspace, &name).await;
     let result = delete_provider_record(state.store.as_ref(), &workspace, &name).await;

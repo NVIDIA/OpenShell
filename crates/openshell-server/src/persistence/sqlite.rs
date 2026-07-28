@@ -534,6 +534,40 @@ LIMIT ?4 OFFSET ?5
         Ok(rows.into_iter().map(row_to_object_record).collect())
     }
 
+    pub async fn list_with_membership_and_selector(
+        &self,
+        object_type: &str,
+        member_type: &str,
+        member_name: &str,
+        label_selector: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        use super::parse_label_selector;
+
+        let required_labels = parse_label_selector(label_selector)?;
+        let all_records = self
+            .list_with_membership(object_type, member_type, member_name, u32::MAX, 0)
+            .await?;
+
+        let filtered: Vec<ObjectRecord> = all_records
+            .into_iter()
+            .filter(|record| {
+                let labels_json = record.labels.as_deref().unwrap_or("{}");
+                let labels: std::collections::HashMap<String, String> =
+                    serde_json::from_str(labels_json).unwrap_or_default();
+
+                required_labels
+                    .iter()
+                    .all(|(key, value)| labels.get(key).is_some_and(|v| v == value))
+            })
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+
+        Ok(filtered)
+    }
+
     pub async fn list_by_scope(
         &self,
         object_type: &str,

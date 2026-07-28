@@ -334,10 +334,9 @@ pub(super) async fn handle_list_sandboxes(
             MinWorkspaceRole::User,
         )
         .await?;
-        let workspace =
-            super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
-                .await?
-                .name;
+        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+            .await?
+            .name;
         if request.label_selector.is_empty() {
             state
                 .store

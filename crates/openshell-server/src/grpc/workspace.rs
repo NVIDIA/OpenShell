@@ -276,15 +276,17 @@ pub(super) async fn handle_list_workspaces(
             .list_messages_with_membership::<Workspace>(member_type, subject, limit, req.offset)
             .await
             .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
-        Some(subject) => {
-            let all: Vec<Workspace> = state
-                .store
-                .list_messages_with_membership(member_type, subject, MAX_PAGE_SIZE, 0)
-                .await
-                .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?;
-            crate::persistence::filter_by_labels(all, &req.label_selector, limit, req.offset)
-                .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?
-        }
+        Some(subject) => state
+            .store
+            .list_messages_with_membership_and_selector::<Workspace>(
+                member_type,
+                subject,
+                &req.label_selector,
+                limit,
+                req.offset,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
         None if req.label_selector.is_empty() => state
             .store
             .list_messages("", limit, req.offset)
@@ -461,17 +463,17 @@ pub(super) async fn handle_add_workspace_member(
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
 
-    let workspace = resolve_workspace(&state.store, &req.workspace)
-        .await?
-        .ensure_active()?;
     let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = resolve_workspace(&state.store, &authz.workspace)
+        .await?
+        .ensure_active()?;
 
     if req.principal_subject.is_empty() {
         return Err(Status::invalid_argument("principal_subject is required"));
@@ -567,15 +569,17 @@ pub(super) async fn handle_remove_workspace_member(
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
 
-    let workspace = resolve_workspace(&state.store, &req.workspace).await?.name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::Admin,
     )
     .await?;
+    let workspace = resolve_workspace(&state.store, &authz.workspace)
+        .await?
+        .name;
 
     if req.principal_subject.is_empty() {
         return Err(Status::invalid_argument("principal_subject is required"));
@@ -601,15 +605,17 @@ pub(super) async fn handle_list_workspace_members(
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
 
-    let workspace = resolve_workspace(&state.store, &req.workspace).await?.name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::User,
     )
     .await?;
+    let workspace = resolve_workspace(&state.store, &authz.workspace)
+        .await?
+        .name;
 
     let limit = clamp_limit(req.limit, 100, MAX_PAGE_SIZE);
 

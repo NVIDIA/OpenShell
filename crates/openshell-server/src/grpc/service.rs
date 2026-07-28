@@ -28,17 +28,17 @@ pub(super) async fn handle_expose_service(
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .ensure_active()?;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::User,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .ensure_active()?;
     validate_endpoint_name("sandbox", &req.sandbox, MAX_SANDBOX_NAME_LEN)?;
     validate_optional_endpoint_name("service", &req.service, MAX_SERVICE_NAME_LEN)?;
     if req.target_port == 0 || req.target_port > u32::from(u16::MAX) {
@@ -147,17 +147,17 @@ pub(super) async fn handle_get_service(
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::User,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     validate_endpoint_name("sandbox", &req.sandbox, MAX_SANDBOX_NAME_LEN)?;
     validate_optional_endpoint_name("service", &req.service, MAX_SERVICE_NAME_LEN)?;
 
@@ -193,17 +193,17 @@ pub(super) async fn handle_list_services(
         }
         state.store.list_all_messages(limit, req.offset).await
     } else {
-        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-            .await?
-            .name;
-        authorize_workspace(
+        let authz = authorize_workspace(
             &state.store,
             &state.admin_role,
             &principal,
-            &workspace,
+            &req.workspace,
             MinWorkspaceRole::User,
         )
         .await?;
+        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+            .await?
+            .name;
         if req.sandbox.is_empty() {
             state
                 .store
@@ -237,17 +237,17 @@ pub(super) async fn handle_delete_service(
 ) -> Result<Response<DeleteServiceResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
-    authorize_workspace(
+    let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
         &principal,
-        &workspace,
+        &req.workspace,
         MinWorkspaceRole::User,
     )
     .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     validate_endpoint_name("sandbox", &req.sandbox, MAX_SANDBOX_NAME_LEN)?;
     validate_optional_endpoint_name("service", &req.service, MAX_SERVICE_NAME_LEN)?;
 
