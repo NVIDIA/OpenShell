@@ -147,7 +147,9 @@ read-only and each test receives a fresh writable overlay and cloud-init
 identity. The optional shared cache stores the compressed standalone disk and
 its compatibility metadata as a custom OCI artifact. Normal test runs consume
 local entries only; the separate cache app owns OCI pulls, trusted builds, and
-explicit publication.
+explicit publication. OCI pulls require a trusted manifest digest and retain
+that provenance with the local entry; mutable tags are used only for explicit
+publication.
 
 ## Python Wheel Packaging
 

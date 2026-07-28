@@ -15,13 +15,14 @@ Options:
   --distro NAME       Base distro: ubuntu, centos, fedora, or rocky
   --with NAME         Apply a configuration; repeatable (docker, podman, selinux)
   --repository REF    OCI repository without a tag
+  --digest DIGEST     Trusted OCI manifest digest required for pulls
   --cache-dir PATH    Override the local prepared-disk cache directory
   --push              Publish a newly built or local entry to the repository
   -h, --help          Show this help
 
 The command ensures one exact distro, architecture, and ordered configuration
-combination exists locally. It checks the local cache, pulls from OCI when a
-repository is configured, or builds and validates a prepared disk on a miss.
+combination exists locally. OCI pulls require a trusted manifest digest.
+Otherwise, the command builds and validates a prepared disk on a miss.
 Publishing is explicit and requires both --repository and --push.
 EOF
 }
@@ -48,6 +49,7 @@ require_value() {
 
 distro=
 repository=${OPENSHELL_TEST_GUEST_CACHE_REPOSITORY:-}
+pull_digest=${OPENSHELL_TEST_GUEST_CACHE_DIGEST:-}
 cache_dir=
 push=0
 configurations=()
@@ -67,6 +69,11 @@ while [ "$#" -gt 0 ]; do
 	--repository)
 		require_value "$@"
 		repository=$2
+		shift 2
+		;;
+	--digest)
+		require_value "$@"
+		pull_digest=$2
 		shift 2
 		;;
 	--cache-dir)
@@ -121,6 +128,19 @@ if [[ ${repository} == *[[:space:]]* ]] || [[ ${repository} == *@* ]]; then
 	echo "--repository must be an untagged OCI repository reference" >&2
 	exit 2
 fi
+if [ -n "${repository}" ] && [ "${push}" -eq 0 ] && [ -z "${pull_digest}" ]; then
+	echo "--repository requires --digest for OCI pulls" >&2
+	exit 2
+fi
+if [ -n "${pull_digest}" ] && [ -z "${repository}" ]; then
+	echo "--digest requires --repository" >&2
+	exit 2
+fi
+if [ -n "${pull_digest}" ] &&
+	[[ ! ${pull_digest} =~ ^sha256:[a-f0-9]{64}$ ]]; then
+	echo "--digest must be a lowercase sha256 OCI manifest digest" >&2
+	exit 2
+fi
 
 if [ -n "${cache_dir}" ]; then
 	OPENSHELL_TEST_GUEST_CACHE_DIR=${cache_dir}
@@ -133,8 +153,12 @@ cache_key=$(test_vm_cache_key "${distro}" "${configurations[@]}")
 cache_tag=$(test_vm_cache_tag "${distro}" "${cache_key}")
 entry_dir=$(test_vm_cache_entry_dir "${cache_root}" "${cache_key}")
 remote_ref=
+pull_ref=
 if [ -n "${repository}" ]; then
 	remote_ref="${repository}:${cache_tag}"
+fi
+if [ -n "${pull_digest}" ]; then
+	pull_ref="${repository}@${pull_digest}"
 fi
 
 mkdir -p "${cache_root}/entries" "${cache_root}/locks" "${cache_root}/staging"
@@ -177,17 +201,21 @@ fi
 install_entry() {
 	local disk=$1
 	local metadata=$2
+	local manifest_digest=${3:-}
 	local temporary_entry
 	temporary_entry=$(mktemp -d "${cache_root}/entries/.${cache_key}.XXXXXX")
 	cp --sparse=always "${disk}" "${temporary_entry}/disk.qcow2"
 	chmod 0444 "${temporary_entry}/disk.qcow2"
 	install -m 0444 "${metadata}" "${temporary_entry}/metadata.json"
+	if [ -n "${manifest_digest}" ]; then
+		printf '%s\n' "${manifest_digest}" >"${temporary_entry}/manifest.digest"
+		chmod 0444 "${temporary_entry}/manifest.digest"
+	fi
 	: >"${temporary_entry}/complete"
 	chmod 0444 "${temporary_entry}/complete"
 
 	if [ -e "${entry_dir}" ]; then
-		if test_vm_cache_local_entry_valid \
-			"${cache_root}" "${cache_key}" "${distro}" "${configurations[@]}"; then
+		if local_entry_valid; then
 			rm -rf "${temporary_entry}"
 			return
 		fi
@@ -196,6 +224,16 @@ install_entry() {
 		return 1
 	fi
 	mv "${temporary_entry}" "${entry_dir}"
+}
+
+local_entry_valid() {
+	test_vm_cache_local_entry_valid \
+		"${cache_root}" "${cache_key}" "${distro}" "${configurations[@]}" ||
+		return 1
+	if [ -n "${pull_digest}" ]; then
+		[ -f "${entry_dir}/manifest.digest" ] &&
+			[ "$(<"${entry_dir}/manifest.digest")" = "${pull_digest}" ]
+	fi
 }
 
 is_remote_miss() {
@@ -208,10 +246,21 @@ pull_remote() {
 	local compressed_size
 	local expected_sha
 	local actual_sha
+	local resolved_digest
 	pull_dir=$(mktemp -d "${cache_root}/staging/pull.${cache_key}.XXXXXX")
 	pull_log="${pull_dir}/oras.log"
 
-	if ! oras pull --output "${pull_dir}" "${remote_ref}" >"${pull_log}" 2>&1; then
+	resolved_digest=$(oras resolve "${pull_ref}") || {
+		rm -rf "${pull_dir}"
+		return 2
+	}
+	if [ "${resolved_digest}" != "${pull_digest}" ]; then
+		echo "OCI cache manifest digest does not match trusted digest" >&2
+		rm -rf "${pull_dir}"
+		return 2
+	fi
+
+	if ! oras pull --output "${pull_dir}" "${pull_ref}" >"${pull_log}" 2>&1; then
 		if is_remote_miss "${pull_log}"; then
 			rm -rf "${pull_dir}"
 			return 1
@@ -261,9 +310,10 @@ pull_remote() {
 		return 2
 	fi
 
-	install_entry "${pull_dir}/disk.qcow2" "${pull_dir}/metadata.json"
+	install_entry \
+		"${pull_dir}/disk.qcow2" "${pull_dir}/metadata.json" "${resolved_digest}"
 	rm -rf "${pull_dir}"
-	echo "==> Cache remote hit: ${remote_ref}"
+	echo "==> Cache remote hit: ${pull_ref}"
 }
 
 build_local() {
@@ -378,11 +428,14 @@ build_local() {
 push_remote() {
 	local push_dir
 	local manifest_log
+	local published_digest
 	push_dir=$(mktemp -d "${cache_root}/staging/push.${cache_key}.XXXXXX")
 	manifest_log="${push_dir}/manifest.log"
 
 	if oras manifest fetch "${remote_ref}" >"${manifest_log}" 2>&1; then
 		echo "==> Cache already published: ${remote_ref}"
+		published_digest=$(oras resolve "${remote_ref}")
+		echo "==> Cache immutable reference: ${repository}@${published_digest}"
 		rm -rf "${push_dir}"
 		return
 	fi
@@ -405,13 +458,14 @@ push_remote() {
 			"metadata.json:${TEST_GUEST_CACHE_METADATA_TYPE}" \
 			"disk.qcow2.zst:${TEST_GUEST_CACHE_DISK_TYPE}"
 	)
+	published_digest=$(oras resolve "${remote_ref}")
 	rm -rf "${push_dir}"
 	echo "==> Cache push complete: ${remote_ref}"
+	echo "==> Cache immutable reference: ${repository}@${published_digest}"
 }
 
 echo "==> Cache key: ${cache_key}"
-if test_vm_cache_local_entry_valid \
-	"${cache_root}" "${cache_key}" "${distro}" "${configurations[@]}"; then
+if local_entry_valid; then
 	echo "==> Cache local hit: ${entry_dir}"
 else
 	if [ -e "${entry_dir}" ]; then
@@ -421,7 +475,7 @@ else
 	fi
 
 	pulled=0
-	if [ -n "${remote_ref}" ]; then
+	if [ -n "${pull_ref}" ]; then
 		if pull_remote; then
 			pulled=1
 		else
@@ -429,7 +483,7 @@ else
 			if [ "${pull_status}" -ne 1 ]; then
 				exit "${pull_status}"
 			fi
-			echo "==> Cache remote miss: ${remote_ref}"
+			echo "==> Cache remote miss: ${pull_ref}"
 		fi
 	fi
 	if [ "${pulled}" -eq 0 ]; then

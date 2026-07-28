@@ -122,13 +122,15 @@ nix run .#test-guest-cache -- \
   --with docker
 ```
 
-Configure an OCI repository to use it as a shared backing cache:
+Configure an OCI repository and a trusted manifest digest to use it as a shared
+backing cache:
 
 ```shell
 nix run .#test-guest-cache -- \
   --distro ubuntu \
   --with docker \
-  --repository ghcr.io/nvidia/openshell/test-guest-cache
+  --repository ghcr.io/nvidia/openshell/test-guest-cache \
+  --digest sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
 The command never publishes implicitly. Add `--push` after authenticating ORAS through its Docker-compatible credential configuration:
@@ -140,6 +142,11 @@ nix run .#test-guest-cache -- \
   --repository ghcr.io/nvidia/openshell/test-guest-cache \
   --push
 ```
+
+A successful push prints the immutable `repository@sha256:...` reference. Supply
+that digest to consumers through trusted CI configuration. Pulls by mutable tag
+are not allowed. A pulled local entry records its manifest digest and is reused
+only when it matches the requested trusted digest.
 
 A cache build boots and configures a disposable VM, runs the internal sealing script, flattens the overlay into a standalone QCOW2 disk, and validates a fresh boot before committing the entry. The OCI artifact contains metadata and a `disk.qcow2.zst` layer.
 
@@ -155,6 +162,7 @@ Cache command options:
 --distro NAME       Base distro: ubuntu, centos, fedora, or rocky
 --with NAME         Apply docker, podman, or selinux; repeatable
 --repository REF    OCI repository without a tag
+--digest DIGEST     Trusted OCI manifest digest required for pulls
 --cache-dir PATH    Override the local prepared-disk cache directory
 --push              Publish the ensured entry to the repository
 ```
