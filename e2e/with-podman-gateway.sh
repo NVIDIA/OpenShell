@@ -13,6 +13,10 @@
 #
 # HTTPS endpoint-only mode is intentionally unsupported here. Use a named
 # gateway config when mTLS materials are needed.
+#
+# Set OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS to override the managed gateway's
+# Podman sandbox stop timeout. The harness default is intentionally shorter
+# than the production driver default to keep CI teardown bounded.
 
 set -euo pipefail
 
@@ -359,6 +363,11 @@ echo "Using Podman supervisor image: ${SUPERVISOR_IMAGE}"
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
+PODMAN_STOP_TIMEOUT_SECS="${OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS:-15}"
+if ! [[ "${PODMAN_STOP_TIMEOUT_SECS}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS must be a non-negative integer." >&2
+  exit 2
+fi
 if ! podman_cmd image exists "${SANDBOX_IMAGE}" 2>/dev/null; then
   echo "Pulling ${SANDBOX_IMAGE}..."
   podman_cmd pull "${SANDBOX_IMAGE}"
@@ -416,6 +425,9 @@ cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
   printf 'gateway_port = %s\n'   "${HOST_PORT}"
   printf 'default_image = %s\n'  "$(toml_string "${SANDBOX_IMAGE}")"
   printf 'image_pull_policy = "missing"\n'
+  # Keep CI teardown bounded while the production Podman driver default stays
+  # conservative for real user workloads.
+  printf 'stop_timeout_secs = %s\n' "${PODMAN_STOP_TIMEOUT_SECS}"
   printf 'supervisor_image = %s\n' "$(toml_string "${SUPERVISOR_IMAGE}")"
   printf 'guest_tls_ca = %s\n'     "$(toml_string "${PKI_DIR}/ca.crt")"
   printf 'guest_tls_cert = %s\n'   "$(toml_string "${PKI_DIR}/client/tls.crt")"
