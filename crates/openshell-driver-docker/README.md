@@ -39,8 +39,32 @@ contract:
 | `restart_policy = unless-stopped` | Keeps managed sandboxes resumable across daemon or gateway restarts. |
 | `PidsLimit` | Enforces the sandbox PID budget at the Docker cgroup layer. Set `[openshell.drivers.docker].sandbox_pids_limit = 0` to inherit the Docker/runtime default. |
 | CDI GPU request | Uses opaque `driver_config.cdi_devices` values when set; otherwise selects the requested count of NVIDIA CDI GPUs in round-robin order when daemon CDI support is detected. Docker daemon `/info` can permit `nvidia.com/gpu=all` as a WSL2 all-only compatibility fallback, where it counts as one selectable device. Exact CDI device lists must not contain duplicates and must match the effective GPU count. |
+| CDI context upload | For GPU/CDI sandboxes only, mounts daemon-reported CDI spec directories read-only under `/run/openshell/supervisor/cdi-specs/<n>` and uploads `/run/openshell/supervisor/cdi-context.json` after container create and before start. |
 
 The agent child process does not retain these supervisor privileges.
+
+## CDI GPU Metadata
+
+Docker remains the source of truth for GPU injection. The driver selects opaque
+CDI device IDs from `driver_config.cdi_devices` or the daemon's discovered CDI
+inventory, then passes the same IDs to Docker with a CDI `DeviceRequest`.
+
+When a GPU/CDI request is present, the driver also mounts the Docker
+daemon-reported `Info.CDISpecDirs` into supervisor-only paths and uploads a
+small versioned CDI context through Docker's container archive API. The context
+uses container-side spec paths for resolution and keeps host-side spec sources
+diagnostic-only. If the upload fails, the driver removes the created container
+and sandbox token file before reporting the failure.
+
+The sandbox supervisor resolves the selected IDs from those mounted specs
+before it launches agent processes. CDI device nodes become read-write
+Landlock paths, mount destinations default to read-only paths, and
+`additionalGids` become supplemental groups for the entrypoint and SSH child
+processes. Writable CDI mount destinations are accepted only for exact
+single-file paths already listed in the sandbox policy `read_write` list;
+writable CDI directory mounts fail closed. Kubernetes, Podman, WSL2 hardware
+validation, and Tegra/Jetson hardware validation are separate follow-up
+targets.
 
 ## Driver Config Mounts
 
