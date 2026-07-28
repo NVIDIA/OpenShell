@@ -11,17 +11,22 @@ use kube::core::DynamicObject;
 use kube::core::gvk::GroupVersionKind;
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
-use openshell_core::driver_utils::LABEL_SANDBOX_ID;
+use openshell_core::driver_utils::{LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID};
 use openshell_core::supervisor_bootstrap::{
     SupervisorBootstrapActivationRequest, SupervisorBootstrapActivator,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tonic::Code;
 use tracing::{debug, info, warn};
 
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
+const ACTIVATION_RESYNC_INTERVAL: Duration = Duration::from_secs(15);
+const ACTIVATION_WATCH_RETRY_DELAY: Duration = Duration::from_secs(5);
+const ACTIVATION_MAX_CONCURRENCY: usize = 32;
 const ACTIVATION_RETRY_ATTEMPTS: usize = 8;
 const ACTIVATION_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const ACTIVATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
@@ -75,55 +80,154 @@ impl SandboxClaimActivationController {
         activator: Arc<dyn SupervisorBootstrapActivator>,
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
-        let claim_api = match self
-            .supported_sandbox_claim_api(self.watch_client.clone())
-            .await
-        {
-            Ok(api) => api,
-            Err(err) => {
-                debug!(
-                    namespace = %self.namespace,
-                    error = %err,
-                    "SandboxClaim API is not available; warm-pool claim activation disabled"
-                );
-                return;
-            }
-        };
-
-        let mut stream = watcher::watcher(claim_api.api, watcher::Config::default()).boxed();
-        info!(
-            namespace = %self.namespace,
-            sandbox_claim_api_version = %claim_api.version,
-            "Watching Kubernetes SandboxClaims for warm-pool activation"
-        );
-
         loop {
-            tokio::select! {
-                changed = shutdown_rx.changed() => {
-                    if changed.is_err() || *shutdown_rx.borrow() {
-                        break;
+            let claim_api = match self
+                .supported_sandbox_claim_api(self.watch_client.clone())
+                .await
+            {
+                Ok(api) => api,
+                Err(err) => {
+                    debug!(
+                        namespace = %self.namespace,
+                        error = %err,
+                        retry_after_ms = ACTIVATION_WATCH_RETRY_DELAY.as_millis(),
+                        "SandboxClaim API is not available; warm-pool claim activation will retry"
+                    );
+                    if wait_for_retry_or_shutdown(ACTIVATION_WATCH_RETRY_DELAY, &mut shutdown_rx)
+                        .await
+                    {
+                        return;
                     }
+                    continue;
                 }
-                event = stream.try_next() => match event {
-                    Ok(Some(Event::Applied(claim))) => {
-                        self.handle_claim(claim, activator.as_ref()).await;
-                    }
-                    Ok(Some(Event::Restarted(claims))) => {
-                        for claim in claims {
-                            self.handle_claim(claim, activator.as_ref()).await;
+            };
+
+            let list_api = self
+                .sandbox_claim_api(self.client.clone(), claim_api.version)
+                .api;
+            let managed_selector = format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}");
+            let watcher_config = watcher::Config::default().labels(&managed_selector);
+            let mut stream = watcher::watcher(claim_api.api, watcher_config).boxed();
+            let mut resync = tokio::time::interval(ACTIVATION_RESYNC_INTERVAL);
+            resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut activation_tasks = JoinSet::new();
+            let mut in_flight = HashSet::new();
+            let mut completed = HashSet::new();
+
+            info!(
+                namespace = %self.namespace,
+                sandbox_claim_api_version = %claim_api.version,
+                "Watching Kubernetes SandboxClaims for warm-pool activation"
+            );
+
+            let mut restart_watch = false;
+            while !restart_watch {
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
                         }
                     }
-                    Ok(Some(Event::Deleted(_))) => {}
-                    Ok(None) => break,
-                    Err(err) => {
-                        warn!(
-                            namespace = %self.namespace,
-                            error = %err,
-                            "SandboxClaim watch failed; warm-pool claim activation stopped"
-                        );
-                        break;
+                    event = stream.try_next() => match event {
+                        Ok(Some(Event::Applied(claim))) => {
+                            schedule_claim_activation(
+                                &mut activation_tasks,
+                                &mut in_flight,
+                                &completed,
+                                self.clone(),
+                                activator.clone(),
+                                claim,
+                            );
+                        }
+                        Ok(Some(Event::Restarted(claims))) => {
+                            for claim in claims {
+                                schedule_claim_activation(
+                                    &mut activation_tasks,
+                                    &mut in_flight,
+                                    &completed,
+                                    self.clone(),
+                                    activator.clone(),
+                                    claim,
+                                );
+                            }
+                        }
+                        Ok(Some(Event::Deleted(claim))) => {
+                            if let Some(key) = claim_activation_key(&claim) {
+                                completed.remove(&key);
+                            }
+                        }
+                        Ok(None) => {
+                            warn!(
+                                namespace = %self.namespace,
+                                "SandboxClaim watch stream ended; retrying"
+                            );
+                            restart_watch = true;
+                        }
+                        Err(err) => {
+                            warn!(
+                                namespace = %self.namespace,
+                                error = %err,
+                                "SandboxClaim watch failed; retrying"
+                            );
+                            restart_watch = true;
+                        }
+                    },
+                    _ = resync.tick() => {
+                        match tokio::time::timeout(
+                            KUBE_API_TIMEOUT,
+                            list_api.list(&ListParams::default().labels(&managed_selector)),
+                        )
+                        .await
+                        {
+                            Ok(Ok(claims)) => {
+                                for claim in claims.items {
+                                    schedule_claim_activation(
+                                        &mut activation_tasks,
+                                        &mut in_flight,
+                                        &completed,
+                                        self.clone(),
+                                        activator.clone(),
+                                        claim,
+                                    );
+                                }
+                            }
+                            Ok(Err(err)) => warn!(
+                                namespace = %self.namespace,
+                                error = %err,
+                                "Failed to resync SandboxClaims for warm-pool activation"
+                            ),
+                            Err(_) => warn!(
+                                namespace = %self.namespace,
+                                timeout_seconds = KUBE_API_TIMEOUT.as_secs(),
+                                "Timed out resyncing SandboxClaims for warm-pool activation"
+                            ),
+                        }
+                    }
+                    task_result = activation_tasks.join_next(), if !activation_tasks.is_empty() => {
+                        match task_result {
+                            Some(Ok((key, activated))) => {
+                                in_flight.remove(&key);
+                                if activated {
+                                    completed.insert(key);
+                                }
+                            }
+                            Some(Err(err)) => {
+                                warn!(
+                                    namespace = %self.namespace,
+                                    error = %err,
+                                    "SandboxClaim activation task failed; restarting reconciliation"
+                                );
+                                restart_watch = true;
+                            }
+                            None => {}
+                        }
                     }
                 }
+            }
+
+            activation_tasks.abort_all();
+            if wait_for_retry_or_shutdown(ACTIVATION_WATCH_RETRY_DELAY, &mut shutdown_rx).await {
+                return;
             }
         }
     }
@@ -132,7 +236,7 @@ impl SandboxClaimActivationController {
         &self,
         claim: DynamicObject,
         activator: &(dyn SupervisorBootstrapActivator + '_),
-    ) {
+    ) -> bool {
         let claim = match parse_sandbox_claim(&claim) {
             Ok(claim) => claim,
             Err(err) => {
@@ -141,7 +245,7 @@ impl SandboxClaimActivationController {
                     error = %err,
                     "Ignoring invalid SandboxClaim"
                 );
-                return;
+                return false;
             }
         };
         debug!(
@@ -160,7 +264,7 @@ impl SandboxClaimActivationController {
                 sandbox_claim = %claim.name,
                 "SandboxClaim has not selected a Sandbox yet"
             );
-            return;
+            return false;
         };
 
         let sandbox_cr = match self.get_sandbox_cr(sandbox_name).await {
@@ -172,7 +276,7 @@ impl SandboxClaimActivationController {
                     sandbox = %sandbox_name,
                     "SandboxClaim selected Sandbox is not available yet"
                 );
-                return;
+                return false;
             }
             Err(err) => {
                 warn!(
@@ -182,13 +286,13 @@ impl SandboxClaimActivationController {
                     error = %err,
                     "Failed to read Sandbox selected by SandboxClaim"
                 );
-                return;
+                return false;
             }
         };
 
         let pod = match self.resolve_controlled_pod(&sandbox_cr).await {
             Ok(Some(pod)) => pod,
-            Ok(None) => return,
+            Ok(None) => return false,
             Err(err) => {
                 warn!(
                     namespace = %self.namespace,
@@ -197,13 +301,13 @@ impl SandboxClaimActivationController {
                     error = %err,
                     "Failed to resolve Sandbox pod for SandboxClaim activation"
                 );
-                return;
+                return false;
             }
         };
 
         let request = match activation_request_from_claim_state(&claim, &sandbox_cr, &pod) {
             Ok(Some(request)) => request,
-            Ok(None) => return,
+            Ok(None) => return false,
             Err(err) => {
                 warn!(
                     namespace = %self.namespace,
@@ -212,7 +316,7 @@ impl SandboxClaimActivationController {
                     error = %err,
                     "SandboxClaim activation validation failed"
                 );
-                return;
+                return false;
             }
         };
 
@@ -239,7 +343,7 @@ impl SandboxClaimActivationController {
             ACTIVATION_RETRY_INITIAL_DELAY,
             ACTIVATION_RETRY_MAX_DELAY,
         )
-        .await;
+        .await
     }
 
     fn sandbox_claim_api(&self, client: Client, version: &'static str) -> SandboxClaimApi {
@@ -364,6 +468,56 @@ impl SandboxClaimActivationController {
     }
 }
 
+fn schedule_claim_activation(
+    tasks: &mut JoinSet<(String, bool)>,
+    in_flight: &mut HashSet<String>,
+    completed: &HashSet<String>,
+    controller: SandboxClaimActivationController,
+    activator: Arc<dyn SupervisorBootstrapActivator>,
+    claim: DynamicObject,
+) {
+    if tasks.len() >= ACTIVATION_MAX_CONCURRENCY {
+        return;
+    }
+    let Some(key) = begin_claim_activation(in_flight, completed, &claim) else {
+        return;
+    };
+    tasks.spawn(async move {
+        let activated = controller.handle_claim(claim, activator.as_ref()).await;
+        (key, activated)
+    });
+}
+
+fn begin_claim_activation(
+    in_flight: &mut HashSet<String>,
+    completed: &HashSet<String>,
+    claim: &DynamicObject,
+) -> Option<String> {
+    let key = claim_activation_key(claim)?;
+    if completed.contains(&key) {
+        return None;
+    }
+    in_flight.insert(key.clone()).then_some(key)
+}
+
+fn claim_activation_key(claim: &DynamicObject) -> Option<String> {
+    claim
+        .metadata
+        .uid
+        .clone()
+        .or_else(|| claim.metadata.name.clone())
+}
+
+async fn wait_for_retry_or_shutdown(
+    delay: Duration,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        () = tokio::time::sleep(delay) => false,
+        changed = shutdown_rx.changed() => changed.is_err() || *shutdown_rx.borrow(),
+    }
+}
+
 struct SandboxClaimApi {
     api: Api<DynamicObject>,
     version: &'static str,
@@ -393,7 +547,7 @@ async fn activate_registered_supervisor_with_retry(
     attempts: usize,
     initial_delay: Duration,
     max_delay: Duration,
-) {
+) -> bool {
     let attempts = attempts.max(1);
     let mut delay = initial_delay;
 
@@ -412,7 +566,7 @@ async fn activate_registered_supervisor_with_retry(
                     attempt,
                     "Activated warm-pool supervisor from SandboxClaim"
                 );
-                return;
+                return true;
             }
             Err(status) if status.code() == Code::AlreadyExists => {
                 debug!(
@@ -424,7 +578,7 @@ async fn activate_registered_supervisor_with_retry(
                     attempt,
                     "Warm-pool supervisor was already activated"
                 );
-                return;
+                return true;
             }
             Err(status) if status.code() == Code::NotFound && attempt < attempts => {
                 debug!(
@@ -450,7 +604,7 @@ async fn activate_registered_supervisor_with_retry(
                     attempts,
                     "Warm-pool supervisor registration is not pending after retries"
                 );
-                return;
+                return false;
             }
             Err(status) => {
                 warn!(
@@ -464,10 +618,12 @@ async fn activate_registered_supervisor_with_retry(
                     message = %status.message(),
                     "Failed to activate warm-pool supervisor from SandboxClaim"
                 );
-                return;
+                return false;
             }
         }
     }
+
+    false
 }
 
 fn parse_sandbox_claim(obj: &DynamicObject) -> Result<ParsedSandboxClaim, String> {
@@ -675,6 +831,64 @@ mod tests {
         obj
     }
 
+    #[test]
+    fn claim_activation_is_deduplicated_by_uid() {
+        let first = dynamic_object(
+            SANDBOX_CLAIM_GROUP,
+            SANDBOX_CLAIM_VERSION_V1BETA1,
+            SANDBOX_CLAIM_KIND,
+            "claim-a",
+            "claim-uid",
+            json!({}),
+        );
+        let mut relisted = first.clone();
+        relisted.metadata.name = Some("renamed-in-test".to_string());
+        let mut in_flight = HashSet::new();
+        let mut completed = HashSet::new();
+
+        assert_eq!(
+            begin_claim_activation(&mut in_flight, &completed, &first).as_deref(),
+            Some("claim-uid")
+        );
+        assert_eq!(
+            begin_claim_activation(&mut in_flight, &completed, &relisted),
+            None
+        );
+
+        in_flight.remove("claim-uid");
+        assert_eq!(
+            begin_claim_activation(&mut in_flight, &completed, &relisted).as_deref(),
+            Some("claim-uid")
+        );
+
+        in_flight.remove("claim-uid");
+        completed.insert("claim-uid".to_string());
+        assert_eq!(
+            begin_claim_activation(&mut in_flight, &completed, &relisted),
+            None
+        );
+    }
+
+    #[test]
+    fn claim_activation_key_falls_back_to_name() {
+        let mut claim = dynamic_object(
+            SANDBOX_CLAIM_GROUP,
+            SANDBOX_CLAIM_VERSION_V1BETA1,
+            SANDBOX_CLAIM_KIND,
+            "claim-a",
+            "claim-uid",
+            json!({}),
+        );
+        claim.metadata.uid = None;
+        let mut in_flight = HashSet::new();
+        let completed = HashSet::new();
+
+        assert_eq!(
+            begin_claim_activation(&mut in_flight, &completed, &claim).as_deref(),
+            Some("claim-a")
+        );
+    }
+
     fn sandbox_cr(name: &str, uid: &str, sandbox_id: &str, version: &'static str) -> DynamicObject {
         let mut obj = dynamic_object(
             SANDBOX_GROUP,
@@ -849,7 +1063,7 @@ mod tests {
             reason: "SandboxClaim/claim-a".to_string(),
         };
 
-        activate_registered_supervisor_with_retry(
+        let activated = activate_registered_supervisor_with_retry(
             &activator,
             request,
             ActivationLogContext {
@@ -863,7 +1077,37 @@ mod tests {
         )
         .await;
 
+        assert!(activated);
         assert_eq!(activator.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn incomplete_activation_remains_eligible_for_resync() {
+        let activator = FakeActivator::new(vec![Err(Status::not_found("not pending"))]);
+        let request = SupervisorBootstrapActivationRequest {
+            driver: DRIVER_NAME.to_string(),
+            instance_id: "pod-uid".to_string(),
+            sandbox_id: "sandbox-id".to_string(),
+            owner_uid: "sandbox-uid".to_string(),
+            reason: "SandboxClaim/claim-a".to_string(),
+        };
+
+        let activated = activate_registered_supervisor_with_retry(
+            &activator,
+            request,
+            ActivationLogContext {
+                namespace: "openshell",
+                sandbox_claim: "claim-a",
+                sandbox: "sandbox-a",
+            },
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await;
+
+        assert!(!activated);
+        assert_eq!(activator.request_count(), 1);
     }
 
     #[test]

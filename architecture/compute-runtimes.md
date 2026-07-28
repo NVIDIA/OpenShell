@@ -232,6 +232,13 @@ or gateway-side claim mapping beyond the same live Kubernetes ownership and
 metadata consistency checks used by the direct path. If an operator grants
 untrusted principals write access to those objects, both warm and direct
 activation require a broader common proof model.
+Claim activation is level-triggered rather than dependent on a single watch
+event. The controller periodically relists OpenShell-managed claims and retries
+failed watch streams, because a claim can become visible before its selected
+`Sandbox`, pod, or outbound supervisor registration. It reconciles different claims
+concurrently, deduplicates work by claim UID, and caps concurrency so one late
+registration or slow Kubernetes lookup cannot block activation for the
+namespace or create unbounded work.
 Warm claim creation is idempotent by the deterministic claim name. After a
 create timeout, transport failure, server error, or conflict, the driver reads
 that name back and retries the same claim create when it is not yet visible. It
