@@ -2226,3 +2226,14 @@ fn container_state_needs_resume_matches_startable_states() {
         );
     }
 }
+
+#[test]
+fn watch_lag_status_is_resource_exhausted() {
+    let status = watch_lag_status(17);
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    assert!(
+        status.message().contains("lagged") && status.message().contains("17"),
+        "unexpected status message: {}",
+        status.message()
+    );
+}

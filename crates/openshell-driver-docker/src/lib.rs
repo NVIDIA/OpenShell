@@ -65,6 +65,12 @@ use tracing::{info, warn};
 use url::Url;
 
 const WATCH_BUFFER: usize = 128;
+
+/// Translate a lagged broadcast receiver into the gRPC status the gateway
+/// watch loop already treats as a reconnect signal.
+fn watch_lag_status(skipped: u64) -> Status {
+    Status::resource_exhausted(format!("watch stream lagged; dropped {skipped} messages"))
+}
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -1505,7 +1511,10 @@ impl ComputeDriver for DockerComputeDriver {
                             return;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        let _ = tx.send(Err(watch_lag_status(n))).await;
+                        return;
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }

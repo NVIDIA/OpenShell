@@ -76,6 +76,12 @@ use url::{Host, Url};
 
 const DRIVER_NAME: &str = "openshell-driver-vm";
 const WATCH_BUFFER: usize = 256;
+
+/// Translate a lagged broadcast receiver into the gRPC status the gateway
+/// watch loop already treats as a reconnect signal.
+fn watch_lag_status(skipped: u64) -> Status {
+    Status::resource_exhausted(format!("watch stream lagged; dropped {skipped} messages"))
+}
 const DEFAULT_VCPUS: u8 = 2;
 const DEFAULT_MEM_MIB: u32 = 2048;
 const DEFAULT_OVERLAY_DISK_MIB: u64 = 4096;
@@ -3112,7 +3118,10 @@ impl ComputeDriver for VmDriver {
                             return;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        let _ = tx.send(Err(watch_lag_status(n))).await;
+                        return;
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -5151,6 +5160,17 @@ mod tests {
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    #[test]
+    fn watch_lag_status_is_resource_exhausted() {
+        let status = watch_lag_status(9);
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert!(
+            status.message().contains("lagged") && status.message().contains("9"),
+            "unexpected status message: {}",
+            status.message()
+        );
+    }
 
     fn gpu_device_ids_config(device_ids: &[&str]) -> Struct {
         list_string_driver_config("gpu_device_ids", device_ids)

@@ -13,6 +13,9 @@ use tracing::{info, warn};
 
 use crate::persistence::{ObjectType, Store};
 
+/// Page size for the background SSH session reaper sweep.
+const REAPER_PAGE_SIZE: u32 = 1000;
+
 impl ObjectType for SshSession {
     fn object_type() -> &'static str {
         "ssh_session"
@@ -34,32 +37,54 @@ pub fn spawn_session_reaper(store: Arc<Store>, interval: Duration) {
 }
 
 async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
+    reap_expired_sessions_paginated(store, REAPER_PAGE_SIZE).await
+}
+
+async fn reap_expired_sessions_paginated(store: &Store, page_size: u32) -> Result<(), String> {
     let now_ms = now_ms();
 
-    let records = store
-        .list_by_type(SshSession::object_type(), 1000, 0)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Collect matching IDs across pages first so deletes do not shift
+    // offsets and leave expired/revoked sessions behind.
+    let mut to_delete = Vec::new();
+    let mut offset = 0u32;
+    loop {
+        let records = store
+            .list_by_type(SshSession::object_type(), page_size, offset)
+            .await
+            .map_err(|e| e.to_string())?;
+        if records.is_empty() {
+            break;
+        }
+        let page_len = u32::try_from(records.len())
+            .map_err(|_| "SSH session reaper page size exceeded u32".to_string())?;
+
+        for record in records {
+            let session: SshSession = match Message::decode(record.payload.as_slice()) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let should_delete =
+                (session.expires_at_ms > 0 && now_ms > session.expires_at_ms) || session.revoked;
+            if should_delete {
+                to_delete.push(session.object_id().to_string());
+            }
+        }
+
+        offset = offset
+            .checked_add(page_len)
+            .ok_or_else(|| "SSH session reaper pagination offset overflow".to_string())?;
+        if page_len < page_size {
+            break;
+        }
+    }
 
     let mut reaped = 0u32;
-    for record in records {
-        let session: SshSession = match Message::decode(record.payload.as_slice()) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        let should_delete =
-            (session.expires_at_ms > 0 && now_ms > session.expires_at_ms) || session.revoked;
-
-        if should_delete {
-            if let Err(e) = store
-                .delete(SshSession::object_type(), session.object_id())
-                .await
-            {
-                warn!(session_id = %session.object_id(), error = %e, "Failed to reap SSH session");
-            } else {
-                reaped += 1;
-            }
+    for session_id in to_delete {
+        if let Err(e) = store.delete(SshSession::object_type(), &session_id).await {
+            warn!(session_id = %session_id, error = %e, "Failed to reap SSH session");
+        } else {
+            reaped += 1;
         }
     }
 
@@ -95,6 +120,43 @@ mod tests {
             expires_at_ms,
             revoked,
         }
+    }
+
+    #[tokio::test]
+    async fn reaper_paginates_past_page_boundary() {
+        let store = test_store().await;
+        for i in 0..5 {
+            let expired = make_session(
+                &format!("expired-page-{i}"),
+                "sbx-page",
+                now_ms() - 60_000,
+                false,
+            );
+            store.put_message(&expired).await.unwrap();
+        }
+        let valid = make_session("valid-page", "sbx-page", now_ms() + 3_600_000, false);
+        store.put_message(&valid).await.unwrap();
+
+        reap_expired_sessions_paginated(&store, 2).await.unwrap();
+
+        for i in 0..5 {
+            assert!(
+                store
+                    .get_message::<SshSession>(&format!("expired-page-{i}"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "expired session {i} should be reaped across pages"
+            );
+        }
+        assert!(
+            store
+                .get_message::<SshSession>("valid-page")
+                .await
+                .unwrap()
+                .is_some(),
+            "valid session should be kept"
+        );
     }
 
     #[tokio::test]

@@ -64,6 +64,8 @@ type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
 
 const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
+/// Page size for sandbox-owned SSH session / service endpoint cleanup scans.
+const SANDBOX_CLEANUP_PAGE_SIZE: u32 = 1000;
 
 /// Serializes request-side deletes for the same stable sandbox ID.
 ///
@@ -1853,52 +1855,116 @@ impl ComputeRuntime {
         sandbox_id: &str,
         workspace: &str,
     ) -> Result<(), String> {
-        let records = self
-            .store
-            .list(SshSession::object_type(), workspace, 1000, 0)
-            .await
-            .map_err(|e| format!("list SSH sessions: {e}"))?;
+        self.cleanup_sandbox_ssh_sessions_paginated(
+            sandbox_id,
+            workspace,
+            SANDBOX_CLEANUP_PAGE_SIZE,
+        )
+        .await
+    }
 
-        for record in records {
-            if let Ok(session) = SshSession::decode(record.payload.as_slice())
-                && session.sandbox_id == sandbox_id
-            {
-                self.store
-                    .delete(SshSession::object_type(), session.object_id())
-                    .await
-                    .map_err(|e| format!("delete SSH session {}: {e}", session.object_id()))?;
+    /// Collect matching SSH session IDs across all workspace pages, then
+    /// delete. Collect-then-delete avoids offset drift from mutating the
+    /// store mid-pagination.
+    async fn cleanup_sandbox_ssh_sessions_paginated(
+        &self,
+        sandbox_id: &str,
+        workspace: &str,
+        page_size: u32,
+    ) -> Result<(), String> {
+        let mut to_delete = Vec::new();
+        let mut offset = 0u32;
+        loop {
+            let records = self
+                .store
+                .list(SshSession::object_type(), workspace, page_size, offset)
+                .await
+                .map_err(|e| format!("list SSH sessions: {e}"))?;
+            if records.is_empty() {
+                break;
             }
+            let page_len = u32::try_from(records.len())
+                .map_err(|_| "SSH session page size exceeded u32".to_string())?;
+            for record in records {
+                if let Ok(session) = SshSession::decode(record.payload.as_slice())
+                    && session.sandbox_id == sandbox_id
+                {
+                    to_delete.push(session.object_id().to_string());
+                }
+            }
+            offset = offset
+                .checked_add(page_len)
+                .ok_or_else(|| "SSH session pagination offset overflow".to_string())?;
+            if page_len < page_size {
+                break;
+            }
+        }
+
+        for session_id in to_delete {
+            self.store
+                .delete(SshSession::object_type(), &session_id)
+                .await
+                .map_err(|e| format!("delete SSH session {session_id}: {e}"))?;
         }
 
         Ok(())
     }
 
-    // TODO: introduce a per-sandbox cap on service endpoints and paginate
-    // this cleanup loop, or query by sandbox label instead of scanning the
-    // full workspace. Without a cap the flat 1,000-record page could miss
-    // endpoints in large workspaces.
     async fn cleanup_sandbox_service_endpoints(
         &self,
         sandbox_id: &str,
         workspace: &str,
     ) -> Result<(), String> {
-        let records = self
-            .store
-            .list(ServiceEndpoint::object_type(), workspace, 1000, 0)
-            .await
-            .map_err(|e| format!("list service endpoints: {e}"))?;
+        self.cleanup_sandbox_service_endpoints_paginated(
+            sandbox_id,
+            workspace,
+            SANDBOX_CLEANUP_PAGE_SIZE,
+        )
+        .await
+    }
 
-        for record in records {
-            if let Ok(endpoint) = ServiceEndpoint::decode(record.payload.as_slice())
-                && endpoint.sandbox_id == sandbox_id
-            {
-                self.store
-                    .delete(ServiceEndpoint::object_type(), endpoint.object_id())
-                    .await
-                    .map_err(|e| {
-                        format!("delete service endpoint {}: {e}", endpoint.object_id())
-                    })?;
+    /// Collect matching service endpoint IDs across all workspace pages, then
+    /// delete. Without pagination a flat 1,000-record page could miss
+    /// endpoints in large workspaces and leave live routing records behind.
+    async fn cleanup_sandbox_service_endpoints_paginated(
+        &self,
+        sandbox_id: &str,
+        workspace: &str,
+        page_size: u32,
+    ) -> Result<(), String> {
+        let mut to_delete = Vec::new();
+        let mut offset = 0u32;
+        loop {
+            let records = self
+                .store
+                .list(ServiceEndpoint::object_type(), workspace, page_size, offset)
+                .await
+                .map_err(|e| format!("list service endpoints: {e}"))?;
+            if records.is_empty() {
+                break;
             }
+            let page_len = u32::try_from(records.len())
+                .map_err(|_| "service endpoint page size exceeded u32".to_string())?;
+            for record in records {
+                if let Ok(endpoint) = ServiceEndpoint::decode(record.payload.as_slice())
+                    && endpoint.sandbox_id == sandbox_id
+                {
+                    to_delete.push(endpoint.object_id().to_string());
+                }
+            }
+            offset = offset
+                .checked_add(page_len)
+                .ok_or_else(|| "service endpoint pagination offset overflow".to_string())?;
+            if page_len < page_size {
+                break;
+            }
+        }
+
+        for endpoint_id in to_delete {
+            self.store
+                .delete(ServiceEndpoint::object_type(), &endpoint_id)
+                .await
+                .map_err(|e| format!("delete service endpoint {endpoint_id}: {e}"))?;
         }
 
         Ok(())
@@ -3418,6 +3484,128 @@ mod tests {
                 .is_some(),
             expected
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_service_endpoints_paginates_past_page_size() {
+        let runtime = test_runtime(Arc::new(NoopTestDriver)).await;
+        let target = sandbox_record("sb-target", "target", SandboxPhase::Ready);
+        let other = sandbox_record("sb-other", "other", SandboxPhase::Ready);
+
+        // page_size=3 with 7 target endpoints requires multiple pages; noise
+        // endpoints for another sandbox must survive.
+        for i in 0..7 {
+            let endpoint = ServiceEndpoint {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("ep-target-{i}"),
+                    name: format!("{}--svc{i}", target.object_name()),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                sandbox_id: target.object_id().to_string(),
+                sandbox_name: target.object_name().to_string(),
+                service_name: format!("svc{i}"),
+                target_port: 8080 + i,
+                domain: true,
+            };
+            runtime.store.put_message(&endpoint).await.unwrap();
+        }
+        for i in 0..2 {
+            let endpoint = ServiceEndpoint {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("ep-other-{i}"),
+                    name: format!("{}--noise{i}", other.object_name()),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                sandbox_id: other.object_id().to_string(),
+                sandbox_name: other.object_name().to_string(),
+                service_name: format!("noise{i}"),
+                target_port: 9000 + i,
+                domain: true,
+            };
+            runtime.store.put_message(&endpoint).await.unwrap();
+        }
+
+        runtime
+            .cleanup_sandbox_service_endpoints_paginated(target.object_id(), "default", 3)
+            .await
+            .unwrap();
+
+        for i in 0..7 {
+            assert!(
+                runtime
+                    .store
+                    .get_message::<ServiceEndpoint>(&format!("ep-target-{i}"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "target endpoint {i} should be deleted across pages"
+            );
+        }
+        for i in 0..2 {
+            assert!(
+                runtime
+                    .store
+                    .get_message::<ServiceEndpoint>(&format!("ep-other-{i}"))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "unrelated endpoint {i} must remain"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_ssh_sessions_paginates_past_page_size() {
+        let runtime = test_runtime(Arc::new(NoopTestDriver)).await;
+        let target_id = "sb-ssh-target";
+        let other_id = "sb-ssh-other";
+
+        for i in 0..5 {
+            let session = ssh_session_record(&format!("sess-target-{i}"), target_id);
+            runtime.store.put_message(&session).await.unwrap();
+        }
+        for i in 0..2 {
+            let session = ssh_session_record(&format!("sess-other-{i}"), other_id);
+            runtime.store.put_message(&session).await.unwrap();
+        }
+
+        runtime
+            .cleanup_sandbox_ssh_sessions_paginated(target_id, "default", 2)
+            .await
+            .unwrap();
+
+        for i in 0..5 {
+            assert!(
+                runtime
+                    .store
+                    .get_message::<SshSession>(&format!("sess-target-{i}"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "target session {i} should be deleted across pages"
+            );
+        }
+        for i in 0..2 {
+            assert!(
+                runtime
+                    .store
+                    .get_message::<SshSession>(&format!("sess-other-{i}"))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "unrelated session {i} must remain"
+            );
+        }
     }
 
     fn make_driver_condition(reason: &str, message: &str) -> DriverCondition {

@@ -22,6 +22,11 @@ drive client provisioning UI, the driver attaches the shared
 clients to parse Kubernetes reasons, VM cache states, or other driver-local
 reason strings.
 
+Docker and VM watch streams fail closed when the in-process broadcast receiver
+lags (`resource_exhausted`). The gateway watch loop treats that as a stream
+error, reconnects, and relies on the periodic reconcile sweep to heal any
+missed Deleted/Updated events. Silently dropping lagged messages is not allowed.
+
 The capability RPC reports driver identity, version, and the default sandbox
 image used by the gateway. GPU availability stays driver-local and is validated
 when a sandbox create request asks for GPU resources.
@@ -50,7 +55,10 @@ An accepted delete (`deleted = true`) is finalized by the watcher. If the
 backend is already absent (`deleted = false`), the request removes gateway state
 synchronously. Sandbox row removal remains bound to the stable ID and resource
 version. Settings retain their existing best-effort name-based cleanup; SSH
-sessions, indexes, and watch/log buses are cleaned after confirmed removal.
+sessions and service endpoints are cleaned with paginated workspace scans
+(collect matching IDs, then delete) so large workspaces cannot leave orphaned
+rows behind a single 1,000-record page. Indexes and watch/log buses are cleaned
+after confirmed removal.
 
 The request acquires both locks before starting owned work, so cancellation
 while queued does not leave a delete armed. After that commitment point, the
