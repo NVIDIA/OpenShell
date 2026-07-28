@@ -159,6 +159,10 @@ for copy_spec in "${copies[@]}"; do
 			echo "--copy destination must not contain '..': ${destination}" >&2
 			exit 2
 		fi
+		if [[ ! ${destination} =~ ^/[A-Za-z0-9._+~/-]+$ ]]; then
+			echo "--copy destination contains unsupported characters: ${destination}" >&2
+			exit 2
+		fi
 		;;
 	*)
 		echo "--copy destination must be absolute: ${destination}" >&2
@@ -455,7 +459,7 @@ for copy_spec in "${copies[@]}"; do
 	remote_copy="/home/openshell/${copy_name}"
 	echo "==> Copying ${copy_name} to ${destination}"
 	scp "${scp_args[@]}" "${source_path}" "openshell@127.0.0.1:${remote_copy}"
-	# The destination was restricted to an absolute, traversal-free path.
+	# The remote path and destination use restricted path characters.
 	# shellcheck disable=SC2029
 	ssh "${ssh_args[@]}" openshell@127.0.0.1 \
 		"sudo install -D -m 0755 '${remote_copy}' '${destination}'; rm -f '${remote_copy}'"

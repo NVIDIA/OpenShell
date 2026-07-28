@@ -62,19 +62,12 @@
         append: true
       register: docker_group_membership
 
-    - name: Read the test user ID
-      ansible.builtin.command:
-        cmd: id -u openshell
-      register: test_user_id
-      changed_when: false
-
-    - name: Refresh the test user's systemd group membership
-      ansible.builtin.systemd_service:
-        name: "user@{{ test_user_id.stdout }}.service"
-        state: restarted
+    - name: Refresh the test user's group membership
+      ansible.builtin.meta: reset_connection
       when: docker_group_membership.changed
 
     - name: Verify Docker
       ansible.builtin.command:
         cmd: docker info
+      become: false
       changed_when: false
