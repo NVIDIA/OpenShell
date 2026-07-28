@@ -554,8 +554,10 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
         .map_err(|_| miette!("websocket text message is not valid UTF-8"))?;
     let live_resolver = options
         .provider_credentials
-        .and_then(|credentials| credentials.resolver_for_endpoint(host, port, options.target));
-    let resolver = live_resolver.as_deref().or(options.resolver);
+        .map(|credentials| credentials.resolver_for_endpoint(host, port, options.target));
+    let resolver = live_resolver
+        .as_ref()
+        .map_or(options.resolver, |resolver| resolver.as_deref());
     let replacements = if let Some(resolver) = resolver {
         resolver
             .rewrite_websocket_text_placeholders(&mut text)
@@ -1182,6 +1184,8 @@ mod tests {
     use super::*;
     use crate::l7::relay::L7EvalContext;
     use crate::opa::{NetworkInput, OpaEngine};
+    use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+    use openshell_core::provider_credentials::ProviderCredentialState;
     use openshell_core::secrets::SecretResolver;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1318,6 +1322,103 @@ network_policies:
         let mut output = Vec::new();
         upstream_read.read_to_end(&mut output).await.unwrap();
         result.map(|()| output)
+    }
+
+    fn bound_websocket_provider_state() -> ProviderCredentialState {
+        ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "DISCORD_BOT_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "gateway.example.test".to_string(),
+                        port: 443,
+                        path: "/socket".to_string(),
+                    }],
+                    credential_identity: "provider-a:DISCORD_BOT_TOKEN".to_string(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("bound websocket provider state")
+    }
+
+    async fn relay_frame_after_live_state_change(
+        state: &ProviderCredentialState,
+        fallback: &SecretResolver,
+    ) -> (Result<()>, Vec<u8>) {
+        let placeholder = b"openshell:resolve:env:v1_DISCORD_BOT_TOKEN";
+        let input = masked_frame(true, 0x1, placeholder);
+        let (mut client_write, mut relay_read) = tokio::io::duplex(4096);
+        let (mut relay_write, mut upstream_read) = tokio::io::duplex(4096);
+        client_write.write_all(&input).await.unwrap();
+        drop(client_write);
+
+        let options = RelayOptions {
+            policy_name: "test-policy",
+            resolver: Some(fallback),
+            provider_credentials: Some(state),
+            target: "/socket",
+            inspector: None,
+            compression: WebSocketCompression::None,
+        };
+        let result = relay_client_to_server(
+            &mut relay_read,
+            &mut relay_write,
+            "gateway.example.test",
+            443,
+            &options,
+        )
+        .await;
+        drop(relay_write);
+        let mut output = Vec::new();
+        upstream_read.read_to_end(&mut output).await.unwrap();
+        (result, output)
+    }
+
+    #[tokio::test]
+    async fn established_websocket_does_not_restore_resolver_after_detach() {
+        let state = bound_websocket_provider_state();
+        let fallback = state.resolver().expect("upgrade-time resolver");
+        state.revoke_static_provider_environment(2);
+
+        let (result, output) = relay_frame_after_live_state_change(&state, fallback.as_ref()).await;
+        assert!(result.is_err(), "revoked placeholder must close the relay");
+        assert!(
+            output.is_empty(),
+            "revoked WebSocket credential must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn established_websocket_does_not_restore_resolver_after_invalid_refresh() {
+        let state = bound_websocket_provider_state();
+        let fallback = state.resolver().expect("upgrade-time resolver");
+        let refresh = state.install_bound_environment(
+            2,
+            HashMap::from([("DISCORD_BOT_TOKEN".to_string(), "rotated".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+        );
+        assert!(
+            refresh.is_err(),
+            "incomplete bindings must revoke static state"
+        );
+
+        let (result, output) = relay_frame_after_live_state_change(&state, fallback.as_ref()).await;
+        assert!(
+            result.is_err(),
+            "invalid-refresh placeholder must close the relay"
+        );
+        assert!(
+            output.is_empty(),
+            "invalid-refresh credential must not reach upstream"
+        );
     }
 
     async fn run_client_to_server_with_graphql_policy(

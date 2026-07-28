@@ -79,7 +79,62 @@ fn scoped_context_for_request(ctx: &L7EvalContext, target: &str) -> Option<L7Eva
     Some(scoped)
 }
 
-async fn reject_credential_resolution<W>(
+fn build_credential_resolution_event(
+    ctx: &L7EvalContext,
+    endpoint_mismatch: bool,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Fail)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(if endpoint_mismatch {
+            SeverityId::High
+        } else {
+            SeverityId::Medium
+        })
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+        .firewall_rule(&ctx.policy_name, "credential-binding")
+        .message(if endpoint_mismatch {
+            format!(
+                "Credential use denied: credential is not authorized for {}:{}",
+                ctx.host, ctx.port
+            )
+        } else {
+            format!(
+                "Credential use denied: credential is unavailable for {}:{}",
+                ctx.host, ctx.port
+            )
+        })
+        .status_detail(if endpoint_mismatch {
+            "credential_endpoint_mismatch"
+        } else {
+            "credential_unavailable"
+        })
+        .build()
+}
+
+fn build_credential_endpoint_mismatch_finding(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
+    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .is_alert(true)
+        .finding_info(FindingInfo::new(
+            "openshell.provider_credential.endpoint_mismatch",
+            "Provider credential used at an unauthorized endpoint",
+        ))
+        .evidence_pairs(&[
+            ("policy", ctx.policy_name.as_str()),
+            ("host", ctx.host.as_str()),
+            ("disposition", "denied"),
+        ])
+        .message("Provider credential endpoint binding mismatch; request denied")
+        .build()
+}
+
+pub(crate) async fn reject_credential_resolution<W>(
     client: &mut W,
     ctx: &L7EvalContext,
     error: &secrets::UnresolvedPlaceholderError,
@@ -108,56 +163,10 @@ where
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
 
-    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Fail)
-        .action(ActionId::Denied)
-        .disposition(DispositionId::Blocked)
-        .severity(if endpoint_mismatch {
-            SeverityId::High
-        } else {
-            SeverityId::Medium
-        })
-        .status(StatusId::Failure)
-        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-        .firewall_rule(&ctx.policy_name, "credential-binding")
-        .message(if endpoint_mismatch {
-            format!(
-                "Credential use denied: credential is not authorized for {}:{}",
-                ctx.host, ctx.port
-            )
-        } else {
-            format!(
-                "Credential use denied: credential is unavailable for {}:{}",
-                ctx.host, ctx.port
-            )
-        })
-        .status_detail(if endpoint_mismatch {
-            "credential_endpoint_mismatch"
-        } else {
-            "credential_unavailable"
-        })
-        .build();
-    ocsf_emit!(event);
+    ocsf_emit!(build_credential_resolution_event(ctx, endpoint_mismatch));
 
     if endpoint_mismatch {
-        let finding = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Denied)
-            .disposition(DispositionId::Blocked)
-            .severity(SeverityId::High)
-            .is_alert(true)
-            .finding_info(FindingInfo::new(
-                "openshell.provider_credential.endpoint_mismatch",
-                "Provider credential used at an unauthorized endpoint",
-            ))
-            .evidence_pairs(&[
-                ("policy", ctx.policy_name.as_str()),
-                ("host", ctx.host.as_str()),
-                ("disposition", "denied"),
-            ])
-            .message("Provider credential endpoint binding mismatch; request denied")
-            .build();
-        ocsf_emit!(finding);
+        ocsf_emit!(build_credential_endpoint_mismatch_finding(ctx));
     }
     Ok(())
 }
@@ -175,6 +184,34 @@ where
         Err(error) => {
             reject_credential_resolution(client, ctx, &error).await?;
             Ok(false)
+        }
+    }
+}
+
+async fn relay_http_request_with_credential_rejection<C, U>(
+    request: &crate::l7::provider::L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    options: crate::l7::rest::RelayRequestOptions<'_>,
+    ctx: &L7EvalContext,
+) -> Result<Option<RelayOutcome>>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    match crate::l7::rest::relay_http_request_with_options_guarded(
+        request, client, upstream, options,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(Some(outcome)),
+        Err(report) => {
+            if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
+                reject_credential_resolution(client, ctx, error).await?;
+                Ok(None)
+            } else {
+                Err(report)
+            }
         }
     }
 }
@@ -616,7 +653,7 @@ where
                     return Ok(());
                 }
             };
-            let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
+            let Some(outcome) = relay_http_request_with_credential_rejection(
                 &req,
                 client,
                 upstream,
@@ -632,8 +669,12 @@ where
                     host: &ctx.host,
                     port: ctx.port,
                 },
+                ctx,
             )
-            .await?;
+            .await?
+            else {
+                return Ok(());
+            };
             match outcome {
                 RelayOutcome::Reusable => {}
                 RelayOutcome::Consumed => return Ok(()),
@@ -1109,7 +1150,7 @@ where
                 };
 
             // Forward request to upstream and relay response
-            let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
+            let Some(outcome) = relay_http_request_with_credential_rejection(
                 &req_with_auth,
                 client,
                 upstream,
@@ -1125,8 +1166,12 @@ where
                     host: &ctx.host,
                     port: ctx.port,
                 },
+                ctx,
             )
-            .await?;
+            .await?
+            else {
+                return Ok(());
+            };
             match outcome {
                 RelayOutcome::Reusable => {} // continue loop
                 RelayOutcome::Consumed => {
@@ -2224,7 +2269,7 @@ where
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends
         // the request upstream and reads the response back to the client.
-        let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
+        let Some(outcome) = relay_http_request_with_credential_rejection(
             &req_with_auth,
             client,
             upstream,
@@ -2233,8 +2278,12 @@ where
                 generation_guard: Some(generation_guard),
                 ..Default::default()
             },
+            ctx,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(());
+        };
 
         match outcome {
             RelayOutcome::Reusable => {} // continue loop
@@ -2277,10 +2326,174 @@ where
 mod tests {
     use super::*;
     use crate::opa::{NetworkInput, OpaEngine};
+    use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+    use openshell_core::provider_credentials::ProviderCredentialState;
+    use std::collections::HashMap as TestHashMap;
     use std::path::PathBuf;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
+
+    fn endpoint_binding(identity: &str) -> StaticCredentialBinding {
+        StaticCredentialBinding {
+            endpoints: vec![StaticCredentialEndpointBinding {
+                host: "allowed.example.test".to_string(),
+                port: 443,
+                path: "/allowed/**".to_string(),
+            }],
+            credential_identity: identity.to_string(),
+        }
+    }
+
+    fn endpoint_mismatch_resolver(
+        values: TestHashMap<String, String>,
+    ) -> (ProviderCredentialState, Arc<SecretResolver>) {
+        let bindings = values
+            .keys()
+            .map(|key| (key.clone(), endpoint_binding(&format!("provider-a:{key}"))))
+            .collect();
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            values,
+            TestHashMap::new(),
+            TestHashMap::new(),
+            bindings,
+            Vec::new(),
+        )
+        .expect("bound provider state");
+        let resolver = state
+            .resolver_for_endpoint("denied.example.test", 443, "/outside")
+            .expect("endpoint-scoped resolver");
+        (state, resolver)
+    }
+
+    async fn assert_credential_relay_rejected(
+        request: crate::l7::provider::L7Request,
+        resolver: &SecretResolver,
+        options: crate::l7::rest::RelayRequestOptions<'_>,
+    ) {
+        let (mut client_peer, mut client) = tokio::io::duplex(8192);
+        let (mut upstream, mut upstream_peer) = tokio::io::duplex(8192);
+        let ctx = L7EvalContext {
+            host: "denied.example.test".to_string(),
+            port: 443,
+            policy_name: "bound".to_string(),
+            secret_resolver: Some(Arc::new(resolver.clone())),
+            ..Default::default()
+        };
+
+        let outcome = relay_http_request_with_credential_rejection(
+            &request,
+            &mut client,
+            &mut upstream,
+            crate::l7::rest::RelayRequestOptions {
+                resolver: Some(resolver),
+                ..options
+            },
+            &ctx,
+        )
+        .await
+        .expect("typed credential denial");
+        assert!(outcome.is_none());
+        drop(client);
+        drop(upstream);
+
+        let mut response = String::new();
+        client_peer.read_to_string(&mut response).await.unwrap();
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            response.contains("credential_endpoint_mismatch"),
+            "{response}"
+        );
+        let mut forwarded = Vec::new();
+        upstream_peer.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "credential mismatch must not write upstream"
+        );
+
+        let activity = build_credential_resolution_event(&ctx, true)
+            .to_json()
+            .unwrap();
+        assert_eq!(activity["status_detail"], "credential_endpoint_mismatch");
+        assert_eq!(activity["action"], "Denied");
+        assert_eq!(activity["disposition"], "Blocked");
+
+        let finding = build_credential_endpoint_mismatch_finding(&ctx)
+            .to_json()
+            .unwrap();
+        assert_eq!(
+            finding["finding_info"]["uid"],
+            "openshell.provider_credential.endpoint_mismatch"
+        );
+        assert_eq!(finding["action"], "Denied");
+        assert_eq!(finding["disposition"], "Blocked");
+    }
+
+    #[tokio::test]
+    async fn body_only_endpoint_mismatch_returns_typed_403() {
+        let (_state, resolver) = endpoint_mismatch_resolver(TestHashMap::from([(
+            "API_TOKEN".to_string(),
+            "secret".to_string(),
+        )]));
+        let body = br#"{"token":"openshell:resolve:env:v1_API_TOKEN"}"#;
+        let request = crate::l7::provider::L7Request {
+            action: "POST".to_string(),
+            target: "/outside".to_string(),
+            query_params: TestHashMap::new(),
+            raw_header: format!(
+                "POST /outside HTTP/1.1\r\nHost: denied.example.test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes()
+            .into_iter()
+            .chain(body.iter().copied())
+            .collect(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(body.len() as u64),
+        };
+
+        assert_credential_relay_rejected(
+            request,
+            resolver.as_ref(),
+            crate::l7::rest::RelayRequestOptions {
+                request_body_credential_rewrite: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn implicit_sigv4_endpoint_mismatch_returns_typed_403() {
+        let (_state, resolver) = endpoint_mismatch_resolver(TestHashMap::from([
+            ("AWS_ACCESS_KEY_ID".to_string(), "access".to_string()),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "secret".to_string()),
+            ("AWS_SESSION_TOKEN".to_string(), "session".to_string()),
+        ]));
+        let request = crate::l7::provider::L7Request {
+            action: "GET".to_string(),
+            target: "/outside".to_string(),
+            query_params: TestHashMap::new(),
+            raw_header:
+                b"GET /outside HTTP/1.1\r\nHost: denied.example.test\r\nContent-Length: 0\r\n\r\n"
+                    .to_vec(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(0),
+        };
+
+        assert_credential_relay_rejected(
+            request,
+            resolver.as_ref(),
+            crate::l7::rest::RelayRequestOptions {
+                credential_signing: crate::l7::CredentialSigning::SigV4NoBody,
+                signing_service: "execute-api",
+                signing_region: "us-west-2",
+                host: "denied.example.test",
+                port: 443,
+                ..Default::default()
+            },
+        )
+        .await;
+    }
 
     fn install_builtin_middleware(engine: &OpaEngine) {
         engine.set_middleware_runner_for_tests(openshell_supervisor_middleware::ChainRunner::new(

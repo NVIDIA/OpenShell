@@ -911,6 +911,15 @@ fn build_forward_allow_ocsf_event(
         .build()
 }
 
+fn build_forward_parse_error_ocsf_event(path: &str) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Fail)
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .message(format!("FORWARD parse error for {path}"))
+        .build()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_forward_policy_deny_ocsf_event(
     peer_addr: SocketAddr,
@@ -3584,6 +3593,71 @@ fn parse_proxy_uri(uri: &str) -> Result<(String, String, u16, String)> {
     Ok((scheme, host, port, path.to_string()))
 }
 
+/// Return a query-free, credential-redacted path suitable for forward-proxy
+/// telemetry. Malformed targets are represented by a fixed sentinel so parse
+/// errors cannot expose query strings or credential environment-key names.
+fn forward_telemetry_path(target_uri: &str) -> String {
+    let Ok((_, _, _, target)) = parse_proxy_uri(target_uri) else {
+        return "/[INVALID_REQUEST_TARGET]".to_string();
+    };
+    let path = target
+        .split_once('?')
+        .map_or(target.as_str(), |(path, _)| path);
+    secrets::redact_target_for_policy(path)
+        .unwrap_or_else(|_| "/[INVALID_REQUEST_TARGET]".to_string())
+}
+
+fn endpoint_secret_resolver(
+    provider_credentials: Option<&ProviderCredentialState>,
+    fallback: Option<Arc<SecretResolver>>,
+    host: &str,
+    port: u16,
+    canonical_path: &str,
+) -> Option<Arc<SecretResolver>> {
+    provider_credentials.map_or(fallback, |credentials| {
+        credentials.resolver_for_endpoint(host, port, canonical_path)
+    })
+}
+
+struct PreparedForwardTarget {
+    canonical_path: String,
+    raw_query: Option<String>,
+    upstream_target: String,
+    telemetry_path: String,
+    secret_resolver: Option<Arc<SecretResolver>>,
+}
+
+fn prepare_forward_target(
+    target: &str,
+    canonicalize_options: crate::l7::path::CanonicalizeOptions,
+    provider_credentials: Option<&ProviderCredentialState>,
+    fallback: Option<Arc<SecretResolver>>,
+    host: &str,
+    port: u16,
+) -> Result<PreparedForwardTarget, crate::l7::path::CanonicalizeError> {
+    let (canonical, raw_query) =
+        crate::l7::path::canonicalize_request_target(target, &canonicalize_options)?;
+    let telemetry_path = secrets::redact_target_for_policy(&canonical.path)
+        .unwrap_or_else(|_| "/[INVALID_REQUEST_TARGET]".to_string());
+    let upstream_target = raw_query
+        .as_deref()
+        .filter(|query| !query.is_empty())
+        .map_or_else(
+            || canonical.path.clone(),
+            |query| format!("{}?{query}", canonical.path),
+        );
+    let secret_resolver =
+        endpoint_secret_resolver(provider_credentials, fallback, host, port, &canonical.path);
+
+    Ok(PreparedForwardTarget {
+        canonical_path: canonical.path,
+        raw_query,
+        upstream_target,
+        telemetry_path,
+        secret_resolver,
+    })
+}
+
 /// Build the HTTP/1.1 `Host` value for a plain-HTTP absolute-form target.
 ///
 /// Forward proxy requests are restricted to `http`, so port 80 is omitted as
@@ -3860,6 +3934,11 @@ struct ForwardRelayOptions<'a> {
     websocket_extensions: crate::l7::rest::WebSocketExtensionMode,
     secret_resolver: Option<&'a SecretResolver>,
     request_body_credential_rewrite: bool,
+    credential_signing: crate::l7::CredentialSigning,
+    signing_service: &'a str,
+    signing_region: &'a str,
+    host: &'a str,
+    port: u16,
 }
 
 async fn relay_rewritten_forward_request<C, U>(
@@ -3898,11 +3977,11 @@ where
             generation_guard: Some(options.generation_guard),
             websocket_extensions: options.websocket_extensions,
             request_body_credential_rewrite: options.request_body_credential_rewrite,
-            credential_signing: crate::l7::CredentialSigning::None,
-            signing_service: "",
-            signing_region: "",
-            host: "",
-            port: 0,
+            credential_signing: options.credential_signing,
+            signing_service: options.signing_service,
+            signing_region: options.signing_region,
+            host: options.host,
+            port: options.port,
         },
     )
     .await
@@ -3968,29 +4047,16 @@ async fn handle_forward_proxy(
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<&ActivitySender>,
 ) -> Result<()> {
-    // 1. Parse the absolute-form URI. `path` is marked `mut` so that, when an
-    //    L7 config applies, the canonicalized form produced below replaces it
-    //    in-place — keeping OPA evaluation and the bytes written onto the wire
-    //    in sync. See the L7 block below.
-    let (scheme, host, port, mut path) = match parse_proxy_uri(target_uri) {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Fail)
-                .severity(SeverityId::Low)
-                .status(StatusId::Failure)
-                .message(format!("FORWARD parse error for {target_uri}: {e}"))
-                .build();
-            ocsf_emit!(event);
-            respond(client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
-            return Ok(());
-        }
+    let mut telemetry_path = forward_telemetry_path(target_uri);
+    // 1. Parse the absolute-form URI. Every external forward target is
+    // canonicalized below before credential binding, policy-path evaluation,
+    // upstream bytes, or telemetry consume it.
+    let Ok((scheme, host, port, mut path)) = parse_proxy_uri(target_uri) else {
+        ocsf_emit!(build_forward_parse_error_ocsf_event(&telemetry_path));
+        respond(client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
+        return Ok(());
     };
     let host_lc = host.to_ascii_lowercase();
-    let secret_resolver = provider_credentials
-        .as_ref()
-        .and_then(|credentials| credentials.resolver_for_endpoint(&host_lc, port, &path))
-        .or(secret_resolver);
 
     if host_lc == POLICY_LOCAL_HOST {
         if scheme != "http" || port != 80 {
@@ -4121,7 +4187,7 @@ async fn handle_forward_proxy(
                 method,
                 &host_lc,
                 port,
-                &path,
+                &telemetry_path,
                 &binary_str,
                 &pid_str,
                 &ancestors_str,
@@ -4144,7 +4210,7 @@ async fn handle_forward_proxy(
                     403,
                     "Forbidden",
                     "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                    &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
                 ),
             )
             .await?;
@@ -4186,14 +4252,13 @@ async fn handle_forward_proxy(
                     403,
                     "Forbidden",
                     "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                    &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
                 ),
             )
             .await?;
             return Ok(());
         }
     };
-    let mut upstream_target = path.clone();
     let mut websocket_extensions = crate::l7::rest::WebSocketExtensionMode::Preserve;
     let mut forward_tunnel_engine: Option<crate::opa::TunnelPolicyEngine> = None;
     // L7 endpoint config and evaluated request info, carried past the L7
@@ -4207,14 +4272,6 @@ async fn handle_forward_proxy(
     let mut forward_websocket_request =
         crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
     let mut request_body_credential_rewrite = false;
-    let l7_ctx = relay::http_context(
-        &decision,
-        provider_credentials,
-        secret_resolver.clone(),
-        activity_tx.cloned(),
-        dynamic_credentials.clone(),
-        agent_proposals,
-    );
     let mut l7_activity_pending = false;
 
     // 4b. If the endpoint has L7 config, evaluate the request against
@@ -4223,6 +4280,67 @@ async fn handle_forward_proxy(
     //     strips hop-by-hop `Connection` headers and drops the upstream after
     //     the response instead of asking the upstream to close it.
     hydrate_l7_route(&opa_engine, &mut decision);
+    let canonicalize_options = crate::l7::path::CanonicalizeOptions {
+        allow_encoded_slash: decision.endpoint.l7_route.as_ref().is_some_and(|route| {
+            route
+                .configs
+                .iter()
+                .any(|snapshot| snapshot.config.allow_encoded_slash)
+        }),
+        ..Default::default()
+    };
+    let prepared_target = match prepare_forward_target(
+        &path,
+        canonicalize_options,
+        provider_credentials.as_ref(),
+        secret_resolver,
+        &host_lc,
+        port,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .message(format!(
+                    "FORWARD rejecting non-canonical request-target: {error}"
+                ))
+                .build();
+            ocsf_emit!(event);
+            emit_activity_simple(activity_tx, true, "forward_parse_rejection");
+            respond(
+                client,
+                &build_json_error_response(
+                    400,
+                    "Bad Request",
+                    "invalid_request_target",
+                    "request-target must be canonical",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    path = prepared_target.canonical_path;
+    telemetry_path = prepared_target.telemetry_path;
+    let upstream_target = prepared_target.upstream_target;
+    let query_params = prepared_target
+        .raw_query
+        .as_deref()
+        .map_or_else(std::collections::HashMap::new, |query| {
+            crate::l7::rest::parse_query_params(query).unwrap_or_default()
+        });
+    let secret_resolver = prepared_target.secret_resolver;
+    let l7_ctx = relay::http_context(
+        &decision,
+        provider_credentials,
+        secret_resolver.clone(),
+        activity_tx.cloned(),
+        dynamic_credentials.clone(),
+        agent_proposals,
+    );
     if let Some(route) = decision
         .endpoint
         .l7_route
@@ -4255,7 +4373,7 @@ async fn handle_forward_proxy(
                     403,
                     "Forbidden",
                     "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                    &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
                 ),
             )
             .await?;
@@ -4280,7 +4398,9 @@ async fn handle_forward_proxy(
                         403,
                         "Forbidden",
                         "policy_denied",
-                        &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                        &format!(
+                            "{method} {host_lc}:{port}{telemetry_path} not permitted by policy"
+                        ),
                     ),
                 )
                 .await?;
@@ -4288,62 +4408,6 @@ async fn handle_forward_proxy(
             }
         };
 
-        // Canonicalize the request-target. The canonical form is fed to OPA
-        // AND reassigned to the outer `path` variable so the later call to
-        // `rewrite_forward_request` writes canonical bytes to the upstream.
-        // This closes the policy/upstream parser-differential at this site;
-        // without this reassignment, OPA would evaluate the canonical form
-        // while the upstream re-normalizes the raw input and dispatches on a
-        // potentially different path.
-        let canonicalize_options = crate::l7::path::CanonicalizeOptions {
-            allow_encoded_slash: route
-                .configs
-                .iter()
-                .any(|snapshot| snapshot.config.allow_encoded_slash),
-            ..Default::default()
-        };
-        let query_params =
-            match crate::l7::path::canonicalize_request_target(&path, &canonicalize_options) {
-                Ok((canon, query)) => {
-                    upstream_target = match query.as_deref() {
-                        Some(raw_query) if !raw_query.is_empty() => {
-                            format!("{}?{raw_query}", canon.path)
-                        }
-                        _ => canon.path.clone(),
-                    };
-                    let params = query
-                        .as_deref()
-                        .map_or_else(std::collections::HashMap::new, |q| {
-                            crate::l7::rest::parse_query_params(q).unwrap_or_default()
-                        });
-                    path = canon.path;
-                    params
-                }
-                Err(e) => {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .message(format!(
-                            "FORWARD_L7 rejecting non-canonical request-target: {e}"
-                        ))
-                        .build();
-                    ocsf_emit!(event);
-                    emit_activity_simple(activity_tx, true, "l7_parse_rejection");
-                    respond(
-                        client,
-                        &build_json_error_response(
-                            400,
-                            "Bad Request",
-                            "invalid_request_target",
-                            "request-target must be canonical",
-                        ),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
         let Ok(redacted_path) = secrets::redact_target_for_policy(&path) else {
             respond(
                 client,
@@ -4365,7 +4429,9 @@ async fn handle_forward_proxy(
                     403,
                     "Forbidden",
                     "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} did not match an L7 endpoint path"),
+                    &format!(
+                        "{method} {host_lc}:{port}{telemetry_path} did not match an L7 endpoint path"
+                    ),
                 ),
             )
             .await?;
@@ -4380,7 +4446,7 @@ async fn handle_forward_proxy(
                 .status(StatusId::Failure)
                 .http_request(HttpRequest::new(
                     method,
-                    OcsfUrl::new("http", &host_lc, &path, port),
+                    OcsfUrl::new("http", &host_lc, &telemetry_path, port),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
@@ -4390,7 +4456,7 @@ async fn handle_forward_proxy(
                 )
                 .firewall_rule(policy_str, "l7")
                 .message(format!(
-                    "FORWARD_L7 denied unsupported h2c upgrade for {method} {host_lc}:{port}{path}"
+                    "FORWARD_L7 denied unsupported h2c upgrade for {method} {host_lc}:{port}{telemetry_path}"
                 ))
                 .status_detail(crate::l7::rest::UNSUPPORTED_H2C_UPGRADE_DETAIL)
                 .build();
@@ -4600,11 +4666,11 @@ async fn handle_forward_proxy(
                             "FORWARD_L7"
                         };
                     format!(
-                        "{message_prefix} {decision_str} {method} {host_lc}:{port}{path} reason={reason}"
+                        "{message_prefix} {decision_str} {method} {host_lc}:{port}{telemetry_path} reason={reason}"
                     )
                 },
                 |jsonrpc_info| {
-                    let endpoint = format!("{host_lc}:{port}{path}");
+                    let endpoint = format!("{host_lc}:{port}{telemetry_path}");
                     crate::l7::relay::jsonrpc_log_message(
                         decision_str,
                         method,
@@ -4622,7 +4688,7 @@ async fn handle_forward_proxy(
                 .severity(severity)
                 .http_request(HttpRequest::new(
                     method,
-                    OcsfUrl::new("http", &host_lc, &path, port),
+                    OcsfUrl::new("http", &host_lc, &telemetry_path, port),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
@@ -4656,7 +4722,9 @@ async fn handle_forward_proxy(
                     403,
                     "Forbidden",
                     "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} denied by L7 policy: {reason}"),
+                    &format!(
+                        "{method} {host_lc}:{port}{telemetry_path} denied by L7 policy: {reason}"
+                    ),
                 ),
             )
             .await?;
@@ -4687,7 +4755,7 @@ async fn handle_forward_proxy(
                 method,
                 &host_lc,
                 port,
-                &path,
+                &telemetry_path,
                 &binary_str,
                 &pid_str,
                 &ancestors_str,
@@ -4724,7 +4792,7 @@ async fn handle_forward_proxy(
                 method,
                 &host_lc,
                 port,
-                &path,
+                &telemetry_path,
                 &binary_str,
                 &pid_str,
                 &ancestors_str,
@@ -4756,7 +4824,7 @@ async fn handle_forward_proxy(
                 403,
                 "Forbidden",
                 "policy_denied",
-                &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
             ),
         )
         .await?;
@@ -4776,7 +4844,7 @@ async fn handle_forward_proxy(
                 .status(StatusId::Failure)
                 .http_request(HttpRequest::new(
                     method,
-                    OcsfUrl::new("http", &host_lc, &path, port),
+                    OcsfUrl::new("http", &host_lc, &telemetry_path, port),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
@@ -4830,7 +4898,7 @@ async fn handle_forward_proxy(
                 403,
                 "Forbidden",
                 "policy_denied",
-                &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
             ),
         )
         .await?;
@@ -4963,15 +5031,26 @@ async fn handle_forward_proxy(
                 403,
                 "Forbidden",
                 "policy_denied",
-                &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                &format!("{method} {host_lc}:{port}{telemetry_path} not permitted by policy"),
             ),
         )
         .await?;
         return Ok(());
     }
-    let outcome = relay_rewritten_forward_request(
+    let credential_signing = forward_upgrade_config
+        .as_ref()
+        .map_or(crate::l7::CredentialSigning::None, |config| {
+            config.credential_signing
+        });
+    let signing_service = forward_upgrade_config
+        .as_ref()
+        .map_or("", |config| config.signing_service.as_str());
+    let signing_region = forward_upgrade_config
+        .as_ref()
+        .map_or("", |config| config.signing_region.as_str());
+    let outcome = match relay_rewritten_forward_request(
         method,
-        &path,
+        &upstream_target,
         rewritten,
         client,
         &mut upstream,
@@ -4980,9 +5059,24 @@ async fn handle_forward_proxy(
             websocket_extensions,
             secret_resolver: secret_resolver.as_deref(),
             request_body_credential_rewrite,
+            credential_signing,
+            signing_service,
+            signing_region,
+            host: &host_lc,
+            port,
         },
     )
-    .await?;
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(report) => {
+            if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
+                crate::l7::relay::reject_credential_resolution(client, &l7_ctx, error).await?;
+                return Ok(());
+            }
+            return Err(report);
+        }
+    };
 
     // The request has now survived middleware, token grant, credential
     // rewriting, generation checks, and the HTTP relay. Only now record the
@@ -4992,7 +5086,7 @@ async fn handle_forward_proxy(
         method,
         &host_lc,
         port,
-        &path,
+        &telemetry_path,
         &binary_str,
         &pid_str,
         &ancestors_str,
@@ -5245,6 +5339,7 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 mod tests {
     use super::*;
     use openshell_core::proposals::AgentProposals;
+    use std::collections::HashMap as TestHashMap;
     use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
@@ -5437,6 +5532,64 @@ network_policies: {}
         assert_eq!(json["status_detail"], reason);
         assert_eq!(json["action"], "Denied");
         assert_eq!(json["disposition"], "Blocked");
+    }
+
+    #[test]
+    fn forward_ocsf_events_omit_queries_and_credential_key_names() {
+        let peer = "127.0.0.1:45123".parse().unwrap();
+        let path = forward_telemetry_path(
+            "http://api.example.com/v1/openshell:resolve:env:API_TOKEN?token=real-secret",
+        );
+        assert_eq!(path, "/v1/[CREDENTIAL]");
+
+        let allowed = build_forward_allow_ocsf_event(
+            peer,
+            "GET",
+            "api.example.com",
+            80,
+            &path,
+            "/usr/bin/curl",
+            "42",
+            "/usr/bin/bash",
+            "curl",
+            "allow_api",
+        )
+        .to_json()
+        .unwrap();
+        let denied = build_forward_policy_deny_ocsf_event(
+            peer,
+            "GET",
+            "api.example.com",
+            80,
+            &path,
+            "/usr/bin/curl",
+            "42",
+            "/usr/bin/bash",
+            "curl",
+            "policy denied",
+        )
+        .to_json()
+        .unwrap();
+        for event in [&allowed, &denied] {
+            assert_eq!(event["http_request"]["url"]["path"], "/v1/[CREDENTIAL]");
+            let serialized = event.to_string();
+            assert!(!serialized.contains("API_TOKEN"), "{serialized}");
+            assert!(!serialized.contains("real-secret"), "{serialized}");
+            assert!(!serialized.contains("?token="), "{serialized}");
+        }
+
+        let malformed = build_forward_parse_error_ocsf_event(&forward_telemetry_path(
+            "not-a-uri?token=real-secret&key=openshell:resolve:env:API_TOKEN",
+        ))
+        .to_json()
+        .unwrap();
+        assert_eq!(
+            malformed["message"],
+            "FORWARD parse error for /[INVALID_REQUEST_TARGET]"
+        );
+        let serialized = malformed.to_string();
+        assert!(!serialized.contains("API_TOKEN"), "{serialized}");
+        assert!(!serialized.contains("real-secret"), "{serialized}");
     }
 
     #[test]
@@ -6009,6 +6162,11 @@ network_policies:
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: resolver,
                 request_body_credential_rewrite,
+                credential_signing: crate::l7::CredentialSigning::None,
+                signing_service: "",
+                signing_region: "",
+                host: "",
+                port: 0,
             },
         )
         .await?;
@@ -6193,6 +6351,11 @@ network_policies:
                     websocket_extensions,
                     secret_resolver: None,
                     request_body_credential_rewrite: false,
+                    credential_signing: crate::l7::CredentialSigning::None,
+                    signing_service: "",
+                    signing_region: "",
+                    host: "",
+                    port: 0,
                 },
             )
             .await?;
@@ -8373,6 +8536,105 @@ network_policies:
     }
 
     #[test]
+    fn forward_telemetry_path_omits_queries_and_redacts_credential_syntax() {
+        let target = "http://host:80/v1/openshell:resolve:env:API_TOKEN?token=real-secret";
+        let redacted = forward_telemetry_path(target);
+        assert_eq!(redacted, "/v1/[CREDENTIAL]");
+        assert!(!redacted.contains("API_TOKEN"));
+        assert!(!redacted.contains("real-secret"));
+
+        let malformed = forward_telemetry_path(
+            "not-a-uri?token=real-secret&key=openshell:resolve:env:API_TOKEN",
+        );
+        assert_eq!(malformed, "/[INVALID_REQUEST_TARGET]");
+        assert!(!malformed.contains("API_TOKEN"));
+        assert!(!malformed.contains("real-secret"));
+    }
+
+    #[test]
+    fn forward_binding_uses_canonical_path_for_dot_segment_traversal() {
+        use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([("API_TOKEN".to_string(), "secret".to_string())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.com".to_string(),
+                        port: 80,
+                        path: "/allowed/**".to_string(),
+                    }],
+                    credential_identity: "provider-a:API_TOKEN".to_string(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("bound provider state");
+        let placeholder = "openshell:resolve:env:v1_API_TOKEN";
+
+        for raw_path in ["/allowed/../outside", "/allowed/%2e%2e/outside"] {
+            let prepared = prepare_forward_target(
+                raw_path,
+                crate::l7::path::CanonicalizeOptions::default(),
+                Some(&state),
+                state.resolver(),
+                "api.example.com",
+                80,
+            )
+            .expect("prepared target");
+            assert_eq!(prepared.canonical_path, "/outside");
+            let resolver = prepared.secret_resolver.expect("scoped resolver");
+            let error = resolver
+                .rewrite_header_value(placeholder)
+                .expect_err("canonical endpoint must deny traversal");
+            assert!(error.is_endpoint_mismatch());
+        }
+    }
+
+    #[test]
+    fn live_forward_state_is_authoritative_after_revocation() {
+        use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([("API_TOKEN".to_string(), "secret".to_string())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.com".to_string(),
+                        port: 80,
+                        path: "/**".to_string(),
+                    }],
+                    credential_identity: "provider-a:API_TOKEN".to_string(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("bound provider state");
+        let connection_open_resolver = state.resolver();
+        state.revoke_static_provider_environment(2);
+
+        assert!(
+            endpoint_secret_resolver(
+                Some(&state),
+                connection_open_resolver,
+                "api.example.com",
+                80,
+                "/v1",
+            )
+            .is_none(),
+            "live revocation must not fall back to the connection-open resolver"
+        );
+    }
+
+    #[test]
     fn test_parse_proxy_uri_ipv6() {
         let (_, host, port, path) = parse_proxy_uri("http://[::1]:8080/test").unwrap();
         assert_eq!(host, "::1");
@@ -9010,19 +9272,34 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn forward_relay_unresolved_body_placeholder_fails_before_upstream_write() {
-        let (_, resolver) = SecretResolver::from_provider_env(
-            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
-                .into_iter()
-                .collect(),
-        );
-        let resolver = resolver.expect("resolver");
-        let alias = "provider-OPENSHELL-RESOLVE-ENV-API_TOKEN";
-        let body = "token=provider-OPENSHELL-RESOLVE-ENV-MISSING_TOKEN";
+    async fn forward_relay_body_endpoint_mismatch_is_typed_before_upstream_write() {
+        use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([("API_TOKEN".to_string(), "provider-real-token".to_string())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "allowed.example.com".to_string(),
+                        port: 80,
+                        path: "/allowed/**".to_string(),
+                    }],
+                    credential_identity: "provider-a:API_TOKEN".to_string(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("bound provider state");
+        let resolver = state
+            .resolver_for_endpoint("api.example.com", 80, "/api/messages")
+            .expect("endpoint-scoped resolver");
+        let body = "token=openshell:resolve:env:v1_API_TOKEN";
         let raw = format!(
             "POST http://api.example.com/api/messages HTTP/1.1\r\n\
              Host: api.example.com\r\n\
-             Authorization: Bearer {alias}\r\n\
              Content-Type: application/x-www-form-urlencoded\r\n\
              Content-Length: {}\r\n\r\n{}",
             body.len(),
@@ -9052,19 +9329,104 @@ network_policies:
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: Some(&resolver),
                 request_body_credential_rewrite: true,
+                credential_signing: crate::l7::CredentialSigning::None,
+                signing_service: "",
+                signing_region: "",
+                host: "",
+                port: 0,
             },
         )
         .await
         .expect_err("unresolved body placeholder should fail closed");
 
+        let credential_error = err
+            .downcast_ref::<secrets::UnresolvedPlaceholderError>()
+            .expect("body mismatch must retain its typed error");
+        assert!(credential_error.is_endpoint_mismatch());
         assert!(!err.to_string().contains("provider-real-token"));
-        assert!(!err.to_string().contains("MISSING_TOKEN"));
+        assert!(!err.to_string().contains("API_TOKEN"));
         drop(proxy_to_upstream);
         let mut forwarded = Vec::new();
         upstream_side.read_to_end(&mut forwarded).await.unwrap();
         assert!(
             forwarded.is_empty(),
             "failed forward body rewrite must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_relay_sigv4_endpoint_mismatch_is_typed_before_upstream_write() {
+        use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+        let values = TestHashMap::from([
+            ("AWS_ACCESS_KEY_ID".to_string(), "access".to_string()),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "secret".to_string()),
+            ("AWS_SESSION_TOKEN".to_string(), "session".to_string()),
+        ]);
+        let bindings = values
+            .keys()
+            .map(|key| {
+                (
+                    key.clone(),
+                    StaticCredentialBinding {
+                        endpoints: vec![StaticCredentialEndpointBinding {
+                            host: "allowed.example.com".to_string(),
+                            port: 80,
+                            path: "/allowed/**".to_string(),
+                        }],
+                        credential_identity: format!("provider-a:{key}"),
+                    },
+                )
+            })
+            .collect();
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            values,
+            TestHashMap::new(),
+            TestHashMap::new(),
+            bindings,
+            Vec::new(),
+        )
+        .expect("bound provider state");
+        let resolver = state
+            .resolver_for_endpoint("api.example.com", 80, "/api")
+            .expect("endpoint-scoped resolver");
+        let guard = forward_test_guard();
+        let rewritten =
+            b"GET /api HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let err = relay_rewritten_forward_request(
+            "GET",
+            "/api",
+            rewritten,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            ForwardRelayOptions {
+                generation_guard: &guard,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: Some(&resolver),
+                request_body_credential_rewrite: false,
+                credential_signing: crate::l7::CredentialSigning::SigV4NoBody,
+                signing_service: "execute-api",
+                signing_region: "us-west-2",
+                host: "api.example.com",
+                port: 80,
+            },
+        )
+        .await
+        .expect_err("SigV4 endpoint mismatch should fail closed");
+
+        let credential_error = err
+            .downcast_ref::<secrets::UnresolvedPlaceholderError>()
+            .expect("SigV4 mismatch must retain its typed error");
+        assert!(credential_error.is_endpoint_mismatch());
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "failed SigV4 credential lookup must not reach upstream"
         );
     }
 
@@ -9132,6 +9494,11 @@ network_policies:
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: None,
                 request_body_credential_rewrite: false,
+                credential_signing: crate::l7::CredentialSigning::None,
+                signing_service: "",
+                signing_region: "",
+                host: "",
+                port: 0,
             },
         )
         .await;
@@ -9175,6 +9542,11 @@ network_policies:
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: None,
                 request_body_credential_rewrite: false,
+                credential_signing: crate::l7::CredentialSigning::None,
+                signing_service: "",
+                signing_region: "",
+                host: "",
+                port: 0,
             },
         )
         .await;
