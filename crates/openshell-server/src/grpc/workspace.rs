@@ -48,38 +48,26 @@ impl ObjectType for WorkspaceMember {
     }
 }
 
-async fn filter_workspaces_by_membership(
-    state: &Arc<ServerState>,
-    principal: &Principal,
-    workspaces: Vec<Workspace>,
-) -> Result<Vec<Workspace>, Status> {
-    let subject = match principal {
+/// Extract the subject that needs membership filtering, or `None` if the
+/// principal has unrestricted visibility (platform admin, sandbox caller).
+fn membership_filter_subject<'a>(
+    state: &ServerState,
+    principal: &'a Principal,
+) -> Result<Option<&'a str>, Status> {
+    match principal {
         Principal::User(u) => {
             if crate::auth::workspace_authz::is_platform_admin_principal(
                 &u.identity.roles,
                 &state.admin_role,
             ) {
-                return Ok(workspaces);
+                Ok(None)
+            } else {
+                Ok(Some(&u.identity.subject))
             }
-            &u.identity.subject
         }
-        Principal::Sandbox(_) => return Ok(workspaces),
-        Principal::Anonymous => return Err(Status::unauthenticated("authentication required")),
-    };
-
-    let mut visible = Vec::new();
-    for ws in workspaces {
-        let ws_name = ws.metadata.as_ref().map_or("", |m| m.name.as_str());
-        let member = state
-            .store
-            .get_message_by_name::<WorkspaceMember>(ws_name, subject)
-            .await
-            .map_err(|e| Status::internal(format!("membership check failed: {e}")))?;
-        if member.is_some() {
-            visible.push(ws);
-        }
+        Principal::Sandbox(_) => Ok(None),
+        Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }
-    Ok(visible)
 }
 
 fn validate_workspace_name(name: &str) -> Result<(), Status> {
@@ -279,22 +267,35 @@ pub(super) async fn handle_list_workspaces(
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let limit = clamp_limit(req.limit, 100, MAX_PAGE_SIZE);
+    let subject = membership_filter_subject(state, &principal)?;
 
-    let workspaces: Vec<Workspace> = if req.label_selector.is_empty() {
-        state
+    let member_type = WorkspaceMember::object_type();
+    let workspaces = match subject {
+        Some(subject) if req.label_selector.is_empty() => state
+            .store
+            .list_messages_with_membership::<Workspace>(member_type, subject, limit, req.offset)
+            .await
+            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
+        Some(subject) => {
+            let all: Vec<Workspace> = state
+                .store
+                .list_messages_with_membership(member_type, subject, u32::MAX, 0)
+                .await
+                .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?;
+            crate::persistence::filter_by_labels(all, &req.label_selector, limit, req.offset)
+                .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?
+        }
+        None if req.label_selector.is_empty() => state
             .store
             .list_messages("", limit, req.offset)
             .await
-            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?
-    } else {
-        state
+            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
+        None => state
             .store
             .list_messages_with_selector("", &req.label_selector, limit, req.offset)
             .await
-            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?
+            .map_err(|e| Status::internal(format!("list workspaces failed: {e}")))?,
     };
-
-    let workspaces = filter_workspaces_by_membership(state, &principal, workspaces).await?;
 
     Ok(Response::new(ListWorkspacesResponse { workspaces }))
 }

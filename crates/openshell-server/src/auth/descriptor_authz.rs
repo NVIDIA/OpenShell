@@ -150,6 +150,9 @@ impl DescriptorAuthTable {
     }
 }
 
+const VALID_WORKSPACE_ROLES: &[&str] = &["user", "admin"];
+const VALID_GLOBAL_ROLES: &[&str] = &["platform_admin"];
+
 fn validate_entry(
     path: &str,
     auth_mode: AuthMode,
@@ -163,7 +166,27 @@ fn validate_entry(
         ));
     }
 
+    if let Some(wr) = workspace_role
+        && !VALID_WORKSPACE_ROLES.contains(&wr)
+    {
+        return Err(format!(
+            "method {path}: unknown workspace_role '{wr}' (expected one of {VALID_WORKSPACE_ROLES:?})"
+        ));
+    }
+    if let Some(gr) = global_role
+        && !VALID_GLOBAL_ROLES.contains(&gr)
+    {
+        return Err(format!(
+            "method {path}: unknown global_role '{gr}' (expected one of {VALID_GLOBAL_ROLES:?})"
+        ));
+    }
+
     if !matches!(auth_mode, AuthMode::Bearer | AuthMode::Dual) {
+        if workspace_role.is_some() || global_role.is_some() || scope.is_some() {
+            return Err(format!(
+                "method {path}: {auth_mode:?} method must not declare role or scope"
+            ));
+        }
         return Ok(());
     }
 
@@ -316,5 +339,61 @@ mod tests {
         )
         .expect_err("multiple authorization layers must be rejected");
         assert!(err.ends_with("workspace_role and global_role are mutually exclusive"));
+    }
+
+    #[test]
+    fn non_bearer_methods_reject_role_and_scope_fields() {
+        let err = validate_entry(
+            FUTURE_RPC,
+            AuthMode::Unauthenticated,
+            Some("user"),
+            None,
+            None,
+        )
+        .expect_err("unauthenticated with role must be rejected");
+        assert!(err.contains("must not declare role or scope"));
+
+        let err = validate_entry(
+            FUTURE_RPC,
+            AuthMode::Sandbox,
+            None,
+            Some("platform_admin"),
+            None,
+        )
+        .expect_err("sandbox with global_role must be rejected");
+        assert!(err.contains("must not declare role or scope"));
+
+        let err = validate_entry(
+            FUTURE_RPC,
+            AuthMode::Sandbox,
+            None,
+            None,
+            Some("sandbox:read"),
+        )
+        .expect_err("sandbox with scope must be rejected");
+        assert!(err.contains("must not declare role or scope"));
+    }
+
+    #[test]
+    fn unknown_role_literals_rejected() {
+        let err = validate_entry(
+            FUTURE_RPC,
+            AuthMode::Bearer,
+            Some("superuser"),
+            None,
+            Some("sandbox:read"),
+        )
+        .expect_err("unknown workspace_role must be rejected");
+        assert!(err.contains("unknown workspace_role 'superuser'"));
+
+        let err = validate_entry(
+            FUTURE_RPC,
+            AuthMode::Bearer,
+            None,
+            Some("root"),
+            Some("sandbox:read"),
+        )
+        .expect_err("unknown global_role must be rejected");
+        assert!(err.contains("unknown global_role 'root'"));
     }
 }

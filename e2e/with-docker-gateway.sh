@@ -445,6 +445,7 @@ e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
 export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
 
 HOST_PORT=$(e2e_pick_port)
+HEALTH_PORT=$(e2e_pick_port)
 STATE_DIR="${XDG_STATE_HOME}"
 mkdir -p "${STATE_DIR}"
 JWT_DIR="${STATE_DIR}/jwt"
@@ -513,6 +514,7 @@ GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"
   --bind-address 0.0.0.0
   --port "${HOST_PORT}"
+  --health-port "${HEALTH_PORT}"
   --drivers docker
   --tls-cert "${PKI_DIR}/server/tls.crt"
   --tls-key "${PKI_DIR}/server/tls.key"
@@ -567,13 +569,12 @@ fi
 echo "Waiting for gateway to become healthy..."
 elapsed=0
 timeout=120
-last_status_output=""
 while [ "${elapsed}" -lt "${timeout}" ]; do
   if ! kill -0 "${GATEWAY_PID}" 2>/dev/null; then
     echo "ERROR: openshell-gateway exited before becoming healthy"
     exit 1
   fi
-  if last_status_output="$("${CLI_BIN}" status 2>&1)"; then
+  if curl -sf "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
     echo "Gateway healthy after ${elapsed}s."
     break
   fi
@@ -582,13 +583,6 @@ while [ "${elapsed}" -lt "${timeout}" ]; do
 done
 if [ "${elapsed}" -ge "${timeout}" ]; then
   echo "ERROR: gateway did not become healthy within ${timeout}s"
-  echo "=== last openshell status output ==="
-  if [ -n "${last_status_output}" ]; then
-    printf '%s\n' "${last_status_output}"
-  else
-    echo "<no output>"
-  fi
-  echo "=== end openshell status output ==="
   exit 1
 fi
 

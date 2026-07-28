@@ -396,6 +396,25 @@ impl Store {
         ))
     }
 
+    /// List objects of `object_type` that have a related `member_type` record
+    /// whose `name` column matches `member_name` in the same workspace.
+    pub async fn list_with_membership(
+        &self,
+        object_type: &str,
+        member_type: &str,
+        member_name: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch!(self.list_with_membership(
+            object_type,
+            member_type,
+            member_name,
+            limit,
+            offset
+        ))
+    }
+
     /// List objects by type across all workspaces with label selector filtering.
     pub async fn list_all_with_selector(
         &self,
@@ -492,6 +511,24 @@ impl Store {
         offset: u32,
     ) -> PersistenceResult<Vec<T>> {
         self.list_by_type(T::object_type(), limit, offset)
+            .await?
+            .into_iter()
+            .map(decode_record)
+            .collect()
+    }
+
+    /// List and decode objects that have a related membership record, with
+    /// pagination. See [`Store::list_with_membership`] for details.
+    pub async fn list_messages_with_membership<
+        T: Message + Default + ObjectType + SetResourceVersion,
+    >(
+        &self,
+        member_type: &str,
+        member_name: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<T>> {
+        self.list_with_membership(T::object_type(), member_type, member_name, limit, offset)
             .await?
             .into_iter()
             .map(decode_record)
@@ -720,6 +757,27 @@ pub fn parse_label_selector(selector: &str) -> PersistenceResult<HashMap<String,
     }
 
     Ok(labels)
+}
+
+/// Filter decoded protobuf messages by label selector, then apply pagination.
+pub fn filter_by_labels<T: ObjectLabels>(
+    items: Vec<T>,
+    label_selector: &str,
+    limit: u32,
+    offset: u32,
+) -> PersistenceResult<Vec<T>> {
+    let required = parse_label_selector(label_selector)?;
+    Ok(items
+        .into_iter()
+        .filter(|item| {
+            let labels = item.object_labels().unwrap_or_default();
+            required
+                .iter()
+                .all(|(k, v)| labels.get(k).is_some_and(|lv| lv == v))
+        })
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect())
 }
 
 /// Unconditional write helpers — test-only.
