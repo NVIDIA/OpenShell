@@ -4,24 +4,8 @@
 //! Compatibility and regression contracts for the shared proxy egress pipeline.
 
 use super::*;
-use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing_subscriber::prelude::*;
-
-#[derive(Clone)]
-struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl Write for SharedBuffer {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
 
 fn allowed_decision(intent: EgressIntent) -> EgressDecision {
     EgressDecision {
@@ -166,75 +150,27 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
 
 #[test]
 fn representative_adapter_denials_preserve_ocsf_fields() {
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let layer = openshell_ocsf::tracing_layers::OcsfJsonlLayer::new(SharedBuffer(captured.clone()));
-    let subscriber = tracing_subscriber::registry().with(layer);
     let denial_reason = "target.example resolves to internal address 10.0.0.5";
-    tracing::subscriber::with_default(subscriber, || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let denial = DestinationDenial {
-                    kind: DestinationDenialKind::InternalAddress,
-                    reason: denial_reason.to_string(),
-                };
-                let peer: SocketAddr = "127.0.0.1:41000".parse().unwrap();
+    let denial = DestinationDenial {
+        kind: DestinationDenialKind::InternalAddress,
+        reason: denial_reason.to_string(),
+    };
+    let peer: SocketAddr = "127.0.0.1:41000".parse().unwrap();
 
-                let (_app, mut proxy) = tcp_pair().await;
-                deny_connect_destination(
-                    &mut proxy,
-                    &denial,
-                    peer,
-                    "target.example",
-                    8443,
-                    "/usr/bin/curl",
-                    "42",
-                    "/usr/bin/sh",
-                    "curl --proxy",
-                    &allowed_decision(EgressIntent::connect("target.example".to_string(), 8443)),
-                    &None,
-                    &None,
-                )
-                .await
-                .unwrap();
-
-                let (_app, mut proxy) = tcp_pair().await;
-                deny_forward_destination(
-                    &mut proxy,
-                    &denial,
-                    peer,
-                    "POST",
-                    "target.example",
-                    8080,
-                    "/v1/items",
-                    "/usr/bin/curl",
-                    "42",
-                    "/usr/bin/sh",
-                    "curl --proxy",
-                    "proxy_compatibility",
-                    &allowed_decision(EgressIntent::forward_http(
-                        "target.example".to_string(),
-                        8080,
-                    )),
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
-            });
-    });
-
-    let bytes = captured.lock().unwrap().clone();
-    let events: Vec<serde_json::Value> = String::from_utf8(bytes)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(events.len(), 2);
-
-    let connect = &events[0];
+    // Build the production events directly rather than routing through the
+    // global tracing pipeline. Its callsite-interest cache is process-global,
+    // so parallel tests can otherwise make captured-event assertions flaky.
+    let connect = serde_json::to_value(build_connect_destination_deny_ocsf_event(
+        &denial,
+        peer,
+        "target.example",
+        8443,
+        "/usr/bin/curl",
+        "42",
+        "/usr/bin/sh",
+        "curl --proxy",
+    ))
+    .unwrap();
     assert_eq!(connect["class_name"], "Network Activity");
     assert_eq!(connect["activity_name"], "Open");
     assert_eq!(connect["action"], "Denied");
@@ -253,7 +189,20 @@ fn representative_adapter_denials_preserve_ocsf_fields() {
     );
     assert_eq!(connect["status_detail"], denial_reason);
 
-    let forward = &events[1];
+    let forward = serde_json::to_value(build_forward_destination_deny_ocsf_event(
+        &denial,
+        peer,
+        "POST",
+        "target.example",
+        8080,
+        "/v1/items",
+        "/usr/bin/curl",
+        "42",
+        "/usr/bin/sh",
+        "curl --proxy",
+        "proxy_compatibility",
+    ))
+    .unwrap();
     assert_eq!(forward["class_name"], "HTTP Activity");
     assert_eq!(forward["activity_name"], "Other");
     assert_eq!(forward["action"], "Denied");

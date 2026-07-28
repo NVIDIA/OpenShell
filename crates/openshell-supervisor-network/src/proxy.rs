@@ -901,6 +901,89 @@ fn build_forward_policy_deny_ocsf_event(
         .build()
 }
 
+fn destination_denial_detail(kind: DestinationDenialKind) -> &'static str {
+    match kind {
+        DestinationDenialKind::TrustedGateway => "trusted-gateway check failed",
+        DestinationDenialKind::InvalidAllowedIps => "invalid allowed_ips in policy",
+        DestinationDenialKind::AllowedIps => "allowed_ips check failed",
+        DestinationDenialKind::DeclaredEndpoint => "declared endpoint check failed",
+        DestinationDenialKind::InternalAddress => "internal address",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_connect_destination_deny_ocsf_event(
+    denial: &DestinationDenial,
+    peer_addr: SocketAddr,
+    host: &str,
+    port: u16,
+    binary: &str,
+    pid: &str,
+    ancestors: &str,
+    cmdline: &str,
+) -> openshell_ocsf::OcsfEvent {
+    let detail = destination_denial_detail(denial.kind);
+    let message = if denial.kind == DestinationDenialKind::InternalAddress {
+        format!("CONNECT blocked: internal address {host}:{port}")
+    } else {
+        format!("CONNECT blocked: {detail} for {host}:{port}")
+    };
+
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .firewall_rule("-", "ssrf")
+        .message(message)
+        .status_detail(&denial.reason)
+        .build()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_forward_destination_deny_ocsf_event(
+    denial: &DestinationDenial,
+    peer_addr: SocketAddr,
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    binary: &str,
+    pid: &str,
+    ancestors: &str,
+    cmdline: &str,
+    policy: &str,
+) -> openshell_ocsf::OcsfEvent {
+    let detail = destination_denial_detail(denial.kind);
+    let log_detail = if denial.kind == DestinationDenialKind::InternalAddress {
+        "internal IP without allowed_ips"
+    } else {
+        detail
+    };
+
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Other)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .http_request(HttpRequest::new(
+            method,
+            OcsfUrl::new("http", host, path, port),
+        ))
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .firewall_rule(policy, "ssrf")
+        .message(format!("FORWARD blocked: {log_detail} for {host}:{port}"))
+        .status_detail(&denial.reason)
+        .build()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn deny_connect_destination(
     client: &mut TcpStream,
@@ -916,33 +999,10 @@ async fn deny_connect_destination(
     denial_tx: &Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: &Option<ActivitySender>,
 ) -> Result<()> {
-    let detail = match denial.kind {
-        DestinationDenialKind::TrustedGateway => "trusted-gateway check failed",
-        DestinationDenialKind::InvalidAllowedIps => "invalid allowed_ips in policy",
-        DestinationDenialKind::AllowedIps => "allowed_ips check failed",
-        DestinationDenialKind::DeclaredEndpoint => "declared endpoint check failed",
-        DestinationDenialKind::InternalAddress => "internal address",
-    };
-    let message = if denial.kind == DestinationDenialKind::InternalAddress {
-        format!("CONNECT blocked: internal address {host}:{port}")
-    } else {
-        format!("CONNECT blocked: {detail} for {host}:{port}")
-    };
-
-    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Open)
-        .action(ActionId::Denied)
-        .disposition(DispositionId::Blocked)
-        .severity(SeverityId::Medium)
-        .status(StatusId::Failure)
-        .dst_endpoint(Endpoint::from_domain(host, port))
-        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
-        .firewall_rule("-", "ssrf")
-        .message(message)
-        .status_detail(&denial.reason)
-        .build();
-    ocsf_emit!(event);
+    let detail = destination_denial_detail(denial.kind);
+    ocsf_emit!(build_connect_destination_deny_ocsf_event(
+        denial, peer_addr, host, port, binary, pid, ancestors, cmdline,
+    ));
 
     emit_denial(
         denial_tx,
@@ -988,37 +1048,10 @@ async fn deny_forward_destination(
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<&ActivitySender>,
 ) -> Result<()> {
-    let detail = match denial.kind {
-        DestinationDenialKind::TrustedGateway => "trusted-gateway check failed",
-        DestinationDenialKind::InvalidAllowedIps => "invalid allowed_ips in policy",
-        DestinationDenialKind::AllowedIps => "allowed_ips check failed",
-        DestinationDenialKind::DeclaredEndpoint => "declared endpoint check failed",
-        DestinationDenialKind::InternalAddress => "internal address",
-    };
-    let log_detail = if denial.kind == DestinationDenialKind::InternalAddress {
-        "internal IP without allowed_ips"
-    } else {
-        detail
-    };
-
-    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Other)
-        .action(ActionId::Denied)
-        .disposition(DispositionId::Blocked)
-        .severity(SeverityId::Medium)
-        .status(StatusId::Failure)
-        .http_request(HttpRequest::new(
-            method,
-            OcsfUrl::new("http", host, path, port),
-        ))
-        .dst_endpoint(Endpoint::from_domain(host, port))
-        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
-        .firewall_rule(policy, "ssrf")
-        .message(format!("FORWARD blocked: {log_detail} for {host}:{port}"))
-        .status_detail(&denial.reason)
-        .build();
-    ocsf_emit!(event);
+    let detail = destination_denial_detail(denial.kind);
+    ocsf_emit!(build_forward_destination_deny_ocsf_event(
+        denial, peer_addr, method, host, port, path, binary, pid, ancestors, cmdline, policy,
+    ));
 
     emit_denial_simple(
         denial_tx,
