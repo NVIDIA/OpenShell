@@ -87,8 +87,55 @@ openshell gateway add http://127.0.0.1:8080 --local --name openshift
 openshell status
 ```
 
+## Production: expose externally with a real certificate
+
+The steps above run the gateway over plaintext HTTP for quick evaluation. For
+a real deployment, cert-manager can issue the gateway's server certificate
+from a real Issuer or ClusterIssuer (for example, an ACME issuer), and an
+OpenShift Route with TLS passthrough exposes it externally while the gateway
+keeps terminating its own TLS and mTLS.
+
+Install cert-manager and configure a working `ClusterIssuer` first, then see
+[Managing Certificates](/kubernetes/managing-certificates) for the
+`certManager.serverIssuerRef` details. Install the chart with:
+
+```shell
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set podSecurityContext.fsGroup=null \
+  --set securityContext.runAsUser=null \
+  --set server.disableTls=false \
+  --set server.grpcEndpoint=https://<external-hostname>:443 \
+  --set certManager.enabled=true \
+  --set certManager.clientCaFromServerTlsSecret=false \
+  --set server.tls.clientCaSecretName=openshell-ca-tls \
+  --set certManager.serverIssuerRef.name=<cluster-issuer-name> \
+  --set certManager.serverIssuerRef.kind=ClusterIssuer \
+  --set certManager.serverDnsNames[0]=<external-hostname> \
+  --set openshiftRoute.enabled=true \
+  --set openshiftRoute.host=<external-hostname>
+```
+
+| Override | Reason |
+|---|---|
+| `server.grpcEndpoint` | Sandboxes call back into the gateway using this hostname. A cert from an external issuer only carries the external SANs you configure, not the internal cluster-local ones, so sandboxes must use the same externally-valid hostname to pass TLS verification. |
+| `certManager.clientCaFromServerTlsSecret=false` + `server.tls.clientCaSecretName` | The server cert's issuer no longer shares a CA with the client (mTLS) cert, so this points the gateway's client-verification CA at `certManager.caSecretName` (the chart's own CA secret, `openshell-ca-tls` by default) instead of the server secret. |
+| `certManager.serverIssuerRef` | Points the server certificate at your real Issuer or ClusterIssuer instead of the chart's built-in self-signed CA. |
+| `openshiftRoute.enabled` / `openshiftRoute.host` | Creates an OpenShift Route with TLS passthrough — the router forwards the encrypted connection by SNI without decrypting, so the gateway keeps terminating its own TLS and mTLS. |
+
+Register the gateway with the CLI over OIDC. Remote gateways authenticate CLI
+users via OIDC, not mTLS — see [Access Control](/kubernetes/access-control):
+
+```shell
+openshell gateway add https://<external-hostname> \
+  --name openshift \
+  --oidc-issuer <issuer-url>
+openshell gateway login openshift
+```
+
 ## Next Steps
 
-- For TLS-enabled deployments, refer to [Managing Certificates](/kubernetes/managing-certificates).
-- To expose the gateway externally, refer to [Ingress](/kubernetes/ingress).
+- For more on certificate provisioning modes, refer to [Managing Certificates](/kubernetes/managing-certificates).
+- To expose the gateway externally through the Kubernetes Gateway API instead of a Route, refer to [Ingress](/kubernetes/ingress).
 - To configure OIDC authentication, refer to [Access Control](/kubernetes/access-control).

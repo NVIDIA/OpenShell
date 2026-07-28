@@ -268,6 +268,37 @@ If the gateway exits with `failed to read sandbox JWT signing key from
 `sandbox-jwt` secret at `/etc/openshell-jwt`. The sandbox JWT mount is required
 even when local Helm values disable TLS.
 
+If `certManager.serverIssuerRef` points the server certificate at an external
+Issuer or ClusterIssuer (for example an ACME issuer, for a publicly-trusted
+cert on an OpenShift `Route` with TLS passthrough — see
+`openshiftRoute.enabled`), check the `Certificate`/`CertificateRequest`/
+`Challenge` resources directly when the secret never becomes Ready:
+
+```bash
+kubectl -n openshell get certificate,certificaterequest,challenge
+kubectl -n openshell describe certificate openshell-server
+oc -n openshell get route
+```
+
+ACME issuers reject certificate requests that include internal-only names
+(`*.svc.cluster.local`, `localhost`, loopback IPs) and require the
+`commonName` to also be a SAN — the server `Certificate` only requests the
+hostnames in `certManager.serverDnsNames` when `serverIssuerRef` is set, for
+exactly this reason.
+
+If sandbox supervisors fail their TLS handshake to the gateway with
+`UnknownCA` after configuring `serverIssuerRef`, the client (mTLS) certificate
+and the server certificate now come from different CAs, and the gateway's
+client-verification CA is misconfigured. Set
+`certManager.clientCaFromServerTlsSecret=false` and
+`server.tls.clientCaSecretName` to a secret that actually contains the CA that
+signs the client certificate (`certManager.caSecretName`'s value by default):
+
+```bash
+helm -n openshell get values openshell | grep -E 'clientCaFromServerTlsSecret|clientCaSecretName|serverIssuerRef|caSecretName'
+kubectl -n openshell get secret openshell-ca-tls -o jsonpath='{.data.ca\.crt}' | base64 -d | openssl x509 -noout -subject
+```
+
 If `server.providerTokenGrants.spiffe.enabled=true`, the gateway should still
 render `[openshell.gateway.gateway_jwt]` and mount the `sandbox-jwt` Secret.
 SPIRE is used only by sandbox pods for dynamic provider token grants. Verify
@@ -452,6 +483,8 @@ openshell logs <sandbox-name>
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |
 | HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
 | HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |
+| Server `Certificate` never becomes Ready with `certManager.serverIssuerRef` set | ACME issuer rejected internal-only SANs, a loopback IP, or a `commonName` absent from the SANs | `kubectl -n openshell describe certificate openshell-server`; confirm `certManager.serverDnsNames` lists only real, externally-resolvable hostnames |
+| Sandbox supervisors fail TLS handshake with `UnknownCA` after configuring `certManager.serverIssuerRef` | Client (mTLS) cert and server cert now come from different CAs, and `server.tls.clientCaSecretName` still points at the wrong (or default, unpopulated) secret | Set `certManager.clientCaFromServerTlsSecret=false` and `server.tls.clientCaSecretName` to the secret named by `certManager.caSecretName` |
 
 ## Reporting
 

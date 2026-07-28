@@ -144,10 +144,12 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | certManager.caSecretName | string | `"openshell-ca-tls"` | Secret created for the intermediate CA (Certificate with isCA: true). |
 | certManager.certificateDuration | string | `"8760h"` | Duration for cert-manager-issued certificates. |
 | certManager.certificateRenewBefore | string | `"720h"` | Renewal window for cert-manager-issued certificates. |
-| certManager.clientCaFromServerTlsSecret | bool | `true` | Mount gateway client CA from the server TLS secret's ca.crt (populated by cert-manager for certs issued by a CA Issuer). Avoids a separate openshell-server-client-ca Secret. |
+| certManager.clientCaFromServerTlsSecret | bool | `true` | Mount gateway client CA from the server TLS secret's ca.crt (populated by cert-manager for certs issued by a CA Issuer). Set to false when serverIssuerRef points at an external issuer (its secret's ca.crt would be that issuer's chain, not the CA that signs the client cert). When false, also set server.tls.clientCaSecretName to a secret containing the actual client CA — for example caSecretName's value, since that's the CA the client certificate above is issued from by default. |
+| certManager.clientIssuerRef | object | `{"group":"","kind":"","name":""}` | Override the issuerRef for the client (mTLS) Certificate. Client certs don't need public trust; leave empty to use the chart's own CA issuer unless an internal PKI issuer is preferred. |
 | certManager.enabled | bool | `false` | Create cert-manager Issuer and Certificate resources. When enabled, cert-manager owns TLS and the chart runs a JWT-only certgen hook to create the sandbox JWT signing Secret that cert-manager does not manage. |
 | certManager.serverDnsNames | list | `["openshell","openshell.openshell.svc","openshell.openshell.svc.cluster.local","localhost","openshell.localhost","*.openshell.localhost","host.docker.internal"]` | DNS SANs on the cert-manager-issued server certificate. |
 | certManager.serverIpAddresses | list | `["127.0.0.1"]` | IP SANs on the cert-manager-issued server certificate. |
+| certManager.serverIssuerRef | object | `{"group":"","kind":"","name":""}` | Override the issuerRef for the server Certificate (e.g. a real ACME ClusterIssuer for a publicly-trusted cert on an external hostname). Leave name empty to use the chart's own self-signed CA issuer (default). |
 | fullnameOverride | string | `""` | Override the full generated resource name. |
 | grpcRoute.enabled | bool | `false` | Create a Gateway API GRPCRoute for the gateway service. |
 | grpcRoute.gateway.className | string | `"eg"` | GatewayClass to reference. Envoy Gateway installs one named "eg". |
@@ -166,6 +168,9 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | nameOverride | string | `"openshell"` | Override the chart name used in generated resource names. |
 | networkPolicy.enabled | bool | `true` | Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway. |
 | nodeSelector | object | `{}` | Node selector for the gateway pod. |
+| openshiftRoute.annotations | object | `{}` | Extra annotations on the Route (e.g. haproxy.router.openshift.io/*). |
+| openshiftRoute.enabled | bool | `false` | Create an OpenShift Route with TLS passthrough. |
+| openshiftRoute.host | string | `""` | Hostname for the Route. Must match a SAN on the gateway's server cert. |
 | pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. When certManager.enabled=true, cert-manager owns TLS and this same hook runs in JWT-only mode even if pkiInitJob.enabled remains true. |
 | pkiInitJob.serverDnsNames | list | `[]` | Extra DNS SANs to append to the server certificate. |
 | pkiInitJob.serverIpAddresses | list | `[]` | Extra IP SANs to append to the server certificate. |
