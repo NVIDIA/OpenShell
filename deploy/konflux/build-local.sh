@@ -5,8 +5,6 @@
 # Prerequisites:
 #   - hermeto (pip install git+https://github.com/hermetoproject/hermeto.git)
 #   - podman
-#   - createrepo_c
-#   - Red Hat CDN CA trusted (sudo cp /etc/rhsm/ca/redhat-uep.pem /etc/pki/ca-trust/source/anchors/ && sudo update-ca-trust)
 #
 # Usage:
 #   ./deploy/konflux/build-local.sh gateway
