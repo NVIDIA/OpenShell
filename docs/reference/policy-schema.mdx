@@ -199,6 +199,12 @@ Each endpoint defines a reachable destination and optional inspection rules.
 
 Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token provider-shaped aliases such as `provider-OPENSHELL-RESOLVE-ENV-API_TOKEN` when the referenced environment key exists in the configured provider credentials.
 
+Static provider placeholders also require the request host, port, and path to
+match an endpoint in the provider profile. Network policy admission does not
+expand that credential boundary. OpenShell rejects a mismatch with HTTP 403 and
+`credential_endpoint_mismatch`. Refer to [Static Credential Endpoint
+Binding](/sandboxes/providers-v2#understand-static-credential-endpoint-binding).
+
 #### Access Levels
 
 The `access` field accepts one of the following values on REST, WebSocket, and GraphQL endpoints. MCP and JSON-RPC endpoints reject `access` because HTTP method/path presets cannot authorize JSON-RPC safely. Use explicit MCP rules, set `mcp.allow_all_known_mcp_methods: true` for the MCP method profile, or use explicit JSON-RPC rules.
