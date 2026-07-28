@@ -12,7 +12,7 @@ use openshell_core::middleware::{SupervisorMiddlewareEndpoint, WebSocketResponse
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
     HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, SupervisorMiddlewarePhase,
-    ValidateConfigRequest, ValidateConfigResponse, WebSocketDirection, WebSocketEvaluationRequest,
+    ValidateConfigRequest, ValidateConfigResponse, WebSocketEvaluationRequest,
     WebSocketEvaluationResponse, WebSocketMessageType, WebSocketPreflightAction,
     WebSocketPreflightDecision, web_socket_evaluation_request, web_socket_evaluation_response,
 };
@@ -26,7 +26,8 @@ pub fn services() -> Vec<Arc<dyn SupervisorMiddlewareEndpoint>> {
     vec![Arc::new(BuiltinMiddlewareService)]
 }
 
-/// Validate configuration for a first-party binding.
+/// Resolve and validate a first-party config before the supervisor has selected
+/// its service endpoint.
 pub fn validate_config(implementation: &str, config: &prost_types::Struct) -> Result<()> {
     match implementation {
         BUILTIN_REGEX => regex::validate_config(config),
@@ -37,12 +38,7 @@ pub fn validate_config(implementation: &str, config: &prost_types::Struct) -> Re
 }
 
 fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpRequestResult> {
-    match evaluation.middleware_name.as_str() {
-        BUILTIN_REGEX => regex::evaluate_http_request(evaluation),
-        other => Err(miette!(
-            "middleware implementation '{other}' is not a registered OpenShell built-in"
-        )),
-    }
+    regex::evaluate_http_request(evaluation)
 }
 
 /// Built-in regex service exposed through the standard middleware contract.
@@ -75,18 +71,7 @@ impl BuiltinMiddlewareService {
                     Some(web_socket_evaluation_request::Request::Preflight(preflight))
                         if config.is_none() && !started =>
                     {
-                        if preflight.middleware_name != BUILTIN_REGEX {
-                            Err(Status::invalid_argument(
-                                "unknown built-in WebSocket middleware",
-                            ))
-                        } else if preflight.phase
-                            != SupervisorMiddlewarePhase::PreCredentials as i32
-                            || preflight.direction != WebSocketDirection::ClientToUpstream as i32
-                        {
-                            Err(Status::invalid_argument(
-                                "unsupported built-in WebSocket binding",
-                            ))
-                        } else {
+                        if preflight.phase == SupervisorMiddlewarePhase::PreCredentials as i32 {
                             let selected_config = preflight.config.unwrap_or_default();
                             match regex::validate_config(&selected_config) {
                                 Ok(()) => {
@@ -103,6 +88,10 @@ impl BuiltinMiddlewareService {
                                 }
                                 Err(error) => Err(Status::invalid_argument(error.to_string())),
                             }
+                        } else {
+                            Err(Status::invalid_argument(
+                                "unsupported built-in WebSocket binding",
+                            ))
                         }
                     }
                     Some(web_socket_evaluation_request::Request::SessionStart(_))
@@ -117,9 +106,7 @@ impl BuiltinMiddlewareService {
                             message.sequence,
                         ) {
                             Err(error)
-                        } else if message.direction != WebSocketDirection::ClientToUpstream as i32
-                            || message.message_type != WebSocketMessageType::Text as i32
-                        {
+                        } else if message.message_type != WebSocketMessageType::Text as i32 {
                             Err(Status::invalid_argument(
                                 "openshell/regex supports only client-to-upstream WebSocket text messages",
                             ))
@@ -209,18 +196,16 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
     ) -> Result<Response<ValidateConfigResponse>, Status> {
         let request = request.into_inner();
         let config = request.config.unwrap_or_default();
-        Ok(Response::new(
-            match validate_config(&request.middleware_name, &config) {
-                Ok(()) => ValidateConfigResponse {
-                    valid: true,
-                    reason: String::new(),
-                },
-                Err(error) => ValidateConfigResponse {
-                    valid: false,
-                    reason: error.to_string(),
-                },
+        Ok(Response::new(match regex::validate_config(&config) {
+            Ok(()) => ValidateConfigResponse {
+                valid: true,
+                reason: String::new(),
             },
-        ))
+            Err(error) => ValidateConfigResponse {
+                valid: false,
+                reason: error.to_string(),
+            },
+        }))
     }
 
     async fn evaluate_http_request(
@@ -274,7 +259,7 @@ impl SupervisorMiddlewareEndpoint for BuiltinMiddlewareService {
 mod tests {
     use super::*;
     use openshell_core::proto::{
-        Decision, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+        Decision, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, WebSocketPreflight,
     };
 
     fn string_config(key: &str, value: &str) -> prost_types::Struct {
@@ -352,7 +337,7 @@ mod tests {
     #[test]
     fn regex_replacement_evaluates_through_binding() {
         let result = evaluate_http_request(&HttpRequestEvaluation {
-            middleware_name: BUILTIN_REGEX.into(),
+            middleware_name: "operator-assigned-name".into(),
             body: br#"{"password":"top-secret","token":"sk-ABCDEFGHIJKLMNOP"}"#.to_vec(),
             config: Some(prost_types::Struct::default()),
             ..Default::default()
@@ -370,6 +355,49 @@ mod tests {
                 .iter()
                 .all(|finding| finding.r#type != "regex.keyword")
         );
+    }
+
+    #[tokio::test]
+    async fn service_config_validation_does_not_dispatch_on_registration_name() {
+        let response = SupervisorMiddleware::validate_config(
+            &BuiltinMiddlewareService,
+            Request::new(ValidateConfigRequest {
+                config: Some(prost_types::Struct::default()),
+                middleware_name: "operator-assigned-name".into(),
+            }),
+        )
+        .await
+        .expect("validate config")
+        .into_inner();
+
+        assert!(response.valid);
+    }
+
+    #[tokio::test]
+    async fn websocket_preflight_does_not_dispatch_on_registration_name() {
+        let requests = tokio_stream::iter([Ok::<_, Status>(WebSocketEvaluationRequest {
+            request: Some(web_socket_evaluation_request::Request::Preflight(
+                WebSocketPreflight {
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    middleware_name: "operator-assigned-name".into(),
+                    config: Some(prost_types::Struct::default()),
+                    ..Default::default()
+                },
+            )),
+        })]);
+        let mut responses = BuiltinMiddlewareService::websocket_stream(requests);
+        let response = responses
+            .next()
+            .await
+            .expect("preflight response")
+            .expect("valid preflight");
+
+        assert!(matches!(
+            response.response,
+            Some(web_socket_evaluation_response::Response::PreflightDecision(
+                WebSocketPreflightDecision { action }
+            )) if action == WebSocketPreflightAction::Inspect as i32
+        ));
     }
 
     #[test]

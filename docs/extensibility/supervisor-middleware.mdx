@@ -39,7 +39,7 @@ Middleware receives the request before credential injection. Operator-run servic
 
 ## Choose a Middleware Type
 
-| Type | Registration | Body limit | Deployment |
+| Type | Registration | Payload limit | Deployment |
 | --- | --- | --- | --- |
 | Built-in | None | Defined by OpenShell | Runs inside the supervisor |
 | Operator-run service | Required in gateway TOML | Set by the operator, up to the service capability | Runs as a separate service reachable by the gateway and supervisors |
@@ -64,7 +64,7 @@ timeout = "500ms"
 | --- | --- |
 | `name` | Operator-owned registration name used by policy attachments and diagnostics. Names must be unique, and `openshell/` is reserved for built-ins. |
 | `grpc_endpoint` | Service address reachable from both the gateway and sandbox supervisors. Supports plaintext `http://` and TLS `https://` with platform trust roots. |
-| `max_body_bytes` | Operator limit applied to HTTP bindings exposed by the service, up to the 4 MiB platform maximum. A WebSocket-only service sets this to `0`; each WebSocket binding declares `max_message_bytes` in its manifest. |
+| `max_body_bytes` | Operator limit applied to logical payloads across every binding exposed by the service, up to the 4 MiB platform maximum. It caps HTTP bodies and complete WebSocket messages. |
 | `timeout` | Optional service-wide RPC timeout using an integer with an `ms` or `s` suffix. Defaults to `500ms`; valid values range from `10ms` through `30s`. |
 
 Each binding returned by `Describe` may advertise a shorter `timeout` using the same syntax and bounds. The operator-configured service timeout is a ceiling: OpenShell uses the smaller of the binding and service values. An omitted binding timeout inherits the service setting, and an omitted service setting uses the 500 ms platform default. OpenShell rejects an invalid timeout before accepting the manifest. The service timeout applies to `Describe`; the effective binding timeout applies to `ValidateConfig`, `EvaluateHttpRequest`, WebSocket preflight, and each WebSocket message. WebSocket streams have no connection-wide deadline.
@@ -126,12 +126,12 @@ A failed `fail_closed` stage uses `error: middleware_failed` and a platform-owne
 
 Middleware decisions are enforced regardless of the endpoint's `enforcement` mode. `enforcement: audit` applies to an endpoint's network and L7 policy rules and does not bypass middleware: a middleware deny, or a failed `fail_closed` stage, blocks the request even on an audit endpoint. A middleware service that needs to observe traffic without blocking should return an allow decision with findings, which OpenShell emits as detection findings.
 
-## Set Body Limits
+## Set Payload Limits
 
-Every middleware binding declares the largest request or replacement body it supports.
+Every middleware binding declares the largest request or replacement payload it supports.
 
 - Built-in middleware uses its OpenShell-defined limit.
-- Each operator-run registration sets `max_body_bytes` no higher than the service capability.
+- Each operator-run registration sets one `max_body_bytes` ceiling no higher than any advertised HTTP-body or WebSocket-message capability.
 - A selected chain buffers using its largest stage limit, so every stage that can process the body receives it.
 - The same per-stage limit applies to request bodies and replacement bodies.
 
@@ -139,7 +139,7 @@ The gateway rejects a registration whose operator limit exceeds the service capa
 
 At request time, exceeding a selected stage's limit is a middleware failure for that stage alone and follows that config's `on_error` behavior; other stages in the chain still run against their own limits. OpenShell can apply `fail_open` to an oversized `Content-Length` before consuming body bytes. A chunked body can cross the limit only after bytes have been consumed, so OpenShell denies that request because it cannot safely resume the original stream.
 
-WebSocket bindings use `max_message_bytes` for complete client text messages and replacements. The platform cap is 4 MiB, with at most 4,096 fragments per message. Oversized messages close the connection with code `1009`; invalid UTF-8 uses `1007`; protocol errors use `1002`; middleware or policy denials use `1008`; and policy reload uses `1012`.
+WebSocket bindings advertise `max_message_bytes` for complete client text messages and replacements. The operator registration's `max_body_bytes` is an additional ceiling on that capability. The platform cap is 4 MiB, with at most 4,096 fragments per message. Oversized messages close the connection with code `1009`; invalid UTF-8 uses `1007`; protocol errors use `1002`; middleware or policy denials use `1008`; and policy reload uses `1012`.
 
 ## Mutate Request Headers
 

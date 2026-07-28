@@ -684,17 +684,15 @@ fn validate_manifest_bindings(
             parse_middleware_timeout(&binding.timeout)
                 .map_err(|reason| miette!("{source} has invalid timeout for binding: {reason}"))?;
         }
-        if kind == SupportedBinding::HttpPreCredentials
-            && operator_max_body_bytes.is_some_and(|limit| limit > advertised)
-        {
+        if operator_max_body_bytes.is_some_and(|limit| limit > advertised) {
             return Err(miette!(
                 "{source} max_body_bytes ({}) exceeds the binding capability ({advertised})",
                 operator_max_body_bytes.expect("operator limit checked above")
             ));
         }
-        if kind == SupportedBinding::HttpPreCredentials && operator_max_body_bytes == Some(0) {
+        if operator_max_body_bytes == Some(0) {
             return Err(miette!(
-                "{source} must configure max_body_bytes for its HTTP_REQUEST binding"
+                "{source} must configure max_body_bytes for every payload-bearing binding"
             ));
         }
     }
@@ -941,8 +939,7 @@ impl MiddlewareRegistry {
                 endpoint: service,
                 manifest: manifest_cell,
                 diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
-                operator_max_body_bytes: (operator_max_body_bytes != 0)
-                    .then_some(operator_max_body_bytes),
+                operator_max_body_bytes: Some(operator_max_body_bytes),
                 operator_timeout,
             }));
             registered_services.push(RegisteredMiddlewareService { registration });
@@ -1202,7 +1199,8 @@ impl ChainRunner {
             };
             let max_message_bytes = if operation == SupervisorMiddlewareOperation::WebsocketMessage
             {
-                validate_message_limit("middleware manifest", &binding)?
+                let advertised = validate_message_limit("middleware manifest", &binding)?;
+                state.operator_max_body_bytes.unwrap_or(advertised)
             } else {
                 0
             };
@@ -2972,6 +2970,46 @@ mod tests {
     }
 
     #[test]
+    fn external_websocket_binding_requires_operator_payload_limit() {
+        let registration = external_registration(0);
+        let manifest = MiddlewareManifest {
+            name: "example/websocket".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
+                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                max_body_bytes: 0,
+                timeout: String::new(),
+                max_message_bytes: 4096,
+            }],
+        };
+
+        let error = validate_external_manifest(&registration, &manifest, Some(0))
+            .expect_err("WebSocket bindings require an operator payload ceiling");
+        assert!(error.to_string().contains("must configure max_body_bytes"));
+    }
+
+    #[test]
+    fn external_websocket_binding_rejects_operator_limit_above_capability() {
+        let registration = external_registration(4097);
+        let manifest = MiddlewareManifest {
+            name: "example/websocket".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
+                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                max_body_bytes: 0,
+                timeout: String::new(),
+                max_message_bytes: 4096,
+            }],
+        };
+
+        let error = validate_external_manifest(&registration, &manifest, Some(4097))
+            .expect_err("operator payload limit must fit WebSocket capability");
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
     fn external_registration_accepts_http_and_https_grpc_endpoints() {
         for grpc_endpoint in [
             "http://127.0.0.1:50051",
@@ -4285,7 +4323,7 @@ mod tests {
             });
         let server_task = tokio::spawn(server);
 
-        let mut registration = external_registration(0);
+        let mut registration = external_registration(1024);
         registration.grpc_endpoint = format!("http://{address}");
         let registry = MiddlewareRegistry::connect_services(Vec::new(), vec![registration])
             .await
@@ -4298,6 +4336,15 @@ mod tests {
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
         }];
+        let described = runner
+            .describe_websocket_chain(&chain)
+            .await
+            .expect("describe WebSocket chain");
+        assert_eq!(
+            described[0].max_message_bytes(),
+            1024,
+            "operator max_body_bytes must cap WebSocket messages"
+        );
         let preflight = runner
             .preflight_websocket(
                 &chain,
@@ -4331,8 +4378,13 @@ mod tests {
             .expect("preflight lock")
             .clone()
             .expect("preflight observed");
-        assert_eq!(observed.host, "api.openai.com");
-        assert_eq!(observed.path, "/v1/responses");
+        let target = observed.target.expect("preflight target");
+        assert_eq!(target.scheme, "wss");
+        assert_eq!(target.host, "api.openai.com");
+        assert_eq!(target.port, 443);
+        assert_eq!(target.method, "GET");
+        assert_eq!(target.path, "/v1/responses");
+        assert!(target.query.is_empty());
         assert_eq!(observed.requested_subprotocols, ["realtime"]);
         session
             .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
@@ -4364,7 +4416,7 @@ mod tests {
             });
         let server_task = tokio::spawn(server);
 
-        let mut registration = external_registration(0);
+        let mut registration = external_registration(1024);
         registration.grpc_endpoint = format!("http://{address}");
         let registry = MiddlewareRegistry::connect_services(Vec::new(), vec![registration])
             .await
@@ -4401,6 +4453,9 @@ mod tests {
                 .expect("preflight lock")
                 .as_ref()
                 .expect("preflight observed")
+                .target
+                .as_ref()
+                .expect("preflight target")
                 .scheme,
             "ws"
         );
@@ -4575,7 +4630,7 @@ mod tests {
                 let _ = shutdown_rx.await;
             });
         let server_task = tokio::spawn(server);
-        let mut registration = external_registration(0);
+        let mut registration = external_registration(1024);
         registration.grpc_endpoint = format!("http://{address}");
         let runner = ChainRunner::from_registry(
             MiddlewareRegistry::connect_services(Vec::new(), vec![registration])

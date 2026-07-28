@@ -128,13 +128,6 @@ enum SupervisorMiddlewarePhase {
   SUPERVISOR_MIDDLEWARE_PHASE_PRE_RETURN = 2;
 }
 
-// Direction of one complete logical WebSocket message.
-enum WebSocketDirection {
-  WEB_SOCKET_DIRECTION_UNSPECIFIED = 0;
-  WEB_SOCKET_DIRECTION_CLIENT_TO_UPSTREAM = 1;
-  WEB_SOCKET_DIRECTION_UPSTREAM_TO_CLIENT = 2;
-}
-
 // Logical WebSocket message type. Raw frame mechanics are never exposed.
 enum WebSocketMessageType {
   WEB_SOCKET_MESSAGE_TYPE_UNSPECIFIED = 0;
@@ -175,19 +168,14 @@ message WebSocketEvaluationRequest {
 message WebSocketPreflight {
   string session_id = 1;
   SupervisorMiddlewarePhase phase = 2;
-  WebSocketDirection direction = 3;
-  RequestContext context = 4;
-  string scheme = 5;
-  string host = 6;
-  uint32 port = 7;
-  // Raw request path without the query string.
-  string path = 8;
-  repeated string requested_subprotocols = 9;
+  RequestContext context = 3;
+  // Admitted HTTP WebSocket-upgrade target. The method is GET, query is always
+  // empty, and path never includes a query string.
+  HttpRequestTarget target = 4;
+  repeated string requested_subprotocols = 5;
   // Built-in middleware name or operator-owned registration name.
-  string middleware_name = 10;
-  // Stable policy-local configuration identity.
-  string config_name = 11;
-  google.protobuf.Struct config = 12;
+  string middleware_name = 6;
+  google.protobuf.Struct config = 7;
 }
 
 // WebSocketSessionStart reports bounded metadata known only after the
@@ -202,10 +190,9 @@ message WebSocketMessage {
   // strictly increase but need not be contiguous. Reject zero, duplicates, and
   // regressions; accept gaps.
   uint64 sequence = 1;
-  WebSocketDirection direction = 2;
-  WebSocketMessageType message_type = 3;
+  WebSocketMessageType message_type = 2;
   // Limited to 4 MiB by the platform and the binding-specific cap.
-  bytes payload = 4;
+  bytes payload = 3;
 }
 
 message WebSocketSessionEnd {
@@ -262,7 +249,7 @@ message RequestContext {
 
 // HttpRequestTarget describes the admitted HTTP destination and request target.
 message HttpRequestTarget {
-  // Request scheme, such as "http" or "https".
+  // Request scheme, such as "http", "https", "ws", or "wss".
   string scheme = 1;
   // Destination hostname selected by network policy.
   string host = 2;

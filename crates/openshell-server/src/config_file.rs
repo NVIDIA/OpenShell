@@ -189,7 +189,8 @@ pub struct MiddlewareServiceFileConfig {
     pub name: String,
     /// Plaintext gRPC endpoint reachable by the gateway and supervisors.
     pub grpc_endpoint: String,
-    /// Operator-owned body limit for every binding exposed by this service.
+    /// Operator-owned logical payload limit for every binding exposed by this
+    /// service, including HTTP bodies and complete WebSocket messages.
     pub max_body_bytes: u64,
     /// Default RPC timeout using an integer with an `ms` or `s` suffix.
     #[serde(default)]

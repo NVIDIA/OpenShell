@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use openshell_core::proto::{
-    Decision, RequestContext, SupervisorMiddlewarePhase, WebSocketDirection,
+    Decision, HttpRequestTarget, RequestContext, SupervisorMiddlewarePhase,
     WebSocketEvaluationRequest, WebSocketMessage, WebSocketMessageResult, WebSocketMessageType,
     WebSocketPreflight, WebSocketPreflightAction, WebSocketSessionEnd, WebSocketSessionEndReason,
     WebSocketSessionStart, web_socket_evaluation_request, web_socket_evaluation_response,
@@ -426,7 +426,6 @@ impl WebSocketSession {
                 request: Some(web_socket_evaluation_request::Request::Message(
                     WebSocketMessage {
                         sequence,
-                        direction: WebSocketDirection::ClientToUpstream as i32,
                         message_type: WebSocketMessageType::Text as i32,
                         payload: current.clone(),
                     },
@@ -666,19 +665,21 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
     let preflight = WebSocketPreflight {
         session_id: input.session_id,
         phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-        direction: WebSocketDirection::ClientToUpstream as i32,
         context: Some(RequestContext {
             request_id: input.request_id,
             sandbox_id: input.sandbox_id,
             originating_process: None,
         }),
-        scheme: input.scheme,
-        host: input.host,
-        port: u32::from(input.port),
-        path: input.path,
+        target: Some(HttpRequestTarget {
+            scheme: input.scheme,
+            host: input.host,
+            port: u32::from(input.port),
+            method: "GET".into(),
+            path: input.path,
+            query: String::new(),
+        }),
         requested_subprotocols: input.requested_subprotocols,
         middleware_name: entry.entry.implementation.clone(),
-        config_name: entry.entry.name.clone(),
         config: Some(entry.entry.config.clone()),
     };
     if validate_preflight_envelope(&preflight).is_err() {
@@ -783,6 +784,18 @@ fn validate_preflight_input(input: &WebSocketPreflightInput) -> miette::Result<(
 }
 
 fn validate_preflight_envelope(preflight: &WebSocketPreflight) -> Result<(), &'static str> {
+    let Some(target) = preflight.target.as_ref() else {
+        return Err("preflight_target_missing");
+    };
+    if target.method != "GET" {
+        return Err("preflight_target_method_invalid");
+    }
+    if !target.query.is_empty() || target.path.contains('?') {
+        return Err("preflight_target_query_present");
+    }
+    if target.encoded_len() > super::MAX_MIDDLEWARE_TARGET_BYTES {
+        return Err("preflight_target_over_capacity");
+    }
     if preflight
         .config
         .as_ref()
