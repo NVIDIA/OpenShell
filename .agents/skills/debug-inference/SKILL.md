@@ -239,6 +239,15 @@ Check instead:
 3. The sandbox has that provider attached (`openshell sandbox provider list [name]`)
 4. `network_policies` allow that host, port, and HTTP rules
 
+If the response reports `credential_endpoint_mismatch`, the provider is attached
+but its credential profile does not authorize that request recipient. Inspect
+`openshell provider get <provider-name>` and compare the profile's endpoint host,
+port, and path with the direct request. Correct the provider selection or profile
+endpoint when that recipient is intentional. Do not widen the sandbox network
+policy to work around the mismatch: policy admission and credential endpoint
+authorization are separate checks, and the provider profile should authorize
+only intended credential recipients.
+
 Attach or detach a provider on an existing sandbox with `openshell sandbox provider attach <sandbox> <provider>` and `openshell sandbox provider detach <sandbox> <provider>`.
 
 Use the `generate-sandbox-policy` skill when the user needs help authoring policy YAML.
@@ -348,6 +357,7 @@ Both commands should return the upstream model list.
 | `no compatible route` | Provider type does not match request shape | Create or select a provider of the matching type, or change the client API |
 | `inference.local` works but a platform function fails | User route is configured but `sandbox-system` is missing or wrong | `openshell inference get --system`; configure or update with `--system`; inspect supervisor logs |
 | Direct call to external host is denied | Missing policy or provider attachment | Update `network_policies` and launch sandbox with the right provider |
+| Direct call returns `credential_endpoint_mismatch` | Attached provider profile does not authorize the request host, port, or path | Inspect the provider profile endpoints; select or update the profile only if it intentionally authorizes that recipient |
 | SDK fails on empty auth token | Client requires a non-empty API key even though OpenShell injects the real one | Use any placeholder token such as `test` |
 | Upstream timeout from container to host-local backend | Host firewall or network config blocks container-to-host traffic | Allow the Docker bridge subnet to reach the inference port on the host gateway IP (see firewall fix section above) |
 

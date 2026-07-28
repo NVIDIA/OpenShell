@@ -79,8 +79,10 @@ in that provider's effective profile. CONNECT, absolute-form forward HTTP,
 request targets, headers, supported request bodies, SigV4 signing, and opted-in
 WebSocket text rewriting use the same scoped resolver. Provider refresh swaps
 credential values and endpoint bindings atomically. An invalid or unavailable
-refresh clears the previous provider state instead of leaving a partially active
-or last-known-good credential set.
+refresh revokes the previous static credential state instead of leaving a
+partially active or last-known-good static set. Invalid metadata preserves the
+supplied dynamic snapshot, while a fetch failure preserves the currently active
+dynamic snapshot.
 
 Route selection and policy evaluation use a syntax-only redacted request target;
 they do not materialize real credentials. Cross-endpoint placeholder use returns
