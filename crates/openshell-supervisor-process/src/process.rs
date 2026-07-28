@@ -1364,6 +1364,18 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
 }
 
 #[cfg(unix)]
+fn should_clear_supplementary_groups(
+    current_uid: Uid,
+    target_uid: Uid,
+    user_name: Option<&str>,
+    resolved_identity: ResolvedProcessIdentity,
+) -> bool {
+    target_uid != current_uid
+        && !(user_name.is_some_and(|name| name.parse::<u32>().is_err())
+            && resolved_identity.uid().is_none())
+}
+
+#[cfg(unix)]
 #[allow(clippy::similar_names)]
 pub fn drop_privileges_with_identity(
     policy: &SandboxPolicy,
@@ -1458,10 +1470,15 @@ pub fn drop_privileges_with_identity(
         };
 
     if target_uid != nix::unistd::geteuid() {
-        if resolved_identity.uid().is_some() {
-            // OCI Config.User defines the selected UID/GID pair, not a second
-            // NSS-dependent supplementary group set. Clear the root
-            // supervisor's inherited supplementary groups before dropping.
+        if should_clear_supplementary_groups(
+            nix::unistd::geteuid(),
+            target_uid,
+            user_name,
+            resolved_identity,
+        ) {
+            // Numeric explicit users and OCI-derived users do not have a
+            // trustworthy NSS supplementary-group source. Clear the root
+            // supervisor's inherited groups before changing UID/GID.
             #[cfg(not(any(
                 target_os = "macos",
                 target_os = "ios",
@@ -1680,6 +1697,53 @@ mod tests {
 
         assert!(validate_sandbox_user_with_identity(&policy, resolved).is_err());
         assert!(validate_sandbox_group_with_identity(&policy, resolved).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn numeric_user_paths_clear_supplementary_groups_before_uid_drop() {
+        let current_uid = Uid::from_raw(0);
+        let target_uid = Uid::from_raw(1234);
+
+        let cases = [
+            (
+                "explicit numeric UID/GID",
+                ResolvedProcessIdentity::default(),
+            ),
+            (
+                "explicit numeric UID with OCI-derived GID",
+                ResolvedProcessIdentity::new(None, Some(1235)),
+            ),
+        ];
+
+        for (description, resolved_identity) in cases {
+            assert!(
+                should_clear_supplementary_groups(
+                    current_uid,
+                    target_uid,
+                    Some("1234"),
+                    resolved_identity,
+                ),
+                "{description}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn supplementary_group_clearing_preserves_explicit_named_user_behavior() {
+        assert!(!should_clear_supplementary_groups(
+            Uid::from_raw(0),
+            Uid::from_raw(1234),
+            Some("app"),
+            ResolvedProcessIdentity::default(),
+        ));
+        assert!(!should_clear_supplementary_groups(
+            Uid::from_raw(1234),
+            Uid::from_raw(1234),
+            Some("1234"),
+            ResolvedProcessIdentity::new(None, Some(1235)),
+        ));
     }
 
     #[test]

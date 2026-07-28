@@ -107,7 +107,28 @@ pub fn resolve_process_identity(
             Path::new(PASSWD_PATH),
             Path::new(GROUP_PATH),
         ),
-        DriverIdentity::None => Ok(ResolvedProcessIdentity::default()),
+        DriverIdentity::None => {
+            // VM/offline drivers retain the pre-OCI per-field fallback. A
+            // partial policy must never leave the omitted component at the
+            // root supervisor identity.
+            if policy
+                .process
+                .run_as_user
+                .as_deref()
+                .is_none_or(str::is_empty)
+            {
+                policy.process.run_as_user = Some("sandbox".into());
+            }
+            if policy
+                .process
+                .run_as_group
+                .as_deref()
+                .is_none_or(str::is_empty)
+            {
+                policy.process.run_as_group = Some("sandbox".into());
+            }
+            Ok(ResolvedProcessIdentity::default())
+        }
     }
 }
 
@@ -610,6 +631,25 @@ mod tests {
             .is_err()
         );
         assert!(DriverIdentity::from_values(None, Some("1234".into()), None).is_err());
+    }
+
+    #[test]
+    fn no_driver_identity_completes_partial_policy_with_sandbox() {
+        let cases = [
+            (None, Some("staff"), "sandbox", "staff"),
+            (Some("app"), None, "app", "sandbox"),
+            (None, None, "sandbox", "sandbox"),
+            (Some("app"), Some("staff"), "app", "staff"),
+        ];
+
+        for (user, group, expected_user, expected_group) in cases {
+            let mut policy = policy(user, group);
+            let resolved = resolve_process_identity(&mut policy, &DriverIdentity::None).unwrap();
+
+            assert_eq!(policy.process.run_as_user.as_deref(), Some(expected_user));
+            assert_eq!(policy.process.run_as_group.as_deref(), Some(expected_group));
+            assert_eq!(resolved, ResolvedProcessIdentity::default());
+        }
     }
 
     #[test]
