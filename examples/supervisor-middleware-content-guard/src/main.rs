@@ -83,6 +83,8 @@ impl GuardConfig {
         if unique_terms.is_empty() {
             return Err("config.terms must contain at least one string".into());
         }
+        let mut terms: Vec<_> = unique_terms.into_iter().collect();
+        terms.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
 
         let replacement = optional_string_field(config, "replacement")?
             .unwrap_or(DEFAULT_REPLACEMENT)
@@ -93,7 +95,7 @@ impl GuardConfig {
 
         Ok(Self {
             mode,
-            terms: unique_terms.into_iter().collect(),
+            terms,
             replacement,
         })
     }
@@ -306,6 +308,22 @@ mod tests {
         );
         assert!(result.has_body);
         assert_eq!(result.findings[0].count, 3);
+    }
+
+    #[test]
+    fn redact_replaces_longest_overlapping_term_first() {
+        let config = GuardConfig::parse(Some(&config(
+            "redact",
+            &["abc", "abcdef"],
+            Some("[FILTERED]"),
+        )))
+        .expect("valid config");
+
+        let result = evaluate(&config, "abcdef");
+
+        assert_eq!(String::from_utf8(result.body).unwrap(), "[FILTERED]");
+        assert_eq!(result.findings[0].count, 1);
+        assert_eq!(result.metadata["matched_term_count"], "1");
     }
 
     #[test]
