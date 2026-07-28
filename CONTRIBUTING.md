@@ -286,6 +286,12 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 3. Run `mise run ci` to verify.
 4. Open a PR using the `create-github-pr` skill or manually following the [PR template](.github/PULL_REQUEST_TEMPLATE.md).
 
+### Stacked Pull Requests
+
+Use [GitHub Stacked PRs](https://github.github.com/gh-stack/) when a change has dependent layers that can be reviewed independently. Put foundational changes at the bottom of the stack and dependent changes above them. The bottom PR targets `main`; each higher PR targets the branch immediately below it so its diff contains only that layer.
+
+GitHub Stacked PRs is currently in private preview and must be enabled for the repository before a stack can be submitted.
+
 ### Commit Messages
 
 This project uses [Conventional Commits](https://www.conventionalcommits.org/). All commit messages must follow the format:
