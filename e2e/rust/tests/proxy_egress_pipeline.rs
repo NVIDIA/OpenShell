@@ -24,13 +24,14 @@ use std::sync::{
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serde_json::Value;
-use tempfile::NamedTempFile;
+use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 const TEST_SERVER_HOST: &str = "host.openshell.internal";
 const PROVIDER_NAME: &str = "e2e-proxy-egress-credentials";
+const PROVIDER_PROFILE_ID: &str = "e2e-proxy-egress-credentials";
 const TOKEN_ENV: &str = "PROXY_E2E_TOKEN";
 const TEST_SECRET: &str = "sk-e2e-proxy-egress-secret";
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
@@ -102,7 +103,15 @@ async fn delete_provider(name: &str) {
     let _ = cmd.status().await;
 }
 
-async fn create_generic_provider(name: &str) -> Result<String, String> {
+async fn delete_provider_profile(id: &str) {
+    let mut cmd = openshell_cmd();
+    cmd.args(["provider", "profile", "delete", id])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _ = cmd.status().await;
+}
+
+async fn create_bound_provider(name: &str) -> Result<String, String> {
     let credential = format!("{TOKEN_ENV}={TEST_SECRET}");
     run_cli(&[
         "provider",
@@ -110,11 +119,49 @@ async fn create_generic_provider(name: &str) -> Result<String, String> {
         "--name",
         name,
         "--type",
-        "generic",
+        PROVIDER_PROFILE_ID,
         "--credential",
         &credential,
     ])
     .await
+}
+
+fn write_credential_profile(port: u16) -> Result<NamedTempFile, String> {
+    let mut file = TempFileBuilder::new()
+        .suffix(".yaml")
+        .tempfile()
+        .map_err(|error| format!("create provider profile: {error}"))?;
+    let profile = format!(
+        r#"id: {PROVIDER_PROFILE_ID}
+display_name: E2E proxy egress credentials
+category: other
+credentials:
+  - name: proxy_e2e_token
+    env_vars: [{TOKEN_ENV}]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: {TEST_SERVER_HOST}
+    port: {port}
+    path: /probe
+    protocol: rest
+    access: full
+    enforcement: enforce
+    request_body_credential_rewrite: true
+    allowed_ips:
+      - "10.0.0.0/8"
+      - "172.0.0.0/8"
+      - "192.168.0.0/16"
+      - "fc00::/7"
+binaries: ["/**"]
+"#
+    );
+    file.write_all(profile.as_bytes())
+        .map_err(|error| format!("write provider profile: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("flush provider profile: {error}"))?;
+    Ok(file)
 }
 
 fn write_policy_document(
@@ -1615,19 +1662,19 @@ async fn http_credentials_are_rewritten_in_headers_and_bodies_for_both_adapters(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     delete_provider(PROVIDER_NAME).await;
-    create_generic_provider(PROVIDER_NAME)
-        .await
-        .expect("create generic provider");
+    delete_provider_profile(PROVIDER_PROFILE_ID).await;
 
     let result = async {
         let server = CredentialProbeServer::start().await?;
-        let endpoint_options = r#"        protocol: rest
+        let profile = write_credential_profile(server.port)?;
+        let profile_path = profile.path().to_string_lossy().into_owned();
+        run_cli(&["provider", "profile", "import", "--file", &profile_path]).await?;
+        create_bound_provider(PROVIDER_NAME).await?;
+        let endpoint_options = r#"        path: /probe
+        protocol: rest
         enforcement: enforce
         request_body_credential_rewrite: true
-        rules:
-          - allow:
-              method: POST
-              path: "/probe""#;
+        access: full"#;
         let policy = write_policy(TEST_SERVER_HOST, server.port, endpoint_options)?;
         let policy_path = policy_path(&policy);
         let script = format!(
@@ -1721,6 +1768,7 @@ print(json.dumps({{"connect": connect, "forward": forward}}, sort_keys=True))
     .await;
 
     delete_provider(PROVIDER_NAME).await;
+    delete_provider_profile(PROVIDER_PROFILE_ID).await;
 
     let guard = result.expect("sandbox create");
     let result = parse_json_line(&guard.create_output);
