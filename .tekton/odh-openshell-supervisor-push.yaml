@@ -1,0 +1,56 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+#
+metadata:
+  annotations:
+    build.appstudio.openshift.io/repo: https://github.com/opendatahub-io/openshell?rev={{revision}}
+    build.appstudio.redhat.com/commit_sha: '{{revision}}'
+    build.appstudio.redhat.com/target_branch: '{{target_branch}}'
+    pipelinesascode.tekton.dev/cancel-in-progress: "false"
+    pipelinesascode.tekton.dev/max-keep-runs: "3"
+    pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch
+      == "main"
+  creationTimestamp: null
+  labels:
+    appstudio.openshift.io/application: opendatahub-builds
+    appstudio.openshift.io/component: odh-openshell-supervisor-ci
+    pipelines.appstudio.openshift.io/type: build
+  name: odh-openshell-supervisor-on-push
+  namespace: open-data-hub-tenant
+spec:
+  params:
+  - name: git-url
+    value: '{{source_url}}'
+  - name: revision
+    value: '{{revision}}'
+  - name: output-image
+    value: quay.io/opendatahub/odh-openshell-supervisor:odh-stable
+  - name: dockerfile
+    value: deploy/docker/Dockerfile.konflux.supervisor
+  - name: path-context
+    value: .
+  - name: hermetic
+    value: "true"
+  - name: prefetch-input
+    value: |
+      [
+        {"type": "cargo", "path": "."},
+        {"type": "rpm", "path": "deploy/konflux/supervisor"},
+        {"type": "generic", "path": "deploy/konflux/supervisor", "lockfile": "generic-fetcher.yaml"}
+      ]
+  pipelineRef:
+    resolver: git
+    params:
+    - name: url
+      value: https://github.com/opendatahub-io/odh-konflux-central.git
+    - name: revision
+      value: main
+    - name: pathInRepo
+      value: pipeline/multi-arch-container-build.yaml
+  taskRunTemplate:
+    serviceAccountName: build-pipeline-odh-openshell-supervisor-ci
+  workspaces:
+  - name: git-auth
+    secret:
+      secretName: '{{ git_auth_secret }}'
+status: {}
