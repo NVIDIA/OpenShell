@@ -2480,6 +2480,28 @@ fn initial_poll_disposition(
     }
 }
 
+fn unchanged_policy_revision_candidate(
+    reloads_gateway_policy: bool,
+    current_policy_version: u32,
+    current_policy_hash: &str,
+    result: &openshell_core::grpc_client::SettingsPollResult,
+) -> Option<u32> {
+    (reloads_gateway_policy
+        && !current_policy_hash.is_empty()
+        && result.policy_source == openshell_core::proto::PolicySource::Sandbox
+        && result.version > current_policy_version
+        && result.policy_hash == current_policy_hash)
+        .then_some(result.version)
+}
+
+fn unchanged_policy_revision_ready_to_ack(
+    candidate: Option<u32>,
+    policy_runtime_changed: bool,
+    policy_runtime_reconciled: bool,
+) -> Option<u32> {
+    candidate.filter(|_| !policy_runtime_changed || policy_runtime_reconciled)
+}
+
 /// Deliver policy status updates independently from policy reconciliation.
 ///
 /// The channel is FIFO, so a delayed older status can never arrive after a
@@ -2899,6 +2921,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 
     let mut current_config_revision: u64 = 0;
     let mut current_provider_env_revision: u64 = ctx.provider_credentials.snapshot().revision;
+    let mut current_policy_version: u32 = 0;
     let mut current_policy_hash = String::new();
     let mut current_middleware_services = Vec::new();
     let mut middleware_registry_status = ctx.middleware_registry_status;
@@ -2934,6 +2957,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                         skills::install_static_skills,
                     );
                     current_config_revision = candidate.config_revision;
+                    current_policy_version = candidate.version;
                     current_policy_hash.clone_from(&candidate.policy_hash);
                     current_middleware_services = result.supervisor_middleware_services;
                     current_settings = result.settings;
@@ -3016,6 +3040,20 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                 &result.supervisor_middleware_services,
                 middleware_registry_status,
             );
+        // Recovery already has its own acknowledgement path below. Giving it
+        // precedence here prevents a restored last-known-good policy from
+        // also being acknowledged as an ordinary same-hash revision.
+        let unchanged_policy_revision = (!recovering_rejected_policy)
+            .then(|| {
+                unchanged_policy_revision_candidate(
+                    reloads_gateway_policy,
+                    current_policy_version,
+                    &current_policy_hash,
+                    &result,
+                )
+            })
+            .flatten();
+        let mut policy_runtime_reconciled = false;
 
         // A local policy override is not coupled to the gateway policy
         // snapshot, so its service registry can still be reconciled alone.
@@ -3031,7 +3069,11 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             .await;
         }
 
-        if !config_changed && !provider_env_changed && !policy_runtime_changed {
+        if !config_changed
+            && !provider_env_changed
+            && !policy_runtime_changed
+            && unchanged_policy_revision.is_none()
+        {
             continue;
         }
 
@@ -3140,6 +3182,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 
             match runtime_result {
                 Ok(()) => {
+                    policy_runtime_reconciled = true;
                     let policy = result
                         .policy
                         .as_ref()
@@ -3189,6 +3232,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                                 &status_sender,
                                 PolicyStatusUpdate::loaded(result.version),
                             );
+                            current_policy_version = result.version;
                         }
                     } else if recovering_rejected_policy
                         && result.version > 0
@@ -3210,6 +3254,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                             &status_sender,
                             PolicyStatusUpdate::loaded(result.version),
                         );
+                        current_policy_version = result.version;
                     }
 
                     if middleware_registry_changed {
@@ -3297,6 +3342,27 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                     // NeedsReconciliation), not by degrading the status here.
                 }
             }
+        }
+
+        if let Some(version) = unchanged_policy_revision_ready_to_ack(
+            unchanged_policy_revision,
+            policy_runtime_changed,
+            policy_runtime_reconciled,
+        ) {
+            enqueue_policy_status(&status_sender, PolicyStatusUpdate::loaded(version));
+            current_policy_version = version;
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Enabled, "loaded")
+                    .unmapped("version", serde_json::json!(version))
+                    .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                    .message(format!(
+                        "Acknowledged unchanged policy revision as loaded [version:{version}]"
+                    ))
+                    .build()
+            );
         }
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
@@ -4183,6 +4249,76 @@ filesystem_policy:
             InitialPollDisposition::Reconcile
         );
         assert!(origin.allows_gateway_policy_reload());
+    }
+
+    #[test]
+    fn unchanged_sandbox_policy_revision_candidate_is_strictly_scoped() {
+        let sandbox_result = openshell_core::grpc_client::SettingsPollResult {
+            policy_hash: "same-policy".to_string(),
+            ..settings_poll_result(
+                Some(proto_policy_fixture()),
+                2,
+                openshell_core::proto::PolicySource::Sandbox,
+            )
+        };
+
+        assert_eq!(
+            unchanged_policy_revision_candidate(true, 1, "same-policy", &sandbox_result),
+            Some(2)
+        );
+        assert_eq!(
+            unchanged_policy_revision_candidate(true, 2, "same-policy", &sandbox_result),
+            None
+        );
+        assert_eq!(
+            unchanged_policy_revision_candidate(true, 1, "different-policy", &sandbox_result),
+            None
+        );
+        assert_eq!(
+            unchanged_policy_revision_candidate(false, 1, "same-policy", &sandbox_result),
+            None
+        );
+        assert_eq!(
+            unchanged_policy_revision_candidate(true, 1, "", &sandbox_result),
+            None
+        );
+
+        let global_result = openshell_core::grpc_client::SettingsPollResult {
+            policy_hash: "same-policy".to_string(),
+            ..settings_poll_result(
+                Some(proto_policy_fixture()),
+                2,
+                openshell_core::proto::PolicySource::Global,
+            )
+        };
+        assert_eq!(
+            unchanged_policy_revision_candidate(true, 1, "same-policy", &global_result),
+            None
+        );
+    }
+
+    #[test]
+    fn unchanged_policy_revision_waits_for_required_runtime_reconciliation() {
+        assert_eq!(
+            unchanged_policy_revision_ready_to_ack(Some(2), false, false),
+            Some(2),
+            "a same-hash revision needs no OPA reload"
+        );
+        assert_eq!(
+            unchanged_policy_revision_ready_to_ack(Some(2), true, false),
+            None,
+            "failed runtime reconciliation must keep the revision pending"
+        );
+        assert_eq!(
+            unchanged_policy_revision_ready_to_ack(Some(2), true, true),
+            Some(2),
+            "successful runtime reconciliation permits acknowledgement"
+        );
+        assert_eq!(
+            unchanged_policy_revision_ready_to_ack(None, false, true),
+            None,
+            "runtime success cannot manufacture a revision candidate"
+        );
     }
 
     #[test]
