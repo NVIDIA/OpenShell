@@ -338,10 +338,7 @@ impl PodmanComputeDriver {
 
         // Ensure the bridge network exists.
         client.ensure_network(&config.network_name).await?;
-        let network_gateway_ip = client
-            .network_gateway_ip(&config.network_name)
-            .await
-            .unwrap_or(None);
+        let network_gateway_ip = client.network_gateway_ip(&config.network_name).await?;
         info!(
             network = %config.network_name,
             gateway_ip = ?network_gateway_ip,
@@ -435,20 +432,27 @@ impl PodmanComputeDriver {
 
         #[cfg(target_os = "linux")]
         {
-            if self.config.host_gateway_ip.trim().is_empty()
-                && self.rootless
-                && self.rootless_network_cmd == "pasta"
-            {
-                return Ok(vec![GatewayListenerRequirement {
-                    reason: "Podman rootless pasta callback uses the host default-route interface"
-                        .to_string(),
-                    selector: Some(Selector::DefaultRouteInterface(
-                        GatewayDefaultRouteInterfaceRequirement {},
-                    )),
-                }]);
-            }
             if self.config.host_gateway_ip.trim().is_empty() && self.rootless {
-                return Ok(Vec::new());
+                let rootless_network_cmd = self.rootless_network_cmd.trim();
+                if rootless_network_cmd == "pasta" {
+                    return Ok(vec![GatewayListenerRequirement {
+                        reason:
+                            "Podman rootless pasta callback uses the host default-route interface"
+                                .to_string(),
+                        selector: Some(Selector::DefaultRouteInterface(
+                            GatewayDefaultRouteInterfaceRequirement {},
+                        )),
+                    }]);
+                }
+
+                let reported = if rootless_network_cmd.is_empty() {
+                    "<missing>"
+                } else {
+                    rootless_network_cmd
+                };
+                return Err(ComputeDriverError::Precondition(format!(
+                    "Podman rootless network helper '{reported}' is unsupported for local gateway callback aliases; configure pasta, set host_gateway_ip, or use an explicitly remote grpc_endpoint"
+                )));
             }
 
             let gateway_ip = if self.config.host_gateway_ip.trim().is_empty() {
@@ -1330,15 +1334,81 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn rootless_non_pasta_does_not_request_additional_listener() {
-        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
-            grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
-            ..PodmanComputeConfig::default()
-        });
-        driver.rootless = true;
-        driver.rootless_network_cmd = "slirp4netns".to_string();
+    fn rootless_unsupported_network_helper_is_rejected() {
+        for (rootless_network_cmd, expected) in [("slirp4netns", "slirp4netns"), ("", "<missing>")]
+        {
+            let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+                grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
+                ..PodmanComputeConfig::default()
+            });
+            driver.rootless = true;
+            driver.rootless_network_cmd = rootless_network_cmd.to_string();
 
-        assert!(driver.gateway_listener_requirements().unwrap().is_empty());
+            let err = driver.gateway_listener_requirements().unwrap_err();
+
+            assert!(
+                matches!(err, ComputeDriverError::Precondition(_)),
+                "unsupported helper should fail precondition: {err}"
+            );
+            assert!(err.to_string().contains(expected));
+            assert!(err.to_string().contains("configure pasta"));
+        }
+    }
+
+    #[tokio::test]
+    async fn constructor_preserves_network_gateway_discovery_error() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "network-gateway-error",
+            vec![
+                StubResponse::new(StatusCode::OK, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{
+                        "host": {
+                            "cgroupVersion": "v2",
+                            "networkBackend": "netavark",
+                            "security": {"rootless": false}
+                        }
+                    }"#,
+                ),
+                StubResponse::new(StatusCode::CREATED, "{}"),
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"network gateway inspection failed"}"#,
+                ),
+            ],
+        );
+        let config = PodmanComputeConfig {
+            socket_path: Some(socket_path.clone()),
+            ..PodmanComputeConfig::default()
+        };
+        let network_name = config.network_name.clone();
+
+        let Err(err) = PodmanComputeDriver::new(config).await else {
+            panic!("network gateway discovery failure should prevent startup");
+        };
+
+        assert!(
+            err.to_string()
+                .contains("network gateway inspection failed"),
+            "unexpected startup error: {err}"
+        );
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            [
+                "GET /_ping".to_string(),
+                format!("GET {}", api_path("/libpod/info")),
+                format!("POST {}", api_path("/libpod/networks/create")),
+                format!(
+                    "GET {}",
+                    api_path(&format!("/libpod/networks/{network_name}/json"))
+                ),
+            ]
+        );
     }
 
     #[test]
