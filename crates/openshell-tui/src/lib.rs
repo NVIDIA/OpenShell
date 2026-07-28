@@ -26,6 +26,7 @@ use openshell_core::proto::open_shell_client::OpenShellClient;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
+use tonic::Code;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 use app::{App, Focus, GatewayEntry, LogLine, Screen};
@@ -33,6 +34,9 @@ use event::{Event, EventHandler};
 
 /// Duration to show the splash screen before auto-dismissing.
 const SPLASH_DURATION: Duration = Duration::from_secs(3);
+const PROVIDER_PROFILE_SCOPE_WORKSPACE: &str = "workspace";
+
+type ProviderProfileCache = HashMap<(String, String), openshell_core::proto::ProviderProfile>;
 
 // Re-export for use by the CLI crate.
 pub use theme::ThemeMode;
@@ -1696,7 +1700,7 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     let _ = tx.send(Event::ProviderCreateResult(Ok(final_name)));
                     return;
                 }
-                Err(status) if status.code() == tonic::Code::AlreadyExists => {
+                Err(status) if status.code() == Code::AlreadyExists => {
                     // Retry with a different name.
                 }
                 Err(e) => {
@@ -2024,6 +2028,45 @@ async fn refresh_workspaces(app: &mut App) {
     }
 }
 
+fn provider_profile_query_workspace(provider: &openshell_core::proto::Provider) -> &str {
+    if provider.profile_workspace.is_empty() {
+        provider.object_workspace()
+    } else {
+        &provider.profile_workspace
+    }
+}
+
+fn provider_profile_cache_workspace<'a>(
+    query_workspace: &'a str,
+    profile: &openshell_core::proto::ProviderProfile,
+) -> &'a str {
+    if profile.scope == PROVIDER_PROFILE_SCOPE_WORKSPACE {
+        query_workspace
+    } else {
+        ""
+    }
+}
+
+fn cache_provider_profile(
+    profiles: &mut ProviderProfileCache,
+    query_workspace: &str,
+    profile: openshell_core::proto::ProviderProfile,
+) {
+    let profile_workspace = provider_profile_cache_workspace(query_workspace, &profile).to_string();
+    profiles.insert((profile_workspace, profile.id.clone()), profile);
+}
+
+fn cached_provider_profile(
+    profiles: &ProviderProfileCache,
+    provider: &openshell_core::proto::Provider,
+) -> Option<openshell_core::proto::ProviderProfile> {
+    let profile_id = provider.r#type.clone();
+    profiles
+        .get(&(provider.profile_workspace.clone(), profile_id.clone()))
+        .or_else(|| profiles.get(&(String::new(), profile_id)))
+        .cloned()
+}
+
 async fn refresh_providers(app: &mut App) {
     let req = openshell_core::proto::ListProvidersRequest {
         limit: 100,
@@ -2035,9 +2078,9 @@ async fn refresh_providers(app: &mut App) {
         },
         all_workspaces: app.all_workspaces,
     };
-    let providers =
+    let response =
         match tokio::time::timeout(Duration::from_secs(5), app.client.list_providers(req)).await {
-            Ok(Ok(resp)) => resp.into_inner().providers,
+            Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(e)) => {
                 app.status_text = format!("failed to list providers: {}", e.message());
                 return;
@@ -2047,44 +2090,46 @@ async fn refresh_providers(app: &mut App) {
                 return;
             }
         };
+    app.providers_v2_enabled = true;
+    let providers = response.providers;
 
-    let profiles: HashMap<(String, String), openshell_core::proto::ProviderProfile> =
-        if app.providers_v2_enabled {
-            let workspaces: std::collections::HashSet<String> = providers
-                .iter()
-                .map(|p| p.profile_workspace.clone())
-                .collect();
-            let mut all_profiles = HashMap::new();
-            for ws in &workspaces {
-                let req = openshell_core::proto::ListProviderProfilesRequest {
-                    limit: 100,
-                    offset: 0,
-                    workspace: ws.clone(),
-                };
-                if let Ok(Ok(resp)) = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    app.client.list_provider_profiles(req),
-                )
-                .await
-                {
-                    for profile in resp.into_inner().profiles {
-                        all_profiles.insert((ws.clone(), profile.id.clone()), profile);
-                    }
+    let profiles: ProviderProfileCache = if app.providers_v2_enabled {
+        let workspaces: std::collections::HashSet<String> = providers
+            .iter()
+            .map(|provider| provider_profile_query_workspace(provider).to_string())
+            // Legacy provider records can decode without an object workspace. Do not
+            // turn that missing context into a platform-scoped profile request.
+            .filter(|workspace| !workspace.is_empty())
+            .collect();
+        let mut all_profiles = HashMap::new();
+        for ws in &workspaces {
+            let req = openshell_core::proto::ListProviderProfilesRequest {
+                limit: 100,
+                offset: 0,
+                workspace: ws.clone(),
+            };
+            if let Ok(Ok(resp)) = tokio::time::timeout(
+                Duration::from_secs(5),
+                app.client.list_provider_profiles(req),
+            )
+            .await
+            {
+                for profile in resp.into_inner().profiles {
+                    cache_provider_profile(&mut all_profiles, ws, profile);
                 }
             }
-            all_profiles
-        } else {
-            HashMap::new()
-        };
+        }
+        all_profiles
+    } else {
+        HashMap::new()
+    };
 
     app.provider_count = providers.len();
     app.provider_entries = providers
         .iter()
         .cloned()
         .map(|provider| app::ProviderListEntry {
-            profile: profiles
-                .get(&(provider.profile_workspace.clone(), provider.r#type.clone()))
-                .cloned(),
+            profile: cached_provider_profile(&profiles, &provider),
             provider,
         })
         .collect();
@@ -2113,23 +2158,32 @@ async fn refresh_providers(app: &mut App) {
 }
 
 async fn refresh_global_settings(app: &mut App) {
-    let req = openshell_core::proto::GetGatewayConfigRequest {};
-    let result =
-        tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await;
-    match result {
-        Ok(Err(e)) => {
-            app.status_text = format!("failed to fetch global settings: {}", e.message());
-        }
-        Err(_) => {
-            app.status_text = "get gateway settings timed out".to_string();
-        }
-        Ok(Ok(resp)) => {
-            let inner = resp.into_inner();
-            app.apply_global_settings(inner.settings, inner.settings_revision);
+    if !app.global_settings_access_denied {
+        let req = openshell_core::proto::GetGatewayConfigRequest {};
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await;
+        match result {
+            Ok(Err(status)) if status.code() == Code::PermissionDenied => {
+                app.deny_global_settings_access();
+            }
+            Ok(Err(status)) => {
+                app.status_text = format!("failed to fetch global settings: {}", status.message());
+            }
+            Err(_) => {
+                app.status_text = "get gateway settings timed out".to_string();
+            }
+            Ok(Ok(resp)) => {
+                let inner = resp.into_inner();
+                app.apply_global_settings(inner.settings, inner.settings_revision);
+            }
         }
     }
 
-    // Check for active global policy.
+    if app.global_policy_access_denied {
+        return;
+    }
+
+    // Check for an active global policy only while the caller can read it.
     let policy_req = openshell_core::proto::ListSandboxPoliciesRequest {
         name: String::new(),
         limit: 1,
@@ -2137,21 +2191,32 @@ async fn refresh_global_settings(app: &mut App) {
         global: true,
         workspace: String::new(),
     };
-    if let Ok(Ok(resp)) = tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(5),
         app.client.list_sandbox_policies(policy_req),
     )
     .await
     {
-        let revisions = resp.into_inner().revisions;
-        if let Some(latest) = revisions.first() {
-            let status =
-                openshell_core::proto::PolicyStatus::try_from(latest.status).unwrap_or_default();
-            app.global_policy_active = status == openshell_core::proto::PolicyStatus::Loaded;
-            app.global_policy_version = latest.version;
-        } else {
-            app.global_policy_active = false;
-            app.global_policy_version = 0;
+        Ok(Err(status)) if status.code() == Code::PermissionDenied => {
+            app.deny_global_policy_access();
+        }
+        Ok(Err(status)) => {
+            app.status_text = format!("failed to fetch global policy: {}", status.message());
+        }
+        Err(_) => {
+            app.status_text = "list global policies timed out".to_string();
+        }
+        Ok(Ok(resp)) => {
+            let revisions = resp.into_inner().revisions;
+            if let Some(latest) = revisions.first() {
+                let status = openshell_core::proto::PolicyStatus::try_from(latest.status)
+                    .unwrap_or_default();
+                app.global_policy_active = status == openshell_core::proto::PolicyStatus::Loaded;
+                app.global_policy_version = latest.version;
+            } else {
+                app.global_policy_active = false;
+                app.global_policy_version = 0;
+            }
         }
     }
 }
@@ -2648,4 +2713,60 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod provider_profile_workspace_tests {
+    use super::*;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use openshell_core::proto::{Provider, ProviderProfile};
+
+    #[test]
+    fn platform_profile_queries_through_provider_workspace() {
+        let provider = Provider {
+            metadata: Some(ObjectMeta {
+                workspace: "team-a".to_string(),
+                ..ObjectMeta::default()
+            }),
+            profile_workspace: String::new(),
+            ..Provider::default()
+        };
+
+        assert_eq!(provider_profile_query_workspace(&provider), "team-a");
+    }
+
+    #[test]
+    fn cached_profile_round_trip_covers_static_platform_and_workspace_scopes() {
+        let cases = [
+            ("", "", "static profile with platform provider scope"),
+            ("team-a", "", "static profile with workspace provider scope"),
+            ("", "platform", "platform profile"),
+            ("team-a", "workspace", "workspace profile"),
+        ];
+
+        for (provider_workspace, response_scope, label) in cases {
+            let provider = Provider {
+                metadata: Some(ObjectMeta {
+                    workspace: "team-a".to_string(),
+                    ..ObjectMeta::default()
+                }),
+                r#type: "claude-code".to_string(),
+                profile_workspace: provider_workspace.to_string(),
+                ..Provider::default()
+            };
+            let profile = ProviderProfile {
+                id: "claude-code".to_string(),
+                scope: response_scope.to_string(),
+                ..ProviderProfile::default()
+            };
+            let mut profiles = ProviderProfileCache::new();
+
+            cache_provider_profile(&mut profiles, "team-a", profile);
+
+            assert!(
+                cached_provider_profile(&profiles, &provider).is_some(),
+                "{label} did not survive cache insertion and lookup"
+            );
+        }
+    }
 }

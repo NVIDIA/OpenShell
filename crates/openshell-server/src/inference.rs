@@ -17,7 +17,6 @@ use openshell_core::{ObjectId, ObjectLabels, ObjectWorkspace};
 use openshell_providers::normalize_provider_type;
 use openshell_router::config::ResolvedRoute as RouterResolvedRoute;
 use openshell_router::{ValidationFailureKind, verify_backend_endpoint};
-use openshell_server_macros::rpc_authz;
 use prost::Message as _;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,6 +25,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     ServerState,
+    auth::workspace_authz::{MinWorkspaceRole, authorize_workspace},
     persistence::{ObjectName, ObjectType, Store, WriteCondition, current_time_ms},
 };
 
@@ -62,10 +62,8 @@ impl ObjectType for InferenceRoute {
     }
 }
 
-#[rpc_authz(service = "openshell.inference.v1.Inference")]
 #[tonic::async_trait]
 impl Inference for InferenceService {
-    #[rpc_auth(auth = "sandbox")]
     async fn get_inference_bundle(
         &self,
         request: Request<GetInferenceBundleRequest>,
@@ -88,16 +86,24 @@ impl Inference for InferenceService {
             .map(Response::new)
     }
 
-    #[rpc_auth(auth = "bearer", scope = "inference:write", role = "admin")]
     async fn set_inference_route(
         &self,
         request: Request<SetInferenceRouteRequest>,
     ) -> Result<Response<SetInferenceRouteResponse>, Status> {
+        let principal = crate::grpc::extract_principal(&request)?;
         let req = request.into_inner();
         let workspace =
             crate::grpc::workspace::resolve_workspace(self.state.store.as_ref(), &req.workspace)
                 .await?
                 .ensure_active()?;
+        authorize_workspace(
+            &self.state.store,
+            &self.state.admin_role,
+            &principal,
+            &workspace,
+            MinWorkspaceRole::Admin,
+        )
+        .await?;
         let route_name = effective_route_name(&req.route_name)?;
         let verify = !req.no_verify;
         let route = upsert_inference_route(
@@ -129,16 +135,24 @@ impl Inference for InferenceService {
         }))
     }
 
-    #[rpc_auth(auth = "bearer", scope = "inference:read", role = "user")]
     async fn get_inference_route(
         &self,
         request: Request<GetInferenceRouteRequest>,
     ) -> Result<Response<GetInferenceRouteResponse>, Status> {
+        let principal = crate::grpc::extract_principal(&request)?;
         let req = request.into_inner();
         let workspace =
             crate::grpc::workspace::resolve_workspace(self.state.store.as_ref(), &req.workspace)
                 .await?
                 .name;
+        authorize_workspace(
+            &self.state.store,
+            &self.state.admin_role,
+            &principal,
+            &workspace,
+            MinWorkspaceRole::User,
+        )
+        .await?;
         let route_name = effective_route_name(&req.route_name)?;
         let route = self
             .state
@@ -173,16 +187,24 @@ impl Inference for InferenceService {
         }))
     }
 
-    #[rpc_auth(auth = "bearer", scope = "inference:write", role = "admin")]
     async fn delete_inference_route(
         &self,
         request: Request<DeleteInferenceRouteRequest>,
     ) -> Result<Response<DeleteInferenceRouteResponse>, Status> {
+        let principal = crate::grpc::extract_principal(&request)?;
         let req = request.into_inner();
         let workspace =
             crate::grpc::workspace::resolve_workspace(self.state.store.as_ref(), &req.workspace)
                 .await?
                 .name;
+        authorize_workspace(
+            &self.state.store,
+            &self.state.admin_role,
+            &principal,
+            &workspace,
+            MinWorkspaceRole::Admin,
+        )
+        .await?;
         let route_name = effective_route_name(&req.route_name)?;
         let deleted = self
             .state

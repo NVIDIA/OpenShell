@@ -605,11 +605,15 @@ pub struct App {
     // Global policy indicator (dashboard)
     pub global_policy_active: bool,
     pub global_policy_version: u32,
+    /// Stop retrying a platform-only policy probe after an expected denial.
+    pub global_policy_access_denied: bool,
 
     // Global settings
     pub global_settings: Vec<GlobalSettingEntry>,
     pub global_settings_selected: usize,
     pub global_settings_revision: u64,
+    /// Stop retrying platform-only settings after an expected denial.
+    pub global_settings_access_denied: bool,
     pub setting_edit: Option<SettingEditState>,
     pub confirm_setting_set: Option<usize>,
     pub confirm_setting_delete: Option<usize>,
@@ -945,9 +949,11 @@ impl App {
             middle_pane_tab: MiddlePaneTab::Providers,
             global_policy_active: false,
             global_policy_version: 0,
+            global_policy_access_denied: false,
             global_settings: Vec::new(),
             global_settings_selected: 0,
             global_settings_revision: 0,
+            global_settings_access_denied: false,
             setting_edit: None,
             confirm_setting_set: None,
             confirm_setting_delete: None,
@@ -1046,16 +1052,7 @@ impl App {
         revision: u64,
     ) {
         self.global_settings_revision = revision;
-        self.providers_v2_enabled = settings
-            .get(settings::PROVIDERS_V2_ENABLED_KEY)
-            .and_then(|value| value.value.as_ref())
-            .and_then(|value| match value {
-                setting_value::Value::BoolValue(value) => Some(*value),
-                setting_value::Value::StringValue(value) => settings::parse_bool_like(value),
-                setting_value::Value::IntValue(value) => Some(*value != 0),
-                setting_value::Value::BytesValue(_) => None,
-            })
-            .unwrap_or(false);
+        self.global_settings_access_denied = false;
         self.global_settings = settings::REGISTERED_SETTINGS
             .iter()
             .map(|reg| {
@@ -1072,6 +1069,24 @@ impl App {
         {
             self.global_settings_selected = self.global_settings.len() - 1;
         }
+    }
+
+    /// Clear privileged settings after the gateway denies platform-admin access.
+    pub fn deny_global_settings_access(&mut self) {
+        self.global_settings_access_denied = true;
+        self.global_settings.clear();
+        self.global_settings_selected = 0;
+        self.global_settings_revision = 0;
+        self.setting_edit = None;
+        self.confirm_setting_set = None;
+        self.confirm_setting_delete = None;
+    }
+
+    /// Clear the global policy badge after the gateway denies platform-admin access.
+    pub fn deny_global_policy_access(&mut self) {
+        self.global_policy_access_denied = true;
+        self.global_policy_active = false;
+        self.global_policy_version = 0;
     }
 
     /// Apply fetched sandbox settings from the `GetSandboxConfig` response.
@@ -3360,6 +3375,15 @@ impl App {
         self.sandbox_providers_list.clear();
         self.policy_lines.clear();
         self.policy_scroll = 0;
+        // Platform-admin capabilities are gateway-specific. Probe them again after
+        // switching gateways and never retain privileged state from the old one.
+        self.global_settings_access_denied = false;
+        self.global_settings.clear();
+        self.global_settings_selected = 0;
+        self.global_settings_revision = 0;
+        self.global_policy_access_denied = false;
+        self.global_policy_active = false;
+        self.global_policy_version = 0;
         // Reset provider state too.
         self.providers_v2_enabled = false;
         self.provider_entries.clear();
@@ -3414,6 +3438,64 @@ fn clamped_scroll(current: usize, delta: isize, total: usize, viewport: usize) -
 mod tests {
     use super::*;
     use openshell_bootstrap::GatewayMetadataSource;
+
+    fn test_app() -> App {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = OpenShellClient::with_interceptor(channel, EdgeAuthInterceptor::noop());
+        App::new(
+            client,
+            "test".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "default".to_string(),
+            crate::theme::Theme::dark(),
+        )
+    }
+
+    #[tokio::test]
+    async fn global_settings_do_not_override_provider_api_capability() {
+        let mut app = test_app();
+        app.providers_v2_enabled = true;
+        let mut values = HashMap::new();
+        values.insert(
+            settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+            openshell_core::proto::SettingValue {
+                value: Some(setting_value::Value::BoolValue(false)),
+            },
+        );
+
+        app.apply_global_settings(values, 7);
+
+        assert!(app.providers_v2_enabled);
+        assert_eq!(app.global_settings_revision, 7);
+    }
+
+    #[tokio::test]
+    async fn denied_platform_state_is_cleared_and_reprobed_after_gateway_switch() {
+        let mut app = test_app();
+        app.global_settings = vec![GlobalSettingEntry {
+            key: "stale".to_string(),
+            kind: SettingValueKind::Bool,
+            value: Some(setting_value::Value::BoolValue(true)),
+        }];
+        app.global_settings_revision = 4;
+        app.global_policy_active = true;
+        app.global_policy_version = 3;
+
+        app.deny_global_settings_access();
+        app.deny_global_policy_access();
+
+        assert!(app.global_settings_access_denied);
+        assert!(app.global_settings.is_empty());
+        assert_eq!(app.global_settings_revision, 0);
+        assert!(app.global_policy_access_denied);
+        assert!(!app.global_policy_active);
+        assert_eq!(app.global_policy_version, 0);
+
+        app.reset_sandbox_state();
+
+        assert!(!app.global_settings_access_denied);
+        assert!(!app.global_policy_access_denied);
+    }
 
     // -- clamped_scroll -------------------------------------------------
 

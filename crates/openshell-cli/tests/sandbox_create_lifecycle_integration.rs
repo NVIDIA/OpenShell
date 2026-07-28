@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -48,6 +48,7 @@ struct SandboxState {
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
+    gateway_config_requests: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Default)]
@@ -57,6 +58,13 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn get_current_user(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
+    ) -> Result<Response<openshell_core::proto::GetCurrentUserResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn health(
         &self,
         _request: tonic::Request<HealthRequest>,
@@ -182,6 +190,9 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<GetGatewayConfigRequest>,
     ) -> Result<Response<GetGatewayConfigResponse>, Status> {
+        self.state
+            .gateway_config_requests
+            .fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(GetGatewayConfigResponse {
             settings: self.state.global_settings.lock().await.clone(),
             settings_revision: 1,
@@ -1205,6 +1216,40 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         load_last_sandbox("openshell", "default").as_deref(),
         Some("default-command"),
         "default sandboxes should be persisted as last-used"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_without_inferred_provider_skips_gateway_config() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("no-provider-config"),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed without reading gateway config");
+
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .gateway_config_requests
+            .load(Ordering::SeqCst),
+        0,
+        "commands without an inferred provider must not require global gateway settings"
     );
 }
 

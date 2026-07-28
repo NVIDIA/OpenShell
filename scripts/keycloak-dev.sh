@@ -109,6 +109,7 @@ print_info() {
     echo "  Test users:"
     echo "    admin@test / admin  (role: openshell-admin)"
     echo "    user@test  / user   (role: openshell-user)"
+    echo "    user-b@test / user-b (role: openshell-user)"
     echo ""
     echo "  Get a token:"
     echo "    curl -s -X POST ${issuer}/protocol/openid-connect/token \\"
