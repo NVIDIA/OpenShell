@@ -2766,7 +2766,7 @@ fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
 
     let nano_cpus = (cores * 1_000_000_000.0).round();
     #[allow(clippy::cast_precision_loss)]
-    if !nano_cpus.is_finite() || nano_cpus < i64::MIN as f64 || nano_cpus > i64::MAX as f64 {
+    if !nano_cpus.is_finite() || nano_cpus < i64::MIN as f64 || nano_cpus >= i64::MAX as f64 {
         return Err(Status::failed_precondition(format!(
             "docker cpu_limit '{value}' is too large",
         )));
@@ -2820,7 +2820,7 @@ fn parse_memory_limit(value: &str) -> Result<Option<i64>, Status> {
 
     let bytes = (amount * multiplier).round();
     #[allow(clippy::cast_precision_loss)]
-    if !bytes.is_finite() || bytes < i64::MIN as f64 || bytes > i64::MAX as f64 {
+    if !bytes.is_finite() || bytes < i64::MIN as f64 || bytes >= i64::MAX as f64 {
         return Err(Status::failed_precondition(format!(
             "docker memory_limit '{value}' is too large",
         )));

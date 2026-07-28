@@ -2302,3 +2302,31 @@ fn parse_memory_limit_rejects_overflow() {
     let err = parse_memory_limit(&huge).unwrap_err();
     assert!(err.message().contains("too large"));
 }
+
+#[test]
+fn parse_cpu_limit_rejects_i64_max_boundary() {
+    // 9_223_372_037 cores * 1e9 rounds to 2^63, which used to pass the > check
+    // and silently saturate to i64::MAX. It must now be rejected.
+    let err = parse_cpu_limit("9223372037").unwrap_err();
+    assert!(err.message().contains("too large"));
+
+    // One core below the boundary is still valid.
+    assert_eq!(
+        parse_cpu_limit("9223372036").unwrap(),
+        Some(9_223_372_036_000_000_000)
+    );
+}
+
+#[test]
+fn parse_memory_limit_rejects_i64_max_boundary() {
+    // 8192 PiB = 2^63 bytes, which used to pass the > check and silently
+    // saturate to i64::MAX. It must now be rejected.
+    let err = parse_memory_limit("8192Pi").unwrap_err();
+    assert!(err.message().contains("too large"));
+
+    // One PiB below the boundary is still valid.
+    assert_eq!(
+        parse_memory_limit("8191Pi").unwrap(),
+        Some(8191 * 1024_i64.pow(5))
+    );
+}

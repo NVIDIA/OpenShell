@@ -1076,7 +1076,14 @@ pub fn build_container_spec_for_image(
             ],
             interval: config
                 .health_check_interval_secs
-                .saturating_mul(1_000_000_000),
+                .checked_mul(1_000_000_000)
+                .filter(|ns| *ns <= i64::MAX as u64)
+                .ok_or_else(|| {
+                    ComputeDriverError::InvalidArgument(format!(
+                        "health_check_interval_secs {} exceeds maximum allowed nanoseconds",
+                        config.health_check_interval_secs
+                    ))
+                })?,
             timeout: 2_000_000_000,
             retries: 10,
             start_period: 5_000_000_000,
@@ -1215,7 +1222,7 @@ fn parse_cpu_to_microseconds(quantity: &str) -> Option<u64> {
         }
         let micros_f = cores * 100_000.0;
         #[allow(clippy::cast_precision_loss)]
-        if !micros_f.is_finite() || micros_f > u64::MAX as f64 {
+        if !micros_f.is_finite() || micros_f >= u64::MAX as f64 {
             return None;
         }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1298,6 +1305,35 @@ mod tests {
     fn parse_cpu_huge_value_returns_none_instead_of_overflow() {
         // A finite f64 whose product with 100_000 overflows to infinity.
         assert_eq!(parse_cpu_to_microseconds("1e300"), None);
+    }
+
+    #[test]
+    fn parse_cpu_rejects_u64_max_boundary() {
+        // 184_467_440_737_095_520 cores * 100_000 rounds to 2^64, which used
+        // to pass the > check and silently saturate to u64::MAX. It must now
+        // be rejected.
+        assert_eq!(parse_cpu_to_microseconds("184467440737095520"), None);
+
+        // One core below the boundary is still valid.
+        assert_eq!(
+            parse_cpu_to_microseconds("184467440737095"),
+            Some(18_446_744_073_709_500_416)
+        );
+    }
+
+    #[test]
+    fn container_spec_rejects_health_check_interval_overflow() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        // i64::MAX nanoseconds / 1_000_000_000 ns/s = 9_223_372_036 seconds.
+        // One second over must be rejected before it can saturate.
+        config.health_check_interval_secs = 9_223_372_037;
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+        assert!(
+            matches!(err, ComputeDriverError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+        assert!(format!("{err}").contains("health_check_interval_secs"));
     }
 
     #[test]
