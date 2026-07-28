@@ -22,6 +22,17 @@ const BASE_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:late
 const READY_MARKER: &str = "podman-oci-identity-ready";
 const OCI_UID: &str = "2345";
 const OCI_GID: &str = "2346";
+const OCI_FALLBACK_POLICY: &str = r#"version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /lib64, /proc, /dev/urandom, /etc]
+  read_write: [/sandbox, /tmp, /dev/null]
+landlock:
+  compatibility: best_effort
+
+network_policies: {}
+"#;
 
 struct ImageGuard {
     engine: ContainerEngine,
@@ -69,6 +80,15 @@ impl ImageGuard {
             ],
         )?;
         let id = run_engine(&engine, &["image", "inspect", "--format", "{{.Id}}", &tag])?;
+        let user = run_engine(
+            &engine,
+            &["image", "inspect", "--format", "{{.Config.User}}", &tag],
+        )?;
+        if user != format!("{OCI_UID}:{OCI_GID}") {
+            return Err(format!(
+                "Podman-built image has OCI user '{user}', expected {OCI_UID}:{OCI_GID}"
+            ));
+        }
 
         Ok(Self { engine, tag, id })
     }
@@ -151,8 +171,20 @@ async fn podman_uses_oci_identity_and_inspected_image_id() {
     }
 
     let image = ImageGuard::build().expect("build Podman OCI identity image");
+    // The community base image contains a baked default policy with an
+    // explicit `sandbox` process identity. Supply a complete policy that
+    // intentionally omits `process` so this test exercises OCI fallback.
+    let policy = tempfile::NamedTempFile::new().expect("create OCI fallback policy");
+    std::fs::write(policy.path(), OCI_FALLBACK_POLICY).expect("write OCI fallback policy");
+    let policy_path = policy.path().to_str().expect("policy path is UTF-8");
     let mut sandbox = SandboxGuard::create_keep_with_args(
-        &["--from", &image.tag, "--no-tty"],
+        &[
+            "--from",
+            &image.tag,
+            "--policy",
+            policy_path,
+            "--no-tty",
+        ],
         &[
             "sh",
             "-c",
