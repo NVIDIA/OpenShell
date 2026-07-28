@@ -1146,6 +1146,7 @@ mod unsafe_pty {
     }
 
     #[allow(unsafe_code)]
+    #[allow(clippy::too_many_arguments)]
     #[cfg_attr(
         not(target_os = "linux"),
         allow(
