@@ -116,7 +116,9 @@ SETUP_LOG="$LOG_DIR/setup.log"
 GATEWAY_LOG="$LOG_DIR/gateway.log"
 MIDDLEWARE_LOG="$LOG_DIR/middleware.log"
 RUN_ID="content-guard-smoke-$$-$RANDOM"
-SANDBOX_NAME="$RUN_ID-sandbox"
+# Sandbox names are capped at 19 characters. Use a short prefix with
+# the PID for uniqueness; keep the full RUN_ID for gateway identity.
+SANDBOX_NAME="cg-$$-$RANDOM"
 SANDBOX_CREATED=0
 
 mkdir -p "$LOG_DIR"
