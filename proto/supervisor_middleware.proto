@@ -157,6 +157,9 @@ enum WebSocketSessionEndReason {
 }
 
 // WebSocketEvaluationRequest is one ordered event in a stage-local stream.
+// Message sequence numbers identify logical messages session-wide. A stage
+// receives a strictly increasing subset of those numbers; gaps are valid when
+// session messages are not delivered to that stage.
 message WebSocketEvaluationRequest {
   oneof request {
     WebSocketPreflight preflight = 1;
@@ -195,6 +198,9 @@ message WebSocketSessionStart {
 
 // WebSocketMessage contains one complete reconstructed logical message.
 message WebSocketMessage {
+  // Session-global sequence starting at 1. Values delivered to one stage must
+  // strictly increase but need not be contiguous. Reject zero, duplicates, and
+  // regressions; accept gaps.
   uint64 sequence = 1;
   WebSocketDirection direction = 2;
   WebSocketMessageType message_type = 3;
@@ -221,6 +227,7 @@ message WebSocketPreflightDecision {
 // one message. A replacement preserves the input message type; text
 // replacements must be valid UTF-8.
 message WebSocketMessageResult {
+  // Must exactly match the sequence of the corresponding WebSocketMessage.
   uint64 sequence = 1;
   Decision decision = 2;
   bytes replacement = 3;

@@ -4171,6 +4171,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn builtin_regex_redacts_after_fail_open_message_capacity_gap() {
+        let runner = builtin_runner();
+        let chain = [entry("regex-redactor", OnError::FailOpen)];
+        let preflight = runner
+            .preflight_websocket(
+                &chain,
+                WebSocketPreflightInput {
+                    session_id: "builtin-regex-gap-session".into(),
+                    request_id: "request".into(),
+                    sandbox_id: "sandbox".into(),
+                    scheme: "wss".into(),
+                    host: "api.openai.com".into(),
+                    port: 443,
+                    path: "/v1/responses".into(),
+                    requested_subprotocols: vec!["realtime".into()],
+                },
+            )
+            .await
+            .expect("preflight");
+        assert!(preflight.allowed);
+        let mut session = preflight.session.expect("built-in chose to inspect");
+        assert!(session.start("realtime").await.allowed);
+
+        let oversized_payload = vec![b'a'; 256 * 1024 + 1];
+        let oversized = session.evaluate_text(oversized_payload.clone()).await;
+        assert!(oversized.allowed);
+        assert_eq!(oversized.payload, oversized_payload);
+        assert_eq!(oversized.invocations[0].sequence, Some(1));
+        assert_eq!(
+            oversized.invocations[0].outcome,
+            WebSocketInvocationOutcome::FailOpen
+        );
+        assert!(!oversized.invocations[0].stage_disabled);
+
+        let original = br#"{"type":"response.create","response":{"input":"sk-ABCDEFGHIJKLMNOP"}}"#;
+        let redacted = session.evaluate_text(original.to_vec()).await;
+        assert!(redacted.allowed);
+        assert_eq!(
+            String::from_utf8(redacted.payload).expect("transformed UTF-8"),
+            r#"{"type":"response.create","response":{"input":"[REDACTED]"}}"#
+        );
+        assert_eq!(redacted.invocations[0].sequence, Some(2));
+        assert_eq!(
+            redacted.invocations[0].outcome,
+            WebSocketInvocationOutcome::Allow
+        );
+        assert!(redacted.invocations[0].transformed);
+        assert!(!redacted.invocations[0].stage_disabled);
+
+        session
+            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .await;
+    }
+
+    #[tokio::test]
     async fn in_process_websocket_endpoint_redacts_openai_event() {
         let service = OpenAiRedactionService::default();
         let runner = ChainRunner::from_endpoint(Arc::new(service));

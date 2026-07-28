@@ -61,7 +61,7 @@ impl BuiltinMiddlewareService {
         tokio::spawn(async move {
             let mut config = None;
             let mut started = false;
-            let mut next_sequence = 1u64;
+            let mut sequence_lower_bound = Some(1u64);
 
             while let Some(request) = requests.next().await {
                 let request = match request {
@@ -112,10 +112,11 @@ impl BuiltinMiddlewareService {
                         Ok(None)
                     }
                     Some(web_socket_evaluation_request::Request::Message(message)) if started => {
-                        if message.sequence != next_sequence {
-                            Err(Status::invalid_argument(
-                                "WebSocket message sequence is not monotonic",
-                            ))
+                        if let Err(error) = advance_sequence_lower_bound(
+                            &mut sequence_lower_bound,
+                            message.sequence,
+                        ) {
+                            Err(error)
                         } else if message.direction != WebSocketDirection::ClientToUpstream as i32
                             || message.message_type != WebSocketMessageType::Text as i32
                         {
@@ -130,16 +131,13 @@ impl BuiltinMiddlewareService {
                                 &message.payload,
                                 selected_config,
                             ) {
-                                Ok(result) => {
-                                    next_sequence = next_sequence.saturating_add(1);
-                                    Ok(Some(WebSocketEvaluationResponse {
-                                        response: Some(
-                                            web_socket_evaluation_response::Response::MessageResult(
-                                                result,
-                                            ),
+                                Ok(result) => Ok(Some(WebSocketEvaluationResponse {
+                                    response: Some(
+                                        web_socket_evaluation_response::Response::MessageResult(
+                                            result,
                                         ),
-                                    }))
-                                }
+                                    ),
+                                })),
                                 Err(error) => Err(Status::invalid_argument(error.to_string())),
                             }
                         }
@@ -170,6 +168,24 @@ impl BuiltinMiddlewareService {
         });
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(responses_rx))
     }
+}
+
+fn advance_sequence_lower_bound(
+    lower_bound: &mut Option<u64>,
+    sequence: u64,
+) -> std::result::Result<(), Status> {
+    let Some(current_lower_bound) = *lower_bound else {
+        return Err(Status::invalid_argument(
+            "WebSocket message sequence must be strictly increasing",
+        ));
+    };
+    if sequence < current_lower_bound {
+        return Err(Status::invalid_argument(
+            "WebSocket message sequence must be strictly increasing",
+        ));
+    }
+    *lower_bound = sequence.checked_add(1);
+    Ok(())
 }
 
 #[tonic::async_trait]
@@ -427,5 +443,21 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn websocket_sequence_lower_bound_accepts_gaps_and_rejects_reuse() {
+        let mut lower_bound = Some(1);
+        advance_sequence_lower_bound(&mut lower_bound, 2).expect("first delivered sequence");
+        assert_eq!(lower_bound, Some(3));
+        assert!(advance_sequence_lower_bound(&mut lower_bound, 2).is_err());
+        assert!(advance_sequence_lower_bound(&mut lower_bound, 1).is_err());
+
+        advance_sequence_lower_bound(&mut lower_bound, 7).expect("forward gap");
+        assert_eq!(lower_bound, Some(8));
+
+        advance_sequence_lower_bound(&mut lower_bound, u64::MAX).expect("last sequence");
+        assert_eq!(lower_bound, None);
+        assert!(advance_sequence_lower_bound(&mut lower_bound, u64::MAX).is_err());
     }
 }
