@@ -8,10 +8,10 @@ use crate::lifecycle::{
     BackendFeature, GuestInitDropin, LaunchAbortReason, LaunchPlan, LifecycleExtensionRegistry,
     RestoreContext, extension_state_dir,
 };
+use crate::provisioning::{RootfsMaterializationRequest, UnpackedImage, VmRootfsMaterializer};
 use crate::rootfs::{
-    clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
-    extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
-    set_rootfs_image_file_mode, write_rootfs_image_file,
+    clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, extract_rootfs_archive_to,
+    sandbox_guest_init_path, set_rootfs_image_file_mode, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
 use bollard::Docker;
@@ -203,8 +203,39 @@ struct GuestImagePayload {
 
 #[derive(Debug, Clone)]
 enum GuestImagePayloadSource {
-    RegistryOciLayout { layout_dir: PathBuf },
-    LocalDocker { rootfs_archive: PathBuf },
+    RegistryOciLayout {
+        layout_dir: PathBuf,
+    },
+    LocalContainer {
+        engine: LocalContainerEngine,
+        rootfs_archive: PathBuf,
+    },
+}
+
+/// The local container engine that supplied an image to the VM driver.
+///
+/// Both engines implement the Docker-compatible API used for inspect and
+/// export, but retaining their identity keeps source selection and progress
+/// reporting accurate.
+#[derive(Debug, Clone, Copy)]
+enum LocalContainerEngine {
+    Docker,
+    Podman,
+}
+
+impl LocalContainerEngine {
+    const fn image_source(self) -> &'static str {
+        match self {
+            Self::Docker => "local_docker",
+            Self::Podman => "local_podman",
+        }
+    }
+}
+
+/// A local image source backed by a Docker-compatible container engine.
+struct LocalContainerImageSource {
+    client: Docker,
+    engine: LocalContainerEngine,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1953,7 +1984,7 @@ impl VmDriver {
     async fn resolve_local_container_image(
         &self,
         image_ref: &str,
-    ) -> Result<Option<(Docker, String)>, Status> {
+    ) -> Result<Option<(LocalContainerImageSource, String)>, Status> {
         let required_local_image = is_openshell_local_build_image_ref(image_ref);
         let engine = match connect_local_container_engine().await {
             Some(engine) => engine,
@@ -1971,7 +2002,7 @@ impl VmDriver {
             }
         };
 
-        match engine.inspect_image(image_ref).await {
+        match engine.client.inspect_image(image_ref).await {
             Ok(inspect) => {
                 if let Some(message) = local_image_platform_mismatch(
                     image_ref,
@@ -1999,6 +2030,7 @@ impl VmDriver {
                 info!(
                     image_ref = %image_ref,
                     image_identity = %image_identity,
+                    image_source = engine.engine.image_source(),
                     "vm driver: resolved image from local container engine"
                 );
                 Ok(Some((engine, image_identity)))
@@ -2027,7 +2059,7 @@ impl VmDriver {
         &self,
         sandbox_id: &str,
         image_ref: &str,
-        docker: &Docker,
+        source: &LocalContainerImageSource,
         image_identity: &str,
     ) -> Result<String, Status> {
         let cache_identity = bootstrap_image_cache_identity(image_identity);
@@ -2050,7 +2082,10 @@ impl VmDriver {
                 format!("Using cached VM root disk for local image \"{image_ref}\""),
                 HashMap::from([
                     ("image_ref".to_string(), image_ref.to_string()),
-                    ("image_source".to_string(), "local_docker".to_string()),
+                    (
+                        "image_source".to_string(),
+                        source.engine.image_source().to_string(),
+                    ),
                     ("cache_hit".to_string(), "true".to_string()),
                     ("image_identity".to_string(), cache_identity.clone()),
                 ]),
@@ -2066,7 +2101,10 @@ impl VmDriver {
             format!("Preparing VM root disk cache for local image \"{image_ref}\""),
             HashMap::from([
                 ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), "local_docker".to_string()),
+                (
+                    "image_source".to_string(),
+                    source.engine.image_source().to_string(),
+                ),
                 ("cache_hit".to_string(), "false".to_string()),
                 ("image_identity".to_string(), cache_identity.clone()),
             ]),
@@ -2088,7 +2126,10 @@ impl VmDriver {
                 format!("Using cached VM root disk for local image \"{image_ref}\""),
                 HashMap::from([
                     ("image_ref".to_string(), image_ref.to_string()),
-                    ("image_source".to_string(), "local_docker".to_string()),
+                    (
+                        "image_source".to_string(),
+                        source.engine.image_source().to_string(),
+                    ),
                     ("cache_hit".to_string(), "true".to_string()),
                     ("image_identity".to_string(), cache_identity.clone()),
                 ]),
@@ -2098,7 +2139,7 @@ impl VmDriver {
             return Ok(cache_identity);
         }
 
-        self.build_cached_local_image_rootfs_image(sandbox_id, docker, image_ref, &cache_identity)
+        self.build_cached_local_image_rootfs_image(sandbox_id, source, image_ref, &cache_identity)
             .await?;
         self.publish_pulled_event(sandbox_id, image_ref, &image_path)
             .await;
@@ -2111,14 +2152,14 @@ impl VmDriver {
         image_ref: &str,
         bootstrap_root_disk: &Path,
     ) -> Result<PreparedImageDisk, Status> {
-        if let Some((docker, image_identity)) =
+        if let Some((source, image_identity)) =
             self.resolve_local_container_image(image_ref).await?
         {
             return self
                 .ensure_prepared_local_image_disk(
                     sandbox_id,
                     image_ref,
-                    &docker,
+                    &source,
                     &image_identity,
                     bootstrap_root_disk,
                 )
@@ -2133,7 +2174,7 @@ impl VmDriver {
         &self,
         sandbox_id: &str,
         image_ref: &str,
-        docker: &Docker,
+        source: &LocalContainerImageSource,
         image_identity: &str,
         bootstrap_root_disk: &Path,
     ) -> Result<PreparedImageDisk, Status> {
@@ -2141,17 +2182,32 @@ impl VmDriver {
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
 
         if tokio::fs::metadata(&image_path).await.is_ok() {
-            self.publish_prepared_cache_hit(sandbox_id, image_ref, "local_docker", &cache_identity);
+            self.publish_prepared_cache_hit(
+                sandbox_id,
+                image_ref,
+                source.engine.image_source(),
+                &cache_identity,
+            );
             return Ok(PreparedImageDisk {
                 image_identity: cache_identity,
                 disk_path: image_path,
             });
         }
 
-        self.publish_prepared_cache_miss(sandbox_id, image_ref, "local_docker", &cache_identity);
+        self.publish_prepared_cache_miss(
+            sandbox_id,
+            image_ref,
+            source.engine.image_source(),
+            &cache_identity,
+        );
         let _cache_guard = self.image_cache_lock.lock().await;
         if tokio::fs::metadata(&image_path).await.is_ok() {
-            self.publish_prepared_cache_hit(sandbox_id, image_ref, "local_docker", &cache_identity);
+            self.publish_prepared_cache_hit(
+                sandbox_id,
+                image_ref,
+                source.engine.image_source(),
+                &cache_identity,
+            );
             return Ok(PreparedImageDisk {
                 image_identity: cache_identity,
                 disk_path: image_path,
@@ -2168,12 +2224,15 @@ impl VmDriver {
             format!("Exporting rootfs from local image \"{image_ref}\""),
             HashMap::from([
                 ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), "local_docker".to_string()),
+                (
+                    "image_source".to_string(),
+                    source.engine.image_source().to_string(),
+                ),
                 ("image_identity".to_string(), cache_identity.clone()),
             ]),
         );
         if let Err(err) =
-            export_local_image_rootfs_to_path(docker, image_ref, &rootfs_archive).await
+            export_local_image_rootfs_to_path(&source.client, image_ref, &rootfs_archive).await
         {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             return Err(err);
@@ -2182,12 +2241,15 @@ impl VmDriver {
         let payload = GuestImagePayload {
             image_ref: image_ref.to_string(),
             image_identity: cache_identity.clone(),
-            source: GuestImagePayloadSource::LocalDocker { rootfs_archive },
+            source: GuestImagePayloadSource::LocalContainer {
+                engine: source.engine,
+                rootfs_archive,
+            },
         };
         self.build_prepared_image_disk(
             sandbox_id,
             image_ref,
-            "local_docker",
+            source.engine.image_source(),
             &cache_identity,
             bootstrap_root_disk,
             &staging_dir,
@@ -2539,7 +2601,7 @@ impl VmDriver {
     async fn build_cached_local_image_rootfs_image(
         &self,
         sandbox_id: &str,
-        docker: &Docker,
+        source: &LocalContainerImageSource,
         image_ref: &str,
         image_identity: &str,
     ) -> Result<(), Status> {
@@ -2548,7 +2610,6 @@ impl VmDriver {
         let staging_dir = image_cache_staging_dir(&self.config.state_dir, image_identity);
         let exported_rootfs = staging_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
         let prepared_rootfs = staging_dir.join("rootfs");
-        let prepared_image = staging_dir.join(IMAGE_CACHE_ROOTFS_IMAGE);
 
         tokio::fs::create_dir_all(image_cache_root_dir(&self.config.state_dir))
             .await
@@ -2578,19 +2639,20 @@ impl VmDriver {
             format!("Exporting rootfs from local image \"{image_ref}\""),
             HashMap::from([
                 ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), "local_docker".to_string()),
+                (
+                    "image_source".to_string(),
+                    source.engine.image_source().to_string(),
+                ),
                 ("image_identity".to_string(), image_identity.to_string()),
             ]),
         );
         if let Err(err) =
-            export_local_image_rootfs_to_path(docker, image_ref, &exported_rootfs).await
+            export_local_image_rootfs_to_path(&source.client, image_ref, &exported_rootfs).await
         {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             return Err(err);
         }
 
-        let image_ref_owned = image_ref.to_string();
-        let image_identity_owned = image_identity.to_string();
         let exported_rootfs_for_build = exported_rootfs.clone();
         let prepared_rootfs_for_build = prepared_rootfs.clone();
         let sandbox_uid = self.config.resolve_sandbox_uid();
@@ -2603,27 +2665,21 @@ impl VmDriver {
             ),
             HashMap::from([
                 ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), "local_docker".to_string()),
+                (
+                    "image_source".to_string(),
+                    source.engine.image_source().to_string(),
+                ),
                 ("image_identity".to_string(), image_identity.to_string()),
                 ("sandbox_uid".to_string(), sandbox_uid.to_string()),
             ]),
         );
-        let prepare_result = tokio::task::spawn_blocking(move || {
-            extract_rootfs_archive_to(&exported_rootfs_for_build, &prepared_rootfs_for_build)?;
-            prepare_sandbox_rootfs_from_image_root(
-                &prepared_rootfs_for_build,
-                &image_identity_owned,
-                sandbox_uid,
-                sandbox_gid,
-            )
-            .map_err(|err| {
-                format!("vm sandbox image '{image_ref_owned}' is not base-compatible: {err}")
-            })
+        let extract_result = tokio::task::spawn_blocking(move || {
+            extract_rootfs_archive_to(&exported_rootfs_for_build, &prepared_rootfs_for_build)
         })
         .await
-        .map_err(|err| Status::internal(format!("local image preparation panicked: {err}")))?;
+        .map_err(|err| Status::internal(format!("local image extraction panicked: {err}")))?;
 
-        if let Err(err) = prepare_result {
+        if let Err(err) = extract_result {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             return Err(Status::failed_precondition(err));
         }
@@ -2634,22 +2690,33 @@ impl VmDriver {
             "Formatting VM root disk image".to_string(),
             HashMap::from([
                 ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), "local_docker".to_string()),
+                (
+                    "image_source".to_string(),
+                    source.engine.image_source().to_string(),
+                ),
                 ("image_identity".to_string(), image_identity.to_string()),
             ]),
         );
-        let prepared_rootfs_for_build = prepared_rootfs.clone();
-        let prepared_image_for_build = prepared_image.clone();
+        let materialize_request = RootfsMaterializationRequest {
+            image_ref: image_ref.to_string(),
+            work_dir: staging_dir.clone(),
+            sandbox_uid,
+            sandbox_gid,
+        };
+        let unpacked_image = UnpackedImage::new(image_identity, prepared_rootfs.clone());
         let build_result = tokio::task::spawn_blocking(move || {
-            create_rootfs_image_from_dir(&prepared_rootfs_for_build, &prepared_image_for_build)
+            VmRootfsMaterializer.materialize(&materialize_request, &unpacked_image)
         })
         .await
         .map_err(|err| Status::internal(format!("rootfs image build panicked: {err}")))?;
 
-        if let Err(err) = build_result {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(Status::failed_precondition(err));
-        }
+        let prepared_image = match build_result {
+            Ok(artifact) => artifact.disk_path().to_path_buf(),
+            Err(err) => {
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                return Err(Status::failed_precondition(err));
+            }
+        };
 
         if tokio::fs::metadata(&image_path).await.is_ok() {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
@@ -2677,7 +2744,6 @@ impl VmDriver {
         let image_path = image_cache_rootfs_image(&self.config.state_dir, image_identity);
         let staging_dir = image_cache_staging_dir(&self.config.state_dir, image_identity);
         let prepared_rootfs = staging_dir.join("rootfs");
-        let prepared_image = staging_dir.join(IMAGE_CACHE_ROOTFS_IMAGE);
 
         tokio::fs::create_dir_all(image_cache_root_dir(&self.config.state_dir))
             .await
@@ -2731,9 +2797,6 @@ impl VmDriver {
             "vm driver: image layers pulled, preparing rootfs image"
         );
 
-        let image_ref_owned = image_ref.to_string();
-        let image_identity_owned = image_identity.to_string();
-        let prepared_rootfs_for_build = prepared_rootfs.clone();
         let sandbox_uid = self.config.resolve_sandbox_uid();
         let sandbox_gid = self.config.resolve_sandbox_gid(sandbox_uid);
         self.publish_vm_progress(
@@ -2747,30 +2810,6 @@ impl VmDriver {
                 ("sandbox_uid".to_string(), sandbox_uid.to_string()),
             ]),
         );
-        let prepare_result = tokio::task::spawn_blocking(move || {
-            prepare_sandbox_rootfs_from_image_root(
-                &prepared_rootfs_for_build,
-                &image_identity_owned,
-                sandbox_uid,
-                sandbox_gid,
-            )
-            .map_err(|err| {
-                format!("vm sandbox image '{image_ref_owned}' is not base-compatible: {err}")
-            })
-        })
-        .await
-        .map_err(|err| Status::internal(format!("image rootfs preparation panicked: {err}")))?;
-
-        if let Err(err) = prepare_result {
-            warn!(
-                image_ref = %image_ref,
-                error = %err,
-                "vm driver: rootfs preparation failed"
-            );
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(Status::failed_precondition(err));
-        }
-
         self.publish_vm_progress(
             sandbox_id,
             "CreatingRootDisk",
@@ -2781,23 +2820,31 @@ impl VmDriver {
                 ("image_identity".to_string(), image_identity.to_string()),
             ]),
         );
-        let prepared_rootfs_for_build = prepared_rootfs.clone();
-        let prepared_image_for_build = prepared_image.clone();
+        let materialize_request = RootfsMaterializationRequest {
+            image_ref: image_ref.to_string(),
+            work_dir: staging_dir.clone(),
+            sandbox_uid,
+            sandbox_gid,
+        };
+        let unpacked_image = UnpackedImage::new(image_identity, prepared_rootfs.clone());
         let build_result = tokio::task::spawn_blocking(move || {
-            create_rootfs_image_from_dir(&prepared_rootfs_for_build, &prepared_image_for_build)
+            VmRootfsMaterializer.materialize(&materialize_request, &unpacked_image)
         })
         .await
         .map_err(|err| Status::internal(format!("image rootfs build panicked: {err}")))?;
 
-        if let Err(err) = build_result {
-            warn!(
-                image_ref = %image_ref,
-                error = %err,
-                "vm driver: rootfs image build failed"
-            );
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(Status::failed_precondition(err));
-        }
+        let prepared_image = match build_result {
+            Ok(artifact) => artifact.disk_path().to_path_buf(),
+            Err(err) => {
+                warn!(
+                    image_ref = %image_ref,
+                    error = %err,
+                    "vm driver: rootfs image build failed"
+                );
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                return Err(Status::failed_precondition(err));
+            }
+        };
 
         if tokio::fs::metadata(&image_path).await.is_ok() {
             info!(
@@ -3263,11 +3310,14 @@ fn parse_registry_reference(image_ref: &str) -> Result<Reference, Status> {
 /// Tries Docker first (`connect_with_local_defaults`, which respects
 /// `DOCKER_HOST`). If Docker is unavailable, falls back to the Podman
 /// socket, which exposes a Docker-compatible API.
-async fn connect_local_container_engine() -> Option<Docker> {
+async fn connect_local_container_engine() -> Option<LocalContainerImageSource> {
     if let Ok(docker) = Docker::connect_with_local_defaults()
         && docker.ping().await.is_ok()
     {
-        return Some(docker);
+        return Some(LocalContainerImageSource {
+            client: docker,
+            engine: LocalContainerEngine::Docker,
+        });
     }
 
     let podman_socket = openshell_core::config::detect_podman_socket()?;
@@ -3279,7 +3329,10 @@ async fn connect_local_container_engine() -> Option<Docker> {
             socket = %podman_socket.display(),
             "vm driver: connected to Podman (Docker-compatible API)"
         );
-        return Some(docker);
+        return Some(LocalContainerImageSource {
+            client: docker,
+            engine: LocalContainerEngine::Podman,
+        });
     }
 
     None
@@ -3301,7 +3354,7 @@ fn local_image_platform_mismatch(
 
     (actual_os != expected_os || actual_arch != expected_arch).then(|| {
         format!(
-            "local Docker image '{image_ref}' is {actual_os}/{actual_arch}, but VM sandboxes require {expected_os}/{expected_arch}"
+            "local container image '{image_ref}' is {actual_os}/{actual_arch}, but VM sandboxes require {expected_os}/{expected_arch}"
         )
     })
 }
@@ -3342,7 +3395,7 @@ async fn export_local_image_rootfs_to_path(
         .await
         .map_err(|err| {
             Status::failed_precondition(format!(
-                "failed to create temporary export container for local Docker image '{image_ref}': {err}"
+                "failed to create temporary export container for local container image '{image_ref}': {err}"
             ))
         })?;
     let container_id = container.id;
@@ -3363,7 +3416,7 @@ async fn export_local_image_rootfs_to_path(
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|err| {
                 Status::failed_precondition(format!(
-                    "failed to export local Docker image '{image_ref}': {err}"
+                    "failed to export local container image '{image_ref}': {err}"
                 ))
             })?;
             file.write_all(&chunk).await.map_err(|err| {
@@ -3387,7 +3440,7 @@ async fn export_local_image_rootfs_to_path(
         (Ok(()), Ok(())) => Ok(()),
         (Err(err), _) => Err(err),
         (Ok(()), Err(err)) => Err(Status::internal(format!(
-            "failed to remove temporary export container for local Docker image '{image_ref}': {err}"
+            "failed to remove temporary export container for local container image '{image_ref}': {err}"
         ))),
     }
 }
@@ -4817,8 +4870,11 @@ fn stage_guest_image_payload(
                 .map_err(|err| format!("write guest image source: {err}"))?;
             copy_dir_recursive(layout_dir, &image_dir.join(GUEST_IMAGE_OCI_LAYOUT_DIR))?;
         }
-        GuestImagePayloadSource::LocalDocker { rootfs_archive } => {
-            fs::write(image_dir.join("source"), b"local-docker")
+        GuestImagePayloadSource::LocalContainer {
+            engine,
+            rootfs_archive,
+        } => {
+            fs::write(image_dir.join("source"), engine.image_source())
                 .map_err(|err| format!("write guest image source: {err}"))?;
             let dest = image_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
             fs::copy(rootfs_archive, &dest).map_err(|err| {
@@ -4872,9 +4928,11 @@ fn prepared_image_disk_size_bytes(
 ) -> Result<u64, String> {
     let payload_size = match &payload.source {
         GuestImagePayloadSource::RegistryOciLayout { layout_dir } => dir_size_bytes(layout_dir)?,
-        GuestImagePayloadSource::LocalDocker { rootfs_archive } => fs::metadata(rootfs_archive)
-            .map_err(|err| format!("stat {}: {err}", rootfs_archive.display()))?
-            .len(),
+        GuestImagePayloadSource::LocalContainer { rootfs_archive, .. } => {
+            fs::metadata(rootfs_archive)
+                .map_err(|err| format!("stat {}: {err}", rootfs_archive.display()))?
+                .len()
+        }
     };
     let requested = payload_size
         .saturating_mul(3)
@@ -6154,6 +6212,12 @@ mod tests {
         assert!(!is_openshell_local_build_image_ref(
             "ghcr.io/nvidia/openshell/base:latest"
         ));
+    }
+
+    #[test]
+    fn local_container_engine_preserves_image_source_identity() {
+        assert_eq!(LocalContainerEngine::Docker.image_source(), "local_docker");
+        assert_eq!(LocalContainerEngine::Podman.image_source(), "local_podman");
     }
 
     #[test]

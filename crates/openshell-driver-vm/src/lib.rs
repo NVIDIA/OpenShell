@@ -8,6 +8,7 @@ pub mod gpu;
 pub mod lifecycle;
 mod nft_ruleset;
 pub mod procguard;
+pub mod provisioning;
 mod rootfs;
 mod runtime;
 
@@ -16,6 +17,9 @@ pub use lifecycle::{
     BackendFeature, ExtensionCapabilities, ExtensionDescriptor, GuestInitDropin, LaunchAbortReason,
     LaunchPlan, LifecycleError, LifecycleExtension, LifecycleExtensionRegistry, LifecycleResult,
     RestoreContext,
+};
+pub use provisioning::{
+    RootfsMaterializationRequest, UnpackedImage, VmRootfsImage, VmRootfsMaterializer,
 };
 pub use runtime::{
     VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, cleanup_stale_tap_interfaces,
