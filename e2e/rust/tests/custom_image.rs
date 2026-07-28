@@ -25,7 +25,7 @@ RUN groupadd -g 1235 appstaff && \
     useradd -m -u 1234 -g appstaff app
 
 # A custom image may already contain a root-owned OpenShell workspace and
-# root-owned files. The supervisor prepares both for the OCI identity.
+# root-owned files. The supervisor prepares only the workspace directory.
 RUN install -d /sandbox && \
     printf root-owned > /sandbox/root-owned.txt
 
@@ -49,8 +49,8 @@ CMD ["sleep", "infinity"]
 
 const MARKER: &str = "custom-image-e2e-marker";
 
-/// A named OCI user can write through direct and SSH children even when the
-/// image starts with a root-owned `/sandbox` tree.
+/// A named OCI user can write through direct and SSH children when the image
+/// starts with a root-owned `/sandbox`; existing content retains its ownership.
 #[tokio::test]
 async fn sandbox_from_custom_dockerfile() {
     // Step 1: Write a temporary Dockerfile.
@@ -70,7 +70,8 @@ async fn sandbox_from_custom_dockerfile() {
             "sh",
             "-c",
             "set -eu; id -u; id -g; test \"$(cat /sandbox/root-owned.txt)\" = root-owned; \
-             test \"$(stat -c %u:%g /sandbox/root-owned.txt)\" = 1234:1235; \
+             test \"$(stat -c %u:%g /sandbox)\" = 1234:1235; \
+             test \"$(stat -c %u:%g /sandbox/root-owned.txt)\" = 0:0; \
              touch /sandbox/direct-oci-user-write; cat /etc/marker.txt; echo Ready; sleep infinity",
         ],
         "Ready",

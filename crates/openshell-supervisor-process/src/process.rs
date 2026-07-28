@@ -14,8 +14,6 @@ use nix::sys::signal::{self, Signal};
 use nix::unistd::{Gid, Group, Pid, Uid, User};
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use std::collections::HashMap;
-#[cfg(unix)]
-use std::collections::HashSet;
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -1227,143 +1225,36 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
     Ok(())
 }
 
-/// Recursively chown a directory tree to the given UID/GID.
-///
-/// Symlinks are skipped (not followed) to prevent privilege escalation via
-/// malicious container images. The TOCTOU window is not exploitable because
-/// no untrusted process is running yet.
-///
-/// The root path is chowned unconditionally — EROFS there is a hard error (a
-/// read-only `/sandbox` is a misconfiguration). Nested mount points are skipped
-/// before chown so user-provided mounts retain their ownership.
 #[cfg(unix)]
-fn chown_sandbox_home(
+fn prepare_oci_workspace(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
+    prepare_oci_workspace_with(root, uid, gid, &nix::unistd::chown)
+}
+
+/// Prepare only the fixed `OpenShell` workspace directory itself.
+///
+/// Image-provided children retain their declared ownership. This avoids
+/// crossing symlinks or user-provided nested mounts and keeps OCI working
+/// directory/content semantics out of the identity-focused change.
+#[cfg(unix)]
+fn prepare_oci_workspace_with(
     root: &Path,
     uid: Option<Uid>,
     gid: Option<Gid>,
-    nested_mounts: &HashSet<PathBuf>,
-) -> Result<()> {
-    let meta = std::fs::symlink_metadata(root).into_diagnostic()?;
-    if meta.file_type().is_symlink() {
-        return Err(miette::miette!(
-            "path '{}' is a symlink — refusing to chown (potential privilege escalation)",
-            root.display()
-        ));
-    }
-
-    nix::unistd::chown(root, uid, gid).into_diagnostic()?;
-
-    if meta.is_dir() {
-        chown_children(root, uid, gid, nested_mounts, &nix::unistd::chown)?;
-    }
-
-    Ok(())
-}
-
-/// Walk directory children and chown each entry, skipping symlinks and nested
-/// mount points. Called after the parent has already been chowned.
-#[cfg(unix)]
-fn chown_children(
-    dir: &Path,
-    uid: Option<Uid>,
-    gid: Option<Gid>,
-    nested_mounts: &HashSet<PathBuf>,
     do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
 ) -> Result<()> {
-    match std::fs::read_dir(dir) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry.into_diagnostic()?;
-                let child = entry.path();
-                chown_recursive(&child, uid, gid, nested_mounts, do_chown)?;
-            }
-        }
-        Err(e) => {
-            debug!(path = %dir.display(), error = %e, "Cannot list directory during sandbox home chown");
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn chown_recursive(
-    path: &Path,
-    uid: Option<Uid>,
-    gid: Option<Gid>,
-    nested_mounts: &HashSet<PathBuf>,
-    do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
-) -> Result<()> {
-    if nested_mounts.contains(path) {
-        debug!(path = %path.display(), "Skipping nested mount during sandbox home chown");
-        return Ok(());
-    }
-
-    let meta = std::fs::symlink_metadata(path).into_diagnostic()?;
-
-    if meta.file_type().is_symlink() {
-        debug!(path = %path.display(), "Skipping symlink during sandbox home chown");
-        return Ok(());
-    }
-
-    do_chown(path, uid, gid).into_diagnostic()?;
-
-    if meta.is_dir() {
-        chown_children(path, uid, gid, nested_mounts, do_chown)?;
-    }
-
-    Ok(())
-}
-
-/// Return mount points strictly beneath `root`.
-///
-/// Linux mountinfo escapes whitespace and backslashes as octal sequences.
-/// Snapshotting before any workload child starts lets the ownership walk avoid
-/// crossing bind mounts and volumes without a race with untrusted code.
-#[cfg(target_os = "linux")]
-fn nested_mount_points(root: &Path) -> Result<HashSet<PathBuf>> {
-    use std::os::unix::ffi::OsStringExt;
-
-    fn decode_mountinfo_path(value: &str) -> PathBuf {
-        let input = value.as_bytes();
-        let mut decoded = Vec::with_capacity(input.len());
-        let mut index = 0;
-        while index < input.len() {
-            if input[index] == b'\\'
-                && index + 3 < input.len()
-                && input[index + 1..=index + 3]
-                    .iter()
-                    .all(|byte| (b'0'..=b'7').contains(byte))
-            {
-                let octal = &input[index + 1..=index + 3];
-                let value = (octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0');
-                decoded.push(value);
-                index += 4;
-            } else {
-                decoded.push(input[index]);
-                index += 1;
-            }
-        }
-        PathBuf::from(std::ffi::OsString::from_vec(decoded))
-    }
-
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").into_diagnostic()?;
-    Ok(mountinfo
-        .lines()
-        .filter_map(|line| line.split_whitespace().nth(4))
-        .map(decode_mountinfo_path)
-        .filter(|mount| mount != root && mount.starts_with(root))
-        .collect())
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-#[allow(clippy::unnecessary_wraps)]
-fn nested_mount_points(_root: &Path) -> Result<HashSet<PathBuf>> {
-    Ok(HashSet::new())
-}
-
-#[cfg(unix)]
-fn prepare_oci_workspace(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
     match std::fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(miette::miette!(
+                "workspace path '{}' is a symlink — refusing to chown",
+                root.display()
+            ));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(miette::miette!(
+                "workspace path '{}' is not a directory",
+                root.display()
+            ));
+        }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::create_dir_all(root).into_diagnostic()?;
@@ -1371,8 +1262,7 @@ fn prepare_oci_workspace(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Res
         Err(error) => return Err(error).into_diagnostic(),
     }
 
-    let mounts = nested_mount_points(root)?;
-    chown_sandbox_home(root, uid, gid, &mounts)
+    do_chown(root, uid, gid).into_diagnostic()
 }
 
 /// Prepare filesystem for the sandboxed process.
@@ -2303,53 +2193,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[allow(clippy::similar_names)]
-    fn chown_sandbox_home_changes_ownership_recursively() {
-        use std::os::unix::fs::MetadataExt;
+    fn prepare_oci_workspace_chowns_only_root() {
+        use std::sync::{Arc, Mutex};
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("sandbox");
         std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("file.txt"), "hello").unwrap();
-        std::fs::create_dir(root.join("subdir")).unwrap();
-        std::fs::write(root.join("subdir").join("nested.txt"), "world").unwrap();
+        let child = root.join("image-content.txt");
+        std::fs::write(&child, "image-owned").unwrap();
 
-        let expected_uid = nix::unistd::geteuid();
-        let expected_gid = nix::unistd::getegid();
+        let chowned = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&chowned);
+        let fake_chown =
+            move |path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+                observed.lock().unwrap().push(path.to_path_buf());
+                Ok(())
+            };
 
-        chown_sandbox_home(
+        prepare_oci_workspace_with(
             &root,
-            Some(expected_uid),
-            Some(expected_gid),
-            &HashSet::new(),
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &fake_chown,
         )
-        .unwrap();
+        .expect("workspace root should be prepared");
 
-        for path in &[
-            root.clone(),
-            root.join("file.txt"),
-            root.join("subdir"),
-            root.join("subdir").join("nested.txt"),
-        ] {
-            let meta = std::fs::metadata(path).unwrap();
-            assert_eq!(
-                meta.uid(),
-                expected_uid.as_raw(),
-                "uid mismatch for {}",
-                path.display()
-            );
-            assert_eq!(
-                meta.gid(),
-                expected_gid.as_raw(),
-                "gid mismatch for {}",
-                path.display()
-            );
-        }
+        assert_eq!(*chowned.lock().unwrap(), vec![root]);
+        assert!(child.exists(), "image-provided child should be untouched");
     }
 
     #[cfg(unix)]
     #[test]
-    fn chown_sandbox_home_rejects_symlink_root() {
+    fn prepare_oci_workspace_rejects_symlink_root() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2358,11 +2233,10 @@ mod tests {
         std::fs::create_dir(&target).unwrap();
         symlink(&target, &link).unwrap();
 
-        let err = chown_sandbox_home(
+        let err = prepare_oci_workspace(
             &link,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
-            &HashSet::new(),
         )
         .unwrap_err();
         assert!(
@@ -2373,103 +2247,72 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn chown_sandbox_home_skips_symlink_children() {
-        use std::os::unix::fs::symlink;
-
+    fn prepare_oci_workspace_rejects_non_directory_root() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("sandbox");
-        std::fs::create_dir(&root).unwrap();
-        let target = dir.path().join("outside");
-        std::fs::write(&target, "secret").unwrap();
-        symlink(&target, root.join("link")).unwrap();
+        std::fs::write(&root, "not a directory").unwrap();
 
-        chown_sandbox_home(
+        let error = prepare_oci_workspace(
             &root,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
-            &HashSet::new(),
         )
-        .expect("should skip symlink children without error");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn chown_recursive_skips_nested_mount_but_continues_siblings() {
-        use std::sync::{Arc, Mutex};
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("sandbox");
-        std::fs::create_dir(&root).unwrap();
-
-        let mount_dir = root.join("mounted");
-        std::fs::create_dir(&mount_dir).unwrap();
-        std::fs::write(mount_dir.join("mounted-file.txt"), "data").unwrap();
-
-        std::fs::write(root.join("writable-sibling.txt"), "data").unwrap();
-
-        let uid = Some(nix::unistd::geteuid());
-        let gid = Some(nix::unistd::getegid());
-
-        let chowned: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
-        let chowned_ref = Arc::clone(&chowned);
-
-        let fake_chown =
-            move |path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
-                chowned_ref.lock().unwrap().push(path.to_path_buf());
-                Ok(())
-            };
-        let nested_mounts = HashSet::from([mount_dir.clone()]);
-
-        chown_children(&root, uid, gid, &nested_mounts, &fake_chown)
-            .expect("nested mount should be skipped");
-
-        let chowned = chowned.lock().unwrap();
+        .unwrap_err();
         assert!(
-            !chowned.contains(&mount_dir),
-            "nested mount root must not be chowned"
-        );
-        assert!(
-            !chowned.contains(&mount_dir.join("mounted-file.txt")),
-            "nested mount contents must not be descended into"
-        );
-        assert!(
-            chowned.contains(&root.join("writable-sibling.txt")),
-            "writable sibling should still be chowned"
+            error.to_string().contains("is not a directory"),
+            "unexpected error: {error}"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn chown_recursive_propagates_chown_errors() {
+    fn prepare_oci_workspace_propagates_root_chown_error() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("sandbox");
         std::fs::create_dir(&root).unwrap();
-
-        let uid = Some(nix::unistd::geteuid());
-        let gid = Some(nix::unistd::getegid());
-
         let fake_chown = |_path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
-            Err(nix::errno::Errno::EPERM)
+            Err(nix::errno::Errno::EROFS)
         };
 
-        let result = chown_recursive(&root, uid, gid, &HashSet::new(), &fake_chown);
-        assert!(result.is_err(), "chown errors should propagate");
+        let error = prepare_oci_workspace_with(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &fake_chown,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Read-only file system"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn prepare_oci_workspace_creates_missing_root() {
+        use std::sync::{Arc, Mutex};
+
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing").join("sandbox");
+        let chowned = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&chowned);
+        let fake_chown =
+            move |path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+                observed.lock().unwrap().push(path.to_path_buf());
+                Ok(())
+            };
 
-        prepare_oci_workspace(
+        prepare_oci_workspace_with(
             &missing,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
+            &fake_chown,
         )
         .expect("missing OCI workspace should be created");
 
         assert!(missing.is_dir());
+        assert_eq!(*chowned.lock().unwrap(), vec![missing]);
     }
 
     #[cfg(unix)]

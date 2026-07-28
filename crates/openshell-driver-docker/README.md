@@ -28,10 +28,10 @@ is filled with the user's numeric primary GID. Explicit `process.run_as_user`
 and `process.run_as_group` values take precedence independently.
 
 When either policy field falls back to OCI `USER`, the supervisor creates the
-fixed `/sandbox` workspace if necessary and transfers ownership of its existing
-image contents to the completed identity before direct or SSH children start.
-It skips symlinks and nested bind or volume mounts so externally owned content
-retains its ownership. A read-only workspace root fails sandbox startup.
+fixed `/sandbox` workspace if necessary and transfers ownership of only that
+directory to the completed identity before direct or SSH children start.
+Image-provided contents and nested bind or volume mounts retain their ownership.
+A read-only workspace root fails sandbox startup.
 
 Docker containers join an OpenShell-managed bridge network. The driver injects
 `host.openshell.internal` and `host.docker.internal` so supervisors have stable
