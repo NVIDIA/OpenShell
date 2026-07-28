@@ -51,6 +51,11 @@ pub fn prepare_current_user(
 /// Neither operation requires root privileges.
 pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
     if let Some(ruleset) = prepared.landlock {
+        // The child process now has a controlling terminal (setsid +
+        // TIOCSCTTY ran before this point), so /dev/tty is accessible.
+        // The supervisor couldn't add this rule during prepare() because
+        // it has no controlling terminal (/dev/tty returns ENXIO).
+        let ruleset = ruleset.add_dev_tty_if_available();
         landlock::enforce(ruleset)?;
     }
     seccomp::apply(&prepared.policy)?;

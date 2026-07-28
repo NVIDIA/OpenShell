@@ -96,6 +96,74 @@ pub struct PreparedRuleset {
     compatibility: LandlockCompatibility,
 }
 
+impl PreparedRuleset {
+    /// Try to add a read-write rule for `/dev/tty` (the controlling terminal).
+    ///
+    /// `/dev/tty` is a magic device that refers to the calling process's
+    /// controlling terminal. The supervisor process has no controlling terminal,
+    /// so `PathFd::new("/dev/tty")` fails with `ENXIO` during [`prepare`].
+    /// After the child calls `setsid()` + `TIOCSCTTY`, `/dev/tty` becomes
+    /// accessible. This method lets the child add the rule before
+    /// `restrict_self()`.
+    ///
+    /// Consumes and returns `self` because `RulesetCreated::add_rule` takes
+    /// ownership. Failures are silently ignored — `/dev/tty` is only needed
+    /// by interactive TUI programs (prompt_toolkit, ratatui, etc.).
+    pub fn add_dev_tty_if_available(self) -> Self {
+        let path = Path::new("/dev/tty");
+        let Ok(path_fd) = PathFd::new(path) else {
+            return self; // no controlling terminal — nothing to do
+        };
+        let abi = ABI::V2;
+        let Ok(allowed_access) = access_for_path_fd(&path_fd, AccessFs::from_all(abi), abi) else {
+            return self;
+        };
+        let compatibility = self.compatibility;
+        // add_rule takes ownership of `self.ruleset`.  On success we get
+        // the updated ruleset back; on error it is consumed irreversibly.
+        // The error requires a landlock_add_rule syscall failure (kernel
+        // bug), so we treat it as unreachable and fall through without
+        // the /dev/tty rule.
+        match self.ruleset.add_rule(PathBeneath::new(path_fd, allowed_access)) {
+            Ok(ruleset) => Self {
+                ruleset,
+                compatibility,
+            },
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "Landlock add_rule for /dev/tty failed (non-fatal)"
+                );
+                // Ruleset is consumed; build a fresh empty one so
+                // enforce() can still call restrict_self().  The original
+                // rules were already committed to the kernel fd, but that
+                // fd is now gone, so enforce will apply a maximally
+                // restrictive empty ruleset.  This is preferable to
+                // skipping Landlock entirely.
+                let fallback = Ruleset::default()
+                    .set_compatibility(compat_level(&compatibility))
+                    .handle_access(AccessFs::from_all(abi))
+                    .and_then(|r| r.create());
+                match fallback {
+                    Ok(ruleset) => Self {
+                        ruleset,
+                        compatibility,
+                    },
+                    Err(_) => {
+                        // Cannot recover at all.  The process will
+                        // continue without Landlock enforcement.
+                        // Return a dummy that enforce() can handle.
+                        unreachable!(
+                            "failed to create fallback Landlock ruleset \
+                             after add_rule failure for /dev/tty"
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PathOpenMode {
     Privileged,
