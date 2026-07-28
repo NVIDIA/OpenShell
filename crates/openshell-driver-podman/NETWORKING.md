@@ -259,12 +259,14 @@ Before the gateway binds its serving sockets, the driver reports the callback
 listener required by the selected topology:
 
 - Rootful Linux Podman reports the configured bridge's gateway address exactly.
-- Rootless Linux Podman using pasta requests the private IPv4 source address
-  selected by the host's default route. This matches pasta's default upstream
-  interface without guessing among private interfaces on a multihomed host.
-- Rootless Linux Podman using another helper cannot infer a safe local callback
-  listener. The driver fails startup unless `host_gateway_ip` is set or
-  `grpc_endpoint` names an explicitly remote endpoint.
+- Rootless Linux Podman using pasta or slirp4netns requests the private IPv4
+  source address selected by the host's default route. Podman 4 does not report
+  its selected helper through the API, so an empty helper value uses the same
+  legacy-compatible requirement. This avoids guessing among private interfaces
+  on a multihomed host.
+- Rootless Linux Podman reporting another named helper cannot infer a safe local
+  callback listener. The driver fails startup unless `host_gateway_ip` is set
+  or `grpc_endpoint` names an explicitly remote endpoint.
 - Podman Machine requests IPv4 loopback because gvproxy terminates the host
   forwarding path there.
 - An explicitly remote callback endpoint requests no additional local listener.

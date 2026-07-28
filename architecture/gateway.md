@@ -631,8 +631,9 @@ system entry instead of pretending to delete package-manager owned state.
   aliases by default so stale Podman machine images do not need Podman's
   `host-gateway` resolver. Linux Podman keeps the resolver unless
   `host_gateway_ip` is configured. Rootful Podman can request its exact bridge
-  gateway listener; rootless pasta requests the private IPv4 source selected by
-  the host default route rather than an arbitrary private interface.
+  gateway listener; rootless pasta, slirp4netns, and legacy Podman versions that
+  do not report their helper request the private IPv4 source selected by the
+  host default route rather than an arbitrary private interface.
 - Gateway restarts recover persisted objects from storage, but live relay
   streams must be re-established by supervisors.
 - User-facing behavior changes must update published docs in `docs/`; this file
