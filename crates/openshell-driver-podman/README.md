@@ -339,7 +339,7 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_NETWORK_NAME` | `--network-name` | `openshell` | Podman bridge network name. |
 | `OPENSHELL_PODMAN_HOST_GATEWAY_IP` | `--host-gateway-ip` | empty on Linux, `192.168.127.254` on macOS | Host gateway IP used for sandbox host aliases. Empty uses Podman's `host-gateway` resolver. |
 | `OPENSHELL_SANDBOX_SSH_SOCKET_PATH` | `--sandbox-ssh-socket-path` | `/run/openshell/ssh.sock` | Supervisor Unix socket path in `PodmanComputeConfig`. |
-| `OPENSHELL_STOP_TIMEOUT` | `--stop-timeout` | `10` | Container stop timeout in seconds. |
+| `OPENSHELL_STOP_TIMEOUT` | `--stop-timeout` | `45` | Container stop timeout in seconds. |
 | `OPENSHELL_SANDBOX_PIDS_LIMIT` | `--sandbox-pids-limit` | `2048` | Podman cgroup PID limit for sandbox containers. Set `0` to inherit Podman's runtime/default PID limit. |
 | `OPENSHELL_SUPERVISOR_IMAGE` | `--supervisor-image` | `ghcr.io/nvidia/openshell/supervisor:latest` through the gateway, required standalone | OCI image containing the supervisor binary. |
 | `OPENSHELL_PODMAN_TLS_CA` | `--podman-tls-ca` | unset | Host path to the CA certificate mounted for sandbox mTLS. |

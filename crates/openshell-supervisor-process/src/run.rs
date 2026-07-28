@@ -11,7 +11,7 @@
 
 use miette::{IntoDiagnostic, Result};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::info;
@@ -34,7 +34,7 @@ use openshell_core::denial::DenialEvent;
 
 #[cfg(target_os = "linux")]
 use crate::managed_children;
-use crate::process::{ProcessEnforcementMode, ProcessHandle};
+use crate::process::{ProcessEnforcementMode, ProcessHandle, ProcessStatus};
 
 fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
     openshell_ocsf::ctx::ctx()
@@ -294,6 +294,8 @@ pub async fn run_process(
         }
     }
 
+    let supervisor_terminating = Arc::new(AtomicBool::new(false));
+
     // Spawn the persistent supervisor session if we have a gateway endpoint
     // and sandbox identity. The session provides relay channels for SSH
     // connect and ExecSandbox through the gateway.
@@ -306,6 +308,7 @@ pub async fn run_process(
             socket.clone(),
             ssh_netns_fd,
             None,
+            Arc::clone(&supervisor_terminating),
         );
         info!("supervisor session task spawned");
     }
@@ -353,11 +356,13 @@ pub async fn run_process(
             .build()
     );
 
-    // Wait for process with optional timeout
-    let result = if timeout_secs > 0 {
-        if let Ok(result) = timeout(Duration::from_secs(timeout_secs), handle.wait()).await {
-            result
-        } else {
+    let outcome =
+        wait_for_process_exit_or_shutdown(&mut handle, timeout_secs, &supervisor_terminating)
+            .await?;
+
+    let status = match outcome {
+        ProcessWaitOutcome::Exited(status) => status,
+        ProcessWaitOutcome::TimedOut => {
             ocsf_emit!(
                 ProcessActivityBuilder::new(ocsf_ctx())
                     .activity(ActivityId::Close)
@@ -368,14 +373,18 @@ pub async fn run_process(
                     .message("Process timed out, killing")
                     .build()
             );
-            handle.kill()?;
             return Ok(124); // Standard timeout exit code
         }
-    } else {
-        handle.wait().await
+        ProcessWaitOutcome::ShutdownSignal { signal, status } => {
+            info!(
+                signal,
+                exit_code = status.code(),
+                "Entrypoint exited after supervisor shutdown signal"
+            );
+            status
+        }
     };
-
-    let status = result.into_diagnostic()?;
+    supervisor_terminating.store(true, Ordering::Release);
 
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())
@@ -390,6 +399,117 @@ pub async fn run_process(
     );
 
     Ok(status.code())
+}
+
+enum ProcessWaitOutcome {
+    Exited(ProcessStatus),
+    TimedOut,
+    ShutdownSignal {
+        signal: &'static str,
+        status: ProcessStatus,
+    },
+}
+
+async fn wait_for_process_exit_or_shutdown(
+    handle: &mut ProcessHandle,
+    timeout_secs: u64,
+    terminating: &AtomicBool,
+) -> Result<ProcessWaitOutcome> {
+    let pid = handle.pid();
+    let wait = handle.wait();
+    tokio::pin!(wait);
+
+    if timeout_secs > 0 {
+        let deadline = tokio::time::sleep(Duration::from_secs(timeout_secs));
+        tokio::pin!(deadline);
+        tokio::select! {
+            result = &mut wait => {
+                terminating.store(true, Ordering::Release);
+                Ok(ProcessWaitOutcome::Exited(result.into_diagnostic()?))
+            }
+            () = &mut deadline => {
+                terminating.store(true, Ordering::Release);
+                terminate_then_kill_pid(pid).await;
+                Ok(ProcessWaitOutcome::TimedOut)
+            }
+            signal = wait_for_supervisor_shutdown_signal() => {
+                terminating.store(true, Ordering::Release);
+                signal_entrypoint_for_shutdown(pid, signal);
+                let status = (&mut wait).await.into_diagnostic()?;
+                Ok(ProcessWaitOutcome::ShutdownSignal { signal, status })
+            }
+        }
+    } else {
+        tokio::select! {
+            result = &mut wait => {
+                terminating.store(true, Ordering::Release);
+                Ok(ProcessWaitOutcome::Exited(result.into_diagnostic()?))
+            }
+            signal = wait_for_supervisor_shutdown_signal() => {
+                terminating.store(true, Ordering::Release);
+                signal_entrypoint_for_shutdown(pid, signal);
+                let status = (&mut wait).await.into_diagnostic()?;
+                Ok(ProcessWaitOutcome::ShutdownSignal { signal, status })
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_then_kill_pid(pid: u32) {
+    signal_pid(pid, nix::sys::signal::Signal::SIGTERM, "process timeout");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    signal_pid(pid, nix::sys::signal::Signal::SIGKILL, "process timeout");
+}
+
+#[cfg(not(unix))]
+async fn terminate_then_kill_pid(_pid: u32) {}
+
+#[cfg(unix)]
+fn signal_entrypoint_for_shutdown(pid: u32, signal: &'static str) {
+    signal_pid(pid, nix::sys::signal::Signal::SIGTERM, signal);
+}
+
+#[cfg(not(unix))]
+fn signal_entrypoint_for_shutdown(_pid: u32, _signal: &'static str) {}
+
+#[cfg(unix)]
+fn signal_pid(pid: u32, signal: nix::sys::signal::Signal, reason: &'static str) {
+    let raw_pid = i32::try_from(pid).unwrap_or(i32::MAX);
+    if let Err(error) = nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw_pid), signal) {
+        tracing::warn!(
+            pid,
+            signal = ?signal,
+            reason,
+            error = %error,
+            "failed to signal entrypoint process"
+        );
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_supervisor_shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(signal) => signal,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Failed to install SIGTERM handler; supervisor shutdown detection disabled"
+            );
+            return std::future::pending::<&'static str>().await;
+        }
+    };
+
+    let _ = sigterm.recv().await;
+    info!("Received SIGTERM, shutting down supervisor process");
+    "SIGTERM"
+}
+
+#[cfg(not(unix))]
+async fn wait_for_supervisor_shutdown_signal() -> &'static str {
+    std::future::pending::<&'static str>().await
 }
 
 fn ssh_proxy_url_for_policy(

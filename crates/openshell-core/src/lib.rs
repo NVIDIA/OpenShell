@@ -39,6 +39,7 @@ pub mod secrets;
 pub mod settings;
 pub mod telemetry;
 pub mod time;
+pub mod transport_errors;
 
 pub use config::{
     ComputeDriverKind, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,

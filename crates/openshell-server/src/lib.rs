@@ -171,12 +171,7 @@ fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
 }
 
 fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool {
-    let msg = error.to_string();
-    msg.contains("connection closed")
-        || msg.contains("connection reset")
-        || msg.contains("connection error")
-        || msg.contains("error reading a body from connection")
-        || msg.contains("broken pipe")
+    openshell_core::transport_errors::is_expected_transport_close_error(error)
 }
 
 impl ServerState {
