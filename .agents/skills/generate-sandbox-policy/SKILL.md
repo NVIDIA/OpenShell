@@ -222,6 +222,7 @@ Add `network_middlewares` only when the user asks to inspect, transform, redact,
 - Use an operator-owned middleware name only when it is already registered under `[[openshell.supervisor.middleware]]` and reachable from both the gateway and sandbox supervisors.
 - Confirm that a requested WebSocket implementation exposes a `WEBSOCKET_MESSAGE/PRE_CREDENTIALS` binding. `openshell/regex` exposes this binding. WebSocket middleware runs for both `ws://` and `wss://`, receives complete client text messages only, and does not inspect binary or upstream-to-client messages.
 - Treat `fail_open` on WebSocket as a session-scoped bypass: if the stage stream fails, OpenShell disables it for later messages on that connection and emits a state-change finding. Prefer `fail_closed` for required redaction or authorization.
+- `on_error` governs middleware failures only. An explicit HTTP, WebSocket preflight, or WebSocket message denial is authoritative under both `fail_open` and `fail_closed`.
 - Default `on_error` to `fail_closed`. Use `fail_open` only when bypassing the stage preserves the user's stated security requirement.
 - Assign unique `order` values across the complete policy. Lower values run first, and at most 10 configs may be selected.
 - Match the narrowest destination hosts possible with `endpoints.include`; use `exclude` when a broad selector has trusted exceptions.

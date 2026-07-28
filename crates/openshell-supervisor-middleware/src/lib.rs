@@ -3940,9 +3940,15 @@ mod tests {
     #[derive(Clone, Default)]
     struct OpenAiRedactionService {
         preflight: Arc<std::sync::Mutex<Option<openshell_core::proto::WebSocketPreflight>>>,
+        manifest_name: String,
+        describe_calls: Arc<std::sync::atomic::AtomicUsize>,
         skip: bool,
+        deny: bool,
         close_on_first_message: bool,
         messages: Arc<std::sync::atomic::AtomicUsize>,
+        session_ends: Option<
+            tokio::sync::mpsc::UnboundedSender<openshell_core::proto::WebSocketSessionEndReason>,
+        >,
     }
 
     impl OpenAiRedactionService {
@@ -3965,8 +3971,10 @@ mod tests {
 
             let preflight = Arc::clone(&self.preflight);
             let skip = self.skip;
+            let deny = self.deny;
             let close_on_first_message = self.close_on_first_message;
             let messages = Arc::clone(&self.messages);
+            let session_ends = self.session_ends.clone();
             let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 while let Some(Ok(request)) = requests.next().await {
@@ -3977,7 +3985,9 @@ mod tests {
                                 response: Some(
                                     web_socket_evaluation_response::Response::PreflightDecision(
                                         WebSocketPreflightDecision {
-                                            action: if skip {
+                                            action: if deny {
+                                                WebSocketPreflightAction::Deny as i32
+                                            } else if skip {
                                                 WebSocketPreflightAction::Skip as i32
                                             } else {
                                                 WebSocketPreflightAction::Inspect as i32
@@ -4010,11 +4020,20 @@ mod tests {
                                 ),
                             })
                         }
-                        Some(
-                            web_socket_evaluation_request::Request::SessionStart(_)
-                            | web_socket_evaluation_request::Request::SessionEnd(_),
-                        )
-                        | None => None,
+                        Some(web_socket_evaluation_request::Request::SessionStart(_)) | None => {
+                            None
+                        }
+                        Some(web_socket_evaluation_request::Request::SessionEnd(end)) => {
+                            if let Some(session_ends) = &session_ends
+                                && let Ok(reason) =
+                                    openshell_core::proto::WebSocketSessionEndReason::try_from(
+                                        end.reason,
+                                    )
+                            {
+                                let _ = session_ends.send(reason);
+                            }
+                            None
+                        }
                     };
                     if let Some(response) = response
                         && responses_tx.send(Ok(response)).await.is_err()
@@ -4048,8 +4067,14 @@ mod tests {
             &self,
             _request: Request<()>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
+            self.describe_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(tonic::Response::new(MiddlewareManifest {
-                name: "test/openai-websocket-redactor".into(),
+                name: if self.manifest_name.is_empty() {
+                    "test/openai-websocket-redactor".into()
+                } else {
+                    self.manifest_name.clone()
+                },
                 service_version: "test".into(),
                 bindings: vec![MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
@@ -4140,6 +4165,171 @@ mod tests {
                 ),
             )
         }
+    }
+
+    fn websocket_entry(
+        name: &str,
+        implementation: &str,
+        order: i32,
+        on_error: OnError,
+    ) -> ChainEntry {
+        ChainEntry {
+            name: name.into(),
+            implementation: implementation.into(),
+            order,
+            config: prost_types::Struct::default(),
+            on_error,
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_websocket_chain_skips_describe_and_preflight() {
+        let service = OpenAiRedactionService::default();
+        let describe_calls = Arc::clone(&service.describe_calls);
+        let observed_preflight = Arc::clone(&service.preflight);
+        let runner = ChainRunner::from_endpoint(Arc::new(service));
+
+        let outcome = runner
+            .preflight_websocket(&[], websocket_preflight_input("empty-chain"))
+            .await
+            .expect("empty preflight");
+
+        assert!(outcome.allowed);
+        assert_eq!(outcome.terminal_reason, None);
+        assert!(outcome.session.is_none());
+        assert!(outcome.invocations.is_empty());
+        assert_eq!(describe_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(observed_preflight.lock().expect("preflight lock").is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_websocket_preflight_denial_is_authoritative_for_both_error_modes() {
+        use openshell_core::proto::WebSocketSessionEndReason;
+
+        for on_error in [OnError::FailOpen, OnError::FailClosed] {
+            let (session_ends_tx, mut session_ends_rx) = tokio::sync::mpsc::unbounded_channel();
+            let runner = ChainRunner::from_endpoint(Arc::new(OpenAiRedactionService {
+                deny: true,
+                session_ends: Some(session_ends_tx),
+                ..Default::default()
+            }));
+
+            let outcome = runner
+                .preflight_websocket(
+                    &[websocket_entry(
+                        "deny-upgrade",
+                        "test/openai-websocket-redactor",
+                        0,
+                        on_error,
+                    )],
+                    websocket_preflight_input("explicit-denial"),
+                )
+                .await
+                .expect("denied preflight");
+
+            assert!(!outcome.allowed);
+            assert_eq!(
+                outcome.terminal_reason,
+                Some(WebSocketSessionEndReason::MiddlewareDenial)
+            );
+            assert_eq!(outcome.reason, "middleware_denied:deny-upgrade");
+            assert_eq!(
+                outcome
+                    .denial
+                    .as_ref()
+                    .map(|denial| denial.config_name.as_str()),
+                Some("deny-upgrade")
+            );
+            assert!(outcome.session.is_none());
+            assert_eq!(outcome.invocations.len(), 1);
+            assert_eq!(
+                outcome.invocations[0].outcome,
+                WebSocketInvocationOutcome::Deny
+            );
+            assert!(!outcome.invocations[0].failed);
+            assert_eq!(
+                session_ends_rx.recv().await,
+                Some(WebSocketSessionEndReason::MiddlewareDenial)
+            );
+            assert!(
+                session_ends_rx.try_recv().is_err(),
+                "each opened stream receives at most one session_end"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_websocket_preflight_denial_ends_every_opened_stage() {
+        use openshell_core::proto::WebSocketSessionEndReason;
+
+        let (first_end_tx, mut first_end_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (denier_end_tx, mut denier_end_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (last_end_tx, mut last_end_rx) = tokio::sync::mpsc::unbounded_channel();
+        let endpoints: Vec<Arc<MiddlewareServiceEndpoint>> = vec![
+            Arc::new(OpenAiRedactionService {
+                manifest_name: "test/first-inspector".into(),
+                session_ends: Some(first_end_tx),
+                ..Default::default()
+            }),
+            Arc::new(OpenAiRedactionService {
+                manifest_name: "test/denier".into(),
+                deny: true,
+                session_ends: Some(denier_end_tx),
+                ..Default::default()
+            }),
+            Arc::new(OpenAiRedactionService {
+                manifest_name: "test/last-inspector".into(),
+                session_ends: Some(last_end_tx),
+                ..Default::default()
+            }),
+        ];
+        let runner = ChainRunner::from_registry(
+            MiddlewareRegistry::connect_services(endpoints, Vec::new())
+                .await
+                .expect("connect mixed middleware services"),
+        );
+        let chain = [
+            websocket_entry("first", "test/first-inspector", 0, OnError::FailClosed),
+            websocket_entry("deny", "test/denier", 1, OnError::FailOpen),
+            websocket_entry("last", "test/last-inspector", 2, OnError::FailClosed),
+        ];
+
+        let outcome = runner
+            .preflight_websocket(&chain, websocket_preflight_input("mixed-denial"))
+            .await
+            .expect("mixed preflight");
+
+        assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.terminal_reason,
+            Some(WebSocketSessionEndReason::MiddlewareDenial)
+        );
+        assert_eq!(
+            outcome
+                .invocations
+                .iter()
+                .map(|invocation| invocation.outcome)
+                .collect::<Vec<_>>(),
+            vec![
+                WebSocketInvocationOutcome::Inspect,
+                WebSocketInvocationOutcome::Deny,
+                WebSocketInvocationOutcome::Inspect,
+            ]
+        );
+        for receiver in [&mut first_end_rx, &mut denier_end_rx, &mut last_end_rx] {
+            assert_eq!(
+                receiver.recv().await,
+                Some(WebSocketSessionEndReason::MiddlewareDenial)
+            );
+            assert!(
+                receiver.try_recv().is_err(),
+                "each opened stream receives at most one session_end"
+            );
+        }
+        assert_eq!(
+            runner.registry.session_admission.available_permits(),
+            MAX_CONCURRENT_MIDDLEWARE_SESSIONS
+        );
     }
 
     #[tokio::test]

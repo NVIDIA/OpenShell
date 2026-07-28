@@ -25,7 +25,8 @@ service SupervisorMiddleware {
   // EvaluateWebSocket opens one ordered stream for a single middleware stage
   // and WebSocket upgrade attempt. PR 1 supports client-to-upstream text
   // messages at PRE_CREDENTIALS. A request may go unanswered when the session
-  // terminates; OpenShell then sends session_end on a best-effort basis.
+  // terminates. For every opened stage stream, OpenShell attempts at most one
+  // session_end before closing the stream when its transport is still writable.
   rpc EvaluateWebSocket(stream WebSocketEvaluationRequest)
       returns (stream WebSocketEvaluationResponse);
 }
@@ -195,15 +196,24 @@ message WebSocketMessage {
   bytes payload = 3;
 }
 
+// WebSocketSessionEnd is OpenShell's best-effort terminal notification for one
+// opened stage stream. A stage receives at most one such notification.
 message WebSocketSessionEnd {
   WebSocketSessionEndReason reason = 1;
 }
 
 // WebSocketPreflightAction is the service's one-time scoping decision.
 enum WebSocketPreflightAction {
+  // Invalid response value handled according to the policy failure mode.
   WEB_SOCKET_PREFLIGHT_ACTION_UNSPECIFIED = 0;
+  // Inspect this session after the upstream accepts the upgrade.
   WEB_SOCKET_PREFLIGHT_ACTION_INSPECT = 1;
+  // Voluntarily decline inspection without denying the upgrade. This is a
+  // successful decision and does not engage on_error.
   WEB_SOCKET_PREFLIGHT_ACTION_SKIP = 2;
+  // Authoritatively deny the upgrade before upstream contact. This is a
+  // successful decision and is enforced regardless of on_error.
+  WEB_SOCKET_PREFLIGHT_ACTION_DENY = 3;
 }
 
 message WebSocketPreflightDecision {

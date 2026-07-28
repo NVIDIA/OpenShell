@@ -74,7 +74,11 @@ pub struct WebSocketInvocation {
 
 pub struct WebSocketPreflightResult {
     pub allowed: bool,
+    /// Typed terminal reason when preflight denied the upgrade. `None` means
+    /// the request may continue, including voluntary skip and fail-open.
+    pub terminal_reason: Option<WebSocketSessionEndReason>,
     pub reason: String,
+    pub denial: Option<MiddlewareDenial>,
     pub session: Option<WebSocketSession>,
     pub invocations: Vec<WebSocketInvocation>,
     pub saturated: bool,
@@ -84,6 +88,8 @@ pub struct WebSocketPreflightResult {
 #[derive(Debug)]
 pub struct WebSocketSessionStartOutcome {
     pub allowed: bool,
+    /// Typed terminal reason when session start cannot continue.
+    pub terminal_reason: Option<WebSocketSessionEndReason>,
     pub reason: String,
     pub invocations: Vec<WebSocketInvocation>,
 }
@@ -141,6 +147,7 @@ pub enum WebSocketMessageAdmission {
 
 enum OpenStage {
     Inspect(Box<WebSocketStage>, WebSocketInvocation),
+    Deny(Box<WebSocketStage>, WebSocketInvocation),
     Skip(WebSocketInvocation),
     Failed(DescribedChainEntry, String),
 }
@@ -151,17 +158,13 @@ impl ChainRunner {
         entries: &[ChainEntry],
         input: WebSocketPreflightInput,
     ) -> miette::Result<WebSocketPreflightResult> {
+        if entries.is_empty() {
+            return Ok(empty_preflight_result());
+        }
         validate_preflight_input(&input)?;
         let described = self.describe_websocket_chain(entries).await?;
         if described.is_empty() {
-            return Ok(WebSocketPreflightResult {
-                allowed: true,
-                reason: String::new(),
-                session: None,
-                invocations: Vec::new(),
-                saturated: false,
-                session_capacity_exhausted: false,
-            });
+            return Ok(empty_preflight_result());
         }
 
         // One permit covers the complete concurrent preflight fan-out. Permit
@@ -183,10 +186,19 @@ impl ChainRunner {
 
         let mut stages = Vec::new();
         let mut invocations = Vec::new();
+        let mut denial = None;
         let mut fail_closed_reason = None;
         for result in opened {
             match result {
                 OpenStage::Inspect(stage, invocation) => {
+                    stages.push(*stage);
+                    invocations.push(invocation);
+                }
+                OpenStage::Deny(stage, invocation) => {
+                    denial.get_or_insert_with(|| MiddlewareDenial {
+                        config_name: stage.entry.entry.name.clone(),
+                        reason_code: None,
+                    });
                     stages.push(*stage);
                     invocations.push(invocation);
                 }
@@ -202,11 +214,27 @@ impl ChainRunner {
             }
         }
 
+        if let Some(denial) = denial {
+            end_stages(&mut stages, WebSocketSessionEndReason::MiddlewareDenial).await;
+            return Ok(WebSocketPreflightResult {
+                allowed: false,
+                terminal_reason: Some(WebSocketSessionEndReason::MiddlewareDenial),
+                reason: middleware_denial_reason(&denial.config_name, None),
+                denial: Some(denial),
+                session: None,
+                invocations,
+                saturated,
+                session_capacity_exhausted: false,
+            });
+        }
+
         if let Some(reason) = fail_closed_reason {
             end_stages(&mut stages, WebSocketSessionEndReason::MiddlewareFailure).await;
             return Ok(WebSocketPreflightResult {
                 allowed: false,
+                terminal_reason: Some(WebSocketSessionEndReason::MiddlewareFailure),
                 reason,
+                denial: None,
                 session: None,
                 invocations,
                 saturated,
@@ -218,7 +246,9 @@ impl ChainRunner {
             drop(session_admission);
             return Ok(WebSocketPreflightResult {
                 allowed: true,
+                terminal_reason: None,
                 reason: String::new(),
+                denial: None,
                 session: None,
                 invocations,
                 saturated,
@@ -228,7 +258,9 @@ impl ChainRunner {
 
         Ok(WebSocketPreflightResult {
             allowed: true,
+            terminal_reason: None,
             reason: String::new(),
+            denial: None,
             session: Some(WebSocketSession {
                 runner: self.clone(),
                 stages,
@@ -239,6 +271,19 @@ impl ChainRunner {
             saturated,
             session_capacity_exhausted: false,
         })
+    }
+}
+
+fn empty_preflight_result() -> WebSocketPreflightResult {
+    WebSocketPreflightResult {
+        allowed: true,
+        terminal_reason: None,
+        reason: String::new(),
+        denial: None,
+        session: None,
+        invocations: Vec::new(),
+        saturated: false,
+        session_capacity_exhausted: false,
     }
 }
 
@@ -257,11 +302,13 @@ fn session_capacity_exhausted(
         .collect();
     WebSocketPreflightResult {
         allowed: !fail_closed,
+        terminal_reason: fail_closed.then_some(WebSocketSessionEndReason::MiddlewareFailure),
         reason: if fail_closed {
             format!("middleware_failed: {reason}")
         } else {
             String::new()
         },
+        denial: None,
         session: None,
         invocations,
         saturated,
@@ -295,6 +342,7 @@ impl WebSocketSession {
         if selected_subprotocol.len() > MAX_SELECTED_SUBPROTOCOL_BYTES {
             return WebSocketSessionStartOutcome {
                 allowed: false,
+                terminal_reason: Some(WebSocketSessionEndReason::MiddlewareFailure),
                 reason: "middleware_failed: selected_subprotocol_over_capacity".to_string(),
                 invocations: Vec::new(),
             };
@@ -328,6 +376,9 @@ impl WebSocketSession {
         self.reconcile_lifecycle();
         WebSocketSessionStartOutcome {
             allowed: fail_closed.is_none(),
+            terminal_reason: fail_closed
+                .as_ref()
+                .map(|_| WebSocketSessionEndReason::MiddlewareFailure),
             reason: fail_closed.unwrap_or_default(),
             invocations,
         }
@@ -614,6 +665,13 @@ impl WebSocketSession {
     }
 }
 
+impl Drop for WebSocketSession {
+    fn drop(&mut self) {
+        end_stages_now(&mut self.stages, WebSocketSessionEndReason::Cancellation);
+        self.reconcile_lifecycle();
+    }
+}
+
 fn platform_oversize_outcome(payload: Vec<u8>) -> WebSocketMessageOutcome {
     WebSocketMessageOutcome {
         allowed: false,
@@ -709,11 +767,17 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
         Err(_) => return OpenStage::Failed(entry, "middleware_timeout".into()),
     };
     let Some(response) = response else {
+        let _ = sender.try_send(session_end_request(
+            WebSocketSessionEndReason::MiddlewareFailure,
+        ));
         return OpenStage::Failed(entry, "missing_preflight_decision".into());
     };
     let Some(web_socket_evaluation_response::Response::PreflightDecision(decision)) =
         response.response
     else {
+        let _ = sender.try_send(session_end_request(
+            WebSocketSessionEndReason::MiddlewareFailure,
+        ));
         return OpenStage::Failed(entry, "invalid_preflight_decision".into());
     };
     match WebSocketPreflightAction::try_from(decision.action) {
@@ -735,6 +799,24 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
                 invocation,
             )
         }
+        Ok(WebSocketPreflightAction::Deny) => {
+            let invocation = success_invocation(
+                &entry,
+                WebSocketInvocationOutcome::Deny,
+                0,
+                0,
+                None,
+                false,
+                None,
+            );
+            OpenStage::Deny(
+                Box::new(WebSocketStage {
+                    entry,
+                    transport: Some(WebSocketStageTransport { sender, responses }),
+                }),
+                invocation,
+            )
+        }
         Ok(WebSocketPreflightAction::Skip) => {
             let invocation = success_invocation(
                 &entry,
@@ -749,6 +831,9 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
             OpenStage::Skip(invocation)
         }
         Ok(WebSocketPreflightAction::Unspecified) | Err(_) => {
+            let _ = sender.try_send(session_end_request(
+                WebSocketSessionEndReason::MiddlewareFailure,
+            ));
             OpenStage::Failed(entry, "invalid_preflight_decision".into())
         }
     }
@@ -979,6 +1064,14 @@ async fn end_stages(stages: &mut [WebSocketStage], reason: WebSocketSessionEndRe
                 transport.sender.send(session_end_request(reason)),
             )
             .await;
+        }
+    }
+}
+
+fn end_stages_now(stages: &mut [WebSocketStage], reason: WebSocketSessionEndReason) {
+    for stage in stages {
+        if let Some(transport) = stage.transport.take() {
+            let _ = transport.sender.try_send(session_end_request(reason));
         }
     }
 }

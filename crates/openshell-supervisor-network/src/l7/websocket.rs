@@ -2562,7 +2562,7 @@ network_policies:
             vec![SupervisorMiddlewareService {
                 name: "openai-redactor".into(),
                 grpc_endpoint: format!("http://{address}"),
-                max_body_bytes: 0,
+                max_body_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES as u64,
                 timeout: "2s".into(),
             }],
         )
@@ -2598,6 +2598,64 @@ network_policies:
             shutdown_tx,
             server_task,
         )
+    }
+
+    #[tokio::test]
+    async fn denied_websocket_session_start_reports_middleware_failure_before_close() {
+        let (session, mut observed, shutdown_tx, server_task) =
+            recording_middleware_session("wss").await;
+        let (mut client_app, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, mut upstream_app) = tokio::io::duplex(4096);
+
+        crate::l7::relay::handle_upgrade(
+            &mut relay_client,
+            &mut relay_upstream,
+            Vec::new(),
+            "api.openai.com",
+            443,
+            crate::l7::relay::UpgradeRelayOptions {
+                websocket_request: true,
+                middleware_session: Some(session),
+                selected_subprotocol: Some("x".repeat(257)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("denied session start closes cleanly");
+
+        assert!(matches!(
+            observed.recv().await,
+            Some(ObservedWebSocketRequest::SessionEnd(
+                openshell_core::proto::WebSocketSessionEndReason::MiddlewareFailure,
+            ))
+        ));
+        assert!(
+            observed.try_recv().is_err(),
+            "session start failure must send exactly one terminal event"
+        );
+
+        let client_close = read_one_frame(&mut client_app).await;
+        assert_eq!(client_close[0] & 0x0f, OPCODE_CLOSE);
+        assert_eq!(
+            u16::from_be_bytes(client_close[2..4].try_into().expect("client close code")),
+            1008
+        );
+        let upstream_close = read_one_frame(&mut upstream_app).await;
+        assert_eq!(upstream_close[0] & 0x0f, OPCODE_CLOSE);
+        assert_eq!(
+            u16::from_be_bytes(
+                decode_masked_payload(&upstream_close)[..2]
+                    .try_into()
+                    .expect("upstream close code"),
+            ),
+            1008
+        );
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware server")
+            .expect("middleware server");
     }
 
     async fn assert_middleware_only_relay_observes_reload(scheme: &str, fragmented: bool) {
@@ -2851,7 +2909,7 @@ network_policies:
             vec![SupervisorMiddlewareService {
                 name: "openai-redactor".into(),
                 grpc_endpoint: format!("http://{address}"),
-                max_body_bytes: 0,
+                max_body_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES as u64,
                 timeout: "2s".into(),
             }],
         )
@@ -2990,7 +3048,7 @@ network_policies:
             vec![SupervisorMiddlewareService {
                 name: "openai-redactor".into(),
                 grpc_endpoint: format!("http://{address}"),
-                max_body_bytes: 0,
+                max_body_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES as u64,
                 timeout: "2s".into(),
             }],
         )

@@ -528,8 +528,15 @@ where
                     }
                 };
                 crate::l7::middleware::emit_websocket_preflight_events(ctx, &preflight);
-                if !preflight.allowed {
-                    write_bad_gateway_response(client).await?;
+                if preflight.terminal_reason.is_some() {
+                    crate::l7::middleware::send_middleware_rejection_response(
+                        &req,
+                        client,
+                        ctx,
+                        preflight.denial.as_ref(),
+                        &redacted_target,
+                    )
+                    .await?;
                     return Ok(());
                 }
                 preflight.session
@@ -733,17 +740,23 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    if let Some(session) = options.middleware_session.as_mut() {
+    let start_terminal_reason = if let Some(session) = options.middleware_session.as_mut() {
         let start = session
             .start(options.selected_subprotocol.as_deref().unwrap_or_default())
             .await;
         if let Some(ctx) = options.ctx {
             crate::l7::middleware::emit_websocket_session_start_events(ctx, &start);
         }
-        if !start.allowed {
-            send_websocket_close(client, upstream, 1008).await;
-            return Ok(());
+        start.terminal_reason
+    } else {
+        None
+    };
+    if let Some(reason) = start_terminal_reason {
+        if let Some(session) = options.middleware_session.take() {
+            session.end(reason).await;
         }
+        send_websocket_close(client, upstream, 1008).await;
+        return Ok(());
     }
     let use_websocket_relay = options.websocket_request
         && (options.websocket.message_policy.inspects_messages()
@@ -1117,8 +1130,15 @@ where
                     }
                 };
                 crate::l7::middleware::emit_websocket_preflight_events(ctx, &preflight);
-                if !preflight.allowed {
-                    write_bad_gateway_response(client).await?;
+                if preflight.terminal_reason.is_some() {
+                    crate::l7::middleware::send_middleware_rejection_response(
+                        &req,
+                        client,
+                        ctx,
+                        preflight.denial.as_ref(),
+                        &redacted_target,
+                    )
+                    .await?;
                     return Ok(());
                 }
                 preflight.session
@@ -2697,7 +2717,7 @@ network_policies:
             vec![SupervisorMiddlewareService {
                 name: "preflight-service".into(),
                 grpc_endpoint: format!("http://{address}"),
-                max_body_bytes: 0,
+                max_body_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES as u64,
                 timeout: "2s".into(),
             }],
         )
@@ -2805,6 +2825,12 @@ network_policies:
             );
             fixture.assert_one_request(provider_key);
         } else {
+            let mut response = [0u8; 1024];
+            let count = app.read(&mut response).await.expect("read client response");
+            let response = String::from_utf8_lossy(&response[..count]);
+            assert!(response.contains("403 Forbidden"), "{response}");
+            assert!(response.contains(r#""error":"middleware_denied""#));
+            assert!(response.contains(r#""middleware":"websocket-preflight""#));
             let mut byte = [0u8; 1];
             let count = upstream.read(&mut byte).await.expect("upstream close");
             assert_eq!(count, 0, "denied preflight must not reach upstream");
@@ -2826,7 +2852,7 @@ network_policies:
     #[tokio::test]
     async fn denied_websocket_preflight_has_no_token_grant_side_effects() {
         assert_websocket_preflight_precedes_token_grant(
-            openshell_core::proto::WebSocketPreflightAction::Unspecified,
+            openshell_core::proto::WebSocketPreflightAction::Deny,
             false,
         )
         .await;

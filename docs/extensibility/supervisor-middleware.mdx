@@ -24,10 +24,10 @@ For each inspected HTTP request, the supervisor:
 
 For an RFC 6455 upgrade over `ws://` or `wss://`, the supervisor selects the same host-matched chain and opens one ordered `EvaluateWebSocket` stream per WebSocket-capable stage. Each stream receives:
 
-1. A preflight before the upgrade is sent upstream. The stage chooses `INSPECT` or `SKIP`.
+1. A preflight before the upgrade is sent upstream. The stage chooses `INSPECT`, voluntary `SKIP`, or authoritative `DENY`. OpenShell runs selected preflights concurrently; any `DENY` rejects the upgrade regardless of `on_error`.
 2. A session-start event after the upstream accepts the upgrade, including the negotiated subprotocol.
 3. Complete client-to-upstream text messages in sequence order. OpenShell reassembles fragmented messages and decompresses negotiated `permessage-deflate` messages before evaluation.
-4. A best-effort session-end event.
+4. A best-effort session-end event when the stage stream remains writable. OpenShell attempts at most one terminal event for each opened stream, including streams opened during a preflight that rejects the upgrade before session start.
 
 Allowed replacements are re-framed, re-compressed when required, and forwarded. Binary messages, control frames, and upstream-to-client traffic remain uninspected. OpenShell reserves shared middleware capacity before buffering HTTP bodies or WebSocket text messages; at most 32 evaluations run and 32 additional unbuffered callers wait for capacity. Persistent middleware streams use a separate process-wide budget of 32 sessions. WebSocket session admission does not wait: if the budget is full, OpenShell applies each selected config's `on_error` behavior before opening a stream.
 
@@ -110,7 +110,7 @@ See [Policy Schema](/reference/policy-schema#network-middleware) for the complet
 
 Use `fail_open` only when bypassing the middleware preserves the intended security policy. OpenShell emits a detection finding when a failed stage is bypassed and a separate state-change finding when a WebSocket stage is disabled for the session.
 
-An explicit deny decision always stops the chain and denies the request, regardless of `on_error`. The HTTP response uses `error: middleware_denied`, identifies the policy-local middleware config, and omits policy-advisor remediation because the network and L7 allow rules already matched. OpenShell never copies the free-form middleware `reason` into the response or security logs. A service can instead return an optional stable `reason_code`: 1–64 bytes, starting with a lowercase ASCII letter and containing only lowercase ASCII letters, digits, and underscores. Invalid codes make the result a middleware failure governed by `on_error`.
+An explicit deny decision always stops the chain and denies the request or WebSocket upgrade, regardless of `on_error`. A WebSocket preflight `DENY` is a successful policy decision, not a middleware failure; OpenShell rejects the upgrade before upstream contact and ends each still-writable stream opened by a successful preflight decision with `MIDDLEWARE_DENIAL`. The HTTP response uses `error: middleware_denied`, identifies the policy-local middleware config, and omits policy-advisor remediation because the network and L7 allow rules already matched. OpenShell never copies the free-form middleware `reason` into the response or security logs. HTTP and WebSocket message results can instead return an optional stable `reason_code`: 1–64 bytes, starting with a lowercase ASCII letter and containing only lowercase ASCII letters, digits, and underscores. Invalid codes make the result a middleware failure governed by `on_error`.
 
 ```json
 {

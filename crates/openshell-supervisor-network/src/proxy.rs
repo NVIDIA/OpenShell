@@ -4987,17 +4987,12 @@ async fn handle_forward_proxy(
             }
         };
         crate::l7::middleware::emit_websocket_preflight_events(&l7_ctx, &preflight);
-        if !preflight.allowed {
-            respond(
-                client,
-                &build_json_error_response(
-                    502,
-                    "Bad Gateway",
-                    "middleware_failed",
-                    "WebSocket middleware preflight denied the upgrade",
-                ),
-            )
-            .await?;
+        if preflight.terminal_reason.is_some() {
+            let response = preflight.denial.as_ref().map_or_else(
+                || build_middleware_failure_response(&l7_ctx.policy_name),
+                |denial| build_middleware_deny_response(&l7_ctx.policy_name, denial),
+            );
+            respond(client, &response).await?;
             return Ok(());
         }
         preflight.session
