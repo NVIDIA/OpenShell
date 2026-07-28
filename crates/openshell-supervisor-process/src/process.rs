@@ -40,6 +40,35 @@ pub enum ProcessEnforcementMode {
     NetworkOnly,
 }
 
+/// Numeric identity components resolved once from driver-owned metadata.
+///
+/// A component is `None` when the corresponding policy field was explicit and
+/// must continue through the existing policy identity path. OCI-derived
+/// components are carried numerically so later filesystem setup and direct/SSH
+/// privilege drops cannot resolve them differently through NSS.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResolvedProcessIdentity {
+    uid: Option<u32>,
+    gid: Option<u32>,
+}
+
+impl ResolvedProcessIdentity {
+    #[must_use]
+    pub const fn new(uid: Option<u32>, gid: Option<u32>) -> Self {
+        Self { uid, gid }
+    }
+
+    #[must_use]
+    pub const fn uid(self) -> Option<u32> {
+        self.uid
+    }
+
+    #[must_use]
+    pub const fn gid(self) -> Option<u32> {
+        self.gid
+    }
+}
+
 impl ProcessEnforcementMode {
     #[must_use]
     pub const fn uses_privileged_process_setup(self) -> bool {
@@ -491,6 +520,7 @@ impl ProcessHandle {
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
         netns: Option<&NetworkNamespace>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
@@ -502,6 +532,7 @@ impl ProcessHandle {
             workdir,
             interactive,
             policy,
+            resolved_identity,
             enforcement_mode,
             netns.and_then(NetworkNamespace::ns_fd),
             ca_paths,
@@ -522,6 +553,7 @@ impl ProcessHandle {
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
@@ -532,6 +564,7 @@ impl ProcessHandle {
             workdir,
             interactive,
             policy,
+            resolved_identity,
             enforcement_mode,
             ca_paths,
             provider_env,
@@ -546,6 +579,7 @@ impl ProcessHandle {
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
         netns_fd: Option<RawFd>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
@@ -663,7 +697,7 @@ impl ProcessHandle {
                     // /etc/group and /etc/passwd which would be blocked if
                     // Landlock were already enforced.
                     if enforcement_mode.uses_privileged_process_setup() {
-                        drop_privileges(&policy)
+                        drop_privileges_with_identity(&policy, resolved_identity)
                             .map_err(|err| std::io::Error::other(err.to_string()))?;
                     }
 
@@ -700,6 +734,7 @@ impl ProcessHandle {
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
@@ -764,7 +799,7 @@ impl ProcessHandle {
                     // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
                     // which may be blocked by Landlock.
                     if enforcement_mode.uses_privileged_process_setup() {
-                        drop_privileges(&policy)
+                        drop_privileges_with_identity(&policy, resolved_identity)
                             .map_err(|err| std::io::Error::other(err.to_string()))?;
                     }
 
@@ -997,6 +1032,32 @@ pub fn validate_sandbox_group(policy: &SandboxPolicy) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+pub fn validate_sandbox_user_with_identity(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+) -> Result<()> {
+    let Some(uid) = resolved_identity.uid() else {
+        return validate_sandbox_user(policy);
+    };
+    let mut effective_policy = policy.clone();
+    effective_policy.process.run_as_user = Some(uid.to_string());
+    validate_sandbox_user(&effective_policy)
+}
+
+#[cfg(unix)]
+pub fn validate_sandbox_group_with_identity(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+) -> Result<()> {
+    let Some(gid) = resolved_identity.gid() else {
+        return validate_sandbox_group(policy);
+    };
+    let mut effective_policy = policy.clone();
+    effective_policy.process.run_as_group = Some(gid.to_string());
+    validate_sandbox_group(&effective_policy)
 }
 
 pub use openshell_policy::{MAX_SANDBOX_UID, MIN_SANDBOX_UID};
@@ -1247,6 +1308,14 @@ fn chown_recursive(
 /// UIDs/GIDs (passed directly to `chown` without a passwd lookup).
 #[cfg(unix)]
 pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
+    prepare_filesystem_with_identity(policy, ResolvedProcessIdentity::default())
+}
+
+#[cfg(unix)]
+pub fn prepare_filesystem_with_identity(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+) -> Result<()> {
     use nix::unistd::chown;
     use nix::unistd::{Gid, Uid};
 
@@ -1265,21 +1334,27 @@ pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     }
 
     // Resolve UID: numeric values are passed directly; names resolve via passwd.
-    let uid = match user_name {
-        Some(name) if name.parse::<u32>().is_ok() => {
-            Some(Uid::from_raw(name.parse().into_diagnostic()?))
-        }
-        Some(name) => User::from_name(name).into_diagnostic()?.map(|u| u.uid),
-        _ => None,
+    let uid = match resolved_identity.uid() {
+        Some(uid) => Some(Uid::from_raw(uid)),
+        None => match user_name {
+            Some(name) if name.parse::<u32>().is_ok() => {
+                Some(Uid::from_raw(name.parse().into_diagnostic()?))
+            }
+            Some(name) => User::from_name(name).into_diagnostic()?.map(|u| u.uid),
+            _ => None,
+        },
     };
 
     // Resolve GID: numeric values are passed directly; names resolve via group.
-    let gid = match group_name {
-        Some(name) if name.parse::<u32>().is_ok() => {
-            Some(Gid::from_raw(name.parse().into_diagnostic()?))
-        }
-        Some(name) => Group::from_name(name).into_diagnostic()?.map(|g| g.gid),
-        _ => None,
+    let gid = match resolved_identity.gid() {
+        Some(gid) => Some(Gid::from_raw(gid)),
+        None => match group_name {
+            Some(name) if name.parse::<u32>().is_ok() => {
+                Some(Gid::from_raw(name.parse().into_diagnostic()?))
+            }
+            Some(name) => Group::from_name(name).into_diagnostic()?.map(|g| g.gid),
+            _ => None,
+        },
     };
 
     // Create missing read_write paths and only chown the ones we created.
@@ -1321,6 +1396,15 @@ pub fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
 #[cfg(unix)]
 #[allow(clippy::similar_names)]
 pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
+    drop_privileges_with_identity(policy, ResolvedProcessIdentity::default())
+}
+
+#[cfg(unix)]
+#[allow(clippy::similar_names)]
+pub fn drop_privileges_with_identity(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+) -> Result<()> {
     let user_name = match policy.process.run_as_user.as_deref() {
         Some(name) if !name.is_empty() => Some(name),
         _ => None,
@@ -1339,86 +1423,109 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
             let mut fallback = policy.clone();
             fallback.process.run_as_user = Some("sandbox".into());
             fallback.process.run_as_group = Some("sandbox".into());
-            return drop_privileges(&fallback);
+            return drop_privileges_with_identity(&fallback, resolved_identity);
         }
         return Ok(());
     }
 
     // Resolve UID: numeric values are used directly; names resolve via passwd.
-    let target_uid = match user_name {
-        Some(name) if name.parse::<u32>().is_ok() => Uid::from_raw(name.parse().into_diagnostic()?),
-        Some(name) => {
-            User::from_name(name)
-                .into_diagnostic()?
-                .ok_or_else(|| miette::miette!("Sandbox user not found: {name}"))?
-                .uid
-        }
-        None => nix::unistd::geteuid(),
+    let target_uid = match resolved_identity.uid() {
+        Some(uid) => Uid::from_raw(uid),
+        None => match user_name {
+            Some(name) if name.parse::<u32>().is_ok() => {
+                Uid::from_raw(name.parse().into_diagnostic()?)
+            }
+            Some(name) => {
+                User::from_name(name)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("Sandbox user not found: {name}"))?
+                    .uid
+            }
+            None => nix::unistd::geteuid(),
+        },
     };
 
     // Resolve group: if a numeric GID is configured use it directly.
     // Otherwise try name resolution, then fall back to current user's primary group.
-    let target_gid = match group_name {
-        Some(name) if name.parse::<u32>().is_ok() => Gid::from_raw(name.parse().into_diagnostic()?),
-        Some(name) => {
-            Group::from_name(name)
-                .into_diagnostic()?
-                .ok_or_else(|| miette::miette!("Sandbox group not found: {name}"))?
-                .gid
-        }
-        None => match target_uid.as_raw() {
-            0 => nix::unistd::getegid(),
-            _ => Group::from_gid(
-                User::from_uid(target_uid)
+    let target_gid = match resolved_identity.gid() {
+        Some(gid) => Gid::from_raw(gid),
+        None => match group_name {
+            Some(name) if name.parse::<u32>().is_ok() => {
+                Gid::from_raw(name.parse().into_diagnostic()?)
+            }
+            Some(name) => {
+                Group::from_name(name)
                     .into_diagnostic()?
-                    .ok_or_else(|| miette::miette!("Failed to resolve user from UID {target_uid}"))?
-                    .gid,
-            )
-            .into_diagnostic()?
-            .map_or_else(nix::unistd::getegid, |g| g.gid),
+                    .ok_or_else(|| miette::miette!("Sandbox group not found: {name}"))?
+                    .gid
+            }
+            None => match target_uid.as_raw() {
+                0 => nix::unistd::getegid(),
+                _ => Group::from_gid(
+                    User::from_uid(target_uid)
+                        .into_diagnostic()?
+                        .ok_or_else(|| {
+                            miette::miette!("Failed to resolve user from UID {target_uid}")
+                        })?
+                        .gid,
+                )
+                .into_diagnostic()?
+                .map_or_else(nix::unistd::getegid, |g| g.gid),
+            },
         },
     };
 
-    // Resolve the user record for initgroups only when identity is name-based.
-    // Numeric UIDs may not have a /etc/passwd entry; skip the lookup rather than
-    // failing with a spurious "user record not found" error.
+    // Resolve the name for initgroups only for the existing explicit-policy
+    // path. OCI-derived users carry a numeric UID from the bounded parser and
+    // must not be looked up again through NSS.
     let user_name_is_numeric = user_name.is_some_and(|n| n.parse::<u32>().is_ok());
-    let user = if user_name.is_some() && !user_name_is_numeric {
-        Some(
-            User::from_uid(target_uid)
-                .into_diagnostic()?
-                .ok_or_else(|| {
-                    miette::miette!("Failed to resolve user record for UID {target_uid}")
-                })?,
-        )
-    } else {
-        None
-    };
+    let initgroups_name =
+        if user_name.is_some() && !user_name_is_numeric && resolved_identity.uid().is_none() {
+            Some(
+                User::from_uid(target_uid)
+                    .into_diagnostic()?
+                    .ok_or_else(|| {
+                        miette::miette!("Failed to resolve user record for UID {target_uid}")
+                    })?
+                    .name,
+            )
+        } else {
+            None
+        };
 
-    // Set supplementary groups only when we have a name-based identity.
-    // Numeric UIDs may not have a passwd entry, so initgroups would fail.
-    if let Some(ref user) = user
-        && target_uid != nix::unistd::geteuid()
-    {
-        let user_cstr =
-            CString::new(user.name.clone()).map_err(|_| miette::miette!("Invalid user name"))?;
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "haiku",
-            target_os = "redox"
-        ))]
-        {
-            let _ = user_cstr;
-        }
-        #[cfg(not(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "haiku",
-            target_os = "redox"
-        )))]
-        {
-            nix::unistd::initgroups(user_cstr.as_c_str(), target_gid).into_diagnostic()?;
+    if target_uid != nix::unistd::geteuid() {
+        if resolved_identity.uid().is_some() {
+            // OCI Config.User defines the selected UID/GID pair, not a second
+            // NSS-dependent supplementary group set. Clear the root
+            // supervisor's inherited supplementary groups before dropping.
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "haiku",
+                target_os = "redox"
+            )))]
+            nix::unistd::setgroups(&[]).into_diagnostic()?;
+        } else if let Some(ref user_name) = initgroups_name {
+            let user_cstr = CString::new(user_name.as_str())
+                .map_err(|_| miette::miette!("Invalid user name"))?;
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "haiku",
+                target_os = "redox"
+            ))]
+            {
+                let _ = user_cstr;
+            }
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "haiku",
+                target_os = "redox"
+            )))]
+            {
+                nix::unistd::initgroups(user_cstr.as_c_str(), target_gid).into_diagnostic()?;
+            }
         }
     }
 
@@ -1583,6 +1690,32 @@ mod tests {
 
         assert!(validate_sandbox_user(&root_user).is_err());
         assert!(validate_sandbox_group(&root_group).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolved_oci_components_do_not_repeat_nss_validation() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("__oci_name_not_in_host_nss__".into()),
+            run_as_group: Some("__oci_group_not_in_host_nss__".into()),
+        });
+        let resolved = ResolvedProcessIdentity::new(Some(1234), Some(1235));
+
+        assert!(validate_sandbox_user_with_identity(&policy, resolved).is_ok());
+        assert!(validate_sandbox_group_with_identity(&policy, resolved).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn explicit_policy_components_keep_existing_validation_path() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("__explicit_name_not_in_host_nss__".into()),
+            run_as_group: Some("__oci_group_not_in_host_nss__".into()),
+        });
+        let resolved = ResolvedProcessIdentity::new(None, Some(1235));
+
+        assert!(validate_sandbox_user_with_identity(&policy, resolved).is_err());
+        assert!(validate_sandbox_group_with_identity(&policy, resolved).is_ok());
     }
 
     #[test]

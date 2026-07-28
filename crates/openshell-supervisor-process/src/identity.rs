@@ -3,6 +3,7 @@
 
 //! Driver identity normalization and OCI `USER` resolution.
 
+use crate::process::ResolvedProcessIdentity;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::policy::SandboxPolicy;
 use std::fs::{File, OpenOptions};
@@ -81,12 +82,14 @@ impl DriverIdentity {
 pub fn resolve_process_identity(
     policy: &mut SandboxPolicy,
     driver_identity: &DriverIdentity,
-) -> Result<()> {
+) -> Result<ResolvedProcessIdentity> {
     match driver_identity {
         DriverIdentity::Resolved { uid, gid } => {
             policy.process.run_as_user = Some(uid.to_string());
             policy.process.run_as_group = Some(gid.to_string());
-            Ok(())
+            // Kubernetes/OpenShift already supply numeric policy values and
+            // retain their existing privilege-drop path.
+            Ok(ResolvedProcessIdentity::default())
         }
         DriverIdentity::OciUser { declaration } => resolve_oci_process_identity_at(
             policy,
@@ -94,16 +97,17 @@ pub fn resolve_process_identity(
             Path::new(PASSWD_PATH),
             Path::new(GROUP_PATH),
         ),
-        DriverIdentity::None => Ok(()),
+        DriverIdentity::None => Ok(ResolvedProcessIdentity::default()),
     }
 }
 
+#[allow(clippy::similar_names)]
 fn resolve_oci_process_identity_at(
     policy: &mut SandboxPolicy,
     declaration: &str,
     passwd_path: &Path,
     group_path: &Path,
-) -> Result<()> {
+) -> Result<ResolvedProcessIdentity> {
     let explicit_user = policy
         .process
         .run_as_user
@@ -116,7 +120,7 @@ fn resolve_oci_process_identity_at(
         .is_some_and(|value| !value.is_empty());
 
     if explicit_user && explicit_group {
-        return Ok(());
+        return Ok(ResolvedProcessIdentity::default());
     }
 
     let (oci_user, oci_group) = split_oci_declaration(declaration);
@@ -132,34 +136,51 @@ fn resolve_oci_process_identity_at(
         None
     };
 
+    let oci_uid = if explicit_user {
+        None
+    } else {
+        Some(
+            resolved_user
+                .as_ref()
+                .expect("omitted OCI user must have been resolved")
+                .0,
+        )
+    };
+
     if !explicit_user {
         policy.process.run_as_user = Some(oci_user.to_string());
     }
 
-    if !explicit_group {
-        policy.process.run_as_group = Some(match oci_group {
+    let oci_gid = if explicit_group {
+        None
+    } else {
+        let (group_value, gid) = match oci_group {
             Some(group) if !group.is_empty() => {
-                validate_oci_group(group, group_path, declaration)?;
-                group.to_string()
+                let gid = validate_oci_group(group, group_path, declaration)?;
+                (group.to_string(), gid)
             }
             Some(_) => {
                 return Err(miette::miette!(
                     "OCI USER '{declaration}' has an empty group component"
                 ));
             }
-            None => resolved_user
-                .and_then(|(_, primary_gid)| primary_gid)
-                .ok_or_else(|| {
+            None => {
+                let gid = resolved_user
+                    .and_then(|(_, primary_gid)| primary_gid)
+                    .ok_or_else(|| {
                     miette::miette!(
                         "OCI USER '{declaration}' uses a numeric UID without an explicit group, \
                          but /etc/passwd has no matching primary GID"
                     )
-                })?
-                .to_string(),
-        });
-    }
+                })?;
+                (gid.to_string(), gid)
+            }
+        };
+        policy.process.run_as_group = Some(group_value);
+        Some(gid)
+    };
 
-    Ok(())
+    Ok(ResolvedProcessIdentity::new(oci_uid, oci_gid))
 }
 
 fn split_oci_declaration(declaration: &str) -> (&str, Option<&str>) {
@@ -214,7 +235,7 @@ fn resolve_required_oci_user(
     Ok((entry.uid, require_primary_gid.then_some(entry.gid)))
 }
 
-fn validate_oci_group(value: &str, group_path: &Path, declaration: &str) -> Result<()> {
+fn validate_oci_group(value: &str, group_path: &Path, declaration: &str) -> Result<u32> {
     validate_component(value, "OCI group")?;
     if value == "root" {
         return Err(miette::miette!(
@@ -233,7 +254,7 @@ fn validate_oci_group(value: &str, group_path: &Path, declaration: &str) -> Resu
             "OCI USER '{declaration}' resolves to prohibited GID 0"
         ));
     }
-    Ok(())
+    Ok(gid)
 }
 
 fn validate_component(value: &str, kind: &str) -> Result<()> {
@@ -441,17 +462,61 @@ mod tests {
             "staff:x:1235:\nsandbox:x:2001:\n",
         );
         let cases = [
-            (Some("2000"), Some("2001"), "root", "2000", "2001"),
-            (Some("2000"), None, "app:staff", "2000", "staff"),
-            (None, Some("2001"), "app:root", "app", "2001"),
-            (None, None, "app:staff", "app", "staff"),
-            (None, None, "app", "app", "1235"),
+            (
+                Some("2000"),
+                Some("2001"),
+                "root",
+                "2000",
+                "2001",
+                None,
+                None,
+            ),
+            (
+                Some("2000"),
+                None,
+                "app:staff",
+                "2000",
+                "staff",
+                None,
+                Some(1235),
+            ),
+            (
+                None,
+                Some("2001"),
+                "app:root",
+                "app",
+                "2001",
+                Some(1234),
+                None,
+            ),
+            (
+                None,
+                None,
+                "app:staff",
+                "app",
+                "staff",
+                Some(1234),
+                Some(1235),
+            ),
+            (None, None, "app", "app", "1235", Some(1234), Some(1235)),
         ];
-        for (user, group_name, declaration, expected_uid, expected_gid) in cases {
+        for (
+            user,
+            group_name,
+            declaration,
+            expected_user,
+            expected_group,
+            resolved_uid,
+            resolved_gid,
+        ) in cases
+        {
             let mut policy = policy(user, group_name);
-            resolve_oci_process_identity_at(&mut policy, declaration, &passwd, &group).unwrap();
-            assert_eq!(policy.process.run_as_user.as_deref(), Some(expected_uid));
-            assert_eq!(policy.process.run_as_group.as_deref(), Some(expected_gid));
+            let resolved =
+                resolve_oci_process_identity_at(&mut policy, declaration, &passwd, &group).unwrap();
+            assert_eq!(policy.process.run_as_user.as_deref(), Some(expected_user));
+            assert_eq!(policy.process.run_as_group.as_deref(), Some(expected_group));
+            assert_eq!(resolved.uid(), resolved_uid);
+            assert_eq!(resolved.gid(), resolved_gid);
         }
     }
 
@@ -461,9 +526,14 @@ mod tests {
         let passwd = dir.path().join("missing-passwd");
         let group = dir.path().join("missing-group");
         let mut policy = policy(None, None);
-        resolve_oci_process_identity_at(&mut policy, "1234:1235", &passwd, &group).unwrap();
+        let resolved =
+            resolve_oci_process_identity_at(&mut policy, "1234:1235", &passwd, &group).unwrap();
         assert_eq!(policy.process.run_as_user.as_deref(), Some("1234"));
         assert_eq!(policy.process.run_as_group.as_deref(), Some("1235"));
+        assert_eq!(
+            resolved,
+            ResolvedProcessIdentity::new(Some(1234), Some(1235))
+        );
     }
 
     #[test]
@@ -471,7 +541,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut policy = policy(Some("sandbox"), Some("sandbox"));
 
-        resolve_oci_process_identity_at(
+        let resolved = resolve_oci_process_identity_at(
             &mut policy,
             "root:root",
             &dir.path().join("missing-passwd"),
@@ -481,6 +551,7 @@ mod tests {
 
         assert_eq!(policy.process.run_as_user.as_deref(), Some("sandbox"));
         assert_eq!(policy.process.run_as_group.as_deref(), Some("sandbox"));
+        assert_eq!(resolved, ResolvedProcessIdentity::default());
     }
 
     #[test]
@@ -517,8 +588,13 @@ mod tests {
     fn numeric_uid_uses_passwd_primary_gid() {
         let (_dir, passwd, group) = account_files("app:x:1234:4321::/home/app:/bin/sh\n", "");
         let mut policy = policy(None, None);
-        resolve_oci_process_identity_at(&mut policy, "1234", &passwd, &group).unwrap();
+        let resolved =
+            resolve_oci_process_identity_at(&mut policy, "1234", &passwd, &group).unwrap();
         assert_eq!(policy.process.run_as_group.as_deref(), Some("4321"));
+        assert_eq!(
+            resolved,
+            ResolvedProcessIdentity::new(Some(1234), Some(4321))
+        );
     }
 
     #[test]
@@ -542,14 +618,20 @@ mod tests {
             account_files("app:x:1234:1235::/home/app:/bin/sh\n", "staff:x:1235:\n");
 
         let mut explicit_user = policy(Some("1234"), None);
-        resolve_oci_process_identity_at(&mut explicit_user, "root:staff", &passwd, &group).unwrap();
+        let resolved =
+            resolve_oci_process_identity_at(&mut explicit_user, "root:staff", &passwd, &group)
+                .unwrap();
         assert_eq!(explicit_user.process.run_as_user.as_deref(), Some("1234"));
         assert_eq!(explicit_user.process.run_as_group.as_deref(), Some("staff"));
+        assert_eq!(resolved, ResolvedProcessIdentity::new(None, Some(1235)));
 
         let mut explicit_group = policy(None, Some("1235"));
-        resolve_oci_process_identity_at(&mut explicit_group, "app:root", &passwd, &group).unwrap();
+        let resolved =
+            resolve_oci_process_identity_at(&mut explicit_group, "app:root", &passwd, &group)
+                .unwrap();
         assert_eq!(explicit_group.process.run_as_user.as_deref(), Some("app"));
         assert_eq!(explicit_group.process.run_as_group.as_deref(), Some("1235"));
+        assert_eq!(resolved, ResolvedProcessIdentity::new(Some(1234), None));
     }
 
     #[test]

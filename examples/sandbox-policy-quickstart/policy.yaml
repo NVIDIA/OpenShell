@@ -6,9 +6,9 @@
 
 version: 1
 
-# Default sandbox filesystem and process settings.
-# These filesystem fields are required when using `openshell policy set`
-# because it replaces the entire policy.
+# Default sandbox filesystem and Landlock settings. Process identity is omitted
+# so the active compute driver can select it. These fields are required when
+# using `openshell policy set` because it replaces the entire policy.
 filesystem_policy:
   include_workdir: true
   read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]

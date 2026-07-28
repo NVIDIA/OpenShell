@@ -189,13 +189,16 @@ pub async fn run_sandbox(
     // OpenShift retain their authoritative numeric pair; Docker and Podman
     // fill only omitted policy fields from OCI Config.User.
     #[cfg(unix)]
-    {
+    let resolved_process_identity = {
         let driver_identity = openshell_supervisor_process::identity::DriverIdentity::from_env()?;
         openshell_supervisor_process::identity::resolve_process_identity(
             &mut policy,
             &driver_identity,
-        )?;
-    }
+        )?
+    };
+    #[cfg(not(unix))]
+    let resolved_process_identity =
+        openshell_supervisor_process::process::ResolvedProcessIdentity::default();
 
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let (provider_credentials, mut provider_env) =
@@ -688,6 +691,7 @@ pub async fn run_sandbox(
             ssh_socket_path,
             sidecar_network_enforcement,
             &process_policy,
+            resolved_process_identity,
             process_enforcement_mode,
             entrypoint_pid,
             entrypoint_started_tx,

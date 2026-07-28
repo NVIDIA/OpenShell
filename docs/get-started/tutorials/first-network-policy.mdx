@@ -114,7 +114,7 @@ network_policies:
       - { path: /usr/bin/curl }
 ```
 
-The `filesystem_policy`, `landlock`, and `process` sections preserve the default sandbox settings. This is required because `policy set` replaces the entire policy. The `network_policies` section is the key part: `curl` can make GET, HEAD, and OPTIONS requests to `api.github.com` over HTTPS. Everything else is denied. The proxy auto-detects TLS on HTTPS endpoints and terminates it to inspect each HTTP request and enforce the `read-only` access preset at the method level.
+The `filesystem_policy` and `landlock` sections preserve the default sandbox settings, while process identity is omitted so the active compute driver can select it. These sections are required because `policy set` replaces the entire policy. The `network_policies` section is the key part: `curl` can make GET, HEAD, and OPTIONS requests to `api.github.com` over HTTPS. Everything else is denied. The proxy auto-detects TLS on HTTPS endpoints and terminates it to inspect each HTTP request and enforce the `read-only` access preset at the method level.
 
 Apply it:
 

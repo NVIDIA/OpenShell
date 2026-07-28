@@ -34,7 +34,9 @@ use openshell_core::denial::DenialEvent;
 
 #[cfg(target_os = "linux")]
 use crate::managed_children;
-use crate::process::{ProcessEnforcementMode, ProcessHandle, ProcessStatus};
+use crate::process::{
+    ProcessEnforcementMode, ProcessHandle, ProcessStatus, ResolvedProcessIdentity,
+};
 
 fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
     openshell_ocsf::ctx::ctx()
@@ -59,6 +61,7 @@ pub async fn run_process(
     ssh_socket_path: Option<String>,
     shared_ssh_socket: bool,
     policy: &SandboxPolicy,
+    resolved_process_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
     entrypoint_pid: Arc<AtomicU32>,
     entrypoint_started_tx: Option<tokio::sync::oneshot::Sender<u32>>,
@@ -83,8 +86,8 @@ pub async fn run_process(
     // Validate the completed process identity before exposing a child.
     #[cfg(unix)]
     if enforcement_mode.uses_privileged_process_setup() {
-        crate::process::validate_sandbox_user(policy)?;
-        crate::process::validate_sandbox_group(policy)?;
+        crate::process::validate_sandbox_user_with_identity(policy, resolved_process_identity)?;
+        crate::process::validate_sandbox_group_with_identity(policy, resolved_process_identity)?;
     }
 
     // Create read_write directories and chown newly-created ones to the
@@ -92,7 +95,7 @@ pub async fn run_process(
     // is forked so the workload sees writable paths it owns.
     #[cfg(unix)]
     if enforcement_mode.uses_privileged_process_setup() {
-        crate::process::prepare_filesystem(policy)?;
+        crate::process::prepare_filesystem_with_identity(policy, resolved_process_identity)?;
     }
 
     // Eagerly fetch initial settings and install the agent skill if the
@@ -246,6 +249,7 @@ pub async fn run_process(
                 ca_paths,
                 provider_credentials_clone,
                 user_env_clone,
+                resolved_process_identity,
                 enforcement_mode,
                 shared_ssh_socket,
             )
@@ -318,6 +322,7 @@ pub async fn run_process(
         workdir,
         interactive,
         policy,
+        resolved_process_identity,
         enforcement_mode,
         netns,
         ca_file_paths.as_ref(),
@@ -331,6 +336,7 @@ pub async fn run_process(
         workdir,
         interactive,
         policy,
+        resolved_process_identity,
         enforcement_mode,
         ca_file_paths.as_ref(),
         &provider_env,
