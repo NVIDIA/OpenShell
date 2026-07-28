@@ -434,6 +434,15 @@ resolution and again by the sandbox placeholder resolver. This keeps expired
 credentials from resolving even when a running sandbox still has retained
 placeholder generations from an earlier provider credential snapshot.
 
+Static credential delivery is capability-negotiated and endpoint-bound. The
+gateway classifies each returned environment entry as either a credential or
+non-secret provider configuration and associates every credential key with the
+host, port, and path selectors from its effective provider profile. It withholds
+static credential material from supervisors that do not advertise binding
+support and rejects profile-backed delivery when a static credential has no
+usable endpoint. Provider environment revisions include profile endpoint and
+binding changes.
+
 ## Inference Resolution
 
 Cluster inference routes store only `provider_name`, `model_id`, and optional

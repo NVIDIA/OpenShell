@@ -72,6 +72,22 @@ its guarded single-request relay while sharing authorization, request context,
 policy-pinning, and destination boundaries.
 Adapter-specific response and OCSF event shapes remain at the protocol boundary.
 
+Provider credential placeholders are resolved through the live provider state
+for each HTTP request, after destination and L7 policy admission. A static
+credential resolves only when the request host, port, and path match an endpoint
+in that provider's effective profile. CONNECT, absolute-form forward HTTP,
+request targets, headers, supported request bodies, SigV4 signing, and opted-in
+WebSocket text rewriting use the same scoped resolver. Provider refresh swaps
+credential values and endpoint bindings atomically. An invalid or unavailable
+refresh clears the previous provider state instead of leaving a partially active
+or last-known-good credential set.
+
+Route selection and policy evaluation use a syntax-only redacted request target;
+they do not materialize real credentials. Cross-endpoint placeholder use returns
+HTTP 403. After a WebSocket upgrade it closes the connection with policy
+violation code 1008. Both paths emit a denied activity event and a detection
+finding without logging the placeholder, environment key, secret, or query.
+
 For inspected HTTP traffic, the proxy can enforce REST method/path rules,
 WebSocket upgrade and text-message rules, GraphQL operation rules, and
 MCP method, tool, and supported params rules or generic JSON-RPC method rules
