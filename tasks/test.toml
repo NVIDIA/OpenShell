@@ -38,7 +38,7 @@ description = "Run all end-to-end tests (Rust + Python + MCP)"
 depends = ["e2e:rust", "e2e:python", "e2e:mcp"]
 
 ["e2e:run"]
-description = "Build the current checkout and run a named host or Nix test-VM E2E suite"
+description = "Build the current checkout and run a named host or Nix test-guest E2E suite"
 run = "e2e/run.sh"
 
 ["e2e:gpu"]

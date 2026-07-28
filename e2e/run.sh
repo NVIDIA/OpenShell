@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Build the current checkout, run its gateway on the host or in a disposable
-# Nix test VM, and execute one named host-side E2E suite against that gateway.
+# Nix test guest, and execute one named host-side E2E suite against that gateway.
 
 set -Eeuo pipefail
 
@@ -23,8 +23,8 @@ Usage:
     --gateway-config PATH --suite NAME
 
 Options:
-  --vm DISTRO          Run the gateway in a Nix test VM
-  --with CONFIG        Apply a Nix test-VM configuration; repeatable
+  --vm DISTRO          Run the gateway in a Nix test guest
+  --with CONFIG        Apply a Nix test-guest configuration; repeatable
   --guest-setup PATH   Run an executable setup script in the guest before the
                        gateway starts; requires VM mode
   --gateway-config PATH
@@ -33,7 +33,7 @@ Options:
   -h, --help           Show this help
 
 Omit --vm and --with to run the gateway on the host. Supplying --with without
---vm selects the Ubuntu test VM. Set OPENSHELL_E2E_KEEP=1 to retain state.
+--vm selects the Ubuntu test guest. Set OPENSHELL_E2E_KEEP=1 to retain state.
 EOF
 }
 
@@ -208,15 +208,15 @@ if [ "${mode}" = vm ]; then
 	if ! command -v nix >/dev/null 2>&1; then
 		die "Nix is required for VM mode"
 	fi
-	if ! vm_catalog="$(cd "${ROOT}" && nix run .#test-vm -- --list)"; then
-		die "failed to read the Nix test-VM catalog"
+	if ! vm_catalog="$(cd "${ROOT}" && nix run .#test-guest -- --list)"; then
+		die "failed to read the Nix test-guest catalog"
 	fi
 	if ! catalog_has_entry "${vm_catalog}" Distros "${vm}"; then
-		die "unknown VM distro in the Nix test-VM catalog: ${vm}"
+		die "unknown VM distro in the Nix test-guest catalog: ${vm}"
 	fi
 	for configuration in "${with_configurations[@]}"; do
 		if ! catalog_has_entry "${vm_catalog}" Configurations "${configuration}"; then
-			die "unknown VM configuration in the Nix test-VM catalog: ${configuration}"
+			die "unknown VM configuration in the Nix test-guest catalog: ${configuration}"
 		fi
 	done
 fi
@@ -505,7 +505,7 @@ EOF
 	chmod 0700 "${guest_launcher}"
 
 	vm_args=(
-		nix run .#test-vm --
+		nix run .#test-guest --
 		--distro "${vm}"
 	)
 	for configuration in "${with_configurations[@]}"; do
@@ -526,7 +526,7 @@ EOF
 	fi
 	vm_args+=(-- "${guest_launcher_path}")
 
-	echo "==> Starting ${vm} test VM gateway at ${gateway_endpoint}"
+	echo "==> Starting ${vm} test guest gateway at ${gateway_endpoint}"
 	(
 		cd "${ROOT}"
 		exec python3 -c \
