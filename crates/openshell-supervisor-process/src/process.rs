@@ -911,12 +911,11 @@ impl Drop for ProcessHandle {
 pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
     let identity = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
 
-    // Explicit policy identities were range-checked before the runtime policy
-    // reached the supervisor. OCI-derived numeric identities may use system
-    // account IDs, so this completed-runtime check only prohibits root.
     if let Ok(uid) = identity.parse::<u32>() {
-        if uid == 0 {
-            return Err(miette::miette!("process user must not select UID 0"));
+        if !(MIN_SANDBOX_UID..=MAX_SANDBOX_UID).contains(&uid) {
+            return Err(miette::miette!(
+                "process user UID must be in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+            ));
         }
         openshell_ocsf::ocsf_emit!(
             openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
@@ -985,8 +984,10 @@ pub fn validate_sandbox_group(policy: &SandboxPolicy) -> Result<()> {
     let identity = policy.process.run_as_group.as_deref().unwrap_or("sandbox");
 
     if let Ok(gid) = identity.parse::<u32>() {
-        if gid == 0 {
-            return Err(miette::miette!("process group must not select GID 0"));
+        if !(MIN_SANDBOX_UID..=MAX_SANDBOX_UID).contains(&gid) {
+            return Err(miette::miette!(
+                "process group GID must be in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+            ));
         }
         openshell_ocsf::ocsf_emit!(
             openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
@@ -1052,9 +1053,10 @@ pub fn validate_sandbox_user_with_identity(
     let Some(uid) = resolved_identity.uid() else {
         return validate_sandbox_user(policy);
     };
-    let mut effective_policy = policy.clone();
-    effective_policy.process.run_as_user = Some(uid.to_string());
-    validate_sandbox_user(&effective_policy)
+    if uid == 0 {
+        return Err(miette::miette!("process user must not select UID 0"));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1065,9 +1067,10 @@ pub fn validate_sandbox_group_with_identity(
     let Some(gid) = resolved_identity.gid() else {
         return validate_sandbox_group(policy);
     };
-    let mut effective_policy = policy.clone();
-    effective_policy.process.run_as_group = Some(gid.to_string());
-    validate_sandbox_group(&effective_policy)
+    if gid == 0 {
+        return Err(miette::miette!("process group must not select GID 0"));
+    }
+    Ok(())
 }
 
 pub use openshell_policy::{MAX_SANDBOX_UID, MIN_SANDBOX_UID};
@@ -1225,44 +1228,81 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
     Ok(())
 }
 
+/// Recursively chown a directory tree to the given UID/GID.
+///
+/// This retains the Kubernetes/OpenShift workspace reconciliation from before
+/// OCI image identity fallback. Symlinks are skipped, and read-only nested
+/// mounts are not traversed.
 #[cfg(unix)]
-fn prepare_oci_workspace(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
-    prepare_oci_workspace_with(root, uid, gid, &nix::unistd::chown)
+fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
+    let meta = std::fs::symlink_metadata(root).into_diagnostic()?;
+    if meta.file_type().is_symlink() {
+        return Err(miette::miette!(
+            "path '{}' is a symlink — refusing to chown (potential privilege escalation)",
+            root.display()
+        ));
+    }
+
+    nix::unistd::chown(root, uid, gid).into_diagnostic()?;
+
+    if meta.is_dir() {
+        chown_children(root, uid, gid, &nix::unistd::chown)?;
+    }
+
+    Ok(())
 }
 
-/// Prepare only the fixed `OpenShell` workspace directory itself.
-///
-/// Image-provided children retain their declared ownership. This avoids
-/// crossing symlinks or user-provided nested mounts and keeps OCI working
-/// directory/content semantics out of the identity-focused change.
 #[cfg(unix)]
-fn prepare_oci_workspace_with(
-    root: &Path,
+fn chown_children(
+    dir: &Path,
     uid: Option<Uid>,
     gid: Option<Gid>,
     do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
 ) -> Result<()> {
-    match std::fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(miette::miette!(
-                "workspace path '{}' is a symlink — refusing to chown",
-                root.display()
-            ));
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.into_diagnostic()?;
+                chown_recursive(&entry.path(), uid, gid, do_chown)?;
+            }
         }
-        Ok(metadata) if !metadata.is_dir() => {
-            return Err(miette::miette!(
-                "workspace path '{}' is not a directory",
-                root.display()
-            ));
+        Err(error) => {
+            debug!(
+                path = %dir.display(),
+                %error,
+                "Cannot list directory during sandbox home chown"
+            );
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(root).into_diagnostic()?;
-        }
-        Err(error) => return Err(error).into_diagnostic(),
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chown_recursive(
+    path: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
+) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path).into_diagnostic()?;
+    if meta.file_type().is_symlink() {
+        debug!(path = %path.display(), "Skipping symlink during sandbox home chown");
+        return Ok(());
     }
 
-    do_chown(root, uid, gid).into_diagnostic()
+    if let Err(error) = do_chown(path, uid, gid) {
+        if error == nix::errno::Errno::EROFS {
+            debug!(path = %path.display(), "Skipping read-only path during sandbox home chown");
+            return Ok(());
+        }
+        return Err(error).into_diagnostic();
+    }
+
+    if meta.is_dir() {
+        chown_children(path, uid, gid, do_chown)?;
+    }
+
+    Ok(())
 }
 
 /// Prepare filesystem for the sandboxed process.
@@ -1337,14 +1377,15 @@ pub fn prepare_filesystem_with_identity(
         }
     }
 
-    // Docker and Podman must make OpenShell's fixed workspace usable when any
-    // identity component came from OCI USER. Explicit policy identity and
-    // platform-resolved Kubernetes/OpenShift identity retain their existing
-    // filesystem paths.
-    if resolved_identity.uses_oci_user_fallback() {
+    // Retain the existing Kubernetes/OpenShift behavior for driver-injected
+    // numeric identities. Docker and Podman clear this variable and do not
+    // receive identity-specific workspace preparation.
+    if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok_and(|uid| !uid.is_empty()) {
         let sandbox_home = Path::new("/sandbox");
-        info!(?uid, ?gid, "Preparing /sandbox for OCI image identity");
-        prepare_oci_workspace(sandbox_home, uid, gid)?;
+        if sandbox_home.exists() {
+            info!(?uid, ?gid, "Chowning /sandbox for driver-injected UID/GID");
+            chown_sandbox_home(sandbox_home, uid, gid)?;
+        }
     }
 
     Ok(())
@@ -1370,7 +1411,8 @@ fn should_clear_supplementary_groups(
     user_name: Option<&str>,
     resolved_identity: ResolvedProcessIdentity,
 ) -> bool {
-    target_uid != current_uid
+    resolved_identity.uses_oci_user_fallback()
+        && target_uid != current_uid
         && !(user_name.is_some_and(|name| name.parse::<u32>().is_err())
             && resolved_identity.uid().is_none())
 }
@@ -1476,9 +1518,10 @@ pub fn drop_privileges_with_identity(
             user_name,
             resolved_identity,
         ) {
-            // Numeric explicit users and OCI-derived users do not have a
-            // trustworthy NSS supplementary-group source. Clear the root
-            // supervisor's inherited groups before changing UID/GID.
+            // OCI-derived users do not have a trustworthy NSS
+            // supplementary-group source. Clear the root supervisor's
+            // inherited groups before changing UID/GID. Platform-resolved and
+            // explicit numeric identities retain their pre-OCI behavior.
             #[cfg(not(any(
                 target_os = "macos",
                 target_os = "ios",
@@ -1647,14 +1690,27 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn completed_runtime_identity_accepts_non_root_system_ids() {
+    fn explicit_identity_rejects_non_root_system_ids() {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some("101".into()),
             run_as_group: Some("102".into()),
         });
 
-        assert!(validate_sandbox_user(&policy).is_ok());
-        assert!(validate_sandbox_group(&policy).is_ok());
+        assert!(validate_sandbox_user(&policy).is_err());
+        assert!(validate_sandbox_group(&policy).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolved_oci_identity_accepts_non_root_system_ids() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("app".into()),
+            run_as_group: Some("staff".into()),
+        });
+        let resolved = ResolvedProcessIdentity::new(Some(101), Some(102));
+
+        assert!(validate_sandbox_user_with_identity(&policy, resolved).is_ok());
+        assert!(validate_sandbox_group_with_identity(&policy, resolved).is_ok());
     }
 
     #[test]
@@ -1701,32 +1757,22 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn numeric_user_paths_clear_supplementary_groups_before_uid_drop() {
+    fn only_oci_numeric_user_paths_clear_supplementary_groups_before_uid_drop() {
         let current_uid = Uid::from_raw(0);
         let target_uid = Uid::from_raw(1234);
 
-        let cases = [
-            (
-                "explicit numeric UID/GID",
-                ResolvedProcessIdentity::default(),
-            ),
-            (
-                "explicit numeric UID with OCI-derived GID",
-                ResolvedProcessIdentity::new(None, Some(1235)),
-            ),
-        ];
-
-        for (description, resolved_identity) in cases {
-            assert!(
-                should_clear_supplementary_groups(
-                    current_uid,
-                    target_uid,
-                    Some("1234"),
-                    resolved_identity,
-                ),
-                "{description}"
-            );
-        }
+        assert!(!should_clear_supplementary_groups(
+            current_uid,
+            target_uid,
+            Some("1234"),
+            ResolvedProcessIdentity::default(),
+        ));
+        assert!(should_clear_supplementary_groups(
+            current_uid,
+            target_uid,
+            Some("1234"),
+            ResolvedProcessIdentity::new(None, Some(1235)),
+        ));
     }
 
     #[test]
@@ -2257,38 +2303,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn prepare_oci_workspace_chowns_only_root() {
-        use std::sync::{Arc, Mutex};
+    #[allow(clippy::similar_names)]
+    fn chown_sandbox_home_changes_ownership_recursively() {
+        use std::os::unix::fs::MetadataExt;
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("sandbox");
         std::fs::create_dir(&root).unwrap();
-        let child = root.join("image-content.txt");
-        std::fs::write(&child, "image-owned").unwrap();
+        std::fs::write(root.join("file.txt"), "hello").unwrap();
+        std::fs::create_dir(root.join("subdir")).unwrap();
+        std::fs::write(root.join("subdir").join("nested.txt"), "world").unwrap();
 
-        let chowned = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&chowned);
-        let fake_chown =
-            move |path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
-                observed.lock().unwrap().push(path.to_path_buf());
-                Ok(())
-            };
+        let expected_uid = nix::unistd::geteuid();
+        let expected_gid = nix::unistd::getegid();
+        chown_sandbox_home(&root, Some(expected_uid), Some(expected_gid)).unwrap();
 
-        prepare_oci_workspace_with(
-            &root,
-            Some(nix::unistd::geteuid()),
-            Some(nix::unistd::getegid()),
-            &fake_chown,
-        )
-        .expect("workspace root should be prepared");
-
-        assert_eq!(*chowned.lock().unwrap(), vec![root]);
-        assert!(child.exists(), "image-provided child should be untouched");
+        for path in &[
+            root.clone(),
+            root.join("file.txt"),
+            root.join("subdir"),
+            root.join("subdir").join("nested.txt"),
+        ] {
+            let meta = std::fs::metadata(path).unwrap();
+            assert_eq!(meta.uid(), expected_uid.as_raw());
+            assert_eq!(meta.gid(), expected_gid.as_raw());
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn prepare_oci_workspace_rejects_symlink_root() {
+    fn chown_sandbox_home_rejects_symlink_root() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2297,7 +2341,7 @@ mod tests {
         std::fs::create_dir(&target).unwrap();
         symlink(&target, &link).unwrap();
 
-        let err = prepare_oci_workspace(
+        let err = chown_sandbox_home(
             &link,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
@@ -2311,72 +2355,86 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn prepare_oci_workspace_rejects_non_directory_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("sandbox");
-        std::fs::write(&root, "not a directory").unwrap();
+    fn chown_sandbox_home_skips_symlink_children() {
+        use std::os::unix::fs::symlink;
 
-        let error = prepare_oci_workspace(
-            &root,
-            Some(nix::unistd::geteuid()),
-            Some(nix::unistd::getegid()),
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("is not a directory"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn prepare_oci_workspace_propagates_root_chown_error() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("sandbox");
         std::fs::create_dir(&root).unwrap();
-        let fake_chown = |_path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
-            Err(nix::errno::Errno::EROFS)
-        };
+        let target = dir.path().join("outside");
+        std::fs::write(&target, "secret").unwrap();
+        symlink(&target, root.join("link")).unwrap();
 
-        let error = prepare_oci_workspace_with(
+        chown_sandbox_home(
             &root,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
-            &fake_chown,
         )
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains("Read-only file system"),
-            "unexpected error: {error}"
-        );
+        .expect("symlink children should be skipped");
     }
 
     #[cfg(unix)]
     #[test]
-    fn prepare_oci_workspace_creates_missing_root() {
+    fn chown_recursive_skips_erofs_subtree_but_continues_siblings() {
         use std::sync::{Arc, Mutex};
 
         let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing").join("sandbox");
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+
+        let readonly_dir = root.join("ro-mount");
+        std::fs::create_dir(&readonly_dir).unwrap();
+        std::fs::write(readonly_dir.join("child-under-ro.txt"), "data").unwrap();
+        std::fs::write(root.join("writable-sibling.txt"), "data").unwrap();
+
         let chowned = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&chowned);
+        let readonly_dir_for_chown = readonly_dir.clone();
         let fake_chown =
             move |path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+                if path == readonly_dir_for_chown {
+                    return Err(nix::errno::Errno::EROFS);
+                }
                 observed.lock().unwrap().push(path.to_path_buf());
                 Ok(())
             };
 
-        prepare_oci_workspace_with(
-            &missing,
+        chown_children(
+            &root,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
             &fake_chown,
         )
-        .expect("missing OCI workspace should be created");
+        .expect("read-only subtree should be skipped");
 
-        assert!(missing.is_dir());
-        assert_eq!(*chowned.lock().unwrap(), vec![missing]);
+        let chowned = chowned.lock().unwrap();
+        assert!(
+            !chowned.contains(&readonly_dir.join("child-under-ro.txt")),
+            "children under EROFS directory must not be traversed"
+        );
+        assert!(
+            chowned.contains(&root.join("writable-sibling.txt")),
+            "writable sibling should still be chowned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_recursive_propagates_non_erofs_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        let fake_chown = |_path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+            Err(nix::errno::Errno::EPERM)
+        };
+
+        let result = chown_recursive(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &fake_chown,
+        );
+        assert!(result.is_err(), "non-EROFS errors should propagate");
     }
 
     #[cfg(unix)]

@@ -2743,11 +2743,16 @@ impl ComputeDriver for NoopTestDriver {
 
 #[cfg(test)]
 pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
+    new_test_runtime_for_driver(store, "test").await
+}
+
+#[cfg(test)]
+pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -> ComputeRuntime {
     ComputeRuntime {
         driver: Arc::new(NoopTestDriver),
         driver_info: ComputeDriverInfoSnapshot {
-            name: "test".to_string(),
-            driver_name: "test".to_string(),
+            name: driver_name.to_string(),
+            driver_name: driver_name.to_string(),
             driver_version: "test".to_string(),
         },
         shutdown_cleanup: None,

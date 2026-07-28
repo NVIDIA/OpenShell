@@ -144,13 +144,6 @@ and uses the same privilege-drop path for direct and SSH children. When a
 declaration omits the group, the supervisor fills it with the user's numeric
 primary GID. It does not rewrite the account files.
 
-When either component falls back to the image identity, Docker and Podman
-prepare the fixed `/sandbox` workspace for the completed UID/GID before direct
-or SSH children start. They create it when absent and transfer ownership of
-only the workspace directory. Image-provided contents and nested mounts retain
-their ownership. Kubernetes/OpenShift keep their PVC and `fsGroup` behavior,
-and VM keeps its guest initialization path.
-
 Sandbox creation fails before the workload becomes ready when a required image
 identity is absent, malformed, unknown, ambiguous, or resolves to UID/GID 0.
 The supervisor itself remains root so it can establish isolation before

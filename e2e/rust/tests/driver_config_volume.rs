@@ -23,15 +23,6 @@ use serde_json::{Map, Value};
 const TEST_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
 const VOLUME_TARGET: &str = "/sandbox/e2e-volume";
 const BIND_TARGET: &str = "/sandbox/e2e-bind";
-#[cfg(feature = "e2e-docker")]
-const OCI_USER_DOCKERFILE: &str = r#"FROM public.ecr.aws/docker/library/python:3.13-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
-    && rm -rf /var/lib/apt/lists/*
-
-USER 2234:2235
-CMD ["sleep", "infinity"]
-"#;
 
 struct VolumeGuard {
     docker: Docker,
@@ -108,69 +99,6 @@ async fn sandbox_mounts_existing_driver_config_volume() {
     verify_volume(&volume)
         .await
         .expect("verify sandbox wrote to named test volume");
-}
-
-#[tokio::test]
-#[cfg(feature = "e2e-docker")]
-async fn oci_workspace_preparation_skips_nested_volume_ownership() {
-    let driver = e2e_driver().expect("OPENSHELL_E2E_DRIVER must be set by the e2e wrapper");
-    assert!(
-        matches!(driver.as_str(), "docker" | "podman"),
-        "OCI workspace mount e2e requires docker or podman, got {driver}"
-    );
-
-    let volume = VolumeGuard::create(&driver)
-        .await
-        .expect("create named test volume");
-    seed_volume(&volume).await.expect("seed named test volume");
-
-    let image_context = tempfile::tempdir().expect("create OCI image context");
-    let dockerfile = image_context.path().join("Dockerfile");
-    fs::write(&dockerfile, OCI_USER_DOCKERFILE).expect("write OCI image Dockerfile");
-    let dockerfile = dockerfile.to_str().expect("Dockerfile path must be UTF-8");
-
-    let driver_config = format!(
-        r#"{{"{driver}":{{"mounts":[{{"type":"volume","source":"{}","target":"{VOLUME_TARGET}","read_only":false}}]}}}}"#,
-        volume.name
-    );
-    let mut sandbox = SandboxGuard::create_keep_with_args(
-        &[
-            "--from",
-            dockerfile,
-            "--driver-config-json",
-            &driver_config,
-            "--no-tty",
-        ],
-        &[
-            "sh",
-            "-lc",
-            "set -eu; test \"$(id -u):$(id -g)\" = 2234:2235; \
-             test \"$(stat -c %u:%g /sandbox/e2e-volume/input.txt)\" = 0:0; \
-             touch /sandbox/direct-write; echo Ready; sleep infinity",
-        ],
-        "Ready",
-    )
-    .await
-    .expect("create OCI-user sandbox with nested volume");
-
-    let ssh_output = sandbox
-        .exec(&[
-            "sh",
-            "-lc",
-            "set -eu; test \"$(stat -c %u:%g /sandbox/e2e-volume/input.txt)\" = 0:0; \
-             touch /sandbox/ssh-write; echo nested-mount-owner-ok",
-        ])
-        .await
-        .expect("SSH child should preserve nested volume ownership");
-    assert!(
-        ssh_output.contains("nested-mount-owner-ok"),
-        "expected nested mount ownership marker:\n{ssh_output}"
-    );
-
-    sandbox.cleanup().await;
-    verify_volume_ownership(&volume)
-        .await
-        .expect("nested volume ownership should remain unchanged");
 }
 
 #[tokio::test]
@@ -275,23 +203,6 @@ async fn verify_volume(volume: &VolumeGuard) -> Result<(), String> {
     if !output.contains("volume-ok") {
         return Err(format!(
             "volume verification did not print expected marker:\n{output}"
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "e2e-docker")]
-async fn verify_volume_ownership(volume: &VolumeGuard) -> Result<(), String> {
-    let output = run_volume_container(
-        volume,
-        "verify-owner",
-        true,
-        "set -eu; test \"$(stat -c %u:%g /vol/input.txt)\" = 0:0; echo owner-ok",
-    )
-    .await?;
-    if !output.contains("owner-ok") {
-        return Err(format!(
-            "volume ownership verification did not print expected marker:\n{output}"
         ));
     }
     Ok(())

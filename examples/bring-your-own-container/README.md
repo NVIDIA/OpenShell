@@ -63,10 +63,9 @@ key requirements are:
   such as `app`, a numeric UID with a passwd entry that supplies its primary
   GID, or a numeric pair such as `1500:1500`. You can instead set both
   `process.run_as_user` and `process.run_as_group` explicitly in policy.
-- **Use `/sandbox` as the workspace.** Docker and Podman create and prepare the
-  directory automatically when OCI `USER` supplies any identity component.
-  Pre-own any files beneath it that the agent must modify; OpenShell does not
-  recursively rewrite image content ownership.
+- **Prepare `/sandbox` as the workspace.** Until OCI working-directory support
+  is added, create `/sandbox` and make it writable by the selected identity.
+  The example does this with `install -d -o app -g app /sandbox`.
 - **Install `iproute2`** for full network namespace isolation.
 - **Use a standard Linux base image** — distroless and `FROM scratch`
   images are not supported.

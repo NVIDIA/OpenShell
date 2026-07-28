@@ -1081,6 +1081,21 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
     }
 }
 
+/// Fill omitted process identity fields with the legacy `sandbox` defaults.
+///
+/// Docker and Podman preserve omission so their supervisors can fall back to
+/// OCI `Config.User`. Other drivers call this before validation and
+/// persistence to retain the existing public policy representation.
+pub fn ensure_sandbox_process_identity(policy: &mut SandboxPolicy) {
+    let process = policy.process.get_or_insert_with(ProcessPolicy::default);
+    if process.run_as_user.is_empty() {
+        process.run_as_user = "sandbox".into();
+    }
+    if process.run_as_group.is_empty() {
+        process.run_as_group = "sandbox".into();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Policy safety validation
 // ---------------------------------------------------------------------------
@@ -1686,6 +1701,30 @@ network_policies:
         assert!(!yaml.contains("run_as_group"));
         let reparsed = parse_sandbox_policy(&yaml).expect("round trip should parse");
         assert!(reparsed.process.unwrap().run_as_group.is_empty());
+    }
+
+    #[test]
+    fn ensure_sandbox_process_identity_fills_each_omitted_field() {
+        let cases = [
+            (None, None, "sandbox", "sandbox"),
+            (Some("1234"), None, "1234", "sandbox"),
+            (None, Some("1235"), "sandbox", "1235"),
+            (Some("1234"), Some("1235"), "1234", "1235"),
+        ];
+
+        for (user, group, expected_user, expected_group) in cases {
+            let mut policy = restrictive_default_policy();
+            policy.process = Some(ProcessPolicy {
+                run_as_user: user.unwrap_or_default().to_string(),
+                run_as_group: group.unwrap_or_default().to_string(),
+            });
+
+            ensure_sandbox_process_identity(&mut policy);
+
+            let process = policy.process.expect("normalized process policy");
+            assert_eq!(process.run_as_user, expected_user);
+            assert_eq!(process.run_as_group, expected_group);
+        }
     }
 
     #[test]

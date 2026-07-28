@@ -903,6 +903,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         token_secret_name,
         gpu_device_ids,
         image,
+        image,
         "",
     )
 }
@@ -912,13 +913,14 @@ pub fn build_container_spec_for_image(
     config: &PodmanComputeConfig,
     token_secret_name: Option<&str>,
     gpu_device_ids: Option<&[String]>,
+    requested_image: &str,
     image_id: &str,
     oci_user: &str,
 ) -> Result<Value, ComputeDriverError> {
     let name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     let vol = volume_name(&sandbox.id);
 
-    let env = build_env(sandbox, config, image_id, oci_user);
+    let env = build_env(sandbox, config, requested_image, oci_user);
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox, config);
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
@@ -1374,12 +1376,17 @@ mod tests {
             &test_config(),
             None,
             None,
+            "registry.example/app:latest",
             "sha256:immutable",
             "app:staff",
         )
         .unwrap();
 
         assert_eq!(container["image"].as_str(), Some("sha256:immutable"));
+        assert_eq!(
+            container["env"]["OPENSHELL_CONTAINER_IMAGE"].as_str(),
+            Some("registry.example/app:latest")
+        );
         assert_eq!(container["user"].as_str(), Some("0:0"));
         assert_eq!(container["image_pull_policy"].as_str(), Some("never"));
         assert_eq!(

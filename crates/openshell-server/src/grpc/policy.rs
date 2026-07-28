@@ -76,8 +76,9 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
-    level_matches, source_matches, validate_annotations, validate_no_reserved_provider_policy_keys,
-    validate_policy_safety, validate_static_fields_unchanged,
+    level_matches, normalize_process_identity_for_driver, source_matches, validate_annotations,
+    validate_no_reserved_provider_policy_keys, validate_policy_safety,
+    validate_static_fields_unchanged,
 };
 use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -1735,9 +1736,10 @@ async fn handle_update_config_inner(
                     "delete_setting cannot be combined with policy payload",
                 ));
             }
-            let new_policy = req.policy.ok_or_else(|| {
+            let mut new_policy = req.policy.ok_or_else(|| {
                 Status::invalid_argument("policy is required for global policy update")
             })?;
+            normalize_process_identity_for_driver(&mut new_policy, state.compute.driver_kind());
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             validate_policy_safety(&new_policy)?;
             crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy)
@@ -2013,11 +2015,15 @@ async fn handle_update_config_inner(
             provenance: &req.annotations,
             annotations: &req.annotations,
         };
+        let mut baseline_policy = spec.policy.clone();
+        if let Some(policy) = baseline_policy.as_mut() {
+            normalize_process_identity_for_driver(policy, state.compute.driver_kind());
+        }
         let (version, hash, updated_sandbox) = apply_merge_operations_with_retry(
             state.store.as_ref(),
             &sandbox_id,
             &workspace,
-            spec.policy.as_ref(),
+            baseline_policy.as_ref(),
             &merge_ops,
             Some(&atomic_context),
         )
@@ -2083,6 +2089,7 @@ async fn handle_update_config_inner(
     let mut new_policy = req
         .policy
         .ok_or_else(|| Status::invalid_argument("policy is required"))?;
+    normalize_process_identity_for_driver(&mut new_policy, state.compute.driver_kind());
 
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
@@ -2108,7 +2115,12 @@ async fn handle_update_config_inner(
     }
 
     let backfill_policy = if let Some(baseline_policy) = spec.policy.as_ref() {
-        validate_static_fields_unchanged(baseline_policy, &new_policy)?;
+        let mut comparable_baseline = baseline_policy.clone();
+        normalize_process_identity_for_driver(
+            &mut comparable_baseline,
+            state.compute.driver_kind(),
+        );
+        validate_static_fields_unchanged(&comparable_baseline, &new_policy)?;
         None
     } else {
         Some(new_policy.clone())
@@ -12118,9 +12130,9 @@ mod tests {
             .as_ref()
             .and_then(|spec| spec.policy.as_ref())
             .and_then(|policy| policy.process.as_ref())
-            .expect("partial process identity should be persisted");
+            .expect("legacy process identity should be persisted");
         assert_eq!(process.run_as_user, "1234");
-        assert!(process.run_as_group.is_empty());
+        assert_eq!(process.run_as_group, "sandbox");
         assert_eq!(
             updated_sandbox.metadata.as_ref().unwrap().resource_version,
             current_version + 1,

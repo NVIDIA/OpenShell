@@ -649,6 +649,7 @@ impl PodmanComputeDriver {
             &self.config,
             token_secret_name.as_deref(),
             gpu_devices.as_deref(),
+            image,
             &inspected_image.id,
             image_user,
         ) {
