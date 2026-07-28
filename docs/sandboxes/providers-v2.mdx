@@ -25,7 +25,7 @@ Providers v2 keeps those pieces together:
 | Custom provider definitions | You can export, edit, lint, import, list, and delete custom profiles. |
 | Runtime provider lifecycle | You can list, attach, and detach providers on existing sandboxes. |
 | Credential rotation | Provider refresh metadata lets the gateway refresh short-lived access tokens and update provider records. |
-| Backward compatibility | Credential delivery still uses environment placeholders and proxy rewrite. |
+| Credential transport | Credential delivery uses environment placeholders and proxy rewrite. Static placeholders resolve only at profile endpoints. |
 
 ## Enable Providers v2
 
@@ -63,6 +63,82 @@ Providers v2 currently includes these user-facing features:
 - Credential expiry metadata with `openshell provider update --credential-expires-at`; values accept Unix epoch milliseconds or ISO/RFC3339 timestamps.
 - Dynamic token grants that use the sandbox's SPIFFE JWT-SVID as an OAuth2 client assertion and inject short-lived tokens into supported headers for matching profile endpoints.
 - Endpoint-bound static credential placeholders. The sandbox proxy resolves a static credential only for request hosts, ports, and paths declared by its provider profile.
+
+## Understand Static Credential Endpoint Binding
+
+Static credential endpoint binding prevents a placeholder for one service from
+resolving on a different policy-allowed service. OpenShell associates every
+static credential environment key with the endpoints in its provider profile.
+The proxy checks that association before it substitutes the real value.
+
+A request can use a static credential only when all of these checks pass:
+
+| Check | Configuration source |
+|---|---|
+| The placeholder belongs to the current attached provider state. | Sandbox provider attachment and current provider record. |
+| The calling binary and destination are allowed. | Effective sandbox network policy. |
+| The host, port, and canonical request path match the credential binding. | Provider profile endpoints. |
+| The HTTP method, path, or protocol operation is allowed when L7 inspection is configured. | Effective sandbox network policy. |
+| The credential has not expired. | Provider credential expiry metadata. |
+
+Network policy and credential binding serve different purposes. Network policy
+authorizes traffic. Provider profile endpoints authorize use of the provider's
+credentials. A sandbox policy allow cannot widen a credential binding, and a
+credential binding cannot widen sandbox network policy.
+
+For example, this profile endpoint binds all static credential environment keys
+from the profile to `api.example.com:443` under `/v1`:
+
+```yaml showLineNumbers={false}
+endpoints:
+  - host: api.example.com
+    port: 443
+    path: /v1/**
+```
+
+The path `/v1/**` matches `/v1` and its descendants. An empty path, `**`, or
+`/**` matches every path on the selected host and port. Other path values use
+glob matching. OpenShell removes the query string and uses a canonical,
+secret-redacted path for this check, so a credential embedded in a request path
+does not need to be revealed before authorization.
+
+The binding applies to CONNECT and forward-proxy HTTP requests, including
+headers, Basic and Bearer authorization, URL paths, query parameters, opted-in
+request bodies, AWS SigV4 signing, and opted-in WebSocket text messages. Raw
+`tls: skip` and non-HTTP tunnels do not perform static credential substitution.
+
+If a request contains a known placeholder at a destination outside its binding,
+OpenShell returns HTTP 403 with this response:
+
+```json
+{"error":"credential_endpoint_mismatch","message":"Credential is not authorized for this request endpoint"}
+```
+
+The sandbox logs include the destination and
+`credential_endpoint_mismatch`. OCSF output includes both the denied activity
+and a detection finding. These events omit credential values, placeholders,
+environment keys, and query strings.
+
+Binding updates apply to both current and retained placeholder generations.
+Credential rotation keeps the current endpoint set. Updating a provider profile
+changes the binding on the next sandbox provider-environment sync, and detaching
+the provider revokes resolution for placeholders already held by running
+processes.
+
+<Warning>
+Static credentials require a provider profile with at least one usable
+endpoint. If any attached static provider lacks complete binding metadata, the
+sandbox rejects the provider environment update and keeps no static provider
+credentials active. Import a custom profile, create a replacement provider
+whose `--type` is that profile ID, attach the replacement, and detach the
+profileless provider.
+</Warning>
+
+After upgrading a gateway and supervisor to a release with endpoint binding,
+restart or recreate older running sandboxes. A new gateway withholds static
+credential material from supervisors that do not advertise binding support.
+Rotate attached static credentials after upgrading when an older sandbox may
+have received their real values.
 
 ## Roadmap
 
@@ -284,7 +360,7 @@ binaries:
 
 `category` groups profiles in `openshell provider list-profiles`. Use one of the values in the category enum.
 
-`credentials` declares the credential names, environment variables, auth metadata, optional refresh metadata, and optional dynamic token grant metadata for the provider type. The `auth_style` field accepts `basic`, `bearer`, `header`, `query`, or `path`. When `auth_style` is `path`, set `path_template` to a URL path containing the `{credential}` placeholder exactly once (for example, `/v1/{credential}/resources`). Static credentials are exposed as placeholder environment variables and resolved in outbound HTTP requests. Dynamic token grants are resolved by the sandbox proxy on demand for matching profile endpoints and support `bearer` or `header` placement. Credential environment variable names must not use the reserved `v<digits>_` prefix, such as `v10_GITHUB_TOKEN`, because OpenShell uses that namespace for revision-scoped placeholders.
+`credentials` declares the credential names, environment variables, auth metadata, optional refresh metadata, and optional dynamic token grant metadata for the provider type. The `auth_style` field accepts `basic`, `bearer`, `header`, `query`, or `path`. When `auth_style` is `path`, set `path_template` to a URL path containing the `{credential}` placeholder exactly once (for example, `/v1/{credential}/resources`). Static credentials are exposed as placeholder environment variables and resolved in outbound HTTP requests only at profile endpoints. Every static credential environment key currently receives the full profile endpoint set. Dynamic token grants are resolved by the sandbox proxy on demand for matching profile endpoints and support `bearer` or `header` placement. Credential environment variable names must not use the reserved `v<digits>_` prefix, such as `v10_GITHUB_TOKEN`, because OpenShell uses that namespace for revision-scoped placeholders.
 
 `discovery` controls what `--from-existing` scans when
 `providers_v2_enabled=true`. Each entry in `discovery.credentials` must name a
@@ -446,7 +522,7 @@ Use an ISO/RFC3339 timestamp or Unix epoch milliseconds. Use `0` as the timestam
 
 OpenShell skips expired provider credentials when it builds a sandbox provider environment. Running sandboxes also reject expired retained credential generations during placeholder resolution, so stale placeholders fail closed instead of forwarding unresolved or expired credential material.
 
-The gateway sends a complete host, port, and path binding for every static credential key. Supervisors reject incomplete binding metadata and clear previously active provider material when a refresh fails validation. A credential used at a different endpoint returns HTTP 403 and produces secret-safe security telemetry.
+The gateway sends a complete host, port, and path binding for every static credential key. Supervisors reject incomplete binding metadata and clear previously active provider material when a refresh fails validation. Refer to [Static Credential Endpoint Binding](#understand-static-credential-endpoint-binding) for matching, denial, lifecycle, and migration behavior.
 
 ## Configure Credential Refresh
 
