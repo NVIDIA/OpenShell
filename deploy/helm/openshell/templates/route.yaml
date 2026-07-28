@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if .Values.openshiftRoute.enabled }}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "openshell.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+  {{- with .Values.openshiftRoute.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.openshiftRoute.host }}
+  host: {{ .Values.openshiftRoute.host }}
+  {{- end }}
+  to:
+    kind: Service
+    name: {{ include "openshell.fullname" . }}
+  port:
+    targetPort: grpc
+  tls:
+    termination: passthrough
+  wildcardPolicy: None
+{{- end }}

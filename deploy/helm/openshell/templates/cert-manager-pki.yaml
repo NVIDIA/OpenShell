@@ -42,6 +42,15 @@ spec:
   ca:
     secretName: {{ .Values.certManager.caSecretName | quote }}
 ---
+{{- $externalServerIssuer := .Values.certManager.serverIssuerRef.name }}
+{{- if $externalServerIssuer }}
+{{- range .Values.certManager.serverDnsNames }}
+{{- /* Single-label names (e.g. "openshell") are also rejected by ACME CAs but are intentionally not checked here — the guard targets recognisable internal-network patterns. */ -}}
+{{- if or (eq . "localhost") (hasSuffix ".localhost" .) (hasSuffix ".svc.cluster.local" .) (hasSuffix ".svc" .) (eq . "host.docker.internal") (eq . "host.containers.internal") }}
+{{- fail (printf "certManager.serverIssuerRef.name is set (external issuer) but certManager.serverDnsNames contains %q — external CAs (e.g. ACME / Let's Encrypt) reject internal-only names per CA/Browser Forum baseline requirements. Override certManager.serverDnsNames with your externally-resolvable hostname(s)." .) }}
+{{- end }}
+{{- end }}
+{{- end }}
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
@@ -53,7 +62,30 @@ spec:
   secretName: {{ .Values.server.tls.certSecretName | quote }}
   duration: {{ .Values.certManager.certificateDuration | quote }}
   renewBefore: {{ .Values.certManager.certificateRenewBefore | quote }}
-  commonName: openshell-server
+  {{- if $externalServerIssuer }}
+  # External issuers (e.g. ACME) reject internal-only names (cluster-local,
+  # localhost, loopback IPs) per CA/Browser Forum baseline requirements, and
+  # require any commonName to also appear in dnsNames. Only request the
+  # externally-resolvable SANs the operator configured — no defaults, no IPs.
+  {{- if .Values.certManager.serverDnsNames }}
+  commonName: {{ first .Values.certManager.serverDnsNames | quote }}
+  {{- end }}
+  dnsNames:
+    {{- range .Values.certManager.serverDnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+  {{- else }}
+  # The chart fullname is always the first entry of defaultServerDnsNames
+  # below, so it's always valid as a commonName.
+  #
+  # Upgrade note: this replaces the previously-hardcoded "openshell-server"
+  # commonName. The ACME commonName-must-be-a-SAN constraint this exists for
+  # only applies to the external-issuer branch above, but this branch was
+  # changed too for consistency. Existing self-signed/internal-CA deployments
+  # will get a new server cert with a different Subject CN on next reissue
+  # after upgrading — SAN-based hostname verification (what TLS clients
+  # actually check) is unaffected.
+  commonName: {{ include "openshell.fullname" . }}
   dnsNames:
     {{- range (include "openshell.defaultServerDnsNames" . | fromYamlArray) }}
     - {{ . | quote }}
@@ -65,6 +97,7 @@ spec:
   ipAddresses:
     {{- toYaml .Values.certManager.serverIpAddresses | nindent 4 }}
   {{- end }}
+  {{- end }}
   privateKey:
     algorithm: ECDSA
     size: 256
@@ -73,9 +106,15 @@ spec:
     - digital signature
     - key encipherment
   issuerRef:
+    {{- if .Values.certManager.serverIssuerRef.name }}
+    name: {{ .Values.certManager.serverIssuerRef.name }}
+    kind: {{ .Values.certManager.serverIssuerRef.kind | default "ClusterIssuer" }}
+    group: {{ .Values.certManager.serverIssuerRef.group | default "cert-manager.io" }}
+    {{- else }}
     name: {{ include "openshell.fullname" . }}-ca-issuer
     kind: Issuer
     group: cert-manager.io
+    {{- end }}
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -97,7 +136,13 @@ spec:
     - digital signature
     - key encipherment
   issuerRef:
+    {{- if .Values.certManager.clientIssuerRef.name }}
+    name: {{ .Values.certManager.clientIssuerRef.name }}
+    kind: {{ .Values.certManager.clientIssuerRef.kind | default "ClusterIssuer" }}
+    group: {{ .Values.certManager.clientIssuerRef.group | default "cert-manager.io" }}
+    {{- else }}
     name: {{ include "openshell.fullname" . }}-ca-issuer
     kind: Issuer
     group: cert-manager.io
+    {{- end }}
 {{- end }}
