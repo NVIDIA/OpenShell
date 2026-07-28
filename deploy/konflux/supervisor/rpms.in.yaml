@@ -1,0 +1,29 @@
+# RPM dependencies for Dockerfile.konflux.supervisor
+# Build + runtime stages combined. Generate lockfile with:
+#   rpm-lockfile-prototype --containerfile deploy/docker/Dockerfile.konflux.supervisor \
+#       --arch x86_64 \
+#       --outfile deploy/konflux/supervisor/rpms.lock.yaml \
+#       deploy/konflux/supervisor/rpms.in.yaml
+#
+contentOrigin:
+  repofiles:
+    - /etc/yum.repos.d/ubi.repo
+packages:
+  # Build stage: musl toolchain build
+  - gcc
+  - make
+  - tar
+  - gzip
+  - xz
+  # Build stage: Rust compilation (rustup provides rust/cargo)
+  - gcc-c++
+  - cmake
+  - openssl-devel
+  - git-core
+  # Runtime stage: network enforcement
+  - nftables
+  - iptables-nft
+  # Runtime stage: network namespace setup
+  - iproute
+  # Runtime stage: namespace entry
+  - util-linux-core

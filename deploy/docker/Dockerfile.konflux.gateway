@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Gateway image for RHEL/Konflux (hermetic build).
+#
+# Multi-stage build that compiles openshell-gateway from source on UBI9.
+# Requires prefetched dependencies via Hermeto (cargo, rpm, generic).
+# See deploy/konflux/ for prefetch configs.
+#
+# Local build:  ./deploy/konflux/build-local.sh gateway
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi:9.6@sha256:dec374e05cc13ebbc0975c9f521f3db6942d27f8ccdf06b180160490eef8bdbc AS builder
+
+RUN dnf install -y --nodocs \
+        rust cargo \
+        gcc gcc-c++ make cmake \
+        openssl-devel git-core clang-devel \
+        gcc-toolset-14 gcc-toolset-14-gcc-c++ \
+    && dnf clean all
+
+# gcc-toolset-14 provides C++20 <format> header required by bundled Z3.
+# Same pattern as ~/git/builder (AIPCC-10154).
+ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64:/opt/rh/gcc-toolset-14/root/usr/lib \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo/ .cargo/
+COPY crates/ crates/
+COPY proto/ proto/
+COPY providers/ providers/
+
+# z3-sys bundled build needs prefetched Z3 source.
+ARG Z3_VERSION=4.16.0
+RUN mkdir -p /tmp/z3-src \
+    && tar xzf /cachi2/deps/generic/z3-${Z3_VERSION}.tar.gz -C /tmp/z3-src --strip-components=1 \
+    && Z3_SYS_BUNDLED_DIR_OVERRIDE=/tmp/z3-src \
+    cargo build --release \
+        --package openshell-server \
+        --features bundled-z3
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.6@sha256:34880b64c07f28f64d95737f82f891516de9a3b43583f39970f7bf8e4cfa48b7
+
+RUN microdnf install -y --nodocs ca-certificates \
+    && microdnf clean all
+
+COPY --from=builder --chmod=0555 \
+    /build/target/release/openshell-gateway \
+    /usr/local/bin/openshell-gateway
+
+LABEL com.redhat.component="odh-openshell-gateway-container" \
+      description="gRPC/HTTP control-plane server for OpenShell sandboxed AI agent runtimes" \
+      summary="gRPC/HTTP control-plane server for OpenShell sandboxed AI agent runtimes" \
+      name="rhoai/odh-openshell-gateway-rhel9" \
+      maintainer="['managed-open-data-hub@redhat.com']" \
+      io.openshift.expose-services="8080:http" \
+      io.k8s.display-name="odh-openshell-gateway" \
+      io.k8s.description="odh-openshell-gateway" \
+      com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
+
+USER 1000:1000
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/openshell-gateway"]
+CMD ["--bind-address", "0.0.0.0", "--port", "8080"]

@@ -1,0 +1,12 @@
+# Generic fetcher artifacts for Dockerfile.konflux.gateway
+# These are prefetched by Hermeto and mounted at /cachi2/deps/generic/
+# Include in prefetch-input alongside cargo and rpm types.
+#
+# To update hashes: curl -sL <url> | sha256sum
+metadata:
+  version: "1.0"
+artifacts:
+  # Z3 source (z3-sys bundled build downloads from GitHub at build time)
+  - download_url: https://github.com/Z3Prover/z3/archive/refs/tags/z3-4.16.0.tar.gz
+    checksum: "sha256:c68c3e5e4810b16126b8cb4c47eee85c1ac3e24a81914c8e371b40de9dd33ac7"
+    filename: z3-4.16.0.tar.gz

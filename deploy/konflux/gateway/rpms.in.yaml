@@ -1,0 +1,29 @@
+# RPM dependencies for Dockerfile.konflux.gateway
+# Build + runtime stages combined. Generate lockfile with:
+#   rpm-lockfile-prototype --image registry.access.redhat.com/ubi9/ubi:9.6 \
+#       --arch x86_64 \
+#       --outfile deploy/konflux/gateway/rpms.lock.yaml \
+#       deploy/konflux/gateway/rpms.in.yaml
+#
+contentOrigin:
+  repofiles:
+    - /etc/yum.repos.d/ubi.repo
+packages:
+  # Build stage: Rust toolchain
+  - rust
+  - cargo
+  # Build stage: C/C++ toolchain
+  - gcc
+  - gcc-c++
+  - make
+  - cmake
+  # Build stage: gcc-toolset-14 for C++20 <format> (required by bundled Z3)
+  - gcc-toolset-14
+  - gcc-toolset-14-gcc-c++
+  # Build stage: z3-sys bindgen needs libclang
+  - clang-devel
+  # Build stage: other
+  - openssl-devel
+  - git-core
+  # Runtime stage
+  - ca-certificates
