@@ -2598,7 +2598,7 @@ mod tests {
         let delete = tokio::spawn(async move {
             handle_delete_sandbox_inner(
                 &delete_state,
-                Request::new(DeleteSandboxRequest {
+                authed_request(DeleteSandboxRequest {
                     name: "reused-name".to_string(),
                     workspace: "default".to_string(),
                 }),
