@@ -11,10 +11,11 @@ use crate::l7::{EnforcementMode, L7RequestInfo};
 use crate::opa::TunnelPolicyEngine;
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use miette::{IntoDiagnostic, Result, miette};
-use openshell_core::secrets::SecretResolver;
+use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_core::secrets::{SecretResolver, contains_reserved_credential_marker};
 use openshell_ocsf::{
-    ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SeverityId, StatusId,
-    ocsf_emit,
+    ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
+    NetworkActivityBuilder, SeverityId, StatusId, ocsf_emit,
 };
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -28,6 +29,7 @@ const OPCODE_BINARY: u8 = 0x2;
 const OPCODE_CLOSE: u8 = 0x8;
 const OPCODE_PING: u8 = 0x9;
 const OPCODE_PONG: u8 = 0xA;
+const CREDENTIAL_ENDPOINT_MISMATCH: &str = "websocket credential endpoint mismatch";
 
 #[derive(Debug)]
 struct FrameHeader {
@@ -65,6 +67,8 @@ pub(super) struct InspectionOptions<'a> {
 pub(super) struct RelayOptions<'a> {
     pub(super) policy_name: &'a str,
     pub(super) resolver: Option<&'a SecretResolver>,
+    pub(super) provider_credentials: Option<&'a ProviderCredentialState>,
+    pub(super) target: &'a str,
     pub(super) inspector: Option<InspectionOptions<'a>>,
     pub(super) compression: WebSocketCompression,
 }
@@ -105,9 +109,65 @@ where
         result = client_to_server => result,
         result = server_to_client => result,
     };
+    if result
+        .as_ref()
+        .is_err_and(|error| error.to_string().contains(CREDENTIAL_ENDPOINT_MISMATCH))
+    {
+        emit_credential_endpoint_mismatch(host, port, options.policy_name);
+        write_policy_violation_close(&mut client_write).await?;
+    }
     let _ = upstream_write.shutdown().await;
     let _ = client_write.shutdown().await;
     result
+}
+
+async fn write_policy_violation_close<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<()> {
+    let reason = b"credential endpoint mismatch";
+    let mut frame = Vec::with_capacity(reason.len() + 4);
+    frame.push(0x80 | OPCODE_CLOSE);
+    frame.push(u8::try_from(reason.len() + 2).expect("close reason fits one-byte length"));
+    frame.extend_from_slice(&1008u16.to_be_bytes());
+    frame.extend_from_slice(reason);
+    writer.write_all(&frame).await.into_diagnostic()?;
+    writer.flush().await.into_diagnostic()
+}
+
+fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
+    ocsf_emit!(
+        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Fail)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain(host, port))
+            .firewall_rule(policy_name, "credential-binding")
+            .message(format!(
+                "WebSocket credential use denied: credential is not authorized for {host}:{port}"
+            ))
+            .status_detail("credential_endpoint_mismatch")
+            .build()
+    );
+    ocsf_emit!(
+        DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::High)
+            .is_alert(true)
+            .finding_info(FindingInfo::new(
+                "openshell.provider_credential.endpoint_mismatch",
+                "Provider credential used at an unauthorized endpoint",
+            ))
+            .evidence_pairs(&[
+                ("policy", policy_name),
+                ("host", host),
+                ("protocol", "websocket"),
+                ("disposition", "denied"),
+            ])
+            .message("Provider credential endpoint binding mismatch; WebSocket closed")
+            .build()
+    );
 }
 
 async fn relay_client_to_server<R, W>(
@@ -492,10 +552,24 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     };
     let mut text = String::from_utf8(message_payload)
         .map_err(|_| miette!("websocket text message is not valid UTF-8"))?;
-    let replacements = if let Some(resolver) = options.resolver {
+    let live_resolver = options
+        .provider_credentials
+        .and_then(|credentials| credentials.resolver_for_endpoint(host, port, options.target));
+    let resolver = live_resolver.as_deref().or(options.resolver);
+    let replacements = if let Some(resolver) = resolver {
         resolver
             .rewrite_websocket_text_placeholders(&mut text)
-            .map_err(|_| miette!("websocket credential placeholder resolution failed"))?
+            .map_err(|error| {
+                if error.is_endpoint_mismatch() {
+                    miette!(CREDENTIAL_ENDPOINT_MISMATCH)
+                } else {
+                    miette!("websocket credential placeholder resolution failed")
+                }
+            })?
+    } else if contains_reserved_credential_marker(&text) {
+        return Err(miette!(
+            "websocket credential placeholder resolution failed"
+        ));
     } else {
         0
     };
@@ -1226,6 +1300,8 @@ network_policies:
         let options = RelayOptions {
             policy_name: "test-policy",
             resolver: Some(&resolver),
+            provider_credentials: None,
+            target: "/",
             inspector: None,
             compression: WebSocketCompression::None,
         };
@@ -1284,6 +1360,8 @@ network_policies:
         let options = RelayOptions {
             policy_name: "graphql_ws",
             resolver,
+            provider_credentials: None,
+            target: "/graphql",
             inspector: Some(InspectionOptions {
                 engine: &tunnel_engine,
                 ctx: &ctx,
@@ -1320,6 +1398,8 @@ network_policies:
         let options = RelayOptions {
             policy_name: "test-policy",
             resolver: Some(&resolver),
+            provider_credentials: None,
+            target: "/",
             inspector: None,
             compression: WebSocketCompression::PermessageDeflate,
         };
@@ -1557,6 +1637,8 @@ network_policies:
                 RelayOptions {
                     policy_name: "test-policy",
                     resolver: Some(&resolver),
+                    provider_credentials: None,
+                    target: "/",
                     inspector: None,
                     compression: WebSocketCompression::None,
                 },

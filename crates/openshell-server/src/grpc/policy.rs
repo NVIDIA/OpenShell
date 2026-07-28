@@ -1656,7 +1656,7 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
     provider_names: &[String],
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-provider-env-revision-v1");
+    hasher.update(b"openshell-provider-env-revision-v2");
 
     for provider_name in provider_names {
         hasher.update(provider_name.as_bytes());
@@ -1788,6 +1788,7 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     request: Request<GetSandboxProviderEnvironmentRequest>,
 ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
+    let supports_static_credential_bindings = request.get_ref().supports_static_credential_bindings;
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     drop(request);
 
@@ -1815,7 +1816,7 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         &provider_names,
     )
     .await?;
-    let provider_environment = super::provider::resolve_provider_environment_with_credentials(
+    let mut provider_environment = super::provider::resolve_provider_environment_with_credentials(
         state.store.as_ref(),
         &provider_profile_catalog,
         &workspace,
@@ -1823,6 +1824,27 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         &state.credentials,
     )
     .await?;
+
+    if supports_static_credential_bindings {
+        for key in &provider_environment.static_credential_keys {
+            let Some(binding) = provider_environment.static_credential_bindings.get(key) else {
+                return Err(Status::failed_precondition(
+                    "static provider credentials require a provider profile with network endpoints",
+                ));
+            };
+            if binding.endpoints.is_empty() {
+                return Err(Status::failed_precondition(
+                    "static provider credentials require at least one provider profile endpoint",
+                ));
+            }
+        }
+    } else {
+        for key in &provider_environment.static_credential_keys {
+            provider_environment.environment.remove(key);
+            provider_environment.credential_expires_at_ms.remove(key);
+        }
+        provider_environment.static_credential_bindings.clear();
+    }
 
     info!(
         sandbox_id = %sandbox_id,
@@ -1832,11 +1854,20 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         "GetSandboxProviderEnvironment request completed successfully"
     );
 
+    let non_secret_environment_keys = provider_environment
+        .environment
+        .keys()
+        .filter(|key| !provider_environment.static_credential_keys.contains(*key))
+        .cloned()
+        .collect();
+
     Ok(Response::new(GetSandboxProviderEnvironmentResponse {
         environment: provider_environment.environment,
         provider_env_revision,
         credential_expires_at_ms: provider_environment.credential_expires_at_ms,
         dynamic_credentials: provider_environment.dynamic_credentials,
+        static_credential_bindings: provider_environment.static_credential_bindings,
+        non_secret_environment_keys,
     }))
 }
 
@@ -5904,6 +5935,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-snapshot-consistency".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -6937,6 +6969,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-env".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -6949,6 +6982,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-env".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -6958,6 +6992,42 @@ mod tests {
 
         assert_eq!(legacy_env, v2_env);
         assert_eq!(v2_env.get("GITHUB_TOKEN"), Some(&"ghp-test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn provider_environment_withholds_static_credentials_from_legacy_supervisors() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-legacy-provider-env",
+                "legacy-provider-env",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-legacy-provider-env".to_string(),
+                supports_static_credential_bindings: false,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.environment.contains_key("GITHUB_TOKEN"));
+        assert!(response.static_credential_bindings.is_empty());
     }
 
     #[tokio::test]
@@ -6983,6 +7053,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-revision".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -6999,6 +7070,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-revision".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -7170,6 +7242,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -7199,6 +7272,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -7236,6 +7310,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -7338,6 +7413,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -7370,6 +7446,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -7406,6 +7483,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await

@@ -15,14 +15,14 @@ use crate::provider_profile_sources::{
 use openshell_core::metadata::ObjectWorkspace;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialTokenGrantAudienceOverride, ProviderProfile,
-    ProviderProfileCredential, Sandbox,
+    ProviderProfileCredential, Sandbox, StaticCredentialBinding, StaticCredentialEndpointBinding,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
 };
 use openshell_policy::ProviderPolicyLayer;
 use prost::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tonic::Status;
 use tracing::warn;
 
@@ -58,6 +58,8 @@ pub(super) struct ProviderEnvironment {
     pub environment: HashMap<String, String>,
     pub credential_expires_at_ms: HashMap<String, i64>,
     pub dynamic_credentials: HashMap<String, ProviderProfileCredential>,
+    pub static_credential_bindings: HashMap<String, StaticCredentialBinding>,
+    pub static_credential_keys: HashSet<String>,
 }
 
 impl ProviderEnvironment {
@@ -929,6 +931,8 @@ pub(super) async fn resolve_provider_environment_with_credentials(
 
     let mut env = HashMap::new();
     let mut expires = HashMap::new();
+    let mut static_credential_bindings = HashMap::new();
+    let mut static_credential_keys = HashSet::new();
     let now_ms = crate::persistence::current_time_ms();
     validate_provider_environment_keys_unique_at(
         store,
@@ -947,6 +951,27 @@ pub(super) async fn resolve_provider_environment_with_credentials(
             .await
             .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
+
+        let profile_id =
+            normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
+        let profile =
+            get_provider_type_profile_for_scope(catalog, profile_id, &provider.profile_workspace);
+        let profile_endpoints = profile.as_ref().map(|profile| {
+            profile
+                .to_proto()
+                .endpoints
+                .into_iter()
+                .flat_map(|endpoint| {
+                    endpoint_ports(endpoint.port, &endpoint.ports)
+                        .into_iter()
+                        .map(move |port| StaticCredentialEndpointBinding {
+                            host: endpoint.host.clone(),
+                            port,
+                            path: endpoint.path.clone(),
+                        })
+                })
+                .collect::<Vec<_>>()
+        });
 
         for (key, value) in &provider.credentials {
             if is_non_injectable_provider_credential(&provider, key) {
@@ -976,6 +1001,15 @@ pub(super) async fn resolve_provider_environment_with_credentials(
                     expires.entry(key.clone()).or_insert(expires_at_ms);
                 }
                 env.entry(key.clone()).or_insert_with(|| value.clone());
+                static_credential_keys.insert(key.clone());
+                if let Some(endpoints) = &profile_endpoints {
+                    static_credential_bindings.insert(
+                        key.clone(),
+                        StaticCredentialBinding {
+                            endpoints: endpoints.clone(),
+                        },
+                    );
+                }
             } else {
                 warn!(
                     provider_name = %name,
@@ -1029,6 +1063,8 @@ pub(super) async fn resolve_provider_environment_with_credentials(
             provider_names,
         )
         .await?,
+        static_credential_bindings,
+        static_credential_keys,
     })
 }
 
@@ -1339,16 +1375,7 @@ fn path_prefix_pattern(path: &str) -> Option<&str> {
 }
 
 fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
-    if path_matches_all(pattern) {
-        return true;
-    }
-    if pattern == path {
-        return true;
-    }
-    if let Some(prefix) = path_prefix_pattern(pattern) {
-        return path == prefix || path.starts_with(&format!("{prefix}/"));
-    }
-    glob::Pattern::new(pattern).is_ok_and(|glob| glob.matches(path))
+    openshell_core::endpoint_path::matches(pattern, path)
 }
 
 pub async fn validate_provider_environment_keys_unique(
@@ -2702,6 +2729,25 @@ async fn profile_attached_sandbox_diagnostics(
                 continue;
             }
             if let Some((source, profile)) = candidate_profiles.get(profile_id) {
+                let has_static_credentials = provider
+                    .credentials
+                    .keys()
+                    .any(|key| !is_non_injectable_provider_credential(&provider, key));
+                let has_usable_endpoint = profile.to_proto().endpoints.iter().any(|endpoint| {
+                    !endpoint_ports(endpoint.port, &endpoint.ports).is_empty()
+                        && !endpoint.host.trim().is_empty()
+                });
+                if has_static_credentials && !has_usable_endpoint {
+                    diagnostics.push(ProfileValidationDiagnostic {
+                        source: source.clone(),
+                        profile_id: profile_id.to_string(),
+                        field: "endpoints".to_string(),
+                        message: format!(
+                            "{operation} would leave static provider credentials without an authorized endpoint on sandbox '{sandbox_name}'"
+                        ),
+                        severity: "error".to_string(),
+                    });
+                }
                 bindings.extend(dynamic_token_grant_bindings_for_profile(
                     provider.object_name(),
                     &profile.to_proto(),
@@ -7497,6 +7543,18 @@ mod tests {
         assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
         assert_eq!(result.get("CLAUDE_API_KEY"), Some(&"sk-abc".to_string()));
         assert!(!result.contains_key("endpoint"));
+        assert!(
+            result
+                .static_credential_bindings
+                .get("ANTHROPIC_API_KEY")
+                .is_some_and(|binding| !binding.endpoints.is_empty())
+        );
+        assert!(
+            result
+                .static_credential_bindings
+                .get("CLAUDE_API_KEY")
+                .is_some_and(|binding| !binding.endpoints.is_empty())
+        );
     }
 
     #[tokio::test]
@@ -7517,6 +7575,7 @@ mod tests {
 
         assert_eq!(result.get("API_TOKEN"), Some(&"token-123".to_string()));
         assert!(result.dynamic_credentials.is_empty());
+        assert!(!result.static_credential_bindings.contains_key("API_TOKEN"));
     }
 
     #[tokio::test]

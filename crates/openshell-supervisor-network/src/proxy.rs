@@ -23,8 +23,9 @@ use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
 use openshell_ocsf::{
-    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
-    NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
+    ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
+    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, Process, SeverityId, StatusId,
+    Url as OcsfUrl, ocsf_emit,
 };
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -61,6 +62,41 @@ const INFERENCE_LOCAL_HOST: &str = "inference.local";
 const INFERENCE_LOCAL_PORT: u16 = 443;
 #[cfg(target_os = "linux")]
 const SIDECAR_SUPERVISOR_TOPOLOGY: &str = "sidecar";
+
+fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
+    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Fail)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .firewall_rule(policy_name, "credential-binding")
+        .message(format!(
+            "Credential use denied: credential is not authorized for {host}:{port}"
+        ))
+        .status_detail("credential_endpoint_mismatch")
+        .build();
+    ocsf_emit!(event);
+    let finding = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .is_alert(true)
+        .finding_info(FindingInfo::new(
+            "openshell.provider_credential.endpoint_mismatch",
+            "Provider credential used at an unauthorized endpoint",
+        ))
+        .evidence_pairs(&[
+            ("policy", policy_name),
+            ("host", host),
+            ("disposition", "denied"),
+        ])
+        .message("Provider credential endpoint binding mismatch; request denied")
+        .build();
+    ocsf_emit!(finding);
+}
 
 /// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
 /// machine. Traffic to these names is eligible for the trusted-gateway SSRF
@@ -327,6 +363,7 @@ impl ProxyHandle {
                         let proposals = agent_proposals.clone();
                         let gw = trusted_host_gateway.clone();
                         let up_proxy = upstream_proxy.clone();
+                        let credentials = provider_credentials.clone();
                         let resolver = provider_credentials
                             .as_ref()
                             .and_then(ProviderCredentialState::resolver);
@@ -350,6 +387,7 @@ impl ProxyHandle {
                                 proposals,
                                 gw,
                                 up_proxy,
+                                credentials,
                                 resolver,
                                 dynamic_credentials,
                                 dtx,
@@ -1098,6 +1136,7 @@ async fn handle_tcp_connection(
     agent_proposals: openshell_core::proposals::AgentProposals,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
+    provider_credentials: Option<ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
     dynamic_credentials: Option<
         Arc<
@@ -1167,6 +1206,7 @@ async fn handle_tcp_connection(
             policy_local_ctx,
             agent_proposals,
             trusted_host_gateway,
+            provider_credentials,
             secret_resolver,
             dynamic_credentials,
             denial_tx.as_ref(),
@@ -1506,6 +1546,7 @@ async fn handle_tcp_connection(
     // Build request-processing context shared by CONNECT and forward HTTP.
     let ctx = relay::http_context(
         &decision,
+        provider_credentials,
         secret_resolver.clone(),
         activity_tx.clone(),
         dynamic_credentials.clone(),
@@ -3747,7 +3788,7 @@ fn rewrite_forward_request(
         if output_str.contains(secrets::PLACEHOLDER_PREFIX_PUBLIC)
             || output_str.contains(secrets::PROVIDER_ALIAS_MARKER_PUBLIC)
         {
-            return Err(secrets::UnresolvedPlaceholderError { location: "header" });
+            return Err(secrets::UnresolvedPlaceholderError::unavailable("header"));
         }
     }
 
@@ -3915,6 +3956,7 @@ async fn handle_forward_proxy(
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     agent_proposals: openshell_core::proposals::AgentProposals,
     trusted_host_gateway: Arc<Option<IpAddr>>,
+    provider_credentials: Option<ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
     dynamic_credentials: Option<
         Arc<
@@ -3945,6 +3987,10 @@ async fn handle_forward_proxy(
         }
     };
     let host_lc = host.to_ascii_lowercase();
+    let secret_resolver = provider_credentials
+        .as_ref()
+        .and_then(|credentials| credentials.resolver_for_endpoint(&host_lc, port, &path))
+        .or(secret_resolver);
 
     if host_lc == POLICY_LOCAL_HOST {
         if scheme != "http" || port != 80 {
@@ -4163,6 +4209,7 @@ async fn handle_forward_proxy(
     let mut request_body_credential_rewrite = false;
     let l7_ctx = relay::http_context(
         &decision,
+        provider_credentials,
         secret_resolver.clone(),
         activity_tx.cloned(),
         dynamic_credentials.clone(),
@@ -4297,7 +4344,20 @@ async fn handle_forward_proxy(
                     return Ok(());
                 }
             };
-        let Some(l7_config) = select_l7_config_for_path(&route.configs, &path) else {
+        let Ok(redacted_path) = secrets::redact_target_for_policy(&path) else {
+            respond(
+                client,
+                &build_json_error_response(
+                    400,
+                    "Bad Request",
+                    "invalid_credential_placeholder",
+                    "request-target contains an invalid credential placeholder",
+                ),
+            )
+            .await?;
+            return Ok(());
+        };
+        let Some(l7_config) = select_l7_config_for_path(&route.configs, &redacted_path) else {
             emit_activity_simple(activity_tx, true, "l7_policy");
             respond(
                 client,
@@ -4477,7 +4537,7 @@ async fn handle_forward_proxy(
         };
         let request_info = crate::l7::L7RequestInfo {
             action: method.to_string(),
-            target: path.clone(),
+            target: redacted_path,
             query_params,
             graphql,
             jsonrpc,
@@ -4859,16 +4919,30 @@ async fn handle_forward_proxy(
                 error = %e,
                 "credential injection failed in forward proxy"
             );
-            respond(
-                client,
-                &build_json_error_response(
-                    500,
-                    "Internal Server Error",
-                    "credential_injection_failed",
-                    "unresolved credential placeholder in request",
-                ),
-            )
-            .await?;
+            if e.is_endpoint_mismatch() {
+                emit_credential_endpoint_mismatch(&host_lc, port, policy_str);
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "credential_endpoint_mismatch",
+                        "credential is not authorized for this request endpoint",
+                    ),
+                )
+                .await?;
+            } else {
+                respond(
+                    client,
+                    &build_json_error_response(
+                        500,
+                        "Internal Server Error",
+                        "credential_injection_failed",
+                        "unresolved credential placeholder in request",
+                    ),
+                )
+                .await?;
+            }
             return Ok(());
         }
     };
@@ -5210,6 +5284,7 @@ network_policies: {}
             AgentProposals::default(),
             Arc::new(None),
             Arc::new(None),
+            None,
             None,
             None,
             None,
@@ -9580,6 +9655,7 @@ network_policies:
                 AgentProposals::default(), // agent_proposals
                 Arc::new(None),            // trusted_host_gateway
                 Arc::new(None),            // upstream_proxy
+                None,                      // provider_credentials
                 None,                      // secret_resolver
                 None,                      // dynamic_credentials
                 Some(denial_tx),           // denial_tx — positive allow/deny signal
@@ -9646,6 +9722,7 @@ network_policies:
             AgentProposals::default(),
             Arc::new(None),
             Arc::new(None),
+            None,
             None,
             None,
             Some(denial_tx),
