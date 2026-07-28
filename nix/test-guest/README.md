@@ -152,7 +152,7 @@ A cache build boots and configures a disposable VM, runs the internal sealing sc
 
 The key includes the pinned base-image identity, guest architecture, ordered configuration file digests, Ansible version, cache generation, and sealing script digest. Installed packages, copied binaries, forwarded ports, and guest commands are never cached.
 
-Normal `test-guest` runs automatically use an exact valid local entry and create a fresh writable overlay, cloud-init instance, machine ID, and SSH identity. On a local miss, the runner uses the pinned cloud image and applies configurations normally. Set `OPENSHELL_TEST_GUEST_CACHE_DISABLE=1` to bypass local lookup.
+Normal `test-guest` runs automatically use an exact valid local entry after rechecking its disk checksum and QCOW2 structure. They create a fresh writable overlay, cloud-init instance, machine ID, and SSH identity. On a local miss, the runner uses the pinned cloud image and applies configurations normally. Set `OPENSHELL_TEST_GUEST_CACHE_DISABLE=1` to bypass local lookup.
 
 The default cache directory is `${XDG_CACHE_HOME:-$HOME/.cache}/openshell/test-guest`. Override it with `--cache-dir` on the cache command or `OPENSHELL_TEST_GUEST_CACHE_DIR` for either app.
 

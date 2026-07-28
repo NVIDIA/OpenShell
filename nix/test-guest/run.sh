@@ -215,11 +215,12 @@ umask 077
 run_parent=${TMPDIR:-/tmp}/openshell-test-guest
 mkdir -p "${run_parent}"
 run_dir=$(mktemp -d "${run_parent%/}/run.XXXXXX")
+ssh_control_dir=$(mktemp -d /tmp/openshell-test-guest-ssh.XXXXXX)
 overlay=${run_dir}/disk.qcow2
 seed=${run_dir}/seed.iso
 vars=${run_dir}/firmware-vars.fd
 private_key=${run_dir}/id_ed25519
-ssh_control_path=${run_dir}/ssh-control
+ssh_control_path=${ssh_control_dir}/ctl
 serial_log=${run_dir}/serial.log
 qemu_log=${run_dir}/qemu.log
 qemu_pid=
@@ -255,6 +256,7 @@ cleanup() {
 	else
 		rm -rf "${run_dir}"
 	fi
+	rm -rf "${ssh_control_dir}"
 	exit "${status}"
 }
 
