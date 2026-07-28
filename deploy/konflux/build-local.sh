@@ -71,9 +71,9 @@ build_image() {
         ]"
 
     echo "=== Injecting files ==="
-    hermeto inject-files "${output_dir}" --for-output-dir /cachi2
+    hermeto inject-files "${output_dir}" --for-output-dir /cachi2/output
     hermeto generate-env "${output_dir}" \
-        --format env --for-output-dir /cachi2 \
+        --format env --for-output-dir /cachi2/output \
         --output "${output_dir}/cachi2.env"
 
     echo "=== Preparing RPM repos ==="
@@ -90,11 +90,20 @@ build_image() {
     cp "${REPO_ROOT}/${dockerfile}" "${hermetic_dockerfile}"
     sed -i 's|^\s*RUN |RUN . /cachi2/cachi2.env \&\& \\\n    |i' "${hermetic_dockerfile}"
 
+    # Disable subscription-manager so it doesn't inject RHEL repos that fail
+    # DNS under --network=none. Same as Konflux Tekton script (unlink rhel secrets).
+    local sm_conf
+    sm_conf=$(mktemp)
+    CLEANUP_PATHS+=("${sm_conf}")
+    echo -e "[main]\nenabled=0" > "${sm_conf}"
+
     podman build \
         -f "${hermetic_dockerfile}" \
         --platform "${PLATFORM}" \
-        --volume "$(realpath "${output_dir}"):/cachi2:Z" \
+        --volume "$(realpath "${output_dir}"):/cachi2/output:Z" \
+        --volume "$(realpath "${output_dir}/cachi2.env"):/cachi2/cachi2.env:Z" \
         --volume "$(realpath "${repos_dir}"):/etc/yum.repos.d:Z" \
+        --volume "${sm_conf}:/etc/dnf/plugins/subscription-manager.conf:Z" \
         --network none \
         -t "openshell-${component}-konflux" \
         "${REPO_ROOT}"

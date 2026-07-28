@@ -29,7 +29,7 @@ RUN dnf install -y --nodocs gcc make tar gzip \
 
 WORKDIR /tmp/musl-build
 
-RUN tar xzf /cachi2/deps/generic/musl-${MUSL_VERSION}.tar.gz --strip-components=1 \
+RUN tar xzf /cachi2/output/deps/generic/musl-${MUSL_VERSION}.tar.gz --strip-components=1 \
     && ./configure --prefix=/usr/local/musl --disable-shared \
     && make -j"$(nproc)" \
     && make install
@@ -52,11 +52,11 @@ RUN RUST_ARCH=$(case "${TARGETARCH}" in amd64) echo x86_64;; arm64) echo aarch64
     RUST_TRIPLE="${RUST_ARCH}-unknown-linux-gnu" && \
     MUSL_TRIPLE="${RUST_ARCH}-unknown-linux-musl" && \
     mkdir -p /tmp/rust-toolchain && \
-    tar xJf /cachi2/deps/generic/rust-${RUST_VERSION}-${RUST_TRIPLE}.tar.xz -C /tmp/rust-toolchain --strip-components=1 && \
+    tar xJf /cachi2/output/deps/generic/rust-${RUST_VERSION}-${RUST_TRIPLE}.tar.xz -C /tmp/rust-toolchain --strip-components=1 && \
     /tmp/rust-toolchain/install.sh --prefix=/usr/local && \
     rm -rf /tmp/rust-toolchain && \
     mkdir -p /tmp/musl-std && \
-    tar xJf /cachi2/deps/generic/rust-std-${RUST_VERSION}-${MUSL_TRIPLE}.tar.xz -C /tmp/musl-std --strip-components=1 && \
+    tar xJf /cachi2/output/deps/generic/rust-std-${RUST_VERSION}-${MUSL_TRIPLE}.tar.xz -C /tmp/musl-std --strip-components=1 && \
     /tmp/musl-std/install.sh --prefix=/usr/local && \
     rm -rf /tmp/musl-std
 
