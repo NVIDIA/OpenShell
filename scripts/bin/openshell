@@ -8,6 +8,16 @@ BINARY="$TARGET_DIR/debug/openshell"
 STATE_FILE="$PROJECT_ROOT/.cache/openshell-build.state"
 CALLER_PWD="$PWD"
 
+# Portable SHA-256 helper: prefer sha256sum (Linux), fall back to shasum (macOS).
+if command -v sha256sum >/dev/null 2>&1; then
+  _sha256() { sha256sum "$@"; }
+elif command -v shasum >/dev/null 2>&1; then
+  _sha256() { shasum -a 256 "$@"; }
+else
+  # Last resort: skip fingerprinting; always rebuild.
+  _sha256() { echo "no-sha-tool $*"; }
+fi
+
 # ---------------------------------------------------------------------------
 # Fingerprint-based rebuild check
 #
@@ -60,7 +70,7 @@ else
   for path in "${changed_files[@]}"; do
     matches_cli "$path" || continue
     if [[ -e "$path" ]]; then
-      digest=$(shasum -a 256 "$path" | cut -d ' ' -f 1)
+      digest=$(_sha256 "$path" | cut -d ' ' -f 1)
     else
       digest="__MISSING__"
     fi
@@ -68,7 +78,7 @@ else
   done
 
   if [[ -n "$payload" ]]; then
-    current_fingerprint=$(printf '%s' "$payload" | shasum -a 256 | cut -d ' ' -f 1)
+    current_fingerprint=$(printf '%s' "$payload" | _sha256 | cut -d ' ' -f 1)
   else
     current_fingerprint=""
   fi
@@ -148,7 +158,7 @@ if [[ "$needs_build" == "1" ]]; then
   for path in "${post_files[@]}"; do
     matches_cli "$path" || continue
     if [[ -e "$path" ]]; then
-      digest=$(shasum -a 256 "$path" | cut -d ' ' -f 1)
+      digest=$(_sha256 "$path" | cut -d ' ' -f 1)
     else
       digest="__MISSING__"
     fi
@@ -156,7 +166,7 @@ if [[ "$needs_build" == "1" ]]; then
   done
 
   if [[ -n "$post_payload" ]]; then
-    new_fingerprint=$(printf '%s' "$post_payload" | shasum -a 256 | cut -d ' ' -f 1)
+    new_fingerprint=$(printf '%s' "$post_payload" | _sha256 | cut -d ' ' -f 1)
   else
     new_fingerprint=""
   fi
