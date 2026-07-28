@@ -9,7 +9,7 @@ set -Eeuo pipefail
 usage() {
 	cat <<'EOF'
 Usage:
-  nix run .#test-vm -- --distro DISTRO [OPTIONS] [-- COMMAND...]
+  nix run .#test-guest -- --distro DISTRO [OPTIONS] [-- COMMAND...]
 
 Options:
   --distro NAME       Base distro: ubuntu, centos, fedora, or rocky
@@ -27,8 +27,9 @@ EOF
 
 if [ "${OPENSHELL_TEST_VM_RUNTIME:-}" != 1 ] ||
 	[ ! -d "${OPENSHELL_TEST_VM_DISTROS:-}" ] ||
-	[ ! -d "${OPENSHELL_TEST_VM_CONFIGURATIONS:-}" ]; then
-	echo "run this script through 'nix run .#test-vm -- ...'" >&2
+	[ ! -d "${OPENSHELL_TEST_VM_CONFIGURATIONS:-}" ] ||
+	[ ! -r "${OPENSHELL_TEST_VM_CACHE_LIB:-}" ]; then
+	echo "run this script through 'nix run .#test-guest -- ...'" >&2
 	exit 2
 fi
 
@@ -81,7 +82,7 @@ while [ "$#" -gt 0 ]; do
 		break
 		;;
 	*)
-		echo "unknown test VM argument: $1" >&2
+		echo "unknown test guest argument: $1" >&2
 		usage >&2
 		exit 2
 		;;
@@ -176,11 +177,38 @@ if [ "${TEST_VM_ACCELERATOR}" = kvm ] &&
 	ssh_wait_seconds=600
 fi
 
-echo "==> Realizing the pinned ${distro} cloud image"
-TEST_VM_IMAGE=$(nix build --no-link --print-out-paths "${TEST_VM_IMAGE_DRV}^out")
+# shellcheck disable=SC1090
+. "${OPENSHELL_TEST_VM_CACHE_LIB}"
+
+prepared_image=0
+TEST_VM_IMAGE=
+if [ -n "${OPENSHELL_TEST_VM_IMAGE_OVERRIDE:-}" ]; then
+	if [ ! -f "${OPENSHELL_TEST_VM_IMAGE_OVERRIDE}" ]; then
+		echo "prepared guest image does not exist: ${OPENSHELL_TEST_VM_IMAGE_OVERRIDE}" >&2
+		exit 2
+	fi
+	TEST_VM_IMAGE=${OPENSHELL_TEST_VM_IMAGE_OVERRIDE}
+	prepared_image=1
+	echo "==> Using explicit prepared guest image"
+elif [ "${OPENSHELL_TEST_VM_CACHE_DISABLE:-0}" -ne 1 ]; then
+	cache_root=$(test_vm_cache_root)
+	cache_key=$(test_vm_cache_key "${distro}" "${configurations[@]}")
+	if test_vm_cache_local_entry_valid \
+		"${cache_root}" "${cache_key}" "${distro}" "${configurations[@]}"; then
+		cache_entry=$(test_vm_cache_entry_dir "${cache_root}" "${cache_key}")
+		TEST_VM_IMAGE="${cache_entry}/disk.qcow2"
+		prepared_image=1
+		echo "==> Cache local hit: ${cache_entry}"
+	fi
+fi
+
+if [ "${prepared_image}" -eq 0 ]; then
+	echo "==> Realizing the pinned ${distro} cloud image"
+	TEST_VM_IMAGE=$(nix build --no-link --print-out-paths "${TEST_VM_IMAGE_DRV}^out")
+fi
 
 umask 077
-run_parent=${TMPDIR:-/tmp}/openshell-test-vm
+run_parent=${TMPDIR:-/tmp}/openshell-test-guest
 mkdir -p "${run_parent}"
 run_dir=$(mktemp -d "${run_parent%/}/run.XXXXXX")
 overlay=${run_dir}/disk.qcow2
@@ -218,7 +246,7 @@ cleanup() {
 		show_logs
 	fi
 	if [ "${keep}" -eq 1 ]; then
-		echo "Kept test VM state at ${run_dir}" >&2
+		echo "Kept test guest state at ${run_dir}" >&2
 	else
 		rm -rf "${run_dir}"
 	fi
@@ -237,8 +265,8 @@ ssh-keygen -q -t ed25519 -N "" -f "${private_key}"
 public_key=$(<"${private_key}.pub")
 
 cat >"${run_dir}/meta-data" <<EOF
-instance-id: openshell-test-vm-${distro}-$$-${RANDOM}
-local-hostname: openshell-test-vm
+instance-id: openshell-test-guest-${distro}-$$-${RANDOM}
+local-hostname: openshell-test-guest
 EOF
 cat >"${run_dir}/user-data" <<EOF
 #cloud-config
@@ -258,7 +286,9 @@ EOF
 )
 
 qemu-img create -q -f qcow2 -F qcow2 -b "${TEST_VM_IMAGE}" "${overlay}"
-qemu-img resize -q "${overlay}" +16G
+if [ "${prepared_image}" -eq 0 ]; then
+	qemu-img resize -q "${overlay}" +16G
+fi
 cp "${TEST_VM_FIRMWARE_VARS}" "${vars}"
 chmod 0600 "${vars}"
 
@@ -373,11 +403,15 @@ cat >"${ansible_inventory}" <<EOF
 guest ansible_host=127.0.0.1 ansible_port=${ssh_port} ansible_user=openshell ansible_ssh_private_key_file=${private_key} ansible_python_interpreter=/usr/bin/python3
 EOF
 
-for item in "${configurations[@]}"; do
-	echo "==> Applying configuration: ${item}"
-	ANSIBLE_CONFIG="${ansible_config}" ANSIBLE_NOCOLOR=1 \
-		ansible-playbook "${OPENSHELL_TEST_VM_CONFIGURATIONS}/${item}"
-done
+if [ "${prepared_image}" -eq 0 ]; then
+	for item in "${configurations[@]}"; do
+		echo "==> Applying configuration: ${item}"
+		ANSIBLE_CONFIG="${ansible_config}" ANSIBLE_NOCOLOR=1 \
+			ansible-playbook "${OPENSHELL_TEST_VM_CONFIGURATIONS}/${item}"
+	done
+else
+	echo "==> Reusing cached configuration: ${configurations[*]:-base image}"
+fi
 
 for package in "${packages[@]}"; do
 	package_name=$(basename "${package}")
@@ -421,7 +455,7 @@ for copy_spec in "${copies[@]}"; do
 		"sudo install -D -m 0755 '${remote_copy}' '${destination}'; rm -f '${remote_copy}'"
 done
 
-echo "==> Test VM ready: ${distro} (SSH port ${ssh_port})"
+echo "==> Test guest ready: ${distro} (SSH port ${ssh_port})"
 if [ "${#guest_command[@]}" -eq 0 ]; then
 	ssh -t "${ssh_args[@]}" openshell@127.0.0.1
 else

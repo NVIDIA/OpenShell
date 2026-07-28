@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# PROTOTYPE: Ensure SELinux is enforcing in a disposable test VM.
+# PROTOTYPE: Ensure SELinux is enforcing in a disposable test guest.
 
 - name: Configure SELinux
   hosts: test_vm

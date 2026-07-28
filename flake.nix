@@ -37,10 +37,11 @@
           projectRootFile = "flake.nix";
           programs.nixfmt.enable = true;
         };
-        testVm = import ./nix/vm { inherit pkgs; };
+        testGuest = import ./nix/test-guest { inherit pkgs; };
       in
       {
-        apps.test-vm = testVm.app;
+        apps.test-guest = testGuest.app;
+        apps.test-guest-cache = testGuest.cacheApp;
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
