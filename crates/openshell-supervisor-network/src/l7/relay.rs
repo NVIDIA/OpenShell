@@ -171,23 +171,6 @@ where
     Ok(())
 }
 
-async fn preflight_request_credentials<W>(
-    client: &mut W,
-    ctx: &L7EvalContext,
-    request: &crate::l7::provider::L7Request,
-) -> Result<bool>
-where
-    W: AsyncWrite + Unpin,
-{
-    match secrets::rewrite_http_header_block(&request.raw_header, ctx.secret_resolver.as_deref()) {
-        Ok(_) => Ok(true),
-        Err(error) => {
-            reject_credential_resolution(client, ctx, &error).await?;
-            Ok(false)
-        }
-    }
-}
-
 async fn relay_http_request_with_credential_rejection<C, U>(
     request: &crate::l7::provider::L7Request,
     client: &mut C,
@@ -470,9 +453,6 @@ where
         };
         let scoped_ctx = scoped_context_for_request(ctx, &req.target);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-        if !preflight_request_credentials(client, ctx, &req).await? {
-            return Ok(());
-        }
 
         if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
             return Ok(());
@@ -992,9 +972,6 @@ where
         };
         let scoped_ctx = scoped_context_for_request(ctx, &req.target);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-        if !preflight_request_credentials(client, ctx, &req).await? {
-            return Ok(());
-        }
 
         if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
             return Ok(());
@@ -1297,9 +1274,6 @@ where
         let jsonrpc_info = parsed.info;
         let scoped_ctx = scoped_context_for_request(ctx, &req.target);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-        if !preflight_request_credentials(client, ctx, &req).await? {
-            return Ok(());
-        }
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
@@ -1500,9 +1474,6 @@ where
         let graphql_info = parsed.info;
         let scoped_ctx = scoped_context_for_request(ctx, &req.target);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-        if !preflight_request_credentials(client, ctx, &req).await? {
-            return Ok(());
-        }
 
         if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
             return Ok(());
@@ -2166,9 +2137,6 @@ where
         let scoped_ctx = scoped_context_for_request(ctx, &req.target);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
         let resolver = ctx.secret_resolver.as_deref();
-        if !preflight_request_credentials(client, ctx, &req).await? {
-            return Ok(());
-        }
 
         if close_if_stale(generation_guard, ctx) {
             return Ok(());
@@ -3122,6 +3090,66 @@ network_policies:
         assert!(
             matches!(result, Err(_) | Ok(Ok(0))),
             "upstream should not receive request bytes"
+        );
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn l7_denial_precedes_credential_endpoint_resolution() {
+        let (config, tunnel_engine, mut ctx) =
+            middleware_relay_context("openshell/regex", "fail_closed");
+        let (_credential_state, resolver) = endpoint_mismatch_resolver(TestHashMap::from([(
+            "API_TOKEN".to_string(),
+            "secret".to_string(),
+        )]));
+        ctx.secret_resolver = Some(resolver);
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /outside HTTP/1.1\r\nHost: api.example.test\r\nAuthorization: Bearer openshell:resolve:env:v1_API_TOKEN\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut response = [0u8; 2048];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("policy denial should reach client")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            !response.contains("credential_endpoint_mismatch"),
+            "L7-denied request must not expose credential binding state: {response}"
+        );
+
+        let mut upstream_request = [0u8; 32];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            upstream.read(&mut upstream_request),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Ok(0))),
+            "L7-denied request must not reach upstream"
         );
 
         drop(app);
