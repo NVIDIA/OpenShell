@@ -42,6 +42,16 @@ impl DriverIdentity {
         uid: Option<String>,
         gid: Option<String>,
     ) -> Result<Self> {
+        // Resolved-identity drivers explicitly clear the OCI declaration so
+        // an image-baked or user-supplied value cannot select the OCI path.
+        // Preserve an empty declaration when no resolved pair is present:
+        // Docker and Podman use that state to reject images without USER.
+        let oci_user = if oci_user.as_deref() == Some("") && (uid.is_some() || gid.is_some()) {
+            None
+        } else {
+            oci_user
+        };
+
         match (oci_user, uid, gid) {
             (Some(declaration), None, None) => Ok(Self::OciUser { declaration }),
             (None, Some(uid), Some(gid)) => {
@@ -567,6 +577,24 @@ mod tests {
             DriverIdentity::Resolved {
                 uid: 1234,
                 gid: 1235
+            }
+        );
+        assert_eq!(
+            DriverIdentity::from_values(
+                Some(String::new()),
+                Some("1234".into()),
+                Some("1235".into())
+            )
+            .unwrap(),
+            DriverIdentity::Resolved {
+                uid: 1234,
+                gid: 1235
+            }
+        );
+        assert_eq!(
+            DriverIdentity::from_values(Some(String::new()), None, None).unwrap(),
+            DriverIdentity::OciUser {
+                declaration: String::new()
             }
         );
         assert_eq!(
