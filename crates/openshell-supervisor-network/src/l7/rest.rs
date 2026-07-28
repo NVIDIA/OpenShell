@@ -677,8 +677,8 @@ where
                 offered_subprotocols: request.subprotocols.clone(),
             });
 
-    let rewrite_result = rewrite_http_header_block(&header_bytes, options.resolver)
-        .map_err(|e| miette!("credential injection failed: {e}"))?;
+    let rewrite_result =
+        rewrite_http_header_block(&header_bytes, options.resolver).map_err(miette::Report::new)?;
 
     if let Some(guard) = options.generation_guard {
         guard.ensure_current()?;
@@ -713,12 +713,18 @@ where
             let session_token_placeholder =
                 openshell_core::secrets::placeholder_for_env_key("AWS_SESSION_TOKEN");
 
-            match (
-                resolver.resolve_placeholder(&access_key_placeholder),
-                resolver.resolve_placeholder(&secret_key_placeholder),
-            ) {
+            let access_key = resolver
+                .resolve_placeholder_checked(&access_key_placeholder, "sigv4")
+                .map_err(miette::Report::new)?;
+            let secret_key = resolver
+                .resolve_placeholder_checked(&secret_key_placeholder, "sigv4")
+                .map_err(miette::Report::new)?;
+            let session_token = resolver
+                .resolve_placeholder_checked(&session_token_placeholder, "sigv4")
+                .map_err(miette::Report::new)?;
+
+            match (access_key, secret_key) {
                 (Some(access_key), Some(secret_key)) => {
-                    let session_token = resolver.resolve_placeholder(&session_token_placeholder);
                     // Use explicit signing_region from policy if set,
                     // otherwise extract from hostname.
                     let region = if options.signing_region.is_empty() {
@@ -1295,7 +1301,7 @@ fn rewrite_buffered_body(
     } else {
         resolver
             .rewrite_text_placeholders(&mut text, "request_body")
-            .map_err(|e| miette!("credential injection failed: {e}"))?
+            .map_err(miette::Report::new)?
     };
     if replacements == 0 || contains_reserved_credential_marker(&text) {
         return Err(miette!(
@@ -1342,7 +1348,7 @@ fn rewrite_form_urlencoded_body(body: &str, resolver: &SecretResolver) -> Result
         let mut rewritten_value = decoded_value;
         let field_replacements = resolver
             .rewrite_text_placeholders(&mut rewritten_value, "request_body")
-            .map_err(|e| miette!("credential injection failed: {e}"))?;
+            .map_err(miette::Report::new)?;
         if field_replacements == 0 || contains_reserved_credential_marker(&rewritten_value) {
             return Err(miette!(
                 "request body credential rewrite left unresolved credential placeholders"
