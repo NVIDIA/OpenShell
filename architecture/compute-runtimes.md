@@ -239,6 +239,10 @@ failed watch streams, because a claim can become visible before its selected
 concurrently, deduplicates work by claim UID, and caps concurrency so one late
 registration or slow Kubernetes lookup cannot block activation for the
 namespace or create unbounded work.
+The gateway retains activated pod-UID tombstones for one hour to reject
+duplicate registration and activation races, then prunes them opportunistically
+on registry access so long-running gateways do not accumulate one entry per
+historical pod.
 Warm claim creation is idempotent by the deterministic claim name. After a
 create timeout, transport failure, server error, or conflict, the driver reads
 that name back and retries the same claim create when it is not yet visible. It

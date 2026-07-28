@@ -16,12 +16,14 @@ use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use tracing::{debug, info, warn};
+
+const ACTIVATED_TOMBSTONE_TTL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Default)]
 pub struct SupervisorPodRegistrationRegistry {
@@ -66,9 +68,11 @@ impl SupervisorPodRegistrationRegistry {
         let instance_name = identity.instance_name.clone();
         let owner_name = identity.owner_name.clone();
         let driver = identity.driver.clone();
+        let now = Instant::now();
 
         let replaced = {
             let mut inner = self.inner.lock().expect("pending pod registry poisoned");
+            prune_activated_tombstones(&mut inner, now);
             if inner.activated_instance_id.contains_key(&instance_id) {
                 return Err(Status::already_exists(
                     "supervisor instance has already been activated",
@@ -82,7 +86,7 @@ impl SupervisorPodRegistrationRegistry {
                         identity,
                         sender,
                         session_id,
-                        registered_at: Instant::now(),
+                        registered_at: now,
                     },
                 )
                 .is_some()
@@ -119,7 +123,8 @@ impl SupervisorPodRegistrationRegistry {
         &self,
         instance_id: &str,
     ) -> Result<SupervisorBootstrapIdentity, Status> {
-        let inner = self.inner.lock().expect("pending pod registry poisoned");
+        let mut inner = self.inner.lock().expect("pending pod registry poisoned");
+        prune_activated_tombstones(&mut inner, Instant::now());
         if inner.activated_instance_id.contains_key(instance_id) {
             return Err(Status::already_exists(
                 "supervisor instance has already been activated",
@@ -138,8 +143,10 @@ impl SupervisorPodRegistrationRegistry {
         instance_id: &str,
         activation: PodActivationMessage,
     ) -> Result<(), Status> {
+        let now = Instant::now();
         let pending = {
             let mut inner = self.inner.lock().expect("pending pod registry poisoned");
+            prune_activated_tombstones(&mut inner, now);
             if inner.activated_instance_id.contains_key(instance_id) {
                 return Err(Status::already_exists(
                     "supervisor instance has already been activated",
@@ -156,7 +163,7 @@ impl SupervisorPodRegistrationRegistry {
             };
             inner
                 .activated_instance_id
-                .insert(instance_id.to_string(), Instant::now());
+                .insert(instance_id.to_string(), now);
             pending
         };
 
@@ -187,6 +194,7 @@ impl SupervisorPodRegistrationRegistry {
     pub(crate) fn fail_pending(&self, instance_id: &str, status: Status) -> Result<(), Status> {
         let pending = {
             let mut inner = self.inner.lock().expect("pending pod registry poisoned");
+            prune_activated_tombstones(&mut inner, Instant::now());
             if inner.activated_instance_id.contains_key(instance_id) {
                 return Err(Status::already_exists(
                     "supervisor instance has already been activated",
@@ -233,11 +241,9 @@ impl SupervisorPodRegistrationRegistry {
     #[must_use]
     #[allow(dead_code)]
     pub fn activated_count(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("pending pod registry poisoned")
-            .activated_instance_id
-            .len()
+        let mut inner = self.inner.lock().expect("pending pod registry poisoned");
+        prune_activated_tombstones(&mut inner, Instant::now());
+        inner.activated_instance_id.len()
     }
 
     fn remove_if_session(&self, instance_id: &str, session_id: u64) {
@@ -263,6 +269,12 @@ impl SupervisorPodRegistrationRegistry {
             );
         }
     }
+}
+
+fn prune_activated_tombstones(inner: &mut Inner, now: Instant) {
+    inner.activated_instance_id.retain(|_, activated_at| {
+        now.saturating_duration_since(*activated_at) < ACTIVATED_TOMBSTONE_TTL
+    });
 }
 
 pub struct PendingRegistrationStream {
@@ -412,6 +424,29 @@ mod tests {
             panic!("activated pod UID must not register again");
         };
         assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[test]
+    fn expired_activation_tombstones_are_pruned() {
+        let registry = Arc::new(SupervisorPodRegistrationRegistry::new());
+        {
+            let mut inner = registry.inner.lock().expect("registry mutex poisoned");
+            inner.activated_instance_id.insert(
+                "expired-pod-uid".to_string(),
+                Instant::now()
+                    .checked_sub(ACTIVATED_TOMBSTONE_TTL + Duration::from_secs(1))
+                    .expect("test tombstone timestamp"),
+            );
+            inner
+                .activated_instance_id
+                .insert("fresh-pod-uid".to_string(), Instant::now());
+        }
+
+        let stream = registry
+            .register_pending(bootstrap_identity("expired-pod-uid"))
+            .expect("expired tombstone must not reject registration");
+        assert_eq!(registry.activated_count(), 1);
+        drop(stream);
     }
 
     #[test]
