@@ -24,8 +24,9 @@ use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::secrets::{self, SecretResolver};
 use openshell_ocsf::{
-    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
-    NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
+    ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
+    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
+    ocsf_emit,
 };
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -34,6 +35,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
 /// Context for L7 request policy evaluation.
+#[derive(Clone)]
 #[cfg_attr(test, derive(Default))]
 pub struct L7EvalContext {
     /// Host from the CONNECT request.
@@ -50,6 +52,9 @@ pub struct L7EvalContext {
     pub cmdline_paths: Vec<String>,
     /// Supervisor-only placeholder resolver for outbound headers.
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
+    /// Live provider state used to scope static credentials to each request.
+    pub(crate) provider_credentials:
+        Option<openshell_core::provider_credentials::ProviderCredentialState>,
     /// Anonymous activity counter channel.
     pub(crate) activity_tx: Option<ActivitySender>,
     /// Dynamic credentials (token grants) keyed by endpoint-bound provider metadata.
@@ -65,6 +70,113 @@ pub struct L7EvalContext {
         Option<Arc<dyn crate::l7::token_grant_injection::TokenGrantResolver>>,
     /// Shared feature state for agent-driven policy proposals.
     pub(crate) agent_proposals: openshell_core::proposals::AgentProposals,
+}
+
+fn scoped_context_for_request(ctx: &L7EvalContext, target: &str) -> Option<L7EvalContext> {
+    let credentials = ctx.provider_credentials.as_ref()?;
+    let mut scoped = ctx.clone();
+    scoped.secret_resolver = credentials.resolver_for_endpoint(&ctx.host, ctx.port, target);
+    Some(scoped)
+}
+
+async fn reject_credential_resolution<W>(
+    client: &mut W,
+    ctx: &L7EvalContext,
+    error: &secrets::UnresolvedPlaceholderError,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let endpoint_mismatch = error.is_endpoint_mismatch();
+    let status = if endpoint_mismatch {
+        "403 Forbidden"
+    } else {
+        "500 Internal Server Error"
+    };
+    let body = if endpoint_mismatch {
+        r#"{"error":"credential_endpoint_mismatch","message":"Credential is not authorized for this request endpoint"}"#
+    } else {
+        r#"{"error":"credential_unavailable","message":"Credential placeholder could not be resolved"}"#
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    client
+        .write_all(response.as_bytes())
+        .await
+        .into_diagnostic()?;
+    client.flush().await.into_diagnostic()?;
+
+    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Fail)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(if endpoint_mismatch {
+            SeverityId::High
+        } else {
+            SeverityId::Medium
+        })
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+        .firewall_rule(&ctx.policy_name, "credential-binding")
+        .message(if endpoint_mismatch {
+            format!(
+                "Credential use denied: credential is not authorized for {}:{}",
+                ctx.host, ctx.port
+            )
+        } else {
+            format!(
+                "Credential use denied: credential is unavailable for {}:{}",
+                ctx.host, ctx.port
+            )
+        })
+        .status_detail(if endpoint_mismatch {
+            "credential_endpoint_mismatch"
+        } else {
+            "credential_unavailable"
+        })
+        .build();
+    ocsf_emit!(event);
+
+    if endpoint_mismatch {
+        let finding = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::High)
+            .is_alert(true)
+            .finding_info(FindingInfo::new(
+                "openshell.provider_credential.endpoint_mismatch",
+                "Provider credential used at an unauthorized endpoint",
+            ))
+            .evidence_pairs(&[
+                ("policy", ctx.policy_name.as_str()),
+                ("host", ctx.host.as_str()),
+                ("disposition", "denied"),
+            ])
+            .message("Provider credential endpoint binding mismatch; request denied")
+            .build();
+        ocsf_emit!(finding);
+    }
+    Ok(())
+}
+
+async fn preflight_request_credentials<W>(
+    client: &mut W,
+    ctx: &L7EvalContext,
+    request: &crate::l7::provider::L7Request,
+) -> Result<bool>
+where
+    W: AsyncWrite + Unpin,
+{
+    match secrets::rewrite_http_header_block(&request.raw_header, ctx.secret_resolver.as_deref()) {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            reject_credential_resolution(client, ctx, &error).await?;
+            Ok(false)
+        }
+    }
 }
 
 #[derive(Default)]
@@ -299,7 +411,14 @@ where
             }
         };
 
-        let Some(config) = select_l7_config_for_path(configs, &req.target) else {
+        let route_target = match secrets::redact_target_for_policy(&req.target) {
+            Ok(target) => target,
+            Err(error) => {
+                reject_credential_resolution(client, ctx, &error).await?;
+                return Ok(());
+            }
+        };
+        let Some(config) = select_l7_config_for_path(configs, &route_target) else {
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
                     &req,
@@ -312,6 +431,11 @@ where
                 .await?;
             return Ok(());
         };
+        let scoped_ctx = scoped_context_for_request(ctx, &req.target);
+        let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
+        if !preflight_request_credentials(client, ctx, &req).await? {
+            return Ok(());
+        }
 
         if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
             return Ok(());
@@ -387,24 +511,12 @@ where
             return Ok(());
         }
 
-        let (eval_target, redacted_target) = if let Some(ref resolver) = ctx.secret_resolver {
-            match secrets::rewrite_target_for_eval(&req.target, resolver) {
-                Ok(result) => (result.resolved, result.redacted),
-                Err(e) => {
-                    warn!(
-                        host = %ctx.host,
-                        port = ctx.port,
-                        error = %e,
-                        "credential resolution failed in request target, rejecting"
-                    );
-                    let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                    client.write_all(response).await.into_diagnostic()?;
-                    client.flush().await.into_diagnostic()?;
-                    return Ok(());
-                }
+        let redacted_target = match secrets::redact_target_for_policy(&req.target) {
+            Ok(target) => target,
+            Err(error) => {
+                reject_credential_resolution(client, ctx, &error).await?;
+                return Ok(());
             }
-        } else {
-            (req.target.clone(), req.target.clone())
         };
 
         let request_info = L7RequestInfo {
@@ -465,8 +577,6 @@ where
             &reason,
             &protocol_summary,
         );
-
-        let _ = &eval_target;
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
@@ -716,6 +826,10 @@ where
             crate::l7::websocket::RelayOptions {
                 policy_name: &options.policy_name,
                 resolver,
+                provider_credentials: options
+                    .ctx
+                    .and_then(|ctx| ctx.provider_credentials.as_ref()),
+                target: &options.target,
                 inspector,
                 compression,
             },
@@ -765,7 +879,7 @@ pub(crate) fn upgrade_options<'a>(
             None
         },
         engine,
-        ctx: engine.map(|_| ctx),
+        ctx: (engine.is_some() || websocket_credential_rewrite).then_some(ctx),
         enforcement: config.enforcement,
         target: target.to_string(),
         query_params: query_params.clone(),
@@ -835,6 +949,11 @@ where
                 return Ok(()); // Close connection on parse error
             }
         };
+        let scoped_ctx = scoped_context_for_request(ctx, &req.target);
+        let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
+        if !preflight_request_credentials(client, ctx, &req).await? {
+            return Ok(());
+        }
 
         if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
             return Ok(());
@@ -844,27 +963,14 @@ where
             return Ok(());
         }
 
-        // Rewrite credential placeholders in the request target BEFORE OPA
-        // evaluation. OPA sees the redacted path; the resolved path goes only
-        // to the upstream write.
-        let (eval_target, redacted_target) = if let Some(ref resolver) = ctx.secret_resolver {
-            match secrets::rewrite_target_for_eval(&req.target, resolver) {
-                Ok(result) => (result.resolved, result.redacted),
-                Err(e) => {
-                    warn!(
-                        host = %ctx.host,
-                        port = ctx.port,
-                        error = %e,
-                        "credential resolution failed in request target, rejecting"
-                    );
-                    let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                    client.write_all(response).await.into_diagnostic()?;
-                    client.flush().await.into_diagnostic()?;
-                    return Ok(());
-                }
+        // Redact placeholder syntax before OPA evaluation without consulting
+        // real credential material. Resolution happens only at upstream write.
+        let redacted_target = match secrets::redact_target_for_policy(&req.target) {
+            Ok(target) => target,
+            Err(error) => {
+                reject_credential_resolution(client, ctx, &error).await?;
+                return Ok(());
             }
-        } else {
-            (req.target.clone(), req.target.clone())
         };
 
         let request_info = L7RequestInfo {
@@ -950,9 +1056,6 @@ where
                 .build();
             ocsf_emit!(event);
         }
-
-        // Store the resolved target for the deny response redaction
-        let _ = &eval_target;
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
@@ -1147,6 +1250,11 @@ where
 
         let req = parsed.request;
         let jsonrpc_info = parsed.info;
+        let scoped_ctx = scoped_context_for_request(ctx, &req.target);
+        let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
+        if !preflight_request_credentials(client, ctx, &req).await? {
+            return Ok(());
+        }
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
@@ -1345,6 +1453,11 @@ where
 
         let req = parsed.request;
         let graphql_info = parsed.info;
+        let scoped_ctx = scoped_context_for_request(ctx, &req.target);
+        let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
+        if !preflight_request_credentials(client, ctx, &req).await? {
+            return Ok(());
+        }
 
         if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
             return Ok(());
@@ -1354,24 +1467,12 @@ where
             return Ok(());
         }
 
-        let (eval_target, redacted_target) = if let Some(ref resolver) = ctx.secret_resolver {
-            match secrets::rewrite_target_for_eval(&req.target, resolver) {
-                Ok(result) => (result.resolved, result.redacted),
-                Err(e) => {
-                    warn!(
-                        host = %ctx.host,
-                        port = ctx.port,
-                        error = %e,
-                        "credential resolution failed in GraphQL request target, rejecting"
-                    );
-                    let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                    client.write_all(response).await.into_diagnostic()?;
-                    client.flush().await.into_diagnostic()?;
-                    return Ok(());
-                }
+        let redacted_target = match secrets::redact_target_for_policy(&req.target) {
+            Ok(target) => target,
+            Err(error) => {
+                reject_credential_resolution(client, ctx, &error).await?;
+                return Ok(());
             }
-        } else {
-            (req.target.clone(), req.target.clone())
         };
 
         let request_info = L7RequestInfo {
@@ -1438,8 +1539,6 @@ where
                 .build();
             ocsf_emit!(event);
         }
-
-        let _ = &eval_target;
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
@@ -2000,8 +2099,6 @@ where
     // `allow_encoded_slash` opt-in applies.
     let provider = crate::l7::rest::RestProvider::default();
     let mut request_count: u64 = 0;
-    let resolver = ctx.secret_resolver.as_deref();
-
     loop {
         if close_if_stale(generation_guard, ctx) {
             return Ok(());
@@ -2021,6 +2118,12 @@ where
                 return Ok(());
             }
         };
+        let scoped_ctx = scoped_context_for_request(ctx, &req.target);
+        let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
+        let resolver = ctx.secret_resolver.as_deref();
+        if !preflight_request_credentials(client, ctx, &req).await? {
+            return Ok(());
+        }
 
         if close_if_stale(generation_guard, ctx) {
             return Ok(());
@@ -2028,25 +2131,13 @@ where
 
         request_count += 1;
 
-        // Resolve and redact the target for logging.
-        let redacted_target = if let Some(ref res) = ctx.secret_resolver {
-            match secrets::rewrite_target_for_eval(&req.target, res) {
-                Ok(result) => result.redacted,
-                Err(e) => {
-                    warn!(
-                        host = %ctx.host,
-                        port = ctx.port,
-                        error = %e,
-                        "credential resolution failed in request target, rejecting"
-                    );
-                    let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                    client.write_all(response).await.into_diagnostic()?;
-                    client.flush().await.into_diagnostic()?;
-                    return Ok(());
-                }
+        // Build the logging representation without materializing a secret.
+        let redacted_target = match secrets::redact_target_for_policy(&req.target) {
+            Ok(target) => target,
+            Err(error) => {
+                reject_credential_resolution(client, ctx, &error).await?;
+                return Ok(());
             }
-        } else {
-            req.target.clone()
         };
 
         // Log for observability via OCSF HTTP Activity event.

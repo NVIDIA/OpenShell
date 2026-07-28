@@ -40,6 +40,7 @@ pub(super) struct RelayContext<'a> {
 /// Build the request-processing context shared by CONNECT and forward HTTP.
 pub(super) fn http_context(
     decision: &EgressDecision,
+    provider_credentials: Option<openshell_core::provider_credentials::ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
     activity_tx: Option<ActivitySender>,
     dynamic_credentials: Option<DynamicCredentials>,
@@ -70,6 +71,7 @@ pub(super) fn http_context(
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
         secret_resolver,
+        provider_credentials,
         activity_tx,
         dynamic_credentials: dynamic_credentials.clone(),
         token_grant_resolver: dynamic_credentials
@@ -338,6 +340,7 @@ mod tests {
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
+            provider_credentials: None,
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,

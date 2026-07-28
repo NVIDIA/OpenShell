@@ -2439,16 +2439,7 @@ fn path_prefix_pattern(path: &str) -> Option<&str> {
 }
 
 fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
-    if path_matches_all(pattern) {
-        return true;
-    }
-    if pattern == path {
-        return true;
-    }
-    if let Some(prefix) = path_prefix_pattern(pattern) {
-        return path == prefix || path.starts_with(&format!("{prefix}/"));
-    }
-    glob::Pattern::new(pattern).is_ok_and(|glob| glob.matches(path))
+    openshell_core::endpoint_path::matches(pattern, path)
 }
 
 fn validate_token_grant_endpoint(token_endpoint: &str) -> Result<(), String> {

@@ -256,16 +256,7 @@ impl L7EndpointConfig {
 }
 
 pub fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
-    if pattern.is_empty() || pattern == "**" || pattern == "/**" {
-        return true;
-    }
-    if pattern == path {
-        return true;
-    }
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return path == prefix || path.starts_with(&format!("{prefix}/"));
-    }
-    glob::Pattern::new(pattern).is_ok_and(|glob| glob.matches(path))
+    openshell_core::endpoint_path::matches(pattern, path)
 }
 
 /// Parse the `tls` field from an endpoint config, independent of L7 protocol.
