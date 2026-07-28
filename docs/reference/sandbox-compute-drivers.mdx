@@ -432,6 +432,14 @@ declared name or numeric components for both direct and SSH children. When
 `USER` omits the group, the supervisor uses the user's numeric primary GID. It
 does not modify `/etc/passwd` or `/etc/group`.
 
+When either identity component falls back to OCI `USER`, OpenShell creates the
+fixed `/sandbox` workspace if it is absent and transfers ownership of its
+existing image contents to the completed UID/GID. The ownership walk skips
+symlinks and nested bind or volume mounts. Sandbox startup fails before
+readiness when the workspace root cannot be prepared, including when it is
+read-only. Images may pre-own `/sandbox` as a build optimization, but this is
+not required.
+
 Sandbox creation fails before readiness if a required `USER` component is
 missing, malformed, unknown, ambiguous, or resolves to UID/GID 0. An image
 without `USER` therefore works only when policy explicitly provides both
@@ -461,4 +469,5 @@ The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/e
 Docker and Podman custom images do not need a baked-in `"sandbox"` user. Declare
 a non-root OCI `USER`, or set both process identity fields explicitly in policy.
 Named image users require matching account entries; a numeric `UID:GID` pair
-does not.
+does not. OpenShell continues to use `/sandbox` as the workspace; it does not
+adopt the image's OCI working directory.

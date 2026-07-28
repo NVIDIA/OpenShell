@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(feature = "e2e")]
+#![cfg(feature = "e2e-local-container-driver")]
 
-//! E2E test: build a custom container image and run a sandbox with it.
+//! E2E test: build custom container images and run sandboxes with them.
 //!
 //! Prerequisites:
-//! - A running Docker-backed openshell gateway (`mise run gateway:docker`)
-//! - Docker daemon running (for image build)
+//! - A running Docker- or Podman-backed openshell gateway
+//! - The matching container runtime running (for image builds)
 //! - The `openshell` binary (built automatically from the workspace)
 
 use std::io::Write;
@@ -23,6 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
 
 RUN groupadd -g 1235 appstaff && \
     useradd -m -u 1234 -g appstaff app
+
+# A custom image may already contain a root-owned OpenShell workspace and
+# root-owned files. The supervisor prepares both for the OCI identity.
+RUN install -d /sandbox && \
+    printf root-owned > /sandbox/root-owned.txt
 
 # Write a marker file so we can verify this is our custom image.
 # Place under /etc (Landlock baseline read-only path) so the sandbox
@@ -44,8 +49,8 @@ CMD ["sleep", "infinity"]
 
 const MARKER: &str = "custom-image-e2e-marker";
 
-/// Build a custom Docker image from a Dockerfile and verify that a sandbox
-/// created from it contains the expected marker file.
+/// A named OCI user can write through direct and SSH children even when the
+/// image starts with a root-owned `/sandbox` tree.
 #[tokio::test]
 async fn sandbox_from_custom_dockerfile() {
     // Step 1: Write a temporary Dockerfile.
@@ -59,14 +64,17 @@ async fn sandbox_from_custom_dockerfile() {
 
     // Step 2: Create a sandbox from the Dockerfile.
     let dockerfile_str = dockerfile_path.to_str().expect("Dockerfile path is UTF-8");
-    let mut guard = SandboxGuard::create(&[
-        "--from",
-        dockerfile_str,
-        "--",
-        "sh",
-        "-c",
-        "id -u; id -g; touch /sandbox/oci-user-write; cat /etc/marker.txt",
-    ])
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &["--from", dockerfile_str, "--no-tty"],
+        &[
+            "sh",
+            "-c",
+            "set -eu; id -u; id -g; test \"$(cat /sandbox/root-owned.txt)\" = root-owned; \
+             test \"$(stat -c %u:%g /sandbox/root-owned.txt)\" = 1234:1235; \
+             touch /sandbox/direct-oci-user-write; cat /etc/marker.txt; echo Ready; sleep infinity",
+        ],
+        "Ready",
+    )
     .await
     .expect("sandbox create from Dockerfile");
 
@@ -81,11 +89,26 @@ async fn sandbox_from_custom_dockerfile() {
         "expected named OCI identity 1234:1235 in sandbox output:\n{clean_output}"
     );
 
+    let ssh_output = guard
+        .exec(&[
+            "sh",
+            "-c",
+            "set -eu; test \"$(id -u):$(id -g)\" = 1234:1235; \
+             touch /sandbox/ssh-oci-user-write; echo ssh-write-ok",
+        ])
+        .await
+        .expect("SSH child should write to prepared workspace");
+    assert!(
+        ssh_output.contains("ssh-write-ok"),
+        "expected SSH write marker:\n{ssh_output}"
+    );
+
     // Explicit cleanup (also happens in Drop, but explicit is clearer in tests).
     guard.cleanup().await;
 }
 
 /// A numeric OCI user/group pair works without passwd or group entries.
+/// The image intentionally has no pre-existing `/sandbox`.
 #[tokio::test]
 async fn sandbox_from_passwd_less_numeric_oci_user() {
     let tmpdir = tempfile::tempdir().expect("create tmpdir");

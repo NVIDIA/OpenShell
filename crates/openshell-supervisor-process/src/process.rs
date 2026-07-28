@@ -14,6 +14,8 @@ use nix::sys::signal::{self, Signal};
 use nix::unistd::{Gid, Group, Pid, Uid, User};
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::collections::HashSet;
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -66,6 +68,16 @@ impl ResolvedProcessIdentity {
     #[must_use]
     pub const fn gid(self) -> Option<u32> {
         self.gid
+    }
+
+    /// Whether at least one process identity component came from OCI `USER`.
+    ///
+    /// Platform-resolved identities are written directly into the policy and
+    /// return the default value, so this is specific to Docker/Podman OCI
+    /// fallback without adding another driver contract.
+    #[must_use]
+    pub const fn uses_oci_user_fallback(self) -> bool {
+        self.uid.is_some() || self.gid.is_some()
     }
 }
 
@@ -1221,13 +1233,16 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
 /// malicious container images. The TOCTOU window is not exploitable because
 /// no untrusted process is running yet.
 ///
-/// The root path is chowned unconditionally — EROFS there is a hard error
-/// (a read-only `/sandbox` is a misconfiguration). For children, `EROFS`
-/// causes the walker to skip that path and its entire subtree — descending
-/// into a read-only mount we do not control would be a TOCTOU risk
-/// (CWE-367/CWE-59). Siblings of the read-only path are still visited.
+/// The root path is chowned unconditionally — EROFS there is a hard error (a
+/// read-only `/sandbox` is a misconfiguration). Nested mount points are skipped
+/// before chown so user-provided mounts retain their ownership.
 #[cfg(unix)]
-fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
+fn chown_sandbox_home(
+    root: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    nested_mounts: &HashSet<PathBuf>,
+) -> Result<()> {
     let meta = std::fs::symlink_metadata(root).into_diagnostic()?;
     if meta.file_type().is_symlink() {
         return Err(miette::miette!(
@@ -1239,19 +1254,20 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
     nix::unistd::chown(root, uid, gid).into_diagnostic()?;
 
     if meta.is_dir() {
-        chown_children(root, uid, gid, &nix::unistd::chown)?;
+        chown_children(root, uid, gid, nested_mounts, &nix::unistd::chown)?;
     }
 
     Ok(())
 }
 
-/// Walk directory children and chown each entry, skipping symlinks and
-/// EROFS subtrees. Called after the parent has already been chowned.
+/// Walk directory children and chown each entry, skipping symlinks and nested
+/// mount points. Called after the parent has already been chowned.
 #[cfg(unix)]
 fn chown_children(
     dir: &Path,
     uid: Option<Uid>,
     gid: Option<Gid>,
+    nested_mounts: &HashSet<PathBuf>,
     do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
 ) -> Result<()> {
     match std::fs::read_dir(dir) {
@@ -1259,7 +1275,7 @@ fn chown_children(
             for entry in entries {
                 let entry = entry.into_diagnostic()?;
                 let child = entry.path();
-                chown_recursive(&child, uid, gid, do_chown)?;
+                chown_recursive(&child, uid, gid, nested_mounts, do_chown)?;
             }
         }
         Err(e) => {
@@ -1274,8 +1290,14 @@ fn chown_recursive(
     path: &Path,
     uid: Option<Uid>,
     gid: Option<Gid>,
+    nested_mounts: &HashSet<PathBuf>,
     do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
 ) -> Result<()> {
+    if nested_mounts.contains(path) {
+        debug!(path = %path.display(), "Skipping nested mount during sandbox home chown");
+        return Ok(());
+    }
+
     let meta = std::fs::symlink_metadata(path).into_diagnostic()?;
 
     if meta.file_type().is_symlink() {
@@ -1283,19 +1305,74 @@ fn chown_recursive(
         return Ok(());
     }
 
-    if let Err(e) = do_chown(path, uid, gid) {
-        if e == nix::errno::Errno::EROFS {
-            debug!(path = %path.display(), "Skipping read-only path during sandbox home chown");
-            return Ok(());
-        }
-        return Err(e).into_diagnostic();
-    }
+    do_chown(path, uid, gid).into_diagnostic()?;
 
     if meta.is_dir() {
-        chown_children(path, uid, gid, do_chown)?;
+        chown_children(path, uid, gid, nested_mounts, do_chown)?;
     }
 
     Ok(())
+}
+
+/// Return mount points strictly beneath `root`.
+///
+/// Linux mountinfo escapes whitespace and backslashes as octal sequences.
+/// Snapshotting before any workload child starts lets the ownership walk avoid
+/// crossing bind mounts and volumes without a race with untrusted code.
+#[cfg(target_os = "linux")]
+fn nested_mount_points(root: &Path) -> Result<HashSet<PathBuf>> {
+    use std::os::unix::ffi::OsStringExt;
+
+    fn decode_mountinfo_path(value: &str) -> PathBuf {
+        let input = value.as_bytes();
+        let mut decoded = Vec::with_capacity(input.len());
+        let mut index = 0;
+        while index < input.len() {
+            if input[index] == b'\\'
+                && index + 3 < input.len()
+                && input[index + 1..=index + 3]
+                    .iter()
+                    .all(|byte| (b'0'..=b'7').contains(byte))
+            {
+                let octal = &input[index + 1..=index + 3];
+                let value = (octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0');
+                decoded.push(value);
+                index += 4;
+            } else {
+                decoded.push(input[index]);
+                index += 1;
+            }
+        }
+        PathBuf::from(std::ffi::OsString::from_vec(decoded))
+    }
+
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").into_diagnostic()?;
+    Ok(mountinfo
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(4))
+        .map(decode_mountinfo_path)
+        .filter(|mount| mount != root && mount.starts_with(root))
+        .collect())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+#[allow(clippy::unnecessary_wraps)]
+fn nested_mount_points(_root: &Path) -> Result<HashSet<PathBuf>> {
+    Ok(HashSet::new())
+}
+
+#[cfg(unix)]
+fn prepare_oci_workspace(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
+    match std::fs::symlink_metadata(root) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(root).into_diagnostic()?;
+        }
+        Err(error) => return Err(error).into_diagnostic(),
+    }
+
+    let mounts = nested_mount_points(root)?;
+    chown_sandbox_home(root, uid, gid, &mounts)
 }
 
 /// Prepare filesystem for the sandboxed process.
@@ -1370,17 +1447,14 @@ pub fn prepare_filesystem_with_identity(
         }
     }
 
-    // When a driver injects a custom UID/GID via environment variables, the
-    // /sandbox home directory may already exist with image-default ownership
-    // (e.g. UID 1000) that differs from the driver-assigned identity.
-    // Recursively chown /sandbox so the sandbox process can use its home
-    // directory.
-    if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok() {
+    // Docker and Podman must make OpenShell's fixed workspace usable when any
+    // identity component came from OCI USER. Explicit policy identity and
+    // platform-resolved Kubernetes/OpenShift identity retain their existing
+    // filesystem paths.
+    if resolved_identity.uses_oci_user_fallback() {
         let sandbox_home = Path::new("/sandbox");
-        if sandbox_home.exists() {
-            info!(?uid, ?gid, "Chowning /sandbox for driver-injected UID/GID");
-            chown_sandbox_home(sandbox_home, uid, gid)?;
-        }
+        info!(?uid, ?gid, "Preparing /sandbox for OCI image identity");
+        prepare_oci_workspace(sandbox_home, uid, gid)?;
     }
 
     Ok(())
@@ -2243,7 +2317,13 @@ mod tests {
         let expected_uid = nix::unistd::geteuid();
         let expected_gid = nix::unistd::getegid();
 
-        chown_sandbox_home(&root, Some(expected_uid), Some(expected_gid)).unwrap();
+        chown_sandbox_home(
+            &root,
+            Some(expected_uid),
+            Some(expected_gid),
+            &HashSet::new(),
+        )
+        .unwrap();
 
         for path in &[
             root.clone(),
@@ -2282,6 +2362,7 @@ mod tests {
             &link,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
+            &HashSet::new(),
         )
         .unwrap_err();
         assert!(
@@ -2306,22 +2387,23 @@ mod tests {
             &root,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
+            &HashSet::new(),
         )
         .expect("should skip symlink children without error");
     }
 
     #[cfg(unix)]
     #[test]
-    fn chown_recursive_skips_erofs_subtree_but_continues_siblings() {
+    fn chown_recursive_skips_nested_mount_but_continues_siblings() {
         use std::sync::{Arc, Mutex};
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("sandbox");
         std::fs::create_dir(&root).unwrap();
 
-        let readonly_dir = root.join("ro-mount");
-        std::fs::create_dir(&readonly_dir).unwrap();
-        std::fs::write(readonly_dir.join("child-under-ro.txt"), "data").unwrap();
+        let mount_dir = root.join("mounted");
+        std::fs::create_dir(&mount_dir).unwrap();
+        std::fs::write(mount_dir.join("mounted-file.txt"), "data").unwrap();
 
         std::fs::write(root.join("writable-sibling.txt"), "data").unwrap();
 
@@ -2331,22 +2413,24 @@ mod tests {
         let chowned: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
         let chowned_ref = Arc::clone(&chowned);
 
-        let readonly_dir_clone = readonly_dir.clone();
         let fake_chown =
             move |path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
-                if path == readonly_dir_clone {
-                    return Err(nix::errno::Errno::EROFS);
-                }
                 chowned_ref.lock().unwrap().push(path.to_path_buf());
                 Ok(())
             };
+        let nested_mounts = HashSet::from([mount_dir.clone()]);
 
-        chown_children(&root, uid, gid, &fake_chown).expect("EROFS should be handled gracefully");
+        chown_children(&root, uid, gid, &nested_mounts, &fake_chown)
+            .expect("nested mount should be skipped");
 
         let chowned = chowned.lock().unwrap();
         assert!(
-            !chowned.contains(&readonly_dir.join("child-under-ro.txt")),
-            "children under EROFS directory must NOT be descended into"
+            !chowned.contains(&mount_dir),
+            "nested mount root must not be chowned"
+        );
+        assert!(
+            !chowned.contains(&mount_dir.join("mounted-file.txt")),
+            "nested mount contents must not be descended into"
         );
         assert!(
             chowned.contains(&root.join("writable-sibling.txt")),
@@ -2356,7 +2440,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn chown_recursive_propagates_non_erofs_errors() {
+    fn chown_recursive_propagates_chown_errors() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("sandbox");
         std::fs::create_dir(&root).unwrap();
@@ -2368,29 +2452,24 @@ mod tests {
             Err(nix::errno::Errno::EPERM)
         };
 
-        let result = chown_recursive(&root, uid, gid, &fake_chown);
-        assert!(result.is_err(), "non-EROFS errors should propagate");
+        let result = chown_recursive(&root, uid, gid, &HashSet::new(), &fake_chown);
+        assert!(result.is_err(), "chown errors should propagate");
     }
 
     #[cfg(unix)]
     #[test]
-    fn chown_children_skips_all_erofs_children_gracefully() {
+    fn prepare_oci_workspace_creates_missing_root() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("sandbox");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::create_dir(root.join("a")).unwrap();
-        std::fs::write(root.join("b.txt"), "data").unwrap();
+        let missing = dir.path().join("missing").join("sandbox");
 
-        let uid = Some(nix::unistd::geteuid());
-        let gid = Some(nix::unistd::getegid());
+        prepare_oci_workspace(
+            &missing,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+        )
+        .expect("missing OCI workspace should be created");
 
-        let always_erofs = |_path: &Path,
-                            _uid: Option<Uid>,
-                            _gid: Option<Gid>|
-         -> nix::Result<()> { Err(nix::errno::Errno::EROFS) };
-
-        chown_children(&root, uid, gid, &always_erofs)
-            .expect("EROFS on all children should be skipped gracefully");
+        assert!(missing.is_dir());
     }
 
     #[cfg(unix)]

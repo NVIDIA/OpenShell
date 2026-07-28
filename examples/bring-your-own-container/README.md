@@ -63,6 +63,9 @@ key requirements are:
   such as `app`, a numeric UID with a passwd entry that supplies its primary
   GID, or a numeric pair such as `1500:1500`. You can instead set both
   `process.run_as_user` and `process.run_as_group` explicitly in policy.
+- **Use `/sandbox` as the workspace.** Pre-owning it in the image is good image
+  hygiene and avoids startup ownership work, but Docker and Podman create and
+  prepare it automatically when OCI `USER` supplies any identity component.
 - **Install `iproute2`** for full network namespace isolation.
 - **Use a standard Linux base image** — distroless and `FROM scratch`
   images are not supported.

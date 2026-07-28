@@ -17,9 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN groupadd --gid 1500 app \
     && useradd --uid 1500 --gid app --create-home app
 
-RUN install -d /sandbox
+RUN install -d -o app -g app /sandbox
 WORKDIR /sandbox
-COPY app.py .
+COPY --chown=app:app app.py .
 
 EXPOSE 8080
 
