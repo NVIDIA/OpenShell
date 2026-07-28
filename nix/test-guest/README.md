@@ -63,6 +63,81 @@ List the available distros and configurations:
 nix run .#test-guest -- --list
 ```
 
+## Run a host or test-guest E2E suite
+
+[`e2e/run.sh`](../../e2e/run.sh) builds OpenShell from the current checkout, starts a gateway from a supplied TOML file, and runs one named host-side suite against it. This opt-in path is separate from `mise run e2e:vm`: `e2e/run.sh` selects where the gateway process runs, while the supplied gateway config selects the compute driver. It is not part of the default E2E task or CI graph.
+
+Omit both `--vm` and `--with` to run the gateway on the host:
+
+```shell
+e2e/run.sh \
+  --gateway-config e2e/configs/gateway/docker.toml \
+  --suite smoke
+```
+
+Pass `--vm` or at least one `--with` to run the gateway in a disposable test guest:
+
+```shell
+e2e/run.sh \
+  --vm ubuntu \
+  --with docker \
+  --gateway-config e2e/configs/gateway/docker.toml \
+  --suite smoke
+```
+
+Use `--guest-setup` when a driver needs checkout-specific guest preparation
+before the gateway starts. For example, the Podman shutdown suite builds a
+supervisor image around the staged `openshell-sandbox` binary:
+
+```shell
+e2e/run.sh \
+  --vm ubuntu \
+  --with podman \
+  --guest-setup e2e/guest-setup/podman-supervisor.sh \
+  --gateway-config e2e/configs/gateway/podman.toml \
+  --suite podman-shutdown
+```
+
+Set `OPENSHELL_E2E_EXPECT_SHUTDOWN_CLOSES=1` when a stacked change must
+classify supervisor and relay transport closures as expected teardown events.
+
+Supplying `--with` without `--vm` selects Ubuntu. `--with` is repeatable and configurations run in input order. Supplying `--vm` without `--with` boots the selected base image without adding software. The wrapper validates both values against the test-guest catalogs:
+
+```shell
+e2e/run.sh \
+  --vm rocky \
+  --with docker \
+  --with selinux \
+  --gateway-config e2e/configs/gateway/docker.toml \
+  --suite smoke
+```
+
+The equivalent passthrough task accepts the same arguments:
+
+```shell
+mise run e2e:test -- \
+  --with docker \
+  --gateway-config e2e/configs/gateway/docker.toml \
+  --suite smoke
+```
+
+The wrapper always builds the tested binaries; it does not accept packages or use release artifacts. Both modes build a native host `openshell` CLI and a static Linux `openshell-sandbox` for the host architecture. Host mode also builds a native `openshell-gateway` with bundled Z3. VM mode builds a static Linux `openshell` and a Linux GNU `openshell-gateway` with bundled Z3 and a glibc 2.28 floor, then stages all three guest binaries through the VM runner's `--copy` interface.
+
+The Linux targets match the host and guest architecture:
+
+| Host architecture | CLI and sandbox | Gateway |
+| --- | --- | --- |
+| x86_64 | `x86_64-unknown-linux-musl` | `x86_64-unknown-linux-gnu.2.28` |
+| aarch64 | `aarch64-unknown-linux-musl` | `aarch64-unknown-linux-gnu.2.28` |
+
+These cross-builds use the Zig and `cargo-zigbuild` versions pinned in [`mise.toml`](../../mise.toml). Install the repository's mise tools before running the wrapper. The wrapper also requires Python 3 and OpenSSL; VM mode requires `base64`. Cargo stores outputs in its normal target directory, so later runs reuse current artifacts. VM mode additionally requires the Nix, QEMU, and host-capacity prerequisites above; host mode does not invoke Nix, QEMU, or Ansible.
+
+Gateway configs are ordinary, fully resolved TOML files under `e2e/configs/gateway/`. The wrapper does not inspect or rewrite them. It supplies only the bind address, gateway port, plaintext transport, and isolated XDG directories at launch. Use portable relative paths for host files. The initial Docker config points `supervisor_bin` at `.cache/openshell-e2e/bin/openshell-sandbox`; the wrapper stages that path under the repository in host mode and under `/home/openshell` in VM mode. It also generates and stages the local sandbox JWT material referenced by the initial config.
+
+Suites are executable scripts under `e2e/suites/` and use lowercase letters, digits, and hyphens for their names. The wrapper exports the selected endpoint, isolated gateway registration, native host CLI path, mode metadata, source config path, and forwarded ports before executing a suite. Add new configs and suites without adding scenario branches to `e2e/run.sh`.
+
+Set `OPENSHELL_E2E_KEEP=1` to retain wrapper state after a host-mode run. In VM mode the wrapper also passes `--keep` to the test-guest runner so its overlay and logs remain available.
+
 ## Open an interactive VM
 
 Boot a base Ubuntu VM:
@@ -215,9 +290,13 @@ The destination must be an absolute guest path. Copied files are installed with 
 --install PATH      Install a .deb or .rpm package; repeatable
 --copy SRC:DEST     Copy an executable into the guest; repeatable
 --ssh-port PORT     Use a specific loopback SSH forwarding port
+--forward-port HOST_PORT:GUEST_PORT
+                    Forward a loopback host port to a guest port; repeatable
 --keep              Preserve the disk overlay and logs after shutdown
 --list              List distros and configurations
 ```
+
+Each `--forward-port` binds only `127.0.0.1` on the host. Both ports must be unprivileged values from 1024 through 65535, and each host port may appear only once.
 
 Arguments after `--` are executed inside the guest. Without a command, the runner opens an interactive SSH session.
 
@@ -243,5 +322,5 @@ Use `--keep` to preserve the overlay, cloud-init seed, SSH key, and serial log f
 - TCG is slower than hardware virtualization and uses a longer SSH readiness timeout.
 - Prepared cache entries are architecture-specific and match the exact ordered configuration list.
 - OCI pulls transfer a complete compressed standalone disk; incremental disk layers are not implemented.
-- Only loopback SSH is forwarded to the host; guest gateway ports are not exposed.
-- The runner does not build OpenShell, configure a gateway, or select an E2E test suite.
+- Guest ports are reachable from the host only when explicitly exposed with loopback-only `--forward-port`.
+- The low-level VM runner does not build OpenShell, configure a gateway, or select an E2E test suite. Use `e2e/run.sh` for that orchestration.

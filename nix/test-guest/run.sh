@@ -17,6 +17,8 @@ Options:
   --install PATH      Install a .deb or .rpm package; repeatable
   --copy SRC:DEST     Copy an executable to an absolute guest path; repeatable
   --ssh-port PORT     Use a specific loopback SSH forwarding port
+  --forward-port HOST_PORT:GUEST_PORT
+                      Forward a loopback host port to a guest port; repeatable
   --keep              Keep the disposable disk and logs after shutdown
   --list              List distros and configurations
   -h, --help          Show this help
@@ -40,6 +42,7 @@ list=0
 configurations=()
 packages=()
 copies=()
+forward_ports=()
 guest_command=()
 
 while [ "$#" -gt 0 ]; do
@@ -62,6 +65,14 @@ while [ "$#" -gt 0 ]; do
 		;;
 	--ssh-port)
 		requested_ssh_port=${2:-}
+		shift 2
+		;;
+	--forward-port)
+		if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+			echo "--forward-port requires HOST_PORT:GUEST_PORT" >&2
+			exit 2
+		fi
+		forward_ports+=("${2:-}")
 		shift 2
 		;;
 	--keep)
@@ -124,13 +135,56 @@ for item in "${configurations[@]}"; do
 done
 
 if [ -n "${requested_ssh_port}" ] && {
-		[[ ! ${requested_ssh_port} =~ ^[0-9]+$ ]] ||
-			[ "${requested_ssh_port}" -lt 1024 ] ||
-			[ "${requested_ssh_port}" -gt 65535 ]
+	[[ ! ${requested_ssh_port} =~ ^[0-9]+$ ]] ||
+		[ "${requested_ssh_port}" -lt 1024 ] ||
+		[ "${requested_ssh_port}" -gt 65535 ]
 	}; then
 	echo "--ssh-port must be an integer between 1024 and 65535" >&2
 	exit 2
 fi
+
+forward_host_ports=()
+for forward_spec in "${forward_ports[@]}"; do
+	host_port=${forward_spec%%:*}
+	guest_port=${forward_spec#*:}
+	if [ "${host_port}" = "${forward_spec}" ] ||
+		[[ ! ${host_port} =~ ^[1-9][0-9]*$ ]] ||
+		[[ ! ${guest_port} =~ ^[1-9][0-9]*$ ]] ||
+		[ "${host_port}" -lt 1024 ] ||
+		[ "${host_port}" -gt 65535 ] ||
+		[ "${guest_port}" -lt 1024 ] ||
+		[ "${guest_port}" -gt 65535 ]; then
+		echo "--forward-port must be HOST_PORT:GUEST_PORT with both ports between 1024 and 65535: ${forward_spec:-<empty>}" >&2
+		exit 2
+	fi
+	for existing_host_port in "${forward_host_ports[@]}"; do
+		if [ "${host_port}" = "${existing_host_port}" ]; then
+			echo "duplicate --forward-port host port: ${host_port}" >&2
+			exit 2
+		fi
+	done
+	if [ -n "${requested_ssh_port}" ] && [ "${host_port}" = "${requested_ssh_port}" ]; then
+		echo "--forward-port host port conflicts with --ssh-port: ${host_port}" >&2
+		exit 2
+	fi
+	if ! python3 - "${host_port}" <<'PY'
+import socket
+import sys
+
+sock = socket.socket()
+try:
+    sock.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    raise SystemExit(1)
+finally:
+    sock.close()
+PY
+	then
+		echo "--forward-port host port is unavailable: ${host_port}" >&2
+		exit 2
+	fi
+	forward_host_ports+=("${host_port}")
+done
 
 for package in "${packages[@]}"; do
 	if [ ! -f "${package}" ]; then
@@ -268,6 +322,17 @@ pick_free_port() {
 	python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
 }
 
+port_is_forwarded() {
+	local candidate=$1
+	local forwarded
+	for forwarded in "${forward_host_ports[@]}"; do
+		if [ "${candidate}" = "${forwarded}" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
 ssh-keygen -q -t ed25519 -N "" -f "${private_key}"
 public_key=$(<"${private_key}.pub")
 
@@ -300,7 +365,22 @@ cp "${TEST_GUEST_FIRMWARE_VARS}" "${vars}"
 chmod 0600 "${vars}"
 
 for attempt in $(seq 1 5); do
-	ssh_port=${requested_ssh_port:-$(pick_free_port)}
+	if [ -n "${requested_ssh_port}" ]; then
+		ssh_port=${requested_ssh_port}
+	else
+		while :; do
+			ssh_port=$(pick_free_port)
+			if ! port_is_forwarded "${ssh_port}"; then
+				break
+			fi
+		done
+	fi
+	netdev_arg="user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
+	for forward_spec in "${forward_ports[@]}"; do
+		host_port=${forward_spec%%:*}
+		guest_port=${forward_spec#*:}
+		netdev_arg+=",hostfwd=tcp:127.0.0.1:${host_port}-:${guest_port}"
+	done
 	: >"${qemu_log}"
 	echo "==> Booting ${distro} (${TEST_GUEST_ARCHITECTURE}) with QEMU/${TEST_GUEST_ACCELERATOR}"
 	"${TEST_GUEST_QEMU}" \
@@ -316,7 +396,7 @@ for attempt in $(seq 1 5); do
 		-drive "if=none,format=raw,readonly=on,file=${seed},id=seed" \
 		-device virtio-blk-pci,drive=seed \
 		-boot strict=on \
-		-netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22" \
+		-netdev "${netdev_arg}" \
 		-device virtio-net-pci,netdev=net0 \
 		-display none \
 		-monitor none \
@@ -332,7 +412,8 @@ for attempt in $(seq 1 5); do
 	wait "${qemu_pid}" || true
 	qemu_pid=
 	if ! grep -q "Could not set up host forwarding rule" "${qemu_log}" ||
-		[ -n "${requested_ssh_port}" ]; then
+		[ -n "${requested_ssh_port}" ] ||
+		[ "${#forward_ports[@]}" -gt 0 ]; then
 		echo "QEMU exited during startup" >&2
 		exit 1
 	fi
