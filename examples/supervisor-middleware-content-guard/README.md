@@ -5,11 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # Supervisor Middleware Content Guard
 
-<!-- markdownlint-disable MD033 -->
-<Warning title="Research Preview Feature">
-Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware integrations.
-</Warning>
-<!-- markdownlint-enable MD033 -->
+> [!WARNING]
+> Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware integrations.
 
 This example implements an operator-run supervisor middleware service. It scans UTF-8 HTTP request bodies for configured literal strings, then either replaces every match or denies the request. Findings report only aggregate counts and never include configured terms or request content.
 
