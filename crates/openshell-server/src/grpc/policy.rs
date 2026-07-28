@@ -1674,7 +1674,12 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
                     Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
                 })?;
                 hasher.update(provider.r#type.as_bytes());
-                hash_provider_profile_revision(catalog, &provider.r#type, &mut hasher);
+                hash_provider_profile_revision(
+                    catalog,
+                    &provider.r#type,
+                    &provider.profile_workspace,
+                    &mut hasher,
+                );
 
                 let mut credential_keys: Vec<_> = provider.credentials.keys().collect();
                 credential_keys.sort();
@@ -1703,10 +1708,11 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
 fn hash_provider_profile_revision(
     catalog: &EffectiveProviderProfileCatalog,
     provider_type: &str,
+    profile_workspace: &str,
     hasher: &mut Sha256,
 ) {
     let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
-    catalog.hash_profile_revision(profile_id, hasher);
+    catalog.hash_type_profile_revision_for_scope(profile_id, profile_workspace, hasher);
 }
 
 #[cfg(test)]
@@ -7275,6 +7281,94 @@ mod tests {
         assert_ne!(
             first, second,
             "custom provider profile updates must trigger sandbox dynamic credential refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn platform_profile_narrowing_changes_platform_provider_revision_when_shadowed() {
+        use crate::persistence::WriteCondition;
+        use openshell_core::proto::{
+            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
+        };
+
+        fn stored_profile(workspace: &str, path: &str) -> StoredProviderProfile {
+            StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!(
+                        "profile-scoped-revision-{}",
+                        if workspace.is_empty() {
+                            "platform"
+                        } else {
+                            workspace
+                        }
+                    ),
+                    name: "scoped-revision".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: workspace.to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                profile: Some(ProviderProfile {
+                    id: "scoped-revision".to_string(),
+                    display_name: format!("{workspace} scoped revision"),
+                    category: ProviderProfileCategory::Other as i32,
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.test".to_string(),
+                        port: 443,
+                        path: path.to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            }
+        }
+
+        let store = test_store().await;
+        store.put_message(&stored_profile("", "/**")).await.unwrap();
+        store
+            .put_message(&stored_profile("default", "/workspace/**"))
+            .await
+            .unwrap();
+        let mut provider = test_provider("platform-scoped", "scoped-revision");
+        provider.profile_workspace = String::new();
+        store.put_message(&provider).await.unwrap();
+
+        let first =
+            compute_provider_env_revision(&store, "default", &["platform-scoped".to_string()])
+                .await
+                .unwrap();
+
+        let mut platform = store
+            .get_message_by_name::<StoredProviderProfile>("", "scoped-revision")
+            .await
+            .unwrap()
+            .unwrap();
+        let metadata = platform.metadata.as_ref().unwrap();
+        let object_id = metadata.id.clone();
+        let resource_version = metadata.resource_version;
+        platform.profile.as_mut().unwrap().endpoints[0].path = "/v1/**".to_string();
+        store
+            .put_if(
+                StoredProviderProfile::object_type(),
+                &object_id,
+                "scoped-revision",
+                "",
+                &platform.encode_to_vec(),
+                None,
+                WriteCondition::MatchResourceVersion(resource_version),
+            )
+            .await
+            .unwrap();
+
+        let second =
+            compute_provider_env_revision(&store, "default", &["platform-scoped".to_string()])
+                .await
+                .unwrap();
+        assert_ne!(
+            first, second,
+            "narrowing the selected platform fallback must refresh sandbox credentials"
         );
     }
 
