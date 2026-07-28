@@ -3533,23 +3533,32 @@ fn parse_proxy_uri(uri: &str) -> Result<(String, String, u16, String)> {
         .ok_or_else(|| miette::miette!("Missing scheme in proxy URI: {uri}"))?;
     let scheme = scheme.to_ascii_lowercase();
 
-    // Split authority from path
-    let (authority, path) = if rest.starts_with('[') {
-        // IPv6: [::1]:port/path
+    // Split authority from the request target. A query may immediately follow
+    // the authority when the absolute URI has no explicit path, so `/` alone
+    // is not a sufficient delimiter.
+    let target_start = if rest.starts_with('[') {
+        // IPv6: [::1]:port/path or [::1]?query
         let bracket_end = rest
             .find(']')
             .ok_or_else(|| miette::miette!("Unclosed IPv6 bracket in URI: {uri}"))?;
-        let after_bracket = &rest[bracket_end + 1..];
-        after_bracket.find('/').map_or((rest, "/"), |slash_pos| {
-            (
-                &rest[..=bracket_end + slash_pos],
-                &after_bracket[slash_pos..],
-            )
-        })
-    } else if let Some(slash_pos) = rest.find('/') {
-        (&rest[..slash_pos], &rest[slash_pos..])
+        rest[bracket_end + 1..]
+            .find(['/', '?', '#'])
+            .map(|position| bracket_end + 1 + position)
     } else {
-        (rest, "/")
+        rest.find(['/', '?', '#'])
+    };
+    let (authority, target) = target_start.map_or((rest, ""), |position| rest.split_at(position));
+    if target.contains('#') {
+        return Err(miette::miette!(
+            "Fragments are not allowed in proxy URI: {uri}"
+        ));
+    }
+    let path = match target.chars().next() {
+        None => "/".to_string(),
+        Some('/') => target.to_string(),
+        Some('?') => format!("/{target}"),
+        Some('#') => unreachable!("fragments were rejected above"),
+        Some(_) => unreachable!("target begins at a recognized delimiter"),
     };
 
     // Parse host and port from authority
@@ -3588,9 +3597,7 @@ fn parse_proxy_uri(uri: &str) -> Result<(String, String, u16, String)> {
         return Err(miette::miette!("Empty host in URI: {uri}"));
     }
 
-    let path = if path.is_empty() { "/" } else { path };
-
-    Ok((scheme, host, port, path.to_string()))
+    Ok((scheme, host, port, path))
 }
 
 /// Return a query-free, credential-redacted path suitable for forward-proxy
@@ -5577,6 +5584,30 @@ network_policies: {}
             assert!(!serialized.contains("real-secret"), "{serialized}");
             assert!(!serialized.contains("?token="), "{serialized}");
         }
+
+        let target = "http://api.example.com?token=real-secret";
+        let (_, host, port, path) = parse_proxy_uri(target).expect("absolute URI without a path");
+        assert_eq!(host, "api.example.com");
+        assert_eq!(path, "/?token=real-secret");
+        let no_path_query = build_forward_allow_ocsf_event(
+            peer,
+            "GET",
+            &host,
+            port,
+            &forward_telemetry_path(target),
+            "/usr/bin/curl",
+            "42",
+            "/usr/bin/bash",
+            "curl",
+            "allow_api",
+        )
+        .to_json()
+        .unwrap();
+        assert_eq!(no_path_query["dst_endpoint"]["domain"], "api.example.com");
+        assert_eq!(no_path_query["http_request"]["url"]["path"], "/");
+        let serialized = no_path_query.to_string();
+        assert!(!serialized.contains("real-secret"), "{serialized}");
+        assert!(!serialized.contains("?token="), "{serialized}");
 
         let malformed = build_forward_parse_error_ocsf_event(&forward_telemetry_path(
             "not-a-uri?token=real-secret&key=openshell:resolve:env:API_TOKEN",
@@ -8536,6 +8567,14 @@ network_policies:
     }
 
     #[test]
+    fn test_parse_proxy_uri_with_query_and_no_path() {
+        let (_, host, port, path) = parse_proxy_uri("http://host:8080?key=val&foo=bar").unwrap();
+        assert_eq!(host, "host");
+        assert_eq!(port, 8080);
+        assert_eq!(path, "/?key=val&foo=bar");
+    }
+
+    #[test]
     fn forward_telemetry_path_omits_queries_and_redacts_credential_syntax() {
         let target = "http://host:80/v1/openshell:resolve:env:API_TOKEN?token=real-secret";
         let redacted = forward_telemetry_path(target);
@@ -8648,6 +8687,20 @@ network_policies:
         assert_eq!(host, "fe80::1");
         assert_eq!(port, 80);
         assert_eq!(path, "/path");
+    }
+
+    #[test]
+    fn test_parse_proxy_uri_ipv6_with_query_and_no_path() {
+        let (_, host, port, path) = parse_proxy_uri("http://[fe80::1]:8080?key=val").unwrap();
+        assert_eq!(host, "fe80::1");
+        assert_eq!(port, 8080);
+        assert_eq!(path, "/?key=val");
+    }
+
+    #[test]
+    fn test_parse_proxy_uri_rejects_fragment() {
+        assert!(parse_proxy_uri("http://example.com#secret").is_err());
+        assert!(parse_proxy_uri("http://[fe80::1]#secret").is_err());
     }
 
     #[test]

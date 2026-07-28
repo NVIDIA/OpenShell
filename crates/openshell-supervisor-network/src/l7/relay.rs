@@ -810,7 +810,7 @@ where
     let use_websocket_relay = options.websocket_request
         && (options.websocket.message_policy.inspects_messages()
             || options.websocket.permessage_deflate
-            || (options.websocket.credential_rewrite && options.secret_resolver.is_some()));
+            || options.websocket.credential_rewrite);
     let relay_mode = if use_websocket_relay {
         "websocket parsed relay"
     } else {
@@ -5348,6 +5348,97 @@ network_policies:
             .expect("client side should close without 101")
             .unwrap();
         assert_eq!(n, 0, "invalid response must not forward 101 headers");
+    }
+
+    #[tokio::test]
+    async fn websocket_rewrite_stays_parsed_when_live_credentials_are_revoked_before_upgrade() {
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([("API_TOKEN".to_string(), "real-token".to_string())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "allowed.example.test".to_string(),
+                        port: 443,
+                        path: "/allowed/**".to_string(),
+                    }],
+                    credential_identity: "provider-a:API_TOKEN".to_string(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("bound provider state");
+        let placeholder = state
+            .snapshot()
+            .child_env
+            .get("API_TOKEN")
+            .expect("placeholder")
+            .clone();
+        state.revoke_static_provider_environment(2);
+
+        let ctx = L7EvalContext {
+            host: "allowed.example.test".into(),
+            port: 443,
+            policy_name: "route_api".into(),
+            provider_credentials: Some(state),
+            ..Default::default()
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            handle_upgrade(
+                &mut relay_client,
+                &mut relay_upstream,
+                Vec::new(),
+                "allowed.example.test",
+                443,
+                UpgradeRelayOptions {
+                    websocket_request: true,
+                    websocket: WebSocketUpgradeBehavior {
+                        credential_rewrite: true,
+                        ..Default::default()
+                    },
+                    ctx: Some(&ctx),
+                    target: "/allowed/socket".to_string(),
+                    policy_name: "route_api".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+
+        app.write_all(&masked_text_frame(placeholder.as_bytes()))
+            .await
+            .unwrap();
+        app.flush().await.unwrap();
+
+        let mut forwarded = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read_to_end(&mut forwarded),
+        )
+        .await
+        .expect("revoked parsed relay should close upstream")
+        .unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "revoked credential frame must not be raw-relayed upstream"
+        );
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("parsed relay should finish after credential rejection")
+            .unwrap()
+            .expect_err("revoked placeholder must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("credential placeholder resolution"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
