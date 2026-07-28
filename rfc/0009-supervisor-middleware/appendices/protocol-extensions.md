@@ -2,6 +2,8 @@
 
 > This is an appendix to the [RFC](../README.md). Please familiarize yourself with the RFC before reading this.
 
+**Update in PR #2477 - WebSocket middleware:** V1 now includes a forward-text WebSocket operation. The updated text below separates this implemented operation from future HTTP streaming and WebSocket return-path operations.
+
 The v1 contract is intentionally minimal: one buffered unary HTTP request hook and one forward-text WebSocket message hook, each with an `allow`/`deny` decision plus optional transformed content, findings, and metadata. This appendix records extensions the proto should not preclude, so v1 stays small without painting future work into a corner. None of these are committed; they exist to validate that the v1 shape is forward-compatible.
 
 ## Streaming
@@ -41,6 +43,8 @@ The streaming method should have its own messages instead of reusing `HttpReques
 A cleaner phased design using a `oneof` over `context` and `body_chunk`, in the style of Envoy `ext_proc`, is available for a future streaming operation because it would not need to preserve the unary v1 message shape. V1 keeps the flat unary request because it is simpler for bounded bodies and avoids making every middleware implement streaming mechanics before the need is proven.
 
 ## Additional operation phases
+
+> **Update in PR #2477 - WebSocket middleware:** This section now records `WEBSOCKET_MESSAGE/PRE_CREDENTIALS` as implemented. It keeps `WEBSOCKET_MESSAGE/PRE_RETURN` as a reserved future operation.
 
 V1 supports `HTTP_REQUEST/PRE_CREDENTIALS` and forward-text `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. The same service interface can host more operations, each advertised through the `Describe` manifest and invoked through an operation-specific method. Each operation and phase pair encodes a different position in the proxy flow:
 

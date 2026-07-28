@@ -22,9 +22,9 @@ For each inspected HTTP request, the supervisor:
 5. Re-checks body-aware protocol policy (GraphQL, JSON-RPC, MCP) after each stage that replaces the body. Every middleware receives a payload the policy admits, and a transformation cannot smuggle a denied or unparseable operation to a later stage or the upstream.
 6. Applies allowed transformations, injects provider credentials, and forwards the request.
 
-For an RFC 6455 upgrade over `ws://` or `wss://`, the supervisor first finds every host-matched attachment, then selects only implementations that advertise `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. It opens one ordered `EvaluateWebSocket` stream per selected stage. An attachment without that binding can still inspect the HTTP upgrade request when it advertises the HTTP binding, but it is not a failed WebSocket stage. OpenShell allows post-upgrade traffic and emits an informational `binding_not_selected` coverage event for that attachment.
+For an RFC 6455 upgrade over `ws://` or `wss://`, the supervisor first finds every host-matched attachment, then selects only implementations that advertise `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. It opens one ordered, phase-specific `EvaluateWebSocketSession` stream per selected stage. OpenShell sends `WebSocketSessionEvent` values, while the service returns `WebSocketSessionResult` values only for preflight and message events; session start and end are notifications. Future upstream-to-client inspection uses the same RPC with `PRE_RETURN`; an implementation that advertises both phases receives two independent streams for the WebSocket session. An attachment without the selected binding can still inspect the HTTP upgrade request when it advertises the HTTP binding, but it is not a failed WebSocket stage. OpenShell allows post-upgrade traffic and emits an informational `binding_not_selected` coverage event for that attachment.
 
-1. A preflight before the upgrade is sent upstream. The stage chooses `INSPECT`, voluntary `SKIP`, or authoritative `DENY`. OpenShell runs selected preflights concurrently; any `DENY` rejects the upgrade regardless of `on_error`.
+1. A preflight before the upgrade is sent upstream. The stage chooses `INSPECT`, voluntary `SKIP`, or authoritative `DENY` and may return a bounded diagnostic reason, stable reason code, findings, and metadata. OpenShell runs selected preflights concurrently; any `DENY` rejects the upgrade regardless of `on_error`.
 2. A session-start event after the upstream accepts the upgrade, including the negotiated subprotocol.
 3. Complete client-to-upstream text messages in sequence order. OpenShell reassembles fragmented messages and decompresses negotiated `permessage-deflate` messages before evaluation.
 4. A best-effort session-end event when the stage stream remains writable. OpenShell attempts at most one terminal event for each opened stream, including streams opened during a preflight that rejects the upgrade before session start.
@@ -56,7 +56,7 @@ Start an operator-run service before starting the gateway, then add a registrati
 [[openshell.supervisor.middleware]]
 name = "local-content-guard"
 grpc_endpoint = "http://host.openshell.internal:50051"
-max_body_bytes = 262144
+max_payload_bytes = 262144
 timeout = "500ms"
 ```
 
@@ -64,7 +64,7 @@ timeout = "500ms"
 | --- | --- |
 | `name` | Operator-owned registration name used by policy attachments and diagnostics. Names must be unique, and `openshell/` is reserved for built-ins. |
 | `grpc_endpoint` | Service address reachable from both the gateway and sandbox supervisors. Supports plaintext `http://` and TLS `https://` with platform trust roots. |
-| `max_body_bytes` | Shared operator limit applied to inspectable logical payloads across every binding exposed by the service, up to the 4 MiB platform maximum. It caps HTTP bodies and complete WebSocket text messages. |
+| `max_payload_bytes` | Shared operator limit applied to inspectable logical payloads across every binding exposed by the service, up to the 4 MiB platform maximum. It caps HTTP bodies and complete WebSocket text messages. |
 | `timeout` | Optional service-wide RPC timeout using an integer with an `ms` or `s` suffix. Defaults to `500ms`; valid values range from `10ms` through `30s`. |
 
 Each binding returned by `Describe` may advertise a shorter `timeout` using the same syntax and bounds. The operator-configured service timeout is a ceiling: OpenShell uses the smaller of the binding and service values. An omitted binding timeout inherits the service setting, and an omitted service setting uses the 500 ms platform default. OpenShell rejects an invalid timeout before accepting the manifest. The service timeout applies to `Describe`; the effective binding timeout applies to `ValidateConfig`, `EvaluateHttpRequest`, WebSocket preflight, and each WebSocket message. WebSocket streams have no connection-wide deadline.
@@ -112,7 +112,7 @@ Use `fail_open` only when bypassing the middleware preserves the intended securi
 
 Capability coverage is separate from failure handling. A host-matched HTTP-only attachment does not join the WebSocket chain, regardless of `on_error`. Binary messages are outside the V1 text-message binding and pass through even when a selected stage is `fail_closed`. OpenShell records both states as informational coverage events so operators do not mistake pass-through traffic for inspected traffic. If a deployment requires all WebSocket message classes to be inspected, V1 cannot express that requirement.
 
-An explicit deny decision always stops the chain and denies the request or WebSocket upgrade, regardless of `on_error`. A WebSocket preflight `DENY` is a successful policy decision, not a middleware failure; OpenShell rejects the upgrade before upstream contact and ends each still-writable stream opened by a successful preflight decision with `MIDDLEWARE_DENIAL`. The HTTP response uses `error: middleware_denied`, identifies the policy-local middleware config, and omits policy-advisor remediation because the network and L7 allow rules already matched. OpenShell never copies the free-form middleware `reason` into the response or security logs. HTTP and WebSocket message results can instead return an optional stable `reason_code`: 1–64 bytes, starting with a lowercase ASCII letter and containing only lowercase ASCII letters, digits, and underscores. Invalid codes make the result a middleware failure governed by `on_error`.
+An explicit deny decision always stops the chain and denies the request or WebSocket upgrade, regardless of `on_error`. A WebSocket preflight `DENY` is a successful policy decision, not a middleware failure; OpenShell rejects the upgrade before upstream contact and ends each still-writable stream opened by a successful preflight decision with `MIDDLEWARE_DENIAL`. The HTTP response uses `error: middleware_denied`, identifies the policy-local middleware config, and omits policy-advisor remediation because the network and L7 allow rules already matched. OpenShell never copies the free-form middleware `reason` into the response or security logs. HTTP results, WebSocket preflight decisions, and WebSocket message results can instead return an optional stable `reason_code`: 1–64 bytes, starting with a lowercase ASCII letter and containing only lowercase ASCII letters, digits, and underscores. Invalid codes make the result a middleware failure governed by `on_error`. Preflight findings and metadata use the same bounds and audit-safe handling as message results.
 
 ```json
 {
@@ -133,7 +133,7 @@ Middleware decisions are enforced regardless of the endpoint's `enforcement` mod
 Every middleware binding declares the largest request or replacement payload it supports.
 
 - Built-in middleware uses its OpenShell-defined limit.
-- Each operator-run registration sets one `max_body_bytes` ceiling no higher than any advertised HTTP-body or WebSocket-message capability.
+- Each operator-run registration sets one `max_payload_bytes` ceiling no higher than any advertised HTTP-body or WebSocket-message capability.
 - A selected chain buffers using its largest stage limit, so every stage that can process the body receives it.
 - The same per-stage limit applies to request bodies and replacement bodies.
 
@@ -141,7 +141,7 @@ The gateway rejects a registration whose operator limit exceeds the service capa
 
 At request time, exceeding a selected stage's limit is a middleware failure for that stage alone and follows that config's `on_error` behavior; other stages in the chain still run against their own limits. OpenShell can apply `fail_open` to an oversized `Content-Length` before consuming body bytes. A chunked body can cross the limit only after bytes have been consumed, so OpenShell denies that request because it cannot safely resume the original stream.
 
-WebSocket bindings advertise `max_message_bytes` for complete client text messages and replacements. The operator registration's shared `max_body_bytes` is an additional ceiling on that capability. Exceeding a selected stage's effective text-message limit follows that stage's `on_error`. The 4 MiB parsed-text platform cap and other protocol-safety limits are independent of middleware failure policy. Binary messages are not delivered to middleware, so the operator ceiling does not become a binary relay limit; individual raw binary frames retain the 16 MiB relay-safety bound. Oversized parsed text closes the connection with code `1009`; invalid UTF-8 uses `1007`; protocol errors use `1002`; middleware or policy denials use `1008`; and policy reload uses `1012`.
+WebSocket bindings advertise `max_message_bytes` for complete client text messages and replacements. The operator registration's shared `max_payload_bytes` is an additional ceiling on that capability. Exceeding a selected stage's effective text-message limit follows that stage's `on_error`. The 4 MiB parsed-text platform cap and other protocol-safety limits are independent of middleware failure policy. Binary messages are not delivered to middleware, so the operator ceiling does not become a binary relay limit; individual raw binary frames retain the 16 MiB relay-safety bound. Oversized parsed text closes the connection with code `1009`; invalid UTF-8 uses `1007`; protocol errors use `1002`; middleware or policy denials use `1008`; and policy reload uses `1012`.
 
 ## Mutate Request Headers
 

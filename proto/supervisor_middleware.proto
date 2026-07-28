@@ -22,13 +22,15 @@ service SupervisorMiddleware {
   // buffered HTTP request.
   rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult);
 
-  // EvaluateWebSocket opens one ordered stream for a single middleware stage
-  // and WebSocket upgrade attempt. PR 1 supports client-to-upstream text
-  // messages at PRE_CREDENTIALS. A request may go unanswered when the session
-  // terminates. For every opened stage stream, OpenShell attempts at most one
-  // session_end before closing the stream when its transport is still writable.
-  rpc EvaluateWebSocket(stream WebSocketEvaluationRequest)
-      returns (stream WebSocketEvaluationResponse);
+  // EvaluateWebSocketSession opens one ordered, phase-specific stream for a
+  // single middleware stage and WebSocket upgrade attempt. The current
+  // implementation supports client-to-upstream text messages at
+  // PRE_CREDENTIALS; PRE_RETURN is reserved for upstream-to-client messages.
+  // A request may go unanswered when the session terminates. For every opened
+  // stage stream, OpenShell attempts at most one session_end before closing the
+  // stream when its transport is still writable.
+  rpc EvaluateWebSocketSession(stream WebSocketSessionEvent)
+      returns (stream WebSocketSessionResult);
 }
 
 // MiddlewareManifest describes one middleware service and the bindings it
@@ -150,12 +152,12 @@ enum WebSocketSessionEndReason {
   WEB_SOCKET_SESSION_END_REASON_POLICY_DENIAL = 9;
 }
 
-// WebSocketEvaluationRequest is one ordered event in a stage-local stream.
+// WebSocketSessionEvent is one ordered event in a stage-local stream.
 // Message sequence numbers identify logical messages session-wide. A stage
 // receives a strictly increasing subset of those numbers; gaps are valid when
 // session messages are not delivered to that stage.
-message WebSocketEvaluationRequest {
-  oneof request {
+message WebSocketSessionEvent {
+  oneof event {
     WebSocketPreflight preflight = 1;
     WebSocketSessionStart session_start = 2;
     WebSocketMessage message = 3;
@@ -218,6 +220,20 @@ enum WebSocketPreflightAction {
 
 message WebSocketPreflightDecision {
   WebSocketPreflightAction action = 1;
+  // Free-form service diagnostic. OpenShell never exposes this to the
+  // workload or security logs. Limited to 4 KiB before discarding.
+  string reason = 2;
+  // Audit-safe findings produced during preflight. At most 32 findings of at
+  // most 4 KiB encoded each are accepted.
+  repeated Finding findings = 3;
+  // Non-secret service-defined metadata included in diagnostics. At most 64
+  // entries and 32 KiB of combined key/value data are accepted.
+  map<string, string> metadata = 4;
+  // Optional stable machine-readable code for a deny decision. Because
+  // preflight runs before the HTTP upgrade completes, OpenShell may return
+  // this code to the requester. Codes follow the same format and 64-byte
+  // maximum as HttpRequestResult.reason_code.
+  string reason_code = 5;
 }
 
 // WebSocketMessageResult contains the decision and optional replacement for
@@ -240,8 +256,10 @@ message WebSocketMessageResult {
   string reason_code = 8;
 }
 
-message WebSocketEvaluationResponse {
-  oneof response {
+// WebSocketSessionResult is an evaluation result for a preflight or message
+// event. Session start and end events do not produce results.
+message WebSocketSessionResult {
+  oneof result {
     WebSocketPreflightDecision preflight_decision = 1;
     WebSocketMessageResult message_result = 2;
   }
@@ -283,13 +301,16 @@ message Process {
   repeated string ancestors = 3;
 }
 
-// Decision controls whether OpenShell continues processing the request.
+// Decision controls whether OpenShell continues processing the current
+// evaluation unit.
 enum Decision {
   // Invalid response value handled according to the policy failure mode.
   DECISION_UNSPECIFIED = 0;
-  // Continue processing the request and apply any returned mutations.
+  // Continue processing the current request or message and apply any returned
+  // mutations.
   DECISION_ALLOW = 1;
-  // Deny the request before credentials are injected or data is sent upstream.
+  // Reject the current request or message. The operation-specific result
+  // defines the enclosing protocol behavior.
   DECISION_DENY = 2;
 }
 

@@ -96,7 +96,7 @@ The gateway calls each interceptor's `Describe` RPC and validates its manifest a
 For operator-run supervisor middleware, inspect `[[openshell.supervisor.middleware]]`, service reachability, and both gateway and supervisor logs:
 
 ```bash
-rg -n 'supervisor|middleware|grpc_endpoint|max_body_bytes|timeout' /etc/openshell/gateway.toml
+rg -n 'supervisor|middleware|grpc_endpoint|max_payload_bytes|timeout' /etc/openshell/gateway.toml
 journalctl -u <middleware-service> --no-pager --lines=200
 journalctl -u openshell-gateway --no-pager --lines=200
 openshell logs <sandbox-name> --tail --source sandbox

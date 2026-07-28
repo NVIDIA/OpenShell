@@ -8,7 +8,7 @@ use openshell_core::middleware::{SupervisorMiddlewareEndpoint, WebSocketResponse
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
 use openshell_core::proto::{
     HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse, WebSocketEvaluationRequest,
+    ValidateConfigResponse, WebSocketSessionEvent,
 };
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Request, Response, Status};
@@ -83,13 +83,13 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
         client.evaluate_http_request(request).await
     }
 
-    async fn open_websocket(
+    async fn open_websocket_session(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<WebSocketEvaluationRequest>,
+        receiver: tokio::sync::mpsc::Receiver<WebSocketSessionEvent>,
     ) -> std::result::Result<WebSocketResponseStream, Status> {
         let mut client = self.client.clone();
         let responses = client
-            .evaluate_web_socket(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+            .evaluate_web_socket_session(Request::new(tokio_stream::wrappers::ReceiverStream::new(
                 receiver,
             )))
             .await?

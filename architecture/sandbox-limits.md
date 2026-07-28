@@ -105,7 +105,7 @@ fragment state, and total deadline. Input progress resets only the idle
 deadline. Completion transfers the permit into middleware evaluation; every
 timeout and terminal parser error drops it.
 
-The operator middleware `max_body_bytes` ceiling applies to payloads exposed
+The operator middleware `max_payload_bytes` ceiling applies to payloads exposed
 through HTTP-body and WebSocket text-message bindings. It does not replace the
 raw binary frame safety bound because binary messages are never delivered to V1
 middleware. A passed binary logical message still advances the active

@@ -36,7 +36,7 @@ use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
 
 pub use openshell_core::middleware::WebSocketResponseStream;
 pub type MiddlewareService =
-    dyn SupervisorMiddleware<EvaluateWebSocketStream = WebSocketResponseStream>;
+    dyn SupervisorMiddleware<EvaluateWebSocketSessionStream = WebSocketResponseStream>;
 pub type MiddlewareServiceEndpoint = dyn SupervisorMiddlewareEndpoint;
 
 struct GeneratedMiddlewareEndpoint {
@@ -70,9 +70,9 @@ impl SupervisorMiddlewareEndpoint for GeneratedMiddlewareEndpoint {
         self.service.evaluate_http_request(request).await
     }
 
-    async fn open_websocket(
+    async fn open_websocket_session(
         &self,
-        _receiver: tokio::sync::mpsc::Receiver<openshell_core::proto::WebSocketEvaluationRequest>,
+        _receiver: tokio::sync::mpsc::Receiver<openshell_core::proto::WebSocketSessionEvent>,
     ) -> std::result::Result<WebSocketResponseStream, TonicStatus> {
         Err(TonicStatus::unimplemented(
             "middleware service does not expose an in-process WebSocket stream",
@@ -448,7 +448,7 @@ struct MiddlewareServiceState {
     endpoint: Arc<MiddlewareServiceEndpoint>,
     manifest: OnceCell<MiddlewareManifest>,
     diagnostic_policy: MiddlewareDiagnosticPolicy,
-    operator_max_body_bytes: Option<usize>,
+    operator_max_payload_bytes: Option<usize>,
     operator_timeout: Duration,
 }
 
@@ -579,9 +579,9 @@ fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<D
             registration.name
         ));
     }
-    if registration.max_body_bytes > MAX_MIDDLEWARE_BODY_BYTES as u64 {
+    if registration.max_payload_bytes > MAX_MIDDLEWARE_BODY_BYTES as u64 {
         return Err(miette!(
-            "middleware registration '{}' max_body_bytes exceeds the platform maximum of {MAX_MIDDLEWARE_BODY_BYTES}",
+            "middleware registration '{}' max_payload_bytes exceeds the platform maximum of {MAX_MIDDLEWARE_BODY_BYTES}",
             registration.name
         ));
     }
@@ -687,7 +687,7 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
 fn validate_manifest_bindings(
     source: &str,
     manifest: &MiddlewareManifest,
-    operator_max_body_bytes: Option<usize>,
+    operator_max_payload_bytes: Option<usize>,
 ) -> Result<()> {
     if manifest.bindings.is_empty() {
         return Err(miette!("{source} describes no bindings"));
@@ -723,15 +723,15 @@ fn validate_manifest_bindings(
             parse_middleware_timeout(&binding.timeout)
                 .map_err(|reason| miette!("{source} has invalid timeout for binding: {reason}"))?;
         }
-        if operator_max_body_bytes.is_some_and(|limit| limit > advertised) {
+        if operator_max_payload_bytes.is_some_and(|limit| limit > advertised) {
             return Err(miette!(
-                "{source} max_body_bytes ({}) exceeds the binding capability ({advertised})",
-                operator_max_body_bytes.expect("operator limit checked above")
+                "{source} max_payload_bytes ({}) exceeds the binding capability ({advertised})",
+                operator_max_payload_bytes.expect("operator limit checked above")
             ));
         }
-        if operator_max_body_bytes == Some(0) {
+        if operator_max_payload_bytes == Some(0) {
             return Err(miette!(
-                "{source} must configure max_body_bytes for every payload-bearing binding"
+                "{source} must configure max_payload_bytes for every payload-bearing binding"
             ));
         }
     }
@@ -741,12 +741,12 @@ fn validate_manifest_bindings(
 fn validate_external_manifest(
     registration: &SupervisorMiddlewareService,
     manifest: &MiddlewareManifest,
-    operator_max_body_bytes: Option<usize>,
+    operator_max_payload_bytes: Option<usize>,
 ) -> Result<()> {
     validate_manifest_bindings(
         &format!("external middleware registration '{}'", registration.name),
         manifest,
-        operator_max_body_bytes,
+        operator_max_payload_bytes,
     )
 }
 
@@ -926,7 +926,7 @@ impl MiddlewareRegistry {
                 endpoint: service,
                 manifest: manifest_cell,
                 diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
-                operator_max_body_bytes: None,
+                operator_max_payload_bytes: None,
                 operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
             }));
         }
@@ -940,10 +940,10 @@ impl MiddlewareRegistry {
                 ));
             }
 
-            let operator_max_body_bytes =
-                usize::try_from(registration.max_body_bytes).map_err(|_| {
+            let operator_max_payload_bytes = usize::try_from(registration.max_payload_bytes)
+                .map_err(|_| {
                     miette!(
-                        "middleware registration '{}' body limit is too large for this platform",
+                        "middleware registration '{}' payload limit is too large for this platform",
                         registration.name
                     )
                 })?;
@@ -968,7 +968,7 @@ impl MiddlewareRegistry {
                     safe_reason(&error.to_string())
                 )
             })?;
-            validate_external_manifest(&registration, &manifest, Some(operator_max_body_bytes))?;
+            validate_external_manifest(&registration, &manifest, Some(operator_max_payload_bytes))?;
             let manifest_cell = OnceCell::new();
             manifest_cell
                 .set(manifest)
@@ -978,7 +978,7 @@ impl MiddlewareRegistry {
                 endpoint: service,
                 manifest: manifest_cell,
                 diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
-                operator_max_body_bytes: Some(operator_max_body_bytes),
+                operator_max_payload_bytes: Some(operator_max_payload_bytes),
                 operator_timeout,
             }));
             registered_services.push(RegisteredMiddlewareService { registration });
@@ -1071,7 +1071,7 @@ impl ChainRunner {
                     endpoint,
                     manifest: OnceCell::new(),
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
-                    operator_max_body_bytes: None,
+                    operator_max_payload_bytes: None,
                     operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                 })]),
                 registered_services: Arc::new(Vec::new()),
@@ -1247,14 +1247,14 @@ impl ChainRunner {
             let timeout = state.timeout_for_binding(&binding)?;
             let max_body_bytes = if operation == SupervisorMiddlewareOperation::HttpRequest {
                 let advertised = validate_body_limit("middleware manifest", &binding)?;
-                state.operator_max_body_bytes.unwrap_or(advertised)
+                state.operator_max_payload_bytes.unwrap_or(advertised)
             } else {
                 0
             };
             let max_message_bytes = if operation == SupervisorMiddlewareOperation::WebsocketMessage
             {
                 let advertised = validate_message_limit("middleware manifest", &binding)?;
-                state.operator_max_body_bytes.unwrap_or(advertised)
+                state.operator_max_payload_bytes.unwrap_or(advertised)
             } else {
                 0
             };
@@ -2033,12 +2033,12 @@ mod tests {
 
     #[tonic::async_trait]
     impl SupervisorMiddleware for ScriptedService {
-        type EvaluateWebSocketStream = WebSocketResponseStream;
+        type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        async fn evaluate_web_socket(
+        async fn evaluate_web_socket_session(
             &self,
-            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketSessionStream>, tonic::Status>
         {
             Err(tonic::Status::unimplemented("HTTP-only test middleware"))
         }
@@ -2093,12 +2093,12 @@ mod tests {
 
     #[tonic::async_trait]
     impl SupervisorMiddleware for SlowService {
-        type EvaluateWebSocketStream = WebSocketResponseStream;
+        type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        async fn evaluate_web_socket(
+        async fn evaluate_web_socket_session(
             &self,
-            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketSessionStream>, tonic::Status>
         {
             Err(tonic::Status::unimplemented("HTTP-only test middleware"))
         }
@@ -2157,12 +2157,12 @@ mod tests {
 
     #[tonic::async_trait]
     impl SupervisorMiddleware for TwoStageService {
-        type EvaluateWebSocketStream = WebSocketResponseStream;
+        type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        async fn evaluate_web_socket(
+        async fn evaluate_web_socket_session(
             &self,
-            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketSessionStream>, tonic::Status>
         {
             Err(tonic::Status::unimplemented("HTTP-only test middleware"))
         }
@@ -2432,12 +2432,12 @@ mod tests {
 
     #[tonic::async_trait]
     impl SupervisorMiddleware for RecordingService {
-        type EvaluateWebSocketStream = WebSocketResponseStream;
+        type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        async fn evaluate_web_socket(
+        async fn evaluate_web_socket_session(
             &self,
-            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketSessionStream>, tonic::Status>
         {
             Err(tonic::Status::unimplemented("HTTP-only test middleware"))
         }
@@ -2502,12 +2502,12 @@ mod tests {
 
     #[tonic::async_trait]
     impl SupervisorMiddleware for HeaderChainService {
-        type EvaluateWebSocketStream = WebSocketResponseStream;
+        type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
-        async fn evaluate_web_socket(
+        async fn evaluate_web_socket_session(
             &self,
-            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+            _request: Request<tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketSessionStream>, tonic::Status>
         {
             Err(tonic::Status::unimplemented("HTTP-only test middleware"))
         }
@@ -2687,11 +2687,11 @@ mod tests {
         );
     }
 
-    fn external_registration(max_body_bytes: u64) -> SupervisorMiddlewareService {
+    fn external_registration(max_payload_bytes: u64) -> SupervisorMiddlewareService {
         SupervisorMiddlewareService {
             name: "local-guard-service".into(),
             grpc_endpoint: "http://127.0.0.1:50051".into(),
-            max_body_bytes,
+            max_payload_bytes,
             ..Default::default()
         }
     }
@@ -2722,9 +2722,9 @@ mod tests {
             .await
             .expect("describe test service")
             .into_inner();
-        let operator_max_body_bytes = usize::try_from(registration.max_body_bytes).unwrap();
+        let operator_max_payload_bytes = usize::try_from(registration.max_payload_bytes).unwrap();
         let operator_timeout = validate_registration(&registration).expect("valid registration");
-        validate_external_manifest(&registration, &manifest, Some(operator_max_body_bytes))
+        validate_external_manifest(&registration, &manifest, Some(operator_max_payload_bytes))
             .expect("valid external manifest");
         let manifest_cell = OnceCell::new();
         manifest_cell.set(manifest).expect("manifest cache");
@@ -2736,7 +2736,7 @@ mod tests {
                     endpoint: builtin_service,
                     manifest: builtin_manifest_cell,
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
-                    operator_max_body_bytes: None,
+                    operator_max_payload_bytes: None,
                     operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                 }),
                 Arc::new(MiddlewareServiceState {
@@ -2744,7 +2744,7 @@ mod tests {
                     endpoint: http_only_endpoint(service),
                     manifest: manifest_cell,
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
-                    operator_max_body_bytes: Some(operator_max_body_bytes),
+                    operator_max_payload_bytes: Some(operator_max_payload_bytes),
                     operator_timeout,
                 }),
             ]),
@@ -2952,7 +2952,7 @@ mod tests {
     }
 
     #[test]
-    fn external_registration_rejects_body_limit_above_platform_maximum() {
+    fn external_registration_rejects_payload_limit_above_platform_maximum() {
         let registration = external_registration(u64::MAX);
         let error = validate_registration(&registration)
             .expect_err("extreme body limit must be rejected before allocation");
@@ -3043,7 +3043,11 @@ mod tests {
 
         let error = validate_external_manifest(&registration, &manifest, Some(0))
             .expect_err("WebSocket bindings require an operator payload ceiling");
-        assert!(error.to_string().contains("must configure max_body_bytes"));
+        assert!(
+            error
+                .to_string()
+                .contains("must configure max_payload_bytes")
+        );
     }
 
     #[test]
@@ -4001,6 +4005,10 @@ mod tests {
         describe_calls: Arc<std::sync::atomic::AtomicUsize>,
         skip: bool,
         deny: bool,
+        preflight_reason: String,
+        preflight_reason_code: String,
+        preflight_findings: Vec<Finding>,
+        preflight_metadata: HashMap<String, String>,
         close_on_first_message: bool,
         messages: Arc<std::sync::atomic::AtomicUsize>,
         session_ends: Option<
@@ -4013,7 +4021,7 @@ mod tests {
         where
             S: Stream<
                     Item = std::result::Result<
-                        openshell_core::proto::WebSocketEvaluationRequest,
+                        openshell_core::proto::WebSocketSessionEvent,
                         tonic::Status,
                     >,
                 > + Send
@@ -4021,40 +4029,45 @@ mod tests {
                 + 'static,
         {
             use openshell_core::proto::{
-                WebSocketEvaluationResponse, WebSocketMessageResult, WebSocketPreflightAction,
-                WebSocketPreflightDecision, web_socket_evaluation_request,
-                web_socket_evaluation_response,
+                WebSocketMessageResult, WebSocketPreflightAction, WebSocketPreflightDecision,
+                WebSocketSessionResult, web_socket_session_event, web_socket_session_result,
             };
 
             let preflight = Arc::clone(&self.preflight);
             let skip = self.skip;
             let deny = self.deny;
+            let preflight_reason = self.preflight_reason.clone();
+            let preflight_reason_code = self.preflight_reason_code.clone();
+            let preflight_findings = self.preflight_findings.clone();
+            let preflight_metadata = self.preflight_metadata.clone();
             let close_on_first_message = self.close_on_first_message;
             let messages = Arc::clone(&self.messages);
             let session_ends = self.session_ends.clone();
             let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 while let Some(Ok(request)) = requests.next().await {
-                    let response = match request.request {
-                        Some(web_socket_evaluation_request::Request::Preflight(value)) => {
+                    let response = match request.event {
+                        Some(web_socket_session_event::Event::Preflight(value)) => {
                             *preflight.lock().expect("preflight lock") = Some(value);
-                            Some(WebSocketEvaluationResponse {
-                                response: Some(
-                                    web_socket_evaluation_response::Response::PreflightDecision(
-                                        WebSocketPreflightDecision {
-                                            action: if deny {
-                                                WebSocketPreflightAction::Deny as i32
-                                            } else if skip {
-                                                WebSocketPreflightAction::Skip as i32
-                                            } else {
-                                                WebSocketPreflightAction::Inspect as i32
-                                            },
+                            Some(WebSocketSessionResult {
+                                result: Some(web_socket_session_result::Result::PreflightDecision(
+                                    WebSocketPreflightDecision {
+                                        action: if deny {
+                                            WebSocketPreflightAction::Deny as i32
+                                        } else if skip {
+                                            WebSocketPreflightAction::Skip as i32
+                                        } else {
+                                            WebSocketPreflightAction::Inspect as i32
                                         },
-                                    ),
-                                ),
+                                        reason: preflight_reason.clone(),
+                                        findings: preflight_findings.clone(),
+                                        metadata: preflight_metadata.clone(),
+                                        reason_code: preflight_reason_code.clone(),
+                                    },
+                                )),
                             })
                         }
-                        Some(web_socket_evaluation_request::Request::Message(value)) => {
+                        Some(web_socket_session_event::Event::Message(value)) => {
                             messages.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             if close_on_first_message {
                                 break;
@@ -4062,25 +4075,21 @@ mod tests {
                             let payload = String::from_utf8(value.payload)
                                 .expect("test OpenAI event must be UTF-8")
                                 .replace("customer-secret", "[REDACTED]");
-                            Some(WebSocketEvaluationResponse {
-                                response: Some(
-                                    web_socket_evaluation_response::Response::MessageResult(
-                                        WebSocketMessageResult {
-                                            sequence: value.sequence,
-                                            decision: Decision::Allow as i32,
-                                            replacement: payload.into_bytes(),
-                                            has_replacement: true,
-                                            reason_code: "redacted".into(),
-                                            ..Default::default()
-                                        },
-                                    ),
-                                ),
+                            Some(WebSocketSessionResult {
+                                result: Some(web_socket_session_result::Result::MessageResult(
+                                    WebSocketMessageResult {
+                                        sequence: value.sequence,
+                                        decision: Decision::Allow as i32,
+                                        replacement: payload.into_bytes(),
+                                        has_replacement: true,
+                                        reason_code: "redacted".into(),
+                                        ..Default::default()
+                                    },
+                                )),
                             })
                         }
-                        Some(web_socket_evaluation_request::Request::SessionStart(_)) | None => {
-                            None
-                        }
-                        Some(web_socket_evaluation_request::Request::SessionEnd(end)) => {
+                        Some(web_socket_session_event::Event::SessionStart(_)) | None => None,
+                        Some(web_socket_session_event::Event::SessionEnd(end)) => {
                             if let Some(session_ends) = &session_ends
                                 && let Ok(reason) =
                                     openshell_core::proto::WebSocketSessionEndReason::try_from(
@@ -4118,7 +4127,7 @@ mod tests {
 
     #[tonic::async_trait]
     impl SupervisorMiddleware for OpenAiRedactionService {
-        type EvaluateWebSocketStream = WebSocketResponseStream;
+        type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
         async fn describe(
             &self,
@@ -4170,10 +4179,10 @@ mod tests {
             ))
         }
 
-        async fn evaluate_web_socket(
+        async fn evaluate_web_socket_session(
             &self,
-            request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+            request: Request<tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketSessionStream>, tonic::Status>
         {
             Ok(tonic::Response::new(
                 self.websocket_stream(request.into_inner()),
@@ -4210,11 +4219,9 @@ mod tests {
             SupervisorMiddleware::evaluate_http_request(self, request).await
         }
 
-        async fn open_websocket(
+        async fn open_websocket_session(
             &self,
-            receiver: tokio::sync::mpsc::Receiver<
-                openshell_core::proto::WebSocketEvaluationRequest,
-            >,
+            receiver: tokio::sync::mpsc::Receiver<openshell_core::proto::WebSocketSessionEvent>,
         ) -> std::result::Result<WebSocketResponseStream, tonic::Status> {
             Ok(
                 self.websocket_stream(
@@ -4351,6 +4358,16 @@ mod tests {
             let (session_ends_tx, mut session_ends_rx) = tokio::sync::mpsc::unbounded_channel();
             let runner = ChainRunner::from_endpoint(Arc::new(OpenAiRedactionService {
                 deny: true,
+                preflight_reason: "contains sensitive request data".into(),
+                preflight_reason_code: "upgrade_blocked".into(),
+                preflight_findings: vec![Finding {
+                    r#type: "content.sensitive".into(),
+                    label: "Sensitive content".into(),
+                    count: 1,
+                    confidence: "high".into(),
+                    severity: "high".into(),
+                }],
+                preflight_metadata: HashMap::from([("policy_version".into(), "1".into())]),
                 session_ends: Some(session_ends_tx),
                 ..Default::default()
             }));
@@ -4373,7 +4390,10 @@ mod tests {
                 outcome.terminal_reason,
                 Some(WebSocketSessionEndReason::MiddlewareDenial)
             );
-            assert_eq!(outcome.reason, "middleware_denied:deny-upgrade");
+            assert_eq!(
+                outcome.reason,
+                "middleware_denied:deny-upgrade:upgrade_blocked"
+            );
             assert_eq!(
                 outcome
                     .denial
@@ -4381,6 +4401,22 @@ mod tests {
                     .map(|denial| denial.config_name.as_str()),
                 Some("deny-upgrade")
             );
+            assert_eq!(
+                outcome
+                    .denial
+                    .as_ref()
+                    .and_then(|denial| denial.reason_code.as_deref()),
+                Some("upgrade_blocked")
+            );
+            assert_eq!(
+                outcome.invocations[0].reason_code.as_deref(),
+                Some("upgrade_blocked")
+            );
+            assert_eq!(outcome.findings.len(), 1);
+            assert_eq!(outcome.findings[0].middleware, "deny-upgrade");
+            assert_eq!(outcome.findings[0].finding.r#type, "content.sensitive");
+            assert_eq!(outcome.metadata["deny-upgrade"]["policy_version"], "1");
+            assert!(!outcome.reason.contains("sensitive request data"));
             assert!(outcome.session.is_none());
             assert_eq!(outcome.invocations.len(), 1);
             assert_eq!(
@@ -4674,7 +4710,7 @@ mod tests {
         assert_eq!(
             described[0].max_message_bytes(),
             1024,
-            "operator max_body_bytes must cap WebSocket messages"
+            "operator max_payload_bytes must cap WebSocket messages"
         );
         let preflight = runner
             .preflight_websocket(

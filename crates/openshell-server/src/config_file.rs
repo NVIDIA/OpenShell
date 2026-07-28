@@ -191,7 +191,7 @@ pub struct MiddlewareServiceFileConfig {
     pub grpc_endpoint: String,
     /// Operator-owned logical payload limit for every binding exposed by this
     /// service, including HTTP bodies and complete WebSocket messages.
-    pub max_body_bytes: u64,
+    pub max_payload_bytes: u64,
     /// Default RPC timeout using an integer with an `ms` or `s` suffix.
     #[serde(default)]
     pub timeout: Option<String>,
@@ -202,7 +202,7 @@ impl From<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
         Self {
             name: config.name.clone(),
             grpc_endpoint: config.grpc_endpoint.clone(),
-            max_body_bytes: config.max_body_bytes,
+            max_payload_bytes: config.max_payload_bytes,
             timeout: config.timeout.clone().unwrap_or_default(),
         }
     }
@@ -455,7 +455,7 @@ allow_unauthenticated_users = true
 [[openshell.supervisor.middleware]]
 name = "local-guard"
 grpc_endpoint = "http://127.0.0.1:50051"
-max_body_bytes = 262144
+max_payload_bytes = 262144
 timeout = "2s"
 "#;
         let tmp = write_tmp(toml);
@@ -465,7 +465,7 @@ timeout = "2s"
             vec![MiddlewareServiceFileConfig {
                 name: "local-guard".into(),
                 grpc_endpoint: "http://127.0.0.1:50051".into(),
-                max_body_bytes: 262_144,
+                max_payload_bytes: 262_144,
                 timeout: Some("2s".into()),
             }]
         );

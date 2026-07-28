@@ -95,6 +95,7 @@ pub fn emit_websocket_preflight_events(
 ) {
     emit_websocket_invocations(ctx, &outcome.invocations);
     emit_websocket_coverage(ctx, &outcome.coverage);
+    emit_websocket_findings(ctx, &outcome.findings);
     if outcome.saturated {
         emit_websocket_saturation(ctx);
     }
@@ -177,7 +178,14 @@ pub(super) fn emit_websocket_message_events(
     if outcome.saturated {
         emit_websocket_saturation(ctx);
     }
-    for finding in &outcome.findings {
+    emit_websocket_findings(ctx, &outcome.findings);
+}
+
+fn emit_websocket_findings(
+    ctx: &L7EvalContext,
+    findings: &[openshell_supervisor_middleware::NamespacedFinding],
+) {
+    for finding in findings {
         let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(SeverityId::Medium)
             .finding_info(FindingInfo::new(

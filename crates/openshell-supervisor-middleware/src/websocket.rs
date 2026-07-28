@@ -13,10 +13,11 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use openshell_core::proto::{
-    Decision, HttpRequestTarget, RequestContext, SupervisorMiddlewarePhase,
-    WebSocketEvaluationRequest, WebSocketMessage, WebSocketMessageResult, WebSocketMessageType,
-    WebSocketPreflight, WebSocketPreflightAction, WebSocketSessionEnd, WebSocketSessionEndReason,
-    WebSocketSessionStart, web_socket_evaluation_request, web_socket_evaluation_response,
+    Decision, HttpRequestTarget, RequestContext, SupervisorMiddlewarePhase, WebSocketMessage,
+    WebSocketMessageResult, WebSocketMessageType, WebSocketPreflight, WebSocketPreflightAction,
+    WebSocketPreflightDecision, WebSocketSessionEnd, WebSocketSessionEndReason,
+    WebSocketSessionEvent, WebSocketSessionStart, web_socket_session_event,
+    web_socket_session_result,
 };
 
 use super::{
@@ -102,6 +103,8 @@ pub struct WebSocketPreflightResult {
     pub reason: String,
     pub denial: Option<MiddlewareDenial>,
     pub session: Option<WebSocketSession>,
+    pub findings: Vec<NamespacedFinding>,
+    pub metadata: BTreeMap<String, BTreeMap<String, String>>,
     pub invocations: Vec<WebSocketInvocation>,
     pub coverage: Vec<WebSocketCoverage>,
     pub saturated: bool,
@@ -131,7 +134,7 @@ pub struct WebSocketMessageOutcome {
 }
 
 struct WebSocketStageTransport {
-    sender: mpsc::Sender<WebSocketEvaluationRequest>,
+    sender: mpsc::Sender<WebSocketSessionEvent>,
     responses: super::WebSocketResponseStream,
 }
 
@@ -169,10 +172,16 @@ pub enum WebSocketMessageAdmission {
 }
 
 enum OpenStage {
-    Inspect(Box<WebSocketStage>, WebSocketInvocation),
-    Deny(Box<WebSocketStage>, WebSocketInvocation),
-    Skip(WebSocketInvocation),
+    Inspect(Box<WebSocketStage>, PreflightStageOutcome),
+    Deny(Box<WebSocketStage>, PreflightStageOutcome),
+    Skip(PreflightStageOutcome),
     Failed(DescribedChainEntry, String),
+}
+
+struct PreflightStageOutcome {
+    invocation: WebSocketInvocation,
+    findings: Vec<NamespacedFinding>,
+    metadata: Option<(String, BTreeMap<String, String>)>,
 }
 
 impl ChainRunner {
@@ -223,23 +232,40 @@ impl ChainRunner {
 
         let mut stages = Vec::new();
         let mut invocations = Vec::new();
+        let mut findings = Vec::new();
+        let mut metadata = BTreeMap::new();
         let mut denial = None;
         let mut fail_closed_reason = None;
         for result in opened {
             match result {
-                OpenStage::Inspect(stage, invocation) => {
+                OpenStage::Inspect(stage, outcome) => {
                     stages.push(*stage);
-                    invocations.push(invocation);
+                    collect_preflight_outcome(
+                        outcome,
+                        &mut invocations,
+                        &mut findings,
+                        &mut metadata,
+                    );
                 }
-                OpenStage::Deny(stage, invocation) => {
+                OpenStage::Deny(stage, outcome) => {
                     denial.get_or_insert_with(|| MiddlewareDenial {
                         config_name: stage.entry.entry.name.clone(),
-                        reason_code: None,
+                        reason_code: outcome.invocation.reason_code.clone(),
                     });
                     stages.push(*stage);
-                    invocations.push(invocation);
+                    collect_preflight_outcome(
+                        outcome,
+                        &mut invocations,
+                        &mut findings,
+                        &mut metadata,
+                    );
                 }
-                OpenStage::Skip(invocation) => invocations.push(invocation),
+                OpenStage::Skip(outcome) => collect_preflight_outcome(
+                    outcome,
+                    &mut invocations,
+                    &mut findings,
+                    &mut metadata,
+                ),
                 OpenStage::Failed(entry, reason) => {
                     let invocation = failure_invocation(&entry, None, 0, &reason);
                     if entry.entry.on_error == OnError::FailClosed {
@@ -256,9 +282,14 @@ impl ChainRunner {
             return Ok(WebSocketPreflightResult {
                 allowed: false,
                 terminal_reason: Some(WebSocketSessionEndReason::MiddlewareDenial),
-                reason: middleware_denial_reason(&denial.config_name, None),
+                reason: middleware_denial_reason(
+                    &denial.config_name,
+                    denial.reason_code.as_deref(),
+                ),
                 denial: Some(denial),
                 session: None,
+                findings,
+                metadata,
                 invocations,
                 coverage,
                 saturated,
@@ -274,6 +305,8 @@ impl ChainRunner {
                 reason,
                 denial: None,
                 session: None,
+                findings,
+                metadata,
                 invocations,
                 coverage,
                 saturated,
@@ -289,6 +322,8 @@ impl ChainRunner {
                 reason: String::new(),
                 denial: None,
                 session: None,
+                findings,
+                metadata,
                 invocations,
                 coverage,
                 saturated,
@@ -307,6 +342,8 @@ impl ChainRunner {
                 next_sequence: 1,
                 session_admission: Some(session_admission),
             }),
+            findings,
+            metadata,
             invocations,
             coverage,
             saturated,
@@ -322,6 +359,8 @@ fn empty_preflight_result() -> WebSocketPreflightResult {
         reason: String::new(),
         denial: None,
         session: None,
+        findings: Vec::new(),
+        metadata: BTreeMap::new(),
         invocations: Vec::new(),
         coverage: Vec::new(),
         saturated: false,
@@ -353,6 +392,8 @@ fn session_capacity_exhausted(
         },
         denial: None,
         session: None,
+        findings: Vec::new(),
+        metadata: BTreeMap::new(),
         invocations,
         coverage,
         saturated,
@@ -397,8 +438,8 @@ impl WebSocketSession {
             let Some(transport) = stage.transport.as_mut() else {
                 continue;
             };
-            let request = WebSocketEvaluationRequest {
-                request: Some(web_socket_evaluation_request::Request::SessionStart(
+            let request = WebSocketSessionEvent {
+                event: Some(web_socket_session_event::Event::SessionStart(
                     WebSocketSessionStart {
                         selected_subprotocol: selected_subprotocol.to_string(),
                     },
@@ -546,14 +587,12 @@ impl WebSocketSession {
                 continue;
             }
             let stage_timeout = stage.entry.timeout.min(remaining);
-            let request = WebSocketEvaluationRequest {
-                request: Some(web_socket_evaluation_request::Request::Message(
-                    WebSocketMessage {
-                        sequence,
-                        message_type: WebSocketMessageType::Text as i32,
-                        payload: current.clone(),
-                    },
-                )),
+            let request = WebSocketSessionEvent {
+                event: Some(web_socket_session_event::Event::Message(WebSocketMessage {
+                    sequence,
+                    message_type: WebSocketMessageType::Text as i32,
+                    payload: current.clone(),
+                })),
             };
             let response = {
                 let transport = stage
@@ -571,9 +610,9 @@ impl WebSocketSession {
                 .await
             };
             let result = match response {
-                Ok(Ok(Some(response))) => match response.response {
-                    Some(web_socket_evaluation_response::Response::MessageResult(result)) => result,
-                    Some(web_socket_evaluation_response::Response::PreflightDecision(_)) | None => {
+                Ok(Ok(Some(response))) => match response.result {
+                    Some(web_socket_session_result::Result::MessageResult(result)) => result,
+                    Some(web_socket_session_result::Result::PreflightDecision(_)) | None => {
                         if let Some(outcome) = handle_stage_failure(
                             stage,
                             sequence,
@@ -798,6 +837,46 @@ fn binding_not_selected_coverage(entry: &ChainEntry) -> WebSocketCoverage {
     }
 }
 
+fn preflight_stage_outcome(
+    entry: &DescribedChainEntry,
+    outcome: WebSocketInvocationOutcome,
+    decision: WebSocketPreflightDecision,
+) -> PreflightStageOutcome {
+    let reason_code = (!decision.reason_code.is_empty()).then(|| decision.reason_code.clone());
+    let findings = decision
+        .findings
+        .into_iter()
+        .map(|finding| NamespacedFinding {
+            middleware: entry.entry.name.clone(),
+            finding,
+        })
+        .collect();
+    let metadata = (!decision.metadata.is_empty()).then(|| {
+        (
+            entry.entry.name.clone(),
+            decision.metadata.into_iter().collect(),
+        )
+    });
+    PreflightStageOutcome {
+        invocation: success_invocation(entry, outcome, 0, 0, None, false, reason_code),
+        findings,
+        metadata,
+    }
+}
+
+fn collect_preflight_outcome(
+    outcome: PreflightStageOutcome,
+    invocations: &mut Vec<WebSocketInvocation>,
+    findings: &mut Vec<NamespacedFinding>,
+    metadata: &mut BTreeMap<String, BTreeMap<String, String>>,
+) {
+    invocations.push(outcome.invocation);
+    findings.extend(outcome.findings);
+    if let Some((middleware, values)) = outcome.metadata {
+        metadata.insert(middleware, values);
+    }
+}
+
 async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) -> OpenStage {
     let Some(service) = entry.service.as_ref() else {
         return OpenStage::Failed(entry, "binding_not_described".into());
@@ -832,12 +911,12 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
     let opened = tokio::time::timeout(timeout, async {
         let (sender, receiver) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
         sender
-            .send(WebSocketEvaluationRequest {
-                request: Some(web_socket_evaluation_request::Request::Preflight(preflight)),
+            .send(WebSocketSessionEvent {
+                event: Some(web_socket_session_event::Event::Preflight(preflight)),
             })
             .await
             .map_err(|_| tonic::Status::unavailable("request stream closed"))?;
-        let mut responses = endpoint.open_websocket(receiver).await?;
+        let mut responses = endpoint.open_websocket_session(receiver).await?;
         let response = responses.next().await.transpose()?;
         Ok::<_, tonic::Status>((sender, responses, response))
     })
@@ -856,69 +935,55 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
         ));
         return OpenStage::Failed(entry, "missing_preflight_decision".into());
     };
-    let Some(web_socket_evaluation_response::Response::PreflightDecision(decision)) =
-        response.response
+    let Some(web_socket_session_result::Result::PreflightDecision(decision)) = response.result
     else {
         let _ = sender.try_send(session_end_request(
             WebSocketSessionEndReason::MiddlewareFailure,
         ));
         return OpenStage::Failed(entry, "invalid_preflight_decision".into());
     };
-    match WebSocketPreflightAction::try_from(decision.action) {
-        Ok(WebSocketPreflightAction::Inspect) => {
-            let invocation = success_invocation(
-                &entry,
-                WebSocketInvocationOutcome::Inspect,
-                0,
-                0,
-                None,
-                false,
-                None,
-            );
+    let decision = match validate_preflight_decision(decision) {
+        Ok(decision) => decision,
+        Err(reason) => {
+            let _ = sender.try_send(session_end_request(
+                WebSocketSessionEndReason::MiddlewareFailure,
+            ));
+            return OpenStage::Failed(entry, reason.into());
+        }
+    };
+    let action =
+        WebSocketPreflightAction::try_from(decision.action).expect("validated preflight action");
+    match action {
+        WebSocketPreflightAction::Inspect => {
+            let outcome =
+                preflight_stage_outcome(&entry, WebSocketInvocationOutcome::Inspect, decision);
             OpenStage::Inspect(
                 Box::new(WebSocketStage {
                     entry,
                     transport: Some(WebSocketStageTransport { sender, responses }),
                 }),
-                invocation,
+                outcome,
             )
         }
-        Ok(WebSocketPreflightAction::Deny) => {
-            let invocation = success_invocation(
-                &entry,
-                WebSocketInvocationOutcome::Deny,
-                0,
-                0,
-                None,
-                false,
-                None,
-            );
+        WebSocketPreflightAction::Deny => {
+            let outcome =
+                preflight_stage_outcome(&entry, WebSocketInvocationOutcome::Deny, decision);
             OpenStage::Deny(
                 Box::new(WebSocketStage {
                     entry,
                     transport: Some(WebSocketStageTransport { sender, responses }),
                 }),
-                invocation,
+                outcome,
             )
         }
-        Ok(WebSocketPreflightAction::Skip) => {
-            let invocation = success_invocation(
-                &entry,
-                WebSocketInvocationOutcome::Skip,
-                0,
-                0,
-                None,
-                false,
-                None,
-            );
+        WebSocketPreflightAction::Skip => {
+            let outcome =
+                preflight_stage_outcome(&entry, WebSocketInvocationOutcome::Skip, decision);
             let _ = sender.try_send(session_end_request(WebSocketSessionEndReason::Cancellation));
-            OpenStage::Skip(invocation)
+            OpenStage::Skip(outcome)
         }
-        Ok(WebSocketPreflightAction::Unspecified) | Err(_) => {
-            let _ = sender.try_send(session_end_request(
-                WebSocketSessionEndReason::MiddlewareFailure,
-            ));
-            OpenStage::Failed(entry, "invalid_preflight_decision".into())
+        WebSocketPreflightAction::Unspecified => {
+            unreachable!("validated preflight action cannot be unspecified")
         }
     }
 }
@@ -983,6 +1048,49 @@ fn validate_preflight_envelope(preflight: &WebSocketPreflight) -> Result<(), &'s
         return Err("preflight_envelope_over_capacity");
     }
     Ok(())
+}
+
+fn validate_preflight_decision(
+    decision: WebSocketPreflightDecision,
+) -> Result<WebSocketPreflightDecision, &'static str> {
+    if !matches!(
+        WebSocketPreflightAction::try_from(decision.action),
+        Ok(WebSocketPreflightAction::Inspect
+            | WebSocketPreflightAction::Skip
+            | WebSocketPreflightAction::Deny)
+    ) {
+        return Err("invalid_preflight_decision");
+    }
+    if decision.reason.len() > MAX_MIDDLEWARE_REASON_BYTES {
+        return Err("response_reason_over_capacity");
+    }
+    if !decision.reason_code.is_empty() && !is_stable_reason_code(&decision.reason_code) {
+        return Err("response_reason_code_invalid");
+    }
+    if decision.findings.len() > MAX_MIDDLEWARE_FINDINGS_PER_STAGE
+        || decision
+            .findings
+            .iter()
+            .any(|finding| finding.encoded_len() > MAX_MIDDLEWARE_FINDING_BYTES)
+    {
+        return Err("response_findings_over_capacity");
+    }
+    if decision.metadata.len() > MAX_MIDDLEWARE_METADATA_ENTRIES {
+        return Err("response_metadata_count_over_capacity");
+    }
+    let metadata_bytes = decision
+        .metadata
+        .iter()
+        .fold(0usize, |total, (key, value)| {
+            total.saturating_add(key.len()).saturating_add(value.len())
+        });
+    if metadata_bytes > MAX_MIDDLEWARE_METADATA_BYTES {
+        return Err("response_metadata_bytes_over_capacity");
+    }
+    if decision.encoded_len() > MIDDLEWARE_GRPC_MESSAGE_BYTES {
+        return Err("response_envelope_over_capacity");
+    }
+    Ok(decision)
 }
 
 fn validate_message_result(
@@ -1160,9 +1268,9 @@ fn end_stages_now(stages: &mut [WebSocketStage], reason: WebSocketSessionEndReas
     }
 }
 
-fn session_end_request(reason: WebSocketSessionEndReason) -> WebSocketEvaluationRequest {
-    WebSocketEvaluationRequest {
-        request: Some(web_socket_evaluation_request::Request::SessionEnd(
+fn session_end_request(reason: WebSocketSessionEndReason) -> WebSocketSessionEvent {
+    WebSocketSessionEvent {
+        event: Some(web_socket_session_event::Event::SessionEnd(
             WebSocketSessionEnd {
                 reason: reason as i32,
             },

@@ -2497,7 +2497,8 @@ network_policies:
 
     #[tonic::async_trait]
     impl SupervisorMiddleware for OpenAiWebSocketRedactor {
-        type EvaluateWebSocketStream = openshell_supervisor_middleware::WebSocketResponseStream;
+        type EvaluateWebSocketSessionStream =
+            openshell_supervisor_middleware::WebSocketResponseStream;
 
         async fn describe(
             &self,
@@ -2543,14 +2544,14 @@ network_policies:
             Err(Status::unimplemented("WebSocket-only test middleware"))
         }
 
-        async fn evaluate_web_socket(
+        async fn evaluate_web_socket_session(
             &self,
-            request: Request<tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>>,
-        ) -> std::result::Result<Response<Self::EvaluateWebSocketStream>, Status> {
+            request: Request<tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>>,
+        ) -> std::result::Result<Response<Self::EvaluateWebSocketSessionStream>, Status> {
             use openshell_core::proto::{
-                Decision, WebSocketEvaluationResponse, WebSocketMessageResult,
-                WebSocketPreflightAction, WebSocketPreflightDecision,
-                web_socket_evaluation_request, web_socket_evaluation_response,
+                Decision, WebSocketMessageResult, WebSocketPreflightAction,
+                WebSocketPreflightDecision, WebSocketSessionResult, web_socket_session_event,
+                web_socket_session_result,
             };
             let mut requests = request.into_inner();
             let observed = self.observed.clone();
@@ -2558,19 +2559,18 @@ network_policies:
             let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 while let Ok(Some(request)) = requests.message().await {
-                    let response = match request.request {
-                        Some(web_socket_evaluation_request::Request::Preflight(_)) => {
-                            Some(WebSocketEvaluationResponse {
-                                response: Some(
-                                    web_socket_evaluation_response::Response::PreflightDecision(
-                                        WebSocketPreflightDecision {
-                                            action: WebSocketPreflightAction::Inspect as i32,
-                                        },
-                                    ),
-                                ),
+                    let response = match request.event {
+                        Some(web_socket_session_event::Event::Preflight(_)) => {
+                            Some(WebSocketSessionResult {
+                                result: Some(web_socket_session_result::Result::PreflightDecision(
+                                    WebSocketPreflightDecision {
+                                        action: WebSocketPreflightAction::Inspect as i32,
+                                        ..Default::default()
+                                    },
+                                )),
                             })
                         }
-                        Some(web_socket_evaluation_request::Request::Message(message)) => {
+                        Some(web_socket_session_event::Event::Message(message)) => {
                             if let Some(observed) = &observed {
                                 let _ = observed.send(ObservedWebSocketRequest::Message {
                                     sequence: message.sequence,
@@ -2585,40 +2585,34 @@ network_policies:
                             let deny = text.contains("deny-me");
                             let replacement =
                                 text.replace("customer-secret", "[REDACTED]").into_bytes();
-                            Some(WebSocketEvaluationResponse {
-                                response: Some(
-                                    web_socket_evaluation_response::Response::MessageResult(
-                                        WebSocketMessageResult {
-                                            sequence: message.sequence,
-                                            decision: if deny {
-                                                Decision::Deny as i32
-                                            } else {
-                                                Decision::Allow as i32
-                                            },
-                                            replacement: if deny {
-                                                Vec::new()
-                                            } else {
-                                                replacement
-                                            },
-                                            has_replacement: !deny,
-                                            reason_code: if deny {
-                                                "blocked".into()
-                                            } else {
-                                                "redacted".into()
-                                            },
-                                            ..Default::default()
+                            Some(WebSocketSessionResult {
+                                result: Some(web_socket_session_result::Result::MessageResult(
+                                    WebSocketMessageResult {
+                                        sequence: message.sequence,
+                                        decision: if deny {
+                                            Decision::Deny as i32
+                                        } else {
+                                            Decision::Allow as i32
                                         },
-                                    ),
-                                ),
+                                        replacement: if deny { Vec::new() } else { replacement },
+                                        has_replacement: !deny,
+                                        reason_code: if deny {
+                                            "blocked".into()
+                                        } else {
+                                            "redacted".into()
+                                        },
+                                        ..Default::default()
+                                    },
+                                )),
                             })
                         }
-                        Some(web_socket_evaluation_request::Request::SessionStart(_)) => {
+                        Some(web_socket_session_event::Event::SessionStart(_)) => {
                             if let Some(observed) = &observed {
                                 let _ = observed.send(ObservedWebSocketRequest::SessionStart);
                             }
                             None
                         }
-                        Some(web_socket_evaluation_request::Request::SessionEnd(end)) => {
+                        Some(web_socket_session_event::Event::SessionEnd(end)) => {
                             if let Some(observed) = &observed
                                 && let Ok(reason) =
                                     openshell_core::proto::WebSocketSessionEndReason::try_from(
@@ -2673,7 +2667,8 @@ network_policies:
             vec![SupervisorMiddlewareService {
                 name: "openai-redactor".into(),
                 grpc_endpoint: format!("http://{address}"),
-                max_body_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES as u64,
+                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES
+                    as u64,
                 timeout: "2s".into(),
             }],
         )
@@ -3281,7 +3276,8 @@ network_policies:
             vec![SupervisorMiddlewareService {
                 name: "openai-redactor".into(),
                 grpc_endpoint: format!("http://{address}"),
-                max_body_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES as u64,
+                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES
+                    as u64,
                 timeout: "2s".into(),
             }],
         )
@@ -3420,7 +3416,8 @@ network_policies:
             vec![SupervisorMiddlewareService {
                 name: "openai-redactor".into(),
                 grpc_endpoint: format!("http://{address}"),
-                max_body_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES as u64,
+                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES
+                    as u64,
                 timeout: "2s".into(),
             }],
         )

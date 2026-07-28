@@ -11,16 +11,12 @@ use tonic::{Request, Response, Status};
 
 use crate::proto::{
     HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse, WebSocketEvaluationRequest, WebSocketEvaluationResponse,
+    ValidateConfigResponse, WebSocketSessionEvent, WebSocketSessionResult,
 };
 
 /// Transport-neutral response stream for one WebSocket middleware stage.
 pub type WebSocketResponseStream = Pin<
-    Box<
-        dyn tokio_stream::Stream<Item = Result<WebSocketEvaluationResponse, Status>>
-            + Send
-            + 'static,
-    >,
+    Box<dyn tokio_stream::Stream<Item = Result<WebSocketSessionResult, Status>> + Send + 'static>,
 >;
 
 /// A middleware implementation reachable either in-process or over a transport.
@@ -41,9 +37,9 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status>;
 
-    async fn open_websocket(
+    async fn open_websocket_session(
         &self,
-        requests: mpsc::Receiver<WebSocketEvaluationRequest>,
+        requests: mpsc::Receiver<WebSocketSessionEvent>,
     ) -> Result<WebSocketResponseStream, Status>;
 }
 

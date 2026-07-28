@@ -12,9 +12,9 @@ use openshell_core::middleware::{SupervisorMiddlewareEndpoint, WebSocketResponse
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
     HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, SupervisorMiddlewarePhase,
-    ValidateConfigRequest, ValidateConfigResponse, WebSocketEvaluationRequest,
-    WebSocketEvaluationResponse, WebSocketMessageType, WebSocketPreflightAction,
-    WebSocketPreflightDecision, web_socket_evaluation_request, web_socket_evaluation_response,
+    ValidateConfigRequest, ValidateConfigResponse, WebSocketMessageType, WebSocketPreflightAction,
+    WebSocketPreflightDecision, WebSocketSessionEvent, WebSocketSessionResult,
+    web_socket_session_event, web_socket_session_result,
 };
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
@@ -48,7 +48,7 @@ pub struct BuiltinMiddlewareService;
 impl BuiltinMiddlewareService {
     fn websocket_stream<S>(mut requests: S) -> WebSocketResponseStream
     where
-        S: Stream<Item = std::result::Result<WebSocketEvaluationRequest, Status>>
+        S: Stream<Item = std::result::Result<WebSocketSessionEvent, Status>>
             + Send
             + Unpin
             + 'static,
@@ -67,8 +67,8 @@ impl BuiltinMiddlewareService {
                         break;
                     }
                 };
-                let response = match request.request {
-                    Some(web_socket_evaluation_request::Request::Preflight(preflight))
+                let response = match request.event {
+                    Some(web_socket_session_event::Event::Preflight(preflight))
                         if config.is_none() && !started =>
                     {
                         if preflight.phase == SupervisorMiddlewarePhase::PreCredentials as i32 {
@@ -76,11 +76,13 @@ impl BuiltinMiddlewareService {
                             match regex::validate_config(&selected_config) {
                                 Ok(()) => {
                                     config = Some(selected_config);
-                                    Ok(Some(WebSocketEvaluationResponse {
-                                        response: Some(
-                                            web_socket_evaluation_response::Response::PreflightDecision(
+                                    Ok(Some(WebSocketSessionResult {
+                                        result: Some(
+                                            web_socket_session_result::Result::PreflightDecision(
                                                 WebSocketPreflightDecision {
-                                                    action: WebSocketPreflightAction::Inspect as i32,
+                                                    action: WebSocketPreflightAction::Inspect
+                                                        as i32,
+                                                    ..Default::default()
                                                 },
                                             ),
                                         ),
@@ -94,13 +96,13 @@ impl BuiltinMiddlewareService {
                             ))
                         }
                     }
-                    Some(web_socket_evaluation_request::Request::SessionStart(_))
+                    Some(web_socket_session_event::Event::SessionStart(_))
                         if config.is_some() && !started =>
                     {
                         started = true;
                         Ok(None)
                     }
-                    Some(web_socket_evaluation_request::Request::Message(message)) if started => {
+                    Some(web_socket_session_event::Event::Message(message)) if started => {
                         if let Err(error) = advance_sequence_lower_bound(
                             &mut sequence_lower_bound,
                             message.sequence,
@@ -118,20 +120,16 @@ impl BuiltinMiddlewareService {
                                 &message.payload,
                                 selected_config,
                             ) {
-                                Ok(result) => Ok(Some(WebSocketEvaluationResponse {
-                                    response: Some(
-                                        web_socket_evaluation_response::Response::MessageResult(
-                                            result,
-                                        ),
-                                    ),
+                                Ok(result) => Ok(Some(WebSocketSessionResult {
+                                    result: Some(web_socket_session_result::Result::MessageResult(
+                                        result,
+                                    )),
                                 })),
                                 Err(error) => Err(Status::invalid_argument(error.to_string())),
                             }
                         }
                     }
-                    Some(web_socket_evaluation_request::Request::SessionEnd(_))
-                        if config.is_some() =>
-                    {
+                    Some(web_socket_session_event::Event::SessionEnd(_)) if config.is_some() => {
                         break;
                     }
                     _ => Err(Status::failed_precondition(
@@ -177,7 +175,7 @@ fn advance_sequence_lower_bound(
 
 #[tonic::async_trait]
 impl SupervisorMiddleware for BuiltinMiddlewareService {
-    type EvaluateWebSocketStream = WebSocketResponseStream;
+    type EvaluateWebSocketSessionStream = WebSocketResponseStream;
 
     async fn describe(
         &self,
@@ -217,10 +215,10 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
             .map_err(|error| Status::invalid_argument(error.to_string()))
     }
 
-    async fn evaluate_web_socket(
+    async fn evaluate_web_socket_session(
         &self,
-        request: Request<tonic::Streaming<WebSocketEvaluationRequest>>,
-    ) -> Result<Response<Self::EvaluateWebSocketStream>, Status> {
+        request: Request<tonic::Streaming<WebSocketSessionEvent>>,
+    ) -> Result<Response<Self::EvaluateWebSocketSessionStream>, Status> {
         Ok(Response::new(Self::websocket_stream(request.into_inner())))
     }
 }
@@ -245,9 +243,9 @@ impl SupervisorMiddlewareEndpoint for BuiltinMiddlewareService {
         SupervisorMiddleware::evaluate_http_request(self, request).await
     }
 
-    async fn open_websocket(
+    async fn open_websocket_session(
         &self,
-        receiver: tokio::sync::mpsc::Receiver<WebSocketEvaluationRequest>,
+        receiver: tokio::sync::mpsc::Receiver<WebSocketSessionEvent>,
     ) -> Result<WebSocketResponseStream, Status> {
         Ok(Self::websocket_stream(
             tokio_stream::wrappers::ReceiverStream::new(receiver).map(Ok),
@@ -375,8 +373,8 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_preflight_does_not_dispatch_on_registration_name() {
-        let requests = tokio_stream::iter([Ok::<_, Status>(WebSocketEvaluationRequest {
-            request: Some(web_socket_evaluation_request::Request::Preflight(
+        let requests = tokio_stream::iter([Ok::<_, Status>(WebSocketSessionEvent {
+            event: Some(web_socket_session_event::Event::Preflight(
                 WebSocketPreflight {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     middleware_name: "operator-assigned-name".into(),
@@ -393,9 +391,9 @@ mod tests {
             .expect("valid preflight");
 
         assert!(matches!(
-            response.response,
-            Some(web_socket_evaluation_response::Response::PreflightDecision(
-                WebSocketPreflightDecision { action }
+            response.result,
+            Some(web_socket_session_result::Result::PreflightDecision(
+                WebSocketPreflightDecision { action, .. }
             )) if action == WebSocketPreflightAction::Inspect as i32
         ));
     }

@@ -2699,7 +2699,8 @@ network_policies:
     impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
         for ControllableWebSocketPreflight
     {
-        type EvaluateWebSocketStream = openshell_supervisor_middleware::WebSocketResponseStream;
+        type EvaluateWebSocketSessionStream =
+            openshell_supervisor_middleware::WebSocketResponseStream;
 
         async fn describe(
             &self,
@@ -2752,16 +2753,14 @@ network_policies:
             Err(tonic::Status::unimplemented("WebSocket-only middleware"))
         }
 
-        async fn evaluate_web_socket(
+        async fn evaluate_web_socket_session(
             &self,
-            request: tonic::Request<
-                tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>,
-            >,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+            request: tonic::Request<tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>>,
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketSessionStream>, tonic::Status>
         {
             use openshell_core::proto::{
-                WebSocketEvaluationResponse, WebSocketPreflightDecision,
-                web_socket_evaluation_request, web_socket_evaluation_response,
+                WebSocketPreflightDecision, WebSocketSessionResult, web_socket_session_event,
+                web_socket_session_result,
             };
             use tokio_stream::wrappers::ReceiverStream;
 
@@ -2773,20 +2772,19 @@ network_policies:
             tokio::spawn(async move {
                 while let Ok(Some(request)) = requests.message().await {
                     if matches!(
-                        request.request,
-                        Some(web_socket_evaluation_request::Request::Preflight(_))
+                        request.event,
+                        Some(web_socket_session_event::Event::Preflight(_))
                     ) {
                         let _ = seen.send(());
                         release.notified().await;
                         let _ = responses_tx
-                            .send(Ok(WebSocketEvaluationResponse {
-                                response: Some(
-                                    web_socket_evaluation_response::Response::PreflightDecision(
-                                        WebSocketPreflightDecision {
-                                            action: action as i32,
-                                        },
-                                    ),
-                                ),
+                            .send(Ok(WebSocketSessionResult {
+                                result: Some(web_socket_session_result::Result::PreflightDecision(
+                                    WebSocketPreflightDecision {
+                                        action: action as i32,
+                                        ..Default::default()
+                                    },
+                                )),
                             }))
                             .await;
                     }
@@ -2831,7 +2829,8 @@ network_policies:
             vec![SupervisorMiddlewareService {
                 name: "preflight-service".into(),
                 grpc_endpoint: format!("http://{address}"),
-                max_body_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES as u64,
+                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES
+                    as u64,
                 timeout: "2s".into(),
             }],
         )
@@ -3882,14 +3881,15 @@ network_policies:
     impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
         for BodyReplacingService
     {
-        type EvaluateWebSocketStream = openshell_supervisor_middleware::WebSocketResponseStream;
+        type EvaluateWebSocketSessionStream =
+            openshell_supervisor_middleware::WebSocketResponseStream;
 
-        async fn evaluate_web_socket(
+        async fn evaluate_web_socket_session(
             &self,
             _request: tonic::Request<
-                tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>,
+                tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>,
             >,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketSessionStream>, tonic::Status>
         {
             Err(tonic::Status::unimplemented(
                 "test service does not inspect WebSocket messages",
@@ -4384,14 +4384,15 @@ network_policies:
     impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
         for LimitService
     {
-        type EvaluateWebSocketStream = openshell_supervisor_middleware::WebSocketResponseStream;
+        type EvaluateWebSocketSessionStream =
+            openshell_supervisor_middleware::WebSocketResponseStream;
 
-        async fn evaluate_web_socket(
+        async fn evaluate_web_socket_session(
             &self,
             _request: tonic::Request<
-                tonic::Streaming<openshell_core::proto::WebSocketEvaluationRequest>,
+                tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>,
             >,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketStream>, tonic::Status>
+        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketSessionStream>, tonic::Status>
         {
             Err(tonic::Status::unimplemented(
                 "test service does not inspect WebSocket messages",
