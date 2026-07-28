@@ -292,6 +292,29 @@ Use [GitHub Stacked PRs](https://github.github.com/gh-stack/) when a change has 
 
 GitHub Stacked PRs is currently in private preview and must be enabled for the repository before a stack can be submitted.
 
+Install the CLI extension and configure the repository once:
+
+```shell
+gh extension install github/gh-stack
+git config rerere.enabled true
+git config remote.pushDefault origin
+```
+
+Create, submit, and inspect a two-layer stack:
+
+```shell
+gh stack init --base main feature-foundation
+# Make and commit the foundational change.
+
+gh stack add feature-follow-up
+# Make and commit the dependent change.
+
+gh stack submit --auto --remote origin
+gh stack view --json
+```
+
+The `--auto` submission creates draft PRs with titles derived from their commits. Mark the PRs ready for review after their descriptions follow the project PR template.
+
 ### Commit Messages
 
 This project uses [Conventional Commits](https://www.conventionalcommits.org/). All commit messages must follow the format:
