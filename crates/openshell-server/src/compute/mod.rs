@@ -45,7 +45,7 @@ use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
     KubernetesSupervisorBootstrapIdentityProvider, LiveK8sResolver,
-    SandboxClaimActivationController,
+    SandboxClaimActivationController, WarmPoolProfileReconciler,
 };
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
@@ -192,6 +192,18 @@ impl ShutdownCleanup for DockerComputeDriver {
 #[tonic::async_trait]
 trait StartupResume: Send + Sync {
     async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String>;
+}
+
+#[tonic::async_trait]
+trait LeaseScopedReconciler: Send + Sync {
+    async fn run(&self, cancel: watch::Receiver<bool>);
+}
+
+#[tonic::async_trait]
+impl LeaseScopedReconciler for WarmPoolProfileReconciler {
+    async fn run(&self, cancel: watch::Receiver<bool>) {
+        self.run(cancel).await;
+    }
 }
 
 #[tonic::async_trait]
@@ -423,6 +435,7 @@ pub struct ComputeRuntime {
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
     supervisor_bootstrap_identity: Option<Arc<dyn SupervisorBootstrapIdentityProvider>>,
     sandbox_claim_activation: Option<Arc<SandboxClaimActivationController>>,
+    lease_scoped_reconciler: Option<Arc<dyn LeaseScopedReconciler>>,
     sync_lock: Arc<Mutex<()>>,
     delete_gates: Arc<DeleteGateRegistry>,
     gateway_bind_addresses: Vec<SocketAddr>,
@@ -484,6 +497,7 @@ impl ComputeRuntime {
             supervisor_sessions,
             supervisor_bootstrap_identity,
             sandbox_claim_activation,
+            lease_scoped_reconciler: None,
             sync_lock: Arc::new(Mutex::new(())),
             delete_gates: Arc::new(DeleteGateRegistry::default()),
             gateway_bind_addresses,
@@ -567,8 +581,11 @@ impl ComputeRuntime {
         let driver = KubernetesComputeDriver::new(config)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
+        let lease_scoped_reconciler = driver
+            .warm_pool_profile_reconciler()
+            .map(|reconciler| -> Arc<dyn LeaseScopedReconciler> { Arc::new(reconciler) });
         let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new(driver));
-        Self::from_driver(
+        let mut runtime = Self::from_driver(
             ComputeDriverKind::Kubernetes.as_str().to_string(),
             driver,
             None,
@@ -583,7 +600,9 @@ impl ComputeRuntime {
             sandbox_claim_activation,
             Vec::new(),
         )
-        .await
+        .await?;
+        runtime.lease_scoped_reconciler = lease_scoped_reconciler;
+        Ok(runtime)
     }
 
     pub(crate) async fn new_remote_driver(
@@ -1356,6 +1375,7 @@ impl ComputeRuntime {
     pub fn spawn_watchers(&self, shutdown_rx: watch::Receiver<bool>) {
         let runtime = Arc::new(self.clone());
         if self.store.is_single_replica() {
+            let _lease_scoped_handle = self.spawn_lease_scoped_reconciler(shutdown_rx.clone());
             let watch_runtime = runtime.clone();
             let watch_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
@@ -1369,6 +1389,17 @@ impl ComputeRuntime {
                 runtime.lease_coordinator(shutdown_rx).await;
             });
         }
+    }
+
+    fn spawn_lease_scoped_reconciler(
+        &self,
+        cancel: watch::Receiver<bool>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.lease_scoped_reconciler.clone().map(|reconciler| {
+            tokio::spawn(async move {
+                reconciler.run(cancel).await;
+            })
+        })
     }
 
     pub async fn cleanup_on_shutdown(&self) -> Result<(), String> {
@@ -1575,6 +1606,8 @@ impl ComputeRuntime {
             runtime.reconcile_loop(cancel_rx).await;
         });
 
+        let lease_scoped_handle = self.spawn_lease_scoped_reconciler(cancel_tx.subscribe());
+
         loop {
             tokio::select! {
                 () = tokio::time::sleep(LEASE_RENEWAL_INTERVAL) => {
@@ -1601,6 +1634,9 @@ impl ComputeRuntime {
                         let _ = cancel_tx.send(true);
                         let _ = watch_handle.await;
                         let _ = reconcile_handle.await;
+                        if let Some(handle) = lease_scoped_handle {
+                            let _ = handle.await;
+                        }
                         return;
                     }
                 }
@@ -1610,6 +1646,9 @@ impl ComputeRuntime {
         let _ = cancel_tx.send(true);
         let _ = watch_handle.await;
         let _ = reconcile_handle.await;
+        if let Some(handle) = lease_scoped_handle {
+            let _ = handle.await;
+        }
         info!(replica = %lease.replica_id(), "reconciler lease lost — returning to standby");
     }
 
@@ -2948,6 +2987,7 @@ pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
         supervisor_bootstrap_identity: None,
         sandbox_claim_activation: None,
+        lease_scoped_reconciler: None,
         sync_lock: Arc::new(Mutex::new(())),
         delete_gates: Arc::new(DeleteGateRegistry::default()),
         gateway_bind_addresses: Vec::new(),
@@ -2969,6 +3009,22 @@ mod tests {
     use std::sync::{Arc, Mutex as TestMutex};
     use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
     use tokio_stream::wrappers::UnboundedReceiverStream;
+
+    struct TestLeaseScopedReconciler {
+        started: Arc<Notify>,
+        stopped: Arc<Notify>,
+    }
+
+    #[tonic::async_trait]
+    impl LeaseScopedReconciler for TestLeaseScopedReconciler {
+        async fn run(&self, mut cancel: watch::Receiver<bool>) {
+            self.started.notify_one();
+            if !*cancel.borrow() {
+                let _ = cancel.changed().await;
+            }
+            self.stopped.notify_one();
+        }
+    }
 
     fn string_value(value: &str) -> prost_types::Value {
         prost_types::Value {
@@ -3423,11 +3479,70 @@ mod tests {
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
             supervisor_bootstrap_identity: None,
             sandbox_claim_activation: None,
+            lease_scoped_reconciler: None,
             sync_lock: Arc::new(Mutex::new(())),
             delete_gates: Arc::new(DeleteGateRegistry::default()),
             gateway_bind_addresses: Vec::new(),
             replica_id: "test-replica".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn lease_scoped_reconciler_stops_when_cancelled() {
+        let mut runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let started = Arc::new(Notify::new());
+        let stopped = Arc::new(Notify::new());
+        runtime.lease_scoped_reconciler = Some(Arc::new(TestLeaseScopedReconciler {
+            started: started.clone(),
+            stopped: stopped.clone(),
+        }));
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let handle = runtime
+            .spawn_lease_scoped_reconciler(cancel_rx)
+            .expect("configured reconciler should start");
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("reconciler should start");
+
+        cancel_tx.send(true).unwrap();
+        handle.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stopped.notified())
+            .await
+            .expect("reconciler should stop after cancellation");
+    }
+
+    #[tokio::test]
+    async fn lease_holder_runs_and_awaits_lease_scoped_reconciler() {
+        let driver = ControlledDriver::new();
+        let mut runtime = test_runtime(driver).await;
+        let started = Arc::new(Notify::new());
+        let stopped = Arc::new(Notify::new());
+        runtime.lease_scoped_reconciler = Some(Arc::new(TestLeaseScopedReconciler {
+            started: started.clone(),
+            stopped: stopped.clone(),
+        }));
+
+        let lease = lease::ReconcilerLease::new(
+            runtime.store.clone(),
+            runtime.replica_id.clone(),
+            lease::LEASE_TTL,
+        );
+        let guard = lease.acquire_or_steal().await.unwrap();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let runtime = Arc::new(runtime);
+        let holder = tokio::spawn(async move {
+            runtime.run_as_holder(&lease, guard, &mut shutdown_rx).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("lease holder should start the reconciler");
+        shutdown_tx.send(true).unwrap();
+        holder.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stopped.notified())
+            .await
+            .expect("lease holder should await reconciler shutdown");
     }
 
     fn register_test_supervisor_session(runtime: &ComputeRuntime, sandbox_id: &str) {

@@ -15,6 +15,6 @@ pub use config::{
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, KubernetesSidecarConfig,
     KubernetesWarmPoolingConfig, SupervisorSideloadMethod, SupervisorTopology,
 };
-pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
+pub use driver::{KubernetesComputeDriver, KubernetesDriverError, WarmPoolProfileReconciler};
 pub use grpc::ComputeDriverService;
 pub use sandboxclaim::SandboxClaimActivationController;

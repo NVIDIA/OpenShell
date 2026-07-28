@@ -55,6 +55,12 @@ and `gpu_count`. The reconciler generates ordinary `SandboxTemplate` and
 `SandboxWarmPool` resources labelled `openshell.ai/enabled=true`; the existing
 matching cache then handles allocation unchanged.
 
+The gateway runs the profile reconciler only while its replica owns the shared
+reconciler lease. In HA deployments, lease loss cancels the old reconciler
+before that replica returns to standby, so generated resources have one active
+gateway writer. The allocation cache remains replica-local and runs on every
+gateway because sandbox creation reads it locally.
+
 ## Workspace Persistence
 
 Sandbox pods use a PVC-backed `/sandbox` workspace. An init container seeds the

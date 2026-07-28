@@ -266,6 +266,10 @@ reconciler that turns admin-authored TOML profiles into generated
 independent of the create-path matcher: admins can use it, Helm, kubectl, or
 another controller to create warm pools, and the matcher only considers the
 resulting enabled warm-pool resources and their fingerprints.
+The gateway starts the profile reconciler only on the replica holding the
+shared reconciler lease and stops it before returning that replica to standby.
+The read-side warm-pool cache still runs on every replica so local create
+requests do not depend on the lease holder.
 
 Kubernetes can run the supervisor in the default combined topology or in a
 sidecar topology. Combined mode keeps network and process supervision in the

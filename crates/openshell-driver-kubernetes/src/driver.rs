@@ -47,7 +47,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{OnceCell, RwLock, mpsc};
+use tokio::sync::{OnceCell, RwLock, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 
@@ -620,6 +620,25 @@ pub struct KubernetesComputeDriver {
     config: KubernetesComputeConfig,
 }
 
+#[derive(Clone)]
+pub struct WarmPoolProfileReconciler {
+    client: Client,
+    watch_client: Client,
+    config: KubernetesComputeConfig,
+}
+
+impl WarmPoolProfileReconciler {
+    pub async fn run(&self, cancel: watch::Receiver<bool>) {
+        run_warm_pool_profile_reconciler(
+            self.client.clone(),
+            self.watch_client.clone(),
+            self.config.clone(),
+            cancel,
+        )
+        .await;
+    }
+}
+
 impl std::fmt::Debug for KubernetesComputeDriver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KubernetesComputeDriver")
@@ -671,11 +690,18 @@ impl KubernetesComputeDriver {
         };
         if driver.config.warm_pooling.enabled {
             driver.spawn_warm_pool_cache_controller();
-            if driver.config.warm_pooling.profiles.enabled {
-                driver.spawn_warm_pool_profile_reconciler();
-            }
         }
         Ok(driver)
+    }
+
+    pub fn warm_pool_profile_reconciler(&self) -> Option<WarmPoolProfileReconciler> {
+        (self.config.warm_pooling.enabled && self.config.warm_pooling.profiles.enabled).then(|| {
+            WarmPoolProfileReconciler {
+                client: self.client.clone(),
+                watch_client: self.watch_client.clone(),
+                config: self.config.clone(),
+            }
+        })
     }
 
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
@@ -764,16 +790,6 @@ impl KubernetesComputeDriver {
 
         tokio::spawn(async move {
             run_warm_pool_cache_controller(cache, client, watch_client, fallback_namespace).await;
-        });
-    }
-
-    fn spawn_warm_pool_profile_reconciler(&self) {
-        let client = self.client.clone();
-        let watch_client = self.watch_client.clone();
-        let config = self.config.clone();
-
-        tokio::spawn(async move {
-            run_warm_pool_profile_reconciler(client, watch_client, config).await;
         });
     }
 
@@ -2175,6 +2191,7 @@ async fn run_warm_pool_profile_reconciler(
     client: Client,
     watch_client: Client,
     config: KubernetesComputeConfig,
+    mut cancel: watch::Receiver<bool>,
 ) {
     let profile_namespace = config
         .warm_pooling
@@ -2188,13 +2205,18 @@ async fn run_warm_pool_profile_reconciler(
         .to_string();
 
     loop {
-        reconcile_existing_warm_pool_profiles(
-            client.clone(),
-            &config,
-            &profile_namespace,
-            &label_selector,
-        )
-        .await;
+        if *cancel.borrow() {
+            return;
+        }
+        tokio::select! {
+            () = reconcile_existing_warm_pool_profiles(
+                client.clone(),
+                &config,
+                &profile_namespace,
+                &label_selector,
+            ) => {}
+            _ = cancel.changed() => return,
+        }
 
         let api: Api<ConfigMap> = Api::namespaced(watch_client.clone(), &profile_namespace);
         let watcher_config = watcher::Config::default().labels(&label_selector);
@@ -2204,15 +2226,14 @@ async fn run_warm_pool_profile_reconciler(
             tokio::select! {
                 event = stream.try_next() => {
                     match event {
-                        Ok(Some(Event::Applied(config_map))) => {
-                            reconcile_warm_pool_profile_config_map(client.clone(), &config, config_map).await;
-                        }
-                        Ok(Some(Event::Deleted(config_map))) => {
-                            garbage_collect_warm_pool_profile(client.clone(), &config, &config_map).await;
-                        }
-                        Ok(Some(Event::Restarted(config_maps))) => {
-                            for config_map in config_maps {
-                                reconcile_warm_pool_profile_config_map(client.clone(), &config, config_map).await;
+                        Ok(Some(event)) => {
+                            tokio::select! {
+                                () = reconcile_warm_pool_profile_event(
+                                    client.clone(),
+                                    &config,
+                                    event,
+                                ) => {}
+                                _ = cancel.changed() => return,
                             }
                         }
                         Ok(None) => {
@@ -2233,18 +2254,44 @@ async fn run_warm_pool_profile_reconciler(
                     }
                 }
                 () = tokio::time::sleep(WARM_POOL_PROFILE_RESYNC_DELAY) => {
-                    reconcile_existing_warm_pool_profiles(
-                        client.clone(),
-                        &config,
-                        &profile_namespace,
-                        &label_selector,
-                    )
-                    .await;
+                    tokio::select! {
+                        () = reconcile_existing_warm_pool_profiles(
+                            client.clone(),
+                            &config,
+                            &profile_namespace,
+                            &label_selector,
+                        ) => {}
+                        _ = cancel.changed() => return,
+                    }
                 }
+                _ = cancel.changed() => return,
             }
         }
 
-        tokio::time::sleep(WARM_POOL_PROFILE_REQUEUE_DELAY).await;
+        tokio::select! {
+            () = tokio::time::sleep(WARM_POOL_PROFILE_REQUEUE_DELAY) => {}
+            _ = cancel.changed() => return,
+        }
+    }
+}
+
+async fn reconcile_warm_pool_profile_event(
+    client: Client,
+    config: &KubernetesComputeConfig,
+    event: Event<ConfigMap>,
+) {
+    match event {
+        Event::Applied(config_map) => {
+            reconcile_warm_pool_profile_config_map(client, config, config_map).await;
+        }
+        Event::Deleted(config_map) => {
+            garbage_collect_warm_pool_profile(client, config, &config_map).await;
+        }
+        Event::Restarted(config_maps) => {
+            for config_map in config_maps {
+                reconcile_warm_pool_profile_config_map(client.clone(), config, config_map).await;
+            }
+        }
     }
 }
 
