@@ -661,8 +661,12 @@ fn allow_plaintext_service_http(
     enabled: bool,
     listen_addr: SocketAddr,
     peer_addr: SocketAddr,
+    listener_purpose: &GatewayListenerPurpose,
 ) -> bool {
-    enabled && listen_addr.ip().is_loopback() && peer_addr.ip().is_loopback()
+    enabled
+        && matches!(listener_purpose, GatewayListenerPurpose::Primary)
+        && listen_addr.ip().is_loopback()
+        && peer_addr.ip().is_loopback()
 }
 
 fn spawn_gateway_connection(
@@ -682,6 +686,7 @@ fn spawn_gateway_connection(
                         enable_loopback_service_http,
                         listen_addr,
                         addr,
+                        &listener_purpose,
                     ) =>
                 {
                     if let Err(e) = service
@@ -696,7 +701,12 @@ fn spawn_gateway_connection(
                     }
                 }
                 Ok(ConnectionProtocol::PlainHttp) => {
-                    warn!(client = %addr, listen = %listen_addr, "Rejected plaintext HTTP on non-loopback gateway listener");
+                    warn!(
+                        client = %addr,
+                        listen = %listen_addr,
+                        purpose = ?listener_purpose,
+                        "Rejected plaintext HTTP on gateway listener"
+                    );
                 }
                 Ok(ConnectionProtocol::Tls | ConnectionProtocol::Unknown) => {
                     // acceptor.acceptor() snapshots the current TLS config;
@@ -1212,11 +1222,28 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:54000".parse().unwrap();
         let wildcard: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let remote_peer: SocketAddr = "192.0.2.10:54000".parse().unwrap();
+        let primary = GatewayListenerPurpose::Primary;
+        let callback = GatewayListenerPurpose::ComputeDriverCallback {
+            driver_name: "test-driver".to_string(),
+            reason: "test callback requirement".to_string(),
+        };
 
-        assert!(allow_plaintext_service_http(true, loopback, peer));
-        assert!(!allow_plaintext_service_http(false, loopback, peer));
-        assert!(!allow_plaintext_service_http(true, wildcard, peer));
-        assert!(!allow_plaintext_service_http(true, loopback, remote_peer));
+        assert!(allow_plaintext_service_http(true, loopback, peer, &primary));
+        assert!(!allow_plaintext_service_http(
+            false, loopback, peer, &primary
+        ));
+        assert!(!allow_plaintext_service_http(
+            true, wildcard, peer, &primary
+        ));
+        assert!(!allow_plaintext_service_http(
+            true,
+            loopback,
+            remote_peer,
+            &primary
+        ));
+        assert!(!allow_plaintext_service_http(
+            true, loopback, peer, &callback
+        ));
     }
 
     #[tokio::test]

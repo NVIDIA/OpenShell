@@ -276,6 +276,9 @@ maps both local callback aliases to that literal. Podman Machine still requests
 gateway loopback because its configured address is guest-visible and gvproxy
 terminates that route on host loopback. The gateway validates and binds every
 accepted callback listener; the primary listener can remain on loopback.
+Negotiated callback listeners expose only the gateway's sandbox-callable gRPC
+methods. Operator, health, reflection, and HTTP requests must use the primary
+listener.
 
 ### Layer 3 Inner Sandbox Network Namespace
 

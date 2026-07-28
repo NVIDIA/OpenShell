@@ -107,6 +107,12 @@ It overrides the gateway's configured default runtime class for that sandbox,
 while a typed `SandboxTemplate.runtime_class_name` value from the API still
 takes precedence.
 
+Docker and Podman callback listeners accept only supervisor callback gRPC
+methods. Use the gateway's primary endpoint for CLI, administrator, health,
+reflection, inference-route management, and HTTP requests. A
+`PermissionDenied` response from one of the sandbox-visible callback addresses
+is expected for those requests.
+
 ## Docker Driver
 
 [Docker](https://www.docker.com/get-started/)-backed sandboxes run as containers on the gateway host. Use Docker for local development, single-machine gateways, and hosts that already use Docker Desktop or Docker Engine.

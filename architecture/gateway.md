@@ -37,6 +37,14 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
+Docker and Podman may negotiate additional listeners that make the gateway
+reachable from their local sandbox network topology. Those listeners accept
+only gRPC methods classified as sandbox-callable by the gateway's generated
+authorization metadata. They reject user and administrator APIs, health,
+reflection, non-callback inference APIs, and HTTP routes before normal request
+authentication. The operator-configured primary listener retains the full
+multiplexed API surface.
+
 Operators can configure a gateway-wide gRPC request rate limit. The limit is
 applied only to gRPC API traffic after protocol multiplexing; health, metrics,
 and local sandbox-service HTTP routes are not rate limited by this control.
