@@ -39,7 +39,7 @@ COPY providers/ providers/
 # z3-sys bundled build needs prefetched Z3 source.
 ARG Z3_VERSION=4.16.0
 RUN mkdir -p /tmp/z3-src \
-    && tar xzf /cachi2/deps/generic/z3-${Z3_VERSION}.tar.gz -C /tmp/z3-src --strip-components=1 \
+    && tar xzf /cachi2/output/deps/generic/z3-${Z3_VERSION}.tar.gz -C /tmp/z3-src --strip-components=1 \
     && Z3_SYS_BUNDLED_DIR_OVERRIDE=/tmp/z3-src \
     cargo build --release \
         --package openshell-server \
