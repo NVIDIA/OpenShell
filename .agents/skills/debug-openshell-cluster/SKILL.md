@@ -176,6 +176,14 @@ Common findings:
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Root and missing identities are rejected.
 - Supervisor cannot call back: check callback endpoint and gateway logs.
+- Gateway exits before becoming healthy with a callback-listener discovery
+  error: inspect `podman info --debug`, the configured Podman network, and the
+  host's IPv4 default route. Rootless pasta, slirp4netns, and Podman 4's
+  unreported legacy helper use the private source address selected by that
+  route; rootful Podman uses the bridge gateway address.
+- An unsupported rootless helper requires an explicit `host_gateway_ip` or an
+  explicitly remote `grpc_endpoint`. Do not work around discovery failures by
+  broadening the primary gateway listener to `0.0.0.0`.
 
 ### Step 6: Check Kubernetes Helm Gateways
 
@@ -392,6 +400,7 @@ openshell logs <sandbox-name>
 |---|---|---|
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
+| Gateway exits while resolving compute-driver listener requirements | Callback alias topology is unsupported, the Podman network cannot be inspected, or the selected address is not private/authorized | Gateway startup error, `podman info --debug`, Podman network inspection, host IPv4 default route |
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
 | Docker GPU e2e fails before GPU sandbox comparison | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
