@@ -35,7 +35,7 @@ e2e-vm = ["e2e", "e2e-host-gateway"]
 [[test]]
 name = "custom_image"
 path = "tests/custom_image.rs"
-required-features = ["e2e-local-container-driver"]
+required-features = ["e2e-docker"]
 
 [[test]]
 name = "docker_preflight"

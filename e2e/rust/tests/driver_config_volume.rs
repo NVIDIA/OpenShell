@@ -23,6 +23,7 @@ use serde_json::{Map, Value};
 const TEST_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
 const VOLUME_TARGET: &str = "/sandbox/e2e-volume";
 const BIND_TARGET: &str = "/sandbox/e2e-bind";
+#[cfg(feature = "e2e-docker")]
 const OCI_USER_DOCKERFILE: &str = r#"FROM public.ecr.aws/docker/library/python:3.13-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
@@ -110,6 +111,7 @@ async fn sandbox_mounts_existing_driver_config_volume() {
 }
 
 #[tokio::test]
+#[cfg(feature = "e2e-docker")]
 async fn oci_workspace_preparation_skips_nested_volume_ownership() {
     let driver = e2e_driver().expect("OPENSHELL_E2E_DRIVER must be set by the e2e wrapper");
     assert!(
@@ -278,6 +280,7 @@ async fn verify_volume(volume: &VolumeGuard) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "e2e-docker")]
 async fn verify_volume_ownership(volume: &VolumeGuard) -> Result<(), String> {
     let output = run_volume_container(
         volume,

@@ -512,10 +512,6 @@ filesystem_policy:
 landlock:
   compatibility: best_effort
 
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-
 network_policies:
   example_api:
     name: example-api
