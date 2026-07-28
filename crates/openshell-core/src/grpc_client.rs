@@ -167,8 +167,16 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read client key from {key_path}"))?;
 
+        // Trust the configured CA (self-signed deployments sign the gateway's
+        // cert with it) *in addition to* the public root stores, rather than
+        // instead of them — tonic's root store is a union of all configured
+        // sources, so this also covers deployments where the gateway's server
+        // cert comes from a public CA (e.g. an ACME issuer) instead of the
+        // same private CA that signs this client's identity.
         let mut tls_config = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(ca_pem))
+            .with_native_roots()
+            .with_webpki_roots()
             .identity(Identity::from_pem(cert_pem, key_pem));
         if let Ok(server_name) = std::env::var(sandbox_env::GATEWAY_TLS_SERVER_NAME)
             && !server_name.is_empty()
