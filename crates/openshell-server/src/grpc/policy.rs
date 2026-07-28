@@ -22,7 +22,7 @@ use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 #[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
-use openshell_core::host_pattern::host_matches;
+use openshell_core::host_pattern::host_patterns_overlap;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
@@ -1870,42 +1870,11 @@ fn endpoint_ports(endpoint: &NetworkEndpoint) -> Vec<u32> {
     }
 }
 
-fn host_patterns_overlap(left: &str, right: &str) -> bool {
-    if left.eq_ignore_ascii_case(right) {
-        return true;
-    }
-
-    let left = left.to_ascii_lowercase();
-    let right = right.to_ascii_lowercase();
-    let left_has_wildcard = left.contains('*');
-    let right_has_wildcard = right.contains('*');
-
-    if !right_has_wildcard {
-        return host_matches(&left, &right).unwrap_or(false);
-    }
-    if !left_has_wildcard {
-        return host_matches(&right, &left).unwrap_or(false);
-    }
-
-    fn literal_suffix(pattern: &str) -> &str {
-        pattern
-            .rfind('*')
-            .map_or(pattern, |index| &pattern[index + 1..])
-    }
-
-    let left_suffix = literal_suffix(&left);
-    let right_suffix = literal_suffix(&right);
-    left_suffix.is_empty()
-        || right_suffix.is_empty()
-        || left_suffix.ends_with(right_suffix)
-        || right_suffix.ends_with(left_suffix)
-}
-
 fn endpoint_matches_credentialed_scope(
     endpoint: &NetworkEndpoint,
     scope: &CredentialedEndpointScope,
 ) -> bool {
-    if !host_patterns_overlap(&endpoint.host, &scope.host) {
+    if !host_patterns_overlap(&endpoint.host, &scope.host).unwrap_or(false) {
         return false;
     }
     let endpoint_ports = endpoint_ports(endpoint);
@@ -5259,6 +5228,12 @@ mod tests {
                             provider_credentialed: true,
                             ..Default::default()
                         },
+                        NetworkEndpoint {
+                            host: "*.api.example.com".to_string(),
+                            port: 443,
+                            provider_credentialed: true,
+                            ..Default::default()
+                        },
                     ],
                     ..Default::default()
                 },
@@ -5276,6 +5251,7 @@ mod tests {
         let endpoints = &policy.network_policies["test"].endpoints;
         assert!(endpoints[0].provider_credentialed);
         assert!(!endpoints[1].provider_credentialed);
+        assert!(!endpoints[2].provider_credentialed);
     }
 
     #[test]
