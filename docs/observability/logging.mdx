@@ -143,6 +143,13 @@ WebSocket middleware emits one safe event per preflight, session-start, or clien
 OCSF NET:OTHER [INFO] WEBSOCKET_MIDDLEWARE allow config=api-redactor implementation=openshell/regex sequence=3 input_bytes=128 replacement_bytes=96 transformed=true reason_code=-
 ```
 
+Coverage events are separate from invocation decisions. `binding_not_selected` means a host-matched attachment did not advertise the WebSocket operation. `unsupported_message_type` means an active WebSocket stage encountered a binary message, which V1 passes through without inspection. Both are informational, do not apply `on_error`, and never claim the traffic was inspected:
+
+```text
+OCSF NET:OTHER [INFO] WEBSOCKET_MIDDLEWARE_COVERAGE state=binding_not_selected config=http-dlp implementation=example/http-dlp sequence=- message_type=- input_bytes=0
+OCSF NET:OTHER [INFO] WEBSOCKET_MIDDLEWARE_COVERAGE state=unsupported_message_type config=api-redactor implementation=openshell/regex sequence=4 message_type=binary input_bytes=512
+```
+
 A fail-open stream error emits both a middleware failure and `openshell.middleware.websocket_stage_disabled`. The latter records that OpenShell will bypass that stage for later messages on the same connection. Waiting for saturated admission capacity also emits a detection finding without payload content; work beyond the bounded wait queue is rejected before its payload is buffered.
 
 Proxy and SSH servers ready:

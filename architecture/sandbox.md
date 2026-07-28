@@ -80,6 +80,12 @@ operator-owned registration names identify implementations.
 Built-ins run in-process; operator services use gRPC. Both implement the same
 transport-neutral endpoint contract, including bidirectional WebSocket
 sessions, so a manifest advertises capabilities independently of transport.
+The runtime keeps three states distinct: host selection attaches policy configs,
+manifest operation and phase bindings select the active chain, and the parsed
+message type determines whether that chain can inspect an individual payload.
+An attachment without a WebSocket binding is not a failed WebSocket stage.
+Binary messages are outside the V1 text-message binding. Both cases pass through
+with informational coverage telemetry rather than applying `on_error`.
 The chain runner owns shared sequencing, deadlines, backpressure, and response
 validation. `openshell-policy` validates policy-owned structure, and the active
 middleware registry validates implementation-owned config. The generic

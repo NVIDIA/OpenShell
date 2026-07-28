@@ -72,6 +72,28 @@ pub struct WebSocketInvocation {
     pub reason_code: Option<String>,
 }
 
+/// Coverage of a selected policy attachment that did not result in a
+/// WebSocket middleware invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSocketCoverageState {
+    /// The attached implementation did not advertise the exact
+    /// `WEBSOCKET_MESSAGE/PRE_CREDENTIALS` binding.
+    BindingNotSelected,
+    /// The binding was selected, but the V1 relay does not expose this message
+    /// class to middleware.
+    UnsupportedMessageType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketCoverage {
+    pub config_name: String,
+    pub implementation: String,
+    pub state: WebSocketCoverageState,
+    pub sequence: Option<u64>,
+    pub message_type: Option<WebSocketMessageType>,
+    pub original_size: usize,
+}
+
 pub struct WebSocketPreflightResult {
     pub allowed: bool,
     /// Typed terminal reason when preflight denied the upgrade. `None` means
@@ -81,6 +103,7 @@ pub struct WebSocketPreflightResult {
     pub denial: Option<MiddlewareDenial>,
     pub session: Option<WebSocketSession>,
     pub invocations: Vec<WebSocketInvocation>,
+    pub coverage: Vec<WebSocketCoverage>,
     pub saturated: bool,
     pub session_capacity_exhausted: bool,
 }
@@ -162,9 +185,23 @@ impl ChainRunner {
             return Ok(empty_preflight_result());
         }
         validate_preflight_input(&input)?;
-        let described = self.describe_websocket_chain(entries).await?;
+        let description = self
+            .describe_chain_for(
+                entries,
+                openshell_core::proto::SupervisorMiddlewareOperation::WebsocketMessage,
+                SupervisorMiddlewarePhase::PreCredentials,
+            )
+            .await?;
+        let coverage = description
+            .unbound
+            .iter()
+            .map(binding_not_selected_coverage)
+            .collect::<Vec<_>>();
+        let described = description.entries;
         if described.is_empty() {
-            return Ok(empty_preflight_result());
+            let mut result = empty_preflight_result();
+            result.coverage = coverage;
+            return Ok(result);
         }
 
         // One permit covers the complete concurrent preflight fan-out. Permit
@@ -174,7 +211,7 @@ impl ChainRunner {
         let session_admission = match self.try_reserve_middleware_session() {
             MiddlewareSessionAdmission::Admitted(admission) => admission,
             MiddlewareSessionAdmission::AtCapacity => {
-                return Ok(session_capacity_exhausted(described, saturated));
+                return Ok(session_capacity_exhausted(described, coverage, saturated));
             }
         };
         let opened = join_all(
@@ -223,6 +260,7 @@ impl ChainRunner {
                 denial: Some(denial),
                 session: None,
                 invocations,
+                coverage,
                 saturated,
                 session_capacity_exhausted: false,
             });
@@ -237,6 +275,7 @@ impl ChainRunner {
                 denial: None,
                 session: None,
                 invocations,
+                coverage,
                 saturated,
                 session_capacity_exhausted: false,
             });
@@ -251,6 +290,7 @@ impl ChainRunner {
                 denial: None,
                 session: None,
                 invocations,
+                coverage,
                 saturated,
                 session_capacity_exhausted: false,
             });
@@ -268,6 +308,7 @@ impl ChainRunner {
                 session_admission: Some(session_admission),
             }),
             invocations,
+            coverage,
             saturated,
             session_capacity_exhausted: false,
         })
@@ -282,6 +323,7 @@ fn empty_preflight_result() -> WebSocketPreflightResult {
         denial: None,
         session: None,
         invocations: Vec::new(),
+        coverage: Vec::new(),
         saturated: false,
         session_capacity_exhausted: false,
     }
@@ -289,6 +331,7 @@ fn empty_preflight_result() -> WebSocketPreflightResult {
 
 fn session_capacity_exhausted(
     described: Vec<DescribedChainEntry>,
+    coverage: Vec<WebSocketCoverage>,
     saturated: bool,
 ) -> WebSocketPreflightResult {
     let reason = "middleware_session_capacity_exhausted";
@@ -311,6 +354,7 @@ fn session_capacity_exhausted(
         denial: None,
         session: None,
         invocations,
+        coverage,
         saturated,
         session_capacity_exhausted: true,
     }
@@ -382,6 +426,35 @@ impl WebSocketSession {
             reason: fail_closed.unwrap_or_default(),
             invocations,
         }
+    }
+
+    /// Record one logical message whose type the selected V1 WebSocket binding
+    /// cannot inspect. This is a coverage state, not a middleware failure:
+    /// `on_error` is not applied and active stages remain available for later
+    /// text messages.
+    pub fn observe_unsupported_message(
+        &mut self,
+        message_type: WebSocketMessageType,
+        original_size: usize,
+    ) -> Vec<WebSocketCoverage> {
+        self.reconcile_lifecycle();
+        if !self.has_active_stages() {
+            return Vec::new();
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.stages
+            .iter()
+            .filter(|stage| stage.is_active())
+            .map(|stage| WebSocketCoverage {
+                config_name: stage.entry.entry.name.clone(),
+                implementation: stage.entry.entry.implementation.clone(),
+                state: WebSocketCoverageState::UnsupportedMessageType,
+                sequence: Some(sequence),
+                message_type: Some(message_type),
+                original_size,
+            })
+            .collect()
     }
 
     pub async fn evaluate_text(&mut self, payload: Vec<u8>) -> WebSocketMessageOutcome {
@@ -711,6 +784,17 @@ fn bypassed_message_outcome(payload: Vec<u8>) -> WebSocketMessageOutcome {
         denial: None,
         saturated: false,
         platform_oversize: false,
+    }
+}
+
+fn binding_not_selected_coverage(entry: &ChainEntry) -> WebSocketCoverage {
+    WebSocketCoverage {
+        config_name: entry.name.clone(),
+        implementation: entry.implementation.clone(),
+        state: WebSocketCoverageState::BindingNotSelected,
+        sequence: None,
+        message_type: None,
+        original_size: 0,
     }
 }
 

@@ -89,12 +89,72 @@ pub fn emit_websocket_preflight_events(
     outcome: &openshell_supervisor_middleware::WebSocketPreflightResult,
 ) {
     emit_websocket_invocations(ctx, &outcome.invocations);
+    emit_websocket_coverage(ctx, &outcome.coverage);
     if outcome.saturated {
         emit_websocket_saturation(ctx);
     }
     if outcome.session_capacity_exhausted {
         emit_middleware_session_capacity_exhausted(ctx);
     }
+}
+
+pub(super) fn emit_websocket_coverage(
+    ctx: &L7EvalContext,
+    coverage: &[openshell_supervisor_middleware::WebSocketCoverage],
+) {
+    for event in websocket_coverage_events(ctx, coverage) {
+        ocsf_emit!(event);
+    }
+}
+
+/// Build coverage events separately from the tracing pipeline so tests can
+/// assert exact coverage telemetry without process-global callsite cache races.
+pub(super) fn websocket_coverage_events(
+    ctx: &L7EvalContext,
+    coverage: &[openshell_supervisor_middleware::WebSocketCoverage],
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    coverage
+        .iter()
+        .map(|coverage| {
+            use openshell_supervisor_middleware::WebSocketCoverageState as State;
+
+            let state = match coverage.state {
+                State::BindingNotSelected => "binding_not_selected",
+                State::UnsupportedMessageType => "unsupported_message_type",
+            };
+            let sequence = coverage
+                .sequence
+                .map_or_else(|| "-".to_string(), |sequence| sequence.to_string());
+            let message_type = match coverage.message_type {
+                Some(openshell_core::proto::WebSocketMessageType::Text) => "text",
+                Some(openshell_core::proto::WebSocketMessageType::Binary) => "binary",
+                Some(openshell_core::proto::WebSocketMessageType::Unspecified) | None => "-",
+            };
+            NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Other)
+                .activity_name("WebSocket middleware coverage")
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                .firewall_rule(&ctx.policy_name, "supervisor-middleware")
+                .unmapped("middleware_config", coverage.config_name.as_str())
+                .unmapped(
+                    "middleware_implementation",
+                    coverage.implementation.as_str(),
+                )
+                .unmapped("coverage_state", state)
+                .unmapped("websocket_message_type", message_type)
+                .unmapped("websocket_sequence", sequence.as_str())
+                .unmapped("input_bytes", coverage.original_size)
+                .message(format!(
+                    "WEBSOCKET_MIDDLEWARE_COVERAGE state={state} config={} implementation={} sequence={sequence} message_type={message_type} input_bytes={}",
+                    coverage.config_name, coverage.implementation, coverage.original_size,
+                ))
+                .build()
+        })
+        .collect()
 }
 
 pub(super) fn emit_websocket_session_start_events(
@@ -754,9 +814,62 @@ fn emit_middleware_events(
 
 #[cfg(test)]
 mod tests {
-    use super::{safe_middleware_headers, send_middleware_rejection_response};
+    use super::{
+        safe_middleware_headers, send_middleware_rejection_response, websocket_coverage_events,
+    };
     use crate::l7::relay::L7EvalContext;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn websocket_coverage_events_distinguish_selection_from_message_support() {
+        use openshell_core::proto::WebSocketMessageType;
+        use openshell_ocsf::SeverityId;
+        use openshell_supervisor_middleware::{WebSocketCoverage, WebSocketCoverageState as State};
+
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "api-policy".into(),
+            ..Default::default()
+        };
+        let events = websocket_coverage_events(
+            &ctx,
+            &[
+                WebSocketCoverage {
+                    config_name: "http-guard".into(),
+                    implementation: "example/http-only".into(),
+                    state: State::BindingNotSelected,
+                    sequence: None,
+                    message_type: None,
+                    original_size: 0,
+                },
+                WebSocketCoverage {
+                    config_name: "text-guard".into(),
+                    implementation: "example/websocket-text".into(),
+                    state: State::UnsupportedMessageType,
+                    sequence: Some(7),
+                    message_type: Some(WebSocketMessageType::Binary),
+                    original_size: 23,
+                },
+            ],
+        );
+
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.class_uid() == 4001));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.base().severity == SeverityId::Informational)
+        );
+        let serialized = serde_json::to_string(&events).expect("serialize coverage events");
+        assert!(serialized.contains("binding_not_selected"));
+        assert!(serialized.contains("unsupported_message_type"));
+        assert!(serialized.contains("\"websocket_message_type\":\"binary\""));
+        assert!(serialized.contains("\"websocket_sequence\":\"7\""));
+        assert!(serialized.contains("\"input_bytes\":23"));
+        assert!(!serialized.contains("fail_open"));
+        assert!(!serialized.contains("fail_closed"));
+    }
 
     #[tokio::test]
     async fn direct_denial_uses_middleware_response_without_service_text() {

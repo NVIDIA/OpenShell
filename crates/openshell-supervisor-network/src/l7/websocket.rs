@@ -112,7 +112,10 @@ struct FrameHeader {
 enum FragmentState {
     None,
     Text(TextMessageAssembly),
-    Binary { fragment_count: usize },
+    Binary {
+        fragment_count: usize,
+        coverage: Vec<openshell_supervisor_middleware::WebSocketCoverage>,
+    },
 }
 
 /// One admitted client text message while its complete logical payload is
@@ -517,7 +520,11 @@ where
                             observe_termination(host, port, options.policy_name, termination);
                         })?;
                     }
-                } else if let FragmentState::Binary { fragment_count } = &mut fragments {
+                } else if let FragmentState::Binary {
+                    fragment_count,
+                    coverage,
+                } = &mut fragments
+                {
                     *fragment_count = fragment_count.saturating_add(1);
                     if *fragment_count > MAX_MESSAGE_FRAGMENTS {
                         return Err(terminate(
@@ -540,8 +547,19 @@ where
                         .map_err(|error| {
                             terminate(WebSocketTerminationCause::PeerDisconnect, error)
                         })?;
+                    let fragment_size = usize::try_from(frame.payload_len).unwrap_or(usize::MAX);
+                    for record in coverage.iter_mut() {
+                        record.original_size = record.original_size.saturating_add(fragment_size);
+                    }
                     if frame.fin {
-                        fragments = FragmentState::None;
+                        let FragmentState::Binary { coverage, .. } =
+                            std::mem::replace(&mut fragments, FragmentState::None)
+                        else {
+                            unreachable!("validated binary continuation state")
+                        };
+                        if let Some(ctx) = options.middleware_context {
+                            crate::l7::middleware::emit_websocket_coverage(ctx, &coverage);
+                        }
                     }
                 } else {
                     let e =
@@ -556,9 +574,17 @@ where
                 }
             }
             OPCODE_BINARY => {
-                if !frame.fin {
-                    fragments = FragmentState::Binary { fragment_count: 1 };
-                }
+                let initial_size = usize::try_from(frame.payload_len).unwrap_or(usize::MAX);
+                let coverage = options
+                    .middleware_session
+                    .as_mut()
+                    .map(|session| {
+                        session.observe_unsupported_message(
+                            openshell_core::proto::WebSocketMessageType::Binary,
+                            initial_size,
+                        )
+                    })
+                    .unwrap_or_default();
                 copy_raw_frame_payload(reader, writer, &frame)
                     .await
                     .inspect_err(|e| {
@@ -570,6 +596,16 @@ where
                         );
                     })
                     .map_err(|error| terminate(WebSocketTerminationCause::PeerDisconnect, error))?;
+                if frame.fin
+                    && let Some(ctx) = options.middleware_context
+                {
+                    crate::l7::middleware::emit_websocket_coverage(ctx, &coverage);
+                } else if !frame.fin {
+                    fragments = FragmentState::Binary {
+                        fragment_count: 1,
+                        coverage,
+                    };
+                }
             }
             OPCODE_CLOSE | OPCODE_PING | OPCODE_PONG => {
                 let control_result = match &fragments {
@@ -2375,7 +2411,7 @@ network_policies:
     #[derive(Debug)]
     enum ObservedWebSocketRequest {
         SessionStart,
-        Message(Vec<u8>),
+        Message { sequence: u64, payload: Vec<u8> },
         SessionEnd(openshell_core::proto::WebSocketSessionEndReason),
     }
 
@@ -2462,9 +2498,10 @@ network_policies:
                         }
                         Some(web_socket_evaluation_request::Request::Message(message)) => {
                             if let Some(observed) = &observed {
-                                let _ = observed.send(ObservedWebSocketRequest::Message(
-                                    message.payload.clone(),
-                                ));
+                                let _ = observed.send(ObservedWebSocketRequest::Message {
+                                    sequence: message.sequence,
+                                    payload: message.payload.clone(),
+                                });
                             }
                             if close_on_first_message {
                                 break;
@@ -2658,6 +2695,79 @@ network_policies:
             .expect("middleware server");
     }
 
+    #[tokio::test]
+    async fn selected_middleware_reports_binary_gap_and_inspects_later_text_at_next_sequence() {
+        let (session, mut observed, shutdown_tx, server_task) =
+            recording_middleware_session("wss").await;
+        let (mut client_app, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, mut upstream_app) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            crate::l7::relay::handle_upgrade(
+                &mut relay_client,
+                &mut relay_upstream,
+                Vec::new(),
+                "api.openai.com",
+                443,
+                crate::l7::relay::UpgradeRelayOptions {
+                    websocket_request: true,
+                    ctx: Some(&L7EvalContext {
+                        host: "api.openai.com".into(),
+                        port: 443,
+                        policy_name: "rest-api".into(),
+                        ..Default::default()
+                    }),
+                    policy_name: "rest-api".into(),
+                    middleware_session: Some(session),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+
+        assert!(matches!(
+            observed.recv().await,
+            Some(ObservedWebSocketRequest::SessionStart)
+        ));
+
+        let binary = masked_frame(true, OPCODE_BINARY, &[0, 1, 2, 3, 255]);
+        let text = masked_frame(true, OPCODE_TEXT, br#"{"type":"response.create"}"#);
+        client_app
+            .write_all(&binary)
+            .await
+            .expect("send binary message");
+        client_app
+            .write_all(&text)
+            .await
+            .expect("send text message");
+
+        assert_eq!(read_one_frame(&mut upstream_app).await, binary);
+        assert_eq!(
+            decode_masked_text_frame(&read_one_frame(&mut upstream_app).await),
+            r#"{"type":"response.create"}"#
+        );
+        assert!(matches!(
+            observed.recv().await,
+            Some(ObservedWebSocketRequest::Message {
+                sequence: 2,
+                payload,
+            }) if payload == br#"{"type":"response.create"}"#
+        ));
+
+        drop(client_app);
+        drop(upstream_app);
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .expect("relay should stop")
+            .expect("join relay")
+            .expect("relay result");
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware server")
+            .expect("middleware server");
+    }
+
     async fn assert_middleware_only_relay_observes_reload(scheme: &str, fragmented: bool) {
         use openshell_supervisor_middleware::MiddlewareRegistry;
 
@@ -2746,7 +2856,7 @@ network_policies:
             Some(ObservedWebSocketRequest::SessionEnd(
                 openshell_core::proto::WebSocketSessionEndReason::PolicyReload,
             )) => {}
-            Some(ObservedWebSocketRequest::Message(payload)) => {
+            Some(ObservedWebSocketRequest::Message { payload, .. }) => {
                 panic!("stale message leaked {} bytes to middleware", payload.len());
             }
             other => panic!("unexpected middleware lifecycle event: {other:?}"),
@@ -2870,7 +2980,7 @@ network_policies:
             Some(ObservedWebSocketRequest::SessionEnd(
                 openshell_core::proto::WebSocketSessionEndReason::PolicyDenial,
             )) => {}
-            Some(ObservedWebSocketRequest::Message(payload)) => {
+            Some(ObservedWebSocketRequest::Message { payload, .. }) => {
                 panic!(
                     "built-in policy denial leaked {} bytes to middleware",
                     payload.len()
@@ -3091,7 +3201,7 @@ network_policies:
         assert!(failed.invocations[0].stage_disabled);
         assert!(matches!(
             observed_rx.recv().await,
-            Some(ObservedWebSocketRequest::Message(_))
+            Some(ObservedWebSocketRequest::Message { .. })
         ));
 
         let mut occupied_work = Vec::new();

@@ -8,9 +8,9 @@ mod remote;
 mod websocket;
 
 pub use websocket::{
-    WebSocketInvocation, WebSocketInvocationOutcome, WebSocketMessageAdmission,
-    WebSocketMessageOutcome, WebSocketPreflightInput, WebSocketPreflightResult, WebSocketSession,
-    WebSocketSessionStartOutcome,
+    WebSocketCoverage, WebSocketCoverageState, WebSocketInvocation, WebSocketInvocationOutcome,
+    WebSocketMessageAdmission, WebSocketMessageOutcome, WebSocketPreflightInput,
+    WebSocketPreflightResult, WebSocketSession, WebSocketSessionStartOutcome,
 };
 
 #[cfg(test)]
@@ -234,8 +234,11 @@ impl TryFrom<(&str, &NetworkMiddlewareConfig)> for ChainEntry {
 }
 
 /// A policy-selected middleware config joined with metadata reported by its
-/// service's `Describe` call. A missing binding is retained so `on_error` can
-/// decide whether the request fails open or closed.
+/// service's `Describe` call.
+///
+/// An unregistered implementation is retained so `on_error` can decide whether
+/// the request fails open or closed. A registered implementation without the
+/// requested binding is not part of this chain.
 #[derive(Clone)]
 pub struct DescribedChainEntry {
     entry: ChainEntry,
@@ -244,6 +247,11 @@ pub struct DescribedChainEntry {
     max_body_bytes: usize,
     max_message_bytes: usize,
     timeout: Duration,
+}
+
+struct DescribedChain {
+    entries: Vec<DescribedChainEntry>,
+    unbound: Vec<ChainEntry>,
 }
 
 impl DescribedChainEntry {
@@ -1140,24 +1148,28 @@ impl ChainRunner {
     }
 
     pub async fn describe_chain(&self, entries: &[ChainEntry]) -> Result<Vec<DescribedChainEntry>> {
-        self.describe_chain_for(
-            entries,
-            SupervisorMiddlewareOperation::HttpRequest,
-            SupervisorMiddlewarePhase::PreCredentials,
-        )
-        .await
+        Ok(self
+            .describe_chain_for(
+                entries,
+                SupervisorMiddlewareOperation::HttpRequest,
+                SupervisorMiddlewarePhase::PreCredentials,
+            )
+            .await?
+            .entries)
     }
 
     pub async fn describe_websocket_chain(
         &self,
         entries: &[ChainEntry],
     ) -> Result<Vec<DescribedChainEntry>> {
-        self.describe_chain_for(
-            entries,
-            SupervisorMiddlewareOperation::WebsocketMessage,
-            SupervisorMiddlewarePhase::PreCredentials,
-        )
-        .await
+        Ok(self
+            .describe_chain_for(
+                entries,
+                SupervisorMiddlewareOperation::WebsocketMessage,
+                SupervisorMiddlewarePhase::PreCredentials,
+            )
+            .await?
+            .entries)
     }
 
     async fn describe_chain_for(
@@ -1165,12 +1177,13 @@ impl ChainRunner {
         entries: &[ChainEntry],
         operation: SupervisorMiddlewareOperation,
         phase: SupervisorMiddlewarePhase,
-    ) -> Result<Vec<DescribedChainEntry>> {
+    ) -> Result<DescribedChain> {
         ensure_chain_capacity(entries.len())?;
         let manifests = self.manifests().await?;
         let mut entries = entries.to_vec();
         sort_chain_entries(&mut entries);
         let mut described_entries = Vec::with_capacity(entries.len());
+        let mut unbound = Vec::new();
         for entry in entries {
             let Some((state, manifest)) = manifests.iter().find(|(state, manifest)| {
                 Self::attachment_name(state, manifest) == entry.implementation
@@ -1188,6 +1201,7 @@ impl ChainRunner {
             let Some(binding) = Self::binding(manifest, operation, phase).cloned() else {
                 // The config remains globally ordered, but it does not
                 // participate in this exact operation/phase chain.
+                unbound.push(entry);
                 continue;
             };
             let timeout = state.timeout_for_binding(&binding)?;
@@ -1214,7 +1228,10 @@ impl ChainRunner {
             });
         }
         ensure_chain_capacity(described_entries.len())?;
-        Ok(described_entries)
+        Ok(DescribedChain {
+            entries: described_entries,
+            unbound,
+        })
     }
 
     pub async fn validate_config(
@@ -4200,6 +4217,90 @@ mod tests {
         assert!(outcome.invocations.is_empty());
         assert_eq!(describe_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(observed_preflight.lock().expect("preflight lock").is_none());
+    }
+
+    #[tokio::test]
+    async fn http_only_attachments_are_reported_but_do_not_select_websocket_stages() {
+        for on_error in [OnError::FailClosed, OnError::FailOpen] {
+            let runner = ChainRunner::new(Arc::new(ScriptedService {
+                manifest_name: "test/http-only".into(),
+                max_body_bytes: 4096,
+                result: allow_result(),
+            }));
+            let chain = [ChainEntry {
+                name: "http-guard".into(),
+                implementation: "test/http-only".into(),
+                order: 0,
+                config: prost_types::Struct::default(),
+                on_error,
+            }];
+
+            let outcome = runner
+                .preflight_websocket(
+                    &chain,
+                    websocket_preflight_input(format!("http-only-{on_error:?}")),
+                )
+                .await
+                .expect("HTTP-only attachment coverage");
+
+            assert!(outcome.allowed);
+            assert_eq!(outcome.terminal_reason, None);
+            assert!(outcome.session.is_none());
+            assert!(outcome.invocations.is_empty());
+            assert_eq!(
+                outcome.coverage,
+                [WebSocketCoverage {
+                    config_name: "http-guard".into(),
+                    implementation: "test/http-only".into(),
+                    state: WebSocketCoverageState::BindingNotSelected,
+                    sequence: None,
+                    message_type: None,
+                    original_size: 0,
+                }]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_binary_messages_advance_sequence_without_applying_on_error() {
+        for on_error in [OnError::FailClosed, OnError::FailOpen] {
+            let runner = builtin_runner();
+            let chain = [entry("regex-redactor", on_error)];
+            let preflight = runner
+                .preflight_websocket(
+                    &chain,
+                    websocket_preflight_input(format!("binary-{on_error:?}")),
+                )
+                .await
+                .expect("preflight");
+            let mut session = preflight.session.expect("built-in inspects text");
+            assert!(session.start("").await.allowed);
+
+            let coverage = session.observe_unsupported_message(
+                openshell_core::proto::WebSocketMessageType::Binary,
+                23,
+            );
+            assert_eq!(
+                coverage,
+                [WebSocketCoverage {
+                    config_name: "regex-redactor".into(),
+                    implementation: BUILTIN_REGEX.into(),
+                    state: WebSocketCoverageState::UnsupportedMessageType,
+                    sequence: Some(1),
+                    message_type: Some(openshell_core::proto::WebSocketMessageType::Binary),
+                    original_size: 23,
+                }]
+            );
+
+            let text = session.evaluate_text(br#"{"input":"safe"}"#.to_vec()).await;
+            assert!(text.allowed);
+            assert_eq!(text.invocations[0].sequence, Some(2));
+            assert!(!text.invocations[0].failed);
+
+            session
+                .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+                .await;
+        }
     }
 
     #[tokio::test]
