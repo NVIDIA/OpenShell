@@ -1039,6 +1039,14 @@
       "created_at": "2026-07-27T23:12:18Z",
       "repoId": 1166129534,
       "pullRequestNo": 2496
+    },
+    {
+      "name": "gburachas",
+      "id": 882003,
+      "comment_id": 5106731320,
+      "created_at": "2026-07-28T16:14:00Z",
+      "repoId": 1166129534,
+      "pullRequestNo": 2496
     }
   ]
 }
