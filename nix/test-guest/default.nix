@@ -95,10 +95,14 @@ let
     export OPENSHELL_TEST_GUEST_RUNNER=${./run.sh}
     export TEST_GUEST_BASH=${pkgs.bash}/bin/bash
     export TEST_GUEST_QEMU=${qemuBinary}
-    export TEST_GUEST_FIRMWARE_CODE=${pkgs.OVMF.firmware}
-    export TEST_GUEST_FIRMWARE_VARS=${pkgs.OVMF.variables}
+    export TEST_GUEST_FIRMWARE_CODE=${firmwareCode}
+    export TEST_GUEST_FIRMWARE_VARS=${firmwareVars}
+    ${pkgs.lib.optionalString isAarch64 ''
+      export TEST_GUEST_TCG_FIRMWARE_CODE=${qemu}/share/qemu/edk2-aarch64-code.fd
+      export TEST_GUEST_TCG_FIRMWARE_VARS=${qemu}/share/qemu/edk2-arm-vars.fd
+    ''}
     export TEST_GUEST_MACHINE=${if isAarch64 then "virt" else "q35"}
-    export TEST_GUEST_ACCELERATOR=${if isDarwin then "hvf" else "kvm"}
+    export TEST_GUEST_ACCELERATOR=${selectedAccelerator}
     export TEST_GUEST_ARCHITECTURE=${architecture}
     export TEST_GUEST_ANSIBLE_VERSION=${pkgs.python3Packages.ansible-core.version}
     export TEST_GUEST_CACHE_GENERATION=1

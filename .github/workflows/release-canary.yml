@@ -94,7 +94,7 @@ jobs:
 
           # The variables in the single-quoted script expand inside the guest.
           # shellcheck disable=SC2016
-          nix run .#test-vm -- \
+          nix run .#test-guest -- \
             --distro "${TEST_VM_DISTRO}" \
             "${configuration_args[@]}" \
             -- \
@@ -146,7 +146,7 @@ jobs:
       - name: Boot pinned ARM64 Ubuntu guest with TCG
         run: |
           set -euo pipefail
-          nix run .#test-vm-arm64-tcg -- \
+          nix run .#test-guest-arm64-tcg -- \
             --distro ubuntu \
             -- true
 

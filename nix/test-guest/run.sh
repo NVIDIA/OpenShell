@@ -237,19 +237,27 @@ for copy_spec in "${copies[@]}"; do
 	esac
 done
 
-test_vm_cpu=host
-ssh_wait_seconds=180
+case "${TEST_GUEST_ACCELERATOR}" in
+tcg)
+	test_vm_cpu=max
+	ssh_wait_seconds=600
+	;;
+*)
+	test_vm_cpu=host
+	ssh_wait_seconds=180
+	;;
+esac
 if [ "${TEST_GUEST_ACCELERATOR}" = kvm ] &&
 	{ [ ! -c /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
 	echo "==> /dev/kvm is unavailable; falling back to QEMU/TCG"
 	TEST_GUEST_ACCELERATOR=tcg
 	test_vm_cpu=max
 	ssh_wait_seconds=600
-	if [ "${TEST_VM_ARCHITECTURE}" = aarch64 ]; then
-		: "${TEST_VM_TCG_FIRMWARE_CODE:?missing QEMU ARM TCG firmware code}"
-		: "${TEST_VM_TCG_FIRMWARE_VARS:?missing QEMU ARM TCG firmware variables}"
-		TEST_VM_FIRMWARE_CODE=${TEST_VM_TCG_FIRMWARE_CODE}
-		TEST_VM_FIRMWARE_VARS=${TEST_VM_TCG_FIRMWARE_VARS}
+	if [ "${TEST_GUEST_ARCHITECTURE}" = aarch64 ]; then
+		: "${TEST_GUEST_TCG_FIRMWARE_CODE:?missing QEMU ARM TCG firmware code}"
+		: "${TEST_GUEST_TCG_FIRMWARE_VARS:?missing QEMU ARM TCG firmware variables}"
+		TEST_GUEST_FIRMWARE_CODE=${TEST_GUEST_TCG_FIRMWARE_CODE}
+		TEST_GUEST_FIRMWARE_VARS=${TEST_GUEST_TCG_FIRMWARE_VARS}
 		echo "==> Using QEMU-bundled ARM firmware for TCG fallback"
 	fi
 fi
@@ -476,7 +484,8 @@ scp_args=(
 
 echo "==> Waiting up to ${ssh_wait_seconds} seconds for SSH on 127.0.0.1:${ssh_port}"
 ssh_ready=0
-for _ in $(seq 1 "$((ssh_wait_seconds * 4))"); do
+ssh_deadline_seconds=$((boot_started_seconds + ssh_wait_seconds))
+while [ "${SECONDS}" -lt "${ssh_deadline_seconds}" ]; do
 	if ! kill -0 "${qemu_pid}" 2>/dev/null; then
 		wait "${qemu_pid}" || true
 		qemu_pid=

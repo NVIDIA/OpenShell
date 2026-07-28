@@ -84,7 +84,7 @@ Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${h
 Reproduce each native-architecture Linux canary with the same VM app:
 
 ```shell
-nix run .#test-vm -- \
+nix run .#test-guest -- \
   --distro ubuntu \
   --with docker \
   -- env \

@@ -63,6 +63,18 @@ List the available distros and configurations:
 nix run .#test-guest -- --list
 ```
 
+## Benchmark ARM64 TCG across Linux hosts
+
+Boot the pinned ARM64 Ubuntu image with QEMU TCG, validate the guest over SSH, and shut it down:
+
+```shell
+nix run .#test-guest-arm64-tcg -- \
+  --distro ubuntu \
+  -- true
+```
+
+Run the same command on x86_64 and ARM64 Linux hosts to compare TCG boot behavior. The app holds the ARM64 cloud image, QEMU version, firmware, vCPU count, and memory constant. The runner prints the elapsed time from QEMU startup until SSH becomes ready.
+
 ## Open an interactive VM
 
 Boot a base Ubuntu VM:
