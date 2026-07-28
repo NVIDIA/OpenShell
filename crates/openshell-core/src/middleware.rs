@@ -11,12 +11,16 @@ use tonic::{Request, Response, Status};
 
 use crate::proto::{
     HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse, WebSocketSessionEvent, WebSocketSessionResult,
+    ValidateConfigResponse, WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
 /// Transport-neutral response stream for one WebSocket middleware stage.
 pub type WebSocketResponseStream = Pin<
-    Box<dyn tokio_stream::Stream<Item = Result<WebSocketSessionResult, Status>> + Send + 'static>,
+    Box<
+        dyn tokio_stream::Stream<Item = Result<WebSocketSessionEventResult, Status>>
+            + Send
+            + 'static,
+    >,
 >;
 
 /// A middleware implementation reachable either in-process or over a transport.

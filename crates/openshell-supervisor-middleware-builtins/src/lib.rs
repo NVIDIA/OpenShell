@@ -13,8 +13,8 @@ use openshell_core::proto::middleware::v1::supervisor_middleware_server::Supervi
 use openshell_core::proto::{
     HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, SupervisorMiddlewarePhase,
     ValidateConfigRequest, ValidateConfigResponse, WebSocketMessageType, WebSocketPreflightAction,
-    WebSocketPreflightDecision, WebSocketSessionEvent, WebSocketSessionResult,
-    web_socket_session_event, web_socket_session_result,
+    WebSocketPreflightDecision, WebSocketSessionEvent, WebSocketSessionEventResult,
+    web_socket_session_event, web_socket_session_event_result,
 };
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
@@ -76,9 +76,9 @@ impl BuiltinMiddlewareService {
                             match regex::validate_config(&selected_config) {
                                 Ok(()) => {
                                     config = Some(selected_config);
-                                    Ok(Some(WebSocketSessionResult {
+                                    Ok(Some(WebSocketSessionEventResult {
                                         result: Some(
-                                            web_socket_session_result::Result::PreflightDecision(
+                                            web_socket_session_event_result::Result::PreflightDecision(
                                                 WebSocketPreflightDecision {
                                                     action: WebSocketPreflightAction::Inspect
                                                         as i32,
@@ -120,10 +120,12 @@ impl BuiltinMiddlewareService {
                                 &message.payload,
                                 selected_config,
                             ) {
-                                Ok(result) => Ok(Some(WebSocketSessionResult {
-                                    result: Some(web_socket_session_result::Result::MessageResult(
-                                        result,
-                                    )),
+                                Ok(result) => Ok(Some(WebSocketSessionEventResult {
+                                    result: Some(
+                                        web_socket_session_event_result::Result::MessageResult(
+                                            result,
+                                        ),
+                                    ),
                                 })),
                                 Err(error) => Err(Status::invalid_argument(error.to_string())),
                             }
@@ -392,7 +394,7 @@ mod tests {
 
         assert!(matches!(
             response.result,
-            Some(web_socket_session_result::Result::PreflightDecision(
+            Some(web_socket_session_event_result::Result::PreflightDecision(
                 WebSocketPreflightDecision { action, .. }
             )) if action == WebSocketPreflightAction::Inspect as i32
         ));

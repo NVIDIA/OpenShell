@@ -4030,7 +4030,8 @@ mod tests {
         {
             use openshell_core::proto::{
                 WebSocketMessageResult, WebSocketPreflightAction, WebSocketPreflightDecision,
-                WebSocketSessionResult, web_socket_session_event, web_socket_session_result,
+                WebSocketSessionEventResult, web_socket_session_event,
+                web_socket_session_event_result,
             };
 
             let preflight = Arc::clone(&self.preflight);
@@ -4049,22 +4050,24 @@ mod tests {
                     let response = match request.event {
                         Some(web_socket_session_event::Event::Preflight(value)) => {
                             *preflight.lock().expect("preflight lock") = Some(value);
-                            Some(WebSocketSessionResult {
-                                result: Some(web_socket_session_result::Result::PreflightDecision(
-                                    WebSocketPreflightDecision {
-                                        action: if deny {
-                                            WebSocketPreflightAction::Deny as i32
-                                        } else if skip {
-                                            WebSocketPreflightAction::Skip as i32
-                                        } else {
-                                            WebSocketPreflightAction::Inspect as i32
+                            Some(WebSocketSessionEventResult {
+                                result: Some(
+                                    web_socket_session_event_result::Result::PreflightDecision(
+                                        WebSocketPreflightDecision {
+                                            action: if deny {
+                                                WebSocketPreflightAction::Deny as i32
+                                            } else if skip {
+                                                WebSocketPreflightAction::Skip as i32
+                                            } else {
+                                                WebSocketPreflightAction::Inspect as i32
+                                            },
+                                            reason: preflight_reason.clone(),
+                                            findings: preflight_findings.clone(),
+                                            metadata: preflight_metadata.clone(),
+                                            reason_code: preflight_reason_code.clone(),
                                         },
-                                        reason: preflight_reason.clone(),
-                                        findings: preflight_findings.clone(),
-                                        metadata: preflight_metadata.clone(),
-                                        reason_code: preflight_reason_code.clone(),
-                                    },
-                                )),
+                                    ),
+                                ),
                             })
                         }
                         Some(web_socket_session_event::Event::Message(value)) => {
@@ -4075,17 +4078,19 @@ mod tests {
                             let payload = String::from_utf8(value.payload)
                                 .expect("test OpenAI event must be UTF-8")
                                 .replace("customer-secret", "[REDACTED]");
-                            Some(WebSocketSessionResult {
-                                result: Some(web_socket_session_result::Result::MessageResult(
-                                    WebSocketMessageResult {
-                                        sequence: value.sequence,
-                                        decision: Decision::Allow as i32,
-                                        replacement: payload.into_bytes(),
-                                        has_replacement: true,
-                                        reason_code: "redacted".into(),
-                                        ..Default::default()
-                                    },
-                                )),
+                            Some(WebSocketSessionEventResult {
+                                result: Some(
+                                    web_socket_session_event_result::Result::MessageResult(
+                                        WebSocketMessageResult {
+                                            sequence: value.sequence,
+                                            decision: Decision::Allow as i32,
+                                            replacement: payload.into_bytes(),
+                                            has_replacement: true,
+                                            reason_code: "redacted".into(),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
                             })
                         }
                         Some(web_socket_session_event::Event::SessionStart(_)) | None => None,

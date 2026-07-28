@@ -17,7 +17,7 @@ use openshell_core::proto::{
     WebSocketMessageResult, WebSocketMessageType, WebSocketPreflight, WebSocketPreflightAction,
     WebSocketPreflightDecision, WebSocketSessionEnd, WebSocketSessionEndReason,
     WebSocketSessionEvent, WebSocketSessionStart, web_socket_session_event,
-    web_socket_session_result,
+    web_socket_session_event_result,
 };
 
 use super::{
@@ -611,8 +611,8 @@ impl WebSocketSession {
             };
             let result = match response {
                 Ok(Ok(Some(response))) => match response.result {
-                    Some(web_socket_session_result::Result::MessageResult(result)) => result,
-                    Some(web_socket_session_result::Result::PreflightDecision(_)) | None => {
+                    Some(web_socket_session_event_result::Result::MessageResult(result)) => result,
+                    Some(web_socket_session_event_result::Result::PreflightDecision(_)) | None => {
                         if let Some(outcome) = handle_stage_failure(
                             stage,
                             sequence,
@@ -935,7 +935,8 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
         ));
         return OpenStage::Failed(entry, "missing_preflight_decision".into());
     };
-    let Some(web_socket_session_result::Result::PreflightDecision(decision)) = response.result
+    let Some(web_socket_session_event_result::Result::PreflightDecision(decision)) =
+        response.result
     else {
         let _ = sender.try_send(session_end_request(
             WebSocketSessionEndReason::MiddlewareFailure,

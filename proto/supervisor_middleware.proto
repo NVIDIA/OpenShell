@@ -30,7 +30,7 @@ service SupervisorMiddleware {
   // stage stream, OpenShell attempts at most one session_end before closing the
   // stream when its transport is still writable.
   rpc EvaluateWebSocketSession(stream WebSocketSessionEvent)
-      returns (stream WebSocketSessionResult);
+      returns (stream WebSocketSessionEventResult);
 }
 
 // MiddlewareManifest describes one middleware service and the bindings it
@@ -256,9 +256,9 @@ message WebSocketMessageResult {
   string reason_code = 8;
 }
 
-// WebSocketSessionResult is an evaluation result for a preflight or message
+// WebSocketSessionEventResult is an evaluation result for a preflight or message
 // event. Session start and end events do not produce results.
-message WebSocketSessionResult {
+message WebSocketSessionEventResult {
   oneof result {
     WebSocketPreflightDecision preflight_decision = 1;
     WebSocketMessageResult message_result = 2;

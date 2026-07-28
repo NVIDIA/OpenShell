@@ -2550,8 +2550,8 @@ network_policies:
         ) -> std::result::Result<Response<Self::EvaluateWebSocketSessionStream>, Status> {
             use openshell_core::proto::{
                 Decision, WebSocketMessageResult, WebSocketPreflightAction,
-                WebSocketPreflightDecision, WebSocketSessionResult, web_socket_session_event,
-                web_socket_session_result,
+                WebSocketPreflightDecision, WebSocketSessionEventResult, web_socket_session_event,
+                web_socket_session_event_result,
             };
             let mut requests = request.into_inner();
             let observed = self.observed.clone();
@@ -2561,13 +2561,15 @@ network_policies:
                 while let Ok(Some(request)) = requests.message().await {
                     let response = match request.event {
                         Some(web_socket_session_event::Event::Preflight(_)) => {
-                            Some(WebSocketSessionResult {
-                                result: Some(web_socket_session_result::Result::PreflightDecision(
-                                    WebSocketPreflightDecision {
-                                        action: WebSocketPreflightAction::Inspect as i32,
-                                        ..Default::default()
-                                    },
-                                )),
+                            Some(WebSocketSessionEventResult {
+                                result: Some(
+                                    web_socket_session_event_result::Result::PreflightDecision(
+                                        WebSocketPreflightDecision {
+                                            action: WebSocketPreflightAction::Inspect as i32,
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
                             })
                         }
                         Some(web_socket_session_event::Event::Message(message)) => {
@@ -2585,25 +2587,31 @@ network_policies:
                             let deny = text.contains("deny-me");
                             let replacement =
                                 text.replace("customer-secret", "[REDACTED]").into_bytes();
-                            Some(WebSocketSessionResult {
-                                result: Some(web_socket_session_result::Result::MessageResult(
-                                    WebSocketMessageResult {
-                                        sequence: message.sequence,
-                                        decision: if deny {
-                                            Decision::Deny as i32
-                                        } else {
-                                            Decision::Allow as i32
+                            Some(WebSocketSessionEventResult {
+                                result: Some(
+                                    web_socket_session_event_result::Result::MessageResult(
+                                        WebSocketMessageResult {
+                                            sequence: message.sequence,
+                                            decision: if deny {
+                                                Decision::Deny as i32
+                                            } else {
+                                                Decision::Allow as i32
+                                            },
+                                            replacement: if deny {
+                                                Vec::new()
+                                            } else {
+                                                replacement
+                                            },
+                                            has_replacement: !deny,
+                                            reason_code: if deny {
+                                                "blocked".into()
+                                            } else {
+                                                "redacted".into()
+                                            },
+                                            ..Default::default()
                                         },
-                                        replacement: if deny { Vec::new() } else { replacement },
-                                        has_replacement: !deny,
-                                        reason_code: if deny {
-                                            "blocked".into()
-                                        } else {
-                                            "redacted".into()
-                                        },
-                                        ..Default::default()
-                                    },
-                                )),
+                                    ),
+                                ),
                             })
                         }
                         Some(web_socket_session_event::Event::SessionStart(_)) => {

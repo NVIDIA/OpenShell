@@ -2759,8 +2759,8 @@ network_policies:
         ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketSessionStream>, tonic::Status>
         {
             use openshell_core::proto::{
-                WebSocketPreflightDecision, WebSocketSessionResult, web_socket_session_event,
-                web_socket_session_result,
+                WebSocketPreflightDecision, WebSocketSessionEventResult, web_socket_session_event,
+                web_socket_session_event_result,
             };
             use tokio_stream::wrappers::ReceiverStream;
 
@@ -2778,13 +2778,15 @@ network_policies:
                         let _ = seen.send(());
                         release.notified().await;
                         let _ = responses_tx
-                            .send(Ok(WebSocketSessionResult {
-                                result: Some(web_socket_session_result::Result::PreflightDecision(
-                                    WebSocketPreflightDecision {
-                                        action: action as i32,
-                                        ..Default::default()
-                                    },
-                                )),
+                            .send(Ok(WebSocketSessionEventResult {
+                                result: Some(
+                                    web_socket_session_event_result::Result::PreflightDecision(
+                                        WebSocketPreflightDecision {
+                                            action: action as i32,
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
                             }))
                             .await;
                     }
