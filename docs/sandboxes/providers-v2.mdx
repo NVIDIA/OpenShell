@@ -108,8 +108,8 @@ headers, Basic and Bearer authorization, URL paths, query parameters, opted-in
 request bodies, AWS SigV4 signing, and opted-in WebSocket text messages. Raw
 `tls: skip` and non-HTTP tunnels do not perform static credential substitution.
 
-If a request contains a known placeholder at a destination outside its binding,
-OpenShell returns HTTP 403 with this response:
+If an HTTP request contains a known placeholder at a destination outside its
+binding, OpenShell returns HTTP 403 with this response:
 
 ```json
 {"error":"credential_endpoint_mismatch","message":"Credential is not authorized for this request endpoint"}
@@ -119,6 +119,10 @@ The sandbox logs include the destination and
 `credential_endpoint_mismatch`. OCSF output includes both the denied activity
 and a detection finding. These events omit credential values, placeholders,
 environment keys, and query strings.
+
+For opted-in WebSocket text-message rewriting, the mismatch can occur after the
+HTTP 101 upgrade has completed. OpenShell closes that WebSocket with policy
+violation code 1008 instead of returning an HTTP response.
 
 Binding updates apply to both current and retained placeholder generations.
 Credential rotation keeps the current endpoint set. Updating a provider profile
