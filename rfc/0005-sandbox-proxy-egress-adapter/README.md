@@ -142,11 +142,19 @@ flowchart TD
     subgraph NativeTcp["Policy DNS + native TCP"]
         NameLookup["Userland DNS lookup"]
         PolicyDns["Policy DNS adapter"]
-        DnsAnswer["DNS answer + correlated active mapping"]
-        NativeConnect["Userland connect(ip:port)"]
-        TcpAdapter["Transparent TCP adapter"]
+        DnsEligible{"Eligible native TCP<br/>policy endpoint?"}
+        DnsDeny["Local DNS refusal<br/>no upstream lookup"]
+        TrustedDns["Trusted upstream lookup<br/>and destination filtering"]
+        DnsMapping["Synthetic IP + active mapping<br/>to validated real addresses"]
+        DnsAnswer["Return synthetic IP"]
+        NativeConnect["Userland connect(synthetic_ip:port)"]
+        TcpAdapter["Transparent TCP adapter<br/>recover mapping"]
         NameLookup --> PolicyDns
-        PolicyDns --> DnsAnswer
+        PolicyDns --> DnsEligible
+        DnsEligible -- No --> DnsDeny
+        DnsEligible -- Yes --> TrustedDns
+        TrustedDns --> DnsMapping
+        DnsMapping --> DnsAnswer
         DnsAnswer --> NativeConnect
         NativeConnect --> TcpAdapter
     end
@@ -167,7 +175,7 @@ flowchart TD
         Intent["EgressIntent"]
         Auth["Authorize and select endpoint"]
         Decision["EgressDecision"]
-        Validate["Resolve and validate destination"]
+        Validate["Resolve or consume pinned destination<br/>and validate"]
         Relay["Relay"]
         Deny["Adapter-specific deny response"]
         Intent --> Auth
@@ -329,16 +337,29 @@ unsupported h2c upgrades on inspected routes, and either stays in a shared HTTP
 request loop or forces `Connection: close` for a guarded single request.
 
 Transparent TCP is for native clients that do not know they are using a proxy.
-It depends on policy DNS and nftables capture: DNS answers create correlated
-active endpoint mappings, userland later calls `connect(ip:port)`, nftables
-redirects matching traffic to a userland listener, and the TCP adapter recovers
-the original destination before building an intent.
+It depends on policy DNS and nftables capture. For a policy-eligible native TCP
+name, policy DNS returns a supervisor-owned synthetic IP and creates an active
+mapping from that IP to the normalized name, matched endpoint, allowed ports,
+and validated real addresses. Userland later calls
+`connect(synthetic_ip:port)`, nftables redirects the traffic to a userland
+listener, and the TCP adapter recovers the synthetic destination and exact
+mapping before building an intent.
 
 Policy DNS replaces static `/etc/hosts` snapshots for native TCP names. It is
-query-driven: check whether the name is policy-eligible, resolve through
-trusted DNS, filter returned IPs, publish the active endpoint mapping, and
-answer userland. The later `connect(ip:port)` still runs through normal
-authorization and must correlate with the mapping created by that DNS answer.
+query-driven. It first checks whether the normalized name matches an endpoint
+whose transport and protocol contract enables native TCP through policy DNS. A
+name without such an endpoint receives a local policy-denial DNS response,
+normally `REFUSED`, and is never sent to upstream DNS. An eligible name is
+resolved through trusted DNS, and every returned address is filtered through
+destination and SSRF controls before the adapter atomically publishes the
+mapping and capture state and returns the synthetic IP to userland.
+
+The later connect still runs through normal authorization. The connector may
+dial only the validated real addresses pinned in the unexpired mapping; it must
+not perform an unrelated fresh resolution or treat a direct connection to one
+of those real IPs as correlated. Process identity remains independent
+authorization evidence evaluated at connect time, not the mechanism that joins
+the DNS request to the TCP connection.
 
 Local service adapters stay outside the normal external egress relay:
 `inference.local` routes chat, completion, model discovery, embeddings, and
@@ -358,16 +379,19 @@ enforcement, not native TCP capture.
 flowchart TD
     Packet["Userland packet"] --> ProxyDest{"Proxy destination?"}
     ProxyDest -- Yes --> AcceptProxy["nftables accept"]
-    ProxyDest -- No --> Capture{"Active policy-DNS capture match?"}
+    ProxyDest -- No --> Capture{"Active synthetic-IP<br/>capture match?"}
     Capture -- Yes --> Redirect["nftables redirect/TPROXY to transparent adapter"]
     Capture -- No --> Reject["nftables log + reject bypass"]
     Reject --> Monitor["Bypass monitor emits OCSF"]
 ```
 
 Transparent TCP extends this nftables model with explicit capture rules that
-run before the reject path and are scoped to unexpired, policy-correlated DNS
-mappings. It does not add a parallel iptables path. The compatibility milestone
-leaves the current table unchanged; capture arrives in a later feature phase.
+run before the reject path and are scoped to unexpired synthetic-IP mappings.
+The sandbox resolver points to policy DNS, while direct external DNS traffic
+continues to the reject path. DNS-over-HTTPS is ordinary HTTPS egress and
+requires its own allowed endpoint. Transparent capture does not add a parallel
+iptables path. The compatibility milestone leaves the current table unchanged;
+capture arrives in a later feature phase.
 
 ### Deployment Modes
 
@@ -461,9 +485,10 @@ refactor branch.
 - Token grants add a runtime dependency on SPIFFE Workload API and token
   endpoints. Failures should remain fail-closed and sanitized.
 - Transparent TCP capture adds network-namespace interception and mutable DNS
-  mapping state. It must coexist with nftables reject/log enforcement, prevent
-  unrelated bare-IP connections from inheriting DNS authorization, and fail
-  closed across policy or mapping generation changes.
+  mapping state. Synthetic address allocation must coexist with runtime
+  networks, avoid premature reuse, prevent unrelated bare-IP connections from
+  inheriting DNS authorization, and fail closed across policy or mapping
+  generation changes.
 - Sidecar or standalone modes may intentionally lack process identity.
   Binary/path-scoped policy needs an advertised identity capability and policy
   validation; missing identity cannot silently broaden an allow.
@@ -510,6 +535,17 @@ destination, and relay boundaries plus policy DNS and nftables capture before
 it can safely preserve endpoint identity. For that reason it is a later phase
 of this RFC, not the first implementation change.
 
+### Return real addresses from policy DNS
+
+Returning validated real addresses avoids a synthetic address pool, but the
+later TCP connection carries only an IP and port. Two policy names can share
+the same real address and port, and a direct bare-IP connection is
+indistinguishable from one caused by the earlier lookup. Process identity does
+not solve shared resolvers, caches, cross-process handoff, or two names resolved
+by the same process. The proposal therefore uses a synthetic address as the
+correlation handle and keeps process identity as separate authorization
+evidence.
+
 ## Prior art
 
 The current `openshell-supervisor-network` split is the immediate prior step:
@@ -544,7 +580,10 @@ adapter wire middleware separately.
 4. What TTL cap should policy DNS use, and should policy reload immediately
    invalidate all active mappings or permit a bounded drain period that cannot
    authorize new connections?
-5. Which original-destination mechanism and nftables redirect mode should each
+5. Which non-routable synthetic IPv4 and IPv6 ranges can each runtime reserve,
+   and what quarantine period prevents address reuse while stale DNS answers
+   may remain cached?
+6. Which original-destination mechanism and nftables redirect mode should each
    supported runtime use while keeping capture rules ahead of bypass rejection?
-6. Which identity capabilities must standalone and sidecar runtimes advertise
+7. Which identity capabilities must standalone and sidecar runtimes advertise
    before the gateway accepts binary/path-scoped policy for them?

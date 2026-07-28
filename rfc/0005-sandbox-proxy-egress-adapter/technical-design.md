@@ -255,6 +255,7 @@ struct ResolvedEndpointCorrelation {
     policy_generation: PolicyGeneration,
     mapping_generation: DnsMappingGeneration,
     mapping_id: DnsMappingId,
+    synthetic_ip: IpAddr,
 }
 
 struct PinnedRequestPolicy {
@@ -330,19 +331,26 @@ Policy DNS is query-driven rather than a static `/etc/hosts` snapshot.
 
 1. Policy load registers eligible native TCP endpoint names.
 2. Userland performs a DNS lookup.
-3. Policy DNS checks whether the name is eligible in the current policy
-   generation.
-4. Policy DNS resolves through trusted upstream DNS and filters answers through
-   endpoint metadata and SSRF controls.
-5. The adapter publishes the DNS answer plus an active mapping containing the
-   normalized name, endpoint identifier, IP/port, policy generation, distinct
-   DNS mapping generation, opaque mapping ID, and expiration.
-6. Capture rules are updated atomically for the active mapping.
-7. Userland later calls `connect(ip:port)`.
-8. Transparent TCP recovers the original destination and requires an unexpired
-   mapping that correlates that connect with the policy-eligible DNS answer.
-9. Normal egress authorization and relay selection run against a policy
-   generation consistent with the mapping contract.
+3. Policy DNS checks whether the normalized name matches an endpoint whose
+   transport and protocol contract enables native TCP through policy DNS in the
+   current policy generation.
+4. An ineligible name receives a local policy-denial DNS response without an
+   upstream query.
+5. Policy DNS resolves an eligible name through trusted upstream DNS and
+   filters every answer through endpoint metadata and SSRF controls.
+6. The adapter allocates a supervisor-owned synthetic IP and creates an active
+   mapping containing the synthetic IP, normalized name, endpoint identifier,
+   allowed ports, validated real addresses, policy generation, distinct DNS
+   mapping generation, opaque mapping ID, and expiration.
+7. The adapter publishes the mapping and capture state atomically before
+   returning the synthetic IP to userland with a bounded TTL.
+8. Userland later calls `connect(synthetic_ip:port)`.
+9. Transparent TCP recovers the synthetic original destination and requires an
+   unexpired exact mapping whose allowed ports contain the requested port.
+10. Normal egress authorization and relay selection run against a policy
+    generation consistent with the mapping contract.
+11. The connector dials only a real address pinned in that mapping. It does not
+    re-resolve the name independently at connect time.
 
 The resolved endpoint store is active state produced by policy-eligible lookups
 and consumed by transparent TCP connects. Policy generation and DNS mapping
@@ -351,7 +359,15 @@ policy reload, while a policy reload can invalidate mappings whose endpoint
 contract is no longer current. A captured connection with no mapping, a stale
 mapping, or a mismatched endpoint/port fails closed. An unrelated bare-IP
 connection cannot inherit a policy-DNS authorization merely because it targets
-an IP currently present in the mapping store.
+a real IP present in the mapping store. Synthetic IPs are correlation handles,
+not upstream destinations, and must never be routed directly or reassigned
+while a stale answer could still refer to the prior mapping.
+
+The mapping is sandbox-scoped rather than process-scoped. Process identity is
+looked up and evaluated independently when the captured TCP connection is
+authorized. It is not used to join DNS and TCP because name resolution may be
+cached, delegated to a resolver helper, or consumed by a different process, and
+multiple names resolved by one process may share a real address and port.
 
 ## nftables Boundary
 
@@ -365,8 +381,10 @@ Transparent TCP capture builds on this same nftables substrate in a later
 feature phase:
 
 - capture rules run before the generic bypass reject rules;
-- capture rules are scoped to active policy-DNS IP/port mappings;
+- capture rules are scoped to active synthetic-IP and allowed-port mappings;
 - mapping and capture-rule updates are atomic from the adapter's perspective;
+- direct external DNS remains blocked; policy DNS is the sandbox resolver, and
+  DNS-over-HTTPS remains ordinary policy-controlled HTTPS egress;
 - reject/log rules remain the fallback for unmatched TCP/UDP egress;
 - VM or Podman driver nftables rules are infrastructure NAT/isolation and are
   not the proxy policy enforcement point.

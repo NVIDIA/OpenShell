@@ -178,15 +178,20 @@ series.
 ## Phase 8 - Policy DNS And Transparent TCP
 
 - Add policy DNS registration for native TCP endpoint names.
-- Replace static host-file mapping with query-driven DNS answers resolved
-  through trusted DNS and filtered through destination controls.
-- Store normalized name, endpoint ID, IP/port, policy generation, distinct DNS
-  mapping generation, mapping ID, and expiration in active mapping state.
+- Reject names that do not match an eligible native TCP endpoint before making
+  an upstream DNS query.
+- Replace static host-file mapping with query-driven synthetic DNS answers.
+  Resolve eligible names through trusted DNS and filter every real address
+  through destination controls.
+- Allocate a supervisor-owned synthetic IP and store the normalized name,
+  endpoint ID, allowed ports, validated real addresses, policy generation,
+  distinct DNS mapping generation, mapping ID, and expiration in active mapping
+  state.
 - Require every captured connect to correlate with the unexpired mapping
-  created by its policy-eligible DNS answer. Do not allow unrelated bare-IP
-  traffic to inherit a policy-DNS decision.
+  selected by its synthetic destination and requested port. Do not allow
+  unrelated bare-IP traffic to inherit a policy-DNS decision.
 - Publish mapping and nftables capture updates atomically from the adapter's
-  perspective.
+  perspective before returning the synthetic DNS answer.
 - Add nftables REDIRECT/TPROXY capture rules ahead of the bypass reject path;
   do not add a parallel iptables path.
 - Coordinate capture-rule ownership with
@@ -194,8 +199,13 @@ series.
   unmatched traffic.
 - Recover the original destination, construct a transparent-TCP intent, and run
   normal generation-consistent authorization and destination validation.
-- Define TTL caps, policy-reload invalidation, stale-mapping behavior, and
-  rollback before enabling capture by default.
+- Restrict the connector to the mapping's pinned validated real addresses; do
+  not independently re-resolve at connect time.
+- Keep direct external DNS blocked and treat DNS-over-HTTPS as ordinary
+  policy-controlled HTTPS egress.
+- Define synthetic address pools and reuse quarantine, TTL caps, policy-reload
+  invalidation, stale-mapping behavior, and rollback before enabling capture by
+  default.
 
 ## Phase 9 - Native Protocol Processors
 
@@ -247,10 +257,14 @@ series.
 - Add protocol-processor harness tests before adding Redis, Postgres, MySQL, or
   similar enforcement. Each concrete processor adds multi-message, handshake,
   timeout, denial, redaction, and middleware coverage.
-- Integration-test policy DNS filtering, TTL, distinct mapping generations,
-  policy-reload invalidation, atomic capture-rule updates, original-destination
-  recovery, captured-connect correlation, and rejection of unrelated bare-IP
+- Integration-test policy DNS filtering, denial without an upstream query,
+  synthetic answer allocation, TTL and reuse quarantine, distinct mapping
+  generations, policy-reload invalidation, atomic capture-rule updates,
+  original-destination recovery, allowed-port correlation, connector
+  restriction to pinned real addresses, and rejection of unrelated bare-IP
   connects.
+- Prove two names that resolve to the same real IP and port receive distinct
+  correlations and cannot inherit each other's endpoint policy.
 - Test standalone/sidecar capability negotiation and prove missing identity or
   processor support fails during policy validation rather than broadening an
   allow at runtime.
