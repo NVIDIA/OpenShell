@@ -71,6 +71,9 @@ pub(crate) fn prepare_child_sandbox(
 }
 
 const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
+    openshell_core::sandbox_env::OCI_IMAGE_USER,
+    openshell_core::sandbox_env::SANDBOX_UID,
+    openshell_core::sandbox_env::SANDBOX_GID,
     openshell_core::sandbox_env::SANDBOX_TOKEN,
     openshell_core::sandbox_env::SANDBOX_TOKEN_FILE,
     openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
@@ -855,15 +858,10 @@ impl Drop for ProcessHandle {
     }
 }
 
-/// Validate that the configured sandbox identity exists in this image.
+/// Validate the configured process user.
 ///
-/// When the identity is the literal `"sandbox"`, verifies the user exists
-/// in `/etc/passwd` (all sandbox images ship with one).
-///
-/// When the identity is a numeric UID, skips the passwd lookup entirely —
-/// the kernel will use the resolved UID regardless of whether an entry
-/// exists in `/etc/passwd`. Logs an OCSF event confirming numeric UID usage.
-/// Non-numeric, non-"sandbox" values are rejected.
+/// Numeric identities do not require a passwd entry. The legacy explicit
+/// `"sandbox"` identity and other names must resolve in `/etc/passwd`.
 #[cfg(unix)]
 pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
     let identity = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
@@ -883,7 +881,7 @@ pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
         return Ok(());
     }
 
-    // "sandbox" name — must exist in /etc/passwd.
+    // Legacy explicit "sandbox" name — must exist in /etc/passwd.
     if identity == "sandbox" {
         match User::from_name("sandbox") {
             Ok(Some(_)) => {
@@ -898,8 +896,7 @@ pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
             }
             Ok(None) => {
                 return Err(miette::miette!(
-                    "sandbox user 'sandbox' not found in image; \
-                     all sandbox images must include a 'sandbox' user and group"
+                    "explicit process user 'sandbox' was not found in the image"
                 ));
             }
             Err(e) => {
@@ -907,15 +904,11 @@ pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
             }
         }
     } else if !identity.is_empty() {
-        // Non-numeric, non-sandbox string — attempt passwd lookup.
-        // This catches cases where someone accidentally put "root" or similar.
+        // Other names are supported by local/offline policy paths and must
+        // resolve before privilege dropping.
         match User::from_name(identity) {
             Ok(Some(_)) => {
-                tracing::warn!(
-                    identity,
-                    "non-sandbox user accepted via passwd entry; \
-                     consider using a numeric UID for UID-injected images"
-                );
+                tracing::warn!(identity, "named process user accepted via passwd entry");
             }
             Ok(None) => {
                 return Err(miette::miette!(
@@ -936,9 +929,7 @@ pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
 
 /// Validate that the configured sandbox group identity is acceptable.
 ///
-/// Mirrors [`validate_sandbox_user`] for the group dimension: numeric GIDs
-/// must fall within the allowed sandbox range, the literal `"sandbox"` must
-/// resolve via `/etc/group`, and unrecognised strings are rejected.
+/// Mirrors [`validate_sandbox_user`] for the group dimension.
 #[cfg(unix)]
 pub fn validate_sandbox_group(policy: &SandboxPolicy) -> Result<()> {
     let identity = policy.process.run_as_group.as_deref().unwrap_or("sandbox");
@@ -971,8 +962,7 @@ pub fn validate_sandbox_group(policy: &SandboxPolicy) -> Result<()> {
             }
             Ok(None) => {
                 return Err(miette::miette!(
-                    "sandbox group 'sandbox' not found in image; \
-                     all sandbox images must include a 'sandbox' user and group"
+                    "explicit process group 'sandbox' was not found in the image"
                 ));
             }
             Err(e) => {
@@ -982,11 +972,7 @@ pub fn validate_sandbox_group(policy: &SandboxPolicy) -> Result<()> {
     } else if !identity.is_empty() {
         match Group::from_name(identity) {
             Ok(Some(_)) => {
-                tracing::warn!(
-                    identity,
-                    "non-sandbox group accepted via group entry; \
-                     consider using a numeric GID for GID-injected images"
-                );
+                tracing::warn!(identity, "named process group accepted via group entry");
             }
             Ok(None) => {
                 return Err(miette::miette!(
@@ -1338,8 +1324,7 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
 
     // If no user/group is configured and we are running as root, fall back to
     // "sandbox:sandbox" instead of silently keeping root.  This covers the
-    // local/dev-mode path where policies are loaded from disk and never pass
-    // through the server-side `ensure_sandbox_process_identity` normalization.
+    // local/dev-mode path for drivers that provide no identity metadata.
     // For non-root runtimes, the no-op is safe -- we are already unprivileged.
     if user_name.is_none() && group_name.is_none() {
         if nix::unistd::geteuid().is_root() {

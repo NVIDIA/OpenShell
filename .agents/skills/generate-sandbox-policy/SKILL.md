@@ -473,15 +473,17 @@ filesystem_policy:
 landlock:
   compatibility: best_effort
 
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-
 network_policies:
   # <generated policies go here>
 ```
 
-The `filesystem_policy`, `landlock`, and `process` sections above are sensible defaults. Tell the user these are defaults and may need adjustment for their environment. Gateway inference is configured separately through `openshell inference set/get`. The generated `network_policies` block is the primary output.
+The `filesystem_policy` and `landlock` sections above are sensible defaults.
+Process identity is omitted so the selected compute driver can choose it. For
+Docker and Podman, each omitted identity field falls back to the image's OCI
+`USER`. Tell the user these are defaults and may need adjustment for their
+environment. Gateway inference is configured separately through `openshell
+inference set/get`. The generated `network_policies` block is the primary
+output.
 
 If the user provides a file path, write to it. Otherwise, ask where to place it. A common convention is a project-local policy file (e.g., `sandbox-policy.yaml`) passed to `openshell sandbox create --policy <path>` or set via the `OPENSHELL_SANDBOX_POLICY` env var.
 

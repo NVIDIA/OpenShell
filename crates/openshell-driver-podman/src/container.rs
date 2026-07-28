@@ -397,6 +397,7 @@ fn build_env(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
     image: &str,
+    oci_user: &str,
 ) -> BTreeMap<String, String> {
     let spec = sandbox.spec.as_ref();
     let template = spec.and_then(|s| s.template.as_ref());
@@ -482,6 +483,18 @@ fn build_env(
 
     env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    env.insert(
+        openshell_core::sandbox_env::OCI_IMAGE_USER.into(),
+        oci_user.to_string(),
+    );
+    env.insert(
+        openshell_core::sandbox_env::SANDBOX_UID.into(),
+        String::new(),
+    );
+    env.insert(
+        openshell_core::sandbox_env::SANDBOX_GID.into(),
+        String::new(),
+    );
 
     // 4. Gateway-minted sandbox JWT. Keep the raw bearer out of container
     //    metadata; the supervisor reads it from a driver-owned bind mount.
@@ -876,6 +889,7 @@ pub fn try_build_container_spec_with_token(
     build_container_spec_with_token_and_gpu_devices(sandbox, config, token_secret_name, cdi_devices)
 }
 
+#[cfg(test)]
 pub fn build_container_spec_with_token_and_gpu_devices(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
@@ -883,10 +897,28 @@ pub fn build_container_spec_with_token_and_gpu_devices(
     gpu_device_ids: Option<&[String]>,
 ) -> Result<Value, ComputeDriverError> {
     let image = resolve_image(sandbox, config);
+    build_container_spec_for_image(
+        sandbox,
+        config,
+        token_secret_name,
+        gpu_device_ids,
+        image,
+        "",
+    )
+}
+
+pub fn build_container_spec_for_image(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    token_secret_name: Option<&str>,
+    gpu_device_ids: Option<&[String]>,
+    image_id: &str,
+    oci_user: &str,
+) -> Result<Value, ComputeDriverError> {
     let name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     let vol = volume_name(&sandbox.id);
 
-    let env = build_env(sandbox, config, image);
+    let env = build_env(sandbox, config, image_id, oci_user);
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox, config);
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
@@ -932,7 +964,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
 
     let container_spec = ContainerSpec {
         name,
-        image: image.to_string(),
+        image: image_id.to_string(),
         labels,
         env,
         volumes,
@@ -1030,7 +1062,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         // locks itself down.
         no_new_privileges: true,
         seccomp_profile_path: "unconfined".into(),
-        image_pull_policy: config.image_pull_policy.as_str().to_string(),
+        image_pull_policy: "never".to_string(),
         healthconfig: HealthConfig {
             test: vec![
                 "CMD-SHELL".into(),
@@ -1322,6 +1354,45 @@ mod tests {
         assert_eq!(
             container_name("default", "my-sandbox", "abc-123"),
             "openshell-default--my-sandbox-abc-123"
+        );
+    }
+
+    #[test]
+    fn container_spec_pins_inspected_image_and_protects_oci_identity() {
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        let spec = sandbox.spec.get_or_insert_default();
+        for (key, value) in [
+            (openshell_core::sandbox_env::OCI_IMAGE_USER, "spoofed"),
+            (openshell_core::sandbox_env::SANDBOX_UID, "9999"),
+            (openshell_core::sandbox_env::SANDBOX_GID, "9999"),
+        ] {
+            spec.environment.insert(key.to_string(), value.to_string());
+        }
+
+        let container = build_container_spec_for_image(
+            &sandbox,
+            &test_config(),
+            None,
+            None,
+            "sha256:immutable",
+            "app:staff",
+        )
+        .unwrap();
+
+        assert_eq!(container["image"].as_str(), Some("sha256:immutable"));
+        assert_eq!(container["user"].as_str(), Some("0:0"));
+        assert_eq!(container["image_pull_policy"].as_str(), Some("never"));
+        assert_eq!(
+            container["env"][openshell_core::sandbox_env::OCI_IMAGE_USER].as_str(),
+            Some("app:staff")
+        );
+        assert_eq!(
+            container["env"][openshell_core::sandbox_env::SANDBOX_UID].as_str(),
+            Some("")
+        );
+        assert_eq!(
+            container["env"][openshell_core::sandbox_env::SANDBOX_GID].as_str(),
+            Some("")
         );
     }
 

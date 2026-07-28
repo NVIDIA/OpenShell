@@ -227,6 +227,12 @@ struct DockerProvisioningFailure {
     message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DockerImageMetadata {
+    id: String,
+    user: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct DockerResourceLimits {
     nano_cpus: Option<i64>,
@@ -710,7 +716,8 @@ impl DockerComputeDriver {
             DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
         })?;
         let template = validated.template;
-        self.ensure_image_available(&sandbox.id, &template.image)
+        let image = self
+            .ensure_image_available(&sandbox.id, &template.image)
             .await
             .map_err(|status| {
                 DockerProvisioningFailure::new("ImagePullFailed", status.message())
@@ -735,11 +742,12 @@ impl DockerComputeDriver {
                 }
                 DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
             })?;
-        let create_body = build_container_create_body_with_gpu_devices(
+        let create_body = build_container_create_body_for_image(
             sandbox,
             &self.config,
             &validated.driver_config,
             gpu_devices.as_deref(),
+            &image,
         )
         .map_err(|status| {
             if token_file_created {
@@ -1280,41 +1288,71 @@ impl DockerComputeDriver {
         }))
     }
 
-    async fn ensure_image_available(&self, sandbox_id: &str, image: &str) -> Result<(), Status> {
+    async fn ensure_image_available(
+        &self,
+        sandbox_id: &str,
+        image: &str,
+    ) -> Result<DockerImageMetadata, Status> {
         let policy = self.config.image_pull_policy.trim().to_ascii_lowercase();
-        match policy.as_str() {
+        let inspect = match policy.as_str() {
             "" | "ifnotpresent" => {
-                if self.docker.inspect_image(image).await.is_ok() {
+                if let Ok(inspect) = self.docker.inspect_image(image).await {
                     self.publish_docker_progress(
                         sandbox_id,
                         "ImagePresent",
                         format!("Docker image \"{image}\" is already present"),
                         HashMap::from([("image_ref".to_string(), image.to_string())]),
                     );
-                    return Ok(());
+                    inspect
+                } else {
+                    self.pull_image(sandbox_id, image).await?;
+                    self.docker
+                        .inspect_image(image)
+                        .await
+                        .map_err(|err| internal_status("inspect Docker image after pull", err))?
                 }
-                self.pull_image(sandbox_id, image).await
             }
-            "always" => self.pull_image(sandbox_id, image).await,
+            "always" => {
+                self.pull_image(sandbox_id, image).await?;
+                self.docker
+                    .inspect_image(image)
+                    .await
+                    .map_err(|err| internal_status("inspect Docker image after pull", err))?
+            }
             "never" => match self.docker.inspect_image(image).await {
-                Ok(_) => {
+                Ok(inspect) => {
                     self.publish_docker_progress(
                         sandbox_id,
                         "ImagePresent",
                         format!("Docker image \"{image}\" is already present"),
                         HashMap::from([("image_ref".to_string(), image.to_string())]),
                     );
-                    Ok(())
+                    inspect
                 }
-                Err(err) if is_not_found_error(&err) => Err(Status::failed_precondition(format!(
-                    "docker image '{image}' is not present locally and image_pull_policy=Never"
-                ))),
-                Err(err) => Err(internal_status("inspect Docker image", err)),
+                Err(err) if is_not_found_error(&err) => {
+                    return Err(Status::failed_precondition(format!(
+                        "docker image '{image}' is not present locally and image_pull_policy=Never"
+                    )));
+                }
+                Err(err) => return Err(internal_status("inspect Docker image", err)),
             },
-            other => Err(Status::failed_precondition(format!(
-                "unsupported docker image_pull_policy '{other}'; expected Always, IfNotPresent, or Never",
-            ))),
-        }
+            other => {
+                return Err(Status::failed_precondition(format!(
+                    "unsupported docker image_pull_policy '{other}'; expected Always, IfNotPresent, or Never",
+                )));
+            }
+        };
+
+        let id = inspect.id.ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "docker image '{image}' inspection did not return an immutable image ID"
+            ))
+        })?;
+        let user = inspect
+            .config
+            .and_then(|config| config.user)
+            .unwrap_or_default();
+        Ok(DockerImageMetadata { id, user })
     }
 
     async fn pull_image(&self, sandbox_id: &str, image: &str) -> Result<(), Status> {
@@ -2132,7 +2170,16 @@ fn cleanup_sandbox_token_file_by_id(sandbox_id: &str, config: &DockerDriverRunti
     }
 }
 
+#[cfg(test)]
 fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) -> Vec<String> {
+    build_environment_for_oci_user(sandbox, config, "")
+}
+
+fn build_environment_for_oci_user(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    oci_user: &str,
+) -> Vec<String> {
     let mut environment = HashMap::from([
         ("HOME".to_string(), "/root".to_string()),
         ("PATH".to_string(), SUPERVISOR_PATH.to_string()),
@@ -2204,6 +2251,18 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
 
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    environment.insert(
+        openshell_core::sandbox_env::OCI_IMAGE_USER.to_string(),
+        oci_user.to_string(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::SANDBOX_UID.to_string(),
+        String::new(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::SANDBOX_GID.to_string(),
+        String::new(),
+    );
 
     // Gateway-minted sandbox JWT. Keep the raw bearer out of container
     // metadata; the supervisor reads it from this driver-owned bind mount.
@@ -2289,6 +2348,30 @@ fn build_container_create_body_with_gpu_devices(
     driver_config: &DockerSandboxDriverConfig,
     gpu_device_ids: Option<&[String]>,
 ) -> Result<ContainerCreateBody, Status> {
+    let template = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
+    build_container_create_body_for_image(
+        sandbox,
+        config,
+        driver_config,
+        gpu_device_ids,
+        &DockerImageMetadata {
+            id: template.image.clone(),
+            user: String::new(),
+        },
+    )
+}
+
+fn build_container_create_body_for_image(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+    driver_config: &DockerSandboxDriverConfig,
+    gpu_device_ids: Option<&[String]>,
+    image: &DockerImageMetadata,
+) -> Result<ContainerCreateBody, Status> {
     let spec = sandbox
         .spec
         .as_ref()
@@ -2328,9 +2411,9 @@ fn build_container_create_body_with_gpu_devices(
     );
 
     Ok(ContainerCreateBody {
-        image: Some(template.image.clone()),
+        image: Some(image.id.clone()),
         user: Some("0".to_string()),
-        env: Some(build_environment(sandbox, config)),
+        env: Some(build_environment_for_oci_user(sandbox, config, &image.user)),
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
         // Clear the image CMD so Docker does not append inherited args to the
         // supervisor entrypoint.

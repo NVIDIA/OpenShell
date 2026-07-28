@@ -162,6 +162,23 @@ pub struct ContainerConfig {
     pub labels: HashMap<String, String>,
 }
 
+/// Immutable image metadata needed to bind OCI identity inspection to launch.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImageInspect {
+    #[serde(alias = "ID")]
+    pub id: String,
+    #[serde(default)]
+    pub config: Option<ImageConfig>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImageConfig {
+    #[serde(default)]
+    pub user: String,
+}
+
 /// A container summary returned by the list API.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -675,6 +692,16 @@ impl PodmanClient {
         Ok(())
     }
 
+    /// Inspect a locally selected image for immutable ID and OCI config.
+    pub async fn inspect_image(&self, reference: &str) -> Result<ImageInspect, PodmanApiError> {
+        self.request_json(
+            hyper::Method::GET,
+            &format!("/libpod/images/{}/json", url_encode(reference)),
+            None,
+        )
+        .await
+    }
+
     // ── System operations ────────────────────────────────────────────────
 
     /// Ping the Podman API to verify connectivity.
@@ -900,6 +927,38 @@ mod tests {
                 .expect("request log lock should not be poisoned")
                 .as_slice(),
             ["GET /v5.0.0/libpod/volumes/work-bind/json"]
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn inspect_image_reads_immutable_id_and_oci_user() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "inspect-image",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                r#"{"Id":"sha256:immutable","Config":{"User":"app:staff"}}"#,
+            )],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let image = client
+            .inspect_image("example/image:latest")
+            .await
+            .expect("image inspect should parse");
+
+        assert_eq!(image.id, "sha256:immutable");
+        assert_eq!(
+            image.config.as_ref().map(|config| config.user.as_str()),
+            Some("app:staff")
+        );
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            ["GET /v5.0.0/libpod/images/example%2Fimage%3Alatest/json"]
         );
         let _ = std::fs::remove_file(socket_path);
     }
