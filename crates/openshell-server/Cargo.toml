@@ -120,6 +120,11 @@ openshell-driver-docker = { path = "../openshell-driver-docker", optional = true
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes", optional = true }
 openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
 
+# MXC is the Windows-only in-process compute backend (openshell-driver-mxc is a
+# no-op stub on other targets). It is only linked into the gateway on Windows.
+[target.'cfg(target_os = "windows")'.dependencies]
+openshell-driver-mxc = { path = "../openshell-driver-mxc" }
+
 [features]
 default = ["telemetry", "in-tree-compute-drivers"]
 ## Link the first-party compute drivers into the standard gateway binary.
