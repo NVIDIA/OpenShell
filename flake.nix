@@ -51,6 +51,8 @@
           test-guest-cache = testGuest.cacheApp;
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          test-guest-arm64-tcg = testGuestArm64Tcg.app;
+        };
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
