@@ -214,7 +214,7 @@ if [ -n "${CARGO_BUILD_JOBS:-}" ]; then
 fi
 
 cd "${ROOT}"
-target_dir="$(e2e_cargo_target_dir "${ROOT}")"
+target_dir="$(e2e_cargo_target_dir "${ROOT}" mise x -- cargo)"
 
 ensure_build_nofile_limit
 
@@ -281,11 +281,24 @@ mkdir -p "${run_parent}"
 run_dir="$(mktemp -d "${run_parent%/}/run.XXXXXX")"
 child_pid=
 runtime_log=
-portable_jwt_dir=
 keep=0
 if [ "${OPENSHELL_E2E_KEEP:-0}" = 1 ]; then
 	keep=1
 fi
+
+start_child() {
+	local working_dir=$1
+	local log_path=$2
+	shift 2
+
+	(
+		cd "${working_dir}"
+		exec python3 -c \
+			'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+			"$@"
+	) >"${log_path}" 2>&1 &
+	child_pid=$!
+}
 
 # Invoked by the EXIT trap through cleanup.
 # shellcheck disable=SC2329
@@ -324,13 +337,6 @@ cleanup() {
 	if [ "${keep}" -eq 1 ]; then
 		echo "Kept E2E runner state at ${run_dir}" >&2
 	else
-		if [ -n "${portable_jwt_dir}" ]; then
-			rm -f \
-				"${portable_jwt_dir}/signing.pem" \
-				"${portable_jwt_dir}/public.pem" \
-				"${portable_jwt_dir}/kid"
-			rmdir "${portable_jwt_dir}" 2>/dev/null || true
-		fi
 		rm -rf "${run_dir}"
 	fi
 	exit "${status}"
@@ -341,14 +347,12 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 jwt_source_dir="${run_dir}/gateway-jwt"
-e2e_generate_gateway_jwt "${jwt_source_dir}"
+host_runtime_dir=
 if [ "${mode}" = host ]; then
-	portable_jwt_dir="${ROOT}/.cache/openshell-e2e/gateway-jwt"
-	mkdir -p "${portable_jwt_dir}"
-	install -m 0600 "${jwt_source_dir}/signing.pem" "${portable_jwt_dir}/signing.pem"
-	install -m 0600 "${jwt_source_dir}/public.pem" "${portable_jwt_dir}/public.pem"
-	install -m 0600 "${jwt_source_dir}/kid" "${portable_jwt_dir}/kid"
+	host_runtime_dir="${run_dir}/host-runtime"
+	jwt_source_dir="${host_runtime_dir}/.cache/openshell-e2e/gateway-jwt"
 fi
+e2e_generate_gateway_jwt "${jwt_source_dir}"
 
 host_port="$(e2e_pick_port)"
 guest_port=
@@ -369,23 +373,20 @@ export OPENSHELL_BIN="${host_cli_bin}"
 
 if [ "${mode}" = host ]; then
 	e2e_align_docker_host_with_cli_context
-	staged_supervisor="${ROOT}/.cache/openshell-e2e/bin/openshell-sandbox"
+	staged_supervisor="${host_runtime_dir}/.cache/openshell-e2e/bin/openshell-sandbox"
 	mkdir -p "$(dirname "${staged_supervisor}")"
 	ln -sfn "${linux_sandbox_bin}" "${staged_supervisor}"
 
 	runtime_log="${run_dir}/gateway.log"
 	echo "==> Starting host gateway at ${gateway_endpoint}"
-	(
-		cd "${ROOT}"
-		exec python3 -c \
-			'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-			"${host_gateway_bin}" \
-			--config "${gateway_config}" \
-			--bind-address 127.0.0.1 \
-			--port "${host_port}" \
-			--disable-tls
-	) >"${runtime_log}" 2>&1 &
-	child_pid=$!
+	start_child \
+		"${host_runtime_dir}" \
+		"${runtime_log}" \
+		"${host_gateway_bin}" \
+		--config "${gateway_config}" \
+		--bind-address 127.0.0.1 \
+		--port "${host_port}" \
+		--disable-tls
 else
 	runtime_log="${run_dir}/vm.log"
 	guest_launcher="${run_dir}/launch-gateway.sh"
@@ -443,13 +444,7 @@ EOF
 	vm_args+=(-- "${guest_launcher_path}")
 
 	echo "==> Starting ${vm} test guest gateway at ${gateway_endpoint}"
-	(
-		cd "${ROOT}"
-		exec python3 -c \
-			'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-			"${vm_args[@]}"
-	) >"${runtime_log}" 2>&1 &
-	child_pid=$!
+	start_child "${ROOT}" "${runtime_log}" "${vm_args[@]}"
 fi
 
 probe_gateway() {

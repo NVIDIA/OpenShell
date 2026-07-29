@@ -7,6 +7,12 @@
 
 e2e_cargo_target_dir() {
   local root=$1
+  shift
+  local cargo_command=(cargo)
+
+  if [ "$#" -gt 0 ]; then
+    cargo_command=("$@")
+  fi
 
   if [ -n "${CARGO_TARGET_DIR:-}" ]; then
     case "${CARGO_TARGET_DIR}" in
@@ -16,7 +22,7 @@ e2e_cargo_target_dir() {
     return 0
   fi
 
-  cargo metadata --format-version=1 --no-deps \
+  "${cargo_command[@]}" metadata --format-version=1 --no-deps \
     | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
 }
 
