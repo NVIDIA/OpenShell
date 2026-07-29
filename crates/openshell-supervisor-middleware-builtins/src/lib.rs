@@ -289,8 +289,7 @@ mod tests {
             manifest.bindings[0].phase,
             SupervisorMiddlewarePhase::PreCredentials as i32
         );
-        assert_eq!(manifest.bindings[0].max_body_bytes, 256 * 1024);
-        assert_eq!(manifest.bindings[0].max_message_bytes, 0);
+        assert_eq!(manifest.bindings[0].max_payload_bytes, 256 * 1024);
         assert_eq!(
             manifest.bindings[1].operation,
             SupervisorMiddlewareOperation::WebsocketMessage as i32
@@ -299,8 +298,7 @@ mod tests {
             manifest.bindings[1].phase,
             SupervisorMiddlewarePhase::PreCredentials as i32
         );
-        assert_eq!(manifest.bindings[1].max_body_bytes, 0);
-        assert_eq!(manifest.bindings[1].max_message_bytes, 256 * 1024);
+        assert_eq!(manifest.bindings[1].max_payload_bytes, 256 * 1024);
     }
 
     #[test]

@@ -2515,10 +2515,9 @@ network_policies:
                 bindings: vec![MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_body_bytes: 0,
-                    timeout: "1s".into(),
-                    max_message_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES
+                    max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES
                         as u64,
+                    timeout: "1s".into(),
                 }],
             }))
         }

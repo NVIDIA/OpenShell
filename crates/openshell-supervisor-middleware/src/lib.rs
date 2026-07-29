@@ -275,8 +275,7 @@ pub struct DescribedChainEntry {
     entry: ChainEntry,
     service: Option<Arc<MiddlewareServiceState>>,
     binding: Option<MiddlewareBinding>,
-    max_body_bytes: usize,
-    max_message_bytes: usize,
+    max_payload_bytes: usize,
     timeout: Duration,
 }
 
@@ -286,12 +285,8 @@ struct DescribedChain {
 }
 
 impl DescribedChainEntry {
-    pub fn max_body_bytes(&self) -> usize {
-        self.max_body_bytes
-    }
-
-    pub fn max_message_bytes(&self) -> usize {
-        self.max_message_bytes
+    pub fn max_payload_bytes(&self) -> usize {
+        self.max_payload_bytes
     }
 
     pub fn on_error(&self) -> OnError {
@@ -305,7 +300,7 @@ impl DescribedChainEntry {
     /// True when this entry resolved to a registered binding and will be
     /// evaluated. When false, the binding is absent from the current registry
     /// and the entry is handled entirely by its `on_error` policy, so it
-    /// imposes no body-buffering limit on the chain.
+    /// imposes no payload-buffering limit on the chain.
     pub fn is_resolved(&self) -> bool {
         self.binding.is_some()
     }
@@ -627,30 +622,17 @@ fn middleware_denial_reason(config_name: &str, reason_code: Option<&str>) -> Str
     )
 }
 
-fn validate_body_limit(source: &str, binding: &MiddlewareBinding) -> Result<usize> {
-    if binding.max_body_bytes == 0 {
-        return Err(miette!("{source} must advertise a non-zero body limit"));
+fn validate_payload_limit(source: &str, binding: &MiddlewareBinding) -> Result<usize> {
+    if binding.max_payload_bytes == 0 {
+        return Err(miette!("{source} must advertise a non-zero payload limit"));
     }
-    if binding.max_body_bytes > MAX_MIDDLEWARE_BODY_BYTES as u64 {
+    if binding.max_payload_bytes > MAX_MIDDLEWARE_BODY_BYTES as u64 {
         return Err(miette!(
-            "{source} body limit exceeds the platform maximum of {MAX_MIDDLEWARE_BODY_BYTES}"
+            "{source} payload limit exceeds the platform maximum of {MAX_MIDDLEWARE_BODY_BYTES}"
         ));
     }
-    usize::try_from(binding.max_body_bytes)
-        .map_err(|_| miette!("{source} reports a body limit too large for this platform"))
-}
-
-fn validate_message_limit(source: &str, binding: &MiddlewareBinding) -> Result<usize> {
-    if binding.max_message_bytes == 0 {
-        return Err(miette!("{source} must advertise a non-zero message limit"));
-    }
-    if binding.max_message_bytes > MAX_MIDDLEWARE_BODY_BYTES as u64 {
-        return Err(miette!(
-            "{source} message limit exceeds the platform maximum of {MAX_MIDDLEWARE_BODY_BYTES}"
-        ));
-    }
-    usize::try_from(binding.max_message_bytes)
-        .map_err(|_| miette!("{source} reports a message limit too large for this platform"))
+    usize::try_from(binding.max_payload_bytes)
+        .map_err(|_| miette!("{source} reports a payload limit too large for this platform"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -695,30 +677,13 @@ fn validate_manifest_bindings(
 
     let mut described_pairs = HashSet::with_capacity(manifest.bindings.len());
     for binding in &manifest.bindings {
-        let kind = supported_binding(source, binding)?;
+        supported_binding(source, binding)?;
         if !described_pairs.insert((binding.operation, binding.phase)) {
             return Err(miette!(
                 "{source} describes a duplicate middleware operation/phase pair"
             ));
         }
-        let advertised = match kind {
-            SupportedBinding::HttpPreCredentials => {
-                if binding.max_message_bytes != 0 {
-                    return Err(miette!(
-                        "{source} HTTP_REQUEST binding must omit max_message_bytes"
-                    ));
-                }
-                validate_body_limit(source, binding)?
-            }
-            SupportedBinding::WebSocketPreCredentials => {
-                if binding.max_body_bytes != 0 {
-                    return Err(miette!(
-                        "{source} WEBSOCKET_MESSAGE binding must omit max_body_bytes"
-                    ));
-                }
-                validate_message_limit(source, binding)?
-            }
-        };
+        let advertised = validate_payload_limit(source, binding)?;
         if !binding.timeout.trim().is_empty() {
             parse_middleware_timeout(&binding.timeout)
                 .map_err(|reason| miette!("{source} has invalid timeout for binding: {reason}"))?;
@@ -1232,8 +1197,7 @@ impl ChainRunner {
                     entry,
                     service: None,
                     binding: None,
-                    max_body_bytes: 0,
-                    max_message_bytes: 0,
+                    max_payload_bytes: 0,
                     timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                 });
                 continue;
@@ -1245,25 +1209,13 @@ impl ChainRunner {
                 continue;
             };
             let timeout = state.timeout_for_binding(&binding)?;
-            let max_body_bytes = if operation == SupervisorMiddlewareOperation::HttpRequest {
-                let advertised = validate_body_limit("middleware manifest", &binding)?;
-                state.operator_max_payload_bytes.unwrap_or(advertised)
-            } else {
-                0
-            };
-            let max_message_bytes = if operation == SupervisorMiddlewareOperation::WebsocketMessage
-            {
-                let advertised = validate_message_limit("middleware manifest", &binding)?;
-                state.operator_max_payload_bytes.unwrap_or(advertised)
-            } else {
-                0
-            };
+            let advertised = validate_payload_limit("middleware manifest", &binding)?;
+            let max_payload_bytes = state.operator_max_payload_bytes.unwrap_or(advertised);
             described_entries.push(DescribedChainEntry {
                 entry,
                 service: Some(Arc::clone(state)),
                 binding: Some(binding),
-                max_body_bytes,
-                max_message_bytes,
+                max_payload_bytes,
                 timeout,
             });
         }
@@ -1402,7 +1354,7 @@ impl ChainRunner {
                     }
                 }
             };
-            if body.len() > entry.max_body_bytes {
+            if body.len() > entry.max_payload_bytes {
                 match apply_on_error(entry, "request_body_over_capacity", &mut applied) {
                     OnErrorAction::FailOpen => continue,
                     OnErrorAction::FailClosed(reason) => {
@@ -1576,7 +1528,7 @@ impl ChainRunner {
                 });
             }
 
-            if result.has_body && result.body.len() > entry.max_body_bytes {
+            if result.has_body && result.body.len() > entry.max_payload_bytes {
                 match apply_on_error(entry, "response_body_over_capacity", &mut applied) {
                     OnErrorAction::FailOpen => continue,
                     OnErrorAction::FailClosed(reason) => {
@@ -2053,9 +2005,8 @@ mod tests {
                 bindings: vec![MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_body_bytes: self.max_body_bytes,
+                    max_payload_bytes: self.max_body_bytes,
                     timeout: String::new(),
-                    max_message_bytes: 0,
                 }],
             }))
         }
@@ -2113,9 +2064,8 @@ mod tests {
                 bindings: vec![MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_body_bytes: 4096,
+                    max_payload_bytes: 4096,
                     timeout: self.binding_timeout.clone(),
-                    max_message_bytes: 0,
                 }],
             }))
         }
@@ -2177,9 +2127,8 @@ mod tests {
                 bindings: vec![MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_body_bytes: 256 * 1024,
+                    max_payload_bytes: 256 * 1024,
                     timeout: String::new(),
-                    max_message_bytes: 0,
                 }],
             }))
         }
@@ -2452,9 +2401,8 @@ mod tests {
                 bindings: vec![MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_body_bytes: 4096,
+                    max_payload_bytes: 4096,
                     timeout: String::new(),
-                    max_message_bytes: 0,
                 }],
             }))
         }
@@ -2522,9 +2470,8 @@ mod tests {
                 bindings: vec![MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_body_bytes: 4096,
+                    max_payload_bytes: 4096,
                     timeout: String::new(),
-                    max_message_bytes: 0,
                 }],
             }))
         }
@@ -2772,7 +2719,7 @@ mod tests {
         // The built-in resolves and reports its real limit; the missing binding
         // does not resolve and must not contribute a body limit.
         assert!(described[0].is_resolved());
-        assert_eq!(described[0].max_body_bytes(), 256 * 1024);
+        assert_eq!(described[0].max_payload_bytes(), 256 * 1024);
         assert!(!described[1].is_resolved());
     }
 
@@ -2795,7 +2742,7 @@ mod tests {
             .describe_chain(std::slice::from_ref(&entry))
             .await
             .expect("describe external middleware");
-        assert_eq!(described[0].max_body_bytes(), 4096);
+        assert_eq!(described[0].max_payload_bytes(), 4096);
         assert_eq!(
             described[0]
                 .binding
@@ -2834,8 +2781,8 @@ mod tests {
             .describe_chain(&entries)
             .await
             .expect("describe chain");
-        assert_eq!(described[0].max_body_bytes(), 256 * 1024);
-        assert_eq!(described[1].max_body_bytes(), 1024);
+        assert_eq!(described[0].max_payload_bytes(), 256 * 1024);
+        assert_eq!(described[1].max_payload_bytes(), 1024);
 
         let outcome = runner
             .evaluate_described(&described, input(r#"token="sk-ABCDEFGHIJKLMNOP""#))
@@ -2941,9 +2888,8 @@ mod tests {
             bindings: vec![MiddlewareBinding {
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
-                max_body_bytes: 4096,
+                max_payload_bytes: 4096,
                 timeout: String::new(),
-                max_message_bytes: 0,
             }],
         };
         let error = validate_external_manifest(&registration, &manifest, Some(4097))
@@ -2968,9 +2914,8 @@ mod tests {
             bindings: vec![MiddlewareBinding {
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
-                max_body_bytes: u64::MAX,
+                max_payload_bytes: u64::MAX,
                 timeout: String::new(),
-                max_message_bytes: 0,
             }],
         };
         let error = validate_external_manifest(&registration, &manifest, Some(4096))
@@ -2984,9 +2929,8 @@ mod tests {
         let binding = || MiddlewareBinding {
             operation: HTTP_REQUEST_OPERATION as i32,
             phase: PRE_CREDENTIALS_PHASE as i32,
-            max_body_bytes: 4096,
+            max_payload_bytes: 4096,
             timeout: String::new(),
-            max_message_bytes: 0,
         };
         let manifest = MiddlewareManifest {
             name: "example/service".into(),
@@ -3008,9 +2952,8 @@ mod tests {
         let binding = |phase| MiddlewareBinding {
             operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
             phase: phase as i32,
-            max_body_bytes: 0,
+            max_payload_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
             timeout: "500ms".into(),
-            max_message_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
         };
         let mut manifest = MiddlewareManifest {
             name: "example/websocket".into(),
@@ -3035,9 +2978,8 @@ mod tests {
             bindings: vec![MiddlewareBinding {
                 operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                max_body_bytes: 0,
+                max_payload_bytes: 4096,
                 timeout: String::new(),
-                max_message_bytes: 4096,
             }],
         };
 
@@ -3059,9 +3001,8 @@ mod tests {
             bindings: vec![MiddlewareBinding {
                 operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                max_body_bytes: 0,
+                max_payload_bytes: 4096,
                 timeout: String::new(),
-                max_message_bytes: 4096,
             }],
         };
 
@@ -3133,9 +3074,8 @@ mod tests {
                 bindings: vec![MiddlewareBinding {
                     operation: HTTP_REQUEST_OPERATION as i32,
                     phase: PRE_CREDENTIALS_PHASE as i32,
-                    max_body_bytes: 4096,
+                    max_payload_bytes: 4096,
                     timeout: timeout.into(),
-                    max_message_bytes: 0,
                 }],
             };
             let error = validate_external_manifest(&registration, &manifest, Some(4096))
@@ -4150,9 +4090,8 @@ mod tests {
                 bindings: vec![MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_body_bytes: 0,
+                    max_payload_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
                     timeout: "1s".into(),
-                    max_message_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
                 }],
             }))
         }
@@ -4713,7 +4652,7 @@ mod tests {
             .await
             .expect("describe WebSocket chain");
         assert_eq!(
-            described[0].max_message_bytes(),
+            described[0].max_payload_bytes(),
             1024,
             "operator max_payload_bytes must cap WebSocket messages"
         );

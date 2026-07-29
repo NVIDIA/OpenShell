@@ -2719,10 +2719,9 @@ network_policies:
                                 as i32,
                         phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
                             as i32,
-                        timeout: "2s".into(),
-                        max_message_bytes:
+                        max_payload_bytes:
                             openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES as u64,
-                        ..Default::default()
+                        timeout: "2s".into(),
                     }],
                 },
             ))
@@ -3914,9 +3913,8 @@ network_policies:
                             as i32,
                         phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
                             as i32,
-                        max_body_bytes: 8192,
+                        max_payload_bytes: 8192,
                         timeout: String::new(),
-                        max_message_bytes: 0,
                     }],
                 },
             ))
@@ -4418,9 +4416,8 @@ network_policies:
                 bindings: vec![MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_body_bytes: self.max_body_bytes,
+                    max_payload_bytes: self.max_body_bytes,
                     timeout: String::new(),
-                    max_message_bytes: 0,
                 }],
             }))
         }

@@ -544,7 +544,7 @@ impl WebSocketSession {
                 continue;
             }
             let original_size = current.len();
-            if original_size > stage.entry.max_message_bytes {
+            if original_size > stage.entry.max_payload_bytes {
                 let reason = "request_message_over_capacity";
                 let invocation =
                     failure_invocation(&stage.entry, Some(sequence), original_size, reason);
@@ -684,7 +684,7 @@ impl WebSocketSession {
             };
 
             let result =
-                match validate_message_result(result, sequence, stage.entry.max_message_bytes) {
+                match validate_message_result(result, sequence, stage.entry.max_payload_bytes) {
                     Ok(result) => result,
                     Err(reason) => {
                         if let Some(outcome) = handle_stage_failure(

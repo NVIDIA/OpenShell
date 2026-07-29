@@ -130,10 +130,10 @@ Middleware decisions are enforced regardless of the endpoint's `enforcement` mod
 
 ## Set Payload Limits
 
-Every middleware binding declares the largest request or replacement payload it supports.
+Every middleware binding declares the largest logical payload or replacement it supports through `max_payload_bytes`. For `HTTP_REQUEST`, that payload is one request body. For `WEBSOCKET_MESSAGE`, it is one complete message rather than the whole session.
 
 - Built-in middleware uses its OpenShell-defined limit.
-- Each operator-run registration sets one `max_payload_bytes` ceiling no higher than any advertised HTTP-body or WebSocket-message capability.
+- Each operator-run registration sets one `max_payload_bytes` ceiling no higher than any binding's advertised `max_payload_bytes` capability.
 - A selected chain buffers using its largest stage limit, so every stage that can process the body receives it.
 - The same per-stage limit applies to request bodies and replacement bodies.
 
@@ -141,7 +141,7 @@ The gateway rejects a registration whose operator limit exceeds the service capa
 
 At request time, exceeding a selected stage's limit is a middleware failure for that stage alone and follows that config's `on_error` behavior; other stages in the chain still run against their own limits. OpenShell can apply `fail_open` to an oversized `Content-Length` before consuming body bytes. A chunked body can cross the limit only after bytes have been consumed, so OpenShell denies that request because it cannot safely resume the original stream.
 
-WebSocket bindings advertise `max_message_bytes` for complete client text messages and replacements. The operator registration's shared `max_payload_bytes` is an additional ceiling on that capability. Exceeding a selected stage's effective text-message limit follows that stage's `on_error`. The 4 MiB parsed-text platform cap and other protocol-safety limits are independent of middleware failure policy. Binary messages are not delivered to middleware, so the operator ceiling does not become a binary relay limit; individual raw binary frames retain the 16 MiB relay-safety bound. Oversized parsed text closes the connection with code `1009`; invalid UTF-8 uses `1007`; protocol errors use `1002`; middleware or policy denials use `1008`; and policy reload uses `1012`.
+For a WebSocket binding, `max_payload_bytes` covers complete client text messages and replacements. Exceeding a selected stage's effective text-message limit follows that stage's `on_error`. The 4 MiB parsed-text platform cap and other protocol-safety limits are independent of middleware failure policy. Binary messages are not delivered to middleware, so the operator ceiling does not become a binary relay limit; individual raw binary frames retain the 16 MiB relay-safety bound. Oversized parsed text closes the connection with code `1009`; invalid UTF-8 uses `1007`; protocol errors use `1002`; middleware or policy denials use `1008`; and policy reload uses `1012`.
 
 ## Mutate Request Headers
 

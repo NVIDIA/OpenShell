@@ -393,7 +393,7 @@ pub(super) fn middleware_chain_body_limit(
     chain
         .iter()
         .filter(|entry| entry.is_resolved())
-        .map(openshell_supervisor_middleware::DescribedChainEntry::max_body_bytes)
+        .map(openshell_supervisor_middleware::DescribedChainEntry::max_payload_bytes)
         .max()
 }
 

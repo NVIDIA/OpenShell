@@ -45,7 +45,7 @@ async fn max_middleware_body_bytes() -> usize {
     }])
     .await
     .expect("describe built-in middleware");
-    chain[0].max_body_bytes()
+    chain[0].max_payload_bytes()
 }
 const RELAY_BUF_SIZE: usize = 8192;
 const HTTP_METHOD_PREFIXES: &[&[u8]] = &[

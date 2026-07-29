@@ -55,18 +55,16 @@ message MiddlewareBinding {
   // reserved for the return-path follow-up and is rejected by current
   // manifest validation.
   SupervisorMiddlewarePhase phase = 2;
-  // Maximum request or replacement HTTP body this binding can process.
-  // Required for HTTP_REQUEST and omitted for WEBSOCKET_MESSAGE.
-  uint64 max_body_bytes = 3;
+  // Maximum logical payload or replacement this binding can process. For
+  // HTTP_REQUEST this is the request body; for WEBSOCKET_MESSAGE this is one
+  // complete message. Required for every payload-bearing operation.
+  uint64 max_payload_bytes = 3;
   // Optional binding-specific RPC timeout. Empty uses the operator-configured
   // service timeout, or the 500ms platform default when that is also omitted.
   // A non-empty value may shorten but cannot extend the operator timeout.
   // Values use an integer with an `ms` or `s` suffix and must be between
   // 10ms and 30s.
   string timeout = 4;
-  // Maximum complete WebSocket message or replacement this binding can
-  // process. Required for WEBSOCKET_MESSAGE and omitted for HTTP_REQUEST.
-  uint64 max_message_bytes = 5;
 }
 
 // ValidateConfigRequest contains one policy configuration to validate.
