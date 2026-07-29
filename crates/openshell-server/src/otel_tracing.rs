@@ -21,8 +21,8 @@
 //! Only traces are exported. Logs and metrics have their own surfaces (OCSF
 //! JSONL and the Prometheus `/metrics` endpoint).
 
-pub use openshell_otel::SetupError;
 use openshell_otel::{OtlpTraceConfig, ServiceName};
+pub use openshell_otel::{SetupError, TraceContextInterceptor, mark_error};
 #[cfg(test)]
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -97,14 +97,6 @@ where
     openshell_otel::layer(provider, INSTRUMENTATION_SCOPE)
 }
 
-/// Mark `span` as failed.
-///
-/// The field must be declared on the span at creation — `tracing` drops
-/// records for fields a span does not have.
-pub fn mark_error(span: &tracing::Span) {
-    span.record("otel.status_code", "ERROR");
-}
-
 /// Isolated in-memory span exporters for tracing tests.
 #[cfg(test)]
 pub mod test_exporter {
@@ -159,6 +151,11 @@ pub mod test_exporter {
                 .collect()
         }
 
+        /// Returns the completed span named `name`.
+        pub fn span_named(&self, name: &str) -> opentelemetry_sdk::trace::SpanData {
+            self.find_span(name, |_| true)
+        }
+
         /// The span named `name` carrying `key` = `value`.
         pub fn span_with(
             &self,
@@ -166,14 +163,22 @@ pub mod test_exporter {
             key: &str,
             value: &str,
         ) -> opentelemetry_sdk::trace::SpanData {
+            self.find_span(name, |span| attribute(span, key).as_deref() == Some(value))
+        }
+
+        fn find_span(
+            &self,
+            name: &str,
+            predicate: impl Fn(&opentelemetry_sdk::trace::SpanData) -> bool,
+        ) -> opentelemetry_sdk::trace::SpanData {
             let spans = self.finished_spans();
             spans
                 .iter()
-                .find(|span| span.name == name && attribute(span, key).as_deref() == Some(value))
+                .find(|span| span.name == name && predicate(span))
                 .cloned()
                 .unwrap_or_else(|| {
                     panic!(
-                        "no span {name:?} with {key}={value:?}, got {:?}",
+                        "no matching span {name:?}, got {:?}",
                         spans.iter().map(|s| &s.name).collect::<Vec<_>>()
                     )
                 })

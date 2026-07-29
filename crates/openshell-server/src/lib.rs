@@ -849,7 +849,10 @@ async fn build_compute_runtime(
         }
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Vm) => {
             let vm_config = compute::driver_config::vm_config_from_context(driver_startup)?;
-            let endpoint = compute::vm::spawn(config, &vm_config).await?;
+            let otlp_config = driver_startup
+                .file
+                .and_then(|file| file.openshell.gateway.otlp.as_ref());
+            let endpoint = compute::vm::spawn(config, &vm_config, otlp_config).await?;
             ComputeRuntime::new_remote_driver(
                 endpoint,
                 store,

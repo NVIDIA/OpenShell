@@ -37,6 +37,7 @@ k8s-openapi = { workspace = true }
 # Async runtime
 tokio = { workspace = true }
 socket2 = { workspace = true }
+nix = { workspace = true }
 
 # gRPC
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }

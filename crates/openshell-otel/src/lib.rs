@@ -3,6 +3,12 @@
 
 //! Shared OpenTelemetry trace export support for `OpenShell` services.
 
+mod grpc;
+mod propagation;
+
+pub use grpc::RecordGrpcFailure;
+pub use propagation::{HeaderMapExtractor, MetadataMapInjector, TraceContextInterceptor};
+
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
@@ -15,6 +21,57 @@ use tracing_subscriber::Layer as _;
 use tracing_subscriber::registry::LookupSpan;
 
 const SDK_UNKNOWN_SERVICE_PREFIX: &str = "unknown_service";
+
+/// Mark `span` as failed.
+///
+/// The field must be declared on the span at creation because `tracing` drops
+/// records for fields a span does not have.
+pub fn mark_error(span: &tracing::Span) {
+    span.record("otel.status_code", "ERROR");
+}
+
+/// Marks the current span when an instrumented operation returns an error.
+pub fn record_error_result<T, E>(result: Result<T, E>) -> Result<T, E> {
+    if result.is_err() {
+        mark_error(&tracing::Span::current());
+    }
+    result
+}
+
+/// Marks an instrumented function's span when it exits before returning success.
+///
+/// Create the guard at the start of the instrumented function and return the
+/// successful result through [`Self::finish`]. An early `?` or error return
+/// drops the unfinished guard and marks the captured span as failed.
+#[must_use]
+pub struct ErrorStatusGuard {
+    span: tracing::Span,
+    finished: bool,
+}
+
+impl ErrorStatusGuard {
+    /// Captures the current instrumented span.
+    pub fn current() -> Self {
+        Self {
+            span: tracing::Span::current(),
+            finished: false,
+        }
+    }
+
+    /// Returns `result`, marking this guard complete when it is successful.
+    pub fn finish<T, E>(mut self, result: Result<T, E>) -> Result<T, E> {
+        self.finished = result.is_ok();
+        result
+    }
+}
+
+impl Drop for ErrorStatusGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            mark_error(&self.span);
+        }
+    }
+}
 
 /// How a process chooses its OpenTelemetry `service.name`.
 #[derive(Debug, Clone, Copy)]
@@ -151,6 +208,52 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_status_guard_marks_only_unfinished_results() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(layer(&provider, "guard-test"));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let failed =
+                tracing::info_span!("failed-operation", otel.status_code = tracing::field::Empty);
+            {
+                let _entered = failed.enter();
+                drop(ErrorStatusGuard::current());
+            }
+            drop(failed);
+
+            let succeeded = tracing::info_span!(
+                "successful-operation",
+                otel.status_code = tracing::field::Empty
+            );
+            {
+                let _entered = succeeded.enter();
+                ErrorStatusGuard::current().finish(Ok::<_, ()>(())).unwrap();
+            }
+            drop(succeeded);
+        });
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let failed = spans
+            .iter()
+            .find(|span| span.name == "failed-operation")
+            .unwrap();
+        assert!(matches!(
+            failed.status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
+        let succeeded = spans
+            .iter()
+            .find(|span| span.name == "successful-operation")
+            .unwrap();
+        assert_eq!(succeeded.status, opentelemetry::trace::Status::Unset);
+    }
 
     #[test]
     fn resource_uses_fixed_service_identity_and_custom_attributes() {

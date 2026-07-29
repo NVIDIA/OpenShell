@@ -72,6 +72,7 @@ struct FakeComputeDriverState {
     gateway_listener_requirements_supported: bool,
     sandboxes: HashMap<String, DriverSandbox>,
     calls: Vec<FakeComputeDriverCall>,
+    traceparents: Vec<String>,
 }
 
 impl Default for FakeComputeDriver {
@@ -92,6 +93,7 @@ impl FakeComputeDriver {
                 gateway_listener_requirements_supported: true,
                 sandboxes: HashMap::new(),
                 calls: Vec::new(),
+                traceparents: Vec::new(),
             })),
         }
     }
@@ -142,6 +144,11 @@ impl FakeComputeDriver {
         self.with_state(|state| state.calls.clone())
     }
 
+    #[must_use]
+    pub fn traceparents(&self) -> Vec<String> {
+        self.with_state(|state| state.traceparents.clone())
+    }
+
     pub fn clear_calls(&self) {
         self.with_state(|state| state.calls.clear());
     }
@@ -169,6 +176,14 @@ impl FakeComputeDriver {
             .lock()
             .expect("fake compute driver state poisoned");
         f(&mut state)
+    }
+
+    fn record_traceparent(&self, metadata: &tonic::metadata::MetadataMap) {
+        let traceparent = metadata
+            .get("traceparent")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        self.with_state(|state| state.traceparents.extend(traceparent));
     }
 }
 
@@ -211,8 +226,9 @@ impl ComputeDriver for FakeComputeDriver {
 
     async fn get_capabilities(
         &self,
-        _request: Request<GetCapabilitiesRequest>,
+        request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
+        self.record_traceparent(request.metadata());
         let response = self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::GetCapabilities);
             GetCapabilitiesResponse {
@@ -226,8 +242,9 @@ impl ComputeDriver for FakeComputeDriver {
 
     async fn get_gateway_listener_requirements(
         &self,
-        _request: Request<GetGatewayListenerRequirementsRequest>,
+        request: Request<GetGatewayListenerRequirementsRequest>,
     ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        self.record_traceparent(request.metadata());
         self.with_state(|state| {
             state
                 .calls
@@ -246,6 +263,7 @@ impl ComputeDriver for FakeComputeDriver {
         &self,
         request: Request<ValidateSandboxCreateRequest>,
     ) -> Result<Response<ValidateSandboxCreateResponse>, Status> {
+        self.record_traceparent(request.metadata());
         let sandbox = request.into_inner().sandbox;
         self.with_state(|state| {
             state
@@ -259,6 +277,7 @@ impl ComputeDriver for FakeComputeDriver {
         &self,
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
+        self.record_traceparent(request.metadata());
         let request = request.into_inner();
         let sandbox = self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::GetSandbox {
@@ -283,8 +302,9 @@ impl ComputeDriver for FakeComputeDriver {
 
     async fn list_sandboxes(
         &self,
-        _request: Request<ListSandboxesRequest>,
+        request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
+        self.record_traceparent(request.metadata());
         let sandboxes = self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::ListSandboxes);
             state.sandboxes.values().cloned().collect()
@@ -296,6 +316,7 @@ impl ComputeDriver for FakeComputeDriver {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
+        self.record_traceparent(request.metadata());
         let sandbox = request.into_inner().sandbox;
         self.with_state(|state| {
             if let Some(sandbox) = sandbox.as_ref() {
@@ -312,6 +333,7 @@ impl ComputeDriver for FakeComputeDriver {
         &self,
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
+        self.record_traceparent(request.metadata());
         let request = request.into_inner();
         self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::StopSandbox {
@@ -326,6 +348,7 @@ impl ComputeDriver for FakeComputeDriver {
         &self,
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
+        self.record_traceparent(request.metadata());
         let request = request.into_inner();
         let deleted = self.with_state(|state| {
             state.calls.push(FakeComputeDriverCall::DeleteSandbox {
@@ -351,8 +374,9 @@ impl ComputeDriver for FakeComputeDriver {
 
     async fn watch_sandboxes(
         &self,
-        _request: Request<WatchSandboxesRequest>,
+        request: Request<WatchSandboxesRequest>,
     ) -> Result<Response<Self::WatchSandboxesStream>, Status> {
+        self.record_traceparent(request.metadata());
         self.with_state(|state| state.calls.push(FakeComputeDriverCall::WatchSandboxes));
         Ok(Response::new(Box::pin(stream::empty())))
     }

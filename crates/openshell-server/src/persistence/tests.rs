@@ -2190,20 +2190,19 @@ async fn store_operations_export_spans_with_parents() {
     let store = test_store().await;
 
     let traced = test_exporter::install_traced();
+    let request_span = tracing::info_span!("request");
     async {
         store
             .list("sandbox", "default", 10, 0)
             .await
             .expect("list succeeds");
     }
-    .instrument(tracing::info_span!("request"))
+    .instrument(request_span.clone())
     .await;
+    drop(request_span);
 
+    let root = traced.span_named("request");
     let spans = traced.finished_spans();
-    let root = spans
-        .iter()
-        .find(|span| span.name == "request")
-        .expect("request span recorded");
     let child = spans
         .iter()
         .find(|span| {

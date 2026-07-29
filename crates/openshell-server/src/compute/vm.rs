@@ -32,6 +32,9 @@
 use super::AcquiredRemoteDriverEndpoint;
 #[cfg(unix)]
 use super::ManagedDriverProcess;
+use crate::config_file::OtlpConfig;
+#[cfg(unix)]
+use crate::otel_tracing::TraceContextInterceptor;
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
 #[cfg(unix)]
@@ -452,6 +455,7 @@ pub fn compute_driver_guest_tls_paths(
 pub async fn spawn(
     config: &Config,
     vm_config: &VmComputeConfig,
+    otlp_config: Option<&OtlpConfig>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     if vm_config.grpc_endpoint.trim().is_empty() {
         return Err(Error::config(
@@ -474,6 +478,7 @@ pub async fn spawn(
         .arg("--expected-peer-pid")
         .arg(std::process::id().to_string());
     command.arg("--log-level").arg(&config.log_level);
+    append_otlp_args(&mut command, otlp_config);
     command
         .arg("--openshell-endpoint")
         .arg(&vm_config.grpc_endpoint);
@@ -515,10 +520,18 @@ pub async fn spawn(
     ))
 }
 
+#[cfg(unix)]
+fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>) {
+    if let Some(config) = otlp_config {
+        command.arg("--otlp-endpoint").arg(&config.endpoint);
+    }
+}
+
 #[cfg(not(unix))]
 pub async fn spawn(
     _config: &Config,
     _vm_config: &VmComputeConfig,
+    _otlp_config: Option<&OtlpConfig>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     Err(Error::config(
         "the vm compute driver requires unix domain socket support",
@@ -526,6 +539,15 @@ pub async fn spawn(
 }
 
 #[cfg(unix)]
+#[tracing::instrument(
+    name = "driver.wait_for_ready",
+    skip_all,
+    fields(
+        otel.name = "driver.wait_for_ready",
+        otel.status_code = tracing::field::Empty,
+        driver.name = "vm",
+    )
+)]
 async fn wait_for_compute_driver(
     socket_path: &Path,
     child: &mut tokio::process::Child,
@@ -543,7 +565,8 @@ async fn wait_for_compute_driver(
 
         match connect_compute_driver(socket_path).await {
             Ok(channel) => {
-                let mut client = ComputeDriverClient::new(channel.clone());
+                let mut client =
+                    ComputeDriverClient::with_interceptor(channel.clone(), TraceContextInterceptor);
                 match client
                     .get_capabilities(tonic::Request::new(GetCapabilitiesRequest {}))
                     .await
@@ -586,14 +609,72 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        VmComputeConfig, compute_driver_guest_tls_paths, compute_driver_socket_path, current_euid,
-        prepare_compute_driver_socket_path, prepare_vm_state_dir, resolve_compute_driver_bin,
-        resolve_driver_search_dirs,
+        VmComputeConfig, append_otlp_args, compute_driver_guest_tls_paths,
+        compute_driver_socket_path, current_euid, prepare_compute_driver_socket_path,
+        prepare_vm_state_dir, resolve_compute_driver_bin, resolve_driver_search_dirs,
+        wait_for_compute_driver,
     };
+    use crate::config_file::OtlpConfig;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn vm_driver_command_includes_gateway_otlp_endpoint() {
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_otlp_args(
+            &mut command,
+            Some(&OtlpConfig {
+                endpoint: "http://collector.internal:4317".to_string(),
+                service_name: Some("custom-gateway".to_string()),
+            }),
+        );
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["--otlp-endpoint", "http://collector.internal:4317"]);
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_propagates_the_active_trace() {
+        use crate::otel_tracing::test_exporter;
+        use crate::test_support::FakeComputeDriver;
+
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("compute-driver.sock");
+        let driver = FakeComputeDriver::new();
+        let _server = driver.serve_uds(&socket_path).unwrap();
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("read _")
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let traced = test_exporter::install_traced();
+        wait_for_compute_driver(&socket_path, &mut child)
+            .await
+            .unwrap();
+
+        let readiness = traced.spans_named("driver.wait_for_ready");
+        assert_eq!(readiness.len(), 1, "one readiness operation should finish");
+        test_exporter::assert_is_root(&readiness[0]);
+        let trace_id = readiness[0].span_context.trace_id().to_string();
+        assert_eq!(
+            driver.traceparents().len(),
+            1,
+            "the readiness capability probe should carry trace context"
+        );
+        assert!(
+            driver.traceparents()[0].contains(&trace_id),
+            "the readiness probe should be part of the active trace"
+        );
+    }
 
     #[test]
     fn resolve_driver_bin_uses_driver_dir_when_binary_present() {

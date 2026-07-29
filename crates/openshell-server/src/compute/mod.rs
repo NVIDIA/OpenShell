@@ -13,6 +13,7 @@ pub use openshell_driver_podman::PodmanComputeConfig;
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
+use crate::otel_tracing::TraceContextInterceptor;
 use crate::persistence::{
     DRAFT_CHUNK_OBJECT_TYPE, ObjectId, ObjectName, ObjectRecord, ObjectType, POLICY_OBJECT_TYPE,
     Store, WriteCondition,
@@ -322,6 +323,45 @@ impl ManagedDriverProcess {
             socket_path,
         }
     }
+
+    #[cfg(unix)]
+    async fn shutdown(&self) -> Result<(), String> {
+        use nix::errno::Errno;
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+
+        let child = self
+            .child
+            .lock()
+            .map_err(|_| "managed compute-driver process lock poisoned".to_string())?
+            .take();
+        let Some(mut child) = child else {
+            return Ok(());
+        };
+
+        if let Some(pid) = child.id()
+            && let Err(err) = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM)
+            && err != Errno::ESRCH
+        {
+            return Err(format!("failed to terminate managed compute driver: {err}"));
+        }
+
+        match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(format!("failed to wait for managed compute driver: {err}")),
+            Err(_) => {
+                child
+                    .kill()
+                    .await
+                    .map_err(|err| format!("failed to kill managed compute driver: {err}"))?;
+                child
+                    .wait()
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| format!("failed to reap managed compute driver: {err}"))
+            }
+        }
+    }
 }
 
 impl Drop for ManagedDriverProcess {
@@ -331,6 +371,39 @@ impl Drop for ManagedDriverProcess {
         }
         let _ = std::fs::remove_file(&self.socket_path);
     }
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn managed_driver_shutdown_sends_sigterm_before_forcing_exit() {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let terminated = dir.path().join("terminated");
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg("trap 'printf terminated > \"$1\"; exit 0' TERM; printf ready; while :; do :; done")
+        .arg("managed-driver-test")
+        .arg(&terminated)
+        .stdout(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().unwrap();
+    let mut ready = [0_u8; 5];
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_exact(&mut ready)
+        .await
+        .unwrap();
+    assert_eq!(&ready, b"ready");
+
+    let process = ManagedDriverProcess::new(child, dir.path().join("driver.sock"));
+    process.shutdown().await.unwrap();
+
+    assert_eq!(std::fs::read_to_string(terminated).unwrap(), "terminated");
 }
 
 #[derive(Debug)]
@@ -364,16 +437,22 @@ impl AcquiredRemoteDriverEndpoint {
 
 #[derive(Debug, Clone)]
 struct RemoteComputeDriver {
-    channel: Channel,
+    client: RemoteComputeDriverClient,
 }
+
+type RemoteComputeDriverClient = ComputeDriverClient<
+    tonic::service::interceptor::InterceptedService<Channel, TraceContextInterceptor>,
+>;
 
 impl RemoteComputeDriver {
     fn new(channel: Channel) -> Self {
-        Self { channel }
+        Self {
+            client: ComputeDriverClient::with_interceptor(channel, TraceContextInterceptor),
+        }
     }
 
-    fn client(&self) -> ComputeDriverClient<Channel> {
-        ComputeDriverClient::new(self.channel.clone())
+    fn client(&self) -> RemoteComputeDriverClient {
+        self.client.clone()
     }
 }
 
@@ -471,7 +550,7 @@ pub struct ComputeRuntime {
     driver_info: ComputeDriverInfoSnapshot,
     shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
     startup_resume: Option<Arc<dyn StartupResume>>,
-    _driver_process: Option<Arc<ManagedDriverProcess>>,
+    driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
@@ -592,7 +671,7 @@ impl ComputeRuntime {
             driver_info,
             shutdown_cleanup,
             startup_resume,
-            _driver_process: driver_process,
+            driver_process,
             default_image,
             store,
             sandbox_index,
@@ -1474,10 +1553,20 @@ impl ComputeRuntime {
     }
 
     pub async fn cleanup_on_shutdown(&self) -> Result<(), String> {
-        let Some(cleanup) = &self.shutdown_cleanup else {
-            return Ok(());
+        let cleanup_result = match &self.shutdown_cleanup {
+            Some(cleanup) => cleanup.cleanup_on_shutdown().await,
+            None => Ok(()),
         };
-        cleanup.cleanup_on_shutdown().await
+        #[cfg(unix)]
+        let process_result = match &self.driver_process {
+            Some(process) => process.shutdown().await,
+            None => Ok(()),
+        };
+
+        cleanup_result?;
+        #[cfg(unix)]
+        process_result?;
+        Ok(())
     }
 
     /// Resume sandboxes whose store records say they should be running.
@@ -3120,7 +3209,7 @@ pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -
         },
         shutdown_cleanup: None,
         startup_resume: None,
-        _driver_process: None,
+        driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
         store,
         sandbox_index: SandboxIndex::new(),
@@ -3607,7 +3696,7 @@ mod tests {
             },
             shutdown_cleanup: None,
             startup_resume,
-            _driver_process: None,
+            driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
             store,
             sandbox_index: SandboxIndex::new(),
@@ -6665,6 +6754,143 @@ mod tests {
 
         let initialization = traced.span_with("driver.initialize", "driver.name", "test-driver");
         test_exporter::assert_is_root(&initialization);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn remote_compute_driver_interceptor_propagates_every_rpc() {
+        use crate::otel_tracing::test_exporter;
+        use crate::test_support::FakeComputeDriver;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("compute-driver.sock");
+        let driver = FakeComputeDriver::new();
+        let _server = driver.serve_uds(&socket_path).unwrap();
+        let endpoint = connect_remote_compute_driver("external-test", &socket_path)
+            .await
+            .unwrap();
+        let remote = RemoteComputeDriver::new(endpoint.channel);
+        let sandbox = DriverSandbox {
+            id: "sb-trace".to_string(),
+            name: "trace-sandbox".to_string(),
+            ..Default::default()
+        };
+
+        let traced = test_exporter::install_traced();
+        async {
+            remote
+                .get_capabilities(Request::new(GetCapabilitiesRequest {}))
+                .await
+                .unwrap();
+            remote
+                .get_gateway_listener_requirements(Request::new(
+                    GetGatewayListenerRequirementsRequest {},
+                ))
+                .await
+                .unwrap();
+            remote
+                .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
+                    sandbox: Some(sandbox.clone()),
+                }))
+                .await
+                .unwrap();
+            remote
+                .create_sandbox(Request::new(CreateSandboxRequest {
+                    sandbox: Some(sandbox.clone()),
+                }))
+                .await
+                .unwrap();
+            remote
+                .get_sandbox(Request::new(GetSandboxRequest {
+                    sandbox_id: sandbox.id.clone(),
+                    sandbox_name: String::new(),
+                }))
+                .await
+                .unwrap();
+            remote
+                .list_sandboxes(Request::new(ListSandboxesRequest {}))
+                .await
+                .unwrap();
+            remote
+                .stop_sandbox(Request::new(StopSandboxRequest {
+                    sandbox_id: sandbox.id.clone(),
+                    sandbox_name: String::new(),
+                }))
+                .await
+                .unwrap();
+            remote
+                .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
+                .await
+                .unwrap();
+            remote
+                .delete_sandbox(Request::new(DeleteSandboxRequest {
+                    sandbox_id: sandbox.id,
+                    sandbox_name: String::new(),
+                }))
+                .await
+                .unwrap();
+        }
+        .instrument(tracing::info_span!("request"))
+        .await;
+
+        let request_spans = traced.spans_named("request");
+        assert_eq!(request_spans.len(), 1, "one request span should finish");
+        let trace_id = request_spans[0].span_context.trace_id().to_string();
+        let traceparents = driver.traceparents();
+        assert_eq!(
+            traceparents.len(),
+            9,
+            "the client interceptor should cover every RPC"
+        );
+        assert!(
+            traceparents
+                .iter()
+                .all(|traceparent| traceparent.contains(&trace_id)),
+            "every RPC should carry the active trace ID; got {traceparents:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn remote_compute_driver_initialization_parents_its_probes() {
+        use crate::otel_tracing::test_exporter;
+        use crate::test_support::FakeComputeDriver;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("compute-driver.sock");
+        let driver = FakeComputeDriver::new();
+        let _server = driver.serve_uds(&socket_path).unwrap();
+        let endpoint = connect_remote_compute_driver("external-test", &socket_path)
+            .await
+            .unwrap();
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+
+        let traced = test_exporter::install_traced();
+        ComputeRuntime::new_remote_driver(
+            endpoint,
+            store,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap();
+
+        let initialization = traced.span_with("driver.initialize", "driver.name", "external-test");
+        let trace_id = initialization.span_context.trace_id().to_string();
+        let traceparents = driver.traceparents();
+        assert_eq!(
+            traceparents.len(),
+            2,
+            "the capability and listener-requirements probes should carry initialization trace context"
+        );
+        assert!(
+            traceparents
+                .iter()
+                .all(|traceparent| traceparent.contains(&trace_id)),
+            "both initialization probes should be part of the initialization trace"
+        );
     }
 
     #[tokio::test]
