@@ -123,6 +123,7 @@ pub struct SecretResolver {
     by_placeholder: HashMap<String, SecretValue>,
     denied_env_keys: std::collections::HashSet<String>,
     no_revision_fallback_env_keys: std::collections::HashSet<String>,
+    revision_fallback_min_revisions: HashMap<String, u64>,
 }
 
 #[derive(Clone)]
@@ -245,6 +246,7 @@ impl SecretResolver {
                     by_placeholder,
                     denied_env_keys: std::collections::HashSet::new(),
                     no_revision_fallback_env_keys: std::collections::HashSet::new(),
+                    revision_fallback_min_revisions: HashMap::new(),
                 }),
             )
         }
@@ -254,11 +256,14 @@ impl SecretResolver {
         let mut by_placeholder = HashMap::new();
         let mut denied_env_keys = std::collections::HashSet::new();
         let mut no_revision_fallback_env_keys = std::collections::HashSet::new();
+        let mut revision_fallback_min_revisions = HashMap::new();
         for resolver in resolvers {
             by_placeholder.extend(resolver.by_placeholder.clone());
             denied_env_keys.extend(resolver.denied_env_keys.iter().cloned());
             no_revision_fallback_env_keys
                 .extend(resolver.no_revision_fallback_env_keys.iter().cloned());
+            revision_fallback_min_revisions
+                .extend(resolver.revision_fallback_min_revisions.clone());
         }
         if by_placeholder.is_empty() {
             None
@@ -267,6 +272,7 @@ impl SecretResolver {
                 by_placeholder,
                 denied_env_keys,
                 no_revision_fallback_env_keys,
+                revision_fallback_min_revisions,
             })
         }
     }
@@ -281,6 +287,7 @@ impl SecretResolver {
         &self,
         bound_keys: &std::collections::HashSet<String>,
         allowed_bound_keys: &std::collections::HashSet<String>,
+        revision_fallback_min_revisions: HashMap<String, u64>,
     ) -> Self {
         let denied_env_keys = bound_keys
             .difference(allowed_bound_keys)
@@ -298,6 +305,7 @@ impl SecretResolver {
             by_placeholder,
             denied_env_keys,
             no_revision_fallback_env_keys: bound_keys.clone(),
+            revision_fallback_min_revisions,
         }
     }
 
@@ -331,8 +339,12 @@ impl SecretResolver {
             // to one provider identity, so falling back by key after replacement
             // would let the old process obtain the replacement provider's secret.
             let key = revisioned_placeholder_env_key(value).or_else(|| alias_env_key(value))?;
-            if revisioned_placeholder_env_key(value).is_some()
+            if let Some((revision, key)) = revisioned_placeholder_parts(value)
                 && self.no_revision_fallback_env_keys.contains(key)
+                && self
+                    .revision_fallback_min_revisions
+                    .get(key)
+                    .is_none_or(|minimum| revision < *minimum)
             {
                 return None;
             }
@@ -615,9 +627,13 @@ fn alias_env_key(token: &str) -> Option<&str> {
 }
 
 fn revisioned_placeholder_env_key(token: &str) -> Option<&str> {
+    revisioned_placeholder_parts(token).map(|(_, key)| key)
+}
+
+fn revisioned_placeholder_parts(token: &str) -> Option<(u64, &str)> {
     let suffix = token.strip_prefix(PLACEHOLDER_PREFIX)?;
-    let (_, key) = split_revisioned_env_key(suffix)?;
-    Some(key)
+    let (revision, key) = split_revisioned_env_key(suffix)?;
+    Some((revision.parse().ok()?, key))
 }
 
 fn placeholder_env_key(token: &str) -> Option<&str> {

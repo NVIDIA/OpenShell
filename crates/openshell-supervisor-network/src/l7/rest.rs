@@ -240,6 +240,11 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
     if version != "HTTP/1.1" && version != "HTTP/1.0" {
         return Err(miette!("Unsupported HTTP version: {version}"));
     }
+    let host_authority = request_host_authority_from_str(header_str)?;
+    if version == "HTTP/1.1" && host_authority.is_none() {
+        return Err(miette!("HTTP/1.1 request is missing a Host header"));
+    }
+    validate_absolute_form_authority(&target, host_authority.as_ref())?;
 
     // Determine body framing from headers
     let body_length = parse_body_length(header_str)?;
@@ -383,6 +388,79 @@ pub(crate) fn validate_http_request_header_block(headers: &[u8]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+pub(crate) fn request_host_authority(raw_header: &[u8]) -> Result<Option<http::uri::Authority>> {
+    let header_end = raw_header
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| miette!("HTTP request headers are missing the CRLF terminator"))?
+        + 4;
+    let headers = std::str::from_utf8(&raw_header[..header_end])
+        .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    request_host_authority_from_str(headers)
+}
+
+fn request_host_authority_from_str(headers: &str) -> Result<Option<http::uri::Authority>> {
+    let mut authorities = headers.lines().skip(1).filter_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("host").then_some(value.trim())
+    });
+    let Some(authority) = authorities.next() else {
+        return Ok(None);
+    };
+    if authorities.next().is_some() {
+        return Err(miette!("HTTP request contains multiple Host headers"));
+    }
+    authority
+        .parse()
+        .map(Some)
+        .map_err(|_| miette!("HTTP request Host header contains an invalid authority"))
+}
+
+fn validate_absolute_form_authority(
+    target: &str,
+    host_authority: Option<&http::uri::Authority>,
+) -> Result<()> {
+    if !target.contains("://") {
+        return Ok(());
+    }
+    let uri = target
+        .parse::<http::Uri>()
+        .map_err(|_| miette!("HTTP absolute-form request target contains an invalid URI"))?;
+    let request_authority = uri
+        .authority()
+        .ok_or_else(|| miette!("HTTP absolute-form request target is missing an authority"))?;
+    let host_authority = host_authority
+        .ok_or_else(|| miette!("HTTP absolute-form request is missing a Host header"))?;
+    if !authorities_match(request_authority, host_authority, uri.scheme_str()) {
+        return Err(miette!(
+            "HTTP absolute-form request authority does not match the Host header"
+        ));
+    }
+    Ok(())
+}
+
+fn authorities_match(
+    left: &http::uri::Authority,
+    right: &http::uri::Authority,
+    scheme: Option<&str>,
+) -> bool {
+    if !normalized_authority_host(left.host())
+        .eq_ignore_ascii_case(normalized_authority_host(right.host()))
+    {
+        return false;
+    }
+    let default_port = match scheme {
+        Some(scheme) if scheme.eq_ignore_ascii_case("http") => Some(80),
+        Some(scheme) if scheme.eq_ignore_ascii_case("https") => Some(443),
+        _ => None,
+    };
+    left.port_u16().or(default_port) == right.port_u16().or(default_port)
+}
+
+fn normalized_authority_host(host: &str) -> &str {
+    host.trim_end_matches('.')
 }
 
 fn validate_http_request_line(request_line: &str) -> Result<()> {
@@ -4715,6 +4793,29 @@ mod tests {
         assert_eq!(
             req.raw_header, b"GET /secret HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
             "outbound request line must carry the canonical path"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_rejects_absolute_authority_mismatched_with_host() {
+        let (mut client, mut peer) = tokio::io::duplex(1024);
+        peer.write_all(
+            b"GET http://attacker.example.test/v1 HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let error = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .expect_err("absolute-form authority mismatch must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("request authority does not match the Host header"),
+            "{error}"
         );
     }
 

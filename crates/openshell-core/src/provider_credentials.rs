@@ -30,6 +30,13 @@ struct ProviderCredentialStateInner {
     suppressed_keys: HashSet<String>,
     static_credential_bindings: HashMap<String, StaticCredentialBinding>,
     known_static_credential_keys: HashSet<String>,
+    static_credential_identity_epochs: HashMap<String, StaticCredentialIdentityEpoch>,
+}
+
+#[derive(Debug)]
+struct StaticCredentialIdentityEpoch {
+    identity: String,
+    first_revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +88,7 @@ impl ProviderCredentialState {
                 suppressed_keys: HashSet::new(),
                 static_credential_bindings: HashMap::new(),
                 known_static_credential_keys: HashSet::new(),
+                static_credential_identity_epochs: HashMap::new(),
             })),
         }
     }
@@ -108,6 +116,11 @@ impl ProviderCredentialState {
             inner
                 .known_static_credential_keys
                 .extend(static_credential_bindings.keys().cloned());
+            update_static_credential_identity_epochs(
+                &mut inner.static_credential_identity_epochs,
+                revision,
+                &static_credential_bindings,
+            );
             inner.static_credential_bindings = static_credential_bindings;
         }
         Ok(state)
@@ -137,6 +150,7 @@ impl ProviderCredentialState {
                 suppressed_keys: HashSet::new(),
                 static_credential_bindings: HashMap::new(),
                 known_static_credential_keys: HashSet::new(),
+                static_credential_identity_epochs: HashMap::new(),
             })),
         }
     }
@@ -171,6 +185,7 @@ impl ProviderCredentialState {
         inner.combined_resolver = None;
         inner.static_credential_bindings.clear();
         inner.known_static_credential_keys.clear();
+        inner.static_credential_identity_epochs.clear();
         inner.current.child_env.len()
     }
 
@@ -205,7 +220,7 @@ impl ProviderCredentialState {
             .read()
             .expect("provider credential state poisoned");
         let request_path = path.split_once('?').map_or(path, |(path, _)| path);
-        let allowed = inner
+        let allowed: HashSet<String> = inner
             .static_credential_bindings
             .iter()
             .filter(|(_, binding)| {
@@ -216,7 +231,23 @@ impl ProviderCredentialState {
             .map(|(key, _)| key.clone())
             .collect();
         inner.combined_resolver.as_ref().map(|resolver| {
-            Arc::new(resolver.scoped_to_env_keys(&inner.known_static_credential_keys, &allowed))
+            let revision_fallback_min_revisions = inner
+                .static_credential_identity_epochs
+                .iter()
+                .filter(|(key, epoch)| {
+                    allowed.contains(*key)
+                        && inner
+                            .static_credential_bindings
+                            .get(*key)
+                            .is_some_and(|binding| binding.credential_identity == epoch.identity)
+                })
+                .map(|(key, epoch)| (key.clone(), epoch.first_revision))
+                .collect();
+            Arc::new(resolver.scoped_to_env_keys(
+                &inner.known_static_credential_keys,
+                &allowed,
+                revision_fallback_min_revisions,
+            ))
         })
     }
 
@@ -442,6 +473,11 @@ impl ProviderCredentialState {
         inner
             .known_static_credential_keys
             .extend(static_credential_bindings.keys().cloned());
+        update_static_credential_identity_epochs(
+            &mut inner.static_credential_identity_epochs,
+            revision,
+            &static_credential_bindings,
+        );
         inner.static_credential_bindings = static_credential_bindings;
         Ok(inner.current.child_env.len())
     }
@@ -474,6 +510,7 @@ impl ProviderCredentialState {
         inner.current_resolver = None;
         inner.combined_resolver = None;
         inner.static_credential_bindings.clear();
+        inner.static_credential_identity_epochs.clear();
     }
 }
 
@@ -543,6 +580,32 @@ fn static_credential_identities(
         .iter()
         .map(|(key, binding)| (key.as_str(), binding.credential_identity.as_str()))
         .collect()
+}
+
+fn update_static_credential_identity_epochs(
+    epochs: &mut HashMap<String, StaticCredentialIdentityEpoch>,
+    revision: u64,
+    bindings: &HashMap<String, StaticCredentialBinding>,
+) {
+    epochs.retain(|key, _| bindings.contains_key(key));
+    for (key, binding) in bindings {
+        match epochs.get_mut(key) {
+            Some(epoch) if epoch.identity == binding.credential_identity => {}
+            Some(epoch) => {
+                epoch.identity.clone_from(&binding.credential_identity);
+                epoch.first_revision = revision;
+            }
+            None => {
+                epochs.insert(
+                    key.clone(),
+                    StaticCredentialIdentityEpoch {
+                        identity: binding.credential_identity.clone(),
+                        first_revision: revision,
+                    },
+                );
+            }
+        }
+    }
 }
 
 fn binding_error(message: &str) -> StaticCredentialBindingError {
@@ -719,6 +782,47 @@ mod tests {
         assert_eq!(
             resolver.resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
             Some("new")
+        );
+    }
+
+    #[test]
+    fn aged_generation_falls_back_after_many_rotations_of_same_provider_credential() {
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("API_KEY".to_string(), "secret-1".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "API_KEY".to_string(),
+                binding("api.example.com", 443, "/**"),
+            )]),
+            Vec::new(),
+        )
+        .expect("initial bindings");
+
+        for revision in 2..=10 {
+            state
+                .install_bound_environment(
+                    revision,
+                    HashMap::from([("API_KEY".to_string(), format!("secret-{revision}"))]),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::from([(
+                        "API_KEY".to_string(),
+                        binding("api.example.com", 443, "/**"),
+                    )]),
+                    Vec::new(),
+                )
+                .expect("rotated bindings");
+        }
+
+        let resolver = state
+            .resolver_for_endpoint("api.example.com", 443, "/v1")
+            .expect("resolver");
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            Some("secret-10"),
+            "an aged-out placeholder may use the current secret while its provider identity is unchanged"
         );
     }
 
