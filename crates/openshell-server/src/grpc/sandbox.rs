@@ -2233,7 +2233,9 @@ async fn run_exec_with_russh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grpc::test_support::{authed_request, test_server_state, test_server_state_with_driver};
+    use crate::grpc::test_support::{
+        authed_request, test_server_state, test_server_state_with_driver,
+    };
     use openshell_core::proto::datamodel::v1::ObjectMeta;
 
     // ---- shell_escape ----
