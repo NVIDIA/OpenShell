@@ -34,9 +34,11 @@ allocation. When `warm_pooling.enabled` is true, the driver watches and caches
 `openshell.ai/enabled=true`, resolves each pool's referenced
 `SandboxTemplate`, and computes an in-memory fingerprint of the template spec.
 
-On create, the driver renders the Kubernetes spec that direct `Sandbox`
-creation would use, strips per-sandbox identity values from the fingerprint,
-and matches it against the warm-pool cache for the target Kubernetes namespace.
+On create, the driver maps the OpenShell workspace to its target Kubernetes
+namespace, renders the spec that direct `Sandbox` creation would use, strips
+per-sandbox identity values from the fingerprint, and matches it against the
+warm-pool cache for that namespace. The current shared-namespace mapping sends
+every workspace to the configured Kubernetes namespace.
 If exactly one pool matches, the driver creates a v1beta1 `SandboxClaim` with
 `spec.warmPoolRef.name` set to that pool. If no pool matches, multiple pools
 match, RBAC prevents cache maintenance, or the v1beta1 extension APIs are
@@ -51,7 +53,8 @@ ConfigMaps when `warm_pooling.profiles.enabled` is true. Profiles live in the
 configured profile namespace, use the `warm-pool.toml` data key, and expose a
 narrow CLI-shaped schema: `workspace`, `replicas`, `image`,
 `runtime_class_name`, `[environment]`, and `[resources]` with `cpu`, `memory`,
-and `gpu_count`. The reconciler generates ordinary `SandboxTemplate` and
+and `gpu_count`. The reconciler uses the same workspace-to-namespace mapping as
+sandbox creation and generates ordinary `SandboxTemplate` and
 `SandboxWarmPool` resources labelled `openshell.ai/enabled=true`; the existing
 matching cache then handles allocation unchanged.
 

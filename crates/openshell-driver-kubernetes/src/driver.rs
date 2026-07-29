@@ -225,6 +225,17 @@ struct WarmPoolCacheState {
     entries: BTreeMap<(String, String), WarmPoolCacheEntry>,
 }
 
+/// Map an `OpenShell` workspace to the Kubernetes namespace that owns its
+/// compute resources.
+///
+/// `OpenShell` currently operates the Kubernetes driver in shared-namespace
+/// mode, so every workspace resolves to the configured namespace. Keeping the
+/// mapping behind this function gives future managed and operator workspace
+/// modes one boundary to replace.
+fn workspace_to_namespace(config: &KubernetesComputeConfig, _workspace: &str) -> String {
+    config.namespace.clone()
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum WarmPoolCacheLookup {
     NotReady,
@@ -738,10 +749,14 @@ impl KubernetesComputeDriver {
         )
     }
 
-    fn agent_sandbox_api(&self, client: Client, sandbox_api_version: &str) -> AgentSandboxApi {
+    fn agent_sandbox_api(
+        client: Client,
+        namespace: &str,
+        sandbox_api_version: &str,
+    ) -> AgentSandboxApi {
         let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, sandbox_api_version, SANDBOX_KIND);
         let resource = ApiResource::from_gvk(&gvk);
-        let api = Api::namespaced_with(client, &self.config.namespace, &resource);
+        let api = Api::namespaced_with(client, namespace, &resource);
         AgentSandboxApi { api, resource }
     }
 
@@ -794,15 +809,35 @@ impl KubernetesComputeDriver {
     }
 
     async fn supported_agent_sandbox_api(&self, client: Client) -> Result<AgentSandboxApi, String> {
-        let sandbox_api_version = self.supported_sandbox_api_version(client.clone()).await?;
-        Ok(self.agent_sandbox_api(client, sandbox_api_version))
+        self.supported_agent_sandbox_api_for_namespace(client, &self.config.namespace)
+            .await
     }
 
-    async fn supported_sandbox_api_version(&self, client: Client) -> Result<&'static str, String> {
+    async fn supported_agent_sandbox_api_for_namespace(
+        &self,
+        client: Client,
+        namespace: &str,
+    ) -> Result<AgentSandboxApi, String> {
+        let sandbox_api_version = self
+            .supported_sandbox_api_version(client.clone(), namespace)
+            .await?;
+        Ok(Self::agent_sandbox_api(
+            client,
+            namespace,
+            sandbox_api_version,
+        ))
+    }
+
+    async fn supported_sandbox_api_version(
+        &self,
+        client: Client,
+        namespace: &str,
+    ) -> Result<&'static str, String> {
         self.sandbox_api_version
-            .get_or_try_init(
-                || async move { self.detect_supported_sandbox_api_version(client).await },
-            )
+            .get_or_try_init(|| async move {
+                self.detect_supported_sandbox_api_version(client, namespace)
+                    .await
+            })
             .await
             .copied()
     }
@@ -810,9 +845,11 @@ impl KubernetesComputeDriver {
     async fn detect_supported_sandbox_api_version(
         &self,
         client: Client,
+        namespace: &str,
     ) -> Result<&'static str, String> {
         for sandbox_api_version in SANDBOX_VERSIONS {
-            let agent_sandbox_api = self.agent_sandbox_api(client.clone(), sandbox_api_version);
+            let agent_sandbox_api =
+                Self::agent_sandbox_api(client.clone(), namespace, sandbox_api_version);
             match tokio::time::timeout(
                 KUBE_API_TIMEOUT,
                 agent_sandbox_api.api.list(&ListParams::default().limit(1)),
@@ -821,7 +858,7 @@ impl KubernetesComputeDriver {
             {
                 Ok(Ok(_)) => {
                     debug!(
-                        namespace = %self.config.namespace,
+                        namespace,
                         sandbox_api_version = %sandbox_api_version,
                         "Selected Agent Sandbox API version"
                     );
@@ -829,7 +866,7 @@ impl KubernetesComputeDriver {
                 }
                 Ok(Err(err)) if should_try_next_sandbox_api_version(&err) => {
                     debug!(
-                        namespace = %self.config.namespace,
+                        namespace,
                         sandbox_api_version = %sandbox_api_version,
                         error = %err,
                         "Sandbox API version is not available; trying next supported version"
@@ -858,13 +895,11 @@ impl KubernetesComputeDriver {
     ///   `openshift.io/sa.scc.uid-range` / `openshift.io/sa.scc.supplemental-groups`
     ///   annotations.
     /// - If neither config nor `OpenShift` is found, returns `(1000, 1000, {})` as defaults.
-    async fn resolve_sandbox_identity(&self) -> (u32, u32, BTreeMap<String, String>) {
-        resolve_sandbox_identity_for_config(
-            self.client.clone(),
-            &self.config,
-            self.config.namespace.as_str(),
-        )
-        .await
+    async fn resolve_sandbox_identity(
+        &self,
+        namespace: &str,
+    ) -> (u32, u32, BTreeMap<String, String>) {
+        resolve_sandbox_identity_for_config(self.client.clone(), &self.config, namespace).await
     }
 
     async fn has_gpu_capacity(&self) -> Result<bool, KubeError> {
@@ -1509,21 +1544,23 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::InvalidArgument)?;
 
         let name = sandbox.name.as_str();
+        let target_namespace = workspace_to_namespace(&self.config, &sandbox.workspace);
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %name,
-            namespace = %self.config.namespace,
+            workspace = %sandbox.workspace,
+            namespace = %target_namespace,
             "Creating sandbox in Kubernetes"
         );
 
         let agent_sandbox_api = self
-            .supported_agent_sandbox_api(self.client.clone())
+            .supported_agent_sandbox_api_for_namespace(self.client.clone(), &target_namespace)
             .await
             .map_err(KubernetesDriverError::Message)?;
 
         // Resolve sandbox UID/GID from config or OpenShift SCC namespace annotations.
         let (resolved_user_id, resolved_group_id, ns_annotations) =
-            self.resolve_sandbox_identity().await;
+            self.resolve_sandbox_identity(&target_namespace).await;
 
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
@@ -1562,7 +1599,6 @@ impl KubernetesComputeDriver {
 
         let data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
-        let target_namespace = self.config.namespace.clone();
         if self.config.warm_pooling.enabled {
             match sandbox_spec_fingerprint(&data) {
                 Ok(fingerprint) => {
@@ -2373,21 +2409,32 @@ async fn reconcile_existing_warm_pool_profiles(
                 .iter()
                 .filter_map(|config_map| config_map.metadata.uid.clone())
                 .collect::<HashSet<_>>();
+            let mut target_namespaces = list
+                .items
+                .iter()
+                .filter_map(|config_map| warm_pool_profile_workspace(config_map).ok())
+                .map(|workspace| workspace_to_namespace(config, &workspace))
+                .collect::<HashSet<_>>();
+            // Shared-namespace mode must still sweep the configured namespace
+            // when there are no valid profiles in the current list.
+            target_namespaces.insert(workspace_to_namespace(config, "default"));
             for config_map in list.items {
                 reconcile_warm_pool_profile_config_map(client.clone(), config, config_map).await;
             }
-            if let Err(err) = garbage_collect_orphaned_warm_pool_profile_resources(
-                client,
-                &config.namespace,
-                &active_source_uids,
-            )
-            .await
-            {
-                warn!(
-                    namespace = %config.namespace,
-                    error = %err,
-                    "Failed to garbage-collect orphaned warm-pool profile resources"
-                );
+            for target_namespace in target_namespaces {
+                if let Err(err) = garbage_collect_orphaned_warm_pool_profile_resources(
+                    client.clone(),
+                    &target_namespace,
+                    &active_source_uids,
+                )
+                .await
+                {
+                    warn!(
+                        namespace = %target_namespace,
+                        error = %err,
+                        "Failed to garbage-collect orphaned warm-pool profile resources"
+                    );
+                }
             }
         }
         Ok(Err(err)) => {
@@ -2411,6 +2458,7 @@ async fn reconcile_warm_pool_profile_config_map(
     config: &KubernetesComputeConfig,
     config_map: ConfigMap,
 ) {
+    let previous_target_namespace = warm_pool_profile_recorded_target_namespace(&config_map);
     match render_warm_pool_profile(client.clone(), config, &config_map).await {
         Ok(rendered) => {
             if let Err(err) = apply_rendered_warm_pool_profile(client.clone(), &rendered).await {
@@ -2440,6 +2488,23 @@ async fn reconcile_warm_pool_profile_config_map(
                     config_map = %rendered.source.name,
                     error = %err,
                     "Failed to garbage-collect superseded warm-pool profile resources"
+                );
+            }
+            if let Some(previous_target_namespace) = previous_target_namespace
+                && previous_target_namespace != rendered.target_namespace
+                && let Err(err) = garbage_collect_warm_pool_profile_resources(
+                    client.clone(),
+                    &previous_target_namespace,
+                    &rendered.source.uid,
+                    None,
+                )
+                .await
+            {
+                warn!(
+                    namespace = %previous_target_namespace,
+                    config_map = %rendered.source.name,
+                    error = %err,
+                    "Failed to garbage-collect warm-pool profile resources from previous workspace namespace"
                 );
             }
             patch_warm_pool_profile_status(
@@ -2496,7 +2561,7 @@ async fn render_warm_pool_profile(
         config.warm_pooling.profiles.effective_max_replicas(),
     )?;
 
-    let target_namespace = config.namespace.clone();
+    let target_namespace = workspace_to_namespace(config, &profile.workspace);
     let spec = warm_pool_profile_to_sandbox_spec(&profile);
     let (profile_user_id, profile_group_id, _) =
         resolve_sandbox_identity_for_config(client, config, &target_namespace).await;
@@ -2589,6 +2654,37 @@ fn warm_pool_profile_source(
 fn parse_warm_pool_profile(data: &str) -> Result<WarmPoolProfile, String> {
     toml::from_str::<WarmPoolProfile>(data)
         .map_err(|err| format!("failed to parse {WARM_POOL_PROFILE_DATA_KEY}: {err}"))
+}
+
+fn warm_pool_profile_workspace(config_map: &ConfigMap) -> Result<String, String> {
+    let data = config_map
+        .data
+        .as_ref()
+        .and_then(|data| data.get(WARM_POOL_PROFILE_DATA_KEY))
+        .ok_or_else(|| format!("missing data key '{WARM_POOL_PROFILE_DATA_KEY}'"))?;
+    Ok(parse_warm_pool_profile(data)?.workspace)
+}
+
+fn warm_pool_profile_recorded_target_namespace(config_map: &ConfigMap) -> Option<String> {
+    config_map
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(ANNOTATION_WARM_POOL_TARGET_NAMESPACE))
+        .filter(|namespace| !namespace.is_empty())
+        .cloned()
+}
+
+fn warm_pool_profile_cleanup_namespace(
+    config: &KubernetesComputeConfig,
+    config_map: &ConfigMap,
+) -> String {
+    warm_pool_profile_recorded_target_namespace(config_map).unwrap_or_else(|| {
+        warm_pool_profile_workspace(config_map).map_or_else(
+            |_| workspace_to_namespace(config, "default"),
+            |workspace| workspace_to_namespace(config, &workspace),
+        )
+    })
 }
 
 fn validate_warm_pool_profile(profile: &WarmPoolProfile, max_replicas: u32) -> Result<(), String> {
@@ -2950,7 +3046,7 @@ async fn garbage_collect_warm_pool_profile(
     let Some(uid) = cm.metadata.uid.as_deref() else {
         return;
     };
-    let namespace = config.namespace.clone();
+    let namespace = warm_pool_profile_cleanup_namespace(config, cm);
     if let Err(err) =
         garbage_collect_warm_pool_profile_resources(client, &namespace, uid, None).await
     {
@@ -9019,6 +9115,70 @@ gpu_count = 1
         assert_eq!(profile.resources.cpu, "4");
         assert_eq!(profile.resources.memory, "8Gi");
         assert_eq!(profile.resources.gpu_count, Some(1));
+    }
+
+    #[test]
+    fn workspace_to_namespace_uses_shared_configured_namespace() {
+        let config = KubernetesComputeConfig {
+            namespace: "shared-sandboxes".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            workspace_to_namespace(&config, "default"),
+            "shared-sandboxes"
+        );
+        assert_eq!(
+            workspace_to_namespace(&config, "research"),
+            "shared-sandboxes"
+        );
+    }
+
+    #[test]
+    fn warm_pool_profile_cleanup_prefers_recorded_target_namespace() {
+        let config = KubernetesComputeConfig {
+            namespace: "shared-sandboxes".to_string(),
+            ..Default::default()
+        };
+        let config_map = ConfigMap {
+            metadata: ObjectMeta {
+                annotations: Some(BTreeMap::from([(
+                    ANNOTATION_WARM_POOL_TARGET_NAMESPACE.to_string(),
+                    "previous-workspace-namespace".to_string(),
+                )])),
+                ..Default::default()
+            },
+            data: Some(BTreeMap::from([(
+                WARM_POOL_PROFILE_DATA_KEY.to_string(),
+                "version = 1\nworkspace = \"research\"\n".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            warm_pool_profile_cleanup_namespace(&config, &config_map),
+            "previous-workspace-namespace"
+        );
+    }
+
+    #[test]
+    fn warm_pool_profile_cleanup_maps_profile_workspace_without_status() {
+        let config = KubernetesComputeConfig {
+            namespace: "shared-sandboxes".to_string(),
+            ..Default::default()
+        };
+        let config_map = ConfigMap {
+            data: Some(BTreeMap::from([(
+                WARM_POOL_PROFILE_DATA_KEY.to_string(),
+                "version = 1\nworkspace = \"research\"\n".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            warm_pool_profile_cleanup_namespace(&config, &config_map),
+            workspace_to_namespace(&config, "research")
+        );
     }
 
     #[test]

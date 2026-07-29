@@ -265,7 +265,10 @@ reconciler that turns admin-authored TOML profiles into generated
 `SandboxTemplate` and `SandboxWarmPool` resources. That reconciler is
 independent of the create-path matcher: admins can use it, Helm, kubectl, or
 another controller to create warm pools, and the matcher only considers the
-resulting enabled warm-pool resources and their fingerprints.
+resulting enabled warm-pool resources and their fingerprints. Sandbox creation
+and profile reconciliation share one workspace-to-namespace mapping boundary;
+the current shared-namespace implementation maps every workspace to the
+configured Kubernetes namespace.
 The gateway starts the profile reconciler only on the replica holding the
 shared reconciler lease and stops it before returning that replica to standby.
 The read-side warm-pool cache still runs on every replica so local create
