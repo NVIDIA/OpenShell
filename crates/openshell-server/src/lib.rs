@@ -72,10 +72,6 @@ use tracing::{debug, error, info, warn};
 pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 use compute::ComputeRuntime;
-#[cfg(test)]
-use compute::GatewayListenerRequirement;
-#[cfg(test)]
-use gateway_listener::GatewayListenerSpec;
 use gateway_listener::{BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
@@ -1024,11 +1020,10 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
 mod tests {
     use super::{
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, GatewayListenerScope,
-        GatewayListenerSpec, MultiplexService, ServerState, TlsAcceptor,
-        allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
-        configured_compute_driver, is_benign_tls_handshake_failure,
-        kubernetes_sandbox_jwt_expiry_disabled, serve_gateway_listener,
-        GatewayListenerRequirement,
+        MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
+        bind_gateway_listeners, classify_initial_bytes, configured_compute_driver,
+        is_benign_tls_handshake_failure, kubernetes_sandbox_jwt_expiry_disabled,
+        serve_gateway_listener,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -1046,7 +1041,11 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::watch;
 
-    use crate::tls_test_utils::{generate_test_certs_with_ca, install_rustls_provider};
+    use crate::{
+        compute::GatewayListenerRequirement,
+        gateway_listener::GatewayListenerSpec,
+        tls_test_utils::{generate_test_certs_with_ca, install_rustls_provider},
+    };
 
     fn test_driver_startup<'a>(
         config: &'a Config,

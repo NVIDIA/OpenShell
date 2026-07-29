@@ -311,7 +311,7 @@ pub async fn bind_gateway_listeners(
         }
         listeners.push(BoundGatewayListener {
             listener,
-            spec: spec.bind_to(local_addr),
+            spec: spec.clone().bind_to(local_addr),
         });
     }
     Ok(listeners)
@@ -517,15 +517,9 @@ mod tests {
         let podman_gateway: SocketAddr = "10.89.1.1:8080".parse().unwrap();
 
         assert_eq!(
-            gateway_listener_specs(
-                primary,
-                &[podman_listener_requirement(podman_gateway)],
-            )
-            .unwrap(),
-            vec![primary_listener_spec_with_covered(
-                primary,
-                podman_gateway,
-            )]
+            gateway_listener_specs(primary, &[podman_listener_requirement(podman_gateway)],)
+                .unwrap(),
+            vec![primary_listener_spec_with_covered(primary, podman_gateway,)]
         );
     }
 
