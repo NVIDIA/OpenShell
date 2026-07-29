@@ -101,6 +101,7 @@ pub async fn run_sandbox(
     network_enabled: bool,
     process_enabled: bool,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    trusted_init_file: Option<std::path::PathBuf>,
 ) -> Result<i32> {
     let (program, args) = command
         .split_first()
@@ -699,6 +700,7 @@ pub async fn run_sandbox(
             provider_env,
             ca_file_paths,
             agent_proposals.clone(),
+            trusted_init_file.as_deref(),
             #[cfg(target_os = "linux")]
             netns.as_ref(),
             #[cfg(target_os = "linux")]

@@ -80,8 +80,26 @@ pub fn apply(policy: &SandboxPolicy) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn apply_trusted_initializer(policy: &SandboxPolicy) -> Result<()> {
+    let allow_inet = matches!(policy.network.mode, NetworkMode::Proxy | NetworkMode::Allow);
+    let main_filter = build_trusted_initializer_filter(allow_inet)?;
+    let clone3_filter = build_clone3_filter()?;
+
+    set_no_new_privs()?;
+    apply_runtime_filters(&main_filter, &clone3_filter)?;
+
+    Ok(())
+}
+
 fn build_filter(allow_inet: bool) -> Result<seccompiler::BpfProgram> {
     let rules = build_filter_rules(allow_inet)?;
+    compile_filter(rules, SeccompAction::Errno(libc::EPERM as u32))
+}
+
+fn build_trusted_initializer_filter(allow_inet: bool) -> Result<seccompiler::BpfProgram> {
+    let mut rules = build_filter_rules(allow_inet)?;
+    rules.entry(libc::SYS_setpgid).or_default();
+    rules.entry(libc::SYS_setsid).or_default();
     compile_filter(rules, SeccompAction::Errno(libc::EPERM as u32))
 }
 
@@ -102,6 +120,7 @@ fn build_supervisor_prelude_rules() -> BTreeMap<i64, Vec<SeccompRule>> {
         libc::SYS_fsmount,
         libc::SYS_fspick,
         libc::SYS_move_mount,
+        libc::SYS_mount_setattr,
         libc::SYS_open_tree,
         libc::SYS_pivot_root,
         libc::SYS_umount2,
@@ -241,6 +260,7 @@ fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>
     rules.entry(libc::SYS_fsmount).or_default();
     rules.entry(libc::SYS_fspick).or_default();
     rules.entry(libc::SYS_move_mount).or_default();
+    rules.entry(libc::SYS_mount_setattr).or_default();
     rules.entry(libc::SYS_open_tree).or_default();
     // Namespace manipulation — setns enters existing namespaces, pivot_root/umount2
     // change the filesystem root. The supervisor calls setns before seccomp is applied,
@@ -387,6 +407,15 @@ mod tests {
     fn build_filter_block_mode_compiles() {
         let filter = build_filter(false);
         assert!(filter.is_ok(), "build_filter(false) should succeed");
+    }
+
+    #[test]
+    fn trusted_initializer_filter_compiles() {
+        let filter = build_trusted_initializer_filter(false);
+        assert!(
+            filter.is_ok(),
+            "trusted initializer filter should block process-group escape"
+        );
     }
 
     #[test]

@@ -480,6 +480,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf '[openshell.gateway]\nlog_level = "info"\n\n'
   e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-docker-${HOST_PORT}"
   e2e_write_gateway_mtls_auth_config
+  e2e_write_trusted_workload_init_config
   printf '[openshell.drivers.docker]\n'
   printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
   printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"

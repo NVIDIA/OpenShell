@@ -291,7 +291,7 @@ mod tests {
 
     use openshell_core::proto::{
         CreateProviderRequest, CreateSandboxRequest, GpuResourceRequirements, Provider,
-        SandboxSpec, UpdateConfigRequest,
+        SandboxSpec, TrustedWorkloadInitRequest, UpdateConfigRequest,
     };
     use prost::Message as _;
     use prost_types::{
@@ -316,6 +316,7 @@ mod tests {
             labels: HashMap::from([("team".to_string(), "agent".to_string())]),
             annotations: HashMap::new(),
             workspace: String::new(),
+            trusted_workload_init: None,
         };
         let bytes = request.encode_to_vec();
         let json = codec
@@ -363,6 +364,37 @@ mod tests {
     }
 
     #[test]
+    fn interceptor_view_omits_trusted_init_payload_but_keeps_contract_id() {
+        let codec = ProtoJsonCodec::openshell().unwrap();
+        let request = CreateSandboxRequest {
+            trusted_workload_init: Some(TrustedWorkloadInitRequest {
+                contract_id: "example.agent-onboarding.v1".to_string(),
+                payload: b"secret onboarding material".to_vec(),
+            }),
+            ..CreateSandboxRequest::default()
+        };
+        let encoded = request.encode_to_vec();
+
+        let authoritative = codec
+            .decode_bytes_to_json("openshell.v1.CreateSandboxRequest", &encoded)
+            .unwrap();
+        let interceptor = codec
+            .decode_bytes_to_interceptor_json("openshell.v1.CreateSandboxRequest", &encoded)
+            .unwrap();
+
+        assert!(
+            authoritative["trustedWorkloadInit"]
+                .get("payload")
+                .is_some()
+        );
+        assert_eq!(
+            interceptor["trustedWorkloadInit"]["contractId"],
+            "example.agent-onboarding.v1"
+        );
+        assert!(interceptor["trustedWorkloadInit"].get("payload").is_none());
+    }
+
+    #[test]
     fn dedicated_secret_fields_are_annotated_in_the_descriptor_set() {
         let codec = ProtoJsonCodec::openshell().unwrap();
         for (message_name, field_name) in [
@@ -384,6 +416,7 @@ mod tests {
                 "openshell.v1.GetSandboxProviderEnvironmentResponse",
                 "environment",
             ),
+            ("openshell.v1.TrustedWorkloadInitRequest", "payload"),
         ] {
             let message = codec.message_descriptor(message_name).unwrap();
             let field = message.get_field_by_name(field_name).unwrap();

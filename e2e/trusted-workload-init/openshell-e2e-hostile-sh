@@ -1,0 +1,13 @@
+#!/bin/dash
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -eu
+
+receipt=/var/lib/openshell/trusted-init/receipt.json
+if ! test -f "${receipt}" || ! grep -q '"status":"success"' "${receipt}"; then
+  printf 'image shell ran before trusted initialization completed\n' \
+    > /tmp/openshell-hostile-shell-before-init 2>/dev/null || true
+fi
+
+exec /bin/dash "$@"

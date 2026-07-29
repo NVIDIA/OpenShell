@@ -55,6 +55,8 @@ message GetCapabilitiesResponse {
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
+  // Versioned optional features implemented by this driver.
+  repeated string features = 6;
 }
 
 // Driver-owned sandbox model used for create requests and platform observations.
@@ -214,6 +216,8 @@ message DriverPlatformEvent {
 message ValidateSandboxCreateRequest {
   // Proposed sandbox configuration to validate before provisioning.
   DriverSandbox sandbox = 1;
+  // Gateway-resolved transient trusted initialization plan.
+  TrustedWorkloadInitPlan trusted_workload_init = 2;
 }
 
 message ValidateSandboxCreateResponse {}
@@ -240,9 +244,41 @@ message ListSandboxesResponse {
 message CreateSandboxRequest {
   // Sandbox configuration to provision on the compute platform.
   DriverSandbox sandbox = 1;
+  // Gateway-resolved transient trusted initialization plan.
+  TrustedWorkloadInitPlan trusted_workload_init = 2;
 }
 
 message CreateSandboxResponse {}
+
+// Privileged initialization plan resolved exclusively from gateway operator
+// configuration. Drivers deliver the payload through a root-only secret and
+// translate the remaining fields into supervisor-owned metadata.
+message TrustedWorkloadInitPlan {
+  string contract_id = 1;
+  bytes payload = 2 [(openshell.options.v1.secret) = true];
+  string payload_sha256 = 3;
+  repeated string command = 4;
+  uint32 timeout_seconds = 5;
+  repeated string writable_paths = 6;
+  // Exact immutable workload image reference authorized by the registration.
+  string image = 7;
+  // Closed operator-owned Linux capability set for the initializer child.
+  repeated string capabilities = 8;
+}
+
+// Driver-sealed initialization request mounted root-only into the workload
+// container. The supervisor accepts this envelope only when the compute
+// driver also supplies the fixed --trusted-init-file activation flag.
+message TrustedWorkloadInitEnvelope {
+  // Envelope schema version. Version 1 is the only accepted value.
+  uint32 schema_version = 1;
+  // Stable sandbox UUID assigned by the gateway.
+  string sandbox_id = 2;
+  // Gateway-resolved operator plan, including the opaque caller payload.
+  TrustedWorkloadInitPlan plan = 3;
+  // Immutable image ID returned by the runtime's image inspection.
+  string resolved_image_id = 4;
+}
 
 message StopSandboxRequest {
   // Stable sandbox ID stored by the gateway.

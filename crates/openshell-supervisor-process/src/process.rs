@@ -124,11 +124,20 @@ const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
 
 pub fn is_supervisor_only_env_var(key: &str) -> bool {
     SUPERVISOR_ONLY_ENV_VARS.contains(&key)
+        || openshell_core::trusted_workload_init::is_supervisor_env_var(key)
 }
 
 fn strip_supervisor_only_env(cmd: &mut Command) {
     for key in SUPERVISOR_ONLY_ENV_VARS {
         cmd.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_str()
+            .is_some_and(openshell_core::trusted_workload_init::is_supervisor_env_var)
+        {
+            cmd.env_remove(key);
+        }
     }
 }
 

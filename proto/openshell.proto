@@ -350,6 +350,9 @@ message ComputeDriverCapabilities {
 
   // Driver-reported implementation version from the startup capability snapshot.
   string driver_version = 2;
+
+  // Versioned optional features supported by this driver.
+  repeated string features = 3;
 }
 
 // Public sandbox resource exposed by the OpenShell API.
@@ -503,6 +506,20 @@ message PlatformEvent {
   map<string, string> metadata = 6;
 }
 
+// Transient request for an operator-registered trusted workload initializer.
+//
+// The gateway resolves `contract_id` to an operator-owned command, immutable
+// workload image, timeout, and filesystem write allowlist. The caller cannot
+// supply any of those privileged execution settings. This message is never
+// persisted as part of the public Sandbox resource.
+message TrustedWorkloadInitRequest {
+  // Operator-registered initialization contract.
+  string contract_id = 1;
+  // Opaque bounded input delivered through the compute driver's native
+  // root-only secret mechanism.
+  bytes payload = 2 [(openshell.options.v1.secret) = true];
+}
+
 // Create sandbox request.
 message CreateSandboxRequest {
   SandboxSpec spec = 1;
@@ -514,6 +531,8 @@ message CreateSandboxRequest {
   map<string, string> annotations = 4;
   // Workspace for the sandbox. Empty defaults to "default".
   string workspace = 5;
+  // Optional transient trusted initialization request.
+  TrustedWorkloadInitRequest trusted_workload_init = 6;
 }
 
 // Get sandbox request.

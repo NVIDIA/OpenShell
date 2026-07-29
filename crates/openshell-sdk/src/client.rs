@@ -15,8 +15,8 @@ use crate::raw::{AuthedGrpcClient, AuthedInferenceClient};
 use crate::refresh::{RefreshedToken, TokenSource};
 use crate::transport;
 use crate::types::{
-    ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxSpec,
-    WorkspaceRef,
+    CreateSandboxOptions, ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef,
+    SandboxSpec, WorkspaceRef,
 };
 use futures::StreamExt;
 use openshell_core::proto;
@@ -153,7 +153,17 @@ impl OpenShellClient {
 
     /// Create a new sandbox from a curated [`SandboxSpec`].
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
-        let request = create_sandbox_request(spec);
+        self.create_sandbox_with_options(spec, CreateSandboxOptions::default())
+            .await
+    }
+
+    /// Create a new sandbox with transient create-only options.
+    pub async fn create_sandbox_with_options(
+        &self,
+        spec: SandboxSpec,
+        options: CreateSandboxOptions,
+    ) -> Result<SandboxRef> {
+        let request = create_sandbox_request(spec, options, String::new());
         let response = self
             .unary(|mut grpc| {
                 let request = request.clone();
@@ -522,8 +532,17 @@ impl WorkspaceScopedClient {
 
     /// Create a new sandbox in this workspace.
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
-        let mut request = create_sandbox_request(spec);
-        request.workspace = self.workspace.clone();
+        self.create_sandbox_with_options(spec, CreateSandboxOptions::default())
+            .await
+    }
+
+    /// Create a new sandbox in this workspace with transient create-only options.
+    pub async fn create_sandbox_with_options(
+        &self,
+        spec: SandboxSpec,
+        options: CreateSandboxOptions,
+    ) -> Result<SandboxRef> {
+        let request = create_sandbox_request(spec, options, self.workspace.clone());
         let response = self
             .client
             .unary(|mut grpc| {
@@ -733,7 +752,11 @@ fn store_bearer(slot: &BearerSlot, token: &str) -> Result<()> {
     Ok(())
 }
 
-fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
+fn create_sandbox_request(
+    spec: SandboxSpec,
+    options: CreateSandboxOptions,
+    workspace: String,
+) -> proto::CreateSandboxRequest {
     let SandboxSpec {
         name,
         image,
@@ -749,6 +772,13 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
     let resource_requirements = gpu.then_some(proto::ResourceRequirements {
         gpu: Some(proto::GpuResourceRequirements { count: None }),
     });
+    let trusted_workload_init =
+        options
+            .trusted_workload_init
+            .map(|init| proto::TrustedWorkloadInitRequest {
+                contract_id: init.contract_id,
+                payload: init.payload,
+            });
     proto::CreateSandboxRequest {
         spec: Some(proto::SandboxSpec {
             environment,
@@ -760,7 +790,8 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         name: name.unwrap_or_default(),
         labels,
         annotations: HashMap::new(),
-        workspace: String::new(),
+        workspace,
+        trusted_workload_init,
     }
 }
 
@@ -933,5 +964,43 @@ mod tests {
         assert!(store_bearer(&slot, "bad\nvalue").is_err());
         let current = slot.read().unwrap().clone().unwrap();
         assert_eq!(current.to_str().unwrap(), "Bearer good-token");
+    }
+
+    #[test]
+    fn create_request_carries_transient_trusted_init_options() {
+        let request = create_sandbox_request(
+            SandboxSpec {
+                name: Some("agent".to_string()),
+                image: Some("sha256:immutable".to_string()),
+                ..SandboxSpec::default()
+            },
+            CreateSandboxOptions {
+                trusted_workload_init: Some(crate::types::TrustedWorkloadInit {
+                    contract_id: "example.onboarding.v1".to_string(),
+                    payload: b"secret onboarding material".to_vec(),
+                }),
+            },
+            "workspace-a".to_string(),
+        );
+
+        assert_eq!(request.workspace, "workspace-a");
+        let init = request
+            .trusted_workload_init
+            .expect("trusted init options should map to the create request");
+        assert_eq!(init.contract_id, "example.onboarding.v1");
+        assert_eq!(init.payload, b"secret onboarding material");
+    }
+
+    #[test]
+    fn trusted_init_debug_redacts_payload() {
+        let init = crate::types::TrustedWorkloadInit {
+            contract_id: "example.onboarding.v1".to_string(),
+            payload: b"do-not-log-me".to_vec(),
+        };
+
+        let debug = format!("{init:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(debug.contains("13"));
+        assert!(!debug.contains("do-not-log-me"));
     }
 }

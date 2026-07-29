@@ -320,6 +320,8 @@ pub struct SandboxCreateConfig<'a> {
     pub auto_providers_override: Option<bool>,
     pub labels: HashMap<String, String>,
     pub environment: HashMap<String, String>,
+    pub trusted_init_contract: Option<&'a str>,
+    pub trusted_init_payload_file: Option<&'a Path>,
     pub approval_mode: &'a str,
     pub output: &'a str,
 }
@@ -344,6 +346,8 @@ impl Default for SandboxCreateConfig<'_> {
             auto_providers_override: None,
             labels: HashMap::new(),
             environment: HashMap::new(),
+            trusted_init_contract: None,
+            trusted_init_payload_file: None,
             approval_mode: "manual",
             output: "table",
         }
@@ -376,6 +380,8 @@ pub async fn sandbox_create(
         auto_providers_override,
         labels,
         environment,
+        trusted_init_contract,
+        trusted_init_payload_file,
         approval_mode,
         output,
     } = config;
@@ -453,6 +459,21 @@ pub async fn sandbox_create(
     };
 
     let resource_requirements = gpu_requirements.map(|gpu| ResourceRequirements { gpu: Some(gpu) });
+    let trusted_workload_init = match (trusted_init_contract, trusted_init_payload_file) {
+        (Some(contract_id), Some(payload_file)) => {
+            let payload = read_trusted_init_payload(payload_file)?;
+            Some(openshell_core::proto::TrustedWorkloadInitRequest {
+                contract_id: contract_id.to_string(),
+                payload,
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(miette::miette!(
+                "--trusted-init-contract and --trusted-init-payload-file must be supplied together"
+            ));
+        }
+    };
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
@@ -467,6 +488,7 @@ pub async fn sandbox_create(
         labels,
         annotations: HashMap::new(),
         workspace: workspace.to_string(),
+        trusted_workload_init,
     };
 
     let response = match client.create_sandbox(request).await {
@@ -958,6 +980,71 @@ pub async fn sandbox_create(
             "sandbox provisioning stream ended before reaching terminal phase"
         )),
     }
+}
+
+fn read_trusted_init_payload(path: &Path) -> Result<Vec<u8>> {
+    let path_metadata = std::fs::symlink_metadata(path)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to inspect trusted initializer payload '{}'",
+                path.display()
+            )
+        })?;
+    if path_metadata.file_type().is_symlink() {
+        return Err(miette::miette!(
+            "trusted initializer payload '{}' must not be a symlink",
+            path.display()
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    }
+    let file = options.open(path).into_diagnostic().wrap_err_with(|| {
+        format!(
+            "failed to open trusted initializer payload '{}'",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().into_diagnostic().wrap_err_with(|| {
+        format!(
+            "failed to inspect trusted initializer payload '{}'",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(miette::miette!(
+            "trusted initializer payload '{}' must be a regular non-symlink file",
+            path.display()
+        ));
+    }
+    let limit = openshell_core::trusted_workload_init::MAX_PAYLOAD_BYTES;
+    if usize::try_from(metadata.len()).map_or(true, |length| length > limit) {
+        return Err(miette::miette!(
+            "trusted initializer payload exceeds platform limit ({} > {limit})",
+            metadata.len()
+        ));
+    }
+    let mut payload = Vec::new();
+    file.take(u64::try_from(limit + 1).unwrap_or(u64::MAX))
+        .read_to_end(&mut payload)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to read trusted initializer payload '{}'",
+                path.display()
+            )
+        })?;
+    if payload.len() > limit {
+        return Err(miette::miette!(
+            "trusted initializer payload changed while reading and exceeds platform limit"
+        ));
+    }
+    Ok(payload)
 }
 
 /// Resolved source for the `--from` flag on `sandbox create`.
@@ -6922,9 +7009,9 @@ mod tests {
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
         parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
         policy_revision_to_json, provider_profile_allows_empty_credentials,
-        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
-        refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
-        service_expose_status_error, service_url_for_gateway,
+        provisioning_timeout_message, read_trusted_init_payload, ready_false_condition_message,
+        refresh_status_header, refresh_status_row, resolve_from, sandbox_should_persist,
+        sandbox_upload_plan, service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::progress_step_from_metadata;
@@ -6947,6 +7034,56 @@ mod tests {
         ProviderProfileCredential, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
         SandboxPolicyRevision, SandboxStatus, datamodel::v1::ObjectMeta,
     };
+
+    #[test]
+    fn trusted_init_payload_reader_accepts_bounded_regular_file() {
+        let mut payload = tempfile::NamedTempFile::new().unwrap();
+        payload.write_all(b"onboarding").unwrap();
+        payload.flush().unwrap();
+
+        assert_eq!(
+            read_trusted_init_payload(payload.path()).unwrap(),
+            b"onboarding"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_init_payload_reader_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("payload");
+        let link = directory.path().join("payload-link");
+        fs::write(&target, b"onboarding").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(
+            read_trusted_init_payload(&link)
+                .unwrap_err()
+                .to_string()
+                .contains("must not be a symlink")
+        );
+    }
+
+    #[test]
+    fn trusted_init_payload_reader_rejects_oversized_file() {
+        let payload = tempfile::NamedTempFile::new().unwrap();
+        payload
+            .as_file()
+            .set_len(
+                u64::try_from(openshell_core::trusted_workload_init::MAX_PAYLOAD_BYTES + 1)
+                    .unwrap(),
+            )
+            .unwrap();
+
+        assert!(
+            read_trusted_init_payload(payload.path())
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds platform limit")
+        );
+    }
 
     #[test]
     fn policy_revision_json_includes_revision_provenance() {

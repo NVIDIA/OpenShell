@@ -1,0 +1,35 @@
+#!/bin/dash
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -eu
+
+# Keep initialization active past the first Podman healthcheck window. An
+# unsafe CMD-SHELL probe or inherited image HEALTHCHECK will leave a sentinel
+# while the receipt is still in its pre-success state.
+sleep 8
+
+test ! -e /tmp/openshell-hostile-shell-before-init
+test ! -e /tmp/openshell-hostile-image-healthcheck-ran
+
+cat > /etc/trusted-init-e2e/payload
+grep -qx 'agent-neutral-runtime-contract-v1' /etc/trusted-init-e2e/payload
+
+# The helper grants only the registered writable paths and closed capability
+# set. These operations must stay blocked even though the initializer is root.
+if chmod 0600 /etc/passwd 2>/dev/null; then
+  echo "initializer unexpectedly changed /etc/passwd" >&2
+  exit 41
+fi
+if printf 'forbidden\n' 2>/dev/null > /usr/local/bin/openshell-e2e-forbidden; then
+  echo "initializer unexpectedly wrote outside its allowlist" >&2
+  exit 42
+fi
+if python3 -c 'import os; os.setsid()' 2>/dev/null; then
+  echo "initializer unexpectedly created a new session" >&2
+  exit 43
+fi
+
+chown 1000:1000 /etc/trusted-init-e2e/payload
+chmod 0600 /etc/trusted-init-e2e/payload
+printf 'trusted-init-result-v1\n'

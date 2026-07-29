@@ -45,6 +45,7 @@ struct ComputeDriverInfoView {
 struct ComputeDriverCapabilitiesView {
     driver_name: String,
     driver_version: String,
+    features: Vec<String>,
 }
 
 /// Show gateway status.
@@ -392,6 +393,7 @@ pub async fn gateway_info(
                     capabilities: ComputeDriverCapabilitiesView {
                         driver_name: capabilities.driver_name,
                         driver_version: capabilities.driver_version,
+                        features: capabilities.features,
                     },
                 }
             })
@@ -446,6 +448,13 @@ fn print_compute_driver_info(drivers: &[ComputeDriverInfoView]) {
             "Driver version:".dimmed(),
             driver.capabilities.driver_version
         );
+        if !driver.capabilities.features.is_empty() {
+            println!(
+                "      {} {}",
+                "Features:".dimmed(),
+                driver.capabilities.features.join(", ")
+            );
+        }
     }
 }
 
@@ -464,6 +473,7 @@ fn gateway_info_to_json(view: &GatewayInfoView) -> serde_json::Value {
                 "capabilities": {
                     "driver_name": &driver.capabilities.driver_name,
                     "driver_version": &driver.capabilities.driver_version,
+                    "features": &driver.capabilities.features,
                 },
             }))
             .collect::<Vec<_>>(),
@@ -1784,6 +1794,7 @@ mod tests {
                 capabilities: ComputeDriverCapabilitiesView {
                     driver_name: "podman".to_string(),
                     driver_version: "0.0.75".to_string(),
+                    features: vec!["trusted-workload-init.v1".to_string()],
                 },
             }],
         };
@@ -1801,6 +1812,10 @@ mod tests {
         assert_eq!(
             json["compute_drivers"][0]["capabilities"]["driver_version"],
             "0.0.75"
+        );
+        assert_eq!(
+            json["compute_drivers"][0]["capabilities"]["features"][0],
+            "trusted-workload-init.v1"
         );
     }
 

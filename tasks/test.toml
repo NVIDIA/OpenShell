@@ -66,6 +66,7 @@ hide = true
 description = "Run Rust CLI e2e tests against a Docker-backed gateway"
 run = [
   "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker",
+  "e2e/rust/e2e-trusted-workload-init.sh docker",
 ]
 
 ["e2e:websocket-conformance"]

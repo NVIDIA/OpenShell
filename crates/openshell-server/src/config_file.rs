@@ -179,6 +179,10 @@ pub struct SupervisorFileSection {
     /// operator-owned and changes require a gateway restart.
     #[serde(default)]
     pub middleware: Vec<MiddlewareServiceFileConfig>,
+
+    /// Operator-owned trusted workload initialization contracts.
+    #[serde(default)]
+    pub trusted_workload_init: Vec<TrustedWorkloadInitFileConfig>,
 }
 
 /// One `[[openshell.supervisor.middleware]]` supervisor middleware registration.
@@ -205,6 +209,29 @@ impl From<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
             timeout: config.timeout.clone().unwrap_or_default(),
         }
     }
+}
+
+/// One `[[openshell.supervisor.trusted_workload_init]]` registration.
+///
+/// Every privileged execution property is operator-owned. Sandbox callers
+/// select only `contract_id` and provide an opaque bounded payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedWorkloadInitFileConfig {
+    /// Stable contract identifier selected by sandbox callers.
+    pub contract_id: String,
+    /// Exact immutable workload images authorized for this contract.
+    pub images: Vec<String>,
+    /// Fixed argv executed directly, without a shell.
+    pub command: Vec<String>,
+    /// Maximum accepted payload size for this contract.
+    pub max_payload_bytes: usize,
+    /// Hard execution deadline.
+    pub timeout_seconds: u32,
+    /// Absolute filesystem paths the initializer may modify.
+    pub writable_paths: Vec<PathBuf>,
+    /// Closed Linux capability set granted to the initializer child.
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

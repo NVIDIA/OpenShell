@@ -167,6 +167,27 @@ e2e_write_gateway_mtls_auth_config() {
   printf 'enabled = true\n\n'
 }
 
+e2e_write_trusted_workload_init_config() {
+  local image=${OPENSHELL_E2E_TRUSTED_INIT_IMAGE:-}
+  if [ -z "${image}" ]; then
+    return 0
+  fi
+
+  if ! [[ "${image}" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+    echo "ERROR: OPENSHELL_E2E_TRUSTED_INIT_IMAGE must be a bare immutable sha256 image ID." >&2
+    return 2
+  fi
+
+  printf '[[openshell.supervisor.trusted_workload_init]]\n'
+  printf 'contract_id = "openshell.e2e.v1"\n'
+  printf 'images = [%s]\n' "$(e2e_toml_string "${image}")"
+  printf 'command = ["/usr/local/bin/openshell-e2e-trusted-init"]\n'
+  printf 'max_payload_bytes = 65536\n'
+  printf 'timeout_seconds = 30\n'
+  printf 'writable_paths = ["/etc/trusted-init-e2e", "/sandbox"]\n'
+  printf 'capabilities = ["CHOWN", "FOWNER"]\n\n'
+}
+
 e2e_build_gateway_binaries() {
   local root=$1
   local target_var=$2

@@ -84,6 +84,55 @@ The gateway records driver identity and version from the startup capability
 response. Elevated gateway info reports that initialized driver snapshot instead
 of re-querying drivers on each request.
 
+## Trusted Workload Initialization
+
+Trusted workload initialization is a versioned optional driver contract. It
+supports image-specific setup that must run with bounded privilege before the
+sandbox becomes ready without exposing a general root-execution API.
+
+The trust boundary is split across three components:
+
+- The gateway resolves a caller-selected contract against a static
+  operator-owned registry. The registry fixes the command, immutable image
+  allowlist, timeout, writable paths, payload limit, and closed capability set.
+- The compute driver validates the resolved plan before workload mutation,
+  binds it to the driver's inspected immutable image identity, and delivers the
+  payload through a runtime-native root-only secret.
+- The supervisor verifies the plan, payload digest, image identity, and
+  idempotency receipt. It executes the fixed command before SSH, gateway session
+  registration, and user workload launch.
+
+The public request contains only the contract identifier and opaque bounded
+payload. It is transient and does not become part of the persisted sandbox
+resource. Driver and supervisor metadata excludes the payload bytes.
+
+Docker keeps trusted-init creation synchronous through envelope upload and
+container start, while ordinary Docker creation remains asynchronous. A
+successful trusted-init create acknowledgment therefore no longer depends on
+an in-memory copy of the transient plan. A gateway crash before acknowledgment
+can still leave a persisted `Provisioning` row or a Docker container in
+`created` state that requires delete and retry. Transparent recovery would
+require durable encrypted operation state and startup reconciliation.
+
+Drivers advertise support with `trusted-workload-init.v1`. The gateway fails a
+request before persistence or compute mutation if the active driver lacks the
+feature or registry resolution fails. The driver and supervisor then validate
+the same resolved plan at their respective trust boundaries. Any mismatch,
+missing secret, timeout, execution failure, or receipt mismatch prevents the
+sandbox from becoming ready.
+
+For trusted-init containers, Docker and Podman replace image health checks with
+a driver-owned exec-form probe that invokes the side-loaded supervisor. The
+probe reports backend readiness only when a success receipt matches the sandbox
+ID and plan digest and the supervisor SSH socket is ready. Image-owned health
+checks and shell hooks cannot advance readiness.
+
+The built-in Docker and Podman drivers implement the V1 contract. The built-in
+Kubernetes and VM drivers do not. The protocol remains versioned so an
+out-of-tree driver can advertise the feature after it implements equivalent
+secret delivery, runs the side-loaded supervisor as container PID 1, and
+implements pre-ready execution without changing the public sandbox model.
+
 ## Deletion Lifecycle
 
 Delete requests use per-sandbox gates to serialize delete attempts. A request

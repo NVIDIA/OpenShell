@@ -48,6 +48,11 @@ path = "tests/driver_config_volume.rs"
 required-features = ["e2e-local-container-driver"]
 
 [[test]]
+name = "trusted_workload_init"
+path = "tests/trusted_workload_init.rs"
+required-features = ["e2e-local-container-driver"]
+
+[[test]]
 name = "gateway_resume"
 path = "tests/gateway_resume.rs"
 required-features = ["e2e-docker"]

@@ -51,6 +51,7 @@ mod tls;
 #[cfg(test)]
 pub(crate) mod tls_test_utils;
 pub mod tracing_bus;
+mod trusted_workload_init;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -132,6 +133,10 @@ pub struct ServerState {
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
+    /// Validated operator-owned trusted workload initialization contracts.
+    pub(crate) trusted_workload_init_registry:
+        Arc<trusted_workload_init::TrustedWorkloadInitRegistry>,
+
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
@@ -202,6 +207,9 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
+            trusted_workload_init_registry: Arc::new(
+                trusted_workload_init::TrustedWorkloadInitRegistry::default(),
+            ),
             oidc_cache,
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
@@ -254,6 +262,18 @@ pub(crate) async fn run_server(
         )
         .await
         .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?,
+    );
+    let trusted_workload_init_registry = Arc::new(
+        trusted_workload_init::TrustedWorkloadInitRegistry::from_config(
+            config_file.as_ref().map_or(&[], |file| {
+                file.openshell.supervisor.trusted_workload_init.as_slice()
+            }),
+        )
+        .map_err(|error| {
+            Error::config(format!(
+                "trusted workload initialization registration failed: {error}"
+            ))
+        })?,
     );
 
     let store = Arc::new(Store::connect(database_url).await?);
@@ -326,6 +346,7 @@ pub(crate) async fn run_server(
         oidc_cache,
     );
     state.middleware_registry = middleware_registry;
+    state.trusted_workload_init_registry = trusted_workload_init_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
 

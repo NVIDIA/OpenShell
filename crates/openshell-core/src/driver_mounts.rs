@@ -30,6 +30,7 @@ const RESERVED_MOUNT_TARGETS: &[&str] = &[
     "/etc/openshell",
     "/etc/openshell-tls",
     "/run/netns",
+    "/var/lib/openshell/trusted-init",
 ];
 
 /// Validate a non-empty driver mount source.
@@ -118,7 +119,8 @@ pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
         return Err("mount target '/sandbox' is reserved for the OpenShell workspace".to_string());
     }
     for reserved in RESERVED_MOUNT_TARGETS {
-        if path_is_or_under(path, Path::new(reserved)) {
+        let reserved_path = Path::new(reserved);
+        if path_is_or_under(path, reserved_path) || path_is_or_under(reserved_path, path) {
             return Err(format!(
                 "mount target '{target}' conflicts with reserved OpenShell path '{reserved}'"
             ));
@@ -169,6 +171,15 @@ mod tests {
         let err = validate_container_mount_target("/etc/openshell/tls/client").unwrap_err();
 
         assert!(err.contains("/etc/openshell"));
+    }
+
+    #[test]
+    fn container_target_rejects_reserved_path_ancestors() {
+        let err = validate_container_mount_target("/etc").unwrap_err();
+        assert!(err.contains("/etc/openshell"));
+
+        let err = validate_container_mount_target("/var/lib").unwrap_err();
+        assert!(err.contains("/var/lib/openshell/trusted-init"));
     }
 
     #[test]

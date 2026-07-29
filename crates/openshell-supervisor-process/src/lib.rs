@@ -20,6 +20,7 @@ pub mod sandbox;
 pub mod skills;
 pub mod ssh;
 pub mod supervisor_session;
+pub mod trusted_init;
 
 mod unix_socket;
 

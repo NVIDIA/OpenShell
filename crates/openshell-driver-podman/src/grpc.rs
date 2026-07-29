@@ -44,12 +44,12 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         request: Request<ValidateSandboxCreateRequest>,
     ) -> Result<Response<ValidateSandboxCreateResponse>, Status> {
+        let request = request.into_inner();
         let sandbox = request
-            .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.driver
-            .validate_sandbox_create(&sandbox)
+            .validate_sandbox_create(&sandbox, request.trusted_workload_init.as_ref())
             .await
             .map_err(Status::from)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
@@ -88,12 +88,12 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
+        let request = request.into_inner();
         let sandbox = request
-            .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.driver
-            .create_sandbox(&sandbox)
+            .create_sandbox(&sandbox, request.trusted_workload_init.as_ref())
             .await
             .map_err(Status::from)?;
         Ok(Response::new(CreateSandboxResponse {}))

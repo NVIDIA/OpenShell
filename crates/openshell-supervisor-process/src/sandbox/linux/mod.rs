@@ -57,6 +57,18 @@ pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
     Ok(())
 }
 
+/// Enforce the trusted-initializer profile.
+///
+/// In addition to the normal workload filter, this prevents descendants from
+/// escaping the supervisor-owned process group used for deadline cleanup.
+pub fn enforce_trusted_initializer(prepared: PreparedSandbox) -> Result<()> {
+    if let Some(ruleset) = prepared.landlock {
+        landlock::enforce(ruleset)?;
+    }
+    seccomp::apply_trusted_initializer(&prepared.policy)?;
+    Ok(())
+}
+
 /// Apply the supervisor seccomp prelude after privileged bootstrap completes.
 pub fn apply_supervisor_prelude() -> Result<()> {
     seccomp::apply_supervisor_prelude()

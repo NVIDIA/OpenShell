@@ -189,6 +189,7 @@ impl ComputeDriver for FakeComputeDriver {
                 driver_name: state.driver_name.clone(),
                 driver_version: state.driver_version.clone(),
                 default_image: state.default_image.clone(),
+                features: Vec::new(),
             }
         });
         Ok(Response::new(response))

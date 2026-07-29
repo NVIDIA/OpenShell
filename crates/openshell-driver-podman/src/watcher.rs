@@ -22,8 +22,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 
 // Condition reason constants shared across event-building paths.
-const CONDITION_RUNNING: &str = "ContainerRunning";
 const CONDITION_STARTING: &str = "ContainerStarting";
+const CONDITION_RUNNING: &str = "ContainerRunning";
 const CONDITION_EXITED: &str = "ContainerExited";
 const CONDITION_STOPPED: &str = "ContainerStopped";
 
@@ -293,7 +293,13 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
         .get(LABEL_SANDBOX_WORKSPACE)
         .cloned()?;
 
-    let condition = condition_from_state(&inspect.state);
+    let trusted_init = inspect
+        .config
+        .labels
+        .get(openshell_core::driver_utils::LABEL_TRUSTED_WORKLOAD_INIT)
+        .map(String::as_str)
+        == Some(openshell_core::trusted_workload_init::FEATURE);
+    let condition = condition_from_state(&inspect.state, trusted_init);
     let deleting = inspect.state.status == "removing";
 
     Some(build_driver_sandbox(
@@ -316,8 +322,18 @@ pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<Driv
         .cloned()
         .unwrap_or_default();
     let workspace = entry.labels.get(LABEL_SANDBOX_WORKSPACE).cloned()?;
+    let trusted_init = entry
+        .labels
+        .get(openshell_core::driver_utils::LABEL_TRUSTED_WORKLOAD_INIT)
+        .map(String::as_str)
+        == Some(openshell_core::trusted_workload_init::FEATURE);
 
     let (reason, status_str, message) = match entry.state.as_str() {
+        "running" if trusted_init => (
+            "HealthStatusUnknown",
+            "False",
+            "Container is running but inspected health status is unavailable".to_string(),
+        ),
         "running" => (
             CONDITION_RUNNING,
             "True",
@@ -348,12 +364,17 @@ pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<Driv
 }
 
 /// Derive a `DriverCondition` from Podman container state.
-fn condition_from_state(state: &ContainerState) -> DriverCondition {
+fn condition_from_state(state: &ContainerState, trusted_init: bool) -> DriverCondition {
     let (status_val, reason, message) = match state.status.as_str() {
         "running" => match &state.health {
             Some(HealthState { status }) if status == "healthy" => {
                 ("True", "HealthCheckPassed", String::new())
             }
+            Some(HealthState { status }) if status == "unhealthy" && trusted_init => (
+                "False",
+                "HealthCheckStarting",
+                "Trusted initialization or supervisor startup is still in progress".to_string(),
+            ),
             Some(HealthState { status }) if status == "unhealthy" => {
                 ("False", "HealthCheckFailed", String::new())
             }
@@ -418,11 +439,30 @@ mod tests {
             started_at: Some("2026-04-14T10:00:00Z".to_string()),
             finished_at: None,
         };
-        let cond = condition_from_state(&state);
+        let cond = condition_from_state(&state, false);
         assert_eq!(cond.r#type, "Ready");
         assert_eq!(cond.status, "True");
         assert_eq!(cond.reason, "HealthCheckPassed");
         assert_eq!(cond.last_transition_time, "2026-04-14T10:00:00Z");
+    }
+
+    #[test]
+    fn condition_unhealthy_trusted_init_remains_nonterminal() {
+        let state = ContainerState {
+            status: "running".to_string(),
+            running: true,
+            exit_code: 0,
+            oom_killed: false,
+            health: Some(HealthState {
+                status: "unhealthy".to_string(),
+            }),
+            started_at: Some("2026-04-14T10:00:00Z".to_string()),
+            finished_at: None,
+        };
+
+        let cond = condition_from_state(&state, true);
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason, "HealthCheckStarting");
     }
 
     #[test]
@@ -436,7 +476,7 @@ mod tests {
             started_at: None,
             finished_at: Some("2026-04-14T11:00:00Z".to_string()),
         };
-        let cond = condition_from_state(&state);
+        let cond = condition_from_state(&state, false);
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, "OOMKilled");
         assert_eq!(cond.last_transition_time, "2026-04-14T11:00:00Z");
@@ -453,7 +493,7 @@ mod tests {
             started_at: None,
             finished_at: Some("2026-04-14T12:00:00Z".to_string()),
         };
-        let cond = condition_from_state(&state);
+        let cond = condition_from_state(&state, false);
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, "ContainerExited");
         assert!(cond.message.contains("code 1"));
@@ -487,7 +527,37 @@ mod tests {
         assert_eq!(status.conditions.len(), 1);
         let cond = &status.conditions[0];
         assert_eq!(cond.status, "True");
-        assert_eq!(cond.reason, "ContainerRunning");
+        assert_eq!(cond.reason, CONDITION_RUNNING);
+        assert!(!status.deleting);
+    }
+
+    #[test]
+    fn sandbox_event_from_list_entry_trusted_init_fails_closed_without_health() {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(LABEL_SANDBOX_ID.to_string(), "test-id".to_string());
+        labels.insert(LABEL_SANDBOX_NAME.to_string(), "test-name".to_string());
+        labels.insert(LABEL_SANDBOX_WORKSPACE.to_string(), "default".to_string());
+        labels.insert(
+            openshell_core::driver_utils::LABEL_TRUSTED_WORKLOAD_INIT.to_string(),
+            openshell_core::trusted_workload_init::FEATURE.to_string(),
+        );
+
+        let entry = ContainerListEntry {
+            id: "abc123def456789".to_string(),
+            names: vec!["openshell-sandbox-test-name".to_string()],
+            state: "running".to_string(),
+            labels,
+            ports: None,
+            networks: None,
+            exit_code: 0,
+        };
+
+        let sandbox = driver_sandbox_from_list_entry(&entry).expect("should produce a sandbox");
+        let status = sandbox.status.expect("should have status");
+        assert_eq!(status.conditions.len(), 1);
+        let cond = &status.conditions[0];
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason, "HealthStatusUnknown");
         assert!(!status.deleting);
     }
 

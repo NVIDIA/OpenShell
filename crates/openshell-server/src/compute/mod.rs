@@ -157,6 +157,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub driver_name: String,
     /// Driver-reported implementation version from the startup capability snapshot.
     pub driver_version: String,
+    /// Versioned optional features reported at driver startup.
+    pub features: Vec<String>,
 }
 
 #[tonic::async_trait]
@@ -411,6 +413,7 @@ impl ComputeRuntime {
             name: driver_name,
             driver_name: capabilities.driver_name,
             driver_version: capabilities.driver_version,
+            features: capabilities.features,
         };
         let default_image = capabilities.default_image;
         Ok(Self {
@@ -588,16 +591,29 @@ impl ComputeRuntime {
     }
 
     #[must_use]
+    pub fn supports_feature(&self, feature: &str) -> bool {
+        self.driver_info
+            .features
+            .iter()
+            .any(|advertised| advertised == feature)
+    }
+
+    #[must_use]
     pub fn gateway_bind_addresses(&self) -> &[SocketAddr] {
         &self.gateway_bind_addresses
     }
 
-    pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
+    pub async fn validate_sandbox_create(
+        &self,
+        sandbox: &Sandbox,
+        trusted_workload_init: Option<&openshell_core::proto::compute::v1::TrustedWorkloadInitPlan>,
+    ) -> Result<(), Status> {
         let driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
         self.driver
             .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
                 sandbox: Some(driver_sandbox),
+                trusted_workload_init: trusted_workload_init.cloned(),
             }))
             .await
             .map(|_| ())
@@ -607,6 +623,7 @@ impl ComputeRuntime {
         &self,
         sandbox: Sandbox,
         sandbox_token: Option<String>,
+        trusted_workload_init: Option<openshell_core::proto::compute::v1::TrustedWorkloadInitPlan>,
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
         let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
@@ -659,6 +676,7 @@ impl ComputeRuntime {
             .driver
             .create_sandbox(Request::new(CreateSandboxRequest {
                 sandbox: Some(driver_sandbox),
+                trusted_workload_init,
             }))
             .await
         {
@@ -2748,6 +2766,7 @@ impl ComputeDriver for NoopTestDriver {
                 driver_name: "noop-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
+                features: Vec::new(),
             },
         ))
     }
@@ -2835,6 +2854,7 @@ pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -
             name: driver_name.to_string(),
             driver_name: driver_name.to_string(),
             driver_version: "test".to_string(),
+            features: Vec::new(),
         },
         shutdown_cleanup: None,
         startup_resume: None,
@@ -2998,6 +3018,7 @@ mod tests {
                 driver_name: "test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
+                features: Vec::new(),
             }))
         }
 
@@ -3180,6 +3201,7 @@ mod tests {
                 driver_name: "controlled-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
+                features: Vec::new(),
             }))
         }
 
@@ -3304,6 +3326,7 @@ mod tests {
                 name: "test-driver".to_string(),
                 driver_name: "test-driver".to_string(),
                 driver_version: "test".to_string(),
+                features: Vec::new(),
             },
             shutdown_cleanup: None,
             startup_resume,
@@ -4107,7 +4130,7 @@ mod tests {
             ..Default::default()
         });
 
-        runtime.create_sandbox(sandbox, None).await.unwrap();
+        runtime.create_sandbox(sandbox, None, None).await.unwrap();
         runtime
             .apply_sandbox_update(ready_driver_sandbox("sb-1", "sandbox-a"))
             .await
@@ -6127,8 +6150,11 @@ mod tests {
             ..Default::default()
         });
 
-        runtime.validate_sandbox_create(&sandbox).await.unwrap();
-        runtime.create_sandbox(sandbox, None).await.unwrap();
+        runtime
+            .validate_sandbox_create(&sandbox, None)
+            .await
+            .unwrap();
+        runtime.create_sandbox(sandbox, None, None).await.unwrap();
         assert!(
             runtime
                 .delete_sandbox("default", "uds-sandbox")
@@ -6196,7 +6222,7 @@ mod tests {
             deletion_timestamp_ms: 0,
         });
 
-        let created = runtime.create_sandbox(sandbox, None).await.unwrap();
+        let created = runtime.create_sandbox(sandbox, None, None).await.unwrap();
 
         assert_eq!(
             created.metadata.as_ref().unwrap().resource_version,
@@ -6231,7 +6257,7 @@ mod tests {
             .labels
             .insert("env".to_string(), "prod".to_string());
 
-        runtime.create_sandbox(sandbox, None).await.unwrap();
+        runtime.create_sandbox(sandbox, None, None).await.unwrap();
 
         let matching = runtime
             .store
@@ -6255,11 +6281,13 @@ mod tests {
         // Spawn two concurrent creation attempts for the same sandbox
         let runtime1 = runtime.clone();
         let sandbox1 = sandbox.clone();
-        let handle1 = tokio::spawn(async move { runtime1.create_sandbox(sandbox1, None).await });
+        let handle1 =
+            tokio::spawn(async move { runtime1.create_sandbox(sandbox1, None, None).await });
 
         let runtime2 = runtime.clone();
         let sandbox2 = sandbox.clone();
-        let handle2 = tokio::spawn(async move { runtime2.create_sandbox(sandbox2, None).await });
+        let handle2 =
+            tokio::spawn(async move { runtime2.create_sandbox(sandbox2, None, None).await });
 
         // Wait for both to complete
         let result1 = handle1.await.unwrap();

@@ -25,6 +25,8 @@ tracing = { workspace = true }
 url = { workspace = true }
 ipnet = "2"
 base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls-webpki-roots"], optional = true }
 

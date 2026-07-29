@@ -1426,6 +1426,18 @@ enum SandboxCommands {
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
 
+        /// Operator-registered trusted workload initialization contract.
+        #[arg(long, requires = "trusted_init_payload_file")]
+        trusted_init_contract: Option<String>,
+
+        /// File containing the bounded opaque trusted initializer payload.
+        #[arg(
+            long,
+            value_hint = ValueHint::FilePath,
+            requires = "trusted_init_contract"
+        )]
+        trusted_init_payload_file: Option<PathBuf>,
+
         /// Approval mode for agent-authored policy proposals.
         ///
         /// `manual` (default): every proposal lands in the draft inbox for
@@ -2909,6 +2921,8 @@ async fn main() -> Result<()> {
                     no_auto_providers,
                     labels,
                     envs,
+                    trusted_init_contract,
+                    trusted_init_payload_file,
                     approval_mode,
                     output,
                     command,
@@ -2996,6 +3010,8 @@ async fn main() -> Result<()> {
                             auto_providers_override,
                             labels: labels_map,
                             environment: env_map,
+                            trusted_init_contract: trusted_init_contract.as_deref(),
+                            trusted_init_payload_file: trusted_init_payload_file.as_deref(),
                             approval_mode: &approval_mode,
                             output: output.as_str(),
                         },

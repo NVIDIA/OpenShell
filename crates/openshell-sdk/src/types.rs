@@ -105,6 +105,31 @@ pub struct SandboxSpec {
     pub gpu: bool,
 }
 
+/// Transient input for an operator-registered trusted workload initializer.
+#[derive(Clone)]
+pub struct TrustedWorkloadInit {
+    pub contract_id: String,
+    pub payload: Vec<u8>,
+}
+
+impl std::fmt::Debug for TrustedWorkloadInit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TrustedWorkloadInit")
+            .field("contract_id", &self.contract_id)
+            .field("payload", &"[REDACTED]")
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
+}
+
+/// Optional inputs for sandbox creation that are intentionally not persisted
+/// in the public [`SandboxSpec`].
+#[derive(Clone, Debug, Default)]
+pub struct CreateSandboxOptions {
+    pub trusted_workload_init: Option<TrustedWorkloadInit>,
+}
+
 /// Reference to a sandbox owned by the gateway.
 #[derive(Clone, Debug)]
 #[non_exhaustive]

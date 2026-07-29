@@ -1,0 +1,14 @@
+#!/bin/dash
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -eu
+
+test "$(id -u):$(id -g)" = "1000:1000"
+test "$(stat -c '%u:%g' /etc/trusted-init-e2e/payload)" = "1000:1000"
+test "$(stat -c '%a' /etc/trusted-init-e2e/payload)" = "600"
+grep -qx 'agent-neutral-runtime-contract-v1' /etc/trusted-init-e2e/payload
+test ! -e /tmp/openshell-hostile-shell-before-init
+test ! -e /tmp/openshell-hostile-image-healthcheck-ran
+
+printf 'trusted-workload-init-e2e-ok\n'

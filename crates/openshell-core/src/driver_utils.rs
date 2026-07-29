@@ -30,6 +30,14 @@ pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.ai/sandbox-namespace";
 /// Container/pod label carrying the sandbox workspace.
 pub const LABEL_SANDBOX_WORKSPACE: &str = "openshell.ai/sandbox-workspace";
 
+/// Container label marking a sandbox whose startup is gated by trusted
+/// workload initialization.
+///
+/// The value is the negotiated trusted-initialization feature version. Drivers
+/// use this marker to preserve ordinary sandbox readiness semantics while
+/// requiring a successful driver-owned health probe for initialized workloads.
+pub const LABEL_TRUSTED_WORKLOAD_INIT: &str = "openshell.ai/trusted-workload-init";
+
 /// Label selector that matches all OpenShell-managed resources which carry a
 /// sandbox ID label.  Used by list and watch operations to exclude foreign
 /// resources from the same namespace.
@@ -402,10 +410,26 @@ pub fn build_capabilities_response(
     driver_version: impl Into<String>,
     default_image: impl Into<String>,
 ) -> GetCapabilitiesResponse {
+    build_capabilities_response_with_features(
+        driver_name,
+        driver_version,
+        default_image,
+        std::iter::empty::<String>(),
+    )
+}
+
+/// Build a [`GetCapabilitiesResponse`] with versioned optional features.
+pub fn build_capabilities_response_with_features(
+    driver_name: &str,
+    driver_version: impl Into<String>,
+    default_image: impl Into<String>,
+    features: impl IntoIterator<Item = impl Into<String>>,
+) -> GetCapabilitiesResponse {
     GetCapabilitiesResponse {
         driver_name: driver_name.to_string(),
         driver_version: driver_version.into(),
         default_image: default_image.into(),
+        features: features.into_iter().map(Into::into).collect(),
     }
 }
 

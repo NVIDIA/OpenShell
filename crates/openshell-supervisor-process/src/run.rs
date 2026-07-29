@@ -69,6 +69,7 @@ pub async fn run_process(
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     agent_proposals: AgentProposals,
+    trusted_init_file: Option<&std::path::Path>,
     #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
     #[cfg(target_os = "linux")] bypass_denial_tx: Option<
         tokio::sync::mpsc::UnboundedSender<DenialEvent>,
@@ -97,6 +98,8 @@ pub async fn run_process(
     if enforcement_mode.uses_privileged_process_setup() {
         crate::process::prepare_filesystem_with_identity(policy, resolved_process_identity)?;
     }
+
+    crate::trusted_init::run_if_requested(trusted_init_file, sandbox_id).await?;
 
     // Eagerly fetch initial settings and install the agent skill if the
     // proposals flag is on at startup, rather than waiting for the policy

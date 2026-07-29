@@ -46,6 +46,6 @@ pub use config::{AuthConfig, ClientConfig};
 pub use error::SdkError;
 pub use refresh::{Refresh, RefreshError, RefreshedToken, TokenSource};
 pub use types::{
-    ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxSpec,
-    ServiceStatus, WorkspaceRef,
+    CreateSandboxOptions, ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef,
+    SandboxSpec, ServiceStatus, TrustedWorkloadInit, WorkspaceRef,
 };

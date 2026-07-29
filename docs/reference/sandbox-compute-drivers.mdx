@@ -107,6 +107,56 @@ It overrides the gateway's configured default runtime class for that sandbox,
 while a typed `SandboxTemplate.runtime_class_name` value from the API still
 takes precedence.
 
+## Trusted Workload Initialization
+
+Trusted workload initialization runs an operator-registered command inside an
+authorized sandbox image before the sandbox becomes ready. The caller selects a
+contract and supplies an opaque payload file. The gateway registration owns the
+command, exact immutable image allowlist, timeout, writable paths, and Linux
+capability set.
+
+Driver support is explicit:
+
+| Compute driver | Support | Payload transport |
+|---|---|---|
+| Docker | Supported. | Root-owned mode-`0400` sealed envelope written into the stopped container before first start. |
+| Podman | Supported, including rootless Podman. | Root-only Podman secret containing the sealed envelope at the same fixed path. |
+| Kubernetes | Not supported. | None. |
+| MicroVM | Not supported. | None. |
+| Extension | Capability-gated. | The extension must implement the internal plan, run the side-loaded supervisor as container PID 1, and advertise the versioned driver feature. |
+
+The gateway reads each driver's feature list during startup. Run the
+administrator-only capability query to inspect the initialized snapshot:
+
+```shell
+openshell gateway info --output json
+```
+
+A supporting driver reports `trusted-workload-init.v1` under
+`compute_drivers[].capabilities.features`. The gateway rejects a trusted-init
+create request before persisting or creating a workload when the active driver
+does not report that feature.
+
+Docker and Podman validate the complete resolved plan and exact authorized image
+before creating the container. After runtime image inspection, each driver
+seals the plan and payload together with the sandbox ID and inspected immutable
+image ID in a runtime-native root-only envelope. A fixed supervisor argv flag,
+not environment or file presence, activates initialization. The supervisor
+verifies the envelope, then executes the operator command before SSH, gateway
+session registration, and the user workload. Any validation error, timeout,
+nonzero exit, or receipt mismatch fails sandbox startup instead of bypassing
+initialization.
+
+For trusted-init containers, Docker and Podman replace image health checks with
+a driver-owned exec-form probe that invokes the side-loaded supervisor. The
+probe reports backend readiness only when a success receipt matches the sandbox
+ID and plan digest and the supervisor SSH socket is ready. Image-owned health
+checks and shell hooks cannot mark a trusted-init sandbox ready.
+
+See [Trusted Workload Initialization](./gateway-config#trusted-workload-initialization)
+for registration fields and the paired
+`--trusted-init-contract` and `--trusted-init-payload-file` flags.
+
 ## Docker Driver
 
 [Docker](https://www.docker.com/get-started/)-backed sandboxes run as containers on the gateway host. Use Docker for local development, single-machine gateways, and hosts that already use Docker Desktop or Docker Engine.

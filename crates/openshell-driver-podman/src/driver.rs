@@ -17,7 +17,7 @@ use openshell_core::gpu::{
     effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
 use openshell_core::proto::compute::v1::{
-    DriverSandbox, GetCapabilitiesResponse, GpuResourceRequirements,
+    DriverSandbox, GetCapabilitiesResponse, GpuResourceRequirements, TrustedWorkloadInitPlan,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -112,6 +112,52 @@ async fn cleanup_sandbox_token_secret(client: &PodmanClient, secret_name: &str) 
             "Failed to remove Podman sandbox token secret"
         );
     }
+}
+
+async fn create_trusted_init_payload_secret(
+    client: &PodmanClient,
+    sandbox: &DriverSandbox,
+    trusted_workload_init: Option<&TrustedWorkloadInitPlan>,
+    resolved_image_id: &str,
+) -> Result<Option<String>, ComputeDriverError> {
+    let Some(plan) = trusted_workload_init else {
+        return Ok(None);
+    };
+    let envelope = openshell_core::trusted_workload_init::encode_envelope(
+        &sandbox.id,
+        plan,
+        resolved_image_id,
+    )
+    .map_err(ComputeDriverError::Precondition)?;
+    let secret_name = container::trusted_init_secret_name(&sandbox.id);
+    client
+        .create_secret(&secret_name, &envelope)
+        .await
+        .map_err(ComputeDriverError::from)?;
+    Ok(Some(secret_name))
+}
+
+async fn cleanup_trusted_init_payload_secret(client: &PodmanClient, secret_name: &str) {
+    if let Err(err) = client.remove_secret(secret_name).await {
+        warn!(
+            secret = %secret_name,
+            error = %err,
+            "Failed to remove Podman trusted initializer payload secret"
+        );
+    }
+}
+
+fn validate_trusted_workload_init(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    trusted_workload_init: Option<&TrustedWorkloadInitPlan>,
+) -> Result<(), ComputeDriverError> {
+    let Some(plan) = trusted_workload_init else {
+        return Ok(());
+    };
+    let image = container::resolve_image(sandbox, config);
+    openshell_core::trusted_workload_init::validate_plan(plan, image)
+        .map_err(ComputeDriverError::Precondition)
 }
 
 /// Read the operator's proxy credentials file and stage it as a per-sandbox
@@ -387,11 +433,14 @@ impl PodmanComputeDriver {
 
     /// Report driver capabilities.
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, ComputeDriverError> {
-        Ok(openshell_core::driver_utils::build_capabilities_response(
-            "podman",
-            openshell_core::VERSION,
-            &self.config.default_image,
-        ))
+        Ok(
+            openshell_core::driver_utils::build_capabilities_response_with_features(
+                "podman",
+                openshell_core::VERSION,
+                &self.config.default_image,
+                [openshell_core::trusted_workload_init::FEATURE],
+            ),
+        )
     }
 
     #[must_use]
@@ -403,14 +452,19 @@ impl PodmanComputeDriver {
     pub async fn validate_sandbox_create(
         &self,
         sandbox: &DriverSandbox,
+        trusted_workload_init: Option<&TrustedWorkloadInitPlan>,
     ) -> Result<(), ComputeDriverError> {
-        let _ = self.validated_sandbox_create(sandbox).await?;
+        validate_trusted_workload_init(sandbox, &self.config, trusted_workload_init)?;
+        let _ = self
+            .validated_sandbox_create(sandbox, trusted_workload_init.is_some())
+            .await?;
         Ok(())
     }
 
     async fn validated_sandbox_create<'a>(
         &self,
         sandbox: &'a DriverSandbox,
+        trusted_workload_init: bool,
     ) -> Result<ValidatedPodmanSandbox<'a>, ComputeDriverError> {
         let gpu_requirements = sandbox
             .spec
@@ -418,6 +472,12 @@ impl PodmanComputeDriver {
             .and_then(|spec| spec.resource_requirements.as_ref())
             .and_then(|requirements| driver_gpu_requirements(Some(requirements)));
         let driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
+        if trusted_workload_init && driver_config.has_mounts() {
+            return Err(ComputeDriverError::Precondition(
+                "podman driver_config mounts are not allowed with trusted workload initialization"
+                    .to_string(),
+            ));
+        }
         Self::validate_gpu_request(gpu_requirements, &driver_config)?;
         self.validate_user_volume_mounts_available(sandbox).await?;
         let _ = self.resolve_gpu_cdi_devices(
@@ -514,7 +574,11 @@ impl PodmanComputeDriver {
     }
 
     /// Create a sandbox container.
-    pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), ComputeDriverError> {
+    pub async fn create_sandbox(
+        &self,
+        sandbox: &DriverSandbox,
+        trusted_workload_init: Option<&TrustedWorkloadInitPlan>,
+    ) -> Result<(), ComputeDriverError> {
         if sandbox.name.is_empty() {
             return Err(ComputeDriverError::Precondition(
                 "sandbox name is required".into(),
@@ -530,7 +594,10 @@ impl PodmanComputeDriver {
         // resources (volume), so we don't leave orphans when the name is
         // invalid.
         let name = validated_container_name(sandbox)?;
-        let validated = self.validated_sandbox_create(sandbox).await?;
+        validate_trusted_workload_init(sandbox, &self.config, trusted_workload_init)?;
+        let validated = self
+            .validated_sandbox_create(sandbox, trusted_workload_init.is_some())
+            .await?;
 
         let vol_name = container::volume_name(&sandbox.id);
 
@@ -619,8 +686,28 @@ impl PodmanComputeDriver {
                     return Err(e);
                 }
             };
+        let trusted_init_secret_name = match create_trusted_init_payload_secret(
+            &self.client,
+            sandbox,
+            trusted_workload_init,
+            &inspected_image.id,
+        )
+        .await
+        {
+            Ok(name) => name,
+            Err(e) => {
+                let _ = self.client.remove_volume(&vol_name).await;
+                if let Some(secret) = token_secret_name.as_deref() {
+                    cleanup_sandbox_token_secret(&self.client, secret).await;
+                }
+                if let Some(secret) = proxy_auth_secret_name.as_deref() {
+                    cleanup_sandbox_proxy_auth_secret(&self.client, secret).await;
+                }
+                return Err(e);
+            }
+        };
 
-        // Clean up the volume and both per-sandbox secrets on any failure past
+        // Clean up the volume and per-sandbox secrets on any failure past
         // this point.
         let cleanup_created = || async {
             let _ = self.client.remove_volume(&vol_name).await;
@@ -629,6 +716,9 @@ impl PodmanComputeDriver {
             }
             if let Some(secret) = proxy_auth_secret_name.as_deref() {
                 cleanup_sandbox_proxy_auth_secret(&self.client, secret).await;
+            }
+            if let Some(secret) = trusted_init_secret_name.as_deref() {
+                cleanup_trusted_init_payload_secret(&self.client, secret).await;
             }
         };
 
@@ -649,9 +739,13 @@ impl PodmanComputeDriver {
             &self.config,
             token_secret_name.as_deref(),
             gpu_devices.as_deref(),
-            image,
-            &inspected_image.id,
-            image_user,
+            container::PodmanImageIdentity {
+                requested: image,
+                immutable_id: &inspected_image.id,
+                oci_user: image_user,
+            },
+            trusted_init_secret_name.as_deref(),
+            trusted_workload_init,
         ) {
             Ok(spec) => spec,
             Err(e) => {
@@ -744,6 +838,11 @@ impl PodmanComputeDriver {
                 &container::proxy_auth_secret_name(sandbox_id),
             )
             .await;
+            cleanup_trusted_init_payload_secret(
+                &self.client,
+                &container::trusted_init_secret_name(sandbox_id),
+            )
+            .await;
             return Ok(false);
         };
         info!(sandbox_id = %sandbox_id, container = %container_id, "Deleting sandbox container");
@@ -774,6 +873,11 @@ impl PodmanComputeDriver {
         cleanup_sandbox_proxy_auth_secret(
             &self.client,
             &container::proxy_auth_secret_name(sandbox_id),
+        )
+        .await;
+        cleanup_trusted_init_payload_secret(
+            &self.client,
+            &container::trusted_init_secret_name(sandbox_id),
         )
         .await;
 
@@ -1232,7 +1336,10 @@ mod tests {
             ..Default::default()
         };
 
-        driver.validate_sandbox_create(&sandbox).await.unwrap();
+        driver
+            .validate_sandbox_create(&sandbox, None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1252,7 +1359,10 @@ mod tests {
             ..Default::default()
         };
 
-        driver.validate_sandbox_create(&sandbox).await.unwrap();
+        driver
+            .validate_sandbox_create(&sandbox, None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1271,7 +1381,10 @@ mod tests {
             ..Default::default()
         };
 
-        let err = driver.validate_sandbox_create(&sandbox).await.unwrap_err();
+        let err = driver
+            .validate_sandbox_create(&sandbox, None)
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().contains("nvidia.com/gpu=all"));
     }
@@ -1293,7 +1406,10 @@ mod tests {
             ..Default::default()
         };
 
-        driver.validate_sandbox_create(&sandbox).await.unwrap();
+        driver
+            .validate_sandbox_create(&sandbox, None)
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -1496,7 +1612,7 @@ mod tests {
         let sandbox = sandbox_with_volume_mount("work-bind");
 
         let err = driver
-            .validate_sandbox_create(&sandbox)
+            .validate_sandbox_create(&sandbox, None)
             .await
             .expect_err("bind-backed volume should require bind mount opt-in");
 
@@ -1533,7 +1649,7 @@ mod tests {
         let sandbox = sandbox_with_volume_mount("work-rbind");
 
         let err = driver
-            .validate_sandbox_create(&sandbox)
+            .validate_sandbox_create(&sandbox, None)
             .await
             .expect_err("rbind-backed volume should require bind mount opt-in");
 
@@ -1575,7 +1691,7 @@ mod tests {
         let sandbox = sandbox_with_volume_mount("work-bind");
 
         driver
-            .validate_sandbox_create(&sandbox)
+            .validate_sandbox_create(&sandbox, None)
             .await
             .expect("bind-backed volume should be allowed when bind mounts are enabled");
 
@@ -1684,7 +1800,7 @@ mod tests {
         let driver = test_driver_with_config(proxy_auth_config(socket_path.clone(), &auth_file));
 
         driver
-            .create_sandbox(&plain_sandbox(sandbox_id, "demo"))
+            .create_sandbox(&plain_sandbox(sandbox_id, "demo"), None)
             .await
             .expect_err("container create should fail");
 
@@ -1728,7 +1844,7 @@ mod tests {
         let driver = test_driver_with_config(proxy_auth_config(socket_path.clone(), &auth_file));
 
         driver
-            .create_sandbox(&plain_sandbox(sandbox_id, "demo"))
+            .create_sandbox(&plain_sandbox(sandbox_id, "demo"), None)
             .await
             .expect_err("container start should fail");
 

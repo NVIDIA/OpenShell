@@ -8,7 +8,9 @@ use openshell_core::ComputeDriverError;
 use openshell_core::driver_mounts::SelinuxLabel;
 #[cfg(test)]
 use openshell_core::gpu::{driver_gpu_requirements, validate_specific_gpu_device_request};
-use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
+use openshell_core::proto::compute::v1::{
+    DriverSandbox, DriverSandboxTemplate, TrustedWorkloadInitPlan,
+};
 use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
 use openshell_core::{driver_mounts, proto_struct};
 use serde::Serialize;
@@ -54,6 +56,7 @@ const VOLUME_PREFIX: &str = "openshell-sandbox-";
 /// Secret name prefix for per-sandbox gateway JWTs.
 const TOKEN_SECRET_PREFIX: &str = "openshell-token-";
 const PROXY_AUTH_SECRET_PREFIX: &str = "openshell-proxy-auth-";
+const TRUSTED_INIT_SECRET_PREFIX: &str = "openshell-trusted-init-";
 
 /// Container-side mount paths for client TLS materials and the sandbox token.
 const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
@@ -100,6 +103,11 @@ impl PodmanSandboxDriverConfig {
         serde_json::from_value(proto_struct::struct_to_json_value(config)).map_err(|err| {
             ComputeDriverError::InvalidArgument(format!("invalid podman driver_config: {err}"))
         })
+    }
+
+    #[must_use]
+    pub(crate) fn has_mounts(&self) -> bool {
+        !self.mounts.is_empty()
     }
 }
 
@@ -169,6 +177,12 @@ pub fn token_secret_name(sandbox_id: &str) -> String {
 #[must_use]
 pub fn proxy_auth_secret_name(sandbox_id: &str) -> String {
     format!("{PROXY_AUTH_SECRET_PREFIX}{sandbox_id}")
+}
+
+/// Build the per-sandbox Podman secret name for a trusted initializer payload.
+#[must_use]
+pub fn trusted_init_secret_name(sandbox_id: &str) -> String {
+    format!("{TRUSTED_INIT_SECRET_PREFIX}{sandbox_id}")
 }
 
 /// Truncate a container ID to 12 characters (standard short form).
@@ -397,7 +411,9 @@ fn build_env(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
     image: &str,
+    _image_id: &str,
     oci_user: &str,
+    _trusted_workload_init: Option<&TrustedWorkloadInitPlan>,
 ) -> BTreeMap<String, String> {
     let spec = sandbox.spec.as_ref();
     let template = spec.and_then(|s| s.template.as_ref());
@@ -423,6 +439,7 @@ fn build_env(
             user_env.insert(k.clone(), v.clone());
         }
     }
+    user_env.retain(|key, _| !openshell_core::trusted_workload_init::is_supervisor_env_var(key));
     env.extend(user_env.clone());
     if !user_env.is_empty()
         && let Ok(json) = serde_json::to_string(&user_env)
@@ -902,10 +919,22 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         config,
         token_secret_name,
         gpu_device_ids,
-        image,
-        image,
-        "",
+        PodmanImageIdentity {
+            requested: image,
+            immutable_id: image,
+            oci_user: "",
+        },
+        None,
+        None,
     )
+}
+
+/// Runtime-inspected identity used to pin a Podman container create.
+#[derive(Clone, Copy)]
+pub struct PodmanImageIdentity<'a> {
+    pub requested: &'a str,
+    pub immutable_id: &'a str,
+    pub oci_user: &'a str,
 }
 
 pub fn build_container_spec_for_image(
@@ -913,15 +942,28 @@ pub fn build_container_spec_for_image(
     config: &PodmanComputeConfig,
     token_secret_name: Option<&str>,
     gpu_device_ids: Option<&[String]>,
-    requested_image: &str,
-    image_id: &str,
-    oci_user: &str,
+    image: PodmanImageIdentity<'_>,
+    trusted_init_secret_name: Option<&str>,
+    trusted_workload_init: Option<&TrustedWorkloadInitPlan>,
 ) -> Result<Value, ComputeDriverError> {
     let name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     let vol = volume_name(&sandbox.id);
 
-    let env = build_env(sandbox, config, requested_image, oci_user);
-    let labels = build_labels(sandbox);
+    let env = build_env(
+        sandbox,
+        config,
+        image.requested,
+        image.immutable_id,
+        image.oci_user,
+        trusted_workload_init,
+    );
+    let mut labels = build_labels(sandbox);
+    if trusted_workload_init.is_some() {
+        labels.insert(
+            openshell_core::driver_utils::LABEL_TRUSTED_WORKLOAD_INIT.to_string(),
+            openshell_core::trusted_workload_init::FEATURE.to_string(),
+        );
+    }
     let resource_limits = build_resource_limits(sandbox, config);
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
@@ -933,6 +975,12 @@ pub fn build_container_spec_for_image(
     {
         return Err(ComputeDriverError::Precondition(
             "podman sandbox token secret is required when sandbox token is set".to_string(),
+        ));
+    }
+    if trusted_workload_init.is_some() && trusted_init_secret_name.is_none() {
+        return Err(ComputeDriverError::Precondition(
+            "podman trusted initializer payload secret is required when trusted initialization is set"
+                .to_string(),
         ));
     }
     let devices = gpu_device_ids.map(|device_ids| {
@@ -966,7 +1014,7 @@ pub fn build_container_spec_for_image(
 
     let container_spec = ContainerSpec {
         name,
-        image: image_id.to_string(),
+        image: image.immutable_id.to_string(),
         labels,
         env,
         volumes,
@@ -987,7 +1035,15 @@ pub fn build_container_spec_for_image(
         // Operator-owned corporate proxy flags. The workload command is not
         // part of argv (the supervisor takes it from the reserved command
         // env var), so these flags are the whole command list.
-        command: upstream_proxy_cli_args(config),
+        command: {
+            let mut command = upstream_proxy_cli_args(config);
+            if trusted_workload_init.is_some() {
+                command.push(openshell_core::trusted_workload_init::ENVELOPE_CLI_FLAG.to_string());
+                command
+                    .push(openshell_core::trusted_workload_init::ENVELOPE_MOUNT_PATH.to_string());
+            }
+            command
+        },
         // Force the supervisor to run as root (UID 0). Sandbox images may
         // set a non-root USER directive (e.g. `USER sandbox`), but the
         // supervisor needs root to create network namespaces, set up the
@@ -1066,14 +1122,28 @@ pub fn build_container_spec_for_image(
         seccomp_profile_path: "unconfined".into(),
         image_pull_policy: "never".to_string(),
         healthconfig: HealthConfig {
-            test: vec![
-                "CMD-SHELL".into(),
-                format!(
-                    "test -e /var/run/openshell-ssh-ready || test -S {} || ss -tlnp | grep -q :{}",
-                    config.sandbox_ssh_socket_path,
-                    openshell_core::config::DEFAULT_SSH_PORT
-                ),
-            ],
+            test: trusted_workload_init.map_or_else(
+                || {
+                    vec![
+                        "CMD-SHELL".into(),
+                        format!(
+                            "test -e /var/run/openshell-ssh-ready || test -S {} || ss -tlnp | grep -q :{}",
+                            config.sandbox_ssh_socket_path,
+                            openshell_core::config::DEFAULT_SSH_PORT
+                        ),
+                    ]
+                },
+                |plan| {
+                    vec![
+                        "CMD".into(),
+                        SUPERVISOR_BINARY_PATH.into(),
+                        openshell_core::trusted_workload_init::HEALTHCHECK_SUBCOMMAND.into(),
+                        sandbox.id.clone(),
+                        openshell_core::trusted_workload_init::plan_sha256(plan),
+                        config.sandbox_ssh_socket_path.clone(),
+                    ]
+                },
+            ),
             interval: config.health_check_interval_secs * 1_000_000_000,
             timeout: 2_000_000_000,
             retries: 10,
@@ -1100,6 +1170,15 @@ pub fn build_container_spec_for_image(
                 secrets.push(SecretMount {
                     source: proxy_auth_secret_name(&sandbox.id),
                     target: UPSTREAM_PROXY_AUTH_MOUNT_PATH.into(),
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o400,
+                });
+            }
+            if let Some(source) = trusted_init_secret_name {
+                secrets.push(SecretMount {
+                    source: source.to_string(),
+                    target: openshell_core::trusted_workload_init::ENVELOPE_MOUNT_PATH.into(),
                     uid: 0,
                     gid: 0,
                     mode: 0o400,
@@ -1376,9 +1455,13 @@ mod tests {
             &test_config(),
             None,
             None,
-            "registry.example/app:latest",
-            "sha256:immutable",
-            "app:staff",
+            PodmanImageIdentity {
+                requested: "registry.example/app:latest",
+                immutable_id: "sha256:immutable",
+                oci_user: "app:staff",
+            },
+            None,
+            None,
         )
         .unwrap();
 
@@ -2063,6 +2146,57 @@ mod tests {
             sandbox_ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
             ..PodmanComputeConfig::default()
         }
+    }
+
+    fn trusted_init_plan() -> TrustedWorkloadInitPlan {
+        TrustedWorkloadInitPlan {
+            contract_id: "example.onboarding.v1".to_string(),
+            payload: b"onboarding".to_vec(),
+            payload_sha256: "a4963c49961afb237b424cf89f69899c335dd77ec4681e9402c0040cd05b17c0"
+                .to_string(),
+            command: vec!["/usr/local/bin/onboard".to_string()],
+            timeout_seconds: 30,
+            writable_paths: vec!["/etc/example-agent".to_string()],
+            image: "test-image:latest".to_string(),
+            capabilities: vec!["CHOWN".to_string()],
+        }
+    }
+
+    #[test]
+    fn trusted_init_container_uses_supervisor_exec_healthcheck() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let plan = trusted_init_plan();
+        let spec = build_container_spec_for_image(
+            &sandbox,
+            &config,
+            None,
+            None,
+            PodmanImageIdentity {
+                requested: "test-image:latest",
+                immutable_id: "sha256:immutable",
+                oci_user: "",
+            },
+            Some("trusted-secret"),
+            Some(&plan),
+        )
+        .unwrap();
+
+        assert_eq!(
+            spec["labels"][openshell_core::driver_utils::LABEL_TRUSTED_WORKLOAD_INIT].as_str(),
+            Some(openshell_core::trusted_workload_init::FEATURE)
+        );
+        assert_eq!(
+            spec["healthconfig"]["test"],
+            serde_json::json!([
+                "CMD",
+                SUPERVISOR_BINARY_PATH,
+                openshell_core::trusted_workload_init::HEALTHCHECK_SUBCOMMAND,
+                sandbox.id,
+                openshell_core::trusted_workload_init::plan_sha256(&plan),
+                config.sandbox_ssh_socket_path,
+            ])
+        );
     }
 
     #[test]

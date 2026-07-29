@@ -1,0 +1,11 @@
+#!/bin/dash
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -eu
+
+test "$(id -u):$(id -g)" = "1000:1000"
+test ! -e /etc/trusted-init-e2e/payload
+test ! -e /var/lib/openshell/trusted-init/receipt.json
+
+printf 'ordinary-create-e2e-ok\n'

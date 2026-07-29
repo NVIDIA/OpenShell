@@ -419,6 +419,7 @@ cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
 {
   e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-podman-${HOST_PORT}"
   e2e_write_gateway_mtls_auth_config
+  e2e_write_trusted_workload_init_config
   printf '\n[openshell.drivers.podman]\n'
   # The Podman driver scopes isolation by network rather than namespace.
   printf 'network_name = %s\n'   "$(toml_string "${PODMAN_NETWORK_NAME}")"

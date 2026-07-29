@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+FROM public.ecr.aws/docker/library/python:3.13-slim
+
+# iproute2 supplies the networking tools used by the sandbox supervisor.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid 1000 sandbox \
+    && useradd --create-home --uid 1000 --gid sandbox sandbox \
+    && install -d -m 0755 /usr/local/libexec
+
+COPY openshell-e2e-trusted-init /usr/local/bin/openshell-e2e-trusted-init
+COPY openshell-e2e-workload-check /usr/local/bin/openshell-e2e-workload-check
+COPY openshell-e2e-ordinary-check /usr/local/bin/openshell-e2e-ordinary-check
+COPY openshell-e2e-hostile-sh /usr/local/libexec/openshell-e2e-hostile-sh
+
+RUN chmod 0755 \
+      /usr/local/bin/openshell-e2e-trusted-init \
+      /usr/local/bin/openshell-e2e-workload-check \
+      /usr/local/bin/openshell-e2e-ordinary-check \
+      /usr/local/libexec/openshell-e2e-hostile-sh \
+    && rm /bin/sh \
+    && ln -s /usr/local/libexec/openshell-e2e-hostile-sh /bin/sh
+
+# A trusted-init runtime must suppress image-owned healthchecks until the
+# supervisor has completed the registered initializer. The command is
+# intentionally shell-form so an unsafe runtime also trips the hostile
+# /bin/sh sentinel.
+HEALTHCHECK --interval=1s --timeout=1s --start-period=1s --retries=30 \
+  CMD touch /tmp/openshell-hostile-image-healthcheck-ran
+
+USER 1000:1000
+CMD ["sleep", "infinity"]

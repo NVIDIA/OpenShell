@@ -119,6 +119,19 @@ grpc_endpoint = "http://host.openshell.internal:50051"
 max_body_bytes = 262144
 timeout = "500ms"
 
+# Operator-owned pre-readiness initialization contract for an exact workload
+# image. Docker and Podman drivers support this contract.
+[[openshell.supervisor.trusted_workload_init]]
+contract_id = "example.agent-onboarding.v1"
+images = [
+  "ghcr.io/example/agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+]
+command = ["/usr/local/bin/agent-onboarding"]
+max_payload_bytes = 65536
+timeout_seconds = 120
+writable_paths = ["/etc/example-agent", "/var/lib/example-agent"]
+capabilities = ["CHOWN", "FOWNER"]
+
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
@@ -198,6 +211,105 @@ The gateway connects to every registered service and validates `Describe` before
 The service `grpc_endpoint` currently supports plaintext `http://` and TLS `https://` using the platform trust store. Custom trust roots, client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
 
 See [Supervisor Middleware](/extensibility/supervisor-middleware) for selection, failure, body-limit, and operational guidance.
+
+## Trusted Workload Initialization
+
+Register a trusted workload initialization contract when an approved sandbox
+image must perform operator-defined setup before the sandbox becomes ready.
+Registration is static and operator-owned. Changing a registration requires
+restarting the gateway.
+
+```toml
+[[openshell.supervisor.trusted_workload_init]]
+contract_id = "example.agent-onboarding.v1"
+images = [
+  "ghcr.io/example/agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+]
+command = ["/usr/local/bin/agent-onboarding"]
+max_payload_bytes = 65536
+timeout_seconds = 120
+writable_paths = ["/etc/example-agent", "/var/lib/example-agent"]
+capabilities = ["CHOWN", "FOWNER"]
+```
+
+The registration defines every privileged execution property:
+
+| Field | Description |
+|---|---|
+| `contract_id` | Stable identifier selected by the sandbox caller. Use lowercase ASCII letters, digits, `.`, `-`, or `_`, with a maximum length of 128 bytes. Registration identifiers must be unique. |
+| `images` | Exact workload images authorized for the contract. Each value must be an OCI digest reference such as `name@sha256:<64-hex-digest>` or a bare `sha256:<64-hex-image-id>`. Mutable tags are rejected. |
+| `command` | Fixed argument vector executed directly without a shell. The executable must use an absolute path. |
+| `max_payload_bytes` | Contract-specific payload limit in bytes. Set a value from `1` through the 384 KiB platform maximum. |
+| `timeout_seconds` | Hard execution deadline from `1` through `300` seconds. |
+| `writable_paths` | Normalized absolute paths the initializer may modify. The list cannot include `/`, supervisor-owned paths, `/proc`, `/sys`, or `/dev`. |
+| `capabilities` | Exact Linux capability set for the initializer child. The supported closed set is `CHOWN` and `FOWNER`; use an empty list when the initializer needs neither. |
+
+The caller supplies only the registered contract identifier and an opaque
+payload file:
+
+```shell
+openshell sandbox create \
+  --from ghcr.io/example/agent@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --trusted-init-contract example.agent-onboarding.v1 \
+  --trusted-init-payload-file ./onboarding.json \
+  -- example-agent
+```
+
+You must supply `--trusted-init-contract` and
+`--trusted-init-payload-file` together. The payload path must identify a
+regular file no larger than 384 KiB. A registration can impose a smaller limit.
+The caller cannot override the registered command, environment, working
+directory, timeout, write paths, capability set, or authorized images.
+
+The built-in Docker and Podman drivers, including rootless Podman, support
+`trusted-workload-init.v1`. An administrator can verify the active driver's
+advertised feature list with:
+
+```shell
+openshell gateway info --output json
+```
+
+Check `compute_drivers[].capabilities.features` for
+`trusted-workload-init.v1`. The built-in Kubernetes and MicroVM drivers do not
+support trusted workload initialization. An extension driver can support the
+contract only when it implements the internal plan, runs the side-loaded
+supervisor as container PID 1, and advertises the same feature. The gateway
+rejects the create request before persisting or creating a workload when the
+selected driver does not advertise the feature, the contract is unregistered,
+the image does not match exactly, or the payload exceeds its limit.
+
+The payload is transient. The gateway does not store it in the public
+`Sandbox` resource or its database record. After inspecting the workload image,
+the driver seals the plan, payload, sandbox ID, and inspected immutable image ID
+into a bounded envelope. Docker writes that envelope into the stopped
+container as a root-owned mode-`0400` file before first start. Podman mounts it
+from a root-only runtime secret. Podman removes the temporary secret when
+creation fails or the sandbox is deleted; Docker removes the envelope with the
+container filesystem. Neither transport places the payload or plan in
+container environment or metadata. Docker keeps trusted-init creation
+synchronous through envelope upload and container start so a successful create
+acknowledgment no longer depends on the gateway's in-memory copy of the
+transient plan. A gateway crash before acknowledgment can still leave a
+persisted `Provisioning` row or a Docker container in `created` state; delete
+the sandbox and retry. Transparent recovery would require durable encrypted
+operation state and startup reconciliation.
+
+The driver also places a fixed, non-secret envelope path on supervisor argv.
+That flag is the only activation channel: an image-baked file or environment
+variable cannot trigger privileged initialization, and an older supervisor
+fails on the unknown flag instead of silently launching the workload. The
+supervisor verifies the contract metadata, payload digest, resolved immutable
+image identity, and prior receipt before execution. It runs the fixed command
+with the registered deadline, write allowlist, closed capability set, empty
+network namespace, and credential-isolated environment. Initialization must
+succeed before the supervisor opens SSH, registers a gateway session, launches
+the workload, or allows the sandbox to become `Ready`. Missing, malformed,
+mismatched, timed-out, or failed initialization material stops sandbox startup.
+For trusted-init containers, the Docker and Podman drivers replace image health
+checks with a fixed exec-form probe that invokes the side-loaded supervisor.
+The probe reports readiness only when a successful receipt matches the sandbox
+ID and plan digest and the supervisor SSH socket is ready. Image-owned health
+checks and shell hooks cannot advance readiness.
 
 ## Gateway Interceptors
 

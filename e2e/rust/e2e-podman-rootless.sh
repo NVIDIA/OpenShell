@@ -16,4 +16,5 @@ if [ "${rootless}" != "true" ]; then
   exit 2
 fi
 
-exec "$(dirname "${BASH_SOURCE[0]}")/e2e-podman.sh"
+"$(dirname "${BASH_SOURCE[0]}")/e2e-podman.sh"
+"$(dirname "${BASH_SOURCE[0]}")/e2e-trusted-workload-init.sh" podman

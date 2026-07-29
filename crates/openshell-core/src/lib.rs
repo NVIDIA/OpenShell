@@ -40,6 +40,7 @@ pub mod settings;
 pub mod telemetry;
 pub mod time;
 pub mod transport_errors;
+pub mod trusted_workload_init;
 
 pub use config::{
     ComputeDriverKind, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,

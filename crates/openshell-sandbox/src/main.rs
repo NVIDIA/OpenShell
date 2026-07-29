@@ -3,7 +3,7 @@
 
 //! `OpenShell` Sandbox - process sandbox and monitor.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -229,6 +229,13 @@ struct Args {
     /// (for proxies whose ACLs filter on hostnames).
     #[arg(long)]
     upstream_proxy_connect_by_hostname: bool,
+
+    /// Driver-owned root-only trusted initialization envelope.
+    ///
+    /// This internal activation channel deliberately has no environment
+    /// fallback: only a compute driver may place it on supervisor argv.
+    #[arg(long, value_name = "PATH", hide = true)]
+    trusted_init_file: Option<PathBuf>,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -480,6 +487,33 @@ fn main() -> Result<()> {
         });
     }
 
+    if raw_args.get(1).map(String::as_str)
+        == Some(openshell_core::trusted_workload_init::HEALTHCHECK_SUBCOMMAND)
+    {
+        if raw_args.len() != 5 {
+            return Err(miette::miette!(
+                "usage: openshell-sandbox {} <SANDBOX_ID> <PLAN_SHA256> <SSH_SOCKET_PATH>",
+                openshell_core::trusted_workload_init::HEALTHCHECK_SUBCOMMAND
+            ));
+        }
+        return openshell_supervisor_process::trusted_init::run_healthcheck(
+            &raw_args[2],
+            &raw_args[3],
+            Path::new(&raw_args[4]),
+        );
+    }
+
+    if raw_args.get(1).map(String::as_str)
+        == Some(openshell_supervisor_process::trusted_init::HELPER_SUBCOMMAND)
+    {
+        if raw_args.len() != 2 {
+            return Err(miette::miette!(
+                "trusted initializer helper does not accept arguments"
+            ));
+        }
+        return openshell_supervisor_process::trusted_init::run_helper();
+    }
+
     let args = Args::parse();
 
     if args.mode.network_init {
@@ -636,6 +670,7 @@ fn main() -> Result<()> {
             args.mode.network,
             args.mode.process,
             upstream_proxy_args,
+            args.trusted_init_file,
         )
         .await
     })?;

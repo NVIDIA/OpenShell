@@ -50,6 +50,86 @@ fn test_sandbox() -> DriverSandbox {
     }
 }
 
+fn trusted_init_plan() -> TrustedWorkloadInitPlan {
+    let payload = b"onboarding".to_vec();
+    TrustedWorkloadInitPlan {
+        contract_id: "example.onboarding.v1".to_string(),
+        payload_sha256: "a4963c49961afb237b424cf89f69899c335dd77ec4681e9402c0040cd05b17c0"
+            .to_string(),
+        payload,
+        command: vec!["/usr/local/bin/onboard".to_string()],
+        timeout_seconds: 30,
+        writable_paths: vec!["/etc/example-agent".to_string()],
+        image: "ghcr.io/nvidia/openshell/sandbox:dev".to_string(),
+        capabilities: vec!["CHOWN".to_string()],
+    }
+}
+
+#[test]
+fn trusted_init_archive_is_root_owned_and_binds_inspected_image() {
+    let resolved_image = format!("sha256:{}", "b".repeat(64));
+    let archive =
+        trusted_init_envelope_archive(&test_sandbox(), &trusted_init_plan(), &resolved_image)
+            .unwrap();
+    let mut archive = tar::Archive::new(std::io::Cursor::new(archive));
+    let mut found = false;
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap()
+            == Path::new(
+                openshell_core::trusted_workload_init::ENVELOPE_MOUNT_PATH.trim_start_matches('/'),
+            )
+        {
+            assert_eq!(entry.header().uid().unwrap(), 0);
+            assert_eq!(entry.header().gid().unwrap(), 0);
+            assert_eq!(entry.header().mode().unwrap() & 0o777, 0o400);
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            let envelope =
+                openshell_core::trusted_workload_init::decode_envelope(&bytes, "sbx-123").unwrap();
+            assert_eq!(envelope.resolved_image_id, resolved_image);
+            found = true;
+        }
+    }
+    assert!(found, "archive must contain the fixed envelope path");
+}
+
+#[test]
+fn trusted_init_container_uses_supervisor_exec_healthcheck() {
+    let sandbox = test_sandbox();
+    let config = runtime_config();
+    let plan = trusted_init_plan();
+    let body = build_container_create_body_with_gpu_devices(
+        &sandbox,
+        &config,
+        &DockerSandboxDriverConfig::default(),
+        None,
+        Some(&plan),
+    )
+    .unwrap();
+
+    assert_eq!(
+        body.labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_TRUSTED_WORKLOAD_INIT))
+            .map(String::as_str),
+        Some(openshell_core::trusted_workload_init::FEATURE)
+    );
+    assert_eq!(
+        body.healthcheck
+            .as_ref()
+            .and_then(|health| health.test.as_ref()),
+        Some(&vec![
+            "CMD".to_string(),
+            SUPERVISOR_MOUNT_PATH.to_string(),
+            openshell_core::trusted_workload_init::HEALTHCHECK_SUBCOMMAND.to_string(),
+            sandbox.id,
+            openshell_core::trusted_workload_init::plan_sha256(&plan),
+            config.ssh_socket_path,
+        ])
+    );
+}
+
 fn cdi_devices_config(device_ids: &[&str]) -> prost_types::Struct {
     list_string_driver_config("cdi_devices", device_ids)
 }
@@ -544,7 +624,13 @@ fn build_environment_protects_oci_identity_metadata() {
         spec.environment.insert(key.to_string(), value.to_string());
     }
 
-    let env = build_environment_for_oci_user(&sandbox, &runtime_config(), "app:staff");
+    let env = build_environment_for_oci_user(
+        &sandbox,
+        &runtime_config(),
+        "app:staff",
+        "sha256:test",
+        None,
+    );
 
     assert!(env.contains(&format!(
         "{}=app:staff",
@@ -569,6 +655,7 @@ fn container_creation_uses_inspected_immutable_image() {
         &DockerSandboxDriverConfig::default(),
         None,
         &metadata,
+        None,
     )
     .unwrap();
 
@@ -640,7 +727,7 @@ fn build_environment_keeps_telemetry_toggle_driver_controlled() {
 
 #[test]
 fn build_binds_uses_docker_tls_directory() {
-    let binds = build_binds(&test_sandbox(), &runtime_config()).unwrap();
+    let binds = build_binds(&test_sandbox(), &runtime_config(), None).unwrap();
     let targets = binds
         .iter()
         .filter_map(|bind| bind.split(':').nth(1).map(String::from))
@@ -1462,6 +1549,7 @@ fn build_container_create_body_maps_default_gpu_to_selected_cdi_device() {
         &config,
         &driver_config,
         Some(&gpu_devices),
+        None,
     )
     .unwrap();
     let request = create_body
@@ -1597,6 +1685,7 @@ fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
         &driver.config,
         &driver_config,
         Some(&first_devices),
+        None,
     )
     .unwrap();
 
@@ -1611,6 +1700,7 @@ fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
         &driver.config,
         &driver_config,
         Some(&second_devices),
+        None,
     )
     .unwrap();
 
@@ -1780,6 +1870,39 @@ fn driver_status_keeps_running_sandboxes_provisioning_with_stable_message() {
     assert_eq!(exited_status.conditions[0].status, "False");
     assert_eq!(exited_status.conditions[0].reason, "ContainerExited");
     assert_eq!(exited_status.conditions[0].message, "Container exited");
+}
+
+#[test]
+fn trusted_init_running_container_requires_healthy_probe() {
+    let labels = HashMap::from([
+        (LABEL_SANDBOX_ID.to_string(), "sbx-1".to_string()),
+        (LABEL_SANDBOX_NAME.to_string(), "demo".to_string()),
+        (LABEL_SANDBOX_NAMESPACE.to_string(), "default".to_string()),
+        (
+            LABEL_TRUSTED_WORKLOAD_INIT.to_string(),
+            openshell_core::trusted_workload_init::FEATURE.to_string(),
+        ),
+    ]);
+    let starting = ContainerSummary {
+        labels: Some(labels.clone()),
+        state: Some(ContainerSummaryStateEnum::RUNNING),
+        status: Some("Up 2 seconds (health: starting)".to_string()),
+        ..Default::default()
+    };
+    let healthy = ContainerSummary {
+        labels: Some(labels),
+        state: Some(ContainerSummaryStateEnum::RUNNING),
+        status: Some("Up 4 seconds (healthy)".to_string()),
+        ..Default::default()
+    };
+
+    let starting_status = driver_status_from_summary(&starting, "demo");
+    assert_eq!(starting_status.conditions[0].status, "False");
+    assert_eq!(starting_status.conditions[0].reason, "HealthCheckStarting");
+
+    let healthy_status = driver_status_from_summary(&healthy, "demo");
+    assert_eq!(healthy_status.conditions[0].status, "True");
+    assert_eq!(healthy_status.conditions[0].reason, "HealthCheckPassed");
 }
 
 #[test]

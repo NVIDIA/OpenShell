@@ -156,7 +156,7 @@ impl NetworkNamespace {
         let ns_path = format!("/var/run/netns/{name}");
         let ns_fd = match nix::fcntl::open(
             ns_path.as_str(),
-            nix::fcntl::OFlag::O_RDONLY,
+            nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_CLOEXEC,
             nix::sys::stat::Mode::empty(),
         ) {
             Ok(fd) => Some(fd),

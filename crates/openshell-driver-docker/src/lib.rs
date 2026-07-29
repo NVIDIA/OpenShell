@@ -8,14 +8,15 @@
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, CreateImageInfo,
-    DeviceRequest, EndpointSettings, HostConfig, Mount, MountTmpfsOptions, MountTypeEnum,
-    MountVolumeOptions, NetworkCreateRequest, NetworkingConfig, ProgressDetail, RestartPolicy,
-    RestartPolicyNameEnum, SystemInfo,
+    ContainerCreateBody, ContainerSummary, ContainerSummaryHealthStatusEnum,
+    ContainerSummaryStateEnum, CreateImageInfo, DeviceRequest, EndpointSettings, HealthConfig,
+    HostConfig, Mount, MountTmpfsOptions, MountTypeEnum, MountVolumeOptions, NetworkCreateRequest,
+    NetworkingConfig, ProgressDetail, RestartPolicy, RestartPolicyNameEnum, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
     ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
+    UploadToContainerOptionsBuilder,
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -25,8 +26,8 @@ use openshell_core::config::{
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH,
-    supervisor_image_should_refresh,
+    LABEL_SANDBOX_NAMESPACE, LABEL_SANDBOX_WORKSPACE, LABEL_TRUSTED_WORKLOAD_INIT,
+    SUPERVISOR_IMAGE_BINARY_PATH, supervisor_image_should_refresh,
 };
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
@@ -41,7 +42,7 @@ use openshell_core::proto::compute::v1::{
     DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxStatus,
     DriverSandboxTemplate, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
     GetSandboxResponse, GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    StopSandboxRequest, StopSandboxResponse, TrustedWorkloadInitPlan, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
     compute_driver_server::ComputeDriver, watch_sandboxes_event,
@@ -408,10 +409,11 @@ impl DockerComputeDriver {
     }
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
-        openshell_core::driver_utils::build_capabilities_response(
+        openshell_core::driver_utils::build_capabilities_response_with_features(
             "docker",
             &self.config.daemon_version,
             &self.config.default_image,
+            [openshell_core::trusted_workload_init::FEATURE],
         )
     }
 
@@ -619,9 +621,18 @@ impl DockerComputeDriver {
         Ok(sandboxes)
     }
 
-    async fn create_sandbox_inner(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
+    async fn create_sandbox_inner(
+        &self,
+        sandbox: &DriverSandbox,
+        trusted_workload_init: Option<TrustedWorkloadInitPlan>,
+    ) -> Result<(), Status> {
         let validated = Self::validated_sandbox(sandbox, &self.config)?;
         Self::validate_sandbox_auth(sandbox)?;
+        validate_trusted_workload_init(
+            sandbox,
+            trusted_workload_init.as_ref(),
+            &validated.driver_config,
+        )?;
         self.validate_user_volume_mounts_available(&validated.driver_config)
             .await?;
         let gpu_devices = self
@@ -636,6 +647,7 @@ impl DockerComputeDriver {
             &self.config,
             &validated.driver_config,
             gpu_devices.as_deref(),
+            trusted_workload_init.as_ref(),
         )?;
 
         if self
@@ -661,11 +673,38 @@ impl DockerComputeDriver {
             false,
         ));
 
+        // The initialization plan is deliberately transient and is not stored
+        // in the public Sandbox record. Do not acknowledge a trusted-init
+        // create until Docker has durably staged the envelope and started the
+        // container; otherwise a gateway restart could lose the only copy
+        // while an in-memory provisioning task was still pulling or creating.
+        if trusted_workload_init.is_some() {
+            return match self
+                .provision_sandbox_inner(sandbox, trusted_workload_init.as_ref())
+                .await
+            {
+                Ok(()) => {
+                    self.clear_pending_sandbox(&sandbox.id).await;
+                    Ok(())
+                }
+                Err(failure) => {
+                    self.fail_pending_sandbox(sandbox, &failure).await;
+                    self.clear_pending_sandbox(&sandbox.id).await;
+                    Err(Status::failed_precondition(format!(
+                        "{}: {}",
+                        failure.reason, failure.message
+                    )))
+                }
+            };
+        }
+
         let driver = self.clone();
         let sandbox_for_task = sandbox.clone();
         let sandbox_id = sandbox.id.clone();
         let task = tokio::spawn(async move {
-            driver.provision_sandbox(sandbox_for_task).await;
+            driver
+                .provision_sandbox(sandbox_for_task, trusted_workload_init)
+                .await;
         });
 
         let mut pending = self.pending.lock().await;
@@ -678,8 +717,15 @@ impl DockerComputeDriver {
         Ok(())
     }
 
-    async fn provision_sandbox(&self, sandbox: DriverSandbox) {
-        match self.provision_sandbox_inner(&sandbox).await {
+    async fn provision_sandbox(
+        &self,
+        sandbox: DriverSandbox,
+        trusted_workload_init: Option<TrustedWorkloadInitPlan>,
+    ) {
+        match self
+            .provision_sandbox_inner(&sandbox, trusted_workload_init.as_ref())
+            .await
+        {
             Ok(()) => {
                 self.clear_pending_sandbox(&sandbox.id).await;
             }
@@ -692,10 +738,15 @@ impl DockerComputeDriver {
     async fn provision_sandbox_inner(
         &self,
         sandbox: &DriverSandbox,
+        trusted_workload_init: Option<&TrustedWorkloadInitPlan>,
     ) -> Result<(), DockerProvisioningFailure> {
         let validated = Self::validated_sandbox(sandbox, &self.config).map_err(|status| {
             DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
         })?;
+        validate_trusted_workload_init(sandbox, trusted_workload_init, &validated.driver_config)
+            .map_err(|status| {
+                DockerProvisioningFailure::new("TrustedInitValidationFailed", status.message())
+            })?;
         let template = validated.template;
         let image = self
             .ensure_image_available(&sandbox.id, &template.image)
@@ -707,6 +758,15 @@ impl DockerComputeDriver {
             .await
             .map_err(|status| {
                 DockerProvisioningFailure::new("SandboxTokenWriteFailed", status.message())
+            })?;
+        let trusted_init_archive = trusted_workload_init
+            .map(|plan| trusted_init_envelope_archive(sandbox, plan, &image.id))
+            .transpose()
+            .map_err(|status| {
+                if token_file_created {
+                    cleanup_sandbox_token_file(sandbox, &self.config);
+                }
+                DockerProvisioningFailure::new("TrustedInitEnvelopeBuildFailed", status.message())
             })?;
 
         let container_name = container_name_for_sandbox(sandbox);
@@ -729,6 +789,7 @@ impl DockerComputeDriver {
             &validated.driver_config,
             gpu_devices.as_deref(),
             &image,
+            trusted_workload_init,
         )
         .map_err(|status| {
             if token_file_created {
@@ -761,6 +822,35 @@ impl DockerComputeDriver {
             format!("Created Docker container \"{container_name}\""),
             HashMap::from([("container_name".to_string(), container_name.clone())]),
         );
+
+        if let Some(archive) = trusted_init_archive
+            && let Err(err) = self
+                .docker
+                .upload_to_container(
+                    &container_name,
+                    Some(UploadToContainerOptionsBuilder::default().path("/").build()),
+                    bollard::body_full(Bytes::from(archive)),
+                )
+                .await
+        {
+            let _ = self
+                .docker
+                .remove_container(
+                    &container_name,
+                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+                )
+                .await;
+            if token_file_created {
+                cleanup_sandbox_token_file(sandbox, &self.config);
+            }
+            return Err(DockerProvisioningFailure::from_status(
+                "TrustedInitEnvelopeWriteFailed",
+                create_status_from_docker_error(
+                    "write trusted initializer envelope into docker sandbox",
+                    err,
+                ),
+            ));
+        }
 
         if let Err(err) = self.docker.start_container(&container_name, None).await {
             let cleanup = self
@@ -1390,11 +1480,16 @@ impl ComputeDriver for DockerComputeDriver {
         &self,
         request: Request<ValidateSandboxCreateRequest>,
     ) -> Result<Response<ValidateSandboxCreateResponse>, Status> {
+        let request = request.into_inner();
         let sandbox = request
-            .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         let validated = Self::validated_sandbox(&sandbox, &self.config)?;
+        validate_trusted_workload_init(
+            &sandbox,
+            request.trusted_workload_init.as_ref(),
+            &validated.driver_config,
+        )?;
         self.validate_user_volume_mounts_available(&validated.driver_config)
             .await?;
         let _ = self
@@ -1443,11 +1538,12 @@ impl ComputeDriver for DockerComputeDriver {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
+        let request = request.into_inner();
         let sandbox = request
-            .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        self.create_sandbox_inner(&sandbox).await?;
+        self.create_sandbox_inner(&sandbox, request.trusted_workload_init)
+            .await?;
         Ok(Response::new(CreateSandboxResponse {}))
     }
 
@@ -1553,6 +1649,25 @@ fn sandbox_image(sandbox: &DriverSandbox) -> Option<String> {
         .and_then(|spec| spec.template.as_ref())
         .map(|template| template.image.clone())
         .filter(|image| !image.trim().is_empty())
+}
+
+fn validate_trusted_workload_init(
+    sandbox: &DriverSandbox,
+    trusted_workload_init: Option<&TrustedWorkloadInitPlan>,
+    driver_config: &DockerSandboxDriverConfig,
+) -> Result<(), Status> {
+    let Some(plan) = trusted_workload_init else {
+        return Ok(());
+    };
+    if !driver_config.mounts.is_empty() {
+        return Err(Status::failed_precondition(
+            "docker driver_config mounts are not allowed with trusted workload initialization",
+        ));
+    }
+    let image = sandbox_image(sandbox)
+        .ok_or_else(|| Status::failed_precondition("sandbox image is required for trusted init"))?;
+    openshell_core::trusted_workload_init::validate_plan(plan, &image)
+        .map_err(Status::failed_precondition)
 }
 
 fn pending_sandbox_snapshot(
@@ -2027,6 +2142,7 @@ fn docker_volume_is_bind_backed(volume: &bollard::models::Volume) -> bool {
 fn build_binds(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
+    _trusted_workload_init: Option<&TrustedWorkloadInitPlan>,
 ) -> Result<Vec<String>, Status> {
     let mut binds = vec![format!(
         "{}:{}:ro,z",
@@ -2115,6 +2231,62 @@ async fn write_sandbox_token_file(
     Ok(true)
 }
 
+fn trusted_init_envelope_archive(
+    sandbox: &DriverSandbox,
+    plan: &TrustedWorkloadInitPlan,
+    resolved_image_id: &str,
+) -> Result<Vec<u8>, Status> {
+    let envelope = openshell_core::trusted_workload_init::encode_envelope(
+        &sandbox.id,
+        plan,
+        resolved_image_id,
+    )
+    .map_err(Status::failed_precondition)?;
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut directory = tar::Header::new_gnu();
+    directory.set_entry_type(tar::EntryType::Directory);
+    directory.set_mode(0o700);
+    directory.set_uid(0);
+    directory.set_gid(0);
+    directory.set_size(0);
+    directory.set_cksum();
+    builder
+        .append_data(
+            &mut directory,
+            "etc/openshell/trusted-init",
+            std::io::empty(),
+        )
+        .map_err(|error| {
+            Status::internal(format!(
+                "build trusted initializer envelope directory archive failed: {error}"
+            ))
+        })?;
+    let mut file = tar::Header::new_gnu();
+    file.set_entry_type(tar::EntryType::Regular);
+    file.set_mode(0o400);
+    file.set_uid(0);
+    file.set_gid(0);
+    file.set_size(
+        u64::try_from(envelope.len())
+            .map_err(|_| Status::internal("trusted initializer envelope size overflow"))?,
+    );
+    file.set_cksum();
+    builder
+        .append_data(
+            &mut file,
+            openshell_core::trusted_workload_init::ENVELOPE_MOUNT_PATH.trim_start_matches('/'),
+            envelope.as_slice(),
+        )
+        .map_err(|error| {
+            Status::internal(format!(
+                "build trusted initializer envelope file archive failed: {error}"
+            ))
+        })?;
+    builder
+        .into_inner()
+        .map_err(|error| Status::internal(format!("finish envelope archive failed: {error}")))
+}
+
 fn cleanup_sandbox_token_file(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) {
     cleanup_sandbox_token_file_by_id(&sandbox.id, config);
 }
@@ -2152,13 +2324,21 @@ fn cleanup_sandbox_token_file_by_id(sandbox_id: &str, config: &DockerDriverRunti
 
 #[cfg(test)]
 fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) -> Vec<String> {
-    build_environment_for_oci_user(sandbox, config, "")
+    build_environment_for_oci_user(
+        sandbox,
+        config,
+        "",
+        sandbox_image(sandbox).as_deref().unwrap_or("unknown"),
+        None,
+    )
 }
 
 fn build_environment_for_oci_user(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
     oci_user: &str,
+    _oci_image_id: &str,
+    _trusted_workload_init: Option<&TrustedWorkloadInitPlan>,
 ) -> Vec<String> {
     let mut environment = HashMap::from([
         ("HOME".to_string(), "/root".to_string()),
@@ -2176,6 +2356,8 @@ fn build_environment_for_oci_user(
             user_env.extend(template.environment.clone());
         }
         user_env.extend(spec.environment.clone());
+        user_env
+            .retain(|key, _| !openshell_core::trusted_workload_init::is_supervisor_env_var(key));
         environment.extend(user_env.clone());
         if !user_env.is_empty()
             && let Ok(json) = serde_json::to_string(&user_env)
@@ -2319,7 +2501,7 @@ fn build_container_create_body(
     } else {
         None
     };
-    build_container_create_body_with_gpu_devices(sandbox, config, &driver_config, cdi_devices)
+    build_container_create_body_with_gpu_devices(sandbox, config, &driver_config, cdi_devices, None)
 }
 
 fn build_container_create_body_with_gpu_devices(
@@ -2327,6 +2509,7 @@ fn build_container_create_body_with_gpu_devices(
     config: &DockerDriverRuntimeConfig,
     driver_config: &DockerSandboxDriverConfig,
     gpu_device_ids: Option<&[String]>,
+    trusted_workload_init: Option<&TrustedWorkloadInitPlan>,
 ) -> Result<ContainerCreateBody, Status> {
     let template = sandbox
         .spec
@@ -2342,6 +2525,7 @@ fn build_container_create_body_with_gpu_devices(
             id: template.image.clone(),
             user: String::new(),
         },
+        trusted_workload_init,
     )
 }
 
@@ -2351,6 +2535,7 @@ fn build_container_create_body_for_image(
     driver_config: &DockerSandboxDriverConfig,
     gpu_device_ids: Option<&[String]>,
     image: &DockerImageMetadata,
+    trusted_workload_init: Option<&TrustedWorkloadInitPlan>,
 ) -> Result<ContainerCreateBody, Status> {
     let spec = sandbox
         .spec
@@ -2389,15 +2574,49 @@ fn build_container_create_body_for_image(
         LABEL_SANDBOX_NAMESPACE.to_string(),
         config.sandbox_namespace.clone(),
     );
+    if trusted_workload_init.is_some() {
+        labels.insert(
+            LABEL_TRUSTED_WORKLOAD_INIT.to_string(),
+            openshell_core::trusted_workload_init::FEATURE.to_string(),
+        );
+    }
 
     Ok(ContainerCreateBody {
         image: Some(image.id.clone()),
         user: Some("0".to_string()),
-        env: Some(build_environment_for_oci_user(sandbox, config, &image.user)),
+        env: Some(build_environment_for_oci_user(
+            sandbox,
+            config,
+            &image.user,
+            &image.id,
+            trusted_workload_init,
+        )),
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
         // Clear the image CMD so Docker does not append inherited args to the
         // supervisor entrypoint.
-        cmd: Some(Vec::new()),
+        cmd: Some(if trusted_workload_init.is_some() {
+            vec![
+                openshell_core::trusted_workload_init::ENVELOPE_CLI_FLAG.to_string(),
+                openshell_core::trusted_workload_init::ENVELOPE_MOUNT_PATH.to_string(),
+            ]
+        } else {
+            Vec::new()
+        }),
+        healthcheck: trusted_workload_init.map(|plan| HealthConfig {
+            test: Some(vec![
+                "CMD".to_string(),
+                SUPERVISOR_MOUNT_PATH.to_string(),
+                openshell_core::trusted_workload_init::HEALTHCHECK_SUBCOMMAND.to_string(),
+                sandbox.id.clone(),
+                openshell_core::trusted_workload_init::plan_sha256(plan),
+                config.ssh_socket_path.clone(),
+            ]),
+            interval: Some(2_000_000_000),
+            timeout: Some(2_000_000_000),
+            retries: Some(10),
+            start_period: Some(5_000_000_000),
+            start_interval: Some(1_000_000_000),
+        }),
         labels: Some(labels),
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,
@@ -2405,7 +2624,7 @@ fn build_container_create_body_for_image(
             pids_limit: docker_pids_limit(config.sandbox_pids_limit)?,
             device_requests,
             binds: {
-                let mut binds = build_binds(sandbox, config)?;
+                let mut binds = build_binds(sandbox, config, trusted_workload_init)?;
                 binds.extend(user_bind_strings);
                 Some(binds)
             },
@@ -2829,7 +3048,12 @@ fn driver_status_from_summary(
     sandbox_name: &str,
 ) -> DriverSandboxStatus {
     let state = summary.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
-    let (ready, reason, message, deleting) = container_ready_condition(state);
+    let trusted_init = summary.labels.as_ref().is_some_and(|labels| {
+        labels.get(LABEL_TRUSTED_WORKLOAD_INIT).map(String::as_str)
+            == Some(openshell_core::trusted_workload_init::FEATURE)
+    });
+    let (ready, reason, message, deleting) =
+        container_ready_condition(state, trusted_init, docker_health_status(summary));
 
     DriverSandboxStatus {
         sandbox_name: summary_container_name(summary).unwrap_or_else(|| sandbox_name.to_string()),
@@ -2849,8 +3073,30 @@ fn driver_status_from_summary(
 
 fn container_ready_condition(
     state: ContainerSummaryStateEnum,
+    trusted_init: bool,
+    health: Option<ContainerSummaryHealthStatusEnum>,
 ) -> (&'static str, &'static str, &'static str, bool) {
     match state {
+        ContainerSummaryStateEnum::RUNNING if trusted_init => match health {
+            Some(ContainerSummaryHealthStatusEnum::HEALTHY) => (
+                "True",
+                "HealthCheckPassed",
+                "Trusted initialization and supervisor startup completed",
+                false,
+            ),
+            Some(ContainerSummaryHealthStatusEnum::UNHEALTHY) => (
+                "False",
+                "HealthCheckStarting",
+                "Trusted initialization or supervisor startup is still in progress",
+                false,
+            ),
+            _ => (
+                "False",
+                "HealthCheckStarting",
+                "Trusted initialization or supervisor startup is in progress",
+                false,
+            ),
+        },
         ContainerSummaryStateEnum::RUNNING => {
             ("True", "BackendReady", "Container is running", false)
         }
@@ -2874,6 +3120,22 @@ fn container_ready_condition(
             ("False", "ContainerExited", "Container exited", false)
         }
         ContainerSummaryStateEnum::DEAD => ("False", "ContainerDead", "Container is dead", false),
+    }
+}
+
+fn docker_health_status(summary: &ContainerSummary) -> Option<ContainerSummaryHealthStatusEnum> {
+    if let Some(status) = summary.health.as_ref().and_then(|health| health.status) {
+        return Some(status);
+    }
+    let status = summary.status.as_deref()?.to_ascii_lowercase();
+    if status.contains("(healthy)") {
+        Some(ContainerSummaryHealthStatusEnum::HEALTHY)
+    } else if status.contains("(unhealthy)") {
+        Some(ContainerSummaryHealthStatusEnum::UNHEALTHY)
+    } else if status.contains("(health: starting)") {
+        Some(ContainerSummaryHealthStatusEnum::STARTING)
+    } else {
+        None
     }
 }
 

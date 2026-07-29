@@ -231,6 +231,7 @@ impl OpenShell for OpenShellService {
                 capabilities: Some(ComputeDriverCapabilities {
                     driver_name: driver.driver_name.clone(),
                     driver_version: driver.driver_version.clone(),
+                    features: driver.features.clone(),
                 }),
             })
             .collect();

@@ -173,6 +173,29 @@ async fn handle_create_sandbox_inner(
         template.image = state.compute.default_image().to_string();
     }
 
+    let trusted_workload_init = request
+        .trusted_workload_init
+        .as_ref()
+        .map(|init| {
+            if !state
+                .compute
+                .supports_feature(openshell_core::trusted_workload_init::FEATURE)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "compute driver '{}' does not support {}",
+                    state
+                        .compute
+                        .driver_kind()
+                        .map_or("unknown", openshell_core::ComputeDriverKind::as_str),
+                    openshell_core::trusted_workload_init::FEATURE
+                )));
+            }
+            state
+                .trusted_workload_init_registry
+                .resolve(init, &template.image)
+        })
+        .transpose()?;
+
     // Docker and Podman preserve omitted identity fields for OCI USER
     // fallback. Other drivers retain the legacy persisted sandbox defaults.
     if let Some(ref mut policy) = spec.policy {
@@ -212,7 +235,7 @@ async fn handle_create_sandbox_inner(
 
     state
         .compute
-        .validate_sandbox_create(&sandbox)
+        .validate_sandbox_create(&sandbox, trusted_workload_init.as_ref())
         .await
         .map_err(|status| {
             warn!(error = %status, "Rejecting sandbox create request");
@@ -239,7 +262,10 @@ async fn handle_create_sandbox_inner(
         None => None,
     };
 
-    let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
+    let sandbox = state
+        .compute
+        .create_sandbox(sandbox, sandbox_token, trusted_workload_init)
+        .await?;
 
     info!(
         sandbox_id = %id,
@@ -2876,6 +2902,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                trusted_workload_init: None,
             }),
         )
         .await
@@ -2910,6 +2937,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                trusted_workload_init: None,
             }),
         )
         .await
@@ -2934,6 +2962,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::from([(annotation_key.clone(), annotation_value.clone())]),
                 workspace: String::new(),
+                trusted_workload_init: None,
             }),
         )
         .await
@@ -2994,6 +3023,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                trusted_workload_init: None,
             }),
         )
         .await
@@ -3059,6 +3089,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                trusted_workload_init: None,
             }),
         )
         .await
@@ -3089,6 +3120,7 @@ mod tests {
                 labels: HashMap::from([("team".to_string(), "x".repeat(512))]),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                trusted_workload_init: None,
             }),
         )
         .await
@@ -3121,6 +3153,7 @@ mod tests {
                     labels: HashMap::new(),
                     annotations: HashMap::new(),
                     workspace: String::new(),
+                    trusted_workload_init: None,
                 }),
             )
             .await
