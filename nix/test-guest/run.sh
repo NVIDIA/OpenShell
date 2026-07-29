@@ -30,6 +30,7 @@ EOF
 if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_DISTROS:-}" ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_CONFIGURATIONS:-}" ] ||
+	[ ! -r "${OPENSHELL_TEST_GUEST_ARTIFACT_PLAYBOOK:-}" ] ||
 	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ]; then
 	echo "run this script through 'nix run .#test-guest -- ...'" >&2
 	exit 2
@@ -305,9 +306,9 @@ qemu_log=${run_dir}/qemu.log
 qemu_pid=
 ssh_port=
 ssh_args=()
-scp_args=()
 ansible_config=${run_dir}/ansible.cfg
 ansible_inventory=${run_dir}/inventory.ini
+artifacts_vars=${run_dir}/artifacts.json
 
 show_logs() {
 	if [ -s "${qemu_log}" ]; then
@@ -464,20 +465,6 @@ ssh_args=(
 	-o StrictHostKeyChecking=no
 	-o UserKnownHostsFile=/dev/null
 )
-scp_args=(
-	-F /dev/null
-	-i "${private_key}"
-	-P "${ssh_port}"
-	-o BatchMode=yes
-	-o ConnectTimeout=5
-	-o ControlMaster=auto
-	-o ControlPersist=60
-	-o "ControlPath=${ssh_control_path}"
-	-o IdentitiesOnly=yes
-	-o LogLevel=ERROR
-	-o StrictHostKeyChecking=no
-	-o UserKnownHostsFile=/dev/null
-)
 
 echo "==> Waiting up to ${ssh_wait_seconds} seconds for SSH on 127.0.0.1:${ssh_port}"
 ssh_ready=0
@@ -533,52 +520,32 @@ else
 	echo "==> Reusing cached configuration: ${configurations[*]:-base image}"
 fi
 
+if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
+	package_artifacts=$(jq -cn --args '$ARGS.positional' "${packages[@]}")
+	copy_artifacts=$(
+		jq -cn --args '
+			$ARGS.positional
+			| map(capture("^(?<source>[^:]+):(?<destination>.*)$"))
+		' "${copies[@]}"
+	)
+	jq -n \
+		--arg package_family "${TEST_GUEST_PACKAGE_FAMILY}" \
+		--argjson packages "${package_artifacts}" \
+		--argjson copies "${copy_artifacts}" \
+		'{test_guest_package_family: $package_family, test_guest_packages: $packages, test_guest_copies: $copies}' \
+		>"${artifacts_vars}"
+
+	echo "==> Installing per-run artifacts"
+	ANSIBLE_CONFIG="${ansible_config}" ANSIBLE_NOCOLOR=1 \
+		ansible-playbook \
+		--extra-vars "@${artifacts_vars}" \
+		"${OPENSHELL_TEST_GUEST_ARTIFACT_PLAYBOOK}"
+fi
+
 # Configuration may change the test user's groups. Close the SSH control
 # connection established before provisioning so subsequent commands start with
 # the guest's current credentials.
 ssh "${ssh_args[@]}" -O exit openshell@127.0.0.1 >/dev/null 2>&1 || true
-
-for package in "${packages[@]}"; do
-	package_name=$(basename "${package}")
-	if [[ ! ${package_name} =~ ^[A-Za-z0-9._+~-]+$ ]]; then
-		echo "package filename contains unsupported characters: ${package_name}" >&2
-		exit 2
-	fi
-	remote_package="/home/openshell/${package_name}"
-	echo "==> Installing package: ${package_name}"
-	scp "${scp_args[@]}" "${package}" "openshell@127.0.0.1:${remote_package}"
-	case "${TEST_GUEST_PACKAGE_FAMILY}" in
-	deb)
-		# The remote path uses a restricted package filename.
-		# shellcheck disable=SC2029
-		ssh "${ssh_args[@]}" openshell@127.0.0.1 \
-			"sudo apt-get update -qq && sudo env DEBIAN_FRONTEND=noninteractive apt-get install -qq -y '${remote_package}' && rm -f '${remote_package}'"
-		;;
-	rpm)
-		# The remote path uses a restricted package filename.
-		# shellcheck disable=SC2029
-		ssh "${ssh_args[@]}" openshell@127.0.0.1 \
-			"sudo dnf install -q -y '${remote_package}' && rm -f '${remote_package}'"
-		;;
-	esac
-done
-
-for copy_spec in "${copies[@]}"; do
-	source_path=${copy_spec%%:*}
-	destination=${copy_spec#*:}
-	copy_name=$(basename "${source_path}")
-	if [[ ! ${copy_name} =~ ^[A-Za-z0-9._+~-]+$ ]]; then
-		echo "copy filename contains unsupported characters: ${copy_name}" >&2
-		exit 2
-	fi
-	remote_copy="/home/openshell/${copy_name}"
-	echo "==> Copying ${copy_name} to ${destination}"
-	scp "${scp_args[@]}" "${source_path}" "openshell@127.0.0.1:${remote_copy}"
-	# The remote path and destination use restricted path characters.
-	# shellcheck disable=SC2029
-	ssh "${ssh_args[@]}" openshell@127.0.0.1 \
-		"sudo install -D -m 0755 '${remote_copy}' '${destination}'; rm -f '${remote_copy}'"
-done
 
 echo "==> Test guest ready: ${distro} (SSH port ${ssh_port})"
 if [ "${#guest_command[@]}" -eq 0 ]; then

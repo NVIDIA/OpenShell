@@ -112,6 +112,8 @@ Configurations are Ansible playbooks stored under `nix/test-guest/configuration/
 
 Configurations run in the order provided on the command line. OpenShell packages and copied binaries are installed after all configurations succeed.
 
+`--install` packages and `--copy` executables are applied by a dedicated per-run Ansible playbook. They are not stored in prepared VM cache entries.
+
 ## Prepared VM cache
 
 The `test-guest-cache` app ensures a prepared disk exists for one exact distro, host architecture, and ordered configuration list. It checks the local cache first, optionally pulls a matching OCI artifact, or builds and validates a new local entry on a miss:
