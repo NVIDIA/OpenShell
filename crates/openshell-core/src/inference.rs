@@ -85,7 +85,6 @@ const VERTEX_AI_PROTOCOLS: &[&str] = &["anthropic_messages", "model_discovery"];
 /// Anthropic-style clients simultaneously.
 const TARS_PROTOCOLS: &[&str] = &[
     "openai_chat_completions",
-    "openai_completions",
     "openai_responses",
     "openai_embeddings",
     "anthropic_messages",
@@ -196,6 +195,15 @@ static DEEPINFRA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
 // deployments override it with `TARS_BASE_URL` (customer-specific hostname).
 // TARS accepts `Authorization: Bearer sk-<key>` on both its OpenAI-compatible
 // and Anthropic Messages routes, so `Bearer` covers the whole protocol set.
+//
+// `default_headers` is intentionally empty even though this profile serves
+// `anthropic_messages`, where `ANTHROPIC_PROFILE` injects `anthropic-version`.
+// Route default headers are applied to every request on the route regardless
+// of the request's protocol (there is no per-protocol hook — see
+// `route_headers_for_route`), so injecting `anthropic-version` here would also
+// stamp it onto `/v1/chat/completions` and `/v1/embeddings`, where a
+// translating gateway may read it as a protocol-family hint. Anthropic clients
+// send the header themselves and it is on the passthrough allowlist below.
 static TARS_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     provider_type: "tars",
     default_base_url: "https://api.router.tetrate.ai/v1",
@@ -467,6 +475,26 @@ mod tests {
                 "tars should route {protocol}"
             );
         }
+    }
+
+    #[test]
+    fn tars_profile_omits_legacy_completions() {
+        let profile = profile_for("tars").expect("tars profile should exist");
+        assert!(!profile.protocols.contains(&"openai_completions"));
+    }
+
+    /// Unlike `ANTHROPIC_PROFILE`, the dual-family TARS profile must not inject
+    /// `anthropic-version` as a route default: route default headers apply to
+    /// every request on the route, so it would also land on the OpenAI-family
+    /// paths TARS serves from the same base URL.
+    #[test]
+    fn tars_profile_injects_no_default_headers() {
+        let profile = profile_for("tars").expect("tars profile should exist");
+        assert!(profile.default_headers.is_empty());
+        assert!(
+            profile.passthrough_headers.contains(&"anthropic-version"),
+            "anthropic clients must still be able to send anthropic-version"
+        );
     }
 
     #[test]

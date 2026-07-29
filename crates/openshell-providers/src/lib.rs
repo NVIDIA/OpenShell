@@ -242,6 +242,12 @@ mod tests {
             normalize_provider_type("vertex-ai"),
             Some("google-vertex-ai")
         );
+        assert_eq!(normalize_provider_type("tars"), Some("tars"));
+        assert_eq!(normalize_provider_type("agentrouter"), Some("tars"));
+        assert_eq!(
+            normalize_provider_type("tetrate-agent-router"),
+            Some("tars")
+        );
         assert_eq!(normalize_provider_type("unknown"), None);
     }
 
