@@ -21,10 +21,11 @@ use openshell_core::proto::{
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     IssueSandboxTokenRequest, IssueSandboxTokenResponse, ListProvidersRequest,
-    ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ProviderResponse,
-    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RelayFrame, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, ServiceStatus,
-    SupervisorMessage, TcpForwardFrame, UpdateProviderRequest, WatchSandboxRequest,
+    ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, PodActivationMessage,
+    ProviderResponse, RefreshSandboxTokenRequest, RefreshSandboxTokenResponse,
+    RegisterSupervisorPodRequest, RelayFrame, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    SandboxResponse, SandboxStreamEvent, ServiceStatus, SupervisorMessage, TcpForwardFrame,
+    UpdateProviderRequest, WatchSandboxRequest,
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
@@ -445,6 +446,15 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<IssueSandboxTokenRequest>,
     ) -> Result<Response<IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type RegisterSupervisorPodStream = ReceiverStream<Result<PodActivationMessage, Status>>;
+
+    async fn register_supervisor_pod(
+        &self,
+        _request: tonic::Request<RegisterSupervisorPodRequest>,
+    ) -> Result<Response<Self::RegisterSupervisorPodStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 

@@ -166,4 +166,15 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::AlreadyExists);
         assert_eq!(status.message(), "sandbox already exists");
     }
+
+    #[test]
+    fn ambiguous_driver_errors_map_to_unavailable_status() {
+        let status: Status = ComputeDriverError::from(KubernetesDriverError::Unavailable(
+            "create outcome unknown".to_string(),
+        ))
+        .into();
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "create outcome unknown");
+    }
 }

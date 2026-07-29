@@ -12,7 +12,7 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
     KubernetesComputeConfig, KubernetesComputeDriver, KubernetesSidecarConfig,
-    SupervisorSideloadMethod, SupervisorTopology,
+    KubernetesWarmPoolingConfig, SupervisorSideloadMethod, SupervisorTopology,
 };
 
 #[derive(Parser, Debug)]
@@ -107,8 +107,8 @@ struct Args {
     app_armor_profile: Option<AppArmorProfile>,
 
     /// Lifetime (seconds) of the projected `ServiceAccount` token
-    /// kubelet writes into each sandbox pod for the `IssueSandboxToken`
-    /// bootstrap exchange. Kubelet enforces a minimum of 600s; the
+    /// kubelet writes into each sandbox pod for the `RegisterSupervisorPod`
+    /// bootstrap stream. Kubelet enforces a minimum of 600s; the
     /// gateway clamps values outside `[600, 86400]`. Default 3600.
     #[arg(long, env = "OPENSHELL_K8S_SA_TOKEN_TTL_SECS", default_value_t = 3600)]
     sa_token_ttl_secs: i64,
@@ -148,6 +148,7 @@ async fn main() -> Result<()> {
             proxy_uid: args.sidecar_proxy_uid,
             process_binary_aware_network_policy: args.sidecar_process_binary_aware_network_policy,
         },
+        warm_pooling: KubernetesWarmPoolingConfig::default(),
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         ssh_socket_path: args.sandbox_ssh_socket_path,
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),

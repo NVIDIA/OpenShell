@@ -148,6 +148,15 @@ data:
     supervisor_image_pull_policy = {{ .Values.supervisor.image.pullPolicy | quote }}
     {{- end }}
 
+    [openshell.drivers.kubernetes.warm_pooling]
+    enabled = {{ .Values.server.warmPooling.enabled }}
+
+    [openshell.drivers.kubernetes.warm_pooling.profiles]
+    enabled        = {{ .Values.server.warmPooling.profiles.enabled }}
+    namespace      = {{ default .Release.Namespace .Values.server.warmPooling.profiles.namespace | quote }}
+    label_selector = {{ .Values.server.warmPooling.profiles.labelSelector | quote }}
+    max_replicas   = {{ .Values.server.warmPooling.profiles.maxReplicas | default 100 }}
+
     [openshell.drivers.kubernetes.sidecar]
     proxy_uid                    = {{ .Values.supervisor.sidecar.proxyUid | default 1337 }}
     process_binary_aware_network_policy = {{ .Values.supervisor.sidecar.processBinaryAwareNetworkPolicy }}

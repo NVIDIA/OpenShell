@@ -34,6 +34,9 @@ pub enum AuthMode {
     /// Only callable by a `Principal::Sandbox` (gateway-minted sandbox JWT).
     /// See `auth/sandbox_jwt.rs`.
     Sandbox,
+    /// Only callable by a Kubernetes pod principal during supervisor pod
+    /// registration. This does not grant sandbox-scoped RPC access.
+    PodRegistration,
     /// Bearer (OIDC) authentication required.
     Bearer,
     /// Either sandbox principal or Bearer; scope and role apply on
@@ -109,6 +112,16 @@ pub fn is_sandbox_callable(method: &str) -> bool {
     )
 }
 
+/// `true` if the method is callable by a Kubernetes pod registration
+/// principal.
+#[must_use]
+pub fn is_pod_registration_callable(method: &str) -> bool {
+    matches!(
+        lookup(method).map(|m| m.mode),
+        Some(AuthMode::PodRegistration)
+    )
+}
+
 /// `true` if the method is callable by a `Principal::User` (`bearer` or
 /// `dual` auth mode).
 ///
@@ -119,7 +132,7 @@ pub fn is_sandbox_callable(method: &str) -> bool {
 #[must_use]
 pub fn is_user_callable(method: &str) -> bool {
     match lookup(method).map(|m| m.mode) {
-        Some(AuthMode::Sandbox | AuthMode::Unauthenticated) => false,
+        Some(AuthMode::Sandbox | AuthMode::PodRegistration | AuthMode::Unauthenticated) => false,
         Some(AuthMode::Bearer | AuthMode::Dual) | None => true,
     }
 }

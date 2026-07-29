@@ -12,8 +12,8 @@
 //!    Podman / VM drivers write this to a bundle file at sandbox-create
 //!    time).
 //! 3. `OPENSHELL_K8S_SA_TOKEN_FILE` — projected `ServiceAccount` JWT; the
-//!    supervisor exchanges it for a gateway JWT via `IssueSandboxToken`
-//!    once at startup.
+//!    supervisor registers its pod and receives a gateway JWT via
+//!    `RegisterSupervisorPod` once at startup.
 //!
 //! The resolved bearer credential is held in process memory thereafter and
 //! injected on every outbound call by [`AuthInterceptor`].
@@ -24,11 +24,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::proto::{
     DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
-    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest,
-    NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
-    ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, UpdateConfigRequest, inference_client::InferenceClient,
-    open_shell_client::OpenShellClient,
+    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, NetworkActivitySummary,
+    PodActivationMessage, PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
+    RegisterSupervisorPodRequest, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
+    inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
 use crate::sandbox_env;
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -242,7 +242,7 @@ async fn token_slot(endpoint: &str, plain_channel: &Channel) -> Result<(TokenSlo
 ///
 /// `endpoint` is logged on errors but never used for transport here; the
 /// actual network call lives inside this function only on the K8s
-/// bootstrap path, which uses `plain_channel` to call `IssueSandboxToken`
+/// bootstrap path, which uses `plain_channel` to call `RegisterSupervisorPod`
 /// once before the steady-state Bearer-authenticated channel is built.
 async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Result<AcquiredToken> {
     if let Ok(t) = std::env::var(sandbox_env::SANDBOX_TOKEN)
@@ -272,7 +272,9 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
         && !sa_path.is_empty()
     {
         return Ok(AcquiredToken {
-            token: acquire_k8s_sandbox_token(endpoint, plain_channel, &sa_path).await?,
+            token: acquire_k8s_supervisor_activation(endpoint, plain_channel, &sa_path)
+                .await?
+                .token,
             refresh_mode: RefreshMode::GatewayJwt(TokenSource::K8sServiceAccount),
         });
     }
@@ -290,12 +292,24 @@ async fn acquire_k8s_sandbox_token(
     plain_channel: &Channel,
     sa_path: &str,
 ) -> Result<String> {
+    Ok(
+        acquire_k8s_supervisor_activation(endpoint, plain_channel, sa_path)
+            .await?
+            .token,
+    )
+}
+
+async fn acquire_k8s_supervisor_activation(
+    endpoint: &str,
+    plain_channel: &Channel,
+    sa_path: &str,
+) -> Result<PodActivationMessage> {
     let sa_token = std::fs::read_to_string(sa_path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read K8s SA token from {sa_path}"))?
         .trim()
         .to_string();
-    info!(endpoint = %endpoint, "exchanging K8s ServiceAccount token for sandbox JWT");
+    info!(endpoint = %endpoint, "registering K8s supervisor pod for sandbox activation");
     // The bootstrap exchange uses a one-off interceptor pinned to the
     // SA token; the resulting gateway JWT becomes the value in the
     // shared `TOKEN_SLOT` once `connect_channel` returns.
@@ -308,11 +322,77 @@ async fn acquire_k8s_sandbox_token(
     let bootstrap = InterceptedService::new(plain_channel.clone(), interceptor);
     let mut client = OpenShellClient::new(bootstrap);
     let resp = client
-        .issue_sandbox_token(IssueSandboxTokenRequest {})
+        .register_supervisor_pod(RegisterSupervisorPodRequest {})
         .await
         .into_diagnostic()
-        .wrap_err("IssueSandboxToken bootstrap exchange failed")?;
-    Ok(resp.into_inner().token)
+        .wrap_err("RegisterSupervisorPod bootstrap stream failed")?;
+    let mut stream = resp.into_inner();
+    let activation = stream
+        .message()
+        .await
+        .into_diagnostic()
+        .wrap_err("RegisterSupervisorPod activation stream failed")?
+        .ok_or_else(|| miette::miette!("RegisterSupervisorPod stream closed before activation"))?;
+    info!(
+        sandbox_id = %activation.sandbox_id,
+        sandbox_name = %activation.sandbox_name,
+        "received supervisor pod activation"
+    );
+    Ok(activation)
+}
+
+/// Register a Kubernetes supervisor pod and install the activated gateway JWT.
+///
+/// Warm pods call this before policy loading. The registration stream remains
+/// pending until the Kubernetes driver observes a claim binding and the gateway
+/// sends activation.
+pub async fn register_k8s_supervisor_pod(endpoint: &str) -> Result<PodActivationMessage> {
+    let sa_path = std::env::var(sandbox_env::K8S_SA_TOKEN_FILE)
+        .ok()
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            miette::miette!(
+                "{} must be set to register Kubernetes supervisor pod",
+                sandbox_env::K8S_SA_TOKEN_FILE
+            )
+        })?;
+
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let activation = {
+            let guard = TOKEN_INIT_LOCK.lock().await;
+            if TOKEN_SLOT.get().is_some() {
+                return Err(miette::miette!(
+                    "Kubernetes supervisor pod registration was requested after sandbox token initialization"
+                ));
+            }
+
+            match async {
+                let plain_channel = build_plain_channel(endpoint).await?;
+                acquire_k8s_supervisor_activation(endpoint, &plain_channel, &sa_path).await
+            }
+            .await
+            {
+                Ok(activation) => activation,
+                Err(err) => {
+                    warn!(
+                        endpoint = %endpoint,
+                        error = %err,
+                        retry_after_secs = backoff.as_secs(),
+                        "Kubernetes supervisor pod registration failed; retrying: {err:#}"
+                    );
+                    drop(guard);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    continue;
+                }
+            }
+        };
+
+        let _slot = install_token_slot(&activation.token)?;
+        let _ = TOKEN_REFRESH_MODE.set(RefreshMode::GatewayJwt(TokenSource::K8sServiceAccount));
+        return Ok(activation);
+    }
 }
 
 /// Build an authenticated channel for direct external use (e.g. the

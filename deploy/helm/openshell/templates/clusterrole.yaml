@@ -31,3 +31,31 @@ rules:
       - namespaces
     verbs:
       - get
+  # Discover OpenShell-enabled Agent Sandbox warm pools across namespaces.
+  # SandboxClaim create/delete is namespaced, but the ClusterRoleBinding lets
+  # workspace-to-namespace mappings use warm pools outside the release namespace.
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxclaims
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxtemplates
+      - sandboxwarmpools
+    verbs:
+      - get
+      - list
+      - watch
+      {{- if .Values.server.warmPooling.profiles.enabled }}
+      - create
+      - patch
+      - update
+      - delete
+      {{- end }}

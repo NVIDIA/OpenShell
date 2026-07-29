@@ -463,13 +463,21 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
                 match &sandbox.source {
                     SandboxIdentitySource::BootstrapJwt { .. } => "bootstrap_jwt",
                     SandboxIdentitySource::BootstrapCert { .. } => "bootstrap_cert",
-                    SandboxIdentitySource::K8sServiceAccount { .. } => "k8s_service_account",
+                    SandboxIdentitySource::SupervisorBootstrap { .. } => "supervisor_bootstrap",
                 }
                 .to_string(),
             );
             if let Some(trust_domain) = &sandbox.trust_domain {
                 fields.insert("trust_domain".to_string(), trust_domain.clone());
             }
+        }
+        Principal::SupervisorBootstrap(identity) => {
+            fields.insert("kind".to_string(), "supervisor_bootstrap".to_string());
+            fields.insert("driver".to_string(), identity.driver.clone());
+            fields.insert("instance_id".to_string(), identity.instance_id.clone());
+            fields.insert("instance_name".to_string(), identity.instance_name.clone());
+            fields.insert("owner_name".to_string(), identity.owner_name.clone());
+            fields.insert("owner_uid".to_string(), identity.owner_uid.clone());
         }
         Principal::Anonymous => {
             fields.insert("kind".to_string(), "anonymous".to_string());
@@ -694,10 +702,12 @@ where
 /// Assemble the authenticator chain for the gateway.
 ///
 /// Chain order (first-match-wins):
-/// 1. `K8sServiceAccountAuthenticator` (path-scoped to `IssueSandboxToken`)
-///    — exchanges a projected SA token for a `Principal::Sandbox` so the
-///    `IssueSandboxToken` handler can mint a gateway JWT. No-op on every
-///    other path; only present when the gateway runs in-cluster.
+/// 1. `SupervisorBootstrapAuthenticator` (path-scoped to supervisor bootstrap
+///    RPCs) — delegates driver-native bootstrap token validation to the active
+///    compute driver and resolves it to either a legacy `Principal::Sandbox`
+///    for `IssueSandboxToken` or a registration-scoped principal for
+///    `RegisterSupervisorPod`. No-op on every other path; only present when
+///    the active driver exposes a bootstrap identity provider.
 /// 2. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
 ///    via a distinctive `kid` so non-matching Bearer tokens fall through.
 /// 3. `OidcAuthenticator` — validates user Bearer tokens against the
@@ -715,8 +725,10 @@ where
 /// to pass-through unless mTLS or local unauthenticated users are enabled.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
-    if let Some(k8s) = state.k8s_sa_authenticator.clone() {
-        authenticators.push(k8s);
+    if let Some(provider) = state.compute.supervisor_bootstrap_identity_provider() {
+        authenticators.push(Arc::new(
+            crate::auth::k8s_sa::SupervisorBootstrapAuthenticator::new(provider),
+        ));
     }
     if let Some(jwt) = state.sandbox_jwt_authenticator.clone() {
         authenticators.push(jwt);
@@ -743,6 +755,8 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
 ///   `Principal::User` is gated by the RBAC `AuthzPolicy`.
 ///   `Principal::Sandbox` is gated by a supervisor-method allowlist, then
 ///   handlers enforce same-sandbox scope on request bodies.
+///   `Principal::SupervisorBootstrap` is gated by the pod-registration method
+///   only.
 #[derive(Clone)]
 pub struct AuthGrpcRouter<S> {
     inner: S,
@@ -880,6 +894,14 @@ where
                             "sandbox principals may not call this method",
                         )));
                     }
+                }
+                Principal::SupervisorBootstrap(ref identity) => {
+                    if !crate::auth::method_authz::is_pod_registration_callable(&path) {
+                        return Ok(status_response(tonic::Status::permission_denied(
+                            "supervisor bootstrap principals may only register supervisors",
+                        )));
+                    }
+                    req.extensions_mut().insert(identity.clone());
                 }
                 Principal::Anonymous => {
                     return Ok(status_response(tonic::Status::unauthenticated(
@@ -1824,6 +1846,9 @@ mod tests {
             Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
         };
         use http_body_util::Full;
+        use openshell_core::supervisor_bootstrap::{
+            SupervisorBootstrapBinding, SupervisorBootstrapIdentity,
+        };
         use std::sync::Arc;
         use std::sync::Mutex;
         use tower::Service;
@@ -1908,6 +1933,17 @@ mod tests {
                     issuer: "openshell-gateway:test".to_string(),
                 },
                 trust_domain: Some("openshell".to_string()),
+            })
+        }
+
+        fn bootstrap_registration_principal() -> Principal {
+            Principal::SupervisorBootstrap(SupervisorBootstrapIdentity {
+                driver: "kubernetes".to_string(),
+                instance_name: "pod-a".to_string(),
+                instance_id: "pod-uid-a".to_string(),
+                owner_name: "sandbox-owner-a".to_string(),
+                owner_uid: "owner-uid-a".to_string(),
+                binding: SupervisorBootstrapBinding::WarmPending,
             })
         }
 
@@ -2099,6 +2135,43 @@ mod tests {
             ));
         }
 
+        #[tokio::test]
+        async fn bootstrap_registration_principal_can_only_register_supervisor_pod() {
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
+                bootstrap_registration_principal(),
+            ))));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+            let res = router
+                .call(empty_request(
+                    "/openshell.v1.OpenShell/RegisterSupervisorPod",
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(res.status(), 200);
+            assert!(matches!(
+                seen.lock().unwrap().as_ref(),
+                Some(Principal::SupervisorBootstrap(_))
+            ));
+
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
+                bootstrap_registration_principal(),
+            ))));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let res = router
+                .call(empty_request("/openshell.v1.OpenShell/GetSandboxConfig"))
+                .await
+                .unwrap();
+
+            assert!(seen.lock().unwrap().is_none());
+            assert_eq!(grpc_status(&res).as_deref(), Some("7"));
+        }
+
         /// A user principal — even one carrying `openshell:all` and the
         /// admin role — must not reach a `sandbox`-annotated method. The
         /// router enforces this from the per-handler auth-mode declarations
@@ -2155,6 +2228,7 @@ mod tests {
                 "/openshell.v1.OpenShell/CreateProvider",
                 "/openshell.v1.OpenShell/ApproveDraftChunk",
                 "/openshell.inference.v1.Inference/GetInferenceRoute",
+                "/openshell.v1.OpenShell/RegisterSupervisorPod",
                 "/openshell.inference.v1.Inference/SetInferenceRoute",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));

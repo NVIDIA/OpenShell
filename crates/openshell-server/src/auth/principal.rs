@@ -15,6 +15,7 @@
 //! to prevent cross-sandbox access (see issue #1354).
 
 use super::identity::Identity;
+use openshell_core::supervisor_bootstrap::SupervisorBootstrapIdentity;
 
 /// Who is calling.
 ///
@@ -28,6 +29,13 @@ pub enum Principal {
     /// sandbox UUID. The wrapped `sandbox_id` MUST match any sandbox referenced
     /// in the request body for sandbox-class methods.
     Sandbox(#[allow(dead_code)] SandboxPrincipal),
+    /// Driver runtime instance authenticated for supervisor bootstrap
+    /// registration only.
+    ///
+    /// This is intentionally not a sandbox principal: warm pods can be valid
+    /// driver instances before they are claimed by a sandbox. The router only
+    /// allows this principal to call `RegisterSupervisorPod`.
+    SupervisorBootstrap(SupervisorBootstrapIdentity),
     /// Truly unauthenticated caller (health probes, reflection). Sandbox-class
     /// and user-class methods reject this variant.
     #[allow(dead_code)]
@@ -70,7 +78,11 @@ pub enum SandboxIdentitySource {
     /// Per-sandbox client certificate. Reserved for channel-bound sandbox
     /// identity.
     BootstrapCert { fingerprint: String },
-    /// K8s `ServiceAccount` token used to bootstrap a gateway-minted JWT
-    /// via `IssueSandboxToken`. Populated only on that one RPC path.
-    K8sServiceAccount { pod_name: String, pod_uid: String },
+    /// Driver-provided bootstrap token used to bootstrap a gateway-minted JWT.
+    /// Populated only on supervisor bootstrap RPC paths.
+    SupervisorBootstrap {
+        driver: String,
+        instance_name: String,
+        instance_id: String,
+    },
 }

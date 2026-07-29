@@ -43,6 +43,7 @@ mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
 mod ssh_sessions;
+mod supervisor_pod_registration;
 pub mod supervisor_session;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
@@ -51,6 +52,7 @@ mod tls;
 #[cfg(test)]
 pub(crate) mod tls_test_utils;
 pub mod tracing_bus;
+pub(crate) mod warm_pod_activation;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -132,11 +134,16 @@ pub struct ServerState {
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
+    /// Pending Kubernetes supervisor pod registrations awaiting warm-pool
+    /// activation.
+    pub(crate) supervisor_pod_registrations:
+        Arc<supervisor_pod_registration::SupervisorPodRegistrationRegistry>,
+
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
     /// Gateway-minted sandbox JWT issuer. `None` when `config.gateway_jwt`
-    /// is not configured; in that mode `IssueSandboxToken` returns
+    /// is not configured; in that mode Kubernetes bootstrap RPCs return
     /// `Status::unavailable`. Populated at startup from the on-disk key
     /// material that `certgen` writes.
     pub sandbox_jwt_issuer: Option<Arc<auth::sandbox_jwt::SandboxJwtIssuer>>,
@@ -145,11 +152,6 @@ pub struct ServerState {
     /// inbound request. Always set when `sandbox_jwt_issuer` is, so callers
     /// presenting a freshly minted token are recognized.
     pub sandbox_jwt_authenticator: Option<Arc<auth::sandbox_jwt::SandboxJwtAuthenticator>>,
-
-    /// Optional K8s `ServiceAccount` authenticator that backs the
-    /// `IssueSandboxToken` bootstrap path. Only present when the gateway
-    /// runs in-cluster.
-    pub k8s_sa_authenticator: Option<Arc<auth::k8s_sa::K8sServiceAccountAuthenticator>>,
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
@@ -202,10 +204,12 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
+            supervisor_pod_registrations: Arc::new(
+                supervisor_pod_registration::SupervisorPodRegistrationRegistry::new(),
+            ),
             oidc_cache,
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
-            k8s_sa_authenticator: None,
             grpc_rate_limiter,
             gateway_interceptors: None,
             provider_profile_sources:
@@ -380,42 +384,6 @@ pub(crate) async fn run_server(
         state.sandbox_jwt_authenticator = Some(Arc::new(authenticator));
     }
 
-    // K8s ServiceAccount bootstrap authenticator. Only constructed when
-    // the gateway is running in-cluster (kubelet provides the API host
-    // env var) and has a sandbox JWT issuer to mint replacements against;
-    // outside the cluster we can't call the apiserver's TokenReview API,
-    // and without the issuer there's nothing to exchange the SA token for.
-    if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-        // Pod lookups and TokenReview identity checks must match the sandbox
-        // namespace and service account used by the Kubernetes driver.
-        let kubernetes_config =
-            compute::driver_config::kubernetes_config_for_k8s_sa_bootstrap(config_file.as_ref())?;
-        let sandbox_namespace = kubernetes_config.namespace;
-        let sandbox_service_account = kubernetes_config.service_account_name;
-        match kube::Client::try_default().await {
-            Ok(client) => {
-                let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
-                    client,
-                    &sandbox_namespace,
-                    "openshell-gateway".to_string(),
-                    sandbox_service_account.clone(),
-                ));
-                let authenticator = auth::k8s_sa::K8sServiceAccountAuthenticator::new(resolver);
-                state.k8s_sa_authenticator = Some(Arc::new(authenticator));
-                info!(
-                    namespace = %sandbox_namespace,
-                    service_account = %sandbox_service_account,
-                    "K8s ServiceAccount bootstrap authenticator enabled"
-                );
-            }
-            Err(e) => warn!(
-                error = %e,
-                "in-cluster K8s client construction failed; \
-                 K8s ServiceAccount bootstrap is disabled"
-            ),
-        }
-    }
-
     let state = Arc::new(state);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -434,6 +402,12 @@ pub(crate) async fn run_server(
     }
 
     state.compute.spawn_watchers(shutdown_rx.clone());
+    let supervisor_registration_rx = state.supervisor_pod_registrations.subscribe();
+    state.compute.spawn_sandbox_claim_activation(
+        Arc::new(warm_pod_activation::GatewaySupervisorBootstrapActivator::new(state.clone())),
+        supervisor_registration_rx,
+        shutdown_rx.clone(),
+    );
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_secs(60));

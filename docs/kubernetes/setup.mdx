@@ -216,12 +216,16 @@ The namespaced Role covers sandbox lifecycle and identity:
 | `""` | `events` | get, list, watch |
 | `""` | `pods` | get |
 
-The ClusterRole grants node inspection and token validation:
+The ClusterRole grants node inspection, token validation, namespace reads, and
+warm-pool extension access:
 
 | API Group | Resource | Verbs |
 |---|---|---|
 | `authentication.k8s.io` | `tokenreviews` | create |
 | `""` | `nodes` | get, list, watch |
+| `""` | `namespaces` | get |
+| `extensions.agents.x-k8s.io` | `sandboxclaims` | create, delete, get, list, watch |
+| `extensions.agents.x-k8s.io` | `sandboxtemplates`, `sandboxwarmpools` | get, list, watch |
 
 To use an existing ServiceAccount instead of creating one, set `serviceAccount.create=false` and supply its name:
 

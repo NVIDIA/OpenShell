@@ -18,6 +18,12 @@ pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 /// Default non-root UID for relaxed Kubernetes network supervisor sidecars.
 pub const DEFAULT_PROXY_UID: u32 = 1337;
 
+/// Label selector for ConfigMap-backed warm-pool profiles.
+pub const DEFAULT_WARM_POOL_PROFILE_LABEL_SELECTOR: &str = "openshell.ai/warm-pool-profile=true";
+
+/// Conservative upper bound for profile-declared warm-pool replicas.
+pub const DEFAULT_WARM_POOL_PROFILE_MAX_REPLICAS: u32 = 100;
+
 /// How the supervisor binary is delivered into sandbox pods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -122,6 +128,82 @@ impl KubernetesSidecarConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesWarmPoolingConfig {
+    /// Allow the Kubernetes driver to satisfy compatible create requests by
+    /// creating v1beta1 Agent Sandbox `SandboxClaim` resources.
+    pub enabled: bool,
+    /// Optional ConfigMap-backed warm-pool profile reconciler.
+    pub profiles: KubernetesWarmPoolProfilesConfig,
+}
+
+impl Default for KubernetesWarmPoolingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            profiles: KubernetesWarmPoolProfilesConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesWarmPoolProfilesConfig {
+    /// Watch labelled `ConfigMap` resources and reconcile generated
+    /// `SandboxTemplate` and `SandboxWarmPool` resources from their TOML
+    /// profiles.
+    pub enabled: bool,
+    /// Namespace containing admin-authored warm-pool profile `ConfigMap`
+    /// resources. When empty, the driver uses its configured Kubernetes
+    /// namespace.
+    pub namespace: String,
+    /// Label selector used to select warm-pool profile `ConfigMap` resources.
+    pub label_selector: String,
+    /// Maximum allowed `replicas` value in a profile.
+    pub max_replicas: u32,
+}
+
+impl Default for KubernetesWarmPoolProfilesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            namespace: String::new(),
+            label_selector: DEFAULT_WARM_POOL_PROFILE_LABEL_SELECTOR.to_string(),
+            max_replicas: DEFAULT_WARM_POOL_PROFILE_MAX_REPLICAS,
+        }
+    }
+}
+
+impl KubernetesWarmPoolProfilesConfig {
+    #[must_use]
+    pub fn effective_namespace<'a>(&'a self, fallback_namespace: &'a str) -> &'a str {
+        if self.namespace.trim().is_empty() {
+            fallback_namespace
+        } else {
+            self.namespace.as_str()
+        }
+    }
+
+    #[must_use]
+    pub fn effective_label_selector(&self) -> &str {
+        if self.label_selector.trim().is_empty() {
+            DEFAULT_WARM_POOL_PROFILE_LABEL_SELECTOR
+        } else {
+            self.label_selector.as_str()
+        }
+    }
+
+    #[must_use]
+    pub fn effective_max_replicas(&self) -> u32 {
+        if self.max_replicas == 0 {
+            DEFAULT_WARM_POOL_PROFILE_MAX_REPLICAS
+        } else {
+            self.max_replicas
+        }
     }
 }
 
@@ -253,6 +335,8 @@ pub struct KubernetesComputeConfig {
     pub topology: SupervisorTopology,
     /// Sidecar-only settings used when `topology = "sidecar"`.
     pub sidecar: KubernetesSidecarConfig,
+    /// Warm-pool allocation settings.
+    pub warm_pooling: KubernetesWarmPoolingConfig,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
@@ -278,9 +362,9 @@ pub struct KubernetesComputeConfig {
     /// Empty string (default) = omit the field, using the cluster default.
     pub default_runtime_class_name: String,
     /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
-    /// writes into each sandbox pod. Used only for the one-shot
-    /// `IssueSandboxToken` bootstrap exchange — the gateway-minted JWT
-    /// that follows has its own TTL set via `gateway_jwt.ttl_secs`.
+    /// writes into each sandbox pod. Used only for the
+    /// `RegisterSupervisorPod` bootstrap stream — the gateway-minted JWT that
+    /// follows has its own TTL set via `gateway_jwt.ttl_secs`.
     ///
     /// Kubelet enforces a minimum of 600 seconds; the supervisor uses
     /// this token within a few seconds of pod start, so any value at
@@ -346,6 +430,7 @@ impl Default for KubernetesComputeConfig {
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             topology: SupervisorTopology::default(),
             sidecar: KubernetesSidecarConfig::default(),
+            warm_pooling: KubernetesWarmPoolingConfig::default(),
             grpc_endpoint: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             client_tls_secret_name: String::new(),
@@ -544,6 +629,57 @@ mod tests {
     fn default_sidecar_requires_process_binary_aware_network_policy() {
         let cfg = KubernetesComputeConfig::default();
         assert!(cfg.sidecar.process_binary_aware_network_policy);
+    }
+
+    #[test]
+    fn default_warm_pooling_is_enabled() {
+        let cfg = KubernetesComputeConfig::default();
+        assert!(cfg.warm_pooling.enabled);
+        assert!(cfg.warm_pooling.profiles.enabled);
+    }
+
+    #[test]
+    fn serde_override_warm_pooling_enabled() {
+        let json = serde_json::json!({
+            "warm_pooling": {
+                "enabled": false
+            }
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert!(!cfg.warm_pooling.enabled);
+    }
+
+    #[test]
+    fn serde_override_warm_pool_profile_reconciliation() {
+        let json = serde_json::json!({
+            "warm_pooling": {
+                "profiles": {
+                    "enabled": false,
+                    "namespace": "profiles",
+                    "label_selector": "openshell.ai/warm-pool-profile=true,tier=gpu",
+                    "max_replicas": 7
+                }
+            }
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert!(!cfg.warm_pooling.profiles.enabled);
+        assert_eq!(cfg.warm_pooling.profiles.namespace, "profiles");
+        assert_eq!(
+            cfg.warm_pooling.profiles.label_selector,
+            "openshell.ai/warm-pool-profile=true,tier=gpu"
+        );
+        assert_eq!(cfg.warm_pooling.profiles.max_replicas, 7);
+    }
+
+    #[test]
+    fn serde_rejects_unknown_warm_pooling_field() {
+        let json = serde_json::json!({
+            "warm_pooling": {
+                "mode": "always"
+            }
+        });
+        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]

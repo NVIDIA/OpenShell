@@ -26,6 +26,44 @@ by the gateway.
 Kubernetes API calls use explicit timeouts so gRPC handlers do not block
 indefinitely when the API server is slow or unavailable.
 
+## Warm-Pool Allocation
+
+The driver can use Agent Sandbox extension CRDs for transparent warm-pool
+allocation. When `warm_pooling.enabled` is true, the driver watches and caches
+`extensions.agents.x-k8s.io/v1beta1` `SandboxWarmPool` resources labelled
+`openshell.ai/enabled=true`, resolves each pool's referenced
+`SandboxTemplate`, and computes an in-memory fingerprint of the template spec.
+
+On create, the driver maps the OpenShell workspace to its target Kubernetes
+namespace, renders the spec that direct `Sandbox` creation would use, strips
+per-sandbox identity values from the fingerprint, and matches it against the
+warm-pool cache for that namespace. The current shared-namespace mapping sends
+every workspace to the configured Kubernetes namespace.
+If exactly one pool matches, the driver creates a v1beta1 `SandboxClaim` with
+`spec.warmPoolRef.name` set to that pool. If no pool matches, multiple pools
+match, RBAC prevents cache maintenance, or the v1beta1 extension APIs are
+unavailable, the driver falls back to direct `Sandbox` creation.
+
+The extension CRDs are intentionally v1beta1-only. The core
+`agents.x-k8s.io/Sandbox` CRD still supports the existing v1beta1-to-v1alpha1
+fallback.
+
+The driver can also reconcile admin-authored warm-pool profiles from labelled
+ConfigMaps when `warm_pooling.profiles.enabled` is true. Profiles live in the
+configured profile namespace, use the `warm-pool.toml` data key, and expose a
+narrow CLI-shaped schema: `workspace`, `replicas`, `image`,
+`runtime_class_name`, `[environment]`, and `[resources]` with `cpu`, `memory`,
+and `gpu_count`. The reconciler uses the same workspace-to-namespace mapping as
+sandbox creation and generates ordinary `SandboxTemplate` and
+`SandboxWarmPool` resources labelled `openshell.ai/enabled=true`; the existing
+matching cache then handles allocation unchanged.
+
+The gateway runs the profile reconciler only while its replica owns the shared
+reconciler lease. In HA deployments, lease loss cancels the old reconciler
+before that replica returns to standby, so generated resources have one active
+gateway writer. The allocation cache remains replica-local and runs on every
+gateway because sandbox creation reads it locally.
+
 ## Workspace Persistence
 
 Sandbox pods use a PVC-backed `/sandbox` workspace. An init container seeds the
@@ -55,8 +93,9 @@ values must override image-provided environment variables.
 Sandbox pods run as `service_account_name` and keep
 `automountServiceAccountToken: false`. The only Kubernetes token exposed to the
 supervisor is an explicit, audience-bound projected token mounted at
-`/var/run/secrets/openshell/token` for the one-shot `IssueSandboxToken`
-bootstrap exchange.
+`/var/run/secrets/openshell/token` for the `RegisterSupervisorPod` bootstrap
+stream. The gateway validates the pod-bound token and activates already-bound
+cold pods by returning a gateway-minted sandbox JWT on that stream.
 
 The gateway uses the supervisor relay for connect, exec, and file sync. Sandbox
 pods do not need direct external ingress for SSH.

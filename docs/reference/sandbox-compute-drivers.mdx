@@ -345,6 +345,44 @@ process/binary identity through `/proc/<entrypoint-pid>`.
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
 
+When Kubernetes warm pooling is enabled, the driver can satisfy compatible
+create requests by creating `extensions.agents.x-k8s.io/v1beta1`
+`SandboxClaim` resources instead of direct `Sandbox` resources. The driver
+discovers `SandboxWarmPool` resources labelled `openshell.ai/enabled=true`
+across namespaces it can observe, resolves each pool's `SandboxTemplate`, and
+matches only against pools in the Kubernetes namespace selected for the
+OpenShell workspace. The current shared-namespace mapping selects the configured
+`sandbox_namespace` for every workspace. Set
+`openshell.drivers.kubernetes.warm_pooling.enabled = false` to force direct
+`Sandbox` creation.
+
+When `openshell.drivers.kubernetes.warm_pooling.profiles.enabled = true`, the
+driver reconciles labelled ConfigMaps into generated `SandboxTemplate` and
+`SandboxWarmPool` resources. This is enabled by default with the Helm chart.
+The reconciler uses the same workspace-to-namespace mapping as sandbox
+creation.
+Each profile ConfigMap must contain
+`data["warm-pool.toml"]` with a narrow CLI-shaped schema:
+
+```toml
+version = 1
+workspace = "default"
+replicas = 3
+image = "ghcr.io/acme/agent-python:latest"
+runtime_class_name = "nvidia"
+
+[environment]
+FOO = "bar"
+
+[resources]
+cpu = "4"
+memory = "8Gi"
+gpu_count = 1
+```
+
+The generated warm pools carry `openshell.ai/enabled=true`, so the existing
+matching path discovers them like any externally managed warm pool.
+
 If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the controller and CRD rollout completes so the gateway can detect the served API versions again.
 
 <Note>

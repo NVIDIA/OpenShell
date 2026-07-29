@@ -37,10 +37,15 @@ use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
     SandboxTemplate, ServiceEndpoint, SshSession,
 };
+use openshell_core::supervisor_bootstrap::{
+    SupervisorBootstrapActivator, SupervisorBootstrapIdentityProvider,
+};
 use openshell_core::{ObjectLabels, ObjectWorkspace};
 use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
+    KubernetesSupervisorBootstrapIdentityProvider, LiveK8sResolver,
+    SandboxClaimActivationController, WarmPoolProfileReconciler,
 };
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
@@ -190,6 +195,18 @@ trait StartupResume: Send + Sync {
 }
 
 #[tonic::async_trait]
+trait LeaseScopedReconciler: Send + Sync {
+    async fn run(&self, cancel: watch::Receiver<bool>);
+}
+
+#[tonic::async_trait]
+impl LeaseScopedReconciler for WarmPoolProfileReconciler {
+    async fn run(&self, cancel: watch::Receiver<bool>) {
+        self.run(cancel).await;
+    }
+}
+
+#[tonic::async_trait]
 impl StartupResume for DockerComputeDriver {
     async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
         Self::resume_sandbox(self, sandbox_id, sandbox_name)
@@ -228,6 +245,54 @@ impl Drop for ManagedDriverProcess {
             let _ = child.take();
         }
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+async fn kubernetes_supervisor_bootstrap_identity_provider(
+    config: &KubernetesComputeConfig,
+) -> Option<Arc<dyn SupervisorBootstrapIdentityProvider>> {
+    std::env::var_os("KUBERNETES_SERVICE_HOST")?;
+
+    match kube::Client::try_default().await {
+        Ok(client) => {
+            let resolver = Arc::new(LiveK8sResolver::new(
+                client,
+                &config.namespace,
+                "openshell-gateway".to_string(),
+                config.service_account_name.clone(),
+            ));
+            Some(Arc::new(
+                KubernetesSupervisorBootstrapIdentityProvider::new(resolver),
+            ))
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "in-cluster K8s client construction failed; supervisor bootstrap is disabled"
+            );
+            None
+        }
+    }
+}
+
+async fn kubernetes_sandbox_claim_activation_controller(
+    config: &KubernetesComputeConfig,
+) -> Option<Arc<SandboxClaimActivationController>> {
+    std::env::var_os("KUBERNETES_SERVICE_HOST")?;
+
+    match kube::Client::try_default().await {
+        Ok(client) => Some(Arc::new(SandboxClaimActivationController::new(
+            client.clone(),
+            client,
+            config.namespace.clone(),
+        ))),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "in-cluster K8s client construction failed; SandboxClaim activation is disabled"
+            );
+            None
+        }
     }
 }
 
@@ -368,6 +433,9 @@ pub struct ComputeRuntime {
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    supervisor_bootstrap_identity: Option<Arc<dyn SupervisorBootstrapIdentityProvider>>,
+    sandbox_claim_activation: Option<Arc<SandboxClaimActivationController>>,
+    lease_scoped_reconciler: Option<Arc<dyn LeaseScopedReconciler>>,
     sync_lock: Arc<Mutex<()>>,
     delete_gates: Arc<DeleteGateRegistry>,
     gateway_bind_addresses: Vec<SocketAddr>,
@@ -393,6 +461,8 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
+        supervisor_bootstrap_identity: Option<Arc<dyn SupervisorBootstrapIdentityProvider>>,
+        sandbox_claim_activation: Option<Arc<SandboxClaimActivationController>>,
         gateway_bind_addresses: Vec<SocketAddr>,
     ) -> Result<Self, ComputeError> {
         let capabilities = driver
@@ -425,6 +495,9 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            supervisor_bootstrap_identity,
+            sandbox_claim_activation,
+            lease_scoped_reconciler: None,
             sync_lock: Arc::new(Mutex::new(())),
             delete_gates: Arc::new(DeleteGateRegistry::default()),
             gateway_bind_addresses,
@@ -486,6 +559,8 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            None,
+            None,
             gateway_bind_addresses,
         )
         .await
@@ -499,11 +574,18 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
+        let supervisor_bootstrap_identity =
+            kubernetes_supervisor_bootstrap_identity_provider(&config).await;
+        let sandbox_claim_activation =
+            kubernetes_sandbox_claim_activation_controller(&config).await;
         let driver = KubernetesComputeDriver::new(config)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
+        let lease_scoped_reconciler = driver
+            .warm_pool_profile_reconciler()
+            .map(|reconciler| -> Arc<dyn LeaseScopedReconciler> { Arc::new(reconciler) });
         let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new(driver));
-        Self::from_driver(
+        let mut runtime = Self::from_driver(
             ComputeDriverKind::Kubernetes.as_str().to_string(),
             driver,
             None,
@@ -514,9 +596,13 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            supervisor_bootstrap_identity,
+            sandbox_claim_activation,
             Vec::new(),
         )
-        .await
+        .await?;
+        runtime.lease_scoped_reconciler = lease_scoped_reconciler;
+        Ok(runtime)
     }
 
     pub(crate) async fn new_remote_driver(
@@ -539,6 +625,8 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            None,
+            None,
             Vec::new(),
         )
         .await
@@ -567,6 +655,8 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            None,
+            None,
             Vec::new(),
         )
         .await
@@ -580,6 +670,24 @@ impl ComputeRuntime {
     #[must_use]
     pub fn driver_info_snapshots(&self) -> &[ComputeDriverInfoSnapshot] {
         std::slice::from_ref(&self.driver_info)
+    }
+
+    #[must_use]
+    pub fn supervisor_bootstrap_identity_provider(
+        &self,
+    ) -> Option<Arc<dyn SupervisorBootstrapIdentityProvider>> {
+        self.supervisor_bootstrap_identity.clone()
+    }
+
+    pub(crate) fn spawn_sandbox_claim_activation(
+        &self,
+        activator: Arc<dyn SupervisorBootstrapActivator>,
+        registration_rx: watch::Receiver<u64>,
+        shutdown_rx: watch::Receiver<bool>,
+    ) {
+        if let Some(controller) = self.sandbox_claim_activation.clone() {
+            controller.spawn(activator, registration_rx, shutdown_rx);
+        }
     }
 
     #[must_use]
@@ -684,6 +792,18 @@ impl ComputeRuntime {
                     .await;
                 self.sandbox_index.remove_sandbox(sandbox.object_id());
                 Err(Status::failed_precondition(status.message().to_string()))
+            }
+            Err(status) if status.code() == Code::Unavailable => {
+                // The driver may have committed the backend create. Keep the
+                // durable Provisioning row so its watcher can reconcile the
+                // accepted resource instead of allowing a new sandbox ID to
+                // reuse the same name.
+                warn!(
+                    sandbox_id = %sandbox.object_id(),
+                    error = %status,
+                    "sandbox create outcome is ambiguous; preserving provisioning state"
+                );
+                Err(Status::unavailable(status.message().to_string()))
             }
             Err(err) => {
                 let _ = self
@@ -1255,6 +1375,7 @@ impl ComputeRuntime {
     pub fn spawn_watchers(&self, shutdown_rx: watch::Receiver<bool>) {
         let runtime = Arc::new(self.clone());
         if self.store.is_single_replica() {
+            let _lease_scoped_handle = self.spawn_lease_scoped_reconciler(shutdown_rx.clone());
             let watch_runtime = runtime.clone();
             let watch_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
@@ -1268,6 +1389,17 @@ impl ComputeRuntime {
                 runtime.lease_coordinator(shutdown_rx).await;
             });
         }
+    }
+
+    fn spawn_lease_scoped_reconciler(
+        &self,
+        cancel: watch::Receiver<bool>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.lease_scoped_reconciler.clone().map(|reconciler| {
+            tokio::spawn(async move {
+                reconciler.run(cancel).await;
+            })
+        })
     }
 
     pub async fn cleanup_on_shutdown(&self) -> Result<(), String> {
@@ -1474,6 +1606,8 @@ impl ComputeRuntime {
             runtime.reconcile_loop(cancel_rx).await;
         });
 
+        let lease_scoped_handle = self.spawn_lease_scoped_reconciler(cancel_tx.subscribe());
+
         loop {
             tokio::select! {
                 () = tokio::time::sleep(LEASE_RENEWAL_INTERVAL) => {
@@ -1500,6 +1634,9 @@ impl ComputeRuntime {
                         let _ = cancel_tx.send(true);
                         let _ = watch_handle.await;
                         let _ = reconcile_handle.await;
+                        if let Some(handle) = lease_scoped_handle {
+                            let _ = handle.await;
+                        }
                         return;
                     }
                 }
@@ -1509,6 +1646,9 @@ impl ComputeRuntime {
         let _ = cancel_tx.send(true);
         let _ = watch_handle.await;
         let _ = reconcile_handle.await;
+        if let Some(handle) = lease_scoped_handle {
+            let _ = handle.await;
+        }
         info!(replica = %lease.replica_id(), "reconciler lease lost — returning to standby");
     }
 
@@ -2845,6 +2985,9 @@ pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -
         sandbox_watch_bus: SandboxWatchBus::new(),
         tracing_log_bus: TracingLogBus::new(),
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
+        supervisor_bootstrap_identity: None,
+        sandbox_claim_activation: None,
+        lease_scoped_reconciler: None,
         sync_lock: Arc::new(Mutex::new(())),
         delete_gates: Arc::new(DeleteGateRegistry::default()),
         gateway_bind_addresses: Vec::new(),
@@ -2866,6 +3009,22 @@ mod tests {
     use std::sync::{Arc, Mutex as TestMutex};
     use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
     use tokio_stream::wrappers::UnboundedReceiverStream;
+
+    struct TestLeaseScopedReconciler {
+        started: Arc<Notify>,
+        stopped: Arc<Notify>,
+    }
+
+    #[tonic::async_trait]
+    impl LeaseScopedReconciler for TestLeaseScopedReconciler {
+        async fn run(&self, mut cancel: watch::Receiver<bool>) {
+            self.started.notify_one();
+            if !*cancel.borrow() {
+                let _ = cancel.changed().await;
+            }
+            self.stopped.notify_one();
+        }
+    }
 
     fn string_value(value: &str) -> prost_types::Value {
         prost_types::Value {
@@ -2984,6 +3143,7 @@ mod tests {
     struct TestDriver {
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
+        create_error: Option<Code>,
     }
 
     #[tonic::async_trait]
@@ -3056,6 +3216,9 @@ mod tests {
             &self,
             _request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
+            if let Some(code) = self.create_error {
+                return Err(Status::new(code, "controlled create error"));
+            }
             Ok(tonic::Response::new(CreateSandboxResponse {}))
         }
 
@@ -3314,11 +3477,72 @@ mod tests {
             sandbox_watch_bus: SandboxWatchBus::new(),
             tracing_log_bus: TracingLogBus::new(),
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
+            supervisor_bootstrap_identity: None,
+            sandbox_claim_activation: None,
+            lease_scoped_reconciler: None,
             sync_lock: Arc::new(Mutex::new(())),
             delete_gates: Arc::new(DeleteGateRegistry::default()),
             gateway_bind_addresses: Vec::new(),
             replica_id: "test-replica".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn lease_scoped_reconciler_stops_when_cancelled() {
+        let mut runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let started = Arc::new(Notify::new());
+        let stopped = Arc::new(Notify::new());
+        runtime.lease_scoped_reconciler = Some(Arc::new(TestLeaseScopedReconciler {
+            started: started.clone(),
+            stopped: stopped.clone(),
+        }));
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let handle = runtime
+            .spawn_lease_scoped_reconciler(cancel_rx)
+            .expect("configured reconciler should start");
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("reconciler should start");
+
+        cancel_tx.send(true).unwrap();
+        handle.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stopped.notified())
+            .await
+            .expect("reconciler should stop after cancellation");
+    }
+
+    #[tokio::test]
+    async fn lease_holder_runs_and_awaits_lease_scoped_reconciler() {
+        let driver = ControlledDriver::new();
+        let mut runtime = test_runtime(driver).await;
+        let started = Arc::new(Notify::new());
+        let stopped = Arc::new(Notify::new());
+        runtime.lease_scoped_reconciler = Some(Arc::new(TestLeaseScopedReconciler {
+            started: started.clone(),
+            stopped: stopped.clone(),
+        }));
+
+        let lease = lease::ReconcilerLease::new(
+            runtime.store.clone(),
+            runtime.replica_id.clone(),
+            lease::LEASE_TTL,
+        );
+        let guard = lease.acquire_or_steal().await.unwrap();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let runtime = Arc::new(runtime);
+        let holder = tokio::spawn(async move {
+            runtime.run_as_holder(&lease, guard, &mut shutdown_rx).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("lease holder should start the reconciler");
+        shutdown_tx.send(true).unwrap();
+        holder.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stopped.notified())
+            .await
+            .expect("lease holder should await reconciler shutdown");
     }
 
     fn register_test_supervisor_session(runtime: &ComputeRuntime, sandbox_id: &str) {
@@ -3348,6 +3572,38 @@ mod tests {
         };
         sandbox.set_phase(phase as i32);
         sandbox
+    }
+
+    #[tokio::test]
+    async fn ambiguous_create_preserves_provisioning_record() {
+        let runtime = test_runtime(Arc::new(TestDriver {
+            create_error: Some(Code::Unavailable),
+            ..Default::default()
+        }))
+        .await;
+        let sandbox = sandbox_record("sb-ambiguous", "sandbox-a", SandboxPhase::Provisioning);
+
+        let err = runtime
+            .create_sandbox(sandbox, None)
+            .await
+            .expect_err("ambiguous create should remain unavailable");
+
+        assert_eq!(err.code(), Code::Unavailable);
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-ambiguous")
+            .await
+            .unwrap()
+            .expect("provisioning record must be retained");
+        assert_eq!(stored.phase(), SandboxPhase::Provisioning as i32);
+        assert_eq!(stored.object_name(), "sandbox-a");
+        assert_eq!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
+                .as_deref(),
+            Some("sb-ambiguous")
+        );
     }
 
     fn ssh_session_record(id: &str, sandbox_id: &str) -> SshSession {
@@ -5633,6 +5889,7 @@ mod tests {
                 }),
                 workspace: "default".to_string(),
             }],
+            ..Default::default()
         }))
         .await;
 
@@ -5697,6 +5954,7 @@ mod tests {
                 })),
                 workspace: "default".to_string(),
             }],
+            ..Default::default()
         }))
         .await;
 

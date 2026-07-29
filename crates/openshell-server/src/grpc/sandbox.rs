@@ -220,7 +220,7 @@ async fn handle_create_sandbox_inner(
         })?;
 
     // Mint the gateway JWT for singleplayer drivers. K8s sandboxes skip
-    // this mint and bootstrap via `IssueSandboxToken` at supervisor
+    // this mint and bootstrap via `RegisterSupervisorPod` at supervisor
     // startup; identifying "is this K8s?" lives in the compute layer, so
     // we mint unconditionally here when the issuer is configured and let
     // the K8s driver simply ignore the field.
