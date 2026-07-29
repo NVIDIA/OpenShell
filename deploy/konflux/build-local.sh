@@ -79,7 +79,11 @@ build_image() {
     echo "=== Preparing RPM repos ==="
     find "${output_dir}" -name "hermeto.repo" -execdir cp {} cachi2.repo \;
     local rpm_arch
-    rpm_arch=$(uname -m)
+    case "${PLATFORM}" in
+        */amd64|*/x86_64) rpm_arch="x86_64" ;;
+        */arm64|*/aarch64) rpm_arch="aarch64" ;;
+        *)                 rpm_arch=$(uname -m) ;;
+    esac
     cp "${output_dir}/deps/rpm/${rpm_arch}/repos.d/cachi2.repo" "${repos_dir}/"
     chmod -R go+rX "${repos_dir}"
 
