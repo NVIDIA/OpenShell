@@ -267,6 +267,12 @@ pub struct KubernetesComputeConfig {
     )]
     pub app_armor_profile: Option<AppArmorProfile>,
     pub workspace_default_storage_size: String,
+    /// Kubernetes `StorageClass` name for the default workspace PVC.
+    /// Empty string (default) = omit `storageClassName`, using the cluster's
+    /// default `StorageClass`. Set this on clusters with no default
+    /// `StorageClass`, otherwise the workspace PVC stays `Pending` and the
+    /// sandbox never starts.
+    pub workspace_storage_class: String,
     /// Default Kubernetes `runtimeClassName` for sandbox pods.
     /// Applied when a `CreateSandbox` request does not specify one.
     /// Empty string (default) = omit the field, using the cluster default.
@@ -347,6 +353,7 @@ impl Default for KubernetesComputeConfig {
             enable_user_namespaces: false,
             app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
+            workspace_storage_class: String::new(),
             default_runtime_class_name: String::new(),
             sa_token_ttl_secs: 3600,
             provider_spiffe_workload_api_socket_path: String::new(),
@@ -515,6 +522,12 @@ mod tests {
     }
 
     #[test]
+    fn default_workspace_storage_class_is_empty() {
+        let cfg = KubernetesComputeConfig::default();
+        assert!(cfg.workspace_storage_class.is_empty());
+    }
+
+    #[test]
     fn default_topology_is_combined() {
         let cfg = KubernetesComputeConfig::default();
         assert_eq!(cfg.topology, SupervisorTopology::Combined);
@@ -656,6 +669,15 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.workspace_default_storage_size, "10Gi");
+    }
+
+    #[test]
+    fn serde_override_workspace_storage_class() {
+        let json = serde_json::json!({
+            "workspace_storage_class": "fast-ssd"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.workspace_storage_class, "fast-ssd");
     }
 
     #[test]

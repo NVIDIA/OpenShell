@@ -848,6 +848,7 @@ impl KubernetesComputeDriver {
             enable_user_namespaces: self.config.enable_user_namespaces,
             app_armor_profile: self.config.app_armor_profile.as_ref(),
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
+            workspace_storage_class: &self.config.workspace_storage_class,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
             provider_spiffe_enabled: self.config.provider_spiffe_enabled(),
@@ -2155,24 +2156,36 @@ fn apply_workspace_persistence(
 ///
 /// Provides a single PVC named "workspace" that backs the `/sandbox`
 /// directory.  The init container seeds it from the image on first use.
-fn default_workspace_volume_claim_templates(storage_size: &str) -> serde_json::Value {
+///
+/// When `storage_class` is non-empty, it is written to the PVC's
+/// `storageClassName`. An empty value omits the field so the cluster's
+/// default `StorageClass` applies. Clusters with no default `StorageClass`
+/// must set this to prevent the PVC from staying `Pending`.
+fn default_workspace_volume_claim_templates(
+    storage_size: &str,
+    storage_class: &str,
+) -> serde_json::Value {
     let size = if storage_size.is_empty() {
         DEFAULT_WORKSPACE_STORAGE_SIZE
     } else {
         storage_size
     };
+    let mut spec = serde_json::json!({
+        "accessModes": ["ReadWriteOnce"],
+        "resources": {
+            "requests": {
+                "storage": size
+            }
+        }
+    });
+    if !storage_class.is_empty() {
+        spec["storageClassName"] = serde_json::json!(storage_class);
+    }
     serde_json::json!([{
         "metadata": {
             "name": WORKSPACE_VOLUME_NAME
         },
-        "spec": {
-            "accessModes": ["ReadWriteOnce"],
-            "resources": {
-                "requests": {
-                    "storage": size
-                }
-            }
-        }
+        "spec": spec
     }])
 }
 
@@ -2197,6 +2210,7 @@ struct SandboxPodParams<'a> {
     enable_user_namespaces: bool,
     app_armor_profile: Option<&'a AppArmorProfile>,
     workspace_default_storage_size: &'a str,
+    workspace_storage_class: &'a str,
     default_runtime_class_name: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
     /// for the bootstrap `IssueSandboxToken` exchange.
@@ -2231,6 +2245,7 @@ impl Default for SandboxPodParams<'_> {
             enable_user_namespaces: false,
             app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
+            workspace_storage_class: "",
             default_runtime_class_name: "",
             sa_token_ttl_secs: 3600,
             provider_spiffe_enabled: false,
@@ -2328,7 +2343,10 @@ fn sandbox_to_k8s_spec(
     if inject_workspace {
         root.insert(
             "volumeClaimTemplates".to_string(),
-            default_workspace_volume_claim_templates(params.workspace_default_storage_size),
+            default_workspace_volume_claim_templates(
+                params.workspace_default_storage_size,
+                params.workspace_storage_class,
+            ),
         );
     }
 
@@ -5714,14 +5732,14 @@ mod tests {
 
     #[test]
     fn default_workspace_vct_uses_provided_storage_size() {
-        let vct = default_workspace_volume_claim_templates("5Gi");
+        let vct = default_workspace_volume_claim_templates("5Gi", "");
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, "5Gi");
     }
 
     #[test]
     fn default_workspace_vct_falls_back_to_const_when_empty() {
-        let vct = default_workspace_volume_claim_templates("");
+        let vct = default_workspace_volume_claim_templates("", "");
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
     }
@@ -5920,5 +5938,43 @@ mod tests {
             data: serde_json::json!({}),
         };
         assert!(sandbox_id_from_object(&obj).is_err());
+    }
+
+    #[test]
+    fn default_workspace_vct_sets_storage_class_when_provided() {
+        let vct = default_workspace_volume_claim_templates("5Gi", "fast-ssd");
+        assert_eq!(vct[0]["spec"]["storageClassName"], "fast-ssd");
+    }
+
+    #[test]
+    fn default_workspace_vct_omits_storage_class_when_empty() {
+        let vct = default_workspace_volume_claim_templates("5Gi", "");
+        assert!(vct[0]["spec"].get("storageClassName").is_none());
+    }
+
+    #[test]
+    fn workspace_storage_class_propagates_to_generated_cr_spec() {
+        let params = SandboxPodParams {
+            workspace_storage_class: "fast-ssd",
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&SandboxSpec::default()), &params);
+        assert_eq!(
+            cr["spec"]["volumeClaimTemplates"][0]["spec"]["storageClassName"],
+            "fast-ssd"
+        );
+    }
+
+    #[test]
+    fn workspace_storage_class_omitted_from_cr_spec_when_empty() {
+        let cr = sandbox_to_k8s_spec_for_test(
+            Some(&SandboxSpec::default()),
+            &SandboxPodParams::default(),
+        );
+        assert!(
+            cr["spec"]["volumeClaimTemplates"][0]["spec"]
+                .get("storageClassName")
+                .is_none()
+        );
     }
 }

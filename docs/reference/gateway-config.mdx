@@ -277,6 +277,10 @@ host_gateway_ip                = "10.0.0.1"
 enable_user_namespaces         = false
 app_armor_profile              = "Unconfined"
 workspace_default_storage_size = "10Gi"
+# Kubernetes StorageClass for the workspace PVC. Empty (default) omits the
+# field, using the cluster's default StorageClass. Set this on clusters with no
+# default StorageClass, otherwise the workspace PVC stays Pending.
+# workspace_storage_class      = "fast-ssd"
 # Kubernetes RuntimeClass applied to sandbox pods when the API request does
 # not specify one. Empty (default) = omit the field, using the cluster default.
 # default_runtime_class_name   = "kata-containers"
