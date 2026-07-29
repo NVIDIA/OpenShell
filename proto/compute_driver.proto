@@ -71,8 +71,8 @@ message GatewayListenerRequirement {
   string reason = 1;
 
   oneof selector {
-    // Concrete IP:port address requested by the driver. The POC requires the
-    // port to match the gateway's fixed primary listener port.
+    // Concrete IP:port address requested by the driver. The port must match
+    // the gateway's configured primary listener port.
     string exact_bind_address = 2;
     // Ask the gateway to bind the IPv4 address selected by its default route.
     // This matches rootless pasta's default upstream-interface selection.

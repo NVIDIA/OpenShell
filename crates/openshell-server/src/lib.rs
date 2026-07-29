@@ -661,10 +661,10 @@ fn allow_plaintext_service_http(
     enabled: bool,
     listen_addr: SocketAddr,
     peer_addr: SocketAddr,
-    listener_purpose: &GatewayListenerPurpose,
+    listener_scope: GatewayListenerScope,
 ) -> bool {
     enabled
-        && matches!(listener_purpose, GatewayListenerPurpose::Primary)
+        && matches!(listener_scope, GatewayListenerScope::Primary)
         && listen_addr.ip().is_loopback()
         && peer_addr.ip().is_loopback()
 }
@@ -686,7 +686,7 @@ fn spawn_gateway_connection(
                         enable_loopback_service_http,
                         listen_addr,
                         addr,
-                        &listener_purpose,
+                        listener_scope,
                     ) =>
                 {
                     if let Err(e) = service
@@ -704,7 +704,7 @@ fn spawn_gateway_connection(
                     warn!(
                         client = %addr,
                         listen = %listen_addr,
-                        purpose = ?listener_purpose,
+                        scope = ?listener_scope,
                         "Rejected plaintext HTTP on gateway listener"
                     );
                 }
@@ -1222,27 +1222,22 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:54000".parse().unwrap();
         let wildcard: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let remote_peer: SocketAddr = "192.0.2.10:54000".parse().unwrap();
-        let primary = GatewayListenerPurpose::Primary;
-        let callback = GatewayListenerPurpose::ComputeDriverCallback {
-            driver_name: "test-driver".to_string(),
-            reason: "test callback requirement".to_string(),
-        };
+        let primary = GatewayListenerScope::Primary;
+        let callback = GatewayListenerScope::ComputeDriverCallback;
 
-        assert!(allow_plaintext_service_http(true, loopback, peer, &primary));
+        assert!(allow_plaintext_service_http(true, loopback, peer, primary));
         assert!(!allow_plaintext_service_http(
-            false, loopback, peer, &primary
+            false, loopback, peer, primary
         ));
-        assert!(!allow_plaintext_service_http(
-            true, wildcard, peer, &primary
-        ));
+        assert!(!allow_plaintext_service_http(true, wildcard, peer, primary));
         assert!(!allow_plaintext_service_http(
             true,
             loopback,
             remote_peer,
-            &primary
+            primary
         ));
         assert!(!allow_plaintext_service_http(
-            true, loopback, peer, &callback
+            true, loopback, peer, callback
         ));
     }
 

@@ -149,7 +149,7 @@ impl MultiplexService {
             .await
     }
 
-    /// Serve a connection and preserve its listener purpose in request
+    /// Serve a connection and preserve its listener scope in request
     /// extensions for downstream routing and policy decisions.
     pub(crate) async fn serve_on_listener<S>(
         &self,
@@ -180,7 +180,7 @@ impl MultiplexService {
         .await
     }
 
-    /// Serve a TLS connection and preserve its listener purpose in request
+    /// Serve a TLS connection and preserve its listener scope in request
     /// extensions for downstream routing and policy decisions.
     pub(crate) async fn serve_with_peer_identity_on_listener<S>(
         &self,
@@ -260,7 +260,7 @@ impl MultiplexService {
     }
 
     /// Serve a plaintext service HTTP connection and preserve its listener
-    /// purpose in request extensions.
+    /// scope in request extensions.
     pub(crate) async fn serve_service_http_on_listener<S>(
         &self,
         stream: S,
@@ -996,15 +996,15 @@ impl<G, H> MultiplexedService<G, H> {
 }
 
 fn listener_allows_request(
-    listener_purpose: Option<&GatewayListenerPurpose>,
+    listener_scope: Option<&GatewayListenerScope>,
     is_grpc: bool,
     path: &str,
 ) -> bool {
-    match listener_purpose {
-        Some(GatewayListenerPurpose::ComputeDriverCallback { .. }) => {
+    match listener_scope {
+        Some(GatewayListenerScope::ComputeDriverCallback) => {
             is_grpc && crate::auth::sandbox_methods::is_sandbox_callable(path)
         }
-        Some(GatewayListenerPurpose::Primary) | None => true,
+        Some(GatewayListenerScope::Primary) | None => true,
     }
 }
 
@@ -1051,7 +1051,7 @@ where
             .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"));
 
         if !listener_allows_request(
-            req.extensions().get::<GatewayListenerPurpose>(),
+            req.extensions().get::<GatewayListenerScope>(),
             is_grpc,
             req.uri().path(),
         ) {
@@ -1246,16 +1246,13 @@ mod tests {
         );
     }
 
-    fn callback_listener_purpose() -> GatewayListenerPurpose {
-        GatewayListenerPurpose::ComputeDriverCallback {
-            driver_name: "test-driver".to_string(),
-            reason: "test callback requirement".to_string(),
-        }
+    fn callback_listener_scope() -> GatewayListenerScope {
+        GatewayListenerScope::ComputeDriverCallback
     }
 
     #[test]
     fn callback_listener_allows_sandbox_callback_rpcs() {
-        let purpose = callback_listener_purpose();
+        let scope = callback_listener_scope();
         let callback_paths = [
             "/openshell.v1.OpenShell/ConnectSupervisor",
             "/openshell.v1.OpenShell/RelayStream",
@@ -1270,15 +1267,28 @@ mod tests {
 
         for path in callback_paths {
             assert!(
-                listener_allows_request(Some(&purpose), true, path),
+                listener_allows_request(Some(&scope), true, path),
                 "callback listener should allow {path}"
             );
         }
     }
 
     #[test]
+    fn callback_listener_surface_matches_rpc_auth_metadata() {
+        let scope = callback_listener_scope();
+
+        for path in crate::auth::method_authz::all_paths() {
+            assert_eq!(
+                listener_allows_request(Some(&scope), true, path),
+                crate::auth::method_authz::is_sandbox_callable(path),
+                "callback listener exposure must follow rpc_auth metadata for {path}"
+            );
+        }
+    }
+
+    #[test]
     fn callback_listener_rejects_non_callback_routes() {
-        let purpose = callback_listener_purpose();
+        let scope = callback_listener_scope();
         let rejected_grpc_paths = [
             "/grpc.health.v1.Health/Check",
             "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
@@ -1291,17 +1301,17 @@ mod tests {
 
         for path in rejected_grpc_paths {
             assert!(
-                !listener_allows_request(Some(&purpose), true, path),
+                !listener_allows_request(Some(&scope), true, path),
                 "callback listener should reject {path}"
             );
         }
-        assert!(!listener_allows_request(Some(&purpose), false, "/health"));
-        assert!(!listener_allows_request(Some(&purpose), false, "/service"));
+        assert!(!listener_allows_request(Some(&scope), false, "/health"));
+        assert!(!listener_allows_request(Some(&scope), false, "/service"));
     }
 
     #[test]
     fn primary_listener_routing_is_unchanged() {
-        let primary = GatewayListenerPurpose::Primary;
+        let primary = GatewayListenerScope::Primary;
         let paths = [
             "/grpc.health.v1.Health/Check",
             "/openshell.v1.OpenShell/ListSandboxes",
@@ -1429,11 +1439,11 @@ mod tests {
     }
 
     async fn start_http_server_with_middleware() -> std::net::SocketAddr {
-        start_http_server_with_middleware_on_listener(GatewayListenerPurpose::Primary).await
+        start_http_server_with_middleware_on_listener(GatewayListenerScope::Primary).await
     }
 
     async fn start_http_server_with_middleware_on_listener(
-        listener_purpose: GatewayListenerPurpose,
+        listener_scope: GatewayListenerScope,
     ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1442,7 +1452,7 @@ mod tests {
         let http_service = request_id_middleware!(http_service);
 
         let service = MultiplexedService::new(http_service.clone(), http_service);
-        let service = GatewayListenerContextService::new(service, listener_purpose);
+        let service = GatewayListenerContextService::new(service, listener_scope);
 
         tokio::spawn(async move {
             loop {
@@ -1496,7 +1506,7 @@ mod tests {
 
     #[tokio::test]
     async fn callback_listener_filter_is_applied_before_route_dispatch() {
-        let addr = start_http_server_with_middleware_on_listener(callback_listener_purpose()).await;
+        let addr = start_http_server_with_middleware_on_listener(callback_listener_scope()).await;
 
         let health = http1_get(addr, "/healthz", &[]).await;
         assert_eq!(health.status(), StatusCode::FORBIDDEN);

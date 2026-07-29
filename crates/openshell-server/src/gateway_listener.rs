@@ -204,7 +204,7 @@ fn validate_gateway_listener_requirement(
             Ok(())
         }
         _ => Err(Error::config(format!(
-            "compute driver '{}' is not authorized for this gateway listener requirement in this proof of concept",
+            "compute driver '{}' is not authorized to request this gateway listener selector",
             requirement.driver_name()
         ))),
     }
@@ -285,7 +285,30 @@ pub async fn bind_gateway_listeners(
             .await
             .map_err(|e| Error::transport(format!("failed to bind to {}: {e}", spec.address)))?;
         let local_addr = listener.local_addr().unwrap_or(spec.address);
-        info!(address = %local_addr, "Server listening");
+        match spec.scope {
+            GatewayListenerScope::Primary => {
+                info!(
+                    address = %local_addr,
+                    listener_purpose = "primary",
+                    authorization_scope = "full-multiplexed-api",
+                    "Gateway listener bound"
+                );
+            }
+            GatewayListenerScope::ComputeDriverCallback => {
+                let provenance = spec
+                    .provenance
+                    .as_ref()
+                    .expect("callback listener spec must include provenance");
+                info!(
+                    address = %local_addr,
+                    listener_purpose = "compute-driver-callback",
+                    driver = %provenance.driver_name,
+                    reason = %provenance.reason,
+                    authorization_scope = "sandbox-callable-grpc-only",
+                    "Gateway listener bound"
+                );
+            }
+        }
         listeners.push(BoundGatewayListener {
             listener,
             spec: spec.bind_to(local_addr),
