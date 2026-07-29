@@ -25,6 +25,12 @@ const GATEWAY_PACKAGES: &[&str] = &["openshell.v1", "openshell.inference.v1"];
 /// silently turn a future RPC into an authentication-only endpoint.
 const AUTH_ONLY_METHODS: &[&str] = &["/openshell.v1.OpenShell/GetCurrentUser"];
 
+/// Bearer-authenticated methods that require a scope but deliberately no role.
+///
+/// Keep this list explicit so an incomplete authorization annotation cannot
+/// silently turn a future mutating RPC into a scope-only endpoint.
+const SCOPE_ONLY_METHODS: &[&str] = &["/openshell.v1.OpenShell/GetGatewayConfig"];
+
 /// Per-method authorization entry decoded from proto annotations.
 #[derive(Debug, Clone)]
 pub struct DescriptorAuthEntry {
@@ -200,10 +206,14 @@ fn validate_entry(
         ));
     }
 
-    // scope-only methods (bearer + scope, no role) are valid: any
-    // authenticated user with the required scope may call them.
     if scope.is_none() {
         return Err(format!("method {path}: bearer method declares no scope"));
+    }
+
+    if role_missing && !SCOPE_ONLY_METHODS.contains(&path) {
+        return Err(format!(
+            "method {path}: scope-only bearer method must be listed in SCOPE_ONLY_METHODS"
+        ));
     }
 
     Ok(())
@@ -312,19 +322,31 @@ mod tests {
 
     #[test]
     fn bearer_rpc_requires_scope() {
-        // scope-only (no role) is valid: any authenticated user with the scope
+        let missing_scope = validate_entry(FUTURE_RPC, AuthMode::Bearer, Some("user"), None, None)
+            .expect_err("missing scope must be rejected");
+        assert!(missing_scope.ends_with("bearer method declares no scope"));
+    }
+
+    #[test]
+    fn scope_only_rpc_must_be_explicitly_allowlisted() {
         validate_entry(
+            SCOPE_ONLY_METHODS[0],
+            AuthMode::Bearer,
+            None,
+            None,
+            Some("config:read"),
+        )
+        .expect("listed scope-only bearer method should be accepted");
+
+        let err = validate_entry(
             FUTURE_RPC,
             AuthMode::Bearer,
             None,
             None,
             Some("config:read"),
         )
-        .expect("scope-only bearer method should be accepted");
-
-        let missing_scope = validate_entry(FUTURE_RPC, AuthMode::Bearer, Some("user"), None, None)
-            .expect_err("missing scope must be rejected");
-        assert!(missing_scope.ends_with("bearer method declares no scope"));
+        .expect_err("unlisted scope-only RPC must be rejected");
+        assert!(err.contains("SCOPE_ONLY_METHODS"));
     }
 
     #[test]

@@ -59,6 +59,32 @@ use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
 
+/// Fetch a sandbox by ID and authorize the caller in one step, returning
+/// `NOT_FOUND` for both missing and unauthorized sandboxes so that callers
+/// cannot distinguish the two cases (CWE-203).
+async fn fetch_and_authorize_sandbox(
+    state: &Arc<ServerState>,
+    principal: &crate::auth::principal::Principal,
+    sandbox_id: &str,
+) -> Result<Sandbox, Status> {
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    authorize_sandbox_workspace(
+        &state.store,
+        &state.admin_role,
+        principal,
+        sandbox.object_workspace(),
+        MinWorkspaceRole::User,
+    )
+    .await
+    .map_err(|_| Status::not_found("sandbox not found"))?;
+    Ok(sandbox)
+}
+
 fn generate_routable_name() -> String {
     let name = petname::petname(2, "-").unwrap_or_else(generate_name);
     let mut truncated = &name[..name.len().min(MAX_ROUTABLE_NAME_LEN)];
@@ -721,20 +747,7 @@ pub(super) async fn handle_watch_sandbox(
     }
     let sandbox_id = req.id.clone();
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    authorize_sandbox_workspace(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        sandbox.object_workspace(),
-        MinWorkspaceRole::User,
-    )
-    .await?;
+    let _sandbox = fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
 
     let follow_status = req.follow_status;
     let follow_logs = req.follow_logs;
@@ -975,20 +988,7 @@ pub(super) async fn handle_exec_sandbox(
     }
     validate_exec_request_fields(&req)?;
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&req.sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    authorize_sandbox_workspace(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        sandbox.object_workspace(),
-        MinWorkspaceRole::User,
-    )
-    .await?;
+    let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
     if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
@@ -1098,20 +1098,7 @@ pub(super) async fn handle_forward_tcp(
 
     let target = validate_tcp_forward_init(&init)?;
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&init.sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    authorize_sandbox_workspace(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        sandbox.object_workspace(),
-        MinWorkspaceRole::User,
-    )
-    .await?;
+    let sandbox = fetch_and_authorize_sandbox(state, &principal, &init.sandbox_id).await?;
 
     if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
@@ -1433,20 +1420,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
 
     let req = validate_interactive_exec_start(first_msg)?;
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&req.sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    authorize_sandbox_workspace(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        sandbox.object_workspace(),
-        MinWorkspaceRole::User,
-    )
-    .await?;
+    let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
     if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
@@ -1517,20 +1491,7 @@ pub(super) async fn handle_create_ssh_session(
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&req.sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    authorize_sandbox_workspace(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        sandbox.object_workspace(),
-        MinWorkspaceRole::User,
-    )
-    .await?;
+    let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
     if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
@@ -1631,7 +1592,8 @@ pub(super) async fn handle_revoke_ssh_session(
         session.object_workspace(),
         MinWorkspaceRole::User,
     )
-    .await?;
+    .await
+    .map_err(|_| Status::not_found("sandbox not found"))?;
 
     let resource_version = session
         .metadata
@@ -4249,6 +4211,68 @@ mod tests {
             err.code(),
             Code::PermissionDenied,
             "handle_delete_sandbox should reject non-members with PermissionDenied"
+        );
+    }
+
+    /// ID-based data-plane handlers must return `NOT_FOUND` — never
+    /// `PERMISSION_DENIED` — when the caller lacks workspace access, so that
+    /// cross-workspace sandbox existence cannot be inferred (CWE-203).
+    #[tokio::test]
+    async fn id_based_handlers_hide_cross_workspace_sandboxes() {
+        use crate::auth::identity::{Identity, IdentityProvider};
+        use crate::auth::principal::{Principal, UserPrincipal};
+        use tonic::Code;
+
+        fn non_member_request<T>(inner: T) -> Request<T> {
+            let mut req = Request::new(inner);
+            req.extensions_mut().insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "non-member".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+            req
+        }
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        let mut sandbox = test_sandbox("cross-ws", Vec::new());
+        sandbox.metadata.as_mut().unwrap().workspace = "other-workspace".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // --- handle_watch_sandbox ---
+        let err = handle_watch_sandbox(
+            &state,
+            non_member_request(WatchSandboxRequest {
+                id: "sandbox-cross-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::NotFound,
+            "handle_watch_sandbox must return NotFound, not PermissionDenied"
+        );
+
+        // --- handle_create_ssh_session ---
+        let err = handle_create_ssh_session(
+            &state,
+            non_member_request(CreateSshSessionRequest {
+                sandbox_id: "sandbox-cross-ws".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::NotFound,
+            "handle_create_ssh_session must return NotFound, not PermissionDenied"
         );
     }
 

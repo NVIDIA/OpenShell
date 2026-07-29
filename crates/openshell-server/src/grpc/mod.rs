@@ -152,6 +152,8 @@ const MAX_PROVIDER_TYPE_LEN: usize = 64;
 const MAX_PROVIDER_CREDENTIALS_ENTRIES: usize = 32;
 /// Maximum number of entries in the provider `config` map.
 const MAX_PROVIDER_CONFIG_ENTRIES: usize = 64;
+/// Maximum number of key=value pairs in a label selector query.
+const MAX_LABEL_SELECTOR_PAIRS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Shared types (used by the policy/settings submodule)

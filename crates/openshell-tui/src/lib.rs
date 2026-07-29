@@ -2090,7 +2090,10 @@ fn cached_provider_profile(
 ) -> Option<openshell_core::proto::ProviderProfile> {
     let profile_id = provider.r#type.clone();
     profiles
-        .get(&(provider.profile_workspace.clone(), profile_id.clone()))
+        .get(&(
+            provider_profile_query_workspace(provider).to_string(),
+            profile_id.clone(),
+        ))
         .or_else(|| profiles.get(&(String::new(), profile_id)))
         .cloned()
 }
@@ -2769,6 +2772,11 @@ mod provider_profile_workspace_tests {
             ("team-a", "", "static profile with workspace provider scope"),
             ("", "platform", "platform profile"),
             ("team-a", "workspace", "workspace profile"),
+            (
+                "",
+                "workspace",
+                "legacy provider with empty profile_workspace and workspace-scoped profile",
+            ),
         ];
 
         for (provider_workspace, response_scope, label) in cases {

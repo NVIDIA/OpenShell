@@ -349,6 +349,11 @@ service OpenShell {
   // Get gateway-global settings (read-only feature flags; any authenticated
   // user may read these so the CLI and TUI can discover capabilities like
   // providers_v2_enabled without requiring Platform Admin).
+  //
+  // Scope-only (no role): scopes are granted by the IdP at token issuance,
+  // orthogonal to workspace membership. Deployments that enable scope
+  // enforcement configure the IdP to grant config:read (or openshell:all)
+  // to all sandbox users, so this does not block least-privilege flows.
   rpc GetGatewayConfig(openshell.sandbox.v1.GetGatewayConfigRequest)
       returns (openshell.sandbox.v1.GetGatewayConfigResponse) {
     option (openshell.options.v1.authorization) = {
