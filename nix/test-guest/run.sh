@@ -198,9 +198,15 @@ PY
 	forward_host_ports+=("${host_port}")
 done
 
+resolved_packages=()
 for package in "${packages[@]}"; do
+	package_input=${package}
+	if ! package=$(realpath -- "${package}"); then
+		echo "package does not exist: ${package_input}" >&2
+		exit 2
+	fi
 	if [ ! -f "${package}" ]; then
-		echo "package does not exist: ${package}" >&2
+		echo "package does not exist: ${package_input}" >&2
 		exit 2
 	fi
 	case "${TEST_GUEST_PACKAGE_FAMILY}:${package}" in
@@ -210,12 +216,17 @@ for package in "${packages[@]}"; do
 		exit 2
 		;;
 	esac
+	resolved_packages+=("${package}")
 done
+packages=("${resolved_packages[@]}")
 
+resolved_copies=()
 for copy_spec in "${copies[@]}"; do
 	source_path=${copy_spec%%:*}
 	destination=${copy_spec#*:}
-	if [ "${source_path}" = "${copy_spec}" ] || [ ! -f "${source_path}" ]; then
+	if [ "${source_path}" = "${copy_spec}" ] ||
+		! source_path=$(realpath -- "${source_path}") ||
+		[ ! -f "${source_path}" ]; then
 		echo "invalid --copy source: ${copy_spec}" >&2
 		exit 2
 	fi
@@ -235,7 +246,9 @@ for copy_spec in "${copies[@]}"; do
 		exit 2
 		;;
 	esac
+	resolved_copies+=("${source_path}:${destination}")
 done
+copies=("${resolved_copies[@]}")
 
 test_vm_cpu=host
 ssh_wait_seconds=180
