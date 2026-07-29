@@ -54,6 +54,7 @@ pub(super) fn http_context(
     L7EvalContext {
         host: decision.intent.destination.host.clone(),
         port: decision.intent.destination.port,
+        request_default_port: None,
         policy_name,
         binary_path: decision
             .binary
@@ -335,6 +336,7 @@ mod tests {
         L7EvalContext {
             host: "example.com".to_string(),
             port: 80,
+            request_default_port: Some(80),
             policy_name: "test".to_string(),
             binary_path: String::new(),
             ancestors: vec![],

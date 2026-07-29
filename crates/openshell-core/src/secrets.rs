@@ -3,7 +3,7 @@
 
 use crate::time::now_ms;
 use base64::Engine as _;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -121,9 +121,9 @@ pub struct RewriteTargetResult {
 #[derive(Clone, Default)]
 pub struct SecretResolver {
     by_placeholder: HashMap<String, SecretValue>,
-    denied_env_keys: std::collections::HashSet<String>,
-    no_revision_fallback_env_keys: std::collections::HashSet<String>,
-    revision_fallback_min_revisions: HashMap<String, u64>,
+    denied_env_keys: HashSet<String>,
+    identity_bound_env_keys: HashSet<String>,
+    revision_fallback_allowed_revisions: HashMap<String, HashSet<u64>>,
 }
 
 #[derive(Clone)]
@@ -244,9 +244,9 @@ impl SecretResolver {
                 child_env,
                 Some(Self {
                     by_placeholder,
-                    denied_env_keys: std::collections::HashSet::new(),
-                    no_revision_fallback_env_keys: std::collections::HashSet::new(),
-                    revision_fallback_min_revisions: HashMap::new(),
+                    denied_env_keys: HashSet::new(),
+                    identity_bound_env_keys: HashSet::new(),
+                    revision_fallback_allowed_revisions: HashMap::new(),
                 }),
             )
         }
@@ -254,16 +254,15 @@ impl SecretResolver {
 
     pub fn merge<'a>(resolvers: impl IntoIterator<Item = &'a Self>) -> Option<Self> {
         let mut by_placeholder = HashMap::new();
-        let mut denied_env_keys = std::collections::HashSet::new();
-        let mut no_revision_fallback_env_keys = std::collections::HashSet::new();
-        let mut revision_fallback_min_revisions = HashMap::new();
+        let mut denied_env_keys = HashSet::new();
+        let mut identity_bound_env_keys = HashSet::new();
+        let mut revision_fallback_allowed_revisions = HashMap::new();
         for resolver in resolvers {
             by_placeholder.extend(resolver.by_placeholder.clone());
             denied_env_keys.extend(resolver.denied_env_keys.iter().cloned());
-            no_revision_fallback_env_keys
-                .extend(resolver.no_revision_fallback_env_keys.iter().cloned());
-            revision_fallback_min_revisions
-                .extend(resolver.revision_fallback_min_revisions.clone());
+            identity_bound_env_keys.extend(resolver.identity_bound_env_keys.iter().cloned());
+            revision_fallback_allowed_revisions
+                .extend(resolver.revision_fallback_allowed_revisions.clone());
         }
         if by_placeholder.is_empty() {
             None
@@ -271,8 +270,8 @@ impl SecretResolver {
             Some(Self {
                 by_placeholder,
                 denied_env_keys,
-                no_revision_fallback_env_keys,
-                revision_fallback_min_revisions,
+                identity_bound_env_keys,
+                revision_fallback_allowed_revisions,
             })
         }
     }
@@ -285,14 +284,14 @@ impl SecretResolver {
     #[must_use]
     pub fn scoped_to_env_keys(
         &self,
-        bound_keys: &std::collections::HashSet<String>,
-        allowed_bound_keys: &std::collections::HashSet<String>,
-        revision_fallback_min_revisions: HashMap<String, u64>,
+        bound_keys: &HashSet<String>,
+        allowed_bound_keys: &HashSet<String>,
+        revision_fallback_allowed_revisions: HashMap<String, HashSet<u64>>,
     ) -> Self {
         let denied_env_keys = bound_keys
             .difference(allowed_bound_keys)
             .cloned()
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<HashSet<_>>();
         let by_placeholder = self
             .by_placeholder
             .iter()
@@ -304,8 +303,8 @@ impl SecretResolver {
         Self {
             by_placeholder,
             denied_env_keys,
-            no_revision_fallback_env_keys: bound_keys.clone(),
-            revision_fallback_min_revisions,
+            identity_bound_env_keys: bound_keys.clone(),
+            revision_fallback_allowed_revisions,
         }
     }
 
@@ -329,46 +328,63 @@ impl SecretResolver {
     /// Returns `None` if the placeholder is unknown or the resolved value
     /// contains prohibited control characters (CRLF, null byte).
     pub fn resolve_placeholder(&self, value: &str) -> Option<&str> {
+        if placeholder_env_key(value).is_some_and(|key| self.identity_bound_env_keys.contains(key))
+            && revisioned_placeholder_parts(value).is_none()
+        {
+            // Canonical placeholders and provider-shaped aliases carry no
+            // credential identity. Endpoint-bound request input must use the
+            // revision-scoped placeholder issued to the workload so a stale
+            // process cannot resolve a replacement provider's credential.
+            return None;
+        }
         let secret = if let Some(secret) = self.by_placeholder.get(value) {
             secret
         } else {
-            // Once an old generation ages out, the revision number is only a
-            // namespace marker. Fall back by key to the current credential so
-            // long-running child processes survive provider credential refresh.
-            // Endpoint-bound credentials are the exception: a revision belongs
-            // to one provider identity, so falling back by key after replacement
-            // would let the old process obtain the replacement provider's secret.
+            // Once an old generation ages out, fall back by key to the current
+            // credential so long-running child processes survive provider
+            // credential refresh. For endpoint-bound credentials, permit that
+            // fallback only when the exact opaque revision belongs to the
+            // current provider-identity epoch.
             let key = revisioned_placeholder_env_key(value).or_else(|| alias_env_key(value))?;
             if let Some((revision, key)) = revisioned_placeholder_parts(value)
-                && self.no_revision_fallback_env_keys.contains(key)
+                && self.identity_bound_env_keys.contains(key)
                 && self
-                    .revision_fallback_min_revisions
+                    .revision_fallback_allowed_revisions
                     .get(key)
-                    .is_none_or(|minimum| revision < *minimum)
+                    .is_none_or(|revisions| !revisions.contains(&revision))
             {
                 return None;
             }
             let canonical = placeholder_for_env_key(key);
             self.by_placeholder.get(&canonical)?
         };
-        if secret.expires_at_ms > 0 && secret.expires_at_ms <= now_ms() {
-            tracing::warn!(
-                location = "resolve_placeholder",
-                "credential resolution rejected: credential is expired"
-            );
-            return None;
+        resolve_secret_value(secret)
+    }
+
+    /// Resolve the current value for an environment key selected by trusted
+    /// supervisor code.
+    ///
+    /// Unlike [`Self::resolve_placeholder_checked`], this method accepts an
+    /// environment key rather than a user-provided placeholder token. Internal
+    /// request transforms such as `SigV4` can therefore select the endpoint-bound
+    /// current credential without making identityless placeholder aliases
+    /// available to sandbox request input.
+    pub fn resolve_current_env_key_checked(
+        &self,
+        key: &str,
+        location: &'static str,
+    ) -> Result<Option<&str>, UnresolvedPlaceholderError> {
+        if self.denied_env_keys.contains(key) {
+            return Err(UnresolvedPlaceholderError {
+                location,
+                reason: UnresolvedPlaceholderReason::EndpointMismatch,
+            });
         }
-        match validate_resolved_secret(secret.value.as_ref()) {
-            Ok(s) => Some(s),
-            Err(reason) => {
-                tracing::warn!(
-                    location = "resolve_placeholder",
-                    reason,
-                    "credential resolution rejected: resolved value contains prohibited characters"
-                );
-                None
-            }
-        }
+        let placeholder = placeholder_for_env_key(key);
+        Ok(self
+            .by_placeholder
+            .get(&placeholder)
+            .and_then(resolve_secret_value))
     }
 
     /// Resolve a placeholder while preserving endpoint-denial information.
@@ -567,6 +583,27 @@ impl SecretResolver {
         }
 
         Ok(Some(b64.encode(rewritten.as_bytes())))
+    }
+}
+
+fn resolve_secret_value(secret: &SecretValue) -> Option<&str> {
+    if secret.expires_at_ms > 0 && secret.expires_at_ms <= now_ms() {
+        tracing::warn!(
+            location = "resolve_placeholder",
+            "credential resolution rejected: credential is expired"
+        );
+        return None;
+    }
+    match validate_resolved_secret(secret.value.as_ref()) {
+        Ok(s) => Some(s),
+        Err(reason) => {
+            tracing::warn!(
+                location = "resolve_placeholder",
+                reason,
+                "credential resolution rejected: resolved value contains prohibited characters"
+            );
+            None
+        }
     }
 }
 

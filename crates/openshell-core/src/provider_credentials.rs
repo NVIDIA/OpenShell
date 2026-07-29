@@ -36,7 +36,7 @@ struct ProviderCredentialStateInner {
 #[derive(Debug)]
 struct StaticCredentialIdentityEpoch {
     identity: String,
-    first_revision: u64,
+    revisions: HashSet<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,7 +231,7 @@ impl ProviderCredentialState {
             .map(|(key, _)| key.clone())
             .collect();
         inner.combined_resolver.as_ref().map(|resolver| {
-            let revision_fallback_min_revisions = inner
+            let revision_fallback_allowed_revisions = inner
                 .static_credential_identity_epochs
                 .iter()
                 .filter(|(key, epoch)| {
@@ -241,12 +241,12 @@ impl ProviderCredentialState {
                             .get(*key)
                             .is_some_and(|binding| binding.credential_identity == epoch.identity)
                 })
-                .map(|(key, epoch)| (key.clone(), epoch.first_revision))
+                .map(|(key, epoch)| (key.clone(), epoch.revisions.clone()))
                 .collect();
             Arc::new(resolver.scoped_to_env_keys(
                 &inner.known_static_credential_keys,
                 &allowed,
-                revision_fallback_min_revisions,
+                revision_fallback_allowed_revisions,
             ))
         })
     }
@@ -590,17 +590,19 @@ fn update_static_credential_identity_epochs(
     epochs.retain(|key, _| bindings.contains_key(key));
     for (key, binding) in bindings {
         match epochs.get_mut(key) {
-            Some(epoch) if epoch.identity == binding.credential_identity => {}
+            Some(epoch) if epoch.identity == binding.credential_identity => {
+                epoch.revisions.insert(revision);
+            }
             Some(epoch) => {
                 epoch.identity.clone_from(&binding.credential_identity);
-                epoch.first_revision = revision;
+                epoch.revisions = HashSet::from([revision]);
             }
             None => {
                 epochs.insert(
                     key.clone(),
                     StaticCredentialIdentityEpoch {
                         identity: binding.credential_identity.clone(),
-                        first_revision: revision,
+                        revisions: HashSet::from([revision]),
                     },
                 );
             }
@@ -786,10 +788,10 @@ mod tests {
     }
 
     #[test]
-    fn aged_generation_falls_back_after_many_rotations_of_same_provider_credential() {
+    fn aged_generation_falls_back_across_non_monotonic_same_identity_rotations() {
         let state = ProviderCredentialState::from_bound_environment(
-            1,
-            HashMap::from([("API_KEY".to_string(), "secret-1".to_string())]),
+            50,
+            HashMap::from([("API_KEY".to_string(), "secret-50".to_string())]),
             HashMap::new(),
             HashMap::new(),
             HashMap::from([(
@@ -800,7 +802,7 @@ mod tests {
         )
         .expect("initial bindings");
 
-        for revision in 2..=10 {
+        for revision in [10, 100, 9, 101, 8, 102, 7, 103, 6] {
             state
                 .install_bound_environment(
                     revision,
@@ -820,16 +822,16 @@ mod tests {
             .resolver_for_endpoint("api.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
-            Some("secret-10"),
-            "an aged-out placeholder may use the current secret while its provider identity is unchanged"
+            resolver.resolve_placeholder("openshell:resolve:env:v50_API_KEY"),
+            Some("secret-6"),
+            "an aged-out placeholder may use the current secret across revisions in both numeric directions while its provider identity is unchanged"
         );
     }
 
     #[test]
     fn replacing_provider_with_reused_key_purges_retained_generation() {
         let state = ProviderCredentialState::from_bound_environment(
-            1,
+            u64::MAX,
             HashMap::from([("API_KEY".to_string(), "provider-a-secret".to_string())]),
             HashMap::new(),
             HashMap::new(),
@@ -842,7 +844,7 @@ mod tests {
 
         state
             .install_bound_environment(
-                2,
+                1,
                 HashMap::from([("API_KEY".to_string(), "provider-b-secret".to_string())]),
                 HashMap::new(),
                 HashMap::new(),
@@ -855,9 +857,26 @@ mod tests {
             .resolver_for_endpoint("b.example.com", 443, "/v1")
             .expect("resolver");
         assert_eq!(
-            resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
+            resolver.resolve_placeholder(&format!("openshell:resolve:env:v{}_API_KEY", u64::MAX)),
             None,
-            "a placeholder issued by another provider identity must fail closed"
+            "an opaque revision from another provider identity must fail closed even when it is numerically greater"
+        );
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:API_KEY"),
+            None,
+            "an identityless canonical placeholder must not resolve a replacement provider"
+        );
+        assert_eq!(
+            resolver.resolve_placeholder("vendor-OPENSHELL-RESOLVE-ENV-API_KEY"),
+            None,
+            "an identityless provider alias must not resolve a replacement provider"
+        );
+        assert_eq!(
+            resolver
+                .resolve_current_env_key_checked("API_KEY", "trusted-transform")
+                .expect("binding authorizes the endpoint"),
+            Some("provider-b-secret"),
+            "trusted supervisor transforms may select the current bound credential by key"
         );
     }
 
@@ -894,6 +913,16 @@ mod tests {
             resolver.resolve_placeholder("openshell:resolve:env:v1_API_KEY"),
             None,
             "a placeholder issued before detach must not resolve to a replacement provider"
+        );
+        assert_eq!(
+            resolver.resolve_placeholder("openshell:resolve:env:API_KEY"),
+            None,
+            "an identityless canonical placeholder must not cross detach and reattach"
+        );
+        assert_eq!(
+            resolver.resolve_placeholder("vendor-OPENSHELL-RESOLVE-ENV-API_KEY"),
+            None,
+            "an identityless provider alias must not cross detach and reattach"
         );
     }
 

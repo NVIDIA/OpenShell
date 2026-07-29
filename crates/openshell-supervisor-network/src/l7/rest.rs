@@ -390,7 +390,16 @@ pub(crate) fn validate_http_request_header_block(headers: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn request_host_authority(raw_header: &[u8]) -> Result<Option<http::uri::Authority>> {
+#[derive(Debug)]
+pub(crate) struct RequestAuthority {
+    pub(crate) authority: http::uri::Authority,
+    pub(crate) effective_port: u16,
+}
+
+pub(crate) fn request_authority(
+    raw_header: &[u8],
+    transport_default_port: Option<u16>,
+) -> Result<Option<RequestAuthority>> {
     let header_end = raw_header
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -398,7 +407,40 @@ pub(crate) fn request_host_authority(raw_header: &[u8]) -> Result<Option<http::u
         + 4;
     let headers = std::str::from_utf8(&raw_header[..header_end])
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
-    request_host_authority_from_str(headers)
+    let Some(host_authority) = request_host_authority_from_str(headers)? else {
+        return Ok(None);
+    };
+
+    let request_target = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| miette!("HTTP request is missing a request target"))?;
+    let absolute_uri = request_target
+        .contains("://")
+        .then(|| request_target.parse::<http::Uri>())
+        .transpose()
+        .map_err(|_| miette!("HTTP absolute-form request target contains an invalid URI"))?;
+    let (authority, default_port) = if let Some(uri) = absolute_uri {
+        let authority = uri
+            .authority()
+            .ok_or_else(|| miette!("HTTP absolute-form request target is missing an authority"))?
+            .clone();
+        let default_port = default_port_for_scheme(uri.scheme_str()).ok_or_else(|| {
+            miette!("HTTP absolute-form request target uses an unsupported scheme")
+        })?;
+        (authority, default_port)
+    } else {
+        let default_port = transport_default_port
+            .ok_or_else(|| miette!("HTTP origin-form request transport scheme is unavailable"))?;
+        (host_authority, default_port)
+    };
+
+    let effective_port = authority.port_u16().unwrap_or(default_port);
+    Ok(Some(RequestAuthority {
+        authority,
+        effective_port,
+    }))
 }
 
 fn request_host_authority_from_str(headers: &str) -> Result<Option<http::uri::Authority>> {
@@ -451,12 +493,16 @@ fn authorities_match(
     {
         return false;
     }
-    let default_port = match scheme {
+    let default_port = default_port_for_scheme(scheme);
+    left.port_u16().or(default_port) == right.port_u16().or(default_port)
+}
+
+fn default_port_for_scheme(scheme: Option<&str>) -> Option<u16> {
+    match scheme {
         Some(scheme) if scheme.eq_ignore_ascii_case("http") => Some(80),
         Some(scheme) if scheme.eq_ignore_ascii_case("https") => Some(443),
         _ => None,
-    };
-    left.port_u16().or(default_port) == right.port_u16().or(default_port)
+    }
 }
 
 fn normalized_authority_host(host: &str) -> &str {
@@ -784,21 +830,14 @@ where
             client.flush().await.into_diagnostic()?;
         }
         if let Some(resolver) = options.resolver {
-            let access_key_placeholder =
-                openshell_core::secrets::placeholder_for_env_key("AWS_ACCESS_KEY_ID");
-            let secret_key_placeholder =
-                openshell_core::secrets::placeholder_for_env_key("AWS_SECRET_ACCESS_KEY");
-            let session_token_placeholder =
-                openshell_core::secrets::placeholder_for_env_key("AWS_SESSION_TOKEN");
-
             let access_key = resolver
-                .resolve_placeholder_checked(&access_key_placeholder, "sigv4")
+                .resolve_current_env_key_checked("AWS_ACCESS_KEY_ID", "sigv4")
                 .map_err(miette::Report::new)?;
             let secret_key = resolver
-                .resolve_placeholder_checked(&secret_key_placeholder, "sigv4")
+                .resolve_current_env_key_checked("AWS_SECRET_ACCESS_KEY", "sigv4")
                 .map_err(miette::Report::new)?;
             let session_token = resolver
-                .resolve_placeholder_checked(&session_token_placeholder, "sigv4")
+                .resolve_current_env_key_checked("AWS_SESSION_TOKEN", "sigv4")
                 .map_err(miette::Report::new)?;
 
             match (access_key, secret_key) {
