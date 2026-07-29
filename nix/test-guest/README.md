@@ -112,6 +112,11 @@ Configurations are Ansible playbooks stored under `nix/test-guest/configuration/
 
 Configurations run in the order provided on the command line. OpenShell packages and copied binaries are installed after all configurations succeed.
 
+When a checkout-built supervisor is copied into a Podman guest, the post-copy
+hook layers it onto a digest-pinned NVIDIA supervisor image. The trusted base
+provides the network-policy runtime without resolving mutable image tags or
+installing packages during guest setup.
+
 A configuration can install executable hooks under
 `/usr/local/libexec/openshell-test-guest/post-copy.d`. The runner invokes them
 in lexical order after all `--install` and `--copy` artifacts are present and

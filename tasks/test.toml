@@ -5,7 +5,7 @@
 
 [test]
 description = "Run all tests (Rust + Python)"
-depends = ["test:rust", "test:python", "test:sbom", "test:install-sh", "test:build-env", "test:packaging-assets", "test:docs-website"]
+depends = ["test:rust", "test:python", "test:sbom", "test:install-sh", "test:build-env", "test:packaging-assets", "test:test-guest", "test:docs-website"]
 
 ["test:docs-website"]
 description = "Test the docs-website sync script"
@@ -31,6 +31,11 @@ hide = true
 ["test:packaging-assets"]
 description = "Run static packaging asset tests"
 run = "tasks/scripts/test-packaging-assets.sh"
+hide = true
+
+["test:test-guest"]
+description = "Run focused test guest runner shell tests"
+run = "nix/test-guest/run-lib-test.sh"
 hide = true
 
 [e2e]

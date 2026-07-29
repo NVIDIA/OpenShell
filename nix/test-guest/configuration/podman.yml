@@ -57,6 +57,7 @@
 
           supervisor_bin=/home/openshell/.cache/openshell-e2e/bin/openshell-sandbox
           supervisor_image=localhost/openshell/supervisor:e2e-vm
+          supervisor_base=ghcr.io/nvidia/openshell/supervisor@sha256:9820a3fa06435055b3c9330487868f8013cd9e3501a93f268a22691181c6fa2a
           relay_socket=/home/openshell/.cache/openshell-e2e/podman-gateway.sock
           host_relay_unit=openshell-e2e-podman-host-relay
           network_relay_unit=openshell-e2e-podman-network-relay
@@ -82,9 +83,8 @@
           trap cleanup EXIT
 
           install -m 0555 "${supervisor_bin}" "${build_context}/openshell-sandbox"
-          cat >"${build_context}/Containerfile" <<'EOF'
-          FROM alpine:3.22
-          RUN apk add --no-cache nftables iptables iptables-legacy
+          cat >"${build_context}/Containerfile" <<EOF
+          FROM ${supervisor_base}
           COPY --chmod=0555 openshell-sandbox /openshell-sandbox
           ENTRYPOINT ["/openshell-sandbox"]
           EOF
@@ -139,7 +139,13 @@
               TCP-LISTEN:8080,bind=0.0.0.0,reuseaddr,fork \
               "UNIX-CONNECT:${relay_socket}"
           for _ in $(seq 1 50); do
-              if systemctl --user is-active --quiet "${network_relay_unit}.service"; then
+              if ! systemctl --user is-active --quiet "${network_relay_unit}.service"; then
+                  break
+              fi
+              if /usr/bin/podman unshare --rootless-netns \
+                  /usr/bin/python3 -c \
+                  'import socket; socket.create_connection(("127.0.0.1", 8080), timeout=0.25).close()' &&
+                  systemctl --user is-active --quiet "${network_relay_unit}.service"; then
                   exit 0
               fi
               sleep 0.1
