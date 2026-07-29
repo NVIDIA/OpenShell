@@ -42,6 +42,9 @@ pub struct L7EvalContext {
     pub host: String,
     /// Port from the CONNECT request.
     pub port: u16,
+    /// Default authority port for the inspected HTTP transport (80 for
+    /// plaintext, 443 after TLS termination).
+    pub(crate) request_default_port: Option<u16>,
     /// Matched policy name from L4 evaluation.
     pub policy_name: String,
     /// Binary path (for cross-layer Rego evaluation).
@@ -72,10 +75,42 @@ pub struct L7EvalContext {
     pub(crate) agent_proposals: openshell_core::proposals::AgentProposals,
 }
 
-fn scoped_context_for_request(ctx: &L7EvalContext, target: &str) -> Option<L7EvalContext> {
-    let credentials = ctx.provider_credentials.as_ref()?;
+fn request_default_port(ctx: &L7EvalContext) -> Option<u16> {
+    ctx.request_default_port.or({
+        // Existing direct relay tests construct the request context below the
+        // production adapter that records the inspected transport. Keep those
+        // fixtures focused on their original concern; authority regressions
+        // set this field explicitly.
+        #[cfg(test)]
+        {
+            Some(ctx.port)
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    })
+}
+
+fn scoped_context_for_request(
+    ctx: &L7EvalContext,
+    request: &crate::l7::provider::L7Request,
+) -> Option<L7EvalContext> {
     let mut scoped = ctx.clone();
-    scoped.secret_resolver = credentials.resolver_for_endpoint(&ctx.host, ctx.port, target);
+    if matches!(
+        crate::l7::rest::request_authority(&request.raw_header, request_default_port(ctx)),
+        Ok(None)
+    ) {
+        // HTTP/1.0 permits an origin-form request without Host. Such requests
+        // remain compatible, but an absent authority cannot authorize static
+        // credential use. Clearing the resolver makes any placeholder or
+        // signing attempt fail closed before an upstream write.
+        scoped.secret_resolver = None;
+        return Some(scoped);
+    }
+    let credentials = ctx.provider_credentials.as_ref()?;
+    scoped.secret_resolver =
+        credentials.resolver_for_endpoint(&ctx.host, ctx.port, &request.target);
     Some(scoped)
 }
 
@@ -83,20 +118,23 @@ fn request_authority_matches_endpoint(
     request: &crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
 ) -> bool {
-    let authority = match crate::l7::rest::request_host_authority(&request.raw_header) {
-        Ok(Some(authority)) => authority,
-        Ok(None) => return true,
-        Err(_) => return false,
-    };
-    let request_host = authority.host().trim_end_matches('.');
+    let authority =
+        match crate::l7::rest::request_authority(&request.raw_header, request_default_port(ctx)) {
+            Ok(Some(authority)) => authority,
+            Ok(None) => {
+                return std::str::from_utf8(&request.raw_header)
+                    .is_ok_and(|request| !secrets::contains_reserved_credential_marker(request));
+            }
+            Err(_) => return false,
+        };
+    let request_host = authority.authority.host().trim_end_matches('.');
     let endpoint_host = ctx
         .host
         .trim()
         .trim_start_matches('[')
         .trim_end_matches(']')
         .trim_end_matches('.');
-    request_host.eq_ignore_ascii_case(endpoint_host)
-        && authority.port_u16().is_none_or(|port| port == ctx.port)
+    request_host.eq_ignore_ascii_case(endpoint_host) && authority.effective_port == ctx.port
 }
 
 async fn reject_request_authority_mismatch<W>(client: &mut W, ctx: &L7EvalContext) -> Result<()>
@@ -532,7 +570,7 @@ where
                 .await?;
             return Ok(());
         };
-        let scoped_ctx = scoped_context_for_request(ctx, &req.target);
+        let scoped_ctx = scoped_context_for_request(ctx, &req);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
 
         if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
@@ -1055,7 +1093,7 @@ where
             reject_request_authority_mismatch(client, ctx).await?;
             return Ok(());
         }
-        let scoped_ctx = scoped_context_for_request(ctx, &req.target);
+        let scoped_ctx = scoped_context_for_request(ctx, &req);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
 
         if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
@@ -1361,7 +1399,7 @@ where
             reject_request_authority_mismatch(client, ctx).await?;
             return Ok(());
         }
-        let scoped_ctx = scoped_context_for_request(ctx, &req.target);
+        let scoped_ctx = scoped_context_for_request(ctx, &req);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
 
         if close_if_stale(engine.generation_guard(), ctx) {
@@ -1578,7 +1616,7 @@ where
             reject_request_authority_mismatch(client, ctx).await?;
             return Ok(());
         }
-        let scoped_ctx = scoped_context_for_request(ctx, &req.target);
+        let scoped_ctx = scoped_context_for_request(ctx, &req);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
 
         if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
@@ -2251,7 +2289,7 @@ where
             reject_request_authority_mismatch(client, ctx).await?;
             return Ok(());
         }
-        let scoped_ctx = scoped_context_for_request(ctx, &req.target);
+        let scoped_ctx = scoped_context_for_request(ctx, &req);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
         let resolver = ctx.secret_resolver.as_deref();
 
@@ -2415,11 +2453,7 @@ mod tests {
     use openshell_core::provider_credentials::ProviderCredentialState;
     use std::collections::HashMap as TestHashMap;
     use std::path::PathBuf;
-    use std::sync::Mutex;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-    use tracing::instrument::WithSubscriber;
-    use tracing_subscriber::Layer;
-    use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
 
@@ -2456,60 +2490,26 @@ mod tests {
         (state, resolver)
     }
 
-    #[derive(Clone, Default)]
-    struct OcsfCapture {
-        events: Arc<Mutex<Vec<serde_json::Value>>>,
-    }
-
-    impl<S> Layer<S> for OcsfCapture
-    where
-        S: tracing::Subscriber,
-    {
-        fn on_event(&self, event: &tracing::Event<'_>, _ctx: LayerContext<'_, S>) {
-            if event.metadata().target() != openshell_ocsf::OCSF_TARGET {
-                return;
-            }
-            let Some(event) = openshell_ocsf::clone_current_event() else {
-                return;
-            };
-            self.events
-                .lock()
-                .expect("OCSF capture lock")
-                .push(event.to_json().expect("OCSF event JSON"));
-        }
-    }
-
-    impl OcsfCapture {
-        fn snapshot(&self) -> Vec<serde_json::Value> {
-            self.events.lock().expect("OCSF capture lock").clone()
-        }
-    }
-
     async fn run_single_config_credential_mismatch(
         config: L7EndpointConfig,
         engine: TunnelPolicyEngine,
         mut ctx: L7EvalContext,
         request: String,
         resolver: Arc<SecretResolver>,
-    ) -> (String, Vec<u8>, Vec<serde_json::Value>) {
+    ) -> (String, Vec<u8>) {
         ctx.secret_resolver = Some(resolver);
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
-        let capture = OcsfCapture::default();
-        let subscriber = tracing_subscriber::registry().with(capture.clone());
-        let relay = tokio::spawn(
-            async move {
-                relay_with_inspection(
-                    &config,
-                    engine,
-                    &mut relay_client,
-                    &mut relay_upstream,
-                    &ctx,
-                )
-                .await
-            }
-            .with_subscriber(subscriber),
-        );
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
 
         app.write_all(request.as_bytes()).await.unwrap();
         let mut response = String::new();
@@ -2528,13 +2528,13 @@ mod tests {
 
         let mut forwarded = Vec::new();
         upstream.read_to_end(&mut forwarded).await.unwrap();
-        (response, forwarded, capture.snapshot())
+        (response, forwarded)
     }
 
     fn assert_single_config_credential_mismatch(
         response: &str,
         forwarded: &[u8],
-        events: &[serde_json::Value],
+        ctx: &L7EvalContext,
     ) {
         assert!(response.contains("403 Forbidden"), "{response}");
         assert!(
@@ -2546,9 +2546,19 @@ mod tests {
             "credential mismatch must not write upstream"
         );
 
-        let events = serde_json::to_string(events).unwrap();
-        assert!(events.contains("\"status_detail\":\"credential_endpoint_mismatch\""));
-        assert!(events.contains("openshell.provider_credential.endpoint_mismatch"));
+        let activity = build_credential_resolution_event(ctx, true)
+            .to_json()
+            .expect("serialize credential mismatch activity");
+        assert_eq!(activity["status_detail"], "credential_endpoint_mismatch");
+        assert_eq!(activity["action"], "Denied");
+        assert_eq!(activity["disposition"], "Blocked");
+        let finding = build_credential_endpoint_mismatch_finding(ctx)
+            .to_json()
+            .expect("serialize credential mismatch finding");
+        assert_eq!(
+            finding["finding_info"]["uid"],
+            "openshell.provider_credential.endpoint_mismatch"
+        );
     }
 
     async fn assert_credential_relay_rejected(
@@ -3025,6 +3035,7 @@ network_policies:
     #[tokio::test]
     async fn single_config_jsonrpc_credential_mismatch_is_typed_and_telemetry_safe() {
         let (config, engine, ctx) = jsonrpc_test_relay_context_with_path("/rpc/**");
+        let event_ctx = ctx.clone();
         let (_state, resolver) = endpoint_mismatch_resolver(TestHashMap::from([(
             "API_TOKEN".to_string(),
             "secret".to_string(),
@@ -3035,24 +3046,27 @@ network_policies:
             body.len()
         );
 
-        let (response, forwarded, events) =
+        let (response, forwarded) =
             run_single_config_credential_mismatch(config, engine, ctx, request, resolver).await;
-        assert_single_config_credential_mismatch(&response, &forwarded, &events);
+        assert_single_config_credential_mismatch(&response, &forwarded, &event_ctx);
 
-        let events = serde_json::to_string(&events).unwrap();
+        let redacted_target =
+            secrets::redact_target_for_policy("/rpc/openshell:resolve:env:v1_API_TOKEN")
+                .expect("policy target redaction");
         assert!(
-            events.contains("[CREDENTIAL]"),
-            "policy telemetry should contain the syntax-only redaction marker: {events}"
+            redacted_target.contains("[CREDENTIAL]"),
+            "policy telemetry should contain the syntax-only redaction marker: {redacted_target}"
         );
         assert!(
-            !events.contains("API_TOKEN"),
-            "policy telemetry must not expose credential environment keys: {events}"
+            !redacted_target.contains("API_TOKEN"),
+            "policy telemetry must not expose credential environment keys: {redacted_target}"
         );
     }
 
     #[tokio::test]
     async fn single_config_mcp_credential_mismatch_returns_typed_denial() {
         let (config, engine, ctx) = mcp_test_relay_context();
+        let event_ctx = ctx.clone();
         let (_state, resolver) = endpoint_mismatch_resolver(TestHashMap::from([(
             "API_TOKEN".to_string(),
             "secret".to_string(),
@@ -3063,14 +3077,15 @@ network_policies:
             body.len()
         );
 
-        let (response, forwarded, events) =
+        let (response, forwarded) =
             run_single_config_credential_mismatch(config, engine, ctx, request, resolver).await;
-        assert_single_config_credential_mismatch(&response, &forwarded, &events);
+        assert_single_config_credential_mismatch(&response, &forwarded, &event_ctx);
     }
 
     #[tokio::test]
     async fn single_config_graphql_credential_mismatch_returns_typed_denial() {
         let (config, engine, ctx) = graphql_test_relay_context();
+        let event_ctx = ctx.clone();
         let (_state, resolver) = endpoint_mismatch_resolver(TestHashMap::from([(
             "API_TOKEN".to_string(),
             "secret".to_string(),
@@ -3081,9 +3096,9 @@ network_policies:
             body.len()
         );
 
-        let (response, forwarded, events) =
+        let (response, forwarded) =
             run_single_config_credential_mismatch(config, engine, ctx, request, resolver).await;
-        assert_single_config_credential_mismatch(&response, &forwarded, &events);
+        assert_single_config_credential_mismatch(&response, &forwarded, &event_ctx);
     }
 
     fn authorization_header_count(headers: &str) -> usize {
@@ -3590,6 +3605,197 @@ network_policies:
             finding["finding_info"]["uid"],
             "openshell.http.request_authority_mismatch"
         );
+    }
+
+    async fn run_bound_credential_request(
+        port: u16,
+        request_default_port: u16,
+        request: impl FnOnce(&str) -> String,
+    ) -> (String, Vec<u8>) {
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        let generation_guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([("API_TOKEN".to_string(), "secret".to_string())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.test".to_string(),
+                        port: u32::from(port),
+                        path: "/v1/**".to_string(),
+                    }],
+                    credential_identity: "provider-a:API_TOKEN".to_string(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("bound provider state");
+        let placeholder = state
+            .snapshot()
+            .child_env
+            .get("API_TOKEN")
+            .expect("placeholder")
+            .clone();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port,
+            request_default_port: Some(request_default_port),
+            policy_name: "passthrough_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            provider_credentials: Some(state),
+            ..Default::default()
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_passthrough_with_credentials(
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+                &generation_guard,
+                None,
+            )
+            .await
+        });
+
+        app.write_all(request(&placeholder).as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read_to_string(&mut response),
+        )
+        .await
+        .expect("credential denial should close the client stream")
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+        let mut forwarded = Vec::new();
+        upstream.read_to_end(&mut forwarded).await.unwrap();
+        (response, forwarded)
+    }
+
+    #[tokio::test]
+    async fn connect_http10_without_authority_cannot_resolve_static_credential() {
+        let (response, forwarded) = run_bound_credential_request(80, 80, |placeholder| {
+            format!(
+                "GET /v1/messages HTTP/1.0\r\nAuthorization: Bearer {placeholder}\r\nConnection: close\r\n\r\n"
+            )
+        })
+        .await;
+
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            response.contains("request_authority_mismatch"),
+            "{response}"
+        );
+        assert!(
+            forwarded.is_empty(),
+            "authority-less credential request must not write upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_origin_form_omitted_port_rejects_non_default_tunnel() {
+        let (response, forwarded) = run_bound_credential_request(8080, 80, |placeholder| {
+            format!(
+                "GET /v1/messages HTTP/1.1\r\nHost: api.example.test\r\nAuthorization: Bearer {placeholder}\r\nConnection: close\r\n\r\n"
+            )
+        })
+        .await;
+
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            response.contains("request_authority_mismatch"),
+            "{response}"
+        );
+        assert!(
+            forwarded.is_empty(),
+            "origin-form request with the wrong effective port must not write upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_absolute_form_omitted_port_rejects_non_default_tunnel() {
+        let (response, forwarded) = run_bound_credential_request(8080, 80, |placeholder| {
+            format!(
+                "GET http://api.example.test/v1/messages HTTP/1.1\r\nHost: api.example.test\r\nAuthorization: Bearer {placeholder}\r\nConnection: close\r\n\r\n"
+            )
+        })
+        .await;
+
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            response.contains("request_authority_mismatch"),
+            "{response}"
+        );
+        assert!(
+            forwarded.is_empty(),
+            "absolute-form request with the wrong effective port must not write upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_http10_without_authority_forwards_credential_free_request() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        let generation_guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 80,
+            request_default_port: Some(80),
+            policy_name: "passthrough_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ..Default::default()
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_passthrough_with_credentials(
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+                &generation_guard,
+                None,
+            )
+            .await
+        });
+
+        app.write_all(b"GET /v1/messages HTTP/1.0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut forwarded = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut forwarded),
+        )
+        .await
+        .expect("credential-free HTTP/1.0 request should reach upstream")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&forwarded[..n]).starts_with("GET /v1/messages HTTP/1.0"));
+        upstream
+            .write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        app.read_to_string(&mut response).await.unwrap();
+        assert!(response.contains("204 No Content"), "{response}");
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
