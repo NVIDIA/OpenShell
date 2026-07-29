@@ -4935,7 +4935,11 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(error.code(), Code::PermissionDenied);
+        assert_eq!(
+            error.code(),
+            Code::NotFound,
+            "cross-workspace sandbox access must return NotFound to prevent CWE-203 oracle"
+        );
     }
 
     #[tokio::test]

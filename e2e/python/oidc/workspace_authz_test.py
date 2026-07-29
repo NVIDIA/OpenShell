@@ -762,11 +762,11 @@ class TestWorkspaceAuthorization:
                     ),
                     metadata=user_md,
                 )
-            _assert_non_member_denial(
-                exc_info.value,
-                other_workspace,
-                user_sub,
-                "GetSandboxLogs",
+            # ID-based handlers normalize unauthorized responses to NOT_FOUND
+            # so cross-workspace sandbox existence cannot be inferred (CWE-203).
+            assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND, (
+                "GetSandboxLogs: expected NOT_FOUND for cross-workspace sandbox, "
+                f"got {exc_info.value.code()}"
             )
         finally:
             if sandbox_id:
