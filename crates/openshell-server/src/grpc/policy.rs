@@ -1275,21 +1275,9 @@ pub(super) async fn handle_get_sandbox_config(
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     drop(request);
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox =
+        super::sandbox::fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
     let workspace = sandbox.object_workspace().to_string();
-    authorize_sandbox_workspace(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        &workspace,
-        MinWorkspaceRole::User,
-    )
-    .await?;
     let sandbox_provider_names = sandbox
         .spec
         .as_ref()
@@ -2533,20 +2521,8 @@ pub(super) async fn handle_get_sandbox_logs(
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&req.sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    authorize_sandbox_workspace(
-        &state.store,
-        &state.admin_role,
-        &principal,
-        sandbox.object_workspace(),
-        MinWorkspaceRole::User,
-    )
-    .await?;
+    let _sandbox =
+        super::sandbox::fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
     let lines = if req.lines == 0 { 2000 } else { req.lines };
     let tail = state.tracing_log_bus.tail(&req.sandbox_id, lines as usize);
@@ -13513,6 +13489,69 @@ mod tests {
             Code::PermissionDenied,
             "handle_get_draft_history should return PermissionDenied, got {:?}",
             err.code()
+        );
+    }
+
+    /// ID-based policy handlers must return `NOT_FOUND` — never
+    /// `PERMISSION_DENIED` — when the caller lacks workspace access, so that
+    /// cross-workspace sandbox existence cannot be inferred (CWE-203).
+    #[tokio::test]
+    async fn id_based_policy_handlers_hide_cross_workspace_sandboxes() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        fn non_member_request<T>(inner: T) -> Request<T> {
+            let mut req = Request::new(inner);
+            req.extensions_mut().insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "non-member".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+            req
+        }
+
+        let mut sandbox = test_sandbox(
+            "sandbox-other",
+            "other",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        sandbox.metadata.as_mut().unwrap().workspace = "other-workspace".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // --- handle_get_sandbox_config ---
+        let err = handle_get_sandbox_config(
+            &state,
+            non_member_request(GetSandboxConfigRequest {
+                sandbox_id: "sandbox-other".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::NotFound,
+            "handle_get_sandbox_config must return NotFound, not PermissionDenied"
+        );
+
+        // --- handle_get_sandbox_logs ---
+        let err = handle_get_sandbox_logs(
+            &state,
+            non_member_request(GetSandboxLogsRequest {
+                sandbox_id: "sandbox-other".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::NotFound,
+            "handle_get_sandbox_logs must return NotFound, not PermissionDenied"
         );
     }
 

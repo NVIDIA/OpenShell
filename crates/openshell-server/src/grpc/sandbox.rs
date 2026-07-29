@@ -62,7 +62,7 @@ const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
 /// Fetch a sandbox by ID and authorize the caller in one step, returning
 /// `NOT_FOUND` for both missing and unauthorized sandboxes so that callers
 /// cannot distinguish the two cases (CWE-203).
-async fn fetch_and_authorize_sandbox(
+pub(super) async fn fetch_and_authorize_sandbox(
     state: &Arc<ServerState>,
     principal: &crate::auth::principal::Principal,
     sandbox_id: &str,
