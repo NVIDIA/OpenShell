@@ -1,7 +1,7 @@
 # RPM dependencies for Dockerfile.konflux.supervisor
 # Build + runtime stages combined. Generate lockfile with:
-#   rpm-lockfile-prototype --containerfile deploy/docker/Dockerfile.konflux.supervisor \
-#       --arch x86_64 \
+#   rpm-lockfile-prototype --bare \
+#       --arch x86_64 --arch aarch64 \
 #       --outfile deploy/konflux/supervisor/rpms.lock.yaml \
 #       deploy/konflux/supervisor/rpms.in.yaml
 #
