@@ -319,7 +319,11 @@ def _proxy_connect_then_http_with_server():
                     {"connect_status": connect_resp.strip(), "http_status": 0}
                 )
 
-            request = f"{method} {path} HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n"
+            request = (
+                f"{method} {path} HTTP/1.1\r\n"
+                f"Host: {target_host}:{target_port}\r\n"
+                "Connection: close\r\n\r\n"
+            )
             conn.sendall(request.encode())
 
             data = b""
