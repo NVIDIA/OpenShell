@@ -105,25 +105,6 @@ impl ResolvedWorkspace {
     }
 }
 
-/// Resolve a workspace for provider profile operations.
-///
-/// Provider profiles support a platform scope where `""` is a distinct,
-/// meaningful value (not an alias for `"default"`). This function preserves
-/// `""` as-is for platform-scoped operations. Non-empty workspace values are
-/// validated for existence via [`resolve_workspace`].
-pub async fn resolve_profile_workspace(
-    store: &crate::persistence::Store,
-    workspace: &str,
-) -> Result<ResolvedWorkspace, Status> {
-    if workspace.is_empty() {
-        return Ok(ResolvedWorkspace {
-            name: String::new(),
-            terminating: false,
-        });
-    }
-    resolve_workspace(store, workspace).await
-}
-
 /// Resolve and validate a workspace name from a request field.
 ///
 /// Empty strings are normalized to `"default"`. The workspace must exist in the
@@ -1464,6 +1445,95 @@ mod tests {
         assert!(
             remaining.is_empty(),
             "inference routes should be cascade-deleted with workspace"
+        );
+    }
+
+    /// Non-member callers must receive `PERMISSION_DENIED` — not `NOT_FOUND` —
+    /// when targeting a workspace that does not exist. Returning `NOT_FOUND`
+    /// would create a CWE-203 workspace-name oracle.
+    #[tokio::test]
+    async fn non_member_gets_permission_denied_not_workspace_oracle() {
+        use crate::auth::identity::{Identity, IdentityProvider};
+        use crate::auth::principal::{Principal, UserPrincipal};
+
+        fn non_member_request<T>(inner: T) -> Request<T> {
+            let mut req = Request::new(inner);
+            req.extensions_mut().insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "non-member".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+            req
+        }
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        let err = handle_get_workspace(
+            &state,
+            non_member_request(GetWorkspaceRequest {
+                name: "no-such-ws".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_get_workspace should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_add_workspace_member(
+            &state,
+            non_member_request(AddWorkspaceMemberRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_add_workspace_member should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_remove_workspace_member(
+            &state,
+            non_member_request(RemoveWorkspaceMemberRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_remove_workspace_member should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_list_workspace_members(
+            &state,
+            non_member_request(ListWorkspaceMembersRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_list_workspace_members should return PermissionDenied, got {:?}",
+            err.code()
         );
     }
 }

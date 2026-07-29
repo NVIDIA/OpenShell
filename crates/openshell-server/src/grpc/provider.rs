@@ -1328,16 +1328,20 @@ use tonic::{Request, Response};
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{MinWorkspaceRole, authorize_workspace, require_platform_admin};
 
-async fn authorize_provider_profile_scope(
+async fn authorize_and_resolve_profile_workspace(
     state: &Arc<ServerState>,
     principal: &Principal,
     workspace: &str,
     min_workspace_role: MinWorkspaceRole,
-) -> Result<(), Status> {
+) -> Result<super::workspace::ResolvedWorkspace, Status> {
     if workspace.is_empty() {
-        require_platform_admin(&state.admin_role, principal)
+        require_platform_admin(&state.admin_role, principal)?;
+        Ok(super::workspace::ResolvedWorkspace {
+            name: String::new(),
+            terminating: false,
+        })
     } else {
-        authorize_workspace(
+        let authz = authorize_workspace(
             &state.store,
             &state.admin_role,
             principal,
@@ -1345,7 +1349,7 @@ async fn authorize_provider_profile_scope(
             min_workspace_role,
         )
         .await?;
-        Ok(())
+        super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace).await
     }
 }
 
@@ -1481,11 +1485,14 @@ pub(super) async fn handle_list_provider_profiles(
 ) -> Result<Response<ListProviderProfilesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let workspace =
-        super::workspace::resolve_profile_workspace(state.store.as_ref(), &request.workspace)
-            .await?
-            .name;
-    authorize_provider_profile_scope(state, &principal, &workspace, MinWorkspaceRole::User).await?;
+    let workspace = authorize_and_resolve_profile_workspace(
+        state,
+        &principal,
+        &request.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?
+    .name;
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE) as usize;
     let offset = request.offset as usize;
     let catalog = state
@@ -1509,11 +1516,14 @@ pub(super) async fn handle_get_provider_profile(
 ) -> Result<Response<ProviderProfileResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_profile_workspace(state.store.as_ref(), &req.workspace)
-            .await?
-            .name;
-    authorize_provider_profile_scope(state, &principal, &workspace, MinWorkspaceRole::User).await?;
+    let workspace = authorize_and_resolve_profile_workspace(
+        state,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?
+    .name;
     let id = req.id;
     let id = normalize_profile_id_request(&id)?;
     let catalog = state
@@ -1535,12 +1545,14 @@ pub(super) async fn handle_import_provider_profiles(
 ) -> Result<Response<ImportProviderProfilesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let workspace =
-        super::workspace::resolve_profile_workspace(state.store.as_ref(), &request.workspace)
-            .await?
-            .ensure_active()?;
-    authorize_provider_profile_scope(state, &principal, &workspace, MinWorkspaceRole::Admin)
-        .await?;
+    let workspace = authorize_and_resolve_profile_workspace(
+        state,
+        &principal,
+        &request.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?
+    .ensure_active()?;
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
@@ -1621,12 +1633,14 @@ pub(super) async fn handle_update_provider_profiles(
 ) -> Result<Response<UpdateProviderProfilesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let workspace =
-        super::workspace::resolve_profile_workspace(state.store.as_ref(), &request.workspace)
-            .await?
-            .ensure_active()?;
-    authorize_provider_profile_scope(state, &principal, &workspace, MinWorkspaceRole::Admin)
-        .await?;
+    let workspace = authorize_and_resolve_profile_workspace(
+        state,
+        &principal,
+        &request.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?
+    .ensure_active()?;
     let items = request.profile.into_iter().collect::<Vec<_>>();
     let (profiles, mut diagnostics) = profiles_from_import_items(&items);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
@@ -1748,11 +1762,14 @@ pub(super) async fn handle_lint_provider_profiles(
 ) -> Result<Response<LintProviderProfilesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let workspace =
-        super::workspace::resolve_profile_workspace(state.store.as_ref(), &request.workspace)
-            .await?
-            .name;
-    authorize_provider_profile_scope(state, &principal, &workspace, MinWorkspaceRole::User).await?;
+    let workspace = authorize_and_resolve_profile_workspace(
+        state,
+        &principal,
+        &request.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?
+    .name;
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     let catalog = state
@@ -1777,12 +1794,14 @@ pub(super) async fn handle_delete_provider_profile(
 ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_profile_workspace(state.store.as_ref(), &req.workspace)
-            .await?
-            .name;
-    authorize_provider_profile_scope(state, &principal, &workspace, MinWorkspaceRole::Admin)
-        .await?;
+    let workspace = authorize_and_resolve_profile_workspace(
+        state,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?
+    .name;
     let id = req.id;
     let id = normalize_profile_id_request(&id)?;
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
@@ -3033,17 +3052,22 @@ fn telemetry_provider_profile(provider_type: &str) -> TelemetryProviderProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::identity::{Identity, IdentityProvider};
+    use crate::auth::principal::{Principal, UserPrincipal};
     use crate::grpc::test_support::{authed_request, test_server_state};
     use crate::grpc::{MAX_MAP_KEY_LEN, MAX_PROVIDER_TYPE_LEN};
     use crate::persistence::test_store;
     use openshell_core::proto::{
-        CreateWorkspaceRequest, DeleteProviderProfileRequest, GetProviderProfileRequest,
+        ConfigureProviderRefreshRequest, CreateProviderRequest, CreateWorkspaceRequest,
+        DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
+        GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRequest,
         ImportProviderProfilesRequest, L7Allow, L7Rule, LintProviderProfilesRequest,
-        ListProviderProfilesRequest, NetworkBinary, NetworkEndpoint, ProviderCredentialRefresh,
-        ProviderCredentialRefreshMaterial, ProviderCredentialTokenGrant,
+        ListProviderProfilesRequest, ListProvidersRequest, NetworkBinary, NetworkEndpoint,
+        ProviderCredentialRefresh, ProviderCredentialRefreshMaterial, ProviderCredentialTokenGrant,
         ProviderCredentialTokenGrantAudienceOverride, ProviderProfile, ProviderProfileCategory,
-        ProviderProfileCredential, ProviderProfileImportItem, Sandbox, SandboxSpec,
-        StoredProviderProfile, UpdateProviderProfilesRequest,
+        ProviderProfileCredential, ProviderProfileImportItem, RotateProviderCredentialRequest,
+        Sandbox, SandboxSpec, StoredProviderProfile, UpdateProviderProfilesRequest,
+        UpdateProviderRequest,
     };
     use openshell_core::{ObjectId, ObjectName};
     use tonic::{Code, Request};
@@ -9618,6 +9642,259 @@ mod tests {
             ws_result.unwrap().display_name,
             "Workspace Version",
             "provider with profile_workspace='default' should resolve workspace profile"
+        );
+    }
+
+    /// Non-members must receive `PERMISSION_DENIED` — never `NOT_FOUND` — when
+    /// calling workspace-scoped provider handlers with a workspace they don't
+    /// belong to.  Leaking `NOT_FOUND` would let an unauthenticated observer
+    /// enumerate workspace names (CWE-203 information-exposure oracle).
+    #[tokio::test]
+    async fn non_member_gets_permission_denied_not_workspace_oracle() {
+        fn non_member_request<T>(inner: T) -> Request<T> {
+            let mut req = Request::new(inner);
+            req.extensions_mut().insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "non-member".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+            req
+        }
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        // --- Regular provider handlers (9) ---
+
+        let err = handle_create_provider(
+            &state,
+            non_member_request(CreateProviderRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_create_provider should reject non-members"
+        );
+
+        let err = handle_get_provider(
+            &state,
+            non_member_request(GetProviderRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_get_provider should reject non-members"
+        );
+
+        let err = handle_list_providers(
+            &state,
+            non_member_request(ListProvidersRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_list_providers should reject non-members"
+        );
+
+        let err = handle_update_provider(
+            &state,
+            non_member_request(UpdateProviderRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_update_provider should reject non-members"
+        );
+
+        let err = handle_get_provider_refresh_status(
+            &state,
+            non_member_request(GetProviderRefreshStatusRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_get_provider_refresh_status should reject non-members"
+        );
+
+        let err = handle_configure_provider_refresh(
+            &state,
+            non_member_request(ConfigureProviderRefreshRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_configure_provider_refresh should reject non-members"
+        );
+
+        let err = handle_rotate_provider_credential(
+            &state,
+            non_member_request(RotateProviderCredentialRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_rotate_provider_credential should reject non-members"
+        );
+
+        let err = handle_delete_provider_refresh(
+            &state,
+            non_member_request(DeleteProviderRefreshRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_delete_provider_refresh should reject non-members"
+        );
+
+        let err = handle_delete_provider(
+            &state,
+            non_member_request(DeleteProviderRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_delete_provider should reject non-members"
+        );
+
+        // --- Profile handlers (6) ---
+
+        let err = handle_list_provider_profiles(
+            &state,
+            non_member_request(ListProviderProfilesRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_list_provider_profiles should reject non-members"
+        );
+
+        let err = handle_get_provider_profile(
+            &state,
+            non_member_request(GetProviderProfileRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_get_provider_profile should reject non-members"
+        );
+
+        let err = handle_import_provider_profiles(
+            &state,
+            non_member_request(ImportProviderProfilesRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_import_provider_profiles should reject non-members"
+        );
+
+        let err = handle_update_provider_profiles(
+            &state,
+            non_member_request(UpdateProviderProfilesRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_update_provider_profiles should reject non-members"
+        );
+
+        let err = handle_lint_provider_profiles(
+            &state,
+            non_member_request(LintProviderProfilesRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_lint_provider_profiles should reject non-members"
+        );
+
+        let err = handle_delete_provider_profile(
+            &state,
+            non_member_request(DeleteProviderProfileRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_delete_provider_profile should reject non-members"
         );
     }
 }

@@ -4105,6 +4105,151 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
+    /// Non-members must receive `PERMISSION_DENIED` — never `NOT_FOUND` — when
+    /// calling workspace-scoped sandbox RPCs with a workspace they do not belong
+    /// to.  If `authorize_workspace` ran *after* a store lookup the error code
+    /// would leak whether the workspace name exists (CWE-203 oracle).
+    #[tokio::test]
+    async fn non_member_gets_permission_denied_not_workspace_oracle() {
+        use crate::auth::identity::{Identity, IdentityProvider};
+        use crate::auth::principal::{Principal, UserPrincipal};
+        use tonic::Code;
+
+        fn non_member_request<T>(inner: T) -> Request<T> {
+            let mut req = Request::new(inner);
+            req.extensions_mut().insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "non-member".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+            req
+        }
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        // --- handle_create_sandbox ---
+        // Provide a spec so the handler passes the "spec is required" check
+        // before reaching authorize_workspace.
+        let err = handle_create_sandbox(
+            &state,
+            non_member_request(CreateSandboxRequest {
+                workspace: "no-such-ws".into(),
+                spec: Some(openshell_core::proto::SandboxSpec::default()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_create_sandbox should reject non-members with PermissionDenied"
+        );
+
+        // --- handle_get_sandbox ---
+        // Provide a name so the handler passes the "name is required" check.
+        let err = handle_get_sandbox(
+            &state,
+            non_member_request(GetSandboxRequest {
+                workspace: "no-such-ws".into(),
+                name: "any".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_get_sandbox should reject non-members with PermissionDenied"
+        );
+
+        // --- handle_list_sandboxes ---
+        let err = handle_list_sandboxes(
+            &state,
+            non_member_request(ListSandboxesRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_list_sandboxes should reject non-members with PermissionDenied"
+        );
+
+        // --- handle_list_sandbox_providers ---
+        let err = handle_list_sandbox_providers(
+            &state,
+            non_member_request(ListSandboxProvidersRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_list_sandbox_providers should reject non-members with PermissionDenied"
+        );
+
+        // --- handle_attach_sandbox_provider ---
+        let err = handle_attach_sandbox_provider(
+            &state,
+            non_member_request(AttachSandboxProviderRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_attach_sandbox_provider should reject non-members with PermissionDenied"
+        );
+
+        // --- handle_detach_sandbox_provider ---
+        let err = handle_detach_sandbox_provider(
+            &state,
+            non_member_request(DetachSandboxProviderRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_detach_sandbox_provider should reject non-members with PermissionDenied"
+        );
+
+        // --- handle_delete_sandbox ---
+        // Provide a name so the handler passes the "name is required" check.
+        let err = handle_delete_sandbox(
+            &state,
+            non_member_request(DeleteSandboxRequest {
+                workspace: "no-such-ws".into(),
+                name: "any".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_delete_sandbox should reject non-members with PermissionDenied"
+        );
+    }
+
     #[tokio::test]
     async fn revoke_ssh_session_preserves_workspace() {
         let state = test_server_state().await;

@@ -860,4 +860,94 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
+
+    /// Non-member callers must receive `PERMISSION_DENIED` — not `NOT_FOUND` —
+    /// when targeting a workspace that does not exist. Returning `NOT_FOUND`
+    /// would create a CWE-203 workspace-name oracle.
+    #[tokio::test]
+    async fn non_member_gets_permission_denied_not_workspace_oracle() {
+        use crate::auth::identity::{Identity, IdentityProvider};
+        use crate::auth::principal::{Principal, UserPrincipal};
+
+        fn non_member_request<T>(inner: T) -> Request<T> {
+            let mut req = Request::new(inner);
+            req.extensions_mut().insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "non-member".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+            req
+        }
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        let err = handle_expose_service(
+            &state,
+            non_member_request(ExposeServiceRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::PermissionDenied,
+            "handle_expose_service should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_get_service(
+            &state,
+            non_member_request(GetServiceRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::PermissionDenied,
+            "handle_get_service should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_list_services(
+            &state,
+            non_member_request(ListServicesRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::PermissionDenied,
+            "handle_list_services should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_delete_service(
+            &state,
+            non_member_request(DeleteServiceRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::PermissionDenied,
+            "handle_delete_service should return PermissionDenied, got {:?}",
+            err.code()
+        );
+    }
 }

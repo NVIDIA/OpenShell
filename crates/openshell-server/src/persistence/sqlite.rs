@@ -543,29 +543,63 @@ LIMIT ?4 OFFSET ?5
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
+        use std::fmt::Write;
+
         use super::parse_label_selector;
 
         let required_labels = parse_label_selector(label_selector)?;
-        let all_records = self
-            .list_with_membership(object_type, member_type, member_name, u32::MAX, 0)
-            .await?;
 
-        let filtered: Vec<ObjectRecord> = all_records
-            .into_iter()
-            .filter(|record| {
-                let labels_json = record.labels.as_deref().unwrap_or("{}");
-                let labels: std::collections::HashMap<String, String> =
-                    serde_json::from_str(labels_json).unwrap_or_default();
+        let mut sql = String::from(
+            r#"
+SELECT w."object_type", w."id", w."name", w."workspace", w."payload",
+       w."created_at_ms", w."updated_at_ms", w."labels", w."resource_version"
+FROM "objects" w
+WHERE w."object_type" = ?1 AND w."workspace" = ''
+AND EXISTS (
+    SELECT 1 FROM "objects" m
+    WHERE m."object_type" = ?2
+    AND m."workspace" = w."name"
+    AND m."name" = ?3
+)"#,
+        );
 
-                required_labels
-                    .iter()
-                    .all(|(key, value)| labels.get(key).is_some_and(|v| v == value))
-            })
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect();
+        let label_pairs: Vec<(&String, &String)> = required_labels.iter().collect();
+        for (i, (key, _)) in label_pairs.iter().enumerate() {
+            let param_idx = 4 + i;
+            write!(
+                sql,
+                "\nAND json_extract(w.\"labels\", '$.{}') = ?{}",
+                key.replace('\'', "''"),
+                param_idx
+            )
+            .unwrap();
+        }
 
-        Ok(filtered)
+        let limit_idx = 4 + label_pairs.len();
+        let offset_idx = limit_idx + 1;
+        write!(
+            sql,
+            "\nORDER BY w.\"created_at_ms\" ASC, w.\"name\" ASC\nLIMIT ?{limit_idx} OFFSET ?{offset_idx}\n"
+        )
+        .unwrap();
+
+        let mut query = sqlx::query(&sql)
+            .bind(object_type)
+            .bind(member_type)
+            .bind(member_name);
+
+        for (_, value) in &label_pairs {
+            query = query.bind(*value);
+        }
+
+        query = query.bind(i64::from(limit)).bind(i64::from(offset));
+
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+
+        Ok(rows.into_iter().map(row_to_object_record).collect())
     }
 
     pub async fn list_by_scope(

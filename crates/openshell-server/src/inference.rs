@@ -92,18 +92,18 @@ impl Inference for InferenceService {
     ) -> Result<Response<SetInferenceRouteResponse>, Status> {
         let principal = crate::grpc::extract_principal(&request)?;
         let req = request.into_inner();
-        let workspace =
-            crate::grpc::workspace::resolve_workspace(self.state.store.as_ref(), &req.workspace)
-                .await?
-                .ensure_active()?;
-        authorize_workspace(
+        let authz = authorize_workspace(
             &self.state.store,
             &self.state.admin_role,
             &principal,
-            &workspace,
+            &req.workspace,
             MinWorkspaceRole::Admin,
         )
         .await?;
+        let workspace =
+            crate::grpc::workspace::resolve_workspace(self.state.store.as_ref(), &authz.workspace)
+                .await?
+                .ensure_active()?;
         let route_name = effective_route_name(&req.route_name)?;
         let verify = !req.no_verify;
         let route = upsert_inference_route(
@@ -141,18 +141,18 @@ impl Inference for InferenceService {
     ) -> Result<Response<GetInferenceRouteResponse>, Status> {
         let principal = crate::grpc::extract_principal(&request)?;
         let req = request.into_inner();
-        let workspace =
-            crate::grpc::workspace::resolve_workspace(self.state.store.as_ref(), &req.workspace)
-                .await?
-                .name;
-        authorize_workspace(
+        let authz = authorize_workspace(
             &self.state.store,
             &self.state.admin_role,
             &principal,
-            &workspace,
+            &req.workspace,
             MinWorkspaceRole::User,
         )
         .await?;
+        let workspace =
+            crate::grpc::workspace::resolve_workspace(self.state.store.as_ref(), &authz.workspace)
+                .await?
+                .name;
         let route_name = effective_route_name(&req.route_name)?;
         let route = self
             .state
@@ -193,18 +193,18 @@ impl Inference for InferenceService {
     ) -> Result<Response<DeleteInferenceRouteResponse>, Status> {
         let principal = crate::grpc::extract_principal(&request)?;
         let req = request.into_inner();
-        let workspace =
-            crate::grpc::workspace::resolve_workspace(self.state.store.as_ref(), &req.workspace)
-                .await?
-                .name;
-        authorize_workspace(
+        let authz = authorize_workspace(
             &self.state.store,
             &self.state.admin_role,
             &principal,
-            &workspace,
+            &req.workspace,
             MinWorkspaceRole::Admin,
         )
         .await?;
+        let workspace =
+            crate::grpc::workspace::resolve_workspace(self.state.store.as_ref(), &authz.workspace)
+                .await?
+                .name;
         let route_name = effective_route_name(&req.route_name)?;
         let deleted = self
             .state
@@ -3432,6 +3432,77 @@ mod tests {
         assert!(
             bundle.routes.is_empty(),
             "bundle should be empty after route deletion"
+        );
+    }
+
+    /// Non-member callers must receive `PERMISSION_DENIED` — not `NOT_FOUND` —
+    /// when targeting a workspace that does not exist. Returning `NOT_FOUND`
+    /// would create a CWE-203 workspace-name oracle.
+    #[tokio::test]
+    async fn non_member_gets_permission_denied_not_workspace_oracle() {
+        use crate::grpc::test_support::test_server_state;
+        use crate::inference::InferenceService;
+        use openshell_core::proto::inference_server::Inference;
+
+        fn non_member_request<T>(inner: T) -> Request<T> {
+            let mut req = Request::new(inner);
+            req.extensions_mut().insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "non-member".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+            req
+        }
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        let svc = InferenceService::new(state.clone());
+
+        let err = svc
+            .set_inference_route(non_member_request(SetInferenceRouteRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::PermissionDenied,
+            "set_inference_route should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = svc
+            .get_inference_route(non_member_request(GetInferenceRouteRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::PermissionDenied,
+            "get_inference_route should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = svc
+            .delete_inference_route(non_member_request(DeleteInferenceRouteRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::PermissionDenied,
+            "delete_inference_route should return PermissionDenied, got {:?}",
+            err.code()
         );
     }
 }

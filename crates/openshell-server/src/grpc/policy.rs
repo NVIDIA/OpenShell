@@ -13316,4 +13316,203 @@ mod tests {
             "concurrent backfills must create exactly one revision"
         );
     }
+
+    /// Non-member callers must receive `PERMISSION_DENIED` — not `NOT_FOUND` —
+    /// when targeting a workspace that does not exist. Returning `NOT_FOUND`
+    /// would create a CWE-203 workspace-name oracle.
+    #[tokio::test]
+    async fn non_member_gets_permission_denied_not_workspace_oracle() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        fn non_member_request<T>(inner: T) -> Request<T> {
+            let mut req = Request::new(inner);
+            req.extensions_mut().insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "non-member".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+            req
+        }
+
+        let err = handle_get_sandbox_policy_status(
+            &state,
+            non_member_request(GetSandboxPolicyStatusRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_get_sandbox_policy_status should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_list_sandbox_policies(
+            &state,
+            non_member_request(ListSandboxPoliciesRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_list_sandbox_policies should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_update_config(
+            &state,
+            non_member_request(UpdateConfigRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_update_config should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_get_draft_policy(
+            &state,
+            non_member_request(GetDraftPolicyRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_get_draft_policy should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_approve_draft_chunk(
+            &state,
+            non_member_request(ApproveDraftChunkRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_approve_draft_chunk should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_reject_draft_chunk(
+            &state,
+            non_member_request(RejectDraftChunkRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_reject_draft_chunk should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_approve_all_draft_chunks(
+            &state,
+            non_member_request(ApproveAllDraftChunksRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_approve_all_draft_chunks should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_edit_draft_chunk(
+            &state,
+            non_member_request(EditDraftChunkRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_edit_draft_chunk should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_undo_draft_chunk(
+            &state,
+            non_member_request(UndoDraftChunkRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_undo_draft_chunk should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_clear_draft_chunks(
+            &state,
+            non_member_request(ClearDraftChunksRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_clear_draft_chunks should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_get_draft_history(
+            &state,
+            non_member_request(GetDraftHistoryRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_get_draft_history should return PermissionDenied, got {:?}",
+            err.code()
+        );
+    }
 }
