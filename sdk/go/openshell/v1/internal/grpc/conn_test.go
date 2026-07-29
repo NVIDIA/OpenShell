@@ -16,7 +16,7 @@ func TestNewConnectionHTTPSchemeUsesPlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer lis.Close()
+	defer func() { _ = lis.Close() }()
 
 	srv := grpc.NewServer()
 	go func() { _ = srv.Serve(lis) }()
@@ -26,7 +26,7 @@ func TestNewConnectionHTTPSchemeUsesPlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConnection with http:// scheme failed: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 }
 
 func TestNewConnectionHTTPSSchemeUsesTLS(t *testing.T) {
@@ -37,7 +37,7 @@ func TestNewConnectionHTTPSSchemeUsesTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConnection with https:// scheme should not fail on create: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 }
 
 func TestNewConnectionNoSchemeUsesTLS(t *testing.T) {
@@ -45,7 +45,7 @@ func TestNewConnectionNoSchemeUsesTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConnection without scheme should not fail on create: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 }
 
 func TestNewConnectionInsecureTLSConfig(t *testing.T) {
@@ -53,7 +53,7 @@ func TestNewConnectionInsecureTLSConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer lis.Close()
+	defer func() { _ = lis.Close() }()
 
 	srv := grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
 	go func() { _ = srv.Serve(lis) }()
@@ -63,5 +63,5 @@ func TestNewConnectionInsecureTLSConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewConnection with Insecure TLS config failed: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 }
