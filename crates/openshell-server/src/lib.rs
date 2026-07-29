@@ -72,7 +72,7 @@ use tracing::{debug, error, info, warn};
 pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 use compute::ComputeRuntime;
-use gateway_listener::{GatewayListenerScope, bind_gateway_listeners};
+use gateway_listener::{BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
@@ -526,9 +526,7 @@ pub(crate) async fn run_server(
     let enable_loopback_service_http = config.service_routing.enable_loopback_service_http;
     for listener in gateway_listeners {
         listener_tasks.push(tokio::spawn(serve_gateway_listener(
-            listener.listener,
-            listener.address,
-            listener.scope,
+            listener,
             service.clone(),
             tls_acceptor.clone(),
             enable_loopback_service_http,
@@ -556,14 +554,18 @@ pub(crate) async fn run_server(
 }
 
 async fn serve_gateway_listener(
-    listener: TcpListener,
-    listen_addr: SocketAddr,
-    scope: GatewayListenerScope,
+    bound_listener: BoundGatewayListener,
     service: MultiplexService,
     tls_acceptor: Option<TlsAcceptor>,
     enable_loopback_service_http: bool,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let BoundGatewayListener {
+        listener,
+        address: listen_addr,
+        scope,
+    } = bound_listener;
+
     loop {
         let accepted = tokio::select! {
             changed = shutdown.changed() => {
@@ -1000,10 +1002,11 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfiguredComputeDriver, ConnectionProtocol, GatewayListenerScope, MultiplexService,
-        ServerState, TlsAcceptor, allow_plaintext_service_http, bind_gateway_listeners,
-        classify_initial_bytes, configured_compute_driver, is_benign_tls_handshake_failure,
-        kubernetes_sandbox_jwt_expiry_disabled, serve_gateway_listener,
+        BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, GatewayListenerScope,
+        MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
+        bind_gateway_listeners, classify_initial_bytes, configured_compute_driver,
+        is_benign_tls_handshake_failure, kubernetes_sandbox_jwt_expiry_disabled,
+        serve_gateway_listener,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -1097,9 +1100,11 @@ mod tests {
         let (tls_dir, tls_acceptor) = test_tls_acceptor();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(serve_gateway_listener(
-            listener,
-            listen_addr,
-            GatewayListenerScope::Primary,
+            BoundGatewayListener {
+                listener,
+                address: listen_addr,
+                scope: GatewayListenerScope::Primary,
+            },
             service,
             Some(tls_acceptor),
             enable_loopback_service_http,
