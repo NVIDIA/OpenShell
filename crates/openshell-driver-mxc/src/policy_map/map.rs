@@ -114,6 +114,7 @@ pub fn split_policy(policy: &SandboxPolicy, opts: &MxcMappingOptions) -> Option<
     let proxy_policy = SandboxPolicy {
         version: policy.version,
         network_policies: policy.network_policies.clone(),
+        network_middlewares: policy.network_middlewares.clone(),
         ..Default::default()
     };
     Some(SplitPolicyResult {
@@ -335,6 +336,20 @@ fn map_network(
     opts: &MxcMappingOptions,
     items: &mut Vec<LossItem>,
 ) -> Vec<String> {
+    if !policy.network_middlewares.is_empty() {
+        add_loss(
+            items,
+            "network_middlewares",
+            "error",
+            &format!(
+                "{} network middleware config(s) require the OpenShell host proxy and cannot be enforced by MXC directly.",
+                policy.network_middlewares.len()
+            ),
+            "network egress middleware",
+            "Middleware transformations and failure behavior would not be applied on the coarse MXC path.",
+        );
+    }
+
     if policy.network_policies.is_empty() {
         add_backend_network_loss(policy, &opts.containment, items);
         return Vec::new();
