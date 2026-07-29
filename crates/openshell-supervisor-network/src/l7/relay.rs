@@ -79,6 +79,83 @@ fn scoped_context_for_request(ctx: &L7EvalContext, target: &str) -> Option<L7Eva
     Some(scoped)
 }
 
+fn request_authority_matches_endpoint(
+    request: &crate::l7::provider::L7Request,
+    ctx: &L7EvalContext,
+) -> bool {
+    let authority = match crate::l7::rest::request_host_authority(&request.raw_header) {
+        Ok(Some(authority)) => authority,
+        Ok(None) => return true,
+        Err(_) => return false,
+    };
+    let request_host = authority.host().trim_end_matches('.');
+    let endpoint_host = ctx
+        .host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    request_host.eq_ignore_ascii_case(endpoint_host)
+        && authority.port_u16().is_none_or(|port| port == ctx.port)
+}
+
+async fn reject_request_authority_mismatch<W>(client: &mut W, ctx: &L7EvalContext) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let body = r#"{"error":"request_authority_mismatch","message":"HTTP request authority does not match the authorized tunnel endpoint"}"#;
+    let response = format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    client
+        .write_all(response.as_bytes())
+        .await
+        .into_diagnostic()?;
+    client.flush().await.into_diagnostic()?;
+
+    ocsf_emit!(build_request_authority_mismatch_event(ctx));
+    ocsf_emit!(build_request_authority_mismatch_finding(ctx));
+    Ok(())
+}
+
+fn build_request_authority_mismatch_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Fail)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+        .firewall_rule(&ctx.policy_name, "request-authority")
+        .message(format!(
+            "HTTP request authority does not match authorized tunnel endpoint {}:{}",
+            ctx.host, ctx.port
+        ))
+        .status_detail("request_authority_mismatch")
+        .build()
+}
+
+fn build_request_authority_mismatch_finding(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
+    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .is_alert(true)
+        .finding_info(FindingInfo::new(
+            "openshell.http.request_authority_mismatch",
+            "HTTP request authority does not match the authorized tunnel endpoint",
+        ))
+        .evidence_pairs(&[
+            ("policy", ctx.policy_name.as_str()),
+            ("host", ctx.host.as_str()),
+            ("disposition", "denied"),
+        ])
+        .message("HTTP request authority mismatch; request denied")
+        .build()
+}
+
 fn build_credential_resolution_event(
     ctx: &L7EvalContext,
     endpoint_mismatch: bool,
@@ -430,6 +507,10 @@ where
                 return Ok(());
             }
         };
+        if !request_authority_matches_endpoint(&req, ctx) {
+            reject_request_authority_mismatch(client, ctx).await?;
+            return Ok(());
+        }
 
         let route_target = match secrets::redact_target_for_policy(&req.target) {
             Ok(target) => target,
@@ -970,6 +1051,10 @@ where
                 return Ok(()); // Close connection on parse error
             }
         };
+        if !request_authority_matches_endpoint(&req, ctx) {
+            reject_request_authority_mismatch(client, ctx).await?;
+            return Ok(());
+        }
         let scoped_ctx = scoped_context_for_request(ctx, &req.target);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
 
@@ -1272,6 +1357,10 @@ where
 
         let req = parsed.request;
         let jsonrpc_info = parsed.info;
+        if !request_authority_matches_endpoint(&req, ctx) {
+            reject_request_authority_mismatch(client, ctx).await?;
+            return Ok(());
+        }
         let scoped_ctx = scoped_context_for_request(ctx, &req.target);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
 
@@ -1485,6 +1574,10 @@ where
 
         let req = parsed.request;
         let graphql_info = parsed.info;
+        if !request_authority_matches_endpoint(&req, ctx) {
+            reject_request_authority_mismatch(client, ctx).await?;
+            return Ok(());
+        }
         let scoped_ctx = scoped_context_for_request(ctx, &req.target);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
 
@@ -2154,6 +2247,10 @@ where
                 return Ok(());
             }
         };
+        if !request_authority_matches_endpoint(&req, ctx) {
+            reject_request_authority_mismatch(client, ctx).await?;
+            return Ok(());
+        }
         let scoped_ctx = scoped_context_for_request(ctx, &req.target);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
         let resolver = ctx.secret_resolver.as_deref();
@@ -3394,6 +3491,105 @@ network_policies:
             .expect("relay should finish")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_credential_request_with_mismatched_host_authority() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        let generation_guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([("API_TOKEN".to_string(), "secret".to_string())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.test".to_string(),
+                        port: 8080,
+                        path: "/v1/**".to_string(),
+                    }],
+                    credential_identity: "provider-a:API_TOKEN".to_string(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("bound provider state");
+        let placeholder = state
+            .snapshot()
+            .child_env
+            .get("API_TOKEN")
+            .expect("placeholder")
+            .clone();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            policy_name: "passthrough_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            provider_credentials: Some(state),
+            ..Default::default()
+        };
+        let event_ctx = ctx.clone();
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_passthrough_with_credentials(
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+                &generation_guard,
+                None,
+            )
+            .await
+        });
+
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: attacker.example.test\r\nAuthorization: Bearer {placeholder}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read_to_string(&mut response),
+        )
+        .await
+        .expect("authority denial should close the client stream")
+        .unwrap();
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            response.contains("request_authority_mismatch"),
+            "{response}"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+        let mut forwarded = Vec::new();
+        upstream.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "mismatched request authority must not write upstream"
+        );
+        let activity = build_request_authority_mismatch_event(&event_ctx)
+            .to_json()
+            .expect("serialize authority mismatch activity");
+        assert_eq!(activity["status_detail"], "request_authority_mismatch");
+        assert_eq!(activity["action"], "Denied");
+        assert_eq!(activity["disposition"], "Blocked");
+        let finding = build_request_authority_mismatch_finding(&event_ctx)
+            .to_json()
+            .expect("serialize authority mismatch finding");
+        assert_eq!(
+            finding["finding_info"]["uid"],
+            "openshell.http.request_authority_mismatch"
+        );
     }
 
     #[tokio::test]
