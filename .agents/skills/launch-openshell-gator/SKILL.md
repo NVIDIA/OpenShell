@@ -27,7 +27,7 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 | `scripts/agents/gator/Dockerfile` | Gator sandbox image source. Local launches build this image through OpenShell. |
 | `scripts/agents/gator/policy.yaml` | Sandbox policy for the gator agent. |
 | `scripts/agents/gator/bin/gh` | Gator-specific `gh` wrapper and same-SHA duplicate-post guard. |
-| `scripts/agents/gator/bin/review-feedback-ledger` | Builds the cross-SHA ledger of Gator inline threads, replies, and resolutions. |
+| `scripts/agents/gator/bin/review-feedback-ledger` | Builds the cross-SHA review scope and ledger of summaries, findings, replies, and resolutions. |
 | `scripts/agents/gator/prompts/gator.md` | Rendered top-level prompt template baked into the payload. |
 | `scripts/agents/gator/skills/gator-gate/SKILL.md` | In-sandbox gator state-machine skill. |
 | `scripts/agents/gator/logs/` | Background launch and supervisor logs. |

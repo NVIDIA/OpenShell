@@ -100,24 +100,44 @@ If the current head SHA already has a marked gator disposition and the same-SHA 
 
 ### Durable review dispositions
 
-A resolved or explicitly waived finding is a durable review disposition across later head SHAs. A new commit permits a fresh review; it does not erase trusted feedback history.
+Every prior Gator finding is a durable review disposition across later head
+SHAs. A new commit permits a delta review; it does not erase trusted feedback
+history or reopen the unchanged PR.
 
-Before every fresh reviewer run, collect Gator-originated inline review threads, replies, resolution state, resolver, and commit context:
+Before every fresh reviewer run, collect Gator review summaries, general
+findings, issue-comment dispositions, inline review threads, replies, resolution
+state, resolver, stable finding IDs, and review-head context:
 
 ```bash
 review-feedback-ledger NVIDIA OpenShell <pr-number> \
   > /tmp/gator-review-feedback-ledger.json
-jq -e '.schema_version == 1 and (.threads | type == "array")' \
+jq -e '
+  .schema_version == 2 and
+  (.dispositions | type == "array") and
+  (.threads | type == "array") and
+  (.review_scope.mode | IN("initial", "follow_up", "already_reviewed"))
+' \
   /tmp/gator-review-feedback-ledger.json >/dev/null
 ```
 
 Treat the ledger as required reviewer input, not optional background:
 
 - Verify whether the PR author, resolver, or replying actor is trusted under the rules above.
+- Treat `review_scope.mode` and `previous_reviewed_sha` as authoritative. Use
+  `initial` for a complete PR review, `follow_up` for an unresolved-feedback
+  plus `<previous_reviewed_sha>..HEAD` delta review, and `already_reviewed` to
+  suppress another reviewer run.
+- Carry every still-open finding forward as an existing obligation. Do not post
+  a new thread or semantically equivalent general finding for it.
 - A Gator thread resolved by a verified maintainer is addressed. If the resolver is only the PR author, inspect the trusted reply and latest diff to decide whether the finding was fixed; resolution alone does not grant a non-maintainer author waiver authority.
 - Preserve a verified maintainer's reply as the rationale. An explicit rejection such as "invalid", "intentional", "fine as implemented", or "won't fix" is a waiver, not an unanswered request.
 - An unresolved thread with an explicit verified-maintainer waiver is also waived. A non-maintainer author's disagreement remains context for review but does not override a maintainer-required change.
-- Do not re-raise a resolved or waived finding, or a semantically equivalent finding with different wording, merely because the head SHA changed.
+- Preserve each `GATOR-<origin-sha-prefix>-<ordinal>` finding ID across later
+  reviews. Use the ledger's `gator-inline-<comment-id>` fallback for legacy
+  inline findings that predate explicit IDs.
+- Do not re-raise an open, resolved, or waived finding, or a semantically
+  equivalent finding with different wording, merely because the head SHA
+  changed.
 - Re-raise it only when the new diff materially invalidates the prior rationale or reintroduces the defect. State what changed since the resolution and why the earlier disposition no longer applies.
 - If the ledger lookup or validation fails, do not run a context-free reviewer. Return a transient supervised result. Use `github_transport_eof` for the transport failures described above; otherwise use `review_feedback_lookup_failed`.
 
@@ -538,7 +558,48 @@ If TTL expires:
 
 When a PR enters `gator:in-review`, run an independent code-only review.
 
-Before running the reviewer or posting any marked gator comment/review, check whether gator has already posted for the current PR head SHA. Search existing issue comments and PR reviews for the gator marker and either `Head SHA: <sha>`, `Head SHA: `<sha>``, or the current `headRefOid` anywhere in the body. Gator may post at most one marked public disposition for a given head SHA.
+### Pragmatic review calibration
+
+Keep reviews proportional, scope-bound, and convergent:
+
+- Evaluate the change against its stated intent, supported user paths,
+  documented threat model, and repository invariants.
+- Make a finding blocking only when it identifies a concrete reachable
+  scenario, material impact, a defect introduced or materially worsened by the
+  PR, and a proportionate requested fix.
+- Require every blocker to state its reachability, impact, and why this PR owns
+  the problem. Do not make the author infer those from a speculative example.
+- Do not block on pre-existing or orthogonal defects, unsupported
+  configurations, speculative future requirements, stylistic preference, or
+  implausible combinations of failures outside a real adversarial trust
+  boundary. Preserve rigorous review of attacker-controlled input at actual
+  trust boundaries.
+- Consider the complexity cost of the requested fix. Do not require defensive
+  branches, abstractions, configuration, or policy surface that make the code
+  less readable or maintainable than the risk warrants. Prefer accepting a
+  clear constraint or recommending non-blocking follow-up hardening.
+- Classify minor improvements and low-probability hardening as Suggestions.
+  Suggestions never require another commit, never count as unresolved review
+  feedback, and never keep a PR in `gator:in-review`.
+- Group equivalent cases into one root-cause finding. Describe the invariant
+  that must hold and the complete supported failure class, not merely one
+  failing input. Do not suggest a partial workaround when the broader failure
+  class is already apparent.
+- On the first review, inspect the complete PR and surface the complete known
+  blocker set. On follow-up reviews, inspect unresolved feedback plus
+  `<previous_reviewed_sha>..HEAD`; do not mine unchanged code for new findings.
+- Introduce a finding against unchanged code on a follow-up only when newly
+  available evidence demonstrates a Critical security, data-loss, or
+  correctness defect. Explain the new evidence and why the earlier review could
+  not reasonably have identified it.
+
+Before running the reviewer or posting any marked gator comment/review, build
+and validate the feedback ledger. If its review mode is `already_reviewed`, do
+not run the reviewer. Also check whether gator has already posted for the
+current PR head SHA. Search existing issue comments and PR reviews for the gator
+marker and either `Head SHA: <sha>`, `Head SHA: `<sha>``, or the current
+`headRefOid` anywhere in the body. Gator may post at most one marked public
+disposition for a given head SHA.
 
 If the current head SHA already has a marked gator comment or PR review:
 
@@ -555,23 +616,50 @@ For PRs authored by `dependabot[bot]`, the primary gator responsibility is depen
 Use the `principal-engineer-reviewer` sub-agent. Include:
 
 - PR title, body, linked issues, labels, and files
-- Full diff or enough chunked diff context to review all changes
 - The complete JSON from `/tmp/gator-review-feedback-ledger.json`
-- An explicit instruction to honor trusted resolved and waived findings as durable across head SHAs, including semantically equivalent findings with different wording
+- For `initial` mode, the full PR diff or enough chunked context to review every change
+- For `follow_up` mode, unresolved feedback plus the diff and affected-file
+  context for `<previous_reviewed_sha>..HEAD`; include older code only when
+  needed to understand that delta
+- An explicit instruction to carry open findings without duplicating them and
+  to honor trusted resolved and waived findings across head SHAs
+- An explicit instruction to apply the pragmatic review calibration above
 - Instruction to focus on correctness, regressions, security, maintainability, and missing tests
 - Instruction to check whether direct UX changes update the Fern docs under `docs/` and navigation when needed
-- Instruction to classify each actionable finding as either line-specific or general
-- For each line-specific finding, instruction to return the exact repository path, current-head diff line, side (`RIGHT` for an added/context line or `LEFT` for a deleted line), severity, and concise comment body
+- Instruction to classify each finding as blocking Critical, blocking Warning,
+  or non-blocking Suggestion
+- Instruction to assign each new blocker a stable
+  `GATOR-<current-head-prefix>-<ordinal>` finding ID
+- Instruction to group semantically equivalent examples under one invariant
+- For each blocker, instruction to return reachability, material impact, PR
+  ownership, and a proportionate requested fix
+- For each line-specific blocker, instruction to return the exact repository
+  path, current-head diff line, side (`RIGHT` for an added/context line or
+  `LEFT` for a deleted line), severity, finding ID, and concise comment body
 - Instruction not to rely on local test execution
 
-When running inside the `scripts/agents/gator` sandbox launcher, invoke the reviewer command specified in the sandbox prompt. Use `task.md` for the subagent input. Put the review feedback ledger, PR metadata, linked issue context, and diff/file context in `task.md`, save the reviewer output, and use it as the independent review result. The main gator process remains responsible for labels, comments, docs gates, and CI monitoring. Before posting, compare every proposed finding with the ledger and remove semantically equivalent resolved or waived findings unless the output identifies material new evidence that invalidates the earlier disposition. If the reviewer command exits nonzero or the saved reviewer output is absent or unusable, stop the cycle with the `reviewer_subagent_failed` transient result described above without changing GitHub labels or posting a public disposition.
+When running inside the `scripts/agents/gator` sandbox launcher, invoke the reviewer command specified in the sandbox prompt. Use `task.md` for the subagent input. Put the review feedback ledger, review mode, PR metadata, linked issue context, and mode-appropriate diff/file context in `task.md`, save the reviewer output, and use it as the independent review result. The main gator process remains responsible for labels, comments, docs gates, and CI monitoring. Before posting, compare every proposed finding with all open, resolved, and waived ledger findings plus prior review summaries. Remove semantically equivalent findings unless the new diff reintroduces the defect or newly available evidence meets the Critical unchanged-code exception above. If the reviewer command exits nonzero or the saved reviewer output is absent or unusable, stop the cycle with the `reviewer_subagent_failed` transient result described above without changing GitHub labels or posting a public disposition.
 
 Post findings using these rules:
 
-- For every actionable line-specific defect that can be anchored to the current diff, post an inline comment. Do not move an anchorable finding into the summary merely for convenience.
+- For every blocking line-specific defect that can be anchored to the
+  mode-appropriate diff, post an inline comment. Do not move an anchorable
+  blocker into the summary merely for convenience.
 - Submit all inline comments for a head SHA together in one `COMMENT` review. The review summary plus its complete inline-comment batch is the single gator disposition for that SHA.
 - Begin the review summary and each inline body with `> **gator-agent**`. Put the current head SHA in the summary using the canonical `Head SHA: <sha>` field.
-- Use the review summary for design concerns, missing tests, cross-file findings, and findings that cannot be anchored because the relevant line is outside the current diff. For an unanchored line-specific finding, retain the `path:line` reference and state why it is in the summary.
+- Put the stable finding ID in every blocking summary item and inline comment.
+- In each blocker, state reachability, impact, why the PR owns the problem, and
+  the proportionate requested change.
+- Use the review summary for blocking design concerns, missing tests,
+  cross-file findings, and blockers that cannot be anchored because the
+  relevant line is outside the mode-appropriate diff. For an unanchored
+  line-specific blocker, retain the `path:line` reference and state why it is
+  in the summary.
+- Put Suggestions only in a clearly labeled non-blocking summary section on the
+  initial review. Do not post Suggestions as inline comments or repeat them on
+  follow-up reviews.
+- List still-open ledger findings as carried obligations by finding ID; do not
+  create replacement threads or restate them as new findings.
 - If there are no inline-eligible findings, use one general marked review or issue comment as the disposition.
 - Do not submit standalone inline comments before or after the batch review. Do not post a separate PR Review Status issue comment for the same SHA after submitting the review.
 - Do not nitpick style unless it affects maintainability or project conventions.
@@ -588,7 +676,7 @@ Build the batch as one REST request. Verify every requested line appears in the 
       "path": "crates/example/src/lib.rs",
       "line": 123,
       "side": "RIGHT",
-      "body": "> **gator-agent**\n\n**Warning:** <actionable finding and concrete fix>"
+      "body": "> **gator-agent**\n\n**Warning — GATOR-12345678-01**\n\nReachability: <supported scenario>\n\nImpact: <material impact>\n\nPR ownership: <why this change owns the defect>\n\nRequested change: <proportionate fix>"
     }
   ]
 }
@@ -602,13 +690,25 @@ gh api --method POST \
 
 The root `body` is what the gator `gh` wrapper checks for the marker and current head SHA. Therefore one accepted request reserves exactly one same-SHA disposition even when `comments` contains multiple inline findings. If GitHub rejects any inline coordinate, fix the batch and retry before any disposition is accepted; do not fall back to a partial set of standalone comments.
 
-If findings require author changes, remain in `gator:in-review` or move to `gator:follow-up-needed` if the author must clarify the proposal before code review can continue.
+If Critical or Warning findings require author changes, remain in
+`gator:in-review` or move to `gator:follow-up-needed` if the author must clarify
+the proposal before code review can continue. Suggestions alone do not require
+author changes and do not prevent pipeline handoff.
 
 For validated PRs with direct user-facing UX changes, require Fern docs updates before moving to `gator:watch-pipeline`. Direct UX changes include CLI commands/flags/output, sandbox behavior visible to users, provider setup flows, gateway configuration fields, TUI screens, published API behavior, policy syntax, installation/packaging behavior, and documented workflows. Accept either relevant updates under `docs/` plus `docs/index.yml` navigation when needed, or a clear maintainer-authored explanation in the PR that docs are intentionally unnecessary. If docs are missing and no explanation exists, treat it as review feedback.
 
 If no blocking findings remain, decide whether E2E labels are needed, then move to `gator:watch-pipeline`.
 
-When resuming a PR already in `gator:in-review`, check the review feedback ledger to determine whether gator findings or trusted maintainer review comments are still unanswered. Ignore unacknowledged third-party comments and reviews. If the PR author has pushed commits, compare the latest commit SHA with the last gator-reviewed SHA; run a fresh review only when the SHA changed, and carry every durable resolved or waived disposition into that review. If the PR author replied without pushing a new commit, do not re-review, repost findings, or post a same-SHA disposition; inspect the response internally and wait for a new commit or maintainer override. If CI changes state without a new commit, do not post a same-SHA CI update.
+When resuming a PR already in `gator:in-review`, use the feedback ledger to
+determine which Gator findings or trusted maintainer comments are still
+unanswered. Ignore unacknowledged third-party comments and reviews. If the PR
+author has pushed commits and `review_scope.mode` is `follow_up`, review only
+the unresolved obligations plus `<previous_reviewed_sha>..HEAD`, carrying all
+other dispositions without duplicating them. If the author replied without
+pushing a new commit, do not re-review, repost findings, or post a same-SHA
+disposition; inspect the response internally and wait for a new commit or
+maintainer override. If CI changes state without a new commit, do not post a
+same-SHA CI update.
 
 If review feedback is waiting on the PR author for more than 48 business hours, post a single author nudge. Use the latest of these timestamps as the TTL start:
 
@@ -773,9 +873,17 @@ Recommended next step: <create-spike/build-from-issue/human planning/other>.
 
 Validation: <why this PR is project-valid>
 Head SHA: `<sha>`
+Review mode: `<initial|follow_up>`
+Previous reviewed SHA: `<sha or none>`
 
-Review findings:
-- <finding or "No blocking findings remain">
+Blocking findings:
+- `<finding-id>`: <finding or "No blocking findings remain">
+
+Carried findings:
+- `<finding-id>`: <existing obligation or "None">
+
+Non-blocking suggestions:
+- <initial-review suggestion or "None"; omit on follow-up reviews>
 
 Docs: <Fern docs updated / not needed because ... / missing for direct UX change>
 

@@ -52,9 +52,11 @@ When reviewing code or diffs:
 4. Call out issues by severity:
    - **Critical** — Must fix before merge. Correctness bugs, security flaws,
      data loss risks.
-   - **Warning** — Should fix. Error handling gaps, unclear contracts, missing
-     edge cases.
-   - **Suggestion** — Consider improving. Style, naming, minor simplifications.
+   - **Warning** — Must fix before merge when the change introduces or
+     materially worsens a concrete, reachable correctness, security, or
+     maintainability problem.
+   - **Suggestion** — Non-blocking improvement. Never require another revision
+     solely for a suggestion.
 5. Reference specific files and line numbers (`file_path:line_number`).
 6. When suggesting a change, show the concrete fix — don't just describe it.
 7. If something is good, say so briefly. Positive signal is useful too.
@@ -65,6 +67,34 @@ When reviewing code or diffs:
    materially invalidates the prior rationale or reintroduces the defect. If
    it does, identify the new evidence and explain why the earlier disposition
    no longer applies.
+
+### Pragmatic review calibration
+
+- Review against the pull request's stated intent, supported user paths,
+  documented threat model, and established repository invariants.
+- Make a finding blocking only when the scenario is concretely reachable, the
+  impact is material, the pull request introduces or materially worsens it, and
+  the proposed fix is proportionate to the risk.
+- For every blocker, state reachability, impact, and why the pull request owns
+  the problem.
+- Do not block on pre-existing or orthogonal defects, unsupported
+  configurations, speculative future requirements, stylistic preference, or
+  implausible failure combinations outside an adversarial trust boundary.
+  Mention valuable follow-up hardening as non-blocking.
+- Account for implementation cost. Do not demand branching, abstraction,
+  configuration, or defensive machinery that makes the code harder to read and
+  maintain than the risk warrants.
+- Treat attacker-controlled input at a real trust boundary as reachable even
+  when an honest user would not supply it. Pragmatism does not weaken
+  default-deny behavior or excuse concrete security regressions.
+- On an initial review, inspect the complete change and report the complete
+  known blocker set. Group related examples under one root-cause invariant.
+- On a follow-up review, carry existing obligations without duplicating them,
+  verify prior fixes, and review only the delta since the previous reviewed
+  head. Do not mine unchanged code for new findings.
+- Raise a new unchanged-code blocker only when newly available evidence
+  demonstrates a Critical security, data-loss, or correctness defect. Explain
+  the evidence and why the initial review could not reasonably identify it.
 
 When reviewing plans or architecture documents:
 
@@ -106,11 +136,28 @@ Structure your review clearly:
 
 Omit empty sections. Keep it concise — density over length.
 
+For each Critical or Warning finding, include:
+
+- The stable finding ID when the task supplies an ID format
+- The concrete reachable scenario
+- The material impact
+- Why the current change owns or worsens the problem
+- A proportionate requested fix
+
+Keep Suggestions explicitly non-blocking. On follow-up reviews, do not repeat
+Suggestions from an earlier review.
+
 ## Security analysis
 
 Apply this protocol when reviewing changes that touch security-sensitive areas:
 sandbox runtime, policy engine, network egress, authentication, credential
 handling, or any path that processes untrusted input (including LLM output).
+
+Apply the pragmatic calibration above to security findings too. A real
+attacker-controlled boundary makes an adversarial input reachable, but
+pre-existing or orthogonal hardening does not become blocking merely because it
+can be assigned a CWE. Explain how the current change introduces or materially
+worsens the exposure.
 
 1. **Threat modeling** — Map the data flow for the change. Where does untrusted
    input (from an LLM, user, or network) enter? Where does it exit (to a

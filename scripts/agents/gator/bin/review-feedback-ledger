@@ -9,20 +9,11 @@ usage() {
     cat >&2 <<'EOF'
 Usage:
   review-feedback-ledger OWNER REPO PR_NUMBER
-  review-feedback-ledger --input GRAPHQL_RESPONSE.json
+  review-feedback-ledger --input RAW_LEDGER_INPUT.json
 EOF
 }
 
-read_pages() {
-    if [[ "${1:-}" == "--input" ]]; then
-        [[ "$#" -eq 2 && -r "$2" ]] || {
-            usage
-            return 2
-        }
-        cat "$2"
-        return
-    fi
-
+collect_live_input() {
     [[ "$#" -eq 3 ]] || {
         usage
         return 2
@@ -44,6 +35,11 @@ read_pages() {
         return 2
     }
 
+    local tmp cleanup_cmd
+    tmp="$(mktemp -d)"
+    printf -v cleanup_cmd 'rm -rf -- %q' "$tmp"
+    trap "$cleanup_cmd" RETURN
+
     gh api graphql --paginate \
         -f owner="$owner" \
         -f repo="$repo" \
@@ -60,6 +56,7 @@ query(
       author {
         login
       }
+      headRefOid
       reviewThreads(first: 100, after: $endCursor) {
         nodes {
           id
@@ -84,6 +81,9 @@ query(
               commit {
                 oid
               }
+              pullRequestReview {
+                id
+              }
               replyTo {
                 databaseId
               }
@@ -97,30 +97,129 @@ query(
       }
     }
   }
-}'
+}' > "$tmp/thread-pages.json"
+
+    gh api "repos/$owner/$repo/pulls/$pr_number/reviews?per_page=100" \
+        --paginate > "$tmp/review-pages.json"
+    gh api "repos/$owner/$repo/issues/$pr_number/comments?per_page=100" \
+        --paginate > "$tmp/issue-comment-pages.json"
+
+    jq -n \
+        --slurpfile thread_pages "$tmp/thread-pages.json" \
+        --slurpfile review_pages "$tmp/review-pages.json" \
+        --slurpfile issue_comment_pages "$tmp/issue-comment-pages.json" \
+        '{
+            thread_pages: $thread_pages,
+            review_pages: $review_pages,
+            issue_comment_pages: $issue_comment_pages
+        }'
 }
 
-read_pages "$@" | jq -s '
-    def pull_request:
+read_input() {
+    if [[ "${1:-}" == "--input" ]]; then
+        [[ "$#" -eq 2 && -r "$2" ]] || {
+            usage
+            return 2
+        }
+        cat "$2"
+        return
+    fi
+
+    collect_live_input "$@"
+}
+
+read_input "$@" | jq '
+    def thread_pull_request:
         .data.repository.pullRequest;
-    def is_gator_thread:
-        (.comments.nodes[0].body // "") | startswith("> **gator-agent**");
-    {
-        schema_version: 1,
-        pr_author: ([.[] | pull_request.author.login][0] // null),
+    def is_gator_body:
+        startswith("> **gator-agent**");
+    def explicit_finding_ids:
+        [scan("GATOR-[0-9A-Fa-f]{8}-[0-9]{2}")] | unique;
+    def marked_head_sha:
+        try capture("Head SHA: `?(?<sha>[0-9A-Fa-f]{40})`?").sha catch null;
+    def is_code_review_body:
+        contains("## PR Review Status") or contains("## Re-check After");
+
+    if has("thread_pages") then
+        .
+    else
+        {
+            thread_pages: [.],
+            review_pages: [],
+            issue_comment_pages: []
+        }
+    end
+    | {
+        schema_version: 2,
+        pr_author: ([.thread_pages[] | thread_pull_request.author.login][0] // null),
+        current_head_sha: (
+            [.thread_pages[] | thread_pull_request.headRefOid]
+            | map(select(. != null))
+            | .[0] // null
+        ),
+        reviews: (
+            [
+                .review_pages[]?[]?
+                | select((.body // "") | is_gator_body)
+                | {
+                    disposition_id: ("review:" + (.id | tostring)),
+                    review_id: (.id | tostring),
+                    kind: "review",
+                    is_code_review: ((.body // "") | is_code_review_body),
+                    head_sha: (.commit_id // null),
+                    author: (.user.login // null),
+                    author_association: (.author_association // null),
+                    state: (.state // null),
+                    submitted_at: (.submitted_at // null),
+                    summary_body: (.body // ""),
+                    finding_ids: ((.body // "") | explicit_finding_ids)
+                }
+            ]
+            | unique_by(.disposition_id)
+            | sort_by(.submitted_at)
+        ),
+        issue_comments: (
+            [
+                .issue_comment_pages[]?[]?
+                | select((.body // "") | is_gator_body)
+                | {
+                    disposition_id: ("issue-comment:" + (.id | tostring)),
+                    comment_id: (.id | tostring),
+                    kind: "issue_comment",
+                    is_code_review: ((.body // "") | is_code_review_body),
+                    head_sha: ((.body // "") | marked_head_sha),
+                    author: (.user.login // null),
+                    author_association: (.author_association // null),
+                    submitted_at: (.created_at // null),
+                    updated_at: (.updated_at // null),
+                    url: (.html_url // null),
+                    summary_body: (.body // ""),
+                    finding_ids: ((.body // "") | explicit_finding_ids)
+                }
+            ]
+            | unique_by(.disposition_id)
+            | sort_by(.submitted_at)
+        ),
         threads: (
             [
-                .[]
-                | pull_request.reviewThreads.nodes[]?
+                .thread_pages[]
+                | thread_pull_request.reviewThreads.nodes[]?
                 | select((.comments.nodes | length) > 0)
-                | select(is_gator_thread)
+                | select((.comments.nodes[0].body // "") | is_gator_body)
                 | {
                     thread_id: .id,
+                    finding_id: (
+                        ((.comments.nodes[0].body // "") | explicit_finding_ids | .[0])
+                        // ("gator-inline-" + (.comments.nodes[0].databaseId | tostring))
+                    ),
                     is_resolved: .isResolved,
                     is_outdated: .isOutdated,
                     path,
                     line,
                     resolved_by: (.resolvedBy.login // null),
+                    origin_review_id: (
+                        .comments.nodes[0].pullRequestReview.id // null
+                    ),
                     comments: [
                         .comments.nodes[]
                         | {
@@ -128,10 +227,12 @@ read_pages "$@" | jq -s '
                             author: (.author.login // null),
                             author_association: .authorAssociation,
                             body,
+                            finding_ids: ((.body // "") | explicit_finding_ids),
                             created_at: .createdAt,
                             updated_at: .updatedAt,
                             url,
                             commit_oid: (.commit.oid // null),
+                            review_id: (.pullRequestReview.id // null),
                             reply_to: (.replyTo.databaseId // null)
                         }
                     ]
@@ -140,8 +241,36 @@ read_pages "$@" | jq -s '
             | unique_by(.thread_id)
         )
     }
+    | .dispositions = (
+        [.reviews[], .issue_comments[]]
+        | sort_by(.submitted_at)
+    )
+    | .last_reviewed_sha = (
+        [
+            .dispositions[]
+            | select(.is_code_review)
+            | .head_sha
+            | select(. != null)
+        ]
+        | last // null
+    )
+    | .review_scope = {
+        mode: (
+            if .last_reviewed_sha == null then
+                "initial"
+            elif .last_reviewed_sha == .current_head_sha then
+                "already_reviewed"
+            else
+                "follow_up"
+            end
+        ),
+        previous_reviewed_sha: .last_reviewed_sha,
+        current_head_sha: .current_head_sha
+    }
     | if .pr_author == null then
-        error("pull request not found in GraphQL response")
+        error("pull request not found in ledger input")
+      elif .current_head_sha == null then
+        error("pull request head SHA missing from ledger input")
       else
         .
       end
