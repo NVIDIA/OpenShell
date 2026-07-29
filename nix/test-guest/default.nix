@@ -71,7 +71,6 @@ let
     export OPENSHELL_TEST_GUEST_CACHE_LIB=${./cache-lib.sh}
     export OPENSHELL_TEST_GUEST_CACHE_SEAL=${./cache-seal.sh}
     export OPENSHELL_TEST_GUEST_RUNNER=${./run.sh}
-    export OPENSHELL_TEST_GUEST_RUN_LIB=${./run-lib.sh}
     export TEST_GUEST_BASH=${pkgs.bash}/bin/bash
     export TEST_GUEST_QEMU=${qemuBinary}
     export TEST_GUEST_FIRMWARE_CODE=${pkgs.OVMF.firmware}

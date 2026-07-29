@@ -30,13 +30,10 @@ EOF
 if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_DISTROS:-}" ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_CONFIGURATIONS:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_GUEST_RUN_LIB:-}" ]; then
+	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ]; then
 	echo "run this script through 'nix run .#test-guest -- ...'" >&2
 	exit 2
 fi
-# shellcheck disable=SC1090
-. "${OPENSHELL_TEST_GUEST_RUN_LIB}"
 
 require_value() {
 	if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
@@ -201,11 +198,9 @@ PY
 	forward_host_ports+=("${host_port}")
 done
 
-resolved_packages=()
 for package in "${packages[@]}"; do
-	package_input=${package}
-	if ! package=$(test_guest_resolve_source "${package}"); then
-		echo "package does not exist: ${package_input}" >&2
+	if [ ! -f "${package}" ]; then
+		echo "package does not exist: ${package}" >&2
 		exit 2
 	fi
 	case "${TEST_GUEST_PACKAGE_FAMILY}:${package}" in
@@ -215,16 +210,12 @@ for package in "${packages[@]}"; do
 		exit 2
 		;;
 	esac
-	resolved_packages+=("${package}")
 done
-packages=("${resolved_packages[@]}")
 
-resolved_copies=()
 for copy_spec in "${copies[@]}"; do
 	source_path=${copy_spec%%:*}
 	destination=${copy_spec#*:}
-	if [ "${source_path}" = "${copy_spec}" ] ||
-		! source_path=$(test_guest_resolve_source "${source_path}"); then
+	if [ "${source_path}" = "${copy_spec}" ] || [ ! -f "${source_path}" ]; then
 		echo "invalid --copy source: ${copy_spec}" >&2
 		exit 2
 	fi
@@ -244,9 +235,7 @@ for copy_spec in "${copies[@]}"; do
 		exit 2
 		;;
 	esac
-	resolved_copies+=("${source_path}:${destination}")
 done
-copies=("${resolved_copies[@]}")
 
 test_vm_cpu=host
 ssh_wait_seconds=180
@@ -544,7 +533,7 @@ for package in "${packages[@]}"; do
 	fi
 	remote_package="/home/openshell/${package_name}"
 	echo "==> Installing package: ${package_name}"
-	scp "${scp_args[@]}" -- "${package}" "openshell@127.0.0.1:${remote_package}"
+	scp "${scp_args[@]}" "${package}" "openshell@127.0.0.1:${remote_package}"
 	case "${TEST_GUEST_PACKAGE_FAMILY}" in
 	deb)
 		# The remote path uses a restricted package filename.
@@ -571,22 +560,12 @@ for copy_spec in "${copies[@]}"; do
 	fi
 	remote_copy="/home/openshell/${copy_name}"
 	echo "==> Copying ${copy_name} to ${destination}"
-	scp "${scp_args[@]}" -- "${source_path}" "openshell@127.0.0.1:${remote_copy}"
+	scp "${scp_args[@]}" "${source_path}" "openshell@127.0.0.1:${remote_copy}"
 	# The remote path and destination use restricted path characters.
 	# shellcheck disable=SC2029
 	ssh "${ssh_args[@]}" openshell@127.0.0.1 \
 		"sudo install -D -m 0755 '${remote_copy}' '${destination}'; rm -f '${remote_copy}'"
 done
-
-post_copy_hook_dir=/usr/local/libexec/openshell-test-guest/post-copy.d
-if ssh "${ssh_args[@]}" openshell@127.0.0.1 \
-	"test -d '${post_copy_hook_dir}'"; then
-	echo "==> Running guest post-copy hooks"
-	# The hook directory is installed by trusted test-guest configurations.
-	# shellcheck disable=SC2029
-	ssh "${ssh_args[@]}" openshell@127.0.0.1 \
-		"set -eu; for hook in '${post_copy_hook_dir}'/*; do [ -e \"\${hook}\" ] || continue; [ -x \"\${hook}\" ] || { echo \"hook is not executable: \${hook}\" >&2; exit 1; }; \"\${hook}\"; done"
-fi
 
 echo "==> Test guest ready: ${distro} (SSH port ${ssh_port})"
 if [ "${#guest_command[@]}" -eq 0 ]; then
