@@ -72,7 +72,10 @@ use tracing::{debug, error, info, warn};
 pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 use compute::ComputeRuntime;
-use gateway_listener::{BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners};
+use gateway_listener::{
+    BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners,
+    gateway_listener_scope_for_local_addr,
+};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
@@ -564,6 +567,7 @@ async fn serve_gateway_listener(
         listener,
         address: listen_addr,
         scope,
+        covered_addresses,
     } = bound_listener;
 
     loop {
@@ -584,12 +588,21 @@ async fn serve_gateway_listener(
                 continue;
             }
         };
+        let listener_scope = match stream.local_addr() {
+            Ok(local_addr) => {
+                gateway_listener_scope_for_local_addr(scope, &covered_addresses, local_addr)
+            }
+            Err(e) => {
+                debug!(error = %e, client = %addr, listen = %listen_addr, "Failed to inspect accepted local address");
+                scope
+            }
+        };
 
         spawn_gateway_connection(
             stream,
             addr,
             listen_addr,
-            scope,
+            listener_scope,
             service.clone(),
             tls_acceptor.clone(),
             enable_loopback_service_http,
@@ -1104,6 +1117,7 @@ mod tests {
                 listener,
                 address: listen_addr,
                 scope: GatewayListenerScope::Primary,
+                covered_addresses: Vec::new(),
             },
             service,
             Some(tls_acceptor),

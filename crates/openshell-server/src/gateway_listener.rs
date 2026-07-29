@@ -14,9 +14,16 @@ pub enum GatewayListenerScope {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoveredGatewayAddress {
+    pub address: SocketAddr,
+    pub scope: GatewayListenerScope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct GatewayListenerSpec {
     address: SocketAddr,
     scope: GatewayListenerScope,
+    covered_addresses: Vec<CoveredGatewayAddress>,
 }
 
 /// A gateway listener together with the context needed to serve it.
@@ -24,6 +31,7 @@ pub struct BoundGatewayListener {
     pub listener: TcpListener,
     pub address: SocketAddr,
     pub scope: GatewayListenerScope,
+    pub covered_addresses: Vec<CoveredGatewayAddress>,
 }
 
 fn gateway_listener_specs(
@@ -33,15 +41,31 @@ fn gateway_listener_specs(
     let mut specs = vec![GatewayListenerSpec {
         address: bind_address,
         scope: GatewayListenerScope::Primary,
+        covered_addresses: Vec::new(),
     }];
     for address in extra_addresses {
-        if !specs
+        let scope = GatewayListenerScope::ComputeDriverCallback;
+        if let Some(existing) = specs
             .iter()
-            .any(|existing| listener_covers(existing.address, *address))
+            .position(|existing| listener_covers(existing.address, *address))
         {
+            let existing = &mut specs[existing];
+            if existing.address != *address
+                && !existing
+                    .covered_addresses
+                    .iter()
+                    .any(|covered| covered.address == *address)
+            {
+                existing.covered_addresses.push(CoveredGatewayAddress {
+                    address: *address,
+                    scope,
+                });
+            }
+        } else {
             specs.push(GatewayListenerSpec {
                 address: *address,
-                scope: GatewayListenerScope::ComputeDriverCallback,
+                scope,
+                covered_addresses: Vec::new(),
             });
         }
     }
@@ -64,9 +88,55 @@ pub async fn bind_gateway_listeners(
             listener,
             address: local_addr,
             scope: spec.scope,
+            covered_addresses: resolve_bound_covered_addresses(
+                &spec.covered_addresses,
+                spec.address,
+                local_addr,
+            ),
         });
     }
     Ok(listeners)
+}
+
+pub fn gateway_listener_scope_for_local_addr(
+    default_scope: GatewayListenerScope,
+    covered_addresses: &[CoveredGatewayAddress],
+    local_addr: SocketAddr,
+) -> GatewayListenerScope {
+    covered_addresses
+        .iter()
+        .find(|covered| covered.address == local_addr)
+        .map_or(default_scope, |covered| covered.scope)
+}
+
+fn resolve_bound_covered_addresses(
+    covered_addresses: &[CoveredGatewayAddress],
+    requested_listener_addr: SocketAddr,
+    bound_listener_addr: SocketAddr,
+) -> Vec<CoveredGatewayAddress> {
+    covered_addresses
+        .iter()
+        .map(|covered| CoveredGatewayAddress {
+            address: resolve_ephemeral_port(
+                covered.address,
+                requested_listener_addr,
+                bound_listener_addr,
+            ),
+            scope: covered.scope,
+        })
+        .collect()
+}
+
+fn resolve_ephemeral_port(
+    address: SocketAddr,
+    requested_listener_addr: SocketAddr,
+    bound_listener_addr: SocketAddr,
+) -> SocketAddr {
+    if requested_listener_addr.port() == 0 && address.port() == 0 {
+        SocketAddr::new(address.ip(), bound_listener_addr.port())
+    } else {
+        address
+    }
 }
 
 fn listener_covers(existing: SocketAddr, requested: SocketAddr) -> bool {
@@ -87,14 +157,15 @@ fn listener_covers(existing: SocketAddr, requested: SocketAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GatewayListenerScope, GatewayListenerSpec, bind_gateway_listeners, gateway_listener_specs,
+        CoveredGatewayAddress, GatewayListenerScope, GatewayListenerSpec, bind_gateway_listeners,
+        gateway_listener_scope_for_local_addr, gateway_listener_specs,
     };
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::net::TcpListener;
 
     #[test]
-    fn gateway_listener_specs_skip_driver_address_covered_by_wildcard() {
+    fn gateway_listener_specs_track_driver_address_covered_by_wildcard() {
         let primary: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
 
@@ -103,7 +174,30 @@ mod tests {
             vec![GatewayListenerSpec {
                 address: primary,
                 scope: GatewayListenerScope::Primary,
+                covered_addresses: vec![CoveredGatewayAddress {
+                    address: docker,
+                    scope: GatewayListenerScope::ComputeDriverCallback,
+                }],
             }]
+        );
+    }
+
+    #[test]
+    fn gateway_listener_scope_for_local_addr_uses_covered_address_scope() {
+        let primary: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let [spec] = gateway_listener_specs(primary, &[docker])
+            .try_into()
+            .unwrap();
+
+        assert_eq!(
+            gateway_listener_scope_for_local_addr(spec.scope, &spec.covered_addresses, docker),
+            GatewayListenerScope::ComputeDriverCallback,
+        );
+        assert_eq!(
+            gateway_listener_scope_for_local_addr(spec.scope, &spec.covered_addresses, loopback),
+            GatewayListenerScope::Primary,
         );
     }
 
@@ -118,10 +212,12 @@ mod tests {
                 GatewayListenerSpec {
                     address: primary,
                     scope: GatewayListenerScope::Primary,
+                    covered_addresses: Vec::new(),
                 },
                 GatewayListenerSpec {
                     address: docker,
                     scope: GatewayListenerScope::ComputeDriverCallback,
+                    covered_addresses: Vec::new(),
                 },
             ]
         );
