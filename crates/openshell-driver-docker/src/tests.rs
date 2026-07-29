@@ -141,14 +141,6 @@ fn inspected_volume(driver: &str, options: HashMap<String, String>) -> bollard::
     }
 }
 
-struct DisconnectedSupervisorReadiness;
-
-impl SupervisorReadiness for DisconnectedSupervisorReadiness {
-    fn is_supervisor_connected(&self, _sandbox_id: &str) -> bool {
-        false
-    }
-}
-
 fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDriver {
     let allow_all_default_gpu = config.allow_all_default_gpu;
     DockerComputeDriver {
@@ -159,7 +151,6 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
         config,
         events: broadcast::channel(WATCH_BUFFER).0,
         pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        supervisor_readiness: Arc::new(DisconnectedSupervisorReadiness),
         gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
             CdiGpuInventory::default(),
             allow_all_default_gpu,
@@ -1776,34 +1767,19 @@ fn driver_status_keeps_running_sandboxes_provisioning_with_stable_message() {
         ..running.clone()
     };
 
-    let running_status = driver_status_from_summary(&running, "demo", false);
-    let running_later_status = driver_status_from_summary(&running_later, "demo", false);
-    assert_eq!(running_status.conditions[0].status, "False");
-    assert_eq!(running_status.conditions[0].reason, "DependenciesNotReady");
-    assert_eq!(
-        running_status.conditions[0].message,
-        "Container is running; waiting for supervisor relay"
-    );
+    // A running container always emits Ready=True with BackendReady. The gateway
+    // composes this with supervisor-session presence to decide public SandboxPhase.
+    let running_status = driver_status_from_summary(&running, "demo");
+    let running_later_status = driver_status_from_summary(&running_later, "demo");
+    assert_eq!(running_status.conditions[0].status, "True");
+    assert_eq!(running_status.conditions[0].reason, "BackendReady");
+    assert_eq!(running_status.conditions[0].message, "Container is running");
     assert_eq!(running_status.conditions, running_later_status.conditions);
 
-    let exited_status = driver_status_from_summary(&exited, "demo", false);
+    let exited_status = driver_status_from_summary(&exited, "demo");
     assert_eq!(exited_status.conditions[0].status, "False");
     assert_eq!(exited_status.conditions[0].reason, "ContainerExited");
     assert_eq!(exited_status.conditions[0].message, "Container exited");
-
-    // With a live supervisor session, a RUNNING container flips Ready=True
-    // so ExecSandbox and other "sandbox must be ready" gates can proceed.
-    let running_connected = driver_status_from_summary(&running, "demo", true);
-    assert_eq!(running_connected.conditions[0].status, "True");
-    assert_eq!(
-        running_connected.conditions[0].reason,
-        "SupervisorConnected"
-    );
-
-    // Supervisor readiness is ignored for non-RUNNING states -- an exited
-    // container must not report Ready=True.
-    let exited_connected = driver_status_from_summary(&exited, "demo", true);
-    assert_eq!(exited_connected.conditions[0].status, "False");
 }
 
 #[test]
@@ -1821,7 +1797,7 @@ fn driver_status_marks_restarting_sandboxes_as_error() {
         ..Default::default()
     };
 
-    let status = driver_status_from_summary(&restarting, "demo", false);
+    let status = driver_status_from_summary(&restarting, "demo");
     assert_eq!(status.conditions[0].status, "False");
     assert_eq!(status.conditions[0].reason, "ContainerRestarting");
     assert_eq!(

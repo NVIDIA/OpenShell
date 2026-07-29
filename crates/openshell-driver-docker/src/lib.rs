@@ -79,17 +79,6 @@ const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const DOCKER_NETWORK_DRIVER: &str = "bridge";
 
-/// Queried by the Docker driver to decide when a sandbox's supervisor
-/// relay is live. Implementations return `true` once a sandbox has an
-/// active `ConnectSupervisor` session registered.
-///
-/// The driver cannot observe the supervisor's SSH socket directly (it
-/// lives inside the container), so it leans on this signal to flip the
-/// Ready condition from `DependenciesNotReady` to `True`.
-pub trait SupervisorReadiness: Send + Sync + 'static {
-    fn is_supervisor_connected(&self, sandbox_id: &str) -> bool;
-}
-
 /// Gateway-local configuration for the Docker compute driver.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -212,7 +201,6 @@ pub struct DockerComputeDriver {
     config: DockerDriverRuntimeConfig,
     events: broadcast::Sender<WatchSandboxesEvent>,
     pending: Arc<Mutex<HashMap<String, PendingSandboxRecord>>>,
-    supervisor_readiness: Arc<dyn SupervisorReadiness>,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
 }
 
@@ -315,11 +303,7 @@ type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send + 'static>>;
 
 impl DockerComputeDriver {
-    pub async fn new(
-        config: &Config,
-        docker_config: &DockerComputeConfig,
-        supervisor_readiness: Arc<dyn SupervisorReadiness>,
-    ) -> CoreResult<Self> {
+    pub async fn new(config: &Config, docker_config: &DockerComputeConfig) -> CoreResult<Self> {
         let socket_path = docker_config
             .socket_path
             .clone()
@@ -401,7 +385,6 @@ impl DockerComputeDriver {
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
-            supervisor_readiness,
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 cdi_gpu_inventory,
                 allow_all_default_gpu,
@@ -612,9 +595,9 @@ impl DockerComputeDriver {
         let container = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
             .await?;
-        if let Some(sandbox) = container.and_then(|summary| {
-            sandbox_from_container_summary(&summary, self.supervisor_readiness.as_ref())
-        }) {
+        if let Some(sandbox) =
+            container.and_then(|summary| sandbox_from_container_summary(&summary))
+        {
             return Ok(Some(sandbox));
         }
 
@@ -625,9 +608,7 @@ impl DockerComputeDriver {
         let containers = self.list_managed_container_summaries().await?;
         let container_sandboxes = containers
             .iter()
-            .filter_map(|summary| {
-                sandbox_from_container_summary(summary, self.supervisor_readiness.as_ref())
-            })
+            .filter_map(sandbox_from_container_summary)
             .collect::<Vec<_>>();
         let mut by_id = self.pending_snapshot_map().await;
         for sandbox in container_sandboxes {
@@ -1131,8 +1112,7 @@ impl DockerComputeDriver {
         if let Some(summary) = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
             .await?
-            && let Some(sandbox) =
-                sandbox_from_container_summary(&summary, self.supervisor_readiness.as_ref())
+            && let Some(sandbox) = sandbox_from_container_summary(&summary)
         {
             self.publish_sandbox_snapshot(sandbox);
         }
@@ -2821,10 +2801,7 @@ fn parse_memory_limit(value: &str) -> Result<Option<i64>, Status> {
     Ok(Some((amount * multiplier).round() as i64))
 }
 
-fn sandbox_from_container_summary(
-    summary: &ContainerSummary,
-    readiness: &dyn SupervisorReadiness,
-) -> Option<DriverSandbox> {
+fn sandbox_from_container_summary(summary: &ContainerSummary) -> Option<DriverSandbox> {
     let labels = summary.labels.as_ref()?;
     let id = labels.get(LABEL_SANDBOX_ID)?.clone();
     let name = labels.get(LABEL_SANDBOX_NAME)?.clone();
@@ -2837,17 +2814,12 @@ fn sandbox_from_container_summary(
         .cloned()
         .unwrap_or_default();
 
-    let supervisor_connected = readiness.is_supervisor_connected(&id);
     Some(DriverSandbox {
         id,
         name: name.clone(),
         namespace,
         spec: None,
-        status: Some(driver_status_from_summary(
-            summary,
-            &name,
-            supervisor_connected,
-        )),
+        status: Some(driver_status_from_summary(summary, &name)),
         workspace,
     })
 }
@@ -2855,10 +2827,9 @@ fn sandbox_from_container_summary(
 fn driver_status_from_summary(
     summary: &ContainerSummary,
     sandbox_name: &str,
-    supervisor_connected: bool,
 ) -> DriverSandboxStatus {
     let state = summary.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
-    let (ready, reason, message, deleting) = container_ready_condition(state, supervisor_connected);
+    let (ready, reason, message, deleting) = container_ready_condition(state);
 
     DriverSandboxStatus {
         sandbox_name: summary_container_name(summary).unwrap_or_else(|| sandbox_name.to_string()),
@@ -2878,25 +2849,10 @@ fn driver_status_from_summary(
 
 fn container_ready_condition(
     state: ContainerSummaryStateEnum,
-    supervisor_connected: bool,
 ) -> (&'static str, &'static str, &'static str, bool) {
     match state {
         ContainerSummaryStateEnum::RUNNING => {
-            if supervisor_connected {
-                (
-                    "True",
-                    "SupervisorConnected",
-                    "Supervisor relay is live",
-                    false,
-                )
-            } else {
-                (
-                    "False",
-                    "DependenciesNotReady",
-                    "Container is running; waiting for supervisor relay",
-                    false,
-                )
-            }
+            ("True", "BackendReady", "Container is running", false)
         }
         ContainerSummaryStateEnum::CREATED => ("False", "Starting", "Container created", false),
         ContainerSummaryStateEnum::RESTARTING => (
