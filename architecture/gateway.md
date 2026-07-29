@@ -603,6 +603,36 @@ Driver-specific values that are not part of the inheritance allowlist
 (e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
 table.
 
+### OTLP export
+
+The gateway already uses Rust's `tracing` framework for structured log events
+and request-span context consumed by stdout and the sandbox log bus. OTLP export
+adds an OpenTelemetry layer to the same subscriber. That layer turns selected
+`tracing` spans into distributed traces; it does not export log events or
+replace the existing logging paths.
+
+`[openshell.gateway.otlp]` is the only enablement path for OpenTelemetry
+export: the table's presence is the on-switch, and `OTEL_EXPORTER_OTLP_ENDPOINT`
+is ignored so enablement has a single source. TOML decides whether and where
+to export; the SDK's `OTEL_*` variables tune how. Transport is OTLP over gRPC
+only.
+
+Span emission requires no per-handler instrumentation. The `tower_http`
+`TraceLayer` in `multiplex.rs` opens a span per inbound request, and that span
+continues incoming W3C trace context when present or starts a new trace
+otherwise. It is named for the RPC and carries the request ID that also appears
+in the gateway's logs — the identifier that lets an operator pivot between a
+trace and its log lines. Store and compute-driver spans become children of the
+request span. Reconciliation, provider refresh, and driver-watch loops create
+their own operation spans because they have no inbound request to provide a
+parent. gRPC status is recorded when response trailers arrive.
+
+Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
+failure stops the gateway from serving: a malformed endpoint is logged at
+startup and disables export. Export is best-effort — the SDK logs runtime
+failures, and a failed batch is dropped rather than retried. Buffered spans
+flush after the server loop exits so `SIGTERM` does not drop in-flight traces.
+
 ### Package-managed gateway registry
 
 The CLI reads its active-gateway and per-gateway metadata from

@@ -29,6 +29,12 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// Closes the connection pool.
+    #[cfg(test)]
+    pub(crate) async fn close_for_test(&self) {
+        self.pool.close().await;
+    }
+
     pub async fn connect(url: &str) -> PersistenceResult<Self> {
         let is_in_memory = url.contains(":memory:") || url.contains("mode=memory");
         let max_connections = if is_in_memory { 1 } else { 5 };
