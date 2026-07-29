@@ -81,7 +81,13 @@ pub(super) async fn fetch_and_authorize_sandbox(
         MinWorkspaceRole::User,
     )
     .await
-    .map_err(|_| Status::not_found("sandbox not found"))?;
+    .map_err(|e| {
+        if e.code() == tonic::Code::PermissionDenied {
+            Status::not_found("sandbox not found")
+        } else {
+            e
+        }
+    })?;
     Ok(sandbox)
 }
 
@@ -1593,7 +1599,13 @@ pub(super) async fn handle_revoke_ssh_session(
         MinWorkspaceRole::User,
     )
     .await
-    .map_err(|_| Status::not_found("sandbox not found"))?;
+    .map_err(|e| {
+        if e.code() == tonic::Code::PermissionDenied {
+            Status::not_found("sandbox not found")
+        } else {
+            e
+        }
+    })?;
 
     let resource_version = session
         .metadata

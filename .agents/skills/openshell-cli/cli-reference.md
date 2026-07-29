@@ -194,7 +194,7 @@ identity provider. Requires an authenticated gateway connection.
 
 | Flag | Description |
 |------|-------------|
-| `--output <FORMAT>` | Output format: `text` (default) or `json` |
+| `--output <FORMAT>` | Output format: `table` (default), `json`, or `yaml` |
 
 ---
 
