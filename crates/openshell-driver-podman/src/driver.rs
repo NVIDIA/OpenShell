@@ -429,6 +429,18 @@ impl PodmanComputeDriver {
         if !uses_local_callback_alias {
             return Ok(Vec::new());
         }
+        let callback_port = endpoint.port_or_known_default().ok_or_else(|| {
+            ComputeDriverError::Precondition(format!(
+                "Podman gateway callback endpoint '{}' has no port",
+                self.config.grpc_endpoint
+            ))
+        })?;
+        if callback_port != self.config.gateway_port {
+            return Err(ComputeDriverError::Precondition(format!(
+                "Podman local callback endpoint '{}' uses port {callback_port}, but the gateway primary listener uses port {}; configure grpc_endpoint with the gateway primary listener port",
+                self.config.grpc_endpoint, self.config.gateway_port
+            )));
+        }
 
         #[cfg(target_os = "linux")]
         {
@@ -476,16 +488,10 @@ impl PodmanComputeDriver {
                     "Podman callback gateway address '{gateway_ip}' is invalid: {err}"
                 ))
             })?;
-            let port = endpoint.port_or_known_default().ok_or_else(|| {
-                ComputeDriverError::Precondition(format!(
-                    "Podman gateway callback endpoint '{}' has no port",
-                    self.config.grpc_endpoint
-                ))
-            })?;
             Ok(vec![GatewayListenerRequirement {
                 reason: format!("Podman network '{}' host gateway", self.config.network_name),
                 selector: Some(Selector::ExactBindAddress(
-                    SocketAddr::new(gateway_ip, port).to_string(),
+                    SocketAddr::new(gateway_ip, callback_port).to_string(),
                 )),
             }])
         }
@@ -1454,11 +1460,38 @@ mod tests {
     #[test]
     fn explicit_remote_callback_does_not_request_gateway_listener() {
         let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
-            grpc_endpoint: "https://gateway.example.test:17670".to_string(),
+            grpc_endpoint: "https://gateway.example.test:9443".to_string(),
+            gateway_port: 17670,
             ..PodmanComputeConfig::default()
         });
 
         assert!(driver.gateway_listener_requirements().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_callback_alias_requires_primary_listener_port() {
+        for grpc_endpoint in [
+            "http://host.openshell.internal:17671",
+            "http://host.containers.internal",
+        ] {
+            let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+                grpc_endpoint: grpc_endpoint.to_string(),
+                gateway_port: 17670,
+                ..PodmanComputeConfig::default()
+            });
+
+            let err = driver.gateway_listener_requirements().unwrap_err();
+
+            assert!(
+                matches!(err, ComputeDriverError::Precondition(_)),
+                "mismatched local callback port should fail precondition: {err}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("gateway primary listener uses port 17670"),
+                "unexpected error for {grpc_endpoint}: {err}"
+            );
+        }
     }
 
     #[test]
