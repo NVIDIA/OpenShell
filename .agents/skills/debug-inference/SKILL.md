@@ -240,13 +240,17 @@ Check instead:
 4. `network_policies` allow that host, port, and HTTP rules
 
 If the response reports `credential_endpoint_mismatch`, the provider is attached
-but its credential profile does not authorize that request recipient. Inspect
-`openshell provider get <provider-name>` and compare the profile's endpoint host,
-port, and path with the direct request. Correct the provider selection or profile
-endpoint when that recipient is intentional. Do not widen the sandbox network
-policy to work around the mismatch: policy admission and credential endpoint
-authorization are separate checks, and the provider profile should authorize
-only intended credential recipients.
+but its credential profile does not authorize that request recipient. Run
+`openshell provider get <provider-name>` to identify the provider type, then
+inspect its profile endpoints with
+`openshell provider profile export <type> -o yaml`. That export uses the current
+workspace scope; add `--global` when the provider was created with
+`--global-profile`. Compare the profile's endpoint host, port, and path with the
+direct request. Correct the provider selection or profile endpoint when that
+recipient is intentional. Do not widen the sandbox network policy to work around
+the mismatch: policy admission and credential endpoint authorization are
+separate checks, and the provider profile should authorize only intended
+credential recipients.
 
 Attach or detach a provider on an existing sandbox with `openshell sandbox provider attach <sandbox> <provider>` and `openshell sandbox provider detach <sandbox> <provider>`.
 

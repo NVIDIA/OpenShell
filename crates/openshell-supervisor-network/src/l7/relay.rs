@@ -1279,7 +1279,13 @@ where
             return Ok(());
         }
 
-        let redacted_target = req.target.clone();
+        let redacted_target = match secrets::redact_target_for_policy(&req.target) {
+            Ok(target) => target,
+            Err(error) => {
+                reject_credential_resolution(client, ctx, &error).await?;
+                return Ok(());
+            }
+        };
 
         let request_info = L7RequestInfo {
             action: req.action.clone(),
@@ -1387,14 +1393,21 @@ where
             // trusted-annotations or version-profile field, so MCP responses and
             // SSE streams are relayed unchanged; see McpOptions in
             // proto/sandbox.proto for planned policy extensions.
-            let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+            let Some(outcome) = relay_http_request_with_credential_rejection(
                 &req,
                 client,
                 upstream,
-                ctx.secret_resolver.as_deref(),
-                Some(engine.generation_guard()),
+                crate::l7::rest::RelayRequestOptions {
+                    resolver: ctx.secret_resolver.as_deref(),
+                    generation_guard: Some(engine.generation_guard()),
+                    ..Default::default()
+                },
+                ctx,
             )
-            .await?;
+            .await?
+            else {
+                return Ok(());
+            };
             match outcome {
                 RelayOutcome::Reusable => {}
                 RelayOutcome::Consumed => {
@@ -1594,14 +1607,21 @@ where
                     return Ok(());
                 }
             };
-            let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+            let Some(outcome) = relay_http_request_with_credential_rejection(
                 &req,
                 client,
                 upstream,
-                ctx.secret_resolver.as_deref(),
-                Some(engine.generation_guard()),
+                crate::l7::rest::RelayRequestOptions {
+                    resolver: ctx.secret_resolver.as_deref(),
+                    generation_guard: Some(engine.generation_guard()),
+                    ..Default::default()
+                },
+                ctx,
             )
-            .await?;
+            .await?
+            else {
+                return Ok(());
+            };
             match outcome {
                 RelayOutcome::Reusable => {}
                 RelayOutcome::Consumed => {
@@ -2298,7 +2318,11 @@ mod tests {
     use openshell_core::provider_credentials::ProviderCredentialState;
     use std::collections::HashMap as TestHashMap;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
 
@@ -2333,6 +2357,101 @@ mod tests {
             .resolver_for_endpoint("denied.example.test", 443, "/outside")
             .expect("endpoint-scoped resolver");
         (state, resolver)
+    }
+
+    #[derive(Clone, Default)]
+    struct OcsfCapture {
+        events: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl<S> Layer<S> for OcsfCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: LayerContext<'_, S>) {
+            if event.metadata().target() != openshell_ocsf::OCSF_TARGET {
+                return;
+            }
+            let Some(event) = openshell_ocsf::clone_current_event() else {
+                return;
+            };
+            self.events
+                .lock()
+                .expect("OCSF capture lock")
+                .push(event.to_json().expect("OCSF event JSON"));
+        }
+    }
+
+    impl OcsfCapture {
+        fn snapshot(&self) -> Vec<serde_json::Value> {
+            self.events.lock().expect("OCSF capture lock").clone()
+        }
+    }
+
+    async fn run_single_config_credential_mismatch(
+        config: L7EndpointConfig,
+        engine: TunnelPolicyEngine,
+        mut ctx: L7EvalContext,
+        request: String,
+        resolver: Arc<SecretResolver>,
+    ) -> (String, Vec<u8>, Vec<serde_json::Value>) {
+        ctx.secret_resolver = Some(resolver);
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let capture = OcsfCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let relay = tokio::spawn(
+            async move {
+                relay_with_inspection(
+                    &config,
+                    engine,
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                )
+                .await
+            }
+            .with_subscriber(subscriber),
+        );
+
+        app.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read_to_string(&mut response),
+        )
+        .await
+        .expect("typed credential denial should close the client stream")
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+
+        let mut forwarded = Vec::new();
+        upstream.read_to_end(&mut forwarded).await.unwrap();
+        (response, forwarded, capture.snapshot())
+    }
+
+    fn assert_single_config_credential_mismatch(
+        response: &str,
+        forwarded: &[u8],
+        events: &[serde_json::Value],
+    ) {
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            response.contains("credential_endpoint_mismatch"),
+            "{response}"
+        );
+        assert!(
+            forwarded.is_empty(),
+            "credential mismatch must not write upstream"
+        );
+
+        let events = serde_json::to_string(events).unwrap();
+        assert!(events.contains("\"status_detail\":\"credential_endpoint_mismatch\""));
+        assert!(events.contains("openshell.provider_credential.endpoint_mismatch"));
     }
 
     async fn assert_credential_relay_rejected(
@@ -2666,23 +2785,31 @@ network_policies:
     }
 
     fn jsonrpc_test_relay_context() -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
-        let data = r"
+        jsonrpc_test_relay_context_with_path("/rpc")
+    }
+
+    fn jsonrpc_test_relay_context_with_path(
+        endpoint_path: &str,
+    ) -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
+        let data = format!(
+            r#"
 network_policies:
   jsonrpc_api:
     name: jsonrpc_api
     endpoints:
       - host: jsonrpc.example.test
         port: 8000
-        path: /rpc
+        path: "{endpoint_path}"
         protocol: json-rpc
         enforcement: enforce
         rules:
           - allow:
               method: initialize
     binaries:
-      - { path: /usr/bin/python3 }
-";
-        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+      - {{ path: /usr/bin/python3 }}
+"#
+        );
+        let engine = OpaEngine::from_strings(TEST_POLICY, &data).unwrap();
         let input = NetworkInput {
             host: "jsonrpc.example.test".into(),
             port: 8000,
@@ -2751,6 +2878,115 @@ network_policies:
             ..Default::default()
         };
         (config, tunnel_engine, ctx)
+    }
+
+    fn graphql_test_relay_context() -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
+        let data = r"
+network_policies:
+  graphql_api:
+    name: graphql_api
+    endpoints:
+      - host: graphql.example.test
+        port: 8000
+        path: /graphql
+        protocol: graphql
+        enforcement: enforce
+        rules:
+          - allow:
+              operation_type: query
+              fields: [viewer]
+    binaries:
+      - { path: /usr/bin/python3 }
+";
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "graphql.example.test".into(),
+            port: 8000,
+            binary_path: PathBuf::from("/usr/bin/python3"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        let config = crate::l7::parse_l7_config(&endpoint_config.unwrap()).unwrap();
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "graphql.example.test".into(),
+            port: 8000,
+            policy_name: "graphql_api".into(),
+            binary_path: "/usr/bin/python3".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            ..Default::default()
+        };
+        (config, tunnel_engine, ctx)
+    }
+
+    #[tokio::test]
+    async fn single_config_jsonrpc_credential_mismatch_is_typed_and_telemetry_safe() {
+        let (config, engine, ctx) = jsonrpc_test_relay_context_with_path("/rpc/**");
+        let (_state, resolver) = endpoint_mismatch_resolver(TestHashMap::from([(
+            "API_TOKEN".to_string(),
+            "secret".to_string(),
+        )]));
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        let request = format!(
+            "POST /rpc/openshell:resolve:env:v1_API_TOKEN HTTP/1.1\r\nHost: jsonrpc.example.test\r\nAuthorization: Bearer openshell:resolve:env:v1_API_TOKEN\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+
+        let (response, forwarded, events) =
+            run_single_config_credential_mismatch(config, engine, ctx, request, resolver).await;
+        assert_single_config_credential_mismatch(&response, &forwarded, &events);
+
+        let events = serde_json::to_string(&events).unwrap();
+        assert!(
+            events.contains("[CREDENTIAL]"),
+            "policy telemetry should contain the syntax-only redaction marker: {events}"
+        );
+        assert!(
+            !events.contains("API_TOKEN"),
+            "policy telemetry must not expose credential environment keys: {events}"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_config_mcp_credential_mismatch_returns_typed_denial() {
+        let (config, engine, ctx) = mcp_test_relay_context();
+        let (_state, resolver) = endpoint_mismatch_resolver(TestHashMap::from([(
+            "API_TOKEN".to_string(),
+            "secret".to_string(),
+        )]));
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test\r\nAuthorization: Bearer openshell:resolve:env:v1_API_TOKEN\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+
+        let (response, forwarded, events) =
+            run_single_config_credential_mismatch(config, engine, ctx, request, resolver).await;
+        assert_single_config_credential_mismatch(&response, &forwarded, &events);
+    }
+
+    #[tokio::test]
+    async fn single_config_graphql_credential_mismatch_returns_typed_denial() {
+        let (config, engine, ctx) = graphql_test_relay_context();
+        let (_state, resolver) = endpoint_mismatch_resolver(TestHashMap::from([(
+            "API_TOKEN".to_string(),
+            "secret".to_string(),
+        )]));
+        let body = r#"{"query":"query { viewer }"}"#;
+        let request = format!(
+            "POST /graphql HTTP/1.1\r\nHost: graphql.example.test\r\nAuthorization: Bearer openshell:resolve:env:v1_API_TOKEN\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+
+        let (response, forwarded, events) =
+            run_single_config_credential_mismatch(config, engine, ctx, request, resolver).await;
+        assert_single_config_credential_mismatch(&response, &forwarded, &events);
     }
 
     fn authorization_header_count(headers: &str) -> usize {
