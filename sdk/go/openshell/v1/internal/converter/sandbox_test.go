@@ -20,11 +20,14 @@ func TestSandboxFromProto(t *testing.T) {
 	gpuCount := uint32(2)
 	proto := &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{
-			Id:              "sb-1",
-			Name:            "my-sandbox",
-			CreatedAtMs:     1700000000000,
-			Labels:          map[string]string{"env": "dev"},
-			ResourceVersion: 3,
+			Id:                  "sb-1",
+			Name:                "my-sandbox",
+			CreatedAtMs:         1700000000000,
+			Labels:              map[string]string{"env": "dev"},
+			Annotations:         map[string]string{"owner": "team-a"},
+			ResourceVersion:     3,
+			Workspace:           "prod",
+			DeletionTimestampMs: 1700000060000,
 		},
 		Spec: &pb.SandboxSpec{
 			LogLevel:    "debug",
@@ -71,7 +74,11 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, "my-sandbox", s.Name)
 	assert.Equal(t, time.UnixMilli(1700000000000).UTC(), s.CreatedAt)
 	assert.Equal(t, map[string]string{"env": "dev"}, s.Labels)
+	assert.Equal(t, map[string]string{"owner": "team-a"}, s.Annotations)
 	assert.Equal(t, uint64(3), s.ResourceVersion)
+	assert.Equal(t, "prod", s.Workspace)
+	require.NotNil(t, s.DeletionTimestamp)
+	assert.Equal(t, time.UnixMilli(1700000060000).UTC(), *s.DeletionTimestamp)
 
 	// Spec
 	assert.Equal(t, "debug", s.Spec.LogLevel)
@@ -165,12 +172,16 @@ func TestSandboxPhaseToProto(t *testing.T) {
 func TestSandboxToProto(t *testing.T) {
 	userNS := true
 	gpuCount := uint32(4)
+	delTime := time.UnixMilli(1700000060000).UTC()
 	s := &v1.Sandbox{
-		ID:              "sb-1",
-		Name:            "my-sandbox",
-		CreatedAt:       time.UnixMilli(1700000000000).UTC(),
-		Labels:          map[string]string{"env": "dev"},
-		ResourceVersion: 3,
+		ID:                "sb-1",
+		Name:              "my-sandbox",
+		CreatedAt:         time.UnixMilli(1700000000000).UTC(),
+		Labels:            map[string]string{"env": "dev"},
+		Annotations:       map[string]string{"owner": "team-a"},
+		ResourceVersion:   3,
+		Workspace:         "prod",
+		DeletionTimestamp: &delTime,
 		Spec: v1.SandboxSpec{
 			LogLevel:    "info",
 			Environment: map[string]string{"KEY": "val"},
@@ -196,7 +207,10 @@ func TestSandboxToProto(t *testing.T) {
 	assert.Equal(t, "my-sandbox", p.Metadata.Name)
 	assert.Equal(t, int64(1700000000000), p.Metadata.CreatedAtMs)
 	assert.Equal(t, map[string]string{"env": "dev"}, p.Metadata.Labels)
+	assert.Equal(t, map[string]string{"owner": "team-a"}, p.Metadata.Annotations)
 	assert.Equal(t, uint64(3), p.Metadata.ResourceVersion)
+	assert.Equal(t, "prod", p.Metadata.Workspace)
+	assert.Equal(t, int64(1700000060000), p.Metadata.DeletionTimestampMs)
 
 	require.NotNil(t, p.Spec)
 	assert.Equal(t, "info", p.Spec.LogLevel)
@@ -241,12 +255,16 @@ func TestSandboxToProto_NilTemplate(t *testing.T) {
 func TestSandboxRoundTrip(t *testing.T) {
 	userNS := false
 	gpuCount := uint32(1)
+	rtDelTime := time.UnixMilli(1700000090000).UTC()
 	original := &v1.Sandbox{
 		ID:              "sb-rt",
 		Name:            "round-trip",
 		CreatedAt:       time.UnixMilli(1700000000000).UTC(),
-		Labels:          map[string]string{"team": "platform"},
-		ResourceVersion: 10,
+		Labels:            map[string]string{"team": "platform"},
+		Annotations:       map[string]string{"note": "rt-test"},
+		ResourceVersion:   10,
+		Workspace:         "staging",
+		DeletionTimestamp: &rtDelTime,
 		Spec: v1.SandboxSpec{
 			LogLevel:    "trace",
 			Environment: map[string]string{"A": "B"},
@@ -289,7 +307,11 @@ func TestSandboxRoundTrip(t *testing.T) {
 	assert.Equal(t, original.Name, back.Name)
 	assert.Equal(t, original.CreatedAt, back.CreatedAt)
 	assert.Equal(t, original.Labels, back.Labels)
+	assert.Equal(t, original.Annotations, back.Annotations)
 	assert.Equal(t, original.ResourceVersion, back.ResourceVersion)
+	assert.Equal(t, original.Workspace, back.Workspace)
+	require.NotNil(t, back.DeletionTimestamp)
+	assert.Equal(t, *original.DeletionTimestamp, *back.DeletionTimestamp)
 	assert.Equal(t, original.Spec.LogLevel, back.Spec.LogLevel)
 	assert.Equal(t, original.Spec.Environment, back.Spec.Environment)
 	assert.Equal(t, original.Spec.Providers, back.Spec.Providers)

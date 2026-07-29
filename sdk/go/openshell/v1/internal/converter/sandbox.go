@@ -22,7 +22,10 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 		result.Name = m.GetName()
 		result.CreatedAt = TimeFromMillis(m.GetCreatedAtMs())
 		result.Labels = CopyStringMap(m.GetLabels())
+		result.Annotations = CopyStringMap(m.GetAnnotations())
 		result.ResourceVersion = m.GetResourceVersion()
+		result.Workspace = m.GetWorkspace()
+		result.DeletionTimestamp = TimeFromMillisPtr(m.GetDeletionTimestampMs())
 	}
 
 	if spec := s.GetSpec(); spec != nil {
@@ -136,11 +139,14 @@ func SandboxToProto(s *types.Sandbox) *pb.Sandbox {
 
 	return &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{
-			Id:              s.ID,
-			Name:            s.Name,
-			CreatedAtMs:     MillisFromTime(s.CreatedAt),
-			Labels:          CopyStringMap(s.Labels),
-			ResourceVersion: s.ResourceVersion,
+			Id:                  s.ID,
+			Name:                s.Name,
+			CreatedAtMs:         MillisFromTime(s.CreatedAt),
+			Labels:              CopyStringMap(s.Labels),
+			Annotations:         CopyStringMap(s.Annotations),
+			ResourceVersion:     s.ResourceVersion,
+			Workspace:           s.Workspace,
+			DeletionTimestampMs: MillisFromTimePtr(s.DeletionTimestamp),
 		},
 		Spec: SandboxSpecToProto(&s.Spec),
 	}

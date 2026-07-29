@@ -7,13 +7,16 @@ import "time"
 
 // Provider represents an AI provider registration.
 type Provider struct {
-	ID              string
-	Name            string
-	Type            string
-	CreatedAt       time.Time
-	Labels          map[string]string
-	ResourceVersion uint64
-	Spec            ProviderSpec
+	ID                string
+	Name              string
+	Type              string
+	CreatedAt         time.Time
+	Labels            map[string]string
+	Annotations       map[string]string
+	ResourceVersion   uint64
+	Workspace         string
+	DeletionTimestamp *time.Time
+	Spec              ProviderSpec
 }
 
 // ProviderSpec holds provider-specific configuration and credentials.

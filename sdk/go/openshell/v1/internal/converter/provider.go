@@ -28,7 +28,10 @@ func ProviderFromProto(p *dm.Provider) *types.Provider {
 		result.Name = m.GetName()
 		result.CreatedAt = TimeFromMillis(m.GetCreatedAtMs())
 		result.Labels = CopyStringMap(m.GetLabels())
+		result.Annotations = CopyStringMap(m.GetAnnotations())
 		result.ResourceVersion = m.GetResourceVersion()
+		result.Workspace = m.GetWorkspace()
+		result.DeletionTimestamp = TimeFromMillisPtr(m.GetDeletionTimestampMs())
 	}
 
 	if expires := p.GetCredentialExpiresAtMs(); len(expires) > 0 {
@@ -49,11 +52,14 @@ func ProviderToProto(p *types.Provider) *dm.Provider {
 
 	result := &dm.Provider{
 		Metadata: &dm.ObjectMeta{
-			Id:              p.ID,
-			Name:            p.Name,
-			CreatedAtMs:     MillisFromTime(p.CreatedAt),
-			Labels:          CopyStringMap(p.Labels),
-			ResourceVersion: p.ResourceVersion,
+			Id:                  p.ID,
+			Name:                p.Name,
+			CreatedAtMs:         MillisFromTime(p.CreatedAt),
+			Labels:              CopyStringMap(p.Labels),
+			Annotations:         CopyStringMap(p.Annotations),
+			ResourceVersion:     p.ResourceVersion,
+			Workspace:           p.Workspace,
+			DeletionTimestampMs: MillisFromTimePtr(p.DeletionTimestamp),
 		},
 		Type:        p.Type,
 		Credentials: CopyStringMap(p.Spec.Credentials),

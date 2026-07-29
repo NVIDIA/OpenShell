@@ -7,13 +7,16 @@ import "time"
 
 // Sandbox represents a sandbox instance.
 type Sandbox struct {
-	ID              string
-	Name            string
-	CreatedAt       time.Time
-	Labels          map[string]string
-	ResourceVersion uint64
-	Spec            SandboxSpec
-	Status          SandboxStatus
+	ID                string
+	Name              string
+	CreatedAt         time.Time
+	Labels            map[string]string
+	Annotations       map[string]string
+	ResourceVersion   uint64
+	Workspace         string
+	DeletionTimestamp *time.Time
+	Spec              SandboxSpec
+	Status            SandboxStatus
 }
 
 // SandboxSpec holds the desired state of a sandbox.
