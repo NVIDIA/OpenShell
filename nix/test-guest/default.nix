@@ -69,6 +69,7 @@ let
     export OPENSHELL_TEST_GUEST_DISTROS=${distroCatalog}
     export OPENSHELL_TEST_GUEST_CONFIGURATIONS=${configurationCatalog}
     export OPENSHELL_TEST_GUEST_CACHE_LIB=${./cache-lib.sh}
+    export OPENSHELL_TEST_GUEST_CACHE_RUNNER=${./cache.sh}
     export OPENSHELL_TEST_GUEST_CACHE_SEAL=${./cache-seal.sh}
     export OPENSHELL_TEST_GUEST_ARTIFACT_PLAYBOOK=${./configuration/artifacts.yml}
     export OPENSHELL_TEST_GUEST_RUNNER=${./run.sh}

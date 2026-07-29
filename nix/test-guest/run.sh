@@ -31,7 +31,8 @@ if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_DISTROS:-}" ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_CONFIGURATIONS:-}" ] ||
 	[ ! -r "${OPENSHELL_TEST_GUEST_ARTIFACT_PLAYBOOK:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ]; then
+	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ] ||
+	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_RUNNER:-}" ]; then
 	echo "run this script through 'nix run .#test-guest -- ...'" >&2
 	exit 2
 fi
@@ -277,13 +278,28 @@ if [ -n "${OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE:-}" ]; then
 elif [ "${OPENSHELL_TEST_GUEST_CACHE_DISABLE:-0}" -ne 1 ]; then
 	cache_root=$(test_vm_cache_root)
 	cache_key=$(test_vm_cache_key "${distro}" "${configurations[@]}")
-	if test_vm_cache_local_entry_valid \
+	cache_entry=$(test_vm_cache_entry_dir "${cache_root}" "${cache_key}")
+	if ! test_vm_cache_local_entry_valid \
 		"${cache_root}" "${cache_key}" "${distro}" "${configurations[@]}"; then
-		cache_entry=$(test_vm_cache_entry_dir "${cache_root}" "${cache_key}")
-		TEST_GUEST_IMAGE="${cache_entry}/disk.qcow2"
-		prepared_image=1
+		cache_args=(--distro "${distro}")
+		for item in "${configurations[@]}"; do
+			cache_args+=(--with "${item}")
+		done
+		echo "==> Cache local miss: populating ${cache_entry}"
+		OPENSHELL_TEST_GUEST_CACHE_DISABLE=1 \
+			"${TEST_GUEST_BASH}" "${OPENSHELL_TEST_GUEST_CACHE_RUNNER}" \
+			"${cache_args[@]}"
+		if ! test_vm_cache_local_entry_valid \
+			"${cache_root}" "${cache_key}" "${distro}" "${configurations[@]}"; then
+			echo "cache builder did not produce a valid entry: ${cache_entry}" >&2
+			exit 1
+		fi
+		echo "==> Cache populated: ${cache_entry}"
+	else
 		echo "==> Cache local hit: ${cache_entry}"
 	fi
+	TEST_GUEST_IMAGE="${cache_entry}/disk.qcow2"
+	prepared_image=1
 fi
 
 if [ "${prepared_image}" -eq 0 ]; then

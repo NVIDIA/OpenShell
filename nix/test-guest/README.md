@@ -154,7 +154,12 @@ A cache build boots and configures a disposable VM, runs the internal sealing sc
 
 The key includes the pinned base-image identity, guest architecture, ordered configuration file digests, Ansible version, cache generation, and sealing script digest. Installed packages, copied binaries, forwarded ports, and guest commands are never cached.
 
-Normal `test-guest` runs automatically use an exact valid local entry after rechecking its disk checksum and QCOW2 structure. They create a fresh writable overlay, cloud-init instance, machine ID, and SSH identity. On a local miss, the runner uses the pinned cloud image and applies configurations normally. Set `OPENSHELL_TEST_GUEST_CACHE_DISABLE=1` to bypass local lookup.
+Normal `test-guest` runs automatically use an exact valid local entry after
+rechecking its disk checksum and QCOW2 structure. On a local miss, the runner
+invokes the cache builder and stores the prepared disk before continuing. It
+then creates a fresh writable overlay, cloud-init instance, machine ID, and SSH
+identity from that entry. Set `OPENSHELL_TEST_GUEST_CACHE_DISABLE=1` to bypass
+both local lookup and automatic population.
 
 The default cache directory is `${XDG_CACHE_HOME:-$HOME/.cache}/openshell/test-guest`. Override it with `--cache-dir` on the cache command or `OPENSHELL_TEST_GUEST_CACHE_DIR` for either app.
 
@@ -229,7 +234,10 @@ Arguments after `--` are executed inside the guest. Without a command, the runne
 
 ## Lifecycle
 
-Each invocation checks for an exact prepared local cache entry. On a miss, Nix realizes the hash-pinned cloud image and the runner applies the selected configurations. It then:
+Each invocation ensures an exact prepared local cache entry exists. On a miss,
+the cache builder realizes the hash-pinned cloud image, applies the selected
+configurations, seals and validates the prepared disk, and stores it locally.
+The runner then:
 
 1. Creates a temporary QCOW2 overlay backed by the prepared cache disk or pinned cloud image.
 2. Boots QEMU with HVF, KVM, or the Linux TCG fallback.

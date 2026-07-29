@@ -359,6 +359,7 @@ build_local() {
 
 	echo "==> Cache miss: preparing ${distro} ($(test_vm_cache_oci_architecture))"
 	TMPDIR="${build_stage}/prepare-tmp" \
+		OPENSHELL_TEST_GUEST_CACHE_DISABLE=1 \
 		"${TEST_GUEST_BASH}" "${OPENSHELL_TEST_GUEST_RUNNER}" "${prepare_args[@]}"
 
 	shopt -s nullglob
@@ -392,6 +393,7 @@ build_local() {
 
 	echo "==> Validating fresh boot from prepared cache disk"
 	TMPDIR="${build_stage}/validate-tmp" \
+		OPENSHELL_TEST_GUEST_CACHE_DISABLE=1 \
 		OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE="${prepared_disk}" \
 		"${TEST_GUEST_BASH}" "${OPENSHELL_TEST_GUEST_RUNNER}" "${validate_args[@]}"
 
