@@ -1668,7 +1668,7 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
             })? {
             Some(record) => {
                 hasher.update(record.id.as_bytes());
-                hasher.update(record.updated_at_ms.to_le_bytes());
+                hasher.update(record.resource_version.to_le_bytes());
 
                 let provider = Provider::decode(record.payload.as_slice()).map_err(|e| {
                     Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
@@ -1696,6 +1696,46 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
             None => {
                 hasher.update(b"missing");
             }
+        }
+    }
+
+    let digest = hasher.finalize();
+    Ok(u64::from_le_bytes(digest[..8].try_into().map_err(
+        |_| Status::internal("provider env revision digest too short"),
+    )?))
+}
+
+fn compute_provider_env_revision_from_records(
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[super::provider::ProviderEnvironmentRecord],
+) -> Result<u64, Status> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openshell-provider-env-revision-v2");
+
+    for record in records {
+        hasher.update(record.name.as_bytes());
+        hasher.update(record.object_id.as_bytes());
+        hasher.update(record.resource_version.to_le_bytes());
+
+        let provider = &record.provider;
+        hasher.update(provider.r#type.as_bytes());
+        hash_provider_profile_revision(
+            catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+            &mut hasher,
+        );
+
+        let mut credential_keys: Vec<_> = provider.credentials.keys().collect();
+        credential_keys.sort();
+        for key in credential_keys {
+            hasher.update(key.as_bytes());
+        }
+        let mut expiry_keys: Vec<_> = provider.credential_expires_at_ms.keys().collect();
+        expiry_keys.sort();
+        for key in expiry_keys {
+            hasher.update(key.as_bytes());
+            hasher.update(provider.credential_expires_at_ms[key].to_le_bytes());
         }
     }
 
@@ -1815,18 +1855,18 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
-    let provider_env_revision = compute_provider_env_revision_with_catalog(
+    let provider_records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
-        &provider_profile_catalog,
         &workspace,
         &provider_names,
     )
     .await?;
-    let mut provider_environment = super::provider::resolve_provider_environment_with_catalog(
+    let provider_env_revision =
+        compute_provider_env_revision_from_records(&provider_profile_catalog, &provider_records)?;
+    let mut provider_environment = super::provider::resolve_provider_environment_from_records(
         state.store.as_ref(),
         &provider_profile_catalog,
-        &workspace,
-        &provider_names,
+        &provider_records,
     )
     .await?;
 
@@ -7111,13 +7151,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_env_revision_changes_when_attached_provider_record_changes() {
+    async fn provider_env_revision_changes_on_consecutive_provider_updates_without_delay() {
         use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
-        use std::time::Duration;
 
         let state = test_server_state().await;
         let mut provider = test_provider("work-github", "github");
         state.store.put_message(&provider).await.unwrap();
+        let first_resource_version = state
+            .store
+            .get_by_name(Provider::object_type(), "default", "work-github")
+            .await
+            .unwrap()
+            .unwrap()
+            .resource_version;
         state
             .store
             .put_message(&test_sandbox(
@@ -7140,11 +7186,33 @@ mod tests {
         .unwrap()
         .into_inner();
 
-        tokio::time::sleep(Duration::from_millis(2)).await;
         provider
             .credentials
             .insert("GITHUB_TOKEN".to_string(), "rotated".to_string());
-        state.store.put_message(&provider).await.unwrap();
+        state
+            .store
+            .put_if(
+                Provider::object_type(),
+                provider.object_id(),
+                provider.object_name(),
+                provider.object_workspace(),
+                &provider.encode_to_vec(),
+                None,
+                crate::persistence::WriteCondition::Unconditional,
+            )
+            .await
+            .unwrap();
+        let second_resource_version = state
+            .store
+            .get_by_name(Provider::object_type(), "default", "work-github")
+            .await
+            .unwrap()
+            .unwrap()
+            .resource_version;
+        assert_ne!(
+            first_resource_version, second_resource_version,
+            "consecutive writes must advance the authoritative resource version"
+        );
 
         let second = handle_get_sandbox_provider_environment(
             &state,
@@ -7164,6 +7232,190 @@ mod tests {
         assert_eq!(
             second.environment.get("GITHUB_TOKEN"),
             Some(&"rotated".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_environment_revision_and_payload_share_immutable_record_snapshot() {
+        use openshell_core::proto::{
+            ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCategory,
+            ProviderProfileCredential, StoredProviderProfile,
+        };
+
+        fn dynamic_profile(
+            id: &str,
+            endpoint_host: &str,
+            token_endpoint: &str,
+        ) -> StoredProviderProfile {
+            StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("profile-{id}"),
+                    name: id.to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                profile: Some(ProviderProfile {
+                    id: id.to_string(),
+                    display_name: id.to_string(),
+                    category: ProviderProfileCategory::Other as i32,
+                    credentials: vec![ProviderProfileCredential {
+                        name: "access_token".to_string(),
+                        auth_style: "bearer".to_string(),
+                        header_name: "authorization".to_string(),
+                        token_grant: Some(ProviderCredentialTokenGrant {
+                            token_endpoint: token_endpoint.to_string(),
+                            audience: "api://snapshot".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    endpoints: vec![NetworkEndpoint {
+                        host: endpoint_host.to_string(),
+                        port: 443,
+                        path: "/**".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            }
+        }
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&dynamic_profile(
+                "snapshot-a",
+                "api.snapshot-a.example",
+                "https://auth.snapshot-a.example/token",
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&dynamic_profile(
+                "snapshot-b",
+                "api.snapshot-b.example",
+                "https://auth.snapshot-b.example/token",
+            ))
+            .await
+            .unwrap();
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .unwrap();
+
+        let mut first_provider = test_provider("replaceable", "snapshot-a");
+        first_provider.metadata.as_mut().unwrap().id = "provider-identity-a".to_string();
+        first_provider.credentials =
+            HashMap::from([("GITHUB_TOKEN".to_string(), "secret-a".to_string())]);
+        state.store.put_message(&first_provider).await.unwrap();
+
+        let provider_names = vec!["replaceable".to_string()];
+        let first_records = crate::grpc::provider::load_provider_environment_records(
+            state.store.as_ref(),
+            "default",
+            &provider_names,
+        )
+        .await
+        .unwrap();
+        let first_revision =
+            compute_provider_env_revision_from_records(&catalog, &first_records).unwrap();
+        let mut next_version_records = first_records.clone();
+        next_version_records[0].resource_version += 1;
+        assert_ne!(
+            first_revision,
+            compute_provider_env_revision_from_records(&catalog, &next_version_records).unwrap(),
+            "resource version alone must advance the provider environment revision"
+        );
+
+        state
+            .store
+            .delete_by_name(Provider::object_type(), "default", "replaceable")
+            .await
+            .unwrap();
+        let mut replacement = test_provider("replaceable", "snapshot-b");
+        replacement.metadata.as_mut().unwrap().id = "provider-identity-b".to_string();
+        replacement.credentials =
+            HashMap::from([("GITHUB_TOKEN".to_string(), "secret-b".to_string())]);
+        state.store.put_message(&replacement).await.unwrap();
+
+        let first_environment = crate::grpc::provider::resolve_provider_environment_from_records(
+            state.store.as_ref(),
+            &catalog,
+            &first_records,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            first_environment.environment.get("GITHUB_TOKEN"),
+            Some(&"secret-a".to_string())
+        );
+        assert_eq!(
+            first_environment
+                .static_credential_bindings
+                .get("GITHUB_TOKEN")
+                .map(|binding| binding.credential_identity.as_str()),
+            Some("provider-identity-a:GITHUB_TOKEN")
+        );
+        assert_eq!(first_environment.dynamic_credentials.len(), 1);
+        assert!(
+            first_environment
+                .dynamic_credentials
+                .values()
+                .all(|credential| {
+                    credential.token_grant.as_ref().is_some_and(|grant| {
+                        grant.token_endpoint == "https://auth.snapshot-a.example/token"
+                    })
+                }),
+            "dynamic grants must come from the first loaded provider snapshot"
+        );
+
+        let replacement_records = crate::grpc::provider::load_provider_environment_records(
+            state.store.as_ref(),
+            "default",
+            &provider_names,
+        )
+        .await
+        .unwrap();
+        let replacement_revision =
+            compute_provider_env_revision_from_records(&catalog, &replacement_records).unwrap();
+        let replacement_environment =
+            crate::grpc::provider::resolve_provider_environment_from_records(
+                state.store.as_ref(),
+                &catalog,
+                &replacement_records,
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(first_revision, replacement_revision);
+        assert_eq!(
+            replacement_environment.environment.get("GITHUB_TOKEN"),
+            Some(&"secret-b".to_string())
+        );
+        assert_eq!(
+            replacement_environment
+                .static_credential_bindings
+                .get("GITHUB_TOKEN")
+                .map(|binding| binding.credential_identity.as_str()),
+            Some("provider-identity-b:GITHUB_TOKEN")
+        );
+        assert_eq!(replacement_environment.dynamic_credentials.len(), 1);
+        assert!(
+            replacement_environment
+                .dynamic_credentials
+                .values()
+                .all(|credential| {
+                    credential.token_grant.as_ref().is_some_and(|grant| {
+                        grant.token_endpoint == "https://auth.snapshot-b.example/token"
+                    })
+                }),
+            "dynamic grants must change only after loading the replacement record"
         );
     }
 

@@ -55,6 +55,19 @@ pub(super) struct ProviderEnvironment {
     pub static_credential_keys: HashSet<String>,
 }
 
+/// Immutable provider records used to build one provider-environment response.
+///
+/// The persistence metadata is kept alongside the decoded provider so callers
+/// can derive both the revision and credential identities from the exact same
+/// records used to resolve environment values and dynamic grants.
+#[derive(Debug, Clone)]
+pub(super) struct ProviderEnvironmentRecord {
+    pub name: String,
+    pub object_id: String,
+    pub resource_version: u64,
+    pub provider: Provider,
+}
+
 impl ProviderEnvironment {
     #[cfg(test)]
     fn is_empty(&self) -> bool {
@@ -539,13 +552,47 @@ pub(super) async fn resolve_provider_environment(
     resolve_provider_environment_with_catalog(store, &catalog, workspace, provider_names).await
 }
 
-pub(super) async fn resolve_provider_environment_with_catalog(
+#[cfg(test)]
+async fn resolve_provider_environment_with_catalog(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<ProviderEnvironment, Status> {
-    if provider_names.is_empty() {
+    let records = load_provider_environment_records(store, workspace, provider_names).await?;
+    resolve_provider_environment_from_records(store, catalog, &records).await
+}
+
+pub(super) async fn load_provider_environment_records(
+    store: &Store,
+    workspace: &str,
+    provider_names: &[String],
+) -> Result<Vec<ProviderEnvironmentRecord>, Status> {
+    let mut records = Vec::with_capacity(provider_names.len());
+    for name in provider_names {
+        let record = store
+            .get_by_name(Provider::object_type(), workspace, name)
+            .await
+            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
+            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
+        let provider = Provider::decode(record.payload.as_slice())
+            .map_err(|e| Status::internal(format!("failed to decode provider '{name}': {e}")))?;
+        records.push(ProviderEnvironmentRecord {
+            name: name.clone(),
+            object_id: record.id,
+            resource_version: record.resource_version,
+            provider,
+        });
+    }
+    Ok(records)
+}
+
+pub(super) async fn resolve_provider_environment_from_records(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[ProviderEnvironmentRecord],
+) -> Result<ProviderEnvironment, Status> {
+    if records.is_empty() {
         return Ok(ProviderEnvironment::default());
     }
 
@@ -554,24 +601,12 @@ pub(super) async fn resolve_provider_environment_with_catalog(
     let mut static_credential_bindings = HashMap::new();
     let mut static_credential_keys = HashSet::new();
     let now_ms = crate::persistence::current_time_ms();
-    validate_provider_environment_keys_unique_at(
-        store,
-        catalog,
-        workspace,
-        provider_names,
-        None,
-        now_ms,
-    )
-    .await?;
+    validate_provider_environment_records_unique_at(store, catalog, records, now_ms).await?;
     let registry = openshell_providers::ProviderRegistry::new();
 
-    for name in provider_names {
-        let provider = store
-            .get_message_by_name::<Provider>(workspace, name)
-            .await
-            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
-            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
-
+    for record in records {
+        let name = &record.name;
+        let provider = &record.provider;
         let profile_id =
             normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
         let profile =
@@ -594,7 +629,7 @@ pub(super) async fn resolve_provider_environment_with_catalog(
         });
 
         for (key, value) in &provider.credentials {
-            if is_non_injectable_provider_credential(&provider, key) {
+            if is_non_injectable_provider_credential(provider, key) {
                 warn!(
                     provider_name = %name,
                     key = %key,
@@ -623,8 +658,7 @@ pub(super) async fn resolve_provider_environment_with_catalog(
                 env.entry(key.clone()).or_insert_with(|| value.clone());
                 static_credential_keys.insert(key.clone());
                 if let Some(endpoints) = &profile_endpoints {
-                    let provider_identity = provider.object_id();
-                    if provider_identity.is_empty() {
+                    if record.object_id.is_empty() {
                         return Err(Status::failed_precondition(format!(
                             "provider '{name}' has no stable object identity"
                         )));
@@ -633,7 +667,7 @@ pub(super) async fn resolve_provider_environment_with_catalog(
                         key.clone(),
                         StaticCredentialBinding {
                             endpoints: endpoints.clone(),
-                            credential_identity: format!("{provider_identity}:{key}"),
+                            credential_identity: format!("{}:{key}", record.object_id),
                         },
                     );
                 }
@@ -646,52 +680,27 @@ pub(super) async fn resolve_provider_environment_with_catalog(
             }
         }
 
-        registry.inject_env(&provider, &mut env);
+        registry.inject_env(provider, &mut env);
     }
 
     Ok(ProviderEnvironment {
         environment: env,
         credential_expires_at_ms: expires,
-        dynamic_credentials: resolve_dynamic_credentials_with_catalog(
-            store,
-            catalog,
-            workspace,
-            provider_names,
-        )
-        .await?,
+        dynamic_credentials: resolve_dynamic_credentials_from_records(catalog, records),
         static_credential_bindings,
         static_credential_keys,
     })
 }
 
-/// Resolve dynamic credentials (token grants) from provider profiles.
-///
-/// Returns a map of endpoint-bound keys to credential metadata for credentials
-/// that have `token_grant` configuration. Keys are internal supervisor metadata:
-/// host, port, endpoint path, and provider credential identity.
-pub(super) async fn resolve_dynamic_credentials_with_catalog(
-    store: &Store,
+/// Resolve dynamic credentials (token grants) from the same records used for
+/// the provider-environment revision and static credential bindings.
+fn resolve_dynamic_credentials_from_records(
     catalog: &EffectiveProviderProfileCatalog,
-    workspace: &str,
-    provider_names: &[String],
-) -> Result<HashMap<String, ProviderProfileCredential>, Status> {
-    if provider_names.is_empty() {
-        return Ok(HashMap::new());
-    }
-
+    records: &[ProviderEnvironmentRecord],
+) -> HashMap<String, ProviderProfileCredential> {
     let mut dynamic_creds = HashMap::new();
-
-    for provider_name in provider_names {
-        let provider = store
-            .get_message_by_name::<Provider>(workspace, provider_name)
-            .await
-            .map_err(|e| {
-                Status::internal(format!("failed to fetch provider '{provider_name}': {e}"))
-            })?
-            .ok_or_else(|| {
-                Status::failed_precondition(format!("provider '{provider_name}' not found"))
-            })?;
-
+    for record in records {
+        let provider = &record.provider;
         let profile_id =
             normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
         let Some(profile) =
@@ -699,15 +708,13 @@ pub(super) async fn resolve_dynamic_credentials_with_catalog(
         else {
             continue;
         };
-
         insert_dynamic_credentials_for_profile(
             &mut dynamic_creds,
             &profile.to_proto(),
-            provider_name,
+            &record.name,
         );
     }
-
-    Ok(dynamic_creds)
+    dynamic_creds
 }
 
 fn insert_dynamic_credentials_for_profile(
@@ -1113,6 +1120,43 @@ async fn validate_provider_environment_keys_unique_at(
     Ok(())
 }
 
+async fn validate_provider_environment_records_unique_at(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[ProviderEnvironmentRecord],
+    now_ms: i64,
+) -> Result<(), Status> {
+    let mut seen = HashMap::<String, String>::new();
+    let mut dynamic_bindings = Vec::new();
+    for record in records {
+        let provider = &record.provider;
+        for key in active_provider_environment_keys_for_identity(
+            store,
+            provider,
+            &record.object_id,
+            now_ms,
+        )
+        .await?
+        {
+            if let Some(first_provider) = seen.get(&key) {
+                if first_provider != &record.name {
+                    return Err(Status::failed_precondition(format!(
+                        "credential env key '{key}' is provided by both provider '{first_provider}' and provider '{}'; use provider-specific env names",
+                        record.name
+                    )));
+                }
+            } else {
+                seen.insert(key, record.name.clone());
+            }
+        }
+        dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
+            catalog, provider,
+        ));
+    }
+    validate_dynamic_token_grant_bindings_unambiguous(&dynamic_bindings)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DynamicTokenGrantBinding {
     provider_name: String,
@@ -1271,10 +1315,20 @@ async fn active_provider_environment_keys(
     provider: &Provider,
     now_ms: i64,
 ) -> Result<Vec<String>, Status> {
+    active_provider_environment_keys_for_identity(store, provider, provider.object_id(), now_ms)
+        .await
+}
+
+async fn active_provider_environment_keys_for_identity(
+    store: &Store,
+    provider: &Provider,
+    provider_identity: &str,
+    now_ms: i64,
+) -> Result<Vec<String>, Status> {
     let mut keys = active_provider_credential_keys(provider, now_ms);
-    if !provider.object_id().is_empty() {
+    if !provider_identity.is_empty() {
         for state in
-            crate::provider_refresh::list_refresh_states_for_provider(store, provider.object_id())
+            crate::provider_refresh::list_refresh_states_for_provider(store, provider_identity)
                 .await?
         {
             // The primary key plus every co-minted output key this refresh owns,
