@@ -37,6 +37,117 @@
         state: started
       become: false
 
+    - name: Install the Podman post-copy hook directory
+      ansible.builtin.file:
+        path: /usr/local/libexec/openshell-test-guest/post-copy.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install the Podman E2E artifact hook
+      ansible.builtin.copy:
+        dest: /usr/local/libexec/openshell-test-guest/post-copy.d/50-podman-e2e
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          supervisor_bin=/home/openshell/.cache/openshell-e2e/bin/openshell-sandbox
+          supervisor_image=localhost/openshell/supervisor:e2e-vm
+          relay_socket=/home/openshell/.cache/openshell-e2e/podman-gateway.sock
+          host_relay_unit=openshell-e2e-podman-host-relay
+          network_relay_unit=openshell-e2e-podman-network-relay
+
+          # A normal interactive test guest has no checkout artifact to prepare.
+          if [ ! -e "${supervisor_bin}" ]; then
+              exit 0
+          fi
+          if [ ! -x "${supervisor_bin}" ]; then
+              echo "ERROR: staged supervisor is not executable: ${supervisor_bin}" >&2
+              exit 1
+          fi
+
+          # test-guest installs copied artifacts as root. Hand the E2E state tree
+          # back to the test user before Podman and the relay services use it.
+          sudo chown -R "$(id -u):$(id -g)" /home/openshell/.cache
+          chmod 0700 /home/openshell/.cache/openshell-e2e
+
+          build_context="$(mktemp -d)"
+          cleanup() {
+              rm -rf "${build_context}"
+          }
+          trap cleanup EXIT
+
+          install -m 0555 "${supervisor_bin}" "${build_context}/openshell-sandbox"
+          cat >"${build_context}/Containerfile" <<'EOF'
+          FROM alpine:3.22
+          RUN apk add --no-cache nftables iptables iptables-legacy
+          COPY --chmod=0555 openshell-sandbox /openshell-sandbox
+          ENTRYPOINT ["/openshell-sandbox"]
+          EOF
+
+          echo "==> Building checkout supervisor image: ${supervisor_image}"
+          podman build \
+              --pull=missing \
+              --tag "${supervisor_image}" \
+              --file "${build_context}/Containerfile" \
+              "${build_context}"
+          podman image exists "${supervisor_image}"
+
+          mkdir -p "$(dirname "${relay_socket}")"
+          systemctl --user stop \
+              "${network_relay_unit}.service" \
+              "${host_relay_unit}.service" \
+              >/dev/null 2>&1 || true
+          systemctl --user reset-failed \
+              "${network_relay_unit}.service" \
+              "${host_relay_unit}.service" \
+              >/dev/null 2>&1 || true
+          rm -f "${relay_socket}"
+
+          systemd-run --user \
+              --unit="${host_relay_unit}" \
+              --collect \
+              --property=Restart=on-failure \
+              --property=RestartSec=1 \
+              -- \
+              /usr/bin/socat \
+              "UNIX-LISTEN:${relay_socket},fork" \
+              TCP:127.0.0.1:8080
+          for _ in $(seq 1 50); do
+              [ -S "${relay_socket}" ] && break
+              sleep 0.1
+          done
+          if [ ! -S "${relay_socket}" ] ||
+              ! systemctl --user is-active --quiet "${host_relay_unit}.service"; then
+              echo "ERROR: failed to start the host-side Podman gateway relay" >&2
+              systemctl --user status "${host_relay_unit}.service" --no-pager >&2 || true
+              exit 1
+          fi
+
+          systemd-run --user \
+              --unit="${network_relay_unit}" \
+              --collect \
+              --property=Restart=on-failure \
+              --property=RestartSec=1 \
+              -- \
+              /usr/bin/podman unshare --rootless-netns \
+              /usr/bin/socat \
+              TCP-LISTEN:8080,bind=0.0.0.0,reuseaddr,fork \
+              "UNIX-CONNECT:${relay_socket}"
+          for _ in $(seq 1 50); do
+              if systemctl --user is-active --quiet "${network_relay_unit}.service"; then
+                  exit 0
+              fi
+              sleep 0.1
+          done
+          echo "ERROR: failed to start the rootless-network Podman gateway relay" >&2
+          systemctl --user status "${network_relay_unit}.service" --no-pager >&2 || true
+          exit 1
+
     - name: Verify rootless Podman
       ansible.builtin.command:
         cmd: podman info

@@ -567,6 +567,16 @@ for copy_spec in "${copies[@]}"; do
 		"sudo install -D -m 0755 '${remote_copy}' '${destination}'; rm -f '${remote_copy}'"
 done
 
+post_copy_hook_dir=/usr/local/libexec/openshell-test-guest/post-copy.d
+if ssh "${ssh_args[@]}" openshell@127.0.0.1 \
+	"test -d '${post_copy_hook_dir}'"; then
+	echo "==> Running guest post-copy hooks"
+	# The hook directory is installed by trusted test-guest configurations.
+	# shellcheck disable=SC2029
+	ssh "${ssh_args[@]}" openshell@127.0.0.1 \
+		"set -eu; for hook in '${post_copy_hook_dir}'/*; do [ -e \"\${hook}\" ] || continue; [ -x \"\${hook}\" ] || { echo \"hook is not executable: \${hook}\" >&2; exit 1; }; \"\${hook}\"; done"
+fi
+
 echo "==> Test guest ready: ${distro} (SSH port ${ssh_port})"
 if [ "${#guest_command[@]}" -eq 0 ]; then
 	ssh -t "${ssh_args[@]}" openshell@127.0.0.1
