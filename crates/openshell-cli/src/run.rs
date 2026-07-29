@@ -2547,7 +2547,7 @@ enum ResolvedSource {
 fn resolve_from(value: &str) -> Result<ResolvedSource> {
     let path = Path::new(value);
 
-// 1. Existing file — treat any valid file path as a container build file.
+    // 1. Existing file — treat any valid file path as a container build file.
     if path.is_file() {
         let dockerfile = path
             .canonicalize()
@@ -2563,7 +2563,7 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
         });
     }
 
-// 2. Existing directory containing a Dockerfile or Containerfile.
+    // 2. Existing directory containing a Dockerfile or Containerfile.
     if path.is_dir() {
         let canonical_context = path
             .canonicalize()
@@ -2620,7 +2620,7 @@ fn filename_looks_like_dockerfile(path: &Path) -> bool {
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
     let lower = name.to_lowercase();
-    lower.contains("dockerfile") 
+    lower.contains("dockerfile")
         || lower.ends_with(".dockerfile")
         || lower.contains("containerfile")
         || lower.ends_with(".containerfile")
@@ -9564,22 +9564,124 @@ mod tests {
     #[test]
     fn resolve_from_accepts_containerfile_and_custom_files() {
         let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let temp_canonical = temp.path().canonicalize().unwrap();
 
-        // Test direct Containerfile
+        // 1. Direct Containerfile test with exact path assertions
         let containerfile = temp.path().join("Containerfile");
         fs::write(&containerfile, "FROM alpine").unwrap();
         let res = resolve_from(containerfile.to_str().unwrap()).unwrap();
-        assert!(matches!(res, super::ResolvedSource::Dockerfile { .. }));
+        if let super::ResolvedSource::Dockerfile {
+            dockerfile,
+            context,
+        } = res
+        {
+            assert_eq!(dockerfile, containerfile.canonicalize().unwrap());
+            assert_eq!(context, temp_canonical);
+        } else {
+            panic!("expected Dockerfile source for Containerfile");
+        }
 
-        // Test directory containing Containerfile fallback
-        let _dir_res = resolve_from(temp.path().to_str().unwrap()).unwrap();
-        assert!(matches!(_dir_res, super::ResolvedSource::Dockerfile { .. }));
+        // 2. Directory containing Containerfile fallback with exact path assertions
+        let dir_res = resolve_from(temp.path().to_str().unwrap()).unwrap();
+        if let super::ResolvedSource::Dockerfile {
+            dockerfile,
+            context,
+        } = dir_res
+        {
+            assert_eq!(dockerfile, containerfile.canonicalize().unwrap());
+            assert_eq!(context, temp_canonical);
+        } else {
+            panic!("expected Dockerfile source for directory with Containerfile");
+        }
 
-        // Test arbitrary custom filename (e.g. MyBuild.file)
+        // 3. Custom build file test with exact path assertions
         let custom_file = temp.path().join("MyBuild.file");
         fs::write(&custom_file, "FROM alpine").unwrap();
         let custom_res = resolve_from(custom_file.to_str().unwrap()).unwrap();
-        assert!(matches!(custom_res, super::ResolvedSource::Dockerfile { .. }));
+        if let super::ResolvedSource::Dockerfile {
+            dockerfile,
+            context,
+        } = custom_res
+        {
+            assert_eq!(dockerfile, custom_file.canonicalize().unwrap());
+            assert_eq!(context, temp_canonical);
+        } else {
+            panic!("expected Dockerfile source for custom build file");
+        }
+
+        // 4. Relative directory test (locks canonicalization fix)
+        let project = temp.path().join("project");
+        fs::create_dir(&project).expect("failed to create project directory");
+
+        let project_containerfile = project.join("Containerfile");
+        fs::write(&project_containerfile, "FROM alpine")
+            .expect("failed to write project Containerfile");
+
+        let old_cwd = std::env::current_dir().expect("failed to get current directory");
+        std::env::set_current_dir(temp.path()).expect("failed to change current directory");
+
+        match resolve_from("project").expect("expected relative directory source") {
+            super::ResolvedSource::Dockerfile {
+                dockerfile,
+                context,
+            } => {
+                assert_eq!(
+                    dockerfile,
+                    project_containerfile
+                        .canonicalize()
+                        .expect("failed to canonicalize project Containerfile")
+                );
+                assert_eq!(
+                    context,
+                    project
+                        .canonicalize()
+                        .expect("failed to canonicalize project directory")
+                );
+            }
+            super::ResolvedSource::Image(image) => {
+                panic!("expected Dockerfile source, got image {image}");
+            }
+        }
+        std::env::set_current_dir(old_cwd).expect("failed to restore current directory");
+    }
+
+    #[test]
+    fn resolve_from_directory_prefers_dockerfile_over_containerfile() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+
+        let dockerfile = temp.path().join("Dockerfile");
+        let containerfile = temp.path().join("Containerfile");
+
+        fs::write(&dockerfile, "FROM docker").expect("failed to write Dockerfile");
+
+        fs::write(&containerfile, "FROM container").expect("failed to write Containerfile");
+
+        let expected_context = temp
+            .path()
+            .canonicalize()
+            .expect("failed to canonicalize context");
+
+        match resolve_from(temp.path().to_str().expect("temp path is not UTF-8"))
+            .expect("expected Dockerfile source")
+        {
+            super::ResolvedSource::Dockerfile {
+                dockerfile: resolved,
+                context,
+            } => {
+                assert_eq!(
+                    resolved,
+                    dockerfile
+                        .canonicalize()
+                        .expect("failed to canonicalize Dockerfile")
+                );
+
+                assert_eq!(context, expected_context);
+            }
+
+            super::ResolvedSource::Image(image) => {
+                panic!("expected Dockerfile source, got image {image}");
+            }
+        }
     }
 
     #[test]
