@@ -9,10 +9,10 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use openshell_core::VERSION;
-use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_podman::config::{
-    DEFAULT_NETWORK_NAME, DEFAULT_SANDBOX_PIDS_LIMIT, ImagePullPolicy,
+    DEFAULT_NETWORK_NAME, DEFAULT_PODMAN_STOP_TIMEOUT_SECS, DEFAULT_SANDBOX_PIDS_LIMIT,
+    ImagePullPolicy,
 };
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
 
@@ -76,7 +76,7 @@ struct Args {
     network_name: String,
 
     /// Container stop timeout in seconds (SIGTERM → SIGKILL).
-    #[arg(long, env = "OPENSHELL_STOP_TIMEOUT", default_value_t = DEFAULT_STOP_TIMEOUT_SECS)]
+    #[arg(long, env = "OPENSHELL_STOP_TIMEOUT", default_value_t = DEFAULT_PODMAN_STOP_TIMEOUT_SECS)]
     stop_timeout: u32,
 
     /// Container cgroup PID limit for sandbox containers. Set 0 to inherit

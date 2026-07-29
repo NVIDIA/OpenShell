@@ -627,11 +627,11 @@ fn resolve_vertex_ai_route(
     // protocol and path contract, but only for the OpenAI-compatible Vertex surface.
     // Anthropic-on-Vertex needs model-path shaping and body adaptation that a fully
     // caller-controlled URL cannot safely preserve.
-    if let Some(base_url) = config
-        .get(profile.base_url_config_keys[0])
-        .or_else(|| config.get(profile.base_url_config_keys[1]))
+    if let Some(base_url) = profile
+        .base_url_config_keys
+        .iter()
+        .find_map(|key| config.get(*key).filter(|v| !v.trim().is_empty()))
         .map(String::as_str)
-        .filter(|v| !v.trim().is_empty())
     {
         if is_anthropic {
             return Err(Status::invalid_argument(
@@ -1131,6 +1131,65 @@ mod tests {
             config: std::iter::once((base_url_key.to_string(), base_url.to_string())).collect(),
             ..make_provider(name, provider_type, key_name, key_value)
         }
+    }
+
+    #[test]
+    fn resolve_vertex_ai_route_handles_empty_base_url_keys() {
+        let config = HashMap::new();
+        let profile = openshell_core::inference::InferenceProviderProfile {
+            provider_type: "google_vertex_ai",
+            default_base_url: "https://example.com",
+            protocols: &[],
+            credential_key_names: &[],
+            base_url_config_keys: &[],
+            auth: openshell_core::inference::AuthHeader::Bearer,
+            default_headers: &[],
+            passthrough_headers: &[],
+        };
+        let result = resolve_vertex_ai_route(&config, "model-id", "route", "api-key", &profile);
+        // Empty base_url_config_keys must not panic. The route still errors because
+        // the minimal Vertex config is missing, so we only assert reachability.
+        assert!(
+            result.is_err(),
+            "expected missing config to error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_vertex_ai_route_skips_blank_preferred_for_fallback() {
+        let mut config = HashMap::new();
+        config.insert("GOOGLE_VERTEX_AI_BASE_URL".to_string(), "   ".to_string());
+        config.insert(
+            "VERTEX_AI_BASE_URL".to_string(),
+            "https://us-central1-aiplatform.googleapis.com".to_string(),
+        );
+        config.insert(
+            VERTEX_AI_PROJECT_ID_KEY.to_string(),
+            "my-project".to_string(),
+        );
+        config.insert(VERTEX_AI_REGION_KEY.to_string(), "us-central1".to_string());
+
+        let profile = openshell_core::inference::InferenceProviderProfile {
+            provider_type: "google-vertex-ai",
+            default_base_url: "",
+            protocols: &[],
+            credential_key_names: &[],
+            base_url_config_keys: &["GOOGLE_VERTEX_AI_BASE_URL", "VERTEX_AI_BASE_URL"],
+            auth: openshell_core::inference::AuthHeader::Bearer,
+            default_headers: &[],
+            passthrough_headers: &[],
+        };
+
+        let result = resolve_vertex_ai_route(&config, "model-id", "route", "api-key", &profile);
+        assert!(
+            result.is_ok(),
+            "blank preferred key should fall back to valid alias: {result:?}"
+        );
+        let route = result.unwrap();
+        assert_eq!(
+            route.endpoint,
+            "https://us-central1-aiplatform.googleapis.com"
+        );
     }
 
     #[test]

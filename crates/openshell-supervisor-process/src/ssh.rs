@@ -6,7 +6,10 @@
 use crate::child_env;
 #[cfg(target_os = "linux")]
 use crate::managed_children;
-use crate::process::{ProcessEnforcementMode, drop_privileges, is_supervisor_only_env_var};
+use crate::process::{
+    ProcessEnforcementMode, ResolvedProcessIdentity, drop_privileges_with_identity,
+    is_supervisor_only_env_var,
+};
 use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
@@ -115,6 +118,7 @@ pub async fn run_ssh_server(
     ca_file_paths: Option<(PathBuf, PathBuf)>,
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
+    resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
     shared_socket: bool,
 ) -> Result<()> {
@@ -159,6 +163,7 @@ pub async fn run_ssh_server(
                 ca_paths,
                 provider_credentials,
                 user_environment,
+                resolved_identity,
                 enforcement_mode,
             )
             .await
@@ -187,6 +192,7 @@ async fn handle_connection(
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
+    resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
 ) -> Result<()> {
     // Access is gated by the Unix-socket filesystem permissions (root-only),
@@ -211,6 +217,7 @@ async fn handle_connection(
         ca_file_paths,
         provider_credentials,
         user_environment,
+        resolved_identity,
         enforcement_mode,
     );
     russh::server::run_stream(config, stream, handler)
@@ -240,6 +247,7 @@ struct SshHandler {
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
+    resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
     channels: HashMap<ChannelId, ChannelState>,
 }
@@ -254,6 +262,7 @@ impl SshHandler {
         ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
         provider_credentials: ProviderCredentialState,
         user_environment: HashMap<String, String>,
+        resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
     ) -> Self {
         Self {
@@ -264,6 +273,7 @@ impl SshHandler {
             ca_file_paths,
             provider_credentials,
             user_environment,
+            resolved_identity,
             enforcement_mode,
             channels: HashMap::new(),
         }
@@ -488,6 +498,7 @@ impl russh::server::Handler for SshHandler {
                 self.ca_file_paths.clone(),
                 &self.provider_credentials.child_env_with_gcp_resolved(),
                 &self.user_environment,
+                self.resolved_identity,
                 self.enforcement_mode,
             )?;
             let state = self.channels.get_mut(&channel).ok_or_else(|| {
@@ -585,6 +596,7 @@ impl SshHandler {
                 self.ca_file_paths.clone(),
                 &provider_env,
                 &self.user_environment,
+                self.resolved_identity,
                 self.enforcement_mode,
             )?;
             state.pty_master = Some(pty_master);
@@ -604,6 +616,7 @@ impl SshHandler {
                 self.ca_file_paths.clone(),
                 &provider_env,
                 &self.user_environment,
+                self.resolved_identity,
                 self.enforcement_mode,
             )?;
             state.input_sender = Some(input_sender);
@@ -775,6 +788,7 @@ fn spawn_pty_shell(
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: &HashMap<String, String>,
     user_environment: &HashMap<String, String>,
+    resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
 ) -> anyhow::Result<(std::fs::File, mpsc::Sender<Vec<u8>>)> {
     let winsize = Winsize {
@@ -852,6 +866,7 @@ fn spawn_pty_shell(
             workdir.clone(),
             slave_fd,
             netns_fd,
+            resolved_identity,
             enforcement_mode,
             #[cfg(target_os = "linux")]
             prepared_sandbox,
@@ -945,6 +960,7 @@ fn spawn_pipe_exec(
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: &HashMap<String, String>,
     user_environment: &HashMap<String, String>,
+    resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
 ) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
     let mut cmd = command.map_or_else(
@@ -1005,6 +1021,7 @@ fn spawn_pipe_exec(
             policy.clone(),
             workdir.clone(),
             netns_fd,
+            resolved_identity,
             enforcement_mode,
             #[cfg(target_os = "linux")]
             prepared_sandbox,
@@ -1106,7 +1123,8 @@ mod unsafe_pty {
     #[cfg(not(target_os = "linux"))]
     use super::sandbox;
     use super::{
-        Command, ProcessEnforcementMode, RawFd, SandboxPolicy, Winsize, drop_privileges, setsid,
+        Command, ProcessEnforcementMode, RawFd, ResolvedProcessIdentity, SandboxPolicy, Winsize,
+        drop_privileges_with_identity, setsid,
     };
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
@@ -1133,6 +1151,7 @@ mod unsafe_pty {
     }
 
     #[allow(unsafe_code)]
+    #[allow(clippy::too_many_arguments)]
     #[cfg_attr(
         not(target_os = "linux"),
         allow(
@@ -1146,6 +1165,7 @@ mod unsafe_pty {
         _workdir: Option<String>,
         slave_fd: RawFd,
         netns_fd: Option<RawFd>,
+        resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
         #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
     ) -> anyhow::Result<()> {
@@ -1169,6 +1189,7 @@ mod unsafe_pty {
                 enter_netns_and_sandbox(
                     netns_fd,
                     &policy,
+                    resolved_identity,
                     enforcement_mode,
                     #[cfg(target_os = "linux")]
                     supervisor_identity_mount,
@@ -1196,6 +1217,7 @@ mod unsafe_pty {
         policy: SandboxPolicy,
         _workdir: Option<String>,
         netns_fd: Option<RawFd>,
+        resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
         #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
     ) -> anyhow::Result<()> {
@@ -1214,6 +1236,7 @@ mod unsafe_pty {
                 enter_netns_and_sandbox(
                     netns_fd,
                     &policy,
+                    resolved_identity,
                     enforcement_mode,
                     #[cfg(target_os = "linux")]
                     supervisor_identity_mount,
@@ -1228,6 +1251,7 @@ mod unsafe_pty {
     fn enter_netns_and_sandbox(
         netns_fd: Option<RawFd>,
         policy: &SandboxPolicy,
+        resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
         #[cfg(target_os = "linux")] supervisor_identity_mount: Option<
             &crate::process::SupervisorIdentityMountNamespace,
@@ -1258,7 +1282,8 @@ mod unsafe_pty {
         // Drop privileges. initgroups/setgid/setuid need /etc/group and
         // /etc/passwd which would be blocked if Landlock were already enforced.
         if enforcement_mode.uses_privileged_process_setup() {
-            drop_privileges(policy).map_err(|err| std::io::Error::other(err.to_string()))?;
+            drop_privileges_with_identity(policy, resolved_identity)
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
         }
         crate::process::harden_child_process()
             .map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -1814,6 +1839,7 @@ mod tests {
             policy,
             None,
             None, // no netns fd
+            ResolvedProcessIdentity::default(),
             ProcessEnforcementMode::Full,
             #[cfg(target_os = "linux")]
             Some(
@@ -1844,6 +1870,62 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("drop-privileges-ok"),
             "echo output should contain 'drop-privileges-ok'"
+        );
+    }
+
+    /// SSH pre-exec uses the numeric identity resolved from OCI metadata rather
+    /// than looking the preserved declaration up through host NSS.
+    #[cfg(unix)]
+    #[test]
+    fn pre_exec_uses_resolved_oci_identity() {
+        use openshell_core::policy::{
+            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
+        };
+
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+
+        let policy = SandboxPolicy {
+            version: 0,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: Some("__oci_user_not_in_host_nss__".into()),
+                run_as_group: Some("__oci_group_not_in_host_nss__".into()),
+            },
+        };
+        let resolved = ResolvedProcessIdentity::new(
+            Some(rustix::process::geteuid().as_raw()),
+            Some(rustix::process::getegid().as_raw()),
+        );
+
+        let mut cmd = Command::new("echo");
+        cmd.arg("resolved-identity-ok");
+        cmd.stdout(Stdio::piped());
+
+        unsafe_pty::install_pre_exec_no_pty(
+            &mut cmd,
+            policy,
+            None,
+            None,
+            resolved,
+            ProcessEnforcementMode::Full,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+        .expect("install pre_exec should succeed");
+
+        let output = cmd
+            .spawn()
+            .expect("spawn should use resolved numeric identity")
+            .wait_with_output()
+            .expect("wait should succeed");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "resolved-identity-ok"
         );
     }
 }

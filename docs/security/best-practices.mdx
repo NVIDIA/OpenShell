@@ -201,10 +201,10 @@ The sandbox process runs as a non-root user after explicit privilege dropping.
 
 | Aspect | Detail |
 |---|---|
-| Default | `run_as_user: sandbox`, `run_as_group: sandbox`. The supervisor calls `setuid()`/`setgid()` with post-condition verification, disables core dumps with `RLIMIT_CORE=0`, and on Linux sets `PR_SET_DUMPABLE=0`. |
-| What you can change | Set `run_as_user` and `run_as_group` in the `process` section. Validation rejects root (`root` or `0`). |
+| Default | The compute driver selects a non-root identity. Docker and Podman use the image's OCI `USER` as a per-field fallback. The supervisor calls `setuid()`/`setgid()` with post-condition verification, disables core dumps with `RLIMIT_CORE=0`, and on Linux sets `PR_SET_DUMPABLE=0`. |
+| What you can change | Set either or both `run_as_user` and `run_as_group` fields in the `process` section. Each explicit field takes precedence and must be `sandbox` or a numeric UID/GID value in the allowed sandbox range. Docker and Podman may use named identities or non-root system IDs only through OCI `USER` fallback. Root identities are always rejected. |
 | Risk if relaxed | Running as a higher-privilege user increases the impact of container escape vulnerabilities. |
-| Recommendation | Keep the `sandbox` user. Do not attempt to set root. |
+| Recommendation | Use a dedicated non-root image identity or explicit numeric policy identity. Do not attempt to set root. |
 
 ### Seccomp Filters
 

@@ -160,6 +160,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| {
             openshell_driver_kubernetes::DEFAULT_WORKSPACE_STORAGE_SIZE.to_string()
         }),
+        workspace_storage_class: std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS")
+            .unwrap_or_default(),
         default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
             .unwrap_or_default(),
         sa_token_ttl_secs: args.sa_token_ttl_secs,

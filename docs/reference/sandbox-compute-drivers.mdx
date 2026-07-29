@@ -182,6 +182,8 @@ For maintainer-level implementation details, refer to the [Podman driver README]
 
 Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
 
+Podman sandboxes default to a 45-second graceful stop window before Podman escalates from `SIGTERM` to `SIGKILL`. Set `stop_timeout_secs` in gateway config, or `OPENSHELL_STOP_TIMEOUT` for the standalone driver, when a local runtime needs a different teardown window.
+
 For proxy-required networks, the Podman driver also accepts the corporate egress proxy keys `https_proxy`, `no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`, and `proxy_connect_by_hostname`. The supervisor chains policy-approved TLS tunnels through the proxy with HTTP CONNECT instead of dialing destinations directly. See the [Gateway Configuration File](./gateway-config) reference for the full contract, including the cleartext-credential acknowledgement and the validated-IP CONNECT behavior.
 
 On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192.168.127.254`, for sandbox host aliases by default. Set `host_gateway_ip` only when your Podman machine uses a non-standard host-loopback address. On Linux, an empty `host_gateway_ip` keeps Podman's `host-gateway` resolver behavior.
@@ -313,6 +315,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `sidecar.process_binary_aware_network_policy` | `supervisor.sidecar.processBinaryAwareNetworkPolicy` | Keep process/binary-aware network policy enabled in `sidecar` topology. The default runs the sidecar as UID 0 with `SYS_PTRACE` and `DAC_READ_SEARCH`. Set false to run as `proxy_uid`, drop both capabilities, and enforce endpoint/L7 policy without matching `policy.binaries`. |
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
+| `workspace_storage_class` | `server.workspaceStorageClass` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
 
 In `combined` topology, the agent container carries the Linux capabilities
@@ -413,7 +416,27 @@ image.
 
 ## Sandbox User Identity
 
-OpenShell accepts both the hardcoded username `"sandbox"` and numeric UIDs in `[1000, 2_000_000_000]` for the supervisor's process identity (the policy's `run_as_user` field). The driver resolves the UID at sandbox creation time and passes it to the supervisor via environment variables.
+The policy can set `process.run_as_user` and `process.run_as_group`
+independently. Each explicit field wins. The active compute driver supplies the
+identity for omitted fields.
+
+### Docker / Podman
+
+Docker and Podman inspect the final image and use its OCI `USER` declaration as
+a per-field fallback. Supported forms include `app`, `app:staff`, a numeric UID
+whose passwd entry supplies its primary GID, and an accountless numeric pair
+such as `1234:1235`.
+
+The driver pins container creation to the immutable image ID it inspected. The
+supervisor validates any required names inside that image and preserves the
+declared name or numeric components for both direct and SSH children. When
+`USER` omits the group, the supervisor uses the user's numeric primary GID. It
+does not modify `/etc/passwd` or `/etc/group`.
+
+Sandbox creation fails before readiness if a required `USER` component is
+missing, malformed, unknown, ambiguous, or resolves to UID/GID 0. An image
+without `USER` therefore works only when policy explicitly provides both
+identity fields.
 
 ### Kubernetes / OpenShift
 
@@ -436,4 +459,10 @@ The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/e
 
 ### Custom Images
 
-Custom sandbox images no longer need a baked-in `"sandbox"` user. If your image requires a passwd entry for tools like `sudo` or `ssh`, add one manually (e.g. `RUN useradd -m -u 1500 deploy`). The supervisor resolves the numeric UID directly via `setuid()` without needing `/etc/passwd`.
+Docker and Podman custom images do not need a baked-in `"sandbox"` user. Declare
+a non-root OCI `USER`, or set both process identity fields explicitly in policy.
+Named image users require matching account entries; a numeric `UID:GID` pair
+does not. OpenShell continues to use `/sandbox` as the workspace; it does not
+adopt the image's OCI working directory. Until OCI working-directory support is
+added, custom images must create `/sandbox` and make it writable by the selected
+identity.

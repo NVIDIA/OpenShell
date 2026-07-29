@@ -7,6 +7,8 @@
 
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 pub mod auth;
 pub(crate) mod commands;

@@ -11,7 +11,7 @@
 
 use miette::{IntoDiagnostic, Result};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::info;
@@ -34,7 +34,9 @@ use openshell_core::denial::DenialEvent;
 
 #[cfg(target_os = "linux")]
 use crate::managed_children;
-use crate::process::{ProcessEnforcementMode, ProcessHandle};
+use crate::process::{
+    ProcessEnforcementMode, ProcessHandle, ProcessStatus, ResolvedProcessIdentity,
+};
 
 fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
     openshell_ocsf::ctx::ctx()
@@ -59,6 +61,7 @@ pub async fn run_process(
     ssh_socket_path: Option<String>,
     shared_ssh_socket: bool,
     policy: &SandboxPolicy,
+    resolved_process_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
     entrypoint_pid: Arc<AtomicU32>,
     entrypoint_started_tx: Option<tokio::sync::oneshot::Sender<u32>>,
@@ -72,21 +75,19 @@ pub async fn run_process(
     >,
     #[cfg(target_os = "linux")] bypass_activity_tx: Option<ActivitySender>,
 ) -> Result<i32> {
-    // When a driver injects a custom UID/GID, update /etc/passwd and
-    // /etc/group so the "sandbox" entry matches. Must run before
-    // validate_sandbox_user so passwd lookups see the correct identity.
+    // Platform drivers with a resolved numeric UID/GID retain the legacy
+    // account-file update. OCI-image identity leaves those environment values
+    // empty, so the image's account files remain unchanged.
     #[cfg(unix)]
     if enforcement_mode.uses_privileged_process_setup() {
         crate::process::update_sandbox_passwd_entries()?;
     }
 
-    // Validate that the sandbox user exists in the image. All sandbox images
-    // must include a "sandbox" user for privilege dropping; failing fast here
-    // beats silently running children as root.
+    // Validate the completed process identity before exposing a child.
     #[cfg(unix)]
     if enforcement_mode.uses_privileged_process_setup() {
-        crate::process::validate_sandbox_user(policy)?;
-        crate::process::validate_sandbox_group(policy)?;
+        crate::process::validate_sandbox_user_with_identity(policy, resolved_process_identity)?;
+        crate::process::validate_sandbox_group_with_identity(policy, resolved_process_identity)?;
     }
 
     // Create read_write directories and chown newly-created ones to the
@@ -94,7 +95,7 @@ pub async fn run_process(
     // is forked so the workload sees writable paths it owns.
     #[cfg(unix)]
     if enforcement_mode.uses_privileged_process_setup() {
-        crate::process::prepare_filesystem(policy)?;
+        crate::process::prepare_filesystem_with_identity(policy, resolved_process_identity)?;
     }
 
     // Eagerly fetch initial settings and install the agent skill if the
@@ -248,6 +249,7 @@ pub async fn run_process(
                 ca_paths,
                 provider_credentials_clone,
                 user_env_clone,
+                resolved_process_identity,
                 enforcement_mode,
                 shared_ssh_socket,
             )
@@ -294,6 +296,8 @@ pub async fn run_process(
         }
     }
 
+    let supervisor_terminating = Arc::new(AtomicBool::new(false));
+
     // Spawn the persistent supervisor session if we have a gateway endpoint
     // and sandbox identity. The session provides relay channels for SSH
     // connect and ExecSandbox through the gateway.
@@ -306,6 +310,7 @@ pub async fn run_process(
             socket.clone(),
             ssh_netns_fd,
             None,
+            Arc::clone(&supervisor_terminating),
         );
         info!("supervisor session task spawned");
     }
@@ -317,6 +322,7 @@ pub async fn run_process(
         workdir,
         interactive,
         policy,
+        resolved_process_identity,
         enforcement_mode,
         netns,
         ca_file_paths.as_ref(),
@@ -330,6 +336,7 @@ pub async fn run_process(
         workdir,
         interactive,
         policy,
+        resolved_process_identity,
         enforcement_mode,
         ca_file_paths.as_ref(),
         &provider_env,
@@ -353,11 +360,13 @@ pub async fn run_process(
             .build()
     );
 
-    // Wait for process with optional timeout
-    let result = if timeout_secs > 0 {
-        if let Ok(result) = timeout(Duration::from_secs(timeout_secs), handle.wait()).await {
-            result
-        } else {
+    let outcome =
+        wait_for_process_exit_or_shutdown(&mut handle, timeout_secs, &supervisor_terminating)
+            .await?;
+
+    let status = match outcome {
+        ProcessWaitOutcome::Exited(status) => status,
+        ProcessWaitOutcome::TimedOut => {
             ocsf_emit!(
                 ProcessActivityBuilder::new(ocsf_ctx())
                     .activity(ActivityId::Close)
@@ -368,14 +377,18 @@ pub async fn run_process(
                     .message("Process timed out, killing")
                     .build()
             );
-            handle.kill()?;
             return Ok(124); // Standard timeout exit code
         }
-    } else {
-        handle.wait().await
+        ProcessWaitOutcome::ShutdownSignal { signal, status } => {
+            info!(
+                signal,
+                exit_code = status.code(),
+                "Entrypoint exited after supervisor shutdown signal"
+            );
+            status
+        }
     };
-
-    let status = result.into_diagnostic()?;
+    supervisor_terminating.store(true, Ordering::Release);
 
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())
@@ -390,6 +403,117 @@ pub async fn run_process(
     );
 
     Ok(status.code())
+}
+
+enum ProcessWaitOutcome {
+    Exited(ProcessStatus),
+    TimedOut,
+    ShutdownSignal {
+        signal: &'static str,
+        status: ProcessStatus,
+    },
+}
+
+async fn wait_for_process_exit_or_shutdown(
+    handle: &mut ProcessHandle,
+    timeout_secs: u64,
+    terminating: &AtomicBool,
+) -> Result<ProcessWaitOutcome> {
+    let pid = handle.pid();
+    let wait = handle.wait();
+    tokio::pin!(wait);
+
+    if timeout_secs > 0 {
+        let deadline = tokio::time::sleep(Duration::from_secs(timeout_secs));
+        tokio::pin!(deadline);
+        tokio::select! {
+            result = &mut wait => {
+                terminating.store(true, Ordering::Release);
+                Ok(ProcessWaitOutcome::Exited(result.into_diagnostic()?))
+            }
+            () = &mut deadline => {
+                terminating.store(true, Ordering::Release);
+                terminate_then_kill_pid(pid).await;
+                Ok(ProcessWaitOutcome::TimedOut)
+            }
+            signal = wait_for_supervisor_shutdown_signal() => {
+                terminating.store(true, Ordering::Release);
+                signal_entrypoint_for_shutdown(pid, signal);
+                let status = (&mut wait).await.into_diagnostic()?;
+                Ok(ProcessWaitOutcome::ShutdownSignal { signal, status })
+            }
+        }
+    } else {
+        tokio::select! {
+            result = &mut wait => {
+                terminating.store(true, Ordering::Release);
+                Ok(ProcessWaitOutcome::Exited(result.into_diagnostic()?))
+            }
+            signal = wait_for_supervisor_shutdown_signal() => {
+                terminating.store(true, Ordering::Release);
+                signal_entrypoint_for_shutdown(pid, signal);
+                let status = (&mut wait).await.into_diagnostic()?;
+                Ok(ProcessWaitOutcome::ShutdownSignal { signal, status })
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_then_kill_pid(pid: u32) {
+    signal_pid(pid, nix::sys::signal::Signal::SIGTERM, "process timeout");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    signal_pid(pid, nix::sys::signal::Signal::SIGKILL, "process timeout");
+}
+
+#[cfg(not(unix))]
+async fn terminate_then_kill_pid(_pid: u32) {}
+
+#[cfg(unix)]
+fn signal_entrypoint_for_shutdown(pid: u32, signal: &'static str) {
+    signal_pid(pid, nix::sys::signal::Signal::SIGTERM, signal);
+}
+
+#[cfg(not(unix))]
+fn signal_entrypoint_for_shutdown(_pid: u32, _signal: &'static str) {}
+
+#[cfg(unix)]
+fn signal_pid(pid: u32, signal: nix::sys::signal::Signal, reason: &'static str) {
+    let raw_pid = i32::try_from(pid).unwrap_or(i32::MAX);
+    if let Err(error) = nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw_pid), signal) {
+        tracing::warn!(
+            pid,
+            signal = ?signal,
+            reason,
+            error = %error,
+            "failed to signal entrypoint process"
+        );
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_supervisor_shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(signal) => signal,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Failed to install SIGTERM handler; supervisor shutdown detection disabled"
+            );
+            return std::future::pending::<&'static str>().await;
+        }
+    };
+
+    let _ = sigterm.recv().await;
+    info!("Received SIGTERM, shutting down supervisor process");
+    "SIGTERM"
+}
+
+#[cfg(not(unix))]
+async fn wait_for_supervisor_shutdown_signal() -> &'static str {
+    std::future::pending::<&'static str>().await
 }
 
 fn ssh_proxy_url_for_policy(

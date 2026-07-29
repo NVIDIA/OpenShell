@@ -145,7 +145,7 @@ In terminal 2, paste the deny reason from the previous step into your coding age
 ```md title="Prompt" wordWrap showLineNumbers={false}
 Based on the following deny reasons, recommend a sandbox policy update that allows GitHub pushes to `https://github.com/<org>/<repo>`, and save to `/tmp/sandbox-policy-update.yaml`:
 
-The `filesystem_policy`, `landlock`, and `process` sections are static. They are read once at sandbox creation and cannot be changed by a hot-reload. They are included here for completeness so the file is self-contained, but only the `network_policies` section takes effect when you apply this to a running sandbox.
+The `filesystem_policy` and `landlock` sections are static. They are read once at sandbox creation and cannot be changed by a hot reload. They are included here for completeness so the file is self-contained. Process identity is omitted so the active compute driver can select it, and only the `network_policies` section takes effect when you apply this to a running sandbox.
 ```
 
 The following steps outline the expected process done by the agent:
@@ -162,7 +162,7 @@ Refer to the following policy example to compare with the generated policy befor
 
 The following YAML shows a complete policy that extends the [default policy](/reference/default-policy) with GitHub access for a single repository. Replace `<org>` with your GitHub organization or username and `<repo>` with your repository name.
 
-The `filesystem_policy`, `landlock`, and `process` sections are static. OpenShell reads them at sandbox creation, and a hot reload cannot change them. They are included here for completeness so the file is self-contained, but only the `network_policies` section takes effect when you apply this to a running sandbox.
+The `filesystem_policy` and `landlock` sections are static. OpenShell reads them at sandbox creation, and a hot reload cannot change them. They are included here for completeness so the file is self-contained. Process identity is omitted so the active compute driver can select it, and only the `network_policies` section takes effect when you apply this to a running sandbox.
 
 ```yaml
 version: 1
@@ -186,10 +186,6 @@ filesystem_policy:
 
 landlock:
   compatibility: best_effort
-
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
 
 # ── Dynamic (hot-reloadable) ─────────────────────────────────────
 

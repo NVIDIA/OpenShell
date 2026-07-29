@@ -243,7 +243,7 @@ impl ProviderCredentialState {
                         DEFAULT_EXPIRES_IN
                     } else {
                         let now = crate::time::now_ms();
-                        (expires_at_ms - now) / 1000
+                        expires_at_ms.saturating_sub(now) / 1000
                     }
                 },
             );
@@ -584,6 +584,27 @@ mod tests {
         assert!(
             (110..=120).contains(&expires_in),
             "expected ~120s remaining, got {expires_in}"
+        );
+    }
+
+    #[test]
+    fn gcp_token_response_handles_already_expired_token_without_panic() {
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), "adc-tok".to_string())]),
+            HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), now_ms - 1_000)]),
+            HashMap::new(),
+        );
+        assert!(
+            state.gcp_token_response().is_none(),
+            "expired token should be skipped rather than panic"
         );
     }
 

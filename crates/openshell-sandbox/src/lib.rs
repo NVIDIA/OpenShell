@@ -17,7 +17,9 @@ mod sidecar_control;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -95,7 +97,7 @@ pub async fn run_sandbox(
     _health_check: bool,
     _health_port: u16,
     inference_routes: Option<String>,
-    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
+    ocsf_enabled: Arc<AtomicBool>,
     network_enabled: bool,
     process_enabled: bool,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
@@ -182,38 +184,21 @@ pub async fn run_sandbox(
         .await?
     };
 
-    // Override the policy's process identity with the driver-resolved UID/GID
-    // from the pod environment. The policy defaults to the name "sandbox" which
-    // resolves via /etc/passwd, but the driver may have chosen a different
-    // numeric UID (e.g. from OpenShift SCC annotations).
-    // Validate overrides against the same rules as the policy layer to prevent
-    // env-injected values (e.g. GID 0) from bypassing policy restrictions.
-    if let Ok(uid) = std::env::var(openshell_core::sandbox_env::SANDBOX_UID)
-        && !uid.is_empty()
-    {
-        if !openshell_policy::is_valid_sandbox_identity(&uid) {
-            return Err(miette::miette!(
-                "OPENSHELL_SANDBOX_UID contains invalid sandbox identity '{uid}'; \
-                 expected 'sandbox' or a numeric UID in range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
-            ));
-        }
-        policy.process.run_as_user = Some(uid);
-    }
-    if let Ok(gid) = std::env::var(openshell_core::sandbox_env::SANDBOX_GID)
-        && !gid.is_empty()
-    {
-        if !openshell_policy::is_valid_sandbox_identity(&gid) {
-            return Err(miette::miette!(
-                "OPENSHELL_SANDBOX_GID contains invalid sandbox identity '{gid}'; \
-                 expected 'sandbox' or a numeric GID in range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
-            ));
-        }
-        policy.process.run_as_group = Some(gid);
-    }
+    // Normalize the active driver's identity contract once, while both the
+    // policy and launched image filesystem are available. Kubernetes and
+    // OpenShift retain their authoritative numeric pair; Docker and Podman
+    // fill only omitted policy fields from OCI Config.User.
+    #[cfg(unix)]
+    let resolved_process_identity = {
+        let driver_identity = openshell_supervisor_process::identity::DriverIdentity::from_env()?;
+        openshell_supervisor_process::identity::resolve_process_identity(
+            &mut policy,
+            &driver_identity,
+        )?
+    };
+    #[cfg(not(unix))]
+    let resolved_process_identity =
+        openshell_supervisor_process::process::ResolvedProcessIdentity::default();
 
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let (provider_credentials, mut provider_env) =
@@ -706,6 +691,7 @@ pub async fn run_sandbox(
             ssh_socket_path,
             sidecar_network_enforcement,
             &process_policy,
+            resolved_process_identity,
             process_enforcement_mode,
             entrypoint_pid,
             entrypoint_started_tx,
@@ -942,8 +928,9 @@ fn spawn_sidecar_entrypoint_handler(
     tokio::spawn(async move {
         let mut session_started = false;
         let mut trusted_supervisor_pid = None;
+        let terminating = Arc::new(AtomicBool::new(false));
         while let Some(started) = entrypoint_rx.recv().await {
-            entrypoint_pid.store(started.pid, std::sync::atomic::Ordering::Release);
+            entrypoint_pid.store(started.pid, Ordering::Release);
             if started.start_session {
                 info!(
                     pid = started.pid,
@@ -990,11 +977,13 @@ fn spawn_sidecar_entrypoint_handler(
                     trusted_ssh_socket_path.clone(),
                     None,
                     Some(supervisor_pid),
+                    Arc::clone(&terminating),
                 );
                 session_started = true;
                 info!("sidecar supervisor session task spawned");
             }
         }
+        terminating.store(true, Ordering::Release);
     });
 }
 
@@ -2521,7 +2510,7 @@ struct PolicyPollLoopContext {
     loaded_policy_origin: LoadedPolicyOrigin,
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
-    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
+    ocsf_enabled: Arc<AtomicBool>,
     provider_credentials: ProviderCredentialState,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
     agent_proposals: AgentProposals,
@@ -2970,7 +2959,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 }
 
 fn apply_ocsf_json_setting(
-    enabled: &std::sync::atomic::AtomicBool,
+    enabled: &AtomicBool,
     settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
 ) {
     use std::sync::atomic::Ordering;
@@ -3362,9 +3351,10 @@ mod tests {
         let policy = discover_policy_from_path(path);
         // Restrictive default has no network policies.
         assert!(policy.network_policies.is_empty());
-        // But does have filesystem and process policies.
+        // It keeps filesystem restrictions while leaving identity to the
+        // active compute driver.
         assert!(policy.filesystem.is_some());
-        assert!(policy.process.is_some());
+        assert!(policy.process.is_none());
     }
 
     #[test]
@@ -3434,9 +3424,7 @@ filesystem_policy:
 
         let policy = discover_policy_from_path(&path);
         // Falls back to restrictive default because of root user.
-        let proc = policy.process.unwrap();
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
+        assert!(policy.process.is_none());
     }
 
     #[test]

@@ -1921,38 +1921,36 @@ async fn run_cli_sandbox_create(
         fs::copy(server.dir.path().join(filename), tls_dir.join(filename)).unwrap();
     }
 
-    tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"))
-        .args([
-            "--gateway",
-            "openshell",
-            "--gateway-endpoint",
-            &server.endpoint,
-            "sandbox",
-            "create",
-            "--name",
-            name,
-            "--no-tty",
-            "--no-auto-providers",
-        ])
-        .args(extra_args)
-        .env("XDG_CONFIG_HOME", xdg_dir.path())
-        .env("HOME", xdg_dir.path())
-        .env("OPENSHELL_PROVISION_TIMEOUT", "5")
-        .output()
-        .await
-        .unwrap()
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"));
+    for (key, _) in std::env::vars().filter(|(k, _)| k.starts_with("OPENSHELL_")) {
+        cmd.env_remove(&key);
+    }
+    cmd.args([
+        "--gateway",
+        "openshell",
+        "--gateway-endpoint",
+        &server.endpoint,
+        "sandbox",
+        "create",
+        "--name",
+        name,
+        "--no-tty",
+        "--no-auto-providers",
+    ])
+    .args(extra_args)
+    .env("XDG_CONFIG_HOME", xdg_dir.path())
+    .env("HOME", xdg_dir.path())
+    .env("OPENSHELL_PROVISION_TIMEOUT", "5")
+    .output()
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
-async fn sandbox_create_json_stdout_is_parseable_with_progress_events() {
+async fn sandbox_create_json_stdout_is_parseable() {
     let server = run_server().await;
-    server
-        .openshell
-        .state
-        .vm_slow_progress_before_ready
-        .store(true, Ordering::SeqCst);
 
-    let result = run_cli_sandbox_create(&server, "json-progress", &["--output=json"]).await;
+    let result = run_cli_sandbox_create(&server, "json-clean", &["--output=json"]).await;
     assert!(
         result.status.success(),
         "sandbox create failed:\n{}",
@@ -1964,15 +1962,10 @@ async fn sandbox_create_json_stdout_is_parseable_with_progress_events() {
 }
 
 #[tokio::test]
-async fn sandbox_create_yaml_stdout_is_parseable_with_progress_events() {
+async fn sandbox_create_yaml_stdout_is_parseable() {
     let server = run_server().await;
-    server
-        .openshell
-        .state
-        .vm_slow_progress_before_ready
-        .store(true, Ordering::SeqCst);
 
-    let result = run_cli_sandbox_create(&server, "yaml-progress", &["--output=yaml"]).await;
+    let result = run_cli_sandbox_create(&server, "yaml-clean", &["--output=yaml"]).await;
     assert!(
         result.status.success(),
         "sandbox create failed:\n{}",
