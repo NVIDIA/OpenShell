@@ -1074,16 +1074,25 @@ pub fn build_container_spec_for_image(
                     openshell_core::config::DEFAULT_SSH_PORT
                 ),
             ],
-            interval: config
-                .health_check_interval_secs
-                .checked_mul(1_000_000_000)
-                .filter(|ns| *ns <= i64::MAX as u64)
-                .ok_or_else(|| {
-                    ComputeDriverError::InvalidArgument(format!(
+            interval: {
+                const NS_PER_S: u64 = 1_000_000_000;
+                let max_secs = (i64::MAX as u64) / NS_PER_S;
+                if config.health_check_interval_secs > max_secs {
+                    return Err(ComputeDriverError::InvalidArgument(format!(
                         "health_check_interval_secs {} exceeds maximum allowed nanoseconds",
                         config.health_check_interval_secs
-                    ))
-                })?,
+                    )));
+                }
+                config
+                    .health_check_interval_secs
+                    .checked_mul(NS_PER_S)
+                    .ok_or_else(|| {
+                        ComputeDriverError::InvalidArgument(format!(
+                            "health_check_interval_secs {} exceeds maximum allowed nanoseconds",
+                            config.health_check_interval_secs
+                        ))
+                    })?
+            },
             timeout: 2_000_000_000,
             retries: 10,
             start_period: 5_000_000_000,
@@ -1309,12 +1318,13 @@ mod tests {
 
     #[test]
     fn parse_cpu_rejects_u64_max_boundary() {
-        // 184_467_440_737_095_520 cores * 100_000 rounds to 2^64, which used
-        // to pass the > check and silently saturate to u64::MAX. It must now
-        // be rejected.
-        assert_eq!(parse_cpu_to_microseconds("184467440737095520"), None);
+        // 184_467_440_737_095.51616 cores * 100_000 rounds exactly to 2^64,
+        // which used to pass the > check and silently saturate to u64::MAX.
+        // It must now be rejected. The previous value (184467440737095520)
+        // was ~1000x larger and did not exercise the equality boundary.
+        assert_eq!(parse_cpu_to_microseconds("184467440737095.51616"), None);
 
-        // One core below the boundary is still valid.
+        // Just below the boundary is still valid.
         assert_eq!(
             parse_cpu_to_microseconds("184467440737095"),
             Some(18_446_744_073_709_500_416)
@@ -1334,6 +1344,20 @@ mod tests {
             "expected InvalidArgument, got {err:?}"
         );
         assert!(format!("{err}").contains("health_check_interval_secs"));
+    }
+
+    #[test]
+    fn container_spec_accepts_health_check_interval_at_boundary() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        // i64::MAX nanoseconds / 1_000_000_000 ns/s = 9_223_372_036 seconds.
+        const NS_PER_S: u64 = 1_000_000_000;
+        config.health_check_interval_secs = (i64::MAX as u64) / NS_PER_S;
+        let spec = try_build_container_spec_with_token(&sandbox, &config, None).unwrap();
+        let interval = spec["healthconfig"]["Interval"]
+            .as_u64()
+            .expect("healthcheck interval should be a u64");
+        assert_eq!(interval, config.health_check_interval_secs * NS_PER_S);
     }
 
     #[test]

@@ -1522,10 +1522,14 @@ pub(super) async fn handle_create_ssh_session(
     let token = uuid::Uuid::new_v4().to_string();
     let now_ms = current_time_ms();
     let expires_at_ms = if state.config.ssh_session_ttl_secs > 0 {
-        let ttl_ms = i64::try_from(state.config.ssh_session_ttl_secs)
-            .unwrap_or(i64::MAX)
-            .saturating_mul(1000);
-        now_ms.saturating_add(ttl_ms)
+        let ttl_secs = state.config.ssh_session_ttl_secs;
+        let ttl_ms = i64::try_from(ttl_secs)
+            .map_err(|_| Status::invalid_argument("ssh_session_ttl_secs is too large"))?
+            .checked_mul(1000)
+            .ok_or_else(|| Status::invalid_argument("ssh_session_ttl_secs is too large"))?;
+        now_ms
+            .checked_add(ttl_ms)
+            .ok_or_else(|| Status::invalid_argument("ssh_session_ttl_secs is too large"))?
     } else {
         0
     };
@@ -4384,5 +4388,33 @@ mod tests {
             .expect("session should still exist after revocation");
         assert!(session.revoked);
         assert_eq!(session.object_workspace(), "default");
+    }
+
+    #[tokio::test]
+    async fn create_ssh_session_rejects_too_large_ttl() {
+        let mut state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox("ttl-test", Vec::new()))
+            .await
+            .unwrap();
+
+        // Any value larger than i64::MAX seconds cannot be converted to
+        // milliseconds without overflowing.
+        Arc::get_mut(&mut state)
+            .expect("fresh test state is uniquely held")
+            .config
+            .ssh_session_ttl_secs = u64::MAX;
+
+        let err = handle_create_ssh_session(
+            &state,
+            Request::new(CreateSshSessionRequest {
+                sandbox_id: "sandbox-ttl-test".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("ssh_session_ttl_secs is too large"));
     }
 }

@@ -2750,7 +2750,14 @@ fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
                 "docker cpu_limit must be greater than zero",
             ));
         }
-        return Ok(Some(millicores.saturating_mul(1_000_000)));
+        return millicores
+            .checked_mul(1_000_000)
+            .map(Some)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "docker cpu_limit '{value}' is too large",
+                ))
+            });
     }
 
     let cores = value.parse::<f64>().map_err(|_| {

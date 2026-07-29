@@ -2305,9 +2305,11 @@ fn parse_memory_limit_rejects_overflow() {
 
 #[test]
 fn parse_cpu_limit_rejects_i64_max_boundary() {
-    // 9_223_372_037 cores * 1e9 rounds to 2^63, which used to pass the > check
-    // and silently saturate to i64::MAX. It must now be rejected.
-    let err = parse_cpu_limit("9223372037").unwrap_err();
+    // 9_223_372_036.854776 cores * 1e9 rounds exactly to 2^63, which used to
+    // pass the > check and silently saturate to i64::MAX. It must now be
+    // rejected. (9_223_372_037 is already above the boundary and would also
+    // pass a > guard, so it does not test the equality case.)
+    let err = parse_cpu_limit("9223372036.854776").unwrap_err();
     assert!(err.message().contains("too large"));
 
     // One core below the boundary is still valid.
@@ -2315,6 +2317,18 @@ fn parse_cpu_limit_rejects_i64_max_boundary() {
         parse_cpu_limit("9223372036").unwrap(),
         Some(9_223_372_036_000_000_000)
     );
+}
+
+#[test]
+fn parse_cpu_limit_rejects_millicore_overflow() {
+    // 9_223_372_036_854 millicores * 1_000_000 == 9_223_372_036_854_000_000,
+    // which fits in i64. One millicore more overflows and must be rejected.
+    assert_eq!(
+        parse_cpu_limit("9223372036854m").unwrap(),
+        Some(9_223_372_036_854_000_000)
+    );
+    let err = parse_cpu_limit("9223372036855m").unwrap_err();
+    assert!(err.message().contains("too large"));
 }
 
 #[test]

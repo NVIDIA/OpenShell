@@ -6574,7 +6574,10 @@ pub async fn sandbox_logs(
                 .as_millis(),
         )
         .into_diagnostic()?;
-        now_ms.saturating_sub(dur_ms)
+        // Negative durations are rejected by parse_duration_to_ms. Overlong
+        // durations are clamped to zero (show all logs since the epoch) rather
+        // than silently producing a future timestamp.
+        now_ms.checked_sub(dur_ms).unwrap_or(0).max(0)
     } else {
         0
     };
