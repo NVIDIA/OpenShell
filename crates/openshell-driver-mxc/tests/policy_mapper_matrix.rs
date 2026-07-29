@@ -16,8 +16,9 @@
 #![cfg(target_os = "windows")]
 
 use openshell_core::proto::{
-    FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7Rule, LandlockPolicy, NetworkBinary,
-    NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
+    FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7Rule, LandlockPolicy,
+    MiddlewareEndpointSelector, NetworkBinary, NetworkEndpoint, NetworkMiddlewareConfig,
+    NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
 };
 use openshell_driver_mxc::{
     EmbeddedPolicyMapper, MapCtx, MapError, MxcMappingOptions, PolicyMapper, map_to_mxc,
@@ -27,6 +28,20 @@ use openshell_policy::{serialize_sandbox_policy, validate_sandbox_policy};
 use serde_json::Value;
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+fn middleware_config() -> NetworkMiddlewareConfig {
+    NetworkMiddlewareConfig {
+        name: "redactor".into(),
+        middleware: "openshell/regex".into(),
+        config: None,
+        on_error: "fail_closed".into(),
+        endpoints: Some(MiddlewareEndpointSelector {
+            include: vec!["api.example.com".into()],
+            exclude: Vec::new(),
+        }),
+        order: 0,
+    }
+}
 
 fn str_list(v: &Value) -> Vec<String> {
     v.as_array()
@@ -1039,6 +1054,7 @@ const HANDLED_TOPLEVEL: &[&str] = &[
     "landlock",
     "process",
     "network_policies",
+    "network_middlewares",
 ];
 
 /// Per-rule keys under each network_policies entry that the mapper handles.
@@ -1120,6 +1136,11 @@ fn handled_fields_inventory() {
                     binaries: Vec::new(),
                 },
             );
+            m
+        },
+        network_middlewares: {
+            let mut m = std::collections::HashMap::new();
+            m.insert("redactor".to_owned(), middleware_config());
             m
         },
     };

@@ -7,6 +7,7 @@
 use crate::mxc::{MxcFilesystem, MxcNetwork, MxcProcess, MxcProcessContainer, WxcExecInvoker};
 use crate::policy::{EmbeddedPolicyMapper, MapCtx, PolicyMapper};
 use futures::Stream;
+use openshell_core::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_core::proto::SandboxPolicy;
 use openshell_core::proto::compute::v1::{
     DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxStatus,
@@ -304,13 +305,17 @@ impl MxcComputeBackend {
             DRIVER_NAME,
             DRIVER_VERSION,
             DEFAULT_IMAGE_SENTINEL,
-            false,
         )
     }
 
     pub fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
         if let Some(spec) = &sandbox.spec {
-            if spec.gpu {
+            if effective_driver_gpu_count(driver_gpu_requirements(
+                spec.resource_requirements.as_ref(),
+            ))
+            .map_err(tonic::Status::invalid_argument)?
+            .is_some()
+            {
                 return Err(tonic::Status::invalid_argument(
                     "mxc driver does not support GPU sandboxes",
                 ));
@@ -819,6 +824,7 @@ fn make_sandbox_with_condition(
         id: base.id.clone(),
         name: base.name.clone(),
         namespace: base.namespace.clone(),
+        workspace: base.workspace.clone(),
         spec: base.spec.clone(),
         status: Some(DriverSandboxStatus {
             sandbox_name: base.name.clone(),
@@ -851,6 +857,7 @@ mod lifecycle_tests {
             id: id.to_string(),
             name: id.to_string(),
             namespace: String::new(),
+            workspace: String::new(),
             spec: Some(DriverSandboxSpec {
                 sandbox_token: "test-token".into(),
                 ..Default::default()
