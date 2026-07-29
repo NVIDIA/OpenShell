@@ -35,7 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let proto_root = manifest_dir.join(PROTO_REL);
+    #[cfg(target_os = "windows")]
     let proto_includes = proto_include_dirs(&proto_root)?;
+    #[cfg(not(target_os = "windows"))]
+    let proto_includes = vec![proto_root.clone()];
 
     let mut proto_files = Vec::new();
     collect_proto_files(&proto_root, &mut proto_files)?;
@@ -62,12 +65,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
 fn proto_include_dirs(proto_root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let mut includes = vec![proto_root.to_path_buf()];
-    #[cfg(target_os = "windows")]
-    {
-        includes.push(protoc_bin_vendored::include_path()?);
-    }
+    includes.push(protoc_bin_vendored::include_path()?);
     Ok(includes)
 }
 
