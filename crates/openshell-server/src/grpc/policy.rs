@@ -76,8 +76,9 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
-    level_matches, source_matches, validate_annotations, validate_no_reserved_provider_policy_keys,
-    validate_policy_safety, validate_static_fields_unchanged,
+    level_matches, normalize_process_identity_for_driver, source_matches, validate_annotations,
+    validate_no_reserved_provider_policy_keys, validate_policy_safety,
+    validate_static_fields_unchanged,
 };
 use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -1738,7 +1739,7 @@ async fn handle_update_config_inner(
             let mut new_policy = req.policy.ok_or_else(|| {
                 Status::invalid_argument("policy is required for global policy update")
             })?;
-            openshell_policy::ensure_sandbox_process_identity(&mut new_policy);
+            normalize_process_identity_for_driver(&mut new_policy, state.compute.driver_kind());
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             validate_policy_safety(&new_policy)?;
             crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy)
@@ -2014,11 +2015,15 @@ async fn handle_update_config_inner(
             provenance: &req.annotations,
             annotations: &req.annotations,
         };
+        let mut baseline_policy = spec.policy.clone();
+        if let Some(policy) = baseline_policy.as_mut() {
+            normalize_process_identity_for_driver(policy, state.compute.driver_kind());
+        }
         let (version, hash, updated_sandbox) = apply_merge_operations_with_retry(
             state.store.as_ref(),
             &sandbox_id,
             &workspace,
-            spec.policy.as_ref(),
+            baseline_policy.as_ref(),
             &merge_ops,
             Some(&atomic_context),
         )
@@ -2084,6 +2089,7 @@ async fn handle_update_config_inner(
     let mut new_policy = req
         .policy
         .ok_or_else(|| Status::invalid_argument("policy is required"))?;
+    normalize_process_identity_for_driver(&mut new_policy, state.compute.driver_kind());
 
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
@@ -2097,7 +2103,6 @@ async fn handle_update_config_inner(
         .as_ref()
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
-    openshell_policy::ensure_sandbox_process_identity(&mut new_policy);
     if sandbox_caller {
         if openshell_policy::strip_provider_rule_names(&mut new_policy) {
             debug!(
@@ -2110,7 +2115,12 @@ async fn handle_update_config_inner(
     }
 
     let backfill_policy = if let Some(baseline_policy) = spec.policy.as_ref() {
-        validate_static_fields_unchanged(baseline_policy, &new_policy)?;
+        let mut comparable_baseline = baseline_policy.clone();
+        normalize_process_identity_for_driver(
+            &mut comparable_baseline,
+            state.compute.driver_kind(),
+        );
+        validate_static_fields_unchanged(&comparable_baseline, &new_policy)?;
         None
     } else {
         Some(new_policy.clone())
@@ -12078,7 +12088,13 @@ mod tests {
         let current_version = current.metadata.as_ref().unwrap().resource_version;
 
         // Backfill the policy with correct expected_resource_version
-        let new_policy = ProtoSandboxPolicy::default();
+        let new_policy = ProtoSandboxPolicy {
+            process: Some(openshell_core::proto::ProcessPolicy {
+                run_as_user: "1234".to_string(),
+                run_as_group: String::new(),
+            }),
+            ..Default::default()
+        };
 
         let response = handle_update_config(
             &state,
@@ -12109,6 +12125,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let process = updated_sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.policy.as_ref())
+            .and_then(|policy| policy.process.as_ref())
+            .expect("legacy process identity should be persisted");
+        assert_eq!(process.run_as_user, "1234");
+        assert_eq!(process.run_as_group, "sandbox");
         assert_eq!(
             updated_sandbox.metadata.as_ref().unwrap().resource_version,
             current_version + 1,
@@ -12225,8 +12249,7 @@ mod tests {
     #[tokio::test]
     async fn update_config_same_policy_hash_with_new_provenance_creates_revision() {
         let state = test_server_state().await;
-        let mut policy = test_policy_with_rule("sandbox_only", "sandbox.example.com");
-        openshell_policy::ensure_sandbox_process_identity(&mut policy);
+        let policy = test_policy_with_rule("sandbox_only", "sandbox.example.com");
         let hash = deterministic_policy_hash(&policy);
         let sandbox = test_sandbox("sb-same-hash", "same-hash", policy.clone(), Vec::new());
         state.store.put_message(&sandbox).await.unwrap();
@@ -12303,8 +12326,7 @@ mod tests {
     #[tokio::test]
     async fn update_config_same_policy_and_provenance_is_idempotent() {
         let state = test_server_state().await;
-        let mut policy = test_policy_with_rule("sandbox_only", "sandbox.example.com");
-        openshell_policy::ensure_sandbox_process_identity(&mut policy);
+        let policy = test_policy_with_rule("sandbox_only", "sandbox.example.com");
         state
             .store
             .put_message(&test_sandbox(
@@ -12360,8 +12382,7 @@ mod tests {
     #[tokio::test]
     async fn update_config_full_policy_empty_annotations_preserves_existing_annotations() {
         let state = test_server_state().await;
-        let mut baseline = test_policy_with_rule("sandbox_only", "old.example.com");
-        openshell_policy::ensure_sandbox_process_identity(&mut baseline);
+        let baseline = test_policy_with_rule("sandbox_only", "old.example.com");
         let mut sandbox = test_sandbox(
             "sb-preserve-full",
             "preserve-full",
@@ -12386,8 +12407,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut updated = test_policy_with_rule("sandbox_only", "new.example.com");
-        openshell_policy::ensure_sandbox_process_identity(&mut updated);
+        let updated = test_policy_with_rule("sandbox_only", "new.example.com");
         let response = handle_update_config(
             &state,
             with_user(Request::new(UpdateConfigRequest {
@@ -12428,8 +12448,7 @@ mod tests {
     #[tokio::test]
     async fn update_config_merge_empty_annotations_preserves_existing_annotations() {
         let state = test_server_state().await;
-        let mut baseline = test_policy_with_rule("sandbox_only", "sandbox.example.com");
-        openshell_policy::ensure_sandbox_process_identity(&mut baseline);
+        let baseline = test_policy_with_rule("sandbox_only", "sandbox.example.com");
         let mut sandbox = test_sandbox("sb-preserve-merge", "preserve-merge", baseline, Vec::new());
         sandbox.metadata.as_mut().unwrap().annotations.insert(
             "openshell.nvidia.com/policy-provenance".to_string(),
@@ -12492,8 +12511,7 @@ mod tests {
     #[tokio::test]
     async fn update_config_merge_stores_revision_provenance_atomically() {
         let state = test_server_state().await;
-        let mut baseline = test_policy_with_rule("sandbox_only", "sandbox.example.com");
-        openshell_policy::ensure_sandbox_process_identity(&mut baseline);
+        let baseline = test_policy_with_rule("sandbox_only", "sandbox.example.com");
         state
             .store
             .put_message(&test_sandbox(

@@ -416,7 +416,27 @@ image.
 
 ## Sandbox User Identity
 
-OpenShell accepts both the hardcoded username `"sandbox"` and numeric UIDs in `[1000, 2_000_000_000]` for the supervisor's process identity (the policy's `run_as_user` field). The driver resolves the UID at sandbox creation time and passes it to the supervisor via environment variables.
+The policy can set `process.run_as_user` and `process.run_as_group`
+independently. Each explicit field wins. The active compute driver supplies the
+identity for omitted fields.
+
+### Docker / Podman
+
+Docker and Podman inspect the final image and use its OCI `USER` declaration as
+a per-field fallback. Supported forms include `app`, `app:staff`, a numeric UID
+whose passwd entry supplies its primary GID, and an accountless numeric pair
+such as `1234:1235`.
+
+The driver pins container creation to the immutable image ID it inspected. The
+supervisor validates any required names inside that image and preserves the
+declared name or numeric components for both direct and SSH children. When
+`USER` omits the group, the supervisor uses the user's numeric primary GID. It
+does not modify `/etc/passwd` or `/etc/group`.
+
+Sandbox creation fails before readiness if a required `USER` component is
+missing, malformed, unknown, ambiguous, or resolves to UID/GID 0. An image
+without `USER` therefore works only when policy explicitly provides both
+identity fields.
 
 ### Kubernetes / OpenShift
 
@@ -439,4 +459,10 @@ The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/e
 
 ### Custom Images
 
-Custom sandbox images no longer need a baked-in `"sandbox"` user. If your image requires a passwd entry for tools like `sudo` or `ssh`, add one manually (e.g. `RUN useradd -m -u 1500 deploy`). The supervisor resolves the numeric UID directly via `setuid()` without needing `/etc/passwd`.
+Docker and Podman custom images do not need a baked-in `"sandbox"` user. Declare
+a non-root OCI `USER`, or set both process identity fields explicitly in policy.
+Named image users require matching account entries; a numeric `UID:GID` pair
+does not. OpenShell continues to use `/sandbox` as the workspace; it does not
+adopt the image's OCI working directory. Until OCI working-directory support is
+added, custom images must create `/sandbox` and make it writable by the selected
+identity.

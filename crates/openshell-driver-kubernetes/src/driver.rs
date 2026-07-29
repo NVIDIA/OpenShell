@@ -1625,21 +1625,15 @@ fn apply_supervisor_sideload(
             volume_mounts.push(supervisor_volume_mount());
         }
 
-        // Inject resolved sandbox UID/GID as environment variables so the
-        // supervisor can use them directly without /etc/passwd lookups.
+        // Inject the protected resolved identity contract. Clearing the OCI
+        // input prevents image or user environment from selecting a
+        // conflicting identity path.
         let env = container
             .entry("env")
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut();
         if let Some(env) = env {
-            env.push(serde_json::json!({
-                "name": openshell_core::sandbox_env::SANDBOX_UID.to_string(),
-                "value": sandbox_uid.to_string(),
-            }));
-            env.push(serde_json::json!({
-                "name": openshell_core::sandbox_env::SANDBOX_GID.to_string(),
-                "value": sandbox_gid.to_string(),
-            }));
+            apply_resolved_identity_env(env, sandbox_uid, sandbox_gid);
         }
     }
 }
@@ -1729,16 +1723,7 @@ fn supervisor_sidecar_env(
         openshell_core::sandbox_env::PROXY_TLS_DIR,
         SIDECAR_TLS_MOUNT_PATH,
     );
-    upsert_env(
-        &mut env,
-        openshell_core::sandbox_env::SANDBOX_UID,
-        &params.sandbox_uid.to_string(),
-    );
-    upsert_env(
-        &mut env,
-        openshell_core::sandbox_env::SANDBOX_GID,
-        &params.sandbox_gid.to_string(),
-    );
+    apply_resolved_identity_env(&mut env, params.sandbox_uid, params.sandbox_gid);
     if !params.process_binary_aware_network_policy {
         upsert_env(
             &mut env,
@@ -2016,16 +2001,7 @@ fn apply_supervisor_sidecar_topology(
                 openshell_core::sandbox_env::PROXY_TLS_DIR,
                 SIDECAR_TLS_MOUNT_PATH,
             );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::SANDBOX_UID,
-                &params.sandbox_uid.to_string(),
-            );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::SANDBOX_GID,
-                &params.sandbox_gid.to_string(),
-            );
+            apply_resolved_identity_env(env, params.sandbox_uid, params.sandbox_gid);
         }
     }
 
@@ -3035,6 +3011,23 @@ fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
     env.push(serde_json::json!({"name": name, "value": value}));
 }
 
+fn apply_resolved_identity_env(env: &mut Vec<serde_json::Value>, uid: u32, gid: u32) {
+    remove_env(env, openshell_core::sandbox_env::OCI_IMAGE_USER);
+    remove_env(env, openshell_core::sandbox_env::SANDBOX_UID);
+    remove_env(env, openshell_core::sandbox_env::SANDBOX_GID);
+    upsert_env(env, openshell_core::sandbox_env::OCI_IMAGE_USER, "");
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::SANDBOX_UID,
+        &uid.to_string(),
+    );
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::SANDBOX_GID,
+        &gid.to_string(),
+    );
+}
+
 fn remove_env(env: &mut Vec<serde_json::Value>, name: &str) {
     env.retain(|item| item.get("name").and_then(|value| value.as_str()) != Some(name));
 }
@@ -3927,6 +3920,59 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_sideload_replaces_spoofed_identity_environment() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "custom-image:latest",
+                    "env": [
+                        {"name": openshell_core::sandbox_env::OCI_IMAGE_USER, "value": "spoofed"},
+                        {"name": openshell_core::sandbox_env::SANDBOX_UID, "value": "9999"},
+                        {"name": openshell_core::sandbox_env::SANDBOX_GID, "value": "9999"},
+                        {"name": openshell_core::sandbox_env::OCI_IMAGE_USER, "value": "duplicate"}
+                    ]
+                }]
+            }
+        });
+
+        apply_supervisor_sideload(
+            &mut pod_template,
+            "supervisor-image:latest",
+            "IfNotPresent",
+            SupervisorSideloadMethod::InitContainer,
+            1500,
+            1600,
+        );
+
+        let agent = &pod_template["spec"]["containers"][0];
+        let env = agent["env"].as_array().unwrap();
+        for name in [
+            openshell_core::sandbox_env::OCI_IMAGE_USER,
+            openshell_core::sandbox_env::SANDBOX_UID,
+            openshell_core::sandbox_env::SANDBOX_GID,
+        ] {
+            assert_eq!(
+                env.iter().filter(|item| item["name"] == name).count(),
+                1,
+                "{name} must have one driver-owned value"
+            );
+        }
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::OCI_IMAGE_USER),
+            Some("")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SANDBOX_UID),
+            Some("1500")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SANDBOX_GID),
+            Some("1600")
+        );
+    }
+
+    #[test]
     fn supervisor_sideload_adds_security_context_when_missing() {
         let mut pod_template = serde_json::json!({
             "spec": {
@@ -4130,6 +4176,20 @@ mod tests {
         let pod_template = sandbox_template_to_k8s(
             &SandboxTemplate {
                 image: "agent-image:latest".to_string(),
+                environment: std::collections::HashMap::from([
+                    (
+                        openshell_core::sandbox_env::OCI_IMAGE_USER.to_string(),
+                        "spoofed".to_string(),
+                    ),
+                    (
+                        openshell_core::sandbox_env::SANDBOX_UID.to_string(),
+                        "9999".to_string(),
+                    ),
+                    (
+                        openshell_core::sandbox_env::SANDBOX_GID.to_string(),
+                        "9999".to_string(),
+                    ),
+                ]),
                 ..SandboxTemplate::default()
             },
             false,
@@ -4206,6 +4266,10 @@ mod tests {
             rendered_env(agent, openshell_core::sandbox_env::SANDBOX_UID),
             Some("1500")
         );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::OCI_IMAGE_USER),
+            Some("")
+        );
 
         let sidecar = containers
             .iter()
@@ -4250,6 +4314,10 @@ mod tests {
         assert_eq!(
             rendered_env(sidecar, openshell_core::sandbox_env::SANDBOX_GID),
             Some("1500")
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::OCI_IMAGE_USER),
+            Some("")
         );
         assert_eq!(
             rendered_env(sidecar, openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET),

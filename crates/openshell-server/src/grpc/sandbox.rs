@@ -47,8 +47,9 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique,
 };
 use super::validation::{
-    level_matches, source_matches, validate_exec_request_fields,
-    validate_no_reserved_provider_policy_keys, validate_policy_safety, validate_sandbox_spec,
+    level_matches, normalize_process_identity_for_driver, source_matches,
+    validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
+    validate_policy_safety, validate_sandbox_spec,
 };
 use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -172,10 +173,10 @@ async fn handle_create_sandbox_inner(
         template.image = state.compute.default_image().to_string();
     }
 
-    // Ensure process identity defaults to "sandbox" when missing or
-    // empty, then validate policy safety before persisting.
+    // Docker and Podman preserve omitted identity fields for OCI USER
+    // fallback. Other drivers retain the legacy persisted sandbox defaults.
     if let Some(ref mut policy) = spec.policy {
-        openshell_policy::ensure_sandbox_process_identity(policy);
+        normalize_process_identity_for_driver(policy, state.compute.driver_kind());
         validate_no_reserved_provider_policy_keys(policy)?;
         validate_policy_safety(policy)?;
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
@@ -2106,7 +2107,7 @@ async fn run_exec_with_russh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grpc::test_support::test_server_state;
+    use crate::grpc::test_support::{test_server_state, test_server_state_with_driver};
     use openshell_core::proto::datamodel::v1::ObjectMeta;
 
     // ---- shell_escape ----
@@ -2967,6 +2968,114 @@ mod tests {
                 .and_then(|metadata| metadata.annotations.get(&annotation_key)),
             Some(&annotation_value)
         );
+    }
+
+    #[tokio::test]
+    async fn create_and_get_preserve_partial_process_identity() {
+        let state =
+            test_server_state_with_driver(openshell_core::ComputeDriverKind::Docker.as_str()).await;
+        let policy = openshell_core::proto::SandboxPolicy {
+            version: 1,
+            process: Some(openshell_core::proto::ProcessPolicy {
+                run_as_user: String::new(),
+                run_as_group: "1234".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let response = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "partial-id".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec {
+                    policy: Some(policy),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .expect("partial process identity should be accepted")
+        .into_inner();
+
+        let created_process = response
+            .sandbox
+            .unwrap()
+            .spec
+            .unwrap()
+            .policy
+            .unwrap()
+            .process
+            .unwrap();
+        assert!(created_process.run_as_user.is_empty());
+        assert_eq!(created_process.run_as_group, "1234");
+
+        let fetched_process = handle_get_sandbox(
+            &state,
+            Request::new(GetSandboxRequest {
+                name: "partial-id".to_string(),
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap()
+        .spec
+        .unwrap()
+        .policy
+        .unwrap()
+        .process
+        .unwrap();
+        assert!(fetched_process.run_as_user.is_empty());
+        assert_eq!(fetched_process.run_as_group, "1234");
+    }
+
+    #[tokio::test]
+    async fn create_and_get_restore_legacy_identity_defaults_for_non_local_driver() {
+        let state =
+            test_server_state_with_driver(openshell_core::ComputeDriverKind::Kubernetes.as_str())
+                .await;
+        let policy = openshell_core::proto::SandboxPolicy {
+            version: 1,
+            process: Some(openshell_core::proto::ProcessPolicy {
+                run_as_user: String::new(),
+                run_as_group: "1234".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let response = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "kube-partial-id".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec {
+                    policy: Some(policy),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .expect("Kubernetes identity defaults should be accepted")
+        .into_inner();
+
+        let process = response
+            .sandbox
+            .unwrap()
+            .spec
+            .unwrap()
+            .policy
+            .unwrap()
+            .process
+            .unwrap();
+        assert_eq!(process.run_as_user, "sandbox");
+        assert_eq!(process.run_as_group, "1234");
     }
 
     #[tokio::test]

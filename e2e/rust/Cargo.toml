@@ -68,6 +68,11 @@ path = "tests/podman_corporate_proxy.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
+name = "podman_oci_identity"
+path = "tests/podman_oci_identity.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
 name = "vm_gateway_resume"
 path = "tests/vm_gateway_resume.rs"
 required-features = ["e2e-vm"]

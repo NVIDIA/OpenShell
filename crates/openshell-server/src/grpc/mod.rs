@@ -788,7 +788,7 @@ pub mod test_support {
     use std::sync::Arc;
 
     use crate::ServerState;
-    use crate::compute::new_test_runtime;
+    use crate::compute::{new_test_runtime, new_test_runtime_for_driver};
     use crate::persistence::Store;
     use crate::sandbox_index::SandboxIndex;
     use crate::sandbox_watch::SandboxWatchBus;
@@ -798,13 +798,22 @@ pub mod test_support {
 
     /// Build an in-memory `ServerState` for unit tests.
     pub async fn test_server_state() -> Arc<ServerState> {
+        test_server_state_with_driver("test").await
+    }
+
+    /// Build an in-memory `ServerState` with a selected built-in driver name.
+    pub async fn test_server_state_with_driver(driver_name: &str) -> Arc<ServerState> {
         let store = Arc::new(
             Store::connect("sqlite::memory:?cache=shared")
                 .await
                 .unwrap(),
         );
         crate::ensure_default_workspace(&store).await.unwrap();
-        let compute = new_test_runtime(store.clone()).await;
+        let compute = if driver_name == "test" {
+            new_test_runtime(store.clone()).await
+        } else {
+            new_test_runtime_for_driver(store.clone(), driver_name).await
+        };
         Arc::new(ServerState::new(
             Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
             store,

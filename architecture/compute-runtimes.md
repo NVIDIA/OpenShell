@@ -125,6 +125,30 @@ Driver-controlled environment variables must override sandbox image or template
 values for sandbox ID, sandbox name, gateway endpoint, relay socket path, TLS
 paths, and command metadata.
 
+## Process Identity
+
+The gateway preserves whether each policy process field was omitted. The active
+driver then supplies one authoritative identity input to the supervisor:
+
+- Docker and Podman inspect the final sandbox image, pin container creation to
+  its immutable image ID, and pass its raw OCI `Config.User`.
+- Kubernetes passes its platform-resolved numeric UID/GID, including OpenShift
+  SCC-derived values.
+- VM keeps its existing guest identity behavior.
+
+For Docker and Podman, policy values take precedence independently. An omitted
+`run_as_user` or `run_as_group` falls back to the corresponding identity from
+the image. The supervisor resolves names from the image's `/etc/passwd` and
+`/etc/group` before readiness, preserves declared name or numeric components,
+and uses the same privilege-drop path for direct and SSH children. When a
+declaration omits the group, the supervisor fills it with the user's numeric
+primary GID. It does not rewrite the account files.
+
+Sandbox creation fails before the workload becomes ready when a required image
+identity is absent, malformed, unknown, ambiguous, or resolves to UID/GID 0.
+The supervisor itself remains root so it can establish isolation before
+starting unprivileged children.
+
 Kubernetes can run the supervisor in the default combined topology or in a
 sidecar topology. Combined mode keeps network and process supervision in the
 agent container. Sidecar mode runs network enforcement, the proxy, and gateway

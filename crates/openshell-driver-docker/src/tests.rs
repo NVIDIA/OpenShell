@@ -542,6 +542,54 @@ fn build_environment_sets_docker_tls_paths() {
 }
 
 #[test]
+fn build_environment_protects_oci_identity_metadata() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    for (key, value) in [
+        (openshell_core::sandbox_env::OCI_IMAGE_USER, "spoofed"),
+        (openshell_core::sandbox_env::SANDBOX_UID, "9999"),
+        (openshell_core::sandbox_env::SANDBOX_GID, "9999"),
+    ] {
+        spec.environment.insert(key.to_string(), value.to_string());
+    }
+
+    let env = build_environment_for_oci_user(&sandbox, &runtime_config(), "app:staff");
+
+    assert!(env.contains(&format!(
+        "{}=app:staff",
+        openshell_core::sandbox_env::OCI_IMAGE_USER
+    )));
+    assert!(env.contains(&format!("{}=", openshell_core::sandbox_env::SANDBOX_UID)));
+    assert!(env.contains(&format!("{}=", openshell_core::sandbox_env::SANDBOX_GID)));
+    assert!(!env.iter().any(|entry| entry.ends_with("=spoofed")));
+    assert!(!env.iter().any(|entry| entry.ends_with("=9999")));
+}
+
+#[test]
+fn container_creation_uses_inspected_immutable_image() {
+    let sandbox = test_sandbox();
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+    };
+    let body = build_container_create_body_for_image(
+        &sandbox,
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+    )
+    .unwrap();
+
+    assert_eq!(body.image.as_deref(), Some("sha256:immutable"));
+    assert_eq!(body.user.as_deref(), Some("0"));
+    assert!(body.env.unwrap().contains(&format!(
+        "{}=1234:1235",
+        openshell_core::sandbox_env::OCI_IMAGE_USER
+    )));
+}
+
+#[test]
 fn build_environment_keeps_path_driver_controlled() {
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();

@@ -422,6 +422,12 @@ The `--from` flag accepts a Dockerfile path, a directory containing a Dockerfile
 
 Local Dockerfile and directory builds require a local gateway because the CLI builds through the local Docker daemon. Use a registry image reference for remote gateways. Bare community names resolve under `ghcr.io/nvidia/openshell-community/sandboxes` unless `OPENSHELL_COMMUNITY_REGISTRY` overrides the prefix.
 
+For Docker and Podman gateways, custom images should declare a non-root OCI
+`USER`. Each explicit `process.run_as_user` or `process.run_as_group` policy
+field wins independently; omitted fields fall back to the image declaration.
+An image with no `USER` fails before readiness unless policy supplies both
+fields.
+
 ### Forward ports
 
 ```bash

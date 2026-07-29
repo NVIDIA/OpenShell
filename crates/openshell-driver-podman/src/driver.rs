@@ -571,6 +571,20 @@ impl PodmanComputeDriver {
             .pull_image(image, pull_policy)
             .await
             .map_err(ComputeDriverError::from)?;
+        let inspected_image = self
+            .client
+            .inspect_image(image)
+            .await
+            .map_err(ComputeDriverError::from)?;
+        if inspected_image.id.is_empty() {
+            return Err(ComputeDriverError::Precondition(format!(
+                "podman image '{image}' inspection did not return an immutable image ID"
+            )));
+        }
+        let image_user = inspected_image
+            .config
+            .as_ref()
+            .map_or("", |config| config.user.as_str());
 
         for image in
             container::podman_driver_image_mount_sources(sandbox, self.config.enable_bind_mounts)
@@ -630,11 +644,14 @@ impl PodmanComputeDriver {
                 return Err(e);
             }
         };
-        let spec = match container::build_container_spec_with_token_and_gpu_devices(
+        let spec = match container::build_container_spec_for_image(
             sandbox,
             &self.config,
             token_secret_name.as_deref(),
             gpu_devices.as_deref(),
+            image,
+            &inspected_image.id,
+            image_user,
         ) {
             Ok(spec) => spec,
             Err(e) => {
@@ -1653,6 +1670,10 @@ mod tests {
             vec![
                 StubResponse::new(StatusCode::OK, "{}"), // pull supervisor image
                 StubResponse::new(StatusCode::OK, "{}"), // pull sandbox image
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":"1234:1235"}}"#,
+                ), // inspect sandbox image
                 StubResponse::new(StatusCode::CREATED, "{}"), // create volume
                 StubResponse::new(StatusCode::CREATED, "{}"), // create proxy-auth secret
                 StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"message":"boom"}"#), // create container
@@ -1691,6 +1712,10 @@ mod tests {
             vec![
                 StubResponse::new(StatusCode::OK, "{}"), // pull supervisor image
                 StubResponse::new(StatusCode::OK, "{}"), // pull sandbox image
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":"1234:1235"}}"#,
+                ), // inspect sandbox image
                 StubResponse::new(StatusCode::CREATED, "{}"), // create volume
                 StubResponse::new(StatusCode::CREATED, "{}"), // create proxy-auth secret
                 StubResponse::new(StatusCode::CREATED, "{}"), // create container
