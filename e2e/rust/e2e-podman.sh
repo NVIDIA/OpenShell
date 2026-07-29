@@ -10,7 +10,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 E2E_TEST="${OPENSHELL_E2E_PODMAN_TEST:-}"
-E2E_FEATURES="${OPENSHELL_E2E_PODMAN_FEATURES:-e2e-podman}"
+E2E_FEATURES="${OPENSHELL_E2E_PODMAN_FEATURES:-e2e-podman,e2e-api-conformance}"
 DEFAULT_WORKLOAD_MANIFEST="${ROOT}/e2e/gpu/images/.build/workloads.yaml"
 
 if [ "${E2E_TEST}" = "gpu" ] && [ -z "${OPENSHELL_E2E_WORKLOAD_MANIFEST:-}" ] && [ ! -f "${DEFAULT_WORKLOAD_MANIFEST}" ]; then

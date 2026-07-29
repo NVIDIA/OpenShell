@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Run the Rust e2e smoke test against an openshell-gateway running the
-# standalone VM compute driver (`openshell-driver-vm`).
+# Run the Rust VM overlay test and API conformance suite against an
+# openshell-gateway using the standalone VM compute driver.
 #
 # Architecture (post supervisor-initiated relay, PR #867):
 #   * The gateway never dials the sandbox. Instead, the in-guest
@@ -52,7 +52,7 @@ GATEWAY_BIN="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
 DRIVER_BIN="${OPENSHELL_VM_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}"
 CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
 E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
-E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
+E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm,e2e-api-conformance,e2e-cli-conformance}"
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
 # AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
@@ -63,7 +63,7 @@ E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
 # so root state under `/tmp` unconditionally to keep UDS paths short.
 STATE_DIR_ROOT="/tmp"
 
-# Smoke test timeouts. First boot extracts the embedded libkrun runtime
+# E2E timeouts. First boot extracts the embedded libkrun runtime
 # (~60-90MB of zstd per architecture) and prepares an ext4 root disk from the
 # configured image. The guest then starts the sandbox supervisor directly; a cold
 # microVM is typically ready within ~15s after image preparation.
@@ -284,7 +284,7 @@ printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"
 #
 # The gateway logs `INFO openshell_server: Server listening
 # address=0.0.0.0:<port>` after its tonic listener is up. That is the
-# only signal the smoke test needs — the VM driver is spawned eagerly
+# only signal the e2e tests need — the VM driver is spawned eagerly
 # but sandboxes are created on demand, so "Server listening" is the
 # right gate here.
 
@@ -305,7 +305,7 @@ done
 
 echo "==> Gateway ready after ${elapsed}s"
 
-# ── Run the smoke test ───────────────────────────────────────────────
+# ── Run the selected test and API conformance ───────────────────────
 #
 # The CLI uses the raw endpoint but still resolves matching metadata so it
 # can find the mTLS client bundle.
@@ -319,7 +319,9 @@ e2e_register_mtls_gateway \
   "${PKI_DIR}"
 
 export OPENSHELL_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
-export OPENSHELL_E2E_EXPECT_VM_OVERLAY=1
+export OPENSHELL_CONFORMANCE_TLS_CA="${PKI_DIR}/ca.crt"
+export OPENSHELL_CONFORMANCE_TLS_CERT="${PKI_DIR}/client/tls.crt"
+export OPENSHELL_CONFORMANCE_TLS_KEY="${PKI_DIR}/client/tls.key"
 export OPENSHELL_E2E_DRIVER="vm"
 export OPENSHELL_E2E_VM_STATE_DIR="${RUN_STATE_DIR}"
 e2e_export_gateway_restart_metadata \
@@ -353,5 +355,10 @@ if [ -n "${E2E_TEST_OVERRIDE}" ]; then
 else
   run_e2e_test smoke
   run_e2e_test host_gateway_alias
+  run_e2e_test vm_overlay
   run_e2e_test vm_gateway_resume
+fi
+
+if [ "${E2E_TEST_OVERRIDE}" != "conformance" ]; then
+  run_e2e_test conformance
 fi

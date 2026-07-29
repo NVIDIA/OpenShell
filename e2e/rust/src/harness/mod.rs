@@ -9,4 +9,5 @@ pub mod container;
 pub mod gateway;
 pub mod output;
 pub mod port;
+pub mod resume;
 pub mod sandbox;
