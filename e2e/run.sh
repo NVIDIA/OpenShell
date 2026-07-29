@@ -27,7 +27,7 @@ Options:
   --with CONFIG        Apply a Nix test-guest configuration; repeatable
   --gateway-config PATH
                        Fully resolved gateway TOML
-  --suite NAME         Host-side suite at e2e/suites/NAME.sh
+  --suite NAME         Rust suite at e2e/rust/tests/NAME.rs
   -h, --help           Show this help
 
 Omit --vm and --with to run the gateway on the host. Supplying --with without
@@ -157,14 +157,10 @@ fi
 if [[ ! ${suite_name} =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
 	die "suite name must contain only lowercase letters, digits, and hyphens: ${suite_name}"
 fi
-suite_path="${ROOT}/e2e/suites/${suite_name}.sh"
+suite_path="${ROOT}/e2e/rust/tests/${suite_name}.rs"
 if [ ! -f "${suite_path}" ]; then
 	die "unknown suite: ${suite_name}"
 fi
-if [ ! -x "${suite_path}" ]; then
-	die "suite is not executable: ${suite_path}"
-fi
-suite_path="$(resolve_file "${suite_path}")"
 mode=host
 if [ "${vm_set}" -eq 1 ] || [ "${#with_configurations[@]}" -gt 0 ]; then
 	mode=vm
@@ -574,8 +570,13 @@ if [ "${readiness_status}" -ne 0 ]; then
 fi
 
 echo "==> Running E2E suite: ${suite_name}"
+cd "${ROOT}"
 set +e
-"${suite_path}"
+cargo test \
+	--manifest-path e2e/rust/Cargo.toml \
+	--features e2e \
+	--test "${suite_name}" \
+	-- --nocapture
 suite_status=$?
 set -e
 cleanup "${suite_status}"
