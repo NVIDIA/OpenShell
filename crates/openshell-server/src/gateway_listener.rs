@@ -20,29 +20,51 @@ pub struct CoveredGatewayAddress {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct GatewayListenerSpec {
-    address: SocketAddr,
-    scope: GatewayListenerScope,
+pub struct GatewayListenerSpec {
+    pub address: SocketAddr,
+    pub scope: GatewayListenerScope,
     covered_addresses: Vec<CoveredGatewayAddress>,
 }
 
 /// A gateway listener together with the context needed to serve it.
 pub struct BoundGatewayListener {
     pub listener: TcpListener,
-    pub address: SocketAddr,
-    pub scope: GatewayListenerScope,
-    pub covered_addresses: Vec<CoveredGatewayAddress>,
+    pub spec: GatewayListenerSpec,
+}
+
+impl GatewayListenerSpec {
+    pub fn new(address: SocketAddr, scope: GatewayListenerScope) -> Self {
+        Self {
+            address,
+            scope,
+            covered_addresses: Vec::new(),
+        }
+    }
+
+    pub fn scope_for_local_addr(&self, local_addr: SocketAddr) -> GatewayListenerScope {
+        self.covered_addresses
+            .iter()
+            .find(|covered| covered.address == local_addr)
+            .map_or(self.scope, |covered| covered.scope)
+    }
+
+    fn bind_to(mut self, local_addr: SocketAddr) -> Self {
+        let requested_addr = self.address;
+        self.address = local_addr;
+        self.covered_addresses =
+            resolve_bound_covered_addresses(&self.covered_addresses, requested_addr, local_addr);
+        self
+    }
 }
 
 fn gateway_listener_specs(
     bind_address: SocketAddr,
     extra_addresses: &[SocketAddr],
 ) -> Vec<GatewayListenerSpec> {
-    let mut specs = vec![GatewayListenerSpec {
-        address: bind_address,
-        scope: GatewayListenerScope::Primary,
-        covered_addresses: Vec::new(),
-    }];
+    let mut specs = vec![GatewayListenerSpec::new(
+        bind_address,
+        GatewayListenerScope::Primary,
+    )];
     for address in extra_addresses {
         let scope = GatewayListenerScope::ComputeDriverCallback;
         if let Some(existing) = specs
@@ -62,11 +84,7 @@ fn gateway_listener_specs(
                 });
             }
         } else {
-            specs.push(GatewayListenerSpec {
-                address: *address,
-                scope,
-                covered_addresses: Vec::new(),
-            });
+            specs.push(GatewayListenerSpec::new(*address, scope));
         }
     }
     specs
@@ -86,27 +104,10 @@ pub async fn bind_gateway_listeners(
         info!(address = %local_addr, "Server listening");
         listeners.push(BoundGatewayListener {
             listener,
-            address: local_addr,
-            scope: spec.scope,
-            covered_addresses: resolve_bound_covered_addresses(
-                &spec.covered_addresses,
-                spec.address,
-                local_addr,
-            ),
+            spec: spec.bind_to(local_addr),
         });
     }
     Ok(listeners)
-}
-
-pub fn gateway_listener_scope_for_local_addr(
-    default_scope: GatewayListenerScope,
-    covered_addresses: &[CoveredGatewayAddress],
-    local_addr: SocketAddr,
-) -> GatewayListenerScope {
-    covered_addresses
-        .iter()
-        .find(|covered| covered.address == local_addr)
-        .map_or(default_scope, |covered| covered.scope)
 }
 
 fn resolve_bound_covered_addresses(
@@ -158,7 +159,7 @@ fn listener_covers(existing: SocketAddr, requested: SocketAddr) -> bool {
 mod tests {
     use super::{
         CoveredGatewayAddress, GatewayListenerScope, GatewayListenerSpec, bind_gateway_listeners,
-        gateway_listener_scope_for_local_addr, gateway_listener_specs,
+        gateway_listener_specs,
     };
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -192,11 +193,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            gateway_listener_scope_for_local_addr(spec.scope, &spec.covered_addresses, docker),
+            spec.scope_for_local_addr(docker),
             GatewayListenerScope::ComputeDriverCallback,
         );
         assert_eq!(
-            gateway_listener_scope_for_local_addr(spec.scope, &spec.covered_addresses, loopback),
+            spec.scope_for_local_addr(loopback),
             GatewayListenerScope::Primary,
         );
     }

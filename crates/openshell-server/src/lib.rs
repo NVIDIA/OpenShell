@@ -72,10 +72,9 @@ use tracing::{debug, error, info, warn};
 pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 use compute::ComputeRuntime;
-use gateway_listener::{
-    BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners,
-    gateway_listener_scope_for_local_addr,
-};
+#[cfg(test)]
+use gateway_listener::GatewayListenerSpec;
+use gateway_listener::{BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
@@ -563,12 +562,8 @@ async fn serve_gateway_listener(
     enable_loopback_service_http: bool,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let BoundGatewayListener {
-        listener,
-        address: listen_addr,
-        scope,
-        covered_addresses,
-    } = bound_listener;
+    let BoundGatewayListener { listener, spec } = bound_listener;
+    let listen_addr = spec.address;
 
     loop {
         let accepted = tokio::select! {
@@ -589,12 +584,10 @@ async fn serve_gateway_listener(
             }
         };
         let listener_scope = match stream.local_addr() {
-            Ok(local_addr) => {
-                gateway_listener_scope_for_local_addr(scope, &covered_addresses, local_addr)
-            }
+            Ok(local_addr) => spec.scope_for_local_addr(local_addr),
             Err(e) => {
                 debug!(error = %e, client = %addr, listen = %listen_addr, "Failed to inspect accepted local address");
-                scope
+                spec.scope
             }
         };
 
@@ -1016,10 +1009,10 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
 mod tests {
     use super::{
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, GatewayListenerScope,
-        MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
-        bind_gateway_listeners, classify_initial_bytes, configured_compute_driver,
-        is_benign_tls_handshake_failure, kubernetes_sandbox_jwt_expiry_disabled,
-        serve_gateway_listener,
+        GatewayListenerSpec, MultiplexService, ServerState, TlsAcceptor,
+        allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
+        configured_compute_driver, is_benign_tls_handshake_failure,
+        kubernetes_sandbox_jwt_expiry_disabled, serve_gateway_listener,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -1115,9 +1108,7 @@ mod tests {
         let handle = tokio::spawn(serve_gateway_listener(
             BoundGatewayListener {
                 listener,
-                address: listen_addr,
-                scope: GatewayListenerScope::Primary,
-                covered_addresses: Vec::new(),
+                spec: GatewayListenerSpec::new(listen_addr, GatewayListenerScope::Primary),
             },
             service,
             Some(tls_acceptor),
