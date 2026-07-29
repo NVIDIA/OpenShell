@@ -54,7 +54,7 @@ This is worth an RFC rather than a single issue because it is a cross-cutting
 architectural decision: it adds a new compute-driver model (in-process,
 supervisor-free), a new platform target with its own build/CI lane, a new
 policy-translation seam between OpenShell policy and MXC config, and a new
-deployment shape (the gateway as a long-lived Windows Service). It also commits
+host-side enforcement model for native Windows sandboxes. It also commits
 OpenShell to a set of dependencies on the Microsoft MXC team. These decisions
 deserve broad review and a durable record.
 
@@ -75,7 +75,8 @@ the Windows work continues to live outside the public project.
   `ComputeDriverService` adapter for MXC. The driver is in-process.
 - Full L7/port/binary-scoped policy enforcement inside MXC itself. MXC network
   filtering is host/IP/CIDR-level; rich policy stays on the host proxy.
-- MSI/WinGet packaging and installer UX
+- MSI/WinGet packaging, installer UX, auto-start, and background gateway
+  management.
 - GPU passthrough into MXC sandboxes.
 - Changing Linux or macOS build, runtime, or driver behavior. All Windows code is
   gated behind `cfg(target_os = "windows")`.
@@ -85,36 +86,68 @@ the Windows work continues to live outside the public project.
 ### Layered architecture
 
 OpenShell on Windows is a four-layer stack with a single hard trust boundary at
-the MXC sandbox. The gateway runs as a long-lived Windows Service; the MXC
-compute driver and the host CONNECT proxy live inside that one process. The agent
-runs inside an MXC AppContainer with all egress redirected back to the host
-proxy.
+the MXC sandbox. For the current scope, the gateway runs as a user-launched
+native Windows process. The MXC compute driver and per-sandbox host CONNECT proxy
+tasks live inside that process. The agent runs inside an MXC AppContainer with
+all egress redirected to its assigned host proxy listener.
 
 ```mermaid
-flowchart TB
-    cli["Clients<br/>openshell.exe (CLI) · TUI · Python SDK"] -->|"gRPC + mTLS"| gw
+flowchart LR
+    clients["Clients<br/>CLI · TUI · SDK"]
+    upstreams["Internet / configured upstreams"]
 
-    subgraph svc["openshell-gateway.exe — Windows Service (NetworkService)"]
-        gw["control plane<br/>auth · sandbox state (SQLite) · policy · providers · OCSF audit"]
-        drv["openshell-driver-mxc (in-process)<br/>wxc-exec invoker · per-sandbox registry · policy→MXC · creds"]
-        proxy["CONNECT proxy · 127.0.0.1:N<br/>OPA · L7 · inference router · privacy router"]
+    subgraph host["Windows host"]
+        direction LR
+
+        subgraph gateway["openshell-gateway.exe - one native Windows process"]
+            direction TB
+
+            control["Control plane<br/>auth · sandbox state · policy · audit"]
+            driver["openshell-driver-mxc (in-process)<br/>one backend · N sandbox entries"]
+
+            subgraph proxies["Per-sandbox host proxy tasks and listeners (N)"]
+                direction TB
+                proxy_a["Proxy A<br/>127.0.0.1:port_A<br/>policy A · agent identity A"]
+                proxy_n["Proxy N<br/>127.0.0.1:port_N<br/>policy N · agent identity N"]
+            end
+
+            control --> driver
+            driver -->|"owns HostProxyHandle A"| proxy_a
+            driver -->|"owns HostProxyHandle N"| proxy_n
+        end
+
+        wxc["wxc-exec.exe invocation(s)"]
+
+        subgraph sandboxes["MXC AppContainers (N)"]
+            direction TB
+            sandbox_a["Sandbox A<br/>agent workload A only<br/>no OpenShell supervisor"]
+            sandbox_n["Sandbox N<br/>agent workload N only<br/>no OpenShell supervisor"]
+        end
+
+        driver -->|"launch and configure"| wxc
+        wxc -->|"creates and runs"| sandbox_a
+        wxc -->|"creates and runs"| sandbox_n
+
+        sandbox_a -.->|"MXC network.proxy<br/>localhost:port_A"| proxy_a
+        sandbox_n -.->|"MXC network.proxy<br/>localhost:port_N"| proxy_n
     end
 
-    drv -->|"wxc-exec --config-base64 ...<br/>provision · start · exec · stop · deprovision"| wxc["wxc-exec.exe (unmodified)"]
-    wxc -->|"creates &amp; holds"| box
-
-    subgraph box["MXC AppContainer (processcontainer default) — isolated"]
-        agent["agent (OpenClaw / Hermes / Codex / python / node)<br/>creds via process.env"]
-    end
-
-    agent -.->|"egress via MXC network.proxy"| proxy
-    proxy -.->|"filtered"| net["Internet / inference"]
+    clients -->|"gRPC + mTLS"| control
+    proxy_a -->|"policy-filtered egress"| upstreams
+    proxy_n -->|"policy-filtered egress"| upstreams
 ```
 
-The defining property is that the OpenShell value layers — egress policy, L7
-inspection, inference routing, and the privacy router — live on the host inside
-the gateway process, not inside the sandbox. A native Windows agent therefore
-gets the Linux feature set without an in-sandbox supervisor.
+The gateway-to-sandbox relationship is 1:N for control and lifecycle, but the
+proxy-listener-to-sandbox relationship is 1:1. Each sandbox registry entry owns
+one `HostProxyHandle`, one sandbox-specific policy, and one unique ephemeral
+loopback listener. The listener identifies the sandbox without attributing
+connections arriving on a shared proxy port.
+
+The defining property is that OpenShell network enforcement lives on the host
+inside the gateway process, not inside the sandbox. The current host-mode path
+provides L4 policy and plaintext/forward-proxy L7 handling. HTTPS MITM trust
+bootstrap, inference/privacy routing, and gateway event-bus wiring remain
+follow-up work.
 
 This still allows the existing supervisor networking code to be reused as a
 host-side proxy component. The boundary is that Windows does not run
@@ -138,7 +171,8 @@ library entry points and configuration structs on both platforms.
 - `openshell-core/build.rs` selects a vendored `protoc` per platform
   (`protoc-bin-vendored` on Windows, `protobuf-src` elsewhere) so proto
   compilation succeeds under MSVC.
-- Windows path defaults resolve SQLite/data under `%APPDATA%`/`%ProgramData%`.
+- Windows path defaults resolve configuration under `%APPDATA%` and state/data
+  under `%LOCALAPPDATA%`.
 - Validation runs through a dedicated `mise` lane (`tasks/windows.toml` →
   `tasks/scripts/windows-msvc.ps1`) invoked as `mise run --skip-tools windows:*`,
   separate from the default Linux `ci` task. The wrapper discovers Visual
@@ -167,7 +201,7 @@ trait — there is no separate binary, no surrogate, and no tonic adapter.
 | registry | In-memory `Arc<Mutex<…>>` mapping OpenShell sandbox id/name ⇄ MXC session id + phase state + exec/PTY handles. Source of truth for Get/List/Watch (MXC has no list-sessions API). |
 | `mxc.rs` | Builds MXC config JSON, base64-encodes it, runs `wxc-exec`, parses envelopes; encapsulates exec-vs-non-exec stdout semantics and error-code mapping. |
 | `policy.rs` | Translates the `SandboxPolicy` proto → MXC config and rejects unenforceable rules. Delegates to the embedded policy mapper (see Part 3). |
-| `proxy.rs` | Hosts the existing OpenShell CONNECT proxy on `127.0.0.1:N`, attributes inbound loopback connections to a sandbox, applies that sandbox's policy. Reuses the Linux proxy/OPA/L7/router code unchanged. |
+| `openshell-supervisor-network::host` | Starts one host CONNECT proxy task per sandbox on a unique `127.0.0.1:<ephemeral-port>` listener, applies that sandbox's trimmed network policy and static agent identity, and retains its `HostProxyHandle` in the driver registry. |
 
 #### Workload and software availability
 
@@ -242,7 +276,7 @@ ephemeral port. It starts the existing OpenShell host CONNECT proxy with that
 sandbox's trimmed network-only policy, then writes the allocated port to MXC's
 `network.proxy = { localhost: N }` redirect. Loopback inside an AppContainer is
 host loopback, so sandbox egress reaches the proxy running in the in-process MXC
-driver and gateway service.
+driver inside the gateway process.
 
 The host-listener-to-sandbox topology is **1:1**, not many-to-one. Multiple
 sandboxes share `127.0.0.1`, but each active sandbox owns a unique ephemeral port
@@ -324,10 +358,11 @@ kernel-level defense-in-depth.
   this RFC. Consequence: governed egress on the opt-in `isolation_session`
   backend depends on Microsoft extending `network.proxy` to that backend; until
   then the design defaults to `processcontainer`, where it works today.
-- **D3 — Gateway as a long-lived Windows Service** under
-  `NT AUTHORITY\NetworkService`. Clients connect over gRPC (loopback or remote
-  mTLS). SQLite at `%ProgramData%\OpenShell\openshell.db`, Windows Event Log
-  integration, mTLS bootstrap on first run.
+- **D3 — User-launched native Windows gateway for the current scope.** Run
+  `openshell-gateway.exe` as a regular user process. Clients connect over gRPC
+  (loopback or remote mTLS), and existing per-user configuration and state paths
+  remain in effect. Installation, auto-start, background process management,
+  and Windows Event Log integration are outside this RFC.
 - **D4 — Reduce the gRPC footprint to the client-facing API only.** Supervisor
   removal deletes the supervisor and sandbox-relay boundaries; in-process MXC
   removes the wire protocol on the gateway↔driver boundary. Only client↔gateway
@@ -349,9 +384,10 @@ are never affected and the changes can land additively.
   `ValidateSandboxCreate` with `invalid_argument` naming the rule. HTTPS MITM,
   inference/privacy routing, and gateway event-bus wiring follow after host-mode
   trust bootstrap is available.
-- **Gateway as a Windows Service.** Package `openshell-gateway.exe` as a Windows
-  Service with SQLite under `%ProgramData%`, Windows Event Log integration, and
-  mTLS bootstrap on first run.
+- **Gateway runtime.** Run `openshell-gateway.exe` directly as a regular user
+  process with the existing per-user configuration, SQLite, TLS, and logging
+  paths. Installation, auto-start, and background process management are
+  follow-up work.
 - **Hardening.** Validate collision-free per-sandbox ephemeral port allocation
   and `processcontainer` concurrency. Persist the sandbox-id ⇄ session-id
   mapping so a gateway restart can reconcile or clean up orphaned sessions, and
