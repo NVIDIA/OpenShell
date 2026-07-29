@@ -77,7 +77,8 @@ EOF
     echo "gateway pid=$GATEWAY_PID"
 
     for _ in $(seq 1 60); do
-        if grep -q "Server listening" "$LOG" 2>/dev/null; then
+        if curl -sf --connect-timeout 1 \
+            "http://127.0.0.1:${health_port}/healthz" >/dev/null 2>&1; then
             return 0
         fi
         if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
@@ -87,7 +88,7 @@ EOF
         fi
         sleep 1
     done
-    echo "!! gateway never reported ready"
+    echo "!! gateway health endpoint never became healthy"
     tail -40 "$LOG" >&2
     return 1
 }
