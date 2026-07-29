@@ -754,6 +754,7 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs, matches: &ArgMatches
                         | ComputeDriverKind::Podman
                         | ComputeDriverKind::Kubernetes
                         | ComputeDriverKind::Vm
+                        | ComputeDriverKind::Mxc
                 )
             ) {
                 return Err(miette::miette!(

@@ -388,7 +388,9 @@ fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
             "guest_tls_cert",
             "guest_tls_key",
         ],
-        None => &[],
+        // MXC reads its own settings from the driver config table and has no
+        // gateway-inherited required fields.
+        Some(ComputeDriverKind::Mxc) | None => &[],
     }
 }
 

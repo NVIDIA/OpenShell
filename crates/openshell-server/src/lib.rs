@@ -864,8 +864,6 @@ async fn build_compute_runtime(
     info!(driver = %driver.name(), "Using compute driver");
 
     let runtime = match driver {
-        #[cfg(target_os = "windows")]
-        ConfiguredComputeDriver::Builtin(driver) => Err(unsupported_builtin_compute_driver(driver)),
         #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Kubernetes) => {
             warn_if_kubernetes_sandbox_jwt_expiry_disabled(config);
@@ -928,6 +926,33 @@ async fn build_compute_runtime(
             )
             .await
         }
+        ConfiguredComputeDriver::Builtin(ComputeDriverKind::Mxc) => {
+            #[cfg(target_os = "windows")]
+            {
+                let mxc_config = compute::driver_config::mxc_config_from_context(driver_startup)?;
+                ComputeRuntime::new_mxc(
+                    mxc_config,
+                    store,
+                    sandbox_index,
+                    sandbox_watch_bus,
+                    tracing_log_bus,
+                    supervisor_sessions,
+                )
+                .await
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Err(compute::ComputeError::Message(
+                    "the mxc compute driver is only supported on Windows".to_string(),
+                ))
+            }
+        }
+        // Any remaining built-in driver is a Linux-only container backend whose
+        // crate is not compiled on Windows; report it as unsupported. Must sit
+        // after the MXC arm so MXC (the one Windows-supported built-in) matches
+        // first instead of being swallowed by this catch-all.
+        #[cfg(target_os = "windows")]
+        ConfiguredComputeDriver::Builtin(driver) => Err(unsupported_builtin_compute_driver(driver)),
         ConfiguredComputeDriver::Remote { name } => {
             let remote_config =
                 compute::driver_config::remote_driver_config_from_context(driver_startup, &name)?;
