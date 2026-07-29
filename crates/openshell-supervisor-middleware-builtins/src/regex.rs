@@ -20,8 +20,7 @@ use regex::Regex;
 use serde::Deserialize;
 
 pub const NAME: &str = "openshell/regex";
-const MAX_BODY_BYTES: u64 = 256 * 1024;
-const MAX_MESSAGE_BYTES: u64 = 256 * 1024;
+const MAX_PAYLOAD_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -52,13 +51,13 @@ pub fn describe() -> Vec<MiddlewareBinding> {
         MiddlewareBinding {
             operation: SupervisorMiddlewareOperation::HttpRequest as i32,
             phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-            max_payload_bytes: MAX_BODY_BYTES,
+            max_payload_bytes: MAX_PAYLOAD_BYTES,
             timeout: String::new(),
         },
         MiddlewareBinding {
             operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
             phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-            max_payload_bytes: MAX_MESSAGE_BYTES,
+            max_payload_bytes: MAX_PAYLOAD_BYTES,
             timeout: String::new(),
         },
     ]
@@ -116,9 +115,9 @@ pub fn evaluate_websocket_text(
     validate_config(config)?;
     let payload_bytes = u64::try_from(payload.len())
         .map_err(|_| miette!("{NAME} WebSocket text message length is not representable"))?;
-    if payload_bytes > MAX_MESSAGE_BYTES {
+    if payload_bytes > MAX_PAYLOAD_BYTES {
         return Err(miette!(
-            "{NAME} WebSocket text message exceeds {MAX_MESSAGE_BYTES} bytes"
+            "{NAME} WebSocket text message exceeds {MAX_PAYLOAD_BYTES} bytes"
         ));
     }
     let text = std::str::from_utf8(payload)

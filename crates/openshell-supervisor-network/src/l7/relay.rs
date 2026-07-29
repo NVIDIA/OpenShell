@@ -2720,7 +2720,7 @@ network_policies:
                         phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
                             as i32,
                         max_payload_bytes:
-                            openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES as u64,
+                            openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES as u64,
                         timeout: "2s".into(),
                     }],
                 },
@@ -2830,7 +2830,7 @@ network_policies:
             vec![SupervisorMiddlewareService {
                 name: "preflight-service".into(),
                 grpc_endpoint: format!("http://{address}"),
-                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES
+                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
                 timeout: "2s".into(),
             }],

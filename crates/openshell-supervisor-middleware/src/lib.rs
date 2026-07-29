@@ -160,8 +160,8 @@ pub use openshell_core::middleware::{
     middleware_timeout_or_default, parse_middleware_timeout,
 };
 
-/// Largest request or replacement body accepted by the middleware platform.
-pub const MAX_MIDDLEWARE_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Largest logical payload or replacement accepted by the middleware platform.
+pub const MAX_MIDDLEWARE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 /// Largest encoded service-specific configuration attached to one evaluation.
 pub const MAX_MIDDLEWARE_CONFIG_BYTES: usize = 64 * 1024;
 /// Largest encoded request identity context attached to one evaluation.
@@ -196,16 +196,16 @@ const MAX_MIDDLEWARE_RESPONSE_ENVELOPE_BYTES: usize = MAX_MIDDLEWARE_REASON_BYTE
     + MAX_MIDDLEWARE_FINDINGS_PER_STAGE * MAX_MIDDLEWARE_FINDING_BYTES
     + MAX_MIDDLEWARE_METADATA_BYTES
     + MAX_MIDDLEWARE_PROTOBUF_OVERHEAD_BYTES;
-/// gRPC envelope headroom derived from every bounded non-body component.
+/// gRPC envelope headroom derived from every bounded non-payload component.
 pub const MIDDLEWARE_GRPC_ENVELOPE_BYTES: usize =
     if MAX_MIDDLEWARE_REQUEST_ENVELOPE_BYTES > MAX_MIDDLEWARE_RESPONSE_ENVELOPE_BYTES {
         MAX_MIDDLEWARE_REQUEST_ENVELOPE_BYTES
     } else {
         MAX_MIDDLEWARE_RESPONSE_ENVELOPE_BYTES
     };
-/// gRPC message limit derived from the body and bounded protobuf components.
+/// gRPC message limit derived from the payload and bounded protobuf components.
 pub const MIDDLEWARE_GRPC_MESSAGE_BYTES: usize =
-    MAX_MIDDLEWARE_BODY_BYTES + MIDDLEWARE_GRPC_ENVELOPE_BYTES;
+    MAX_MIDDLEWARE_PAYLOAD_BYTES + MIDDLEWARE_GRPC_ENVELOPE_BYTES;
 
 const MAX_STABLE_IDENTIFIER_BYTES: usize = 128;
 const EXTERNAL_FINDING_LABEL: &str = "External middleware finding";
@@ -574,9 +574,9 @@ fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<D
             registration.name
         ));
     }
-    if registration.max_payload_bytes > MAX_MIDDLEWARE_BODY_BYTES as u64 {
+    if registration.max_payload_bytes > MAX_MIDDLEWARE_PAYLOAD_BYTES as u64 {
         return Err(miette!(
-            "middleware registration '{}' max_payload_bytes exceeds the platform maximum of {MAX_MIDDLEWARE_BODY_BYTES}",
+            "middleware registration '{}' max_payload_bytes exceeds the platform maximum of {MAX_MIDDLEWARE_PAYLOAD_BYTES}",
             registration.name
         ));
     }
@@ -626,9 +626,9 @@ fn validate_payload_limit(source: &str, binding: &MiddlewareBinding) -> Result<u
     if binding.max_payload_bytes == 0 {
         return Err(miette!("{source} must advertise a non-zero payload limit"));
     }
-    if binding.max_payload_bytes > MAX_MIDDLEWARE_BODY_BYTES as u64 {
+    if binding.max_payload_bytes > MAX_MIDDLEWARE_PAYLOAD_BYTES as u64 {
         return Err(miette!(
-            "{source} payload limit exceeds the platform maximum of {MAX_MIDDLEWARE_BODY_BYTES}"
+            "{source} payload limit exceeds the platform maximum of {MAX_MIDDLEWARE_PAYLOAD_BYTES}"
         ));
     }
     usize::try_from(binding.max_payload_bytes)
@@ -751,7 +751,7 @@ fn normalize_untrusted_diagnostics(
 fn validate_request_envelope(
     evaluation: &HttpRequestEvaluation,
 ) -> std::result::Result<(), &'static str> {
-    if evaluation.body.len() > MAX_MIDDLEWARE_BODY_BYTES {
+    if evaluation.body.len() > MAX_MIDDLEWARE_PAYLOAD_BYTES {
         return Err("request_body_over_capacity");
     }
     if evaluation
@@ -793,7 +793,7 @@ fn validate_request_envelope(
 fn validate_response_envelope(
     result: &openshell_core::proto::HttpRequestResult,
 ) -> std::result::Result<(), &'static str> {
-    if result.body.len() > MAX_MIDDLEWARE_BODY_BYTES {
+    if result.body.len() > MAX_MIDDLEWARE_PAYLOAD_BYTES {
         return Err("response_body_over_capacity");
     }
     if result.reason.len() > MAX_MIDDLEWARE_REASON_BYTES {
@@ -2901,12 +2901,12 @@ mod tests {
     fn external_registration_rejects_payload_limit_above_platform_maximum() {
         let registration = external_registration(u64::MAX);
         let error = validate_registration(&registration)
-            .expect_err("extreme body limit must be rejected before allocation");
+            .expect_err("extreme payload limit must be rejected before allocation");
         assert!(error.to_string().contains("platform maximum"));
     }
 
     #[test]
-    fn manifest_rejects_body_limit_above_platform_maximum() {
+    fn manifest_rejects_payload_limit_above_platform_maximum() {
         let registration = external_registration(4096);
         let manifest = MiddlewareManifest {
             name: "example/service".into(),
@@ -2919,7 +2919,7 @@ mod tests {
             }],
         };
         let error = validate_external_manifest(&registration, &manifest, Some(4096))
-            .expect_err("extreme advertised body limit must be rejected");
+            .expect_err("extreme advertised payload limit must be rejected");
         assert!(error.to_string().contains("platform maximum"));
     }
 
@@ -2952,7 +2952,7 @@ mod tests {
         let binding = |phase| MiddlewareBinding {
             operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
             phase: phase as i32,
-            max_payload_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
+            max_payload_bytes: MAX_MIDDLEWARE_PAYLOAD_BYTES as u64,
             timeout: "500ms".into(),
         };
         let mut manifest = MiddlewareManifest {
@@ -3313,11 +3313,11 @@ mod tests {
             .add_service(
                 SupervisorMiddlewareServer::new(ScriptedService {
                     manifest_name: "test/middleware".into(),
-                    max_body_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
+                    max_body_bytes: MAX_MIDDLEWARE_PAYLOAD_BYTES as u64,
                     result: openshell_core::proto::HttpRequestResult {
                         reason: "r".repeat(MAX_MIDDLEWARE_REASON_BYTES - 128),
                         reason_code: "r".repeat(MAX_MIDDLEWARE_REASON_CODE_BYTES),
-                        body: vec![b'x'; MAX_MIDDLEWARE_BODY_BYTES],
+                        body: vec![b'x'; MAX_MIDDLEWARE_PAYLOAD_BYTES],
                         has_body: true,
                         header_mutations: vec![write_header(
                             "x-openshell-middleware-envelope",
@@ -3341,7 +3341,7 @@ mod tests {
             });
         let server_task = tokio::spawn(server);
 
-        let mut registration = external_registration(MAX_MIDDLEWARE_BODY_BYTES as u64);
+        let mut registration = external_registration(MAX_MIDDLEWARE_PAYLOAD_BYTES as u64);
         registration.grpc_endpoint = format!("http://{address}");
         let registry = MiddlewareRegistry::connect_services(Vec::new(), vec![registration])
             .await
@@ -3365,7 +3365,7 @@ mod tests {
             "x-large-envelope".into(),
             "v".repeat(MAX_MIDDLEWARE_HEADER_BYTES - 256),
         )];
-        request.body = vec![b'b'; MAX_MIDDLEWARE_BODY_BYTES];
+        request.body = vec![b'b'; MAX_MIDDLEWARE_PAYLOAD_BYTES];
         let outcome = ChainRunner::from_registry(registry)
             .evaluate(
                 &[ChainEntry {
@@ -3381,7 +3381,7 @@ mod tests {
             .expect("maximum bounded envelopes should fit configured transport limit");
 
         assert!(outcome.allowed);
-        assert_eq!(outcome.body.len(), MAX_MIDDLEWARE_BODY_BYTES);
+        assert_eq!(outcome.body.len(), MAX_MIDDLEWARE_PAYLOAD_BYTES);
         assert_eq!(outcome.header_mutations.len(), 1);
         assert_eq!(outcome.findings.len(), MAX_MIDDLEWARE_FINDINGS_PER_STAGE);
         let _ = shutdown_tx.send(());
@@ -3396,7 +3396,7 @@ mod tests {
         assert_eq!(MIDDLEWARE_GRPC_ENVELOPE_BYTES, 292 * 1024 + 64);
         assert_eq!(
             MIDDLEWARE_GRPC_MESSAGE_BYTES,
-            MAX_MIDDLEWARE_BODY_BYTES + 292 * 1024 + 64
+            MAX_MIDDLEWARE_PAYLOAD_BYTES + 292 * 1024 + 64
         );
     }
 
@@ -4090,7 +4090,7 @@ mod tests {
                 bindings: vec![MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_payload_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
+                    max_payload_bytes: MAX_MIDDLEWARE_PAYLOAD_BYTES as u64,
                     timeout: "1s".into(),
                 }],
             }))

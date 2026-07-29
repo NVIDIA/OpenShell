@@ -21,7 +21,7 @@ use std::future::Future;
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-const MAX_TEXT_MESSAGE_BYTES: usize = openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES;
+const MAX_TEXT_MESSAGE_BYTES: usize = openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES;
 const MAX_RAW_FRAME_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MESSAGE_FRAGMENTS: usize = 4096;
 const TEXT_MESSAGE_ASSEMBLY_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
@@ -2515,7 +2515,7 @@ network_policies:
                 bindings: vec![MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                    max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES
+                    max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                         as u64,
                     timeout: "1s".into(),
                 }],
@@ -2674,7 +2674,7 @@ network_policies:
             vec![SupervisorMiddlewareService {
                 name: "openai-redactor".into(),
                 grpc_endpoint: format!("http://{address}"),
-                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES
+                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
                 timeout: "2s".into(),
             }],
@@ -3283,7 +3283,7 @@ network_policies:
             vec![SupervisorMiddlewareService {
                 name: "openai-redactor".into(),
                 grpc_endpoint: format!("http://{address}"),
-                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES
+                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
                 timeout: "2s".into(),
             }],
@@ -3423,7 +3423,7 @@ network_policies:
             vec![SupervisorMiddlewareService {
                 name: "openai-redactor".into(),
                 grpc_endpoint: format!("http://{address}"),
-                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES
+                max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
                 timeout: "2s".into(),
             }],

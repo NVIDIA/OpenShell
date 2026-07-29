@@ -26,8 +26,7 @@ use tonic::{Request, Response, Status};
 
 const MANIFEST_NAME: &str = "example/content-guard-service";
 const PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::PreCredentials;
-const MAX_BODY_BYTES: u64 = 256 * 1024;
-const MAX_MESSAGE_BYTES: u64 = 256 * 1024;
+const MAX_PAYLOAD_BYTES: u64 = 256 * 1024;
 const DEFAULT_REPLACEMENT: &str = "[REDACTED]";
 
 #[derive(Debug, Parser)]
@@ -230,13 +229,13 @@ impl SupervisorMiddleware for ContentGuard {
                 MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: PHASE as i32,
-                    max_payload_bytes: MAX_BODY_BYTES,
+                    max_payload_bytes: MAX_PAYLOAD_BYTES,
                     timeout: String::new(),
                 },
                 MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                     phase: PHASE as i32,
-                    max_payload_bytes: MAX_MESSAGE_BYTES,
+                    max_payload_bytes: MAX_PAYLOAD_BYTES,
                     timeout: String::new(),
                 },
             ],
@@ -351,9 +350,9 @@ fn evaluate_websocket_message(
     let payload_bytes = u64::try_from(message.payload.len()).map_err(|_| {
         Status::invalid_argument("WebSocket text message length is not representable")
     })?;
-    if payload_bytes > MAX_MESSAGE_BYTES {
+    if payload_bytes > MAX_PAYLOAD_BYTES {
         return Err(Status::invalid_argument(format!(
-            "WebSocket text message exceeds {MAX_MESSAGE_BYTES} bytes"
+            "WebSocket text message exceeds {MAX_PAYLOAD_BYTES} bytes"
         )));
     }
     let payload = std::str::from_utf8(&message.payload)
@@ -517,12 +516,12 @@ mod tests {
             manifest.bindings[0].operation,
             SupervisorMiddlewareOperation::HttpRequest as i32
         );
-        assert_eq!(manifest.bindings[0].max_payload_bytes, MAX_BODY_BYTES);
+        assert_eq!(manifest.bindings[0].max_payload_bytes, MAX_PAYLOAD_BYTES);
         assert_eq!(
             manifest.bindings[1].operation,
             SupervisorMiddlewareOperation::WebsocketMessage as i32
         );
-        assert_eq!(manifest.bindings[1].max_payload_bytes, MAX_MESSAGE_BYTES);
+        assert_eq!(manifest.bindings[1].max_payload_bytes, MAX_PAYLOAD_BYTES);
     }
 
     #[tokio::test]

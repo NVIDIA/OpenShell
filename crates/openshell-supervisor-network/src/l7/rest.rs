@@ -4413,7 +4413,7 @@ mod tests {
             &mut client,
             &[],
             None,
-            Some(openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES),
+            Some(openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES),
         )
         .await
         .expect("chunked body should decode");
@@ -4441,7 +4441,7 @@ mod tests {
             &req,
             &mut client,
             None,
-            openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES,
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES,
         )
         .await
         .expect("oversized body should produce a capacity result");

@@ -21,13 +21,13 @@ use openshell_core::proto::{
 };
 
 use super::{
-    ChainEntry, ChainRunner, DescribedChainEntry, MAX_MIDDLEWARE_BODY_BYTES,
-    MAX_MIDDLEWARE_CHAIN_TIMEOUT, MAX_MIDDLEWARE_CONFIG_BYTES, MAX_MIDDLEWARE_CONTEXT_BYTES,
-    MAX_MIDDLEWARE_FINDING_BYTES, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_METADATA_BYTES,
-    MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT, MAX_MIDDLEWARE_REASON_BYTES,
-    MIDDLEWARE_GRPC_MESSAGE_BYTES, MiddlewareDenial, MiddlewareSessionAdmission,
-    MiddlewareSessionPermit, MiddlewareWorkAdmission, NamespacedFinding, OnError,
-    is_stable_reason_code, middleware_denial_reason,
+    ChainEntry, ChainRunner, DescribedChainEntry, MAX_MIDDLEWARE_CHAIN_TIMEOUT,
+    MAX_MIDDLEWARE_CONFIG_BYTES, MAX_MIDDLEWARE_CONTEXT_BYTES, MAX_MIDDLEWARE_FINDING_BYTES,
+    MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_METADATA_BYTES,
+    MAX_MIDDLEWARE_METADATA_ENTRIES, MAX_MIDDLEWARE_PAYLOAD_BYTES,
+    MAX_MIDDLEWARE_PREFLIGHT_TIMEOUT, MAX_MIDDLEWARE_REASON_BYTES, MIDDLEWARE_GRPC_MESSAGE_BYTES,
+    MiddlewareDenial, MiddlewareSessionAdmission, MiddlewareSessionPermit, MiddlewareWorkAdmission,
+    NamespacedFinding, OnError, is_stable_reason_code, middleware_denial_reason,
 };
 
 const STREAM_CHANNEL_CAPACITY: usize = 4;
@@ -499,7 +499,7 @@ impl WebSocketSession {
     }
 
     pub async fn evaluate_text(&mut self, payload: Vec<u8>) -> WebSocketMessageOutcome {
-        if payload.len() > MAX_MIDDLEWARE_BODY_BYTES {
+        if payload.len() > MAX_MIDDLEWARE_PAYLOAD_BYTES {
             return platform_oversize_outcome(payload);
         }
         match self.admit_message().await {
@@ -526,7 +526,7 @@ impl WebSocketSession {
         payload: Vec<u8>,
         admission: MiddlewareWorkAdmission,
     ) -> WebSocketMessageOutcome {
-        if payload.len() > MAX_MIDDLEWARE_BODY_BYTES {
+        if payload.len() > MAX_MIDDLEWARE_PAYLOAD_BYTES {
             return platform_oversize_outcome(payload);
         }
 
@@ -1118,7 +1118,7 @@ fn validate_message_result(
         return Err("unsolicited_replacement");
     }
     if result.has_replacement {
-        if result.replacement.len() > MAX_MIDDLEWARE_BODY_BYTES {
+        if result.replacement.len() > MAX_MIDDLEWARE_PAYLOAD_BYTES {
             return Err("response_message_over_platform_capacity");
         }
         if result.replacement.len() > stage_limit {
