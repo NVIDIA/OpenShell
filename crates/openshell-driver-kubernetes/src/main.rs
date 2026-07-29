@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(not(target_os = "windows"))]
-include!("main_unix.rs");
+use clap::{ArgAction, Parser};
+use miette::{IntoDiagnostic, Result};
+use std::net::SocketAddr;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;

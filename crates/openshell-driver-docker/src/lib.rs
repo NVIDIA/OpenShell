@@ -1,11 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(target_os = "windows")]
-mod windows;
+//! Docker compute driver.
 
-#[cfg(target_os = "windows")]
-pub use windows::{DockerComputeConfig, default_docker_supervisor_image};
+#![allow(clippy::result_large_err)]
 
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
