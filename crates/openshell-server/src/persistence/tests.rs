@@ -2016,3 +2016,67 @@ async fn membership_and_label_selector_handles_dotted_keys() {
         .unwrap();
     assert_eq!(results.len(), 0, "wrong value for dotted key");
 }
+
+/// Single quotes in label keys must not break the SQL query (CWE-89
+/// defense-in-depth). The gRPC validation layer rejects such keys, but the
+/// persistence layer must handle them safely regardless.
+#[tokio::test]
+async fn membership_selector_escapes_adversarial_label_key() {
+    let store = test_store().await;
+
+    store
+        .put(
+            "workspace",
+            "ws-sq-id",
+            "ws-sq",
+            "",
+            b"p1",
+            Some(r#"{"it's":"here"}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .put("workspace_member", "m1", "alice", "ws-sq", b"", None)
+        .await
+        .unwrap();
+
+    // A key containing a single quote must not cause a SQL error.
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "it's=here",
+            10,
+            0,
+        )
+        .await;
+    assert!(
+        results.is_ok(),
+        "single-quote key must not cause SQL error: {:?}",
+        results.unwrap_err()
+    );
+
+    // A key designed to break out of the SQL string literal must not match
+    // unrelated rows or cause an error.
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "x' OR '1'='1=pwned",
+            10,
+            0,
+        )
+        .await;
+    assert!(
+        results.is_ok(),
+        "SQL injection attempt must not cause SQL error: {:?}",
+        results.unwrap_err()
+    );
+    assert_eq!(
+        results.unwrap().len(),
+        0,
+        "SQL injection must not match rows"
+    );
+}

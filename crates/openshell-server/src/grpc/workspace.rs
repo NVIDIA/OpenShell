@@ -247,6 +247,7 @@ pub(super) async fn handle_list_workspaces(
 ) -> Result<Response<ListWorkspacesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
+    super::validation::validate_label_selector(&req.label_selector)?;
     let limit = clamp_limit(req.limit, 100, MAX_PAGE_SIZE);
     let subject = membership_filter_subject(state, &principal)?;
 
@@ -1535,5 +1536,32 @@ mod tests {
             "handle_list_workspace_members should return PermissionDenied, got {:?}",
             err.code()
         );
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_rejects_invalid_label_selector() {
+        let state = test_server_state().await;
+
+        let err = handle_list_workspaces(
+            &state,
+            authed_request(ListWorkspacesRequest {
+                label_selector: "=no-key".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+
+        let err = handle_list_workspaces(
+            &state,
+            authed_request(ListWorkspacesRequest {
+                label_selector: "no-equals-sign".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 }

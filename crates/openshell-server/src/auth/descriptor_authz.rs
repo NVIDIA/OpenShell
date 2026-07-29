@@ -200,9 +200,8 @@ fn validate_entry(
         ));
     }
 
-    if role_missing {
-        return Err(format!("method {path}: bearer method declares no role"));
-    }
+    // scope-only methods (bearer + scope, no role) are valid: any
+    // authenticated user with the required scope may call them.
     if scope.is_none() {
         return Err(format!("method {path}: bearer method declares no scope"));
     }
@@ -312,16 +311,16 @@ mod tests {
     }
 
     #[test]
-    fn bearer_rpc_requires_both_role_and_scope() {
-        let missing_role = validate_entry(
+    fn bearer_rpc_requires_scope() {
+        // scope-only (no role) is valid: any authenticated user with the scope
+        validate_entry(
             FUTURE_RPC,
             AuthMode::Bearer,
             None,
             None,
-            Some("sandbox:read"),
+            Some("config:read"),
         )
-        .expect_err("missing role must be rejected");
-        assert!(missing_role.ends_with("bearer method declares no role"));
+        .expect("scope-only bearer method should be accepted");
 
         let missing_scope = validate_entry(FUTURE_RPC, AuthMode::Bearer, Some("user"), None, None)
             .expect_err("missing scope must be rejected");

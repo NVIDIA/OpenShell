@@ -135,6 +135,60 @@ async fn user_can_create_sandbox() {
     delete_workspace(&admin, WORKSPACE).await;
 }
 
+/// Workspace users must be able to create sandboxes with inferred-provider
+/// commands (e.g. `claude`). The CLI calls `GetGatewayConfig` to check
+/// `providers_v2_enabled` before sandbox creation; that RPC must not be
+/// gated to Platform Admin or the workspace-user flow breaks.
+#[tokio::test]
+async fn user_can_create_sandbox_with_inferred_provider_command() {
+    const WORKSPACE: &str = "oidc-inferred-cmd";
+    let user = login_identity(USER).await;
+    let admin = login_identity(ADMIN).await;
+    prepare_workspace(&admin, &user, WORKSPACE, "user").await;
+    let _lifecycle = SANDBOX_LIFECYCLE_LOCK.lock().await;
+
+    // Use `claude` as the command so the CLI infers provider type
+    // `claude-code` and calls `GetGatewayConfig` to check
+    // `providers_v2_enabled`. The sandbox won't actually start (no
+    // provider credentials), but we only care that the
+    // `GetGatewayConfig` call itself succeeds for a workspace user.
+    let output = run_workspace_cli(
+        &user,
+        WORKSPACE,
+        &[
+            "sandbox",
+            "create",
+            "--name",
+            "oidc-inferred-cmd",
+            "--no-tty",
+            "--",
+            "claude",
+        ],
+    )
+    .await;
+    let combined = combined_output(&output);
+
+    // The sandbox won't start because there are no provider credentials,
+    // but the error must be about the missing provider — NOT a
+    // platform-admin gate on GetGatewayConfig.
+    assert!(
+        !combined.to_ascii_lowercase().contains("platform admin"),
+        "workspace user hit a platform-admin gate on an inferred-provider command:\n{combined}"
+    );
+    assert!(
+        combined.contains("missing required provider"),
+        "expected missing-provider error for non-interactive session, got:\n{combined}"
+    );
+
+    let _ = run_workspace_cli(
+        &user,
+        WORKSPACE,
+        &["sandbox", "delete", "oidc-inferred-cmd"],
+    )
+    .await;
+    delete_workspace(&admin, WORKSPACE).await;
+}
+
 #[tokio::test]
 async fn admin_can_delete_sandbox() {
     let session = login_identity(ADMIN).await;

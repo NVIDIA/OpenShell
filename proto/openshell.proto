@@ -346,13 +346,14 @@ service OpenShell {
     };
   }
 
-  // Get gateway-global settings.
+  // Get gateway-global settings (read-only feature flags; any authenticated
+  // user may read these so the CLI and TUI can discover capabilities like
+  // providers_v2_enabled without requiring Platform Admin).
   rpc GetGatewayConfig(openshell.sandbox.v1.GetGatewayConfigRequest)
       returns (openshell.sandbox.v1.GetGatewayConfigResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "config:read"
-      global_role: "platform_admin"
     };
   }
 

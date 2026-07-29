@@ -500,7 +500,10 @@ async fn handle_gateway_switch(app: &mut App) {
             app.gateway_name = name;
             app.endpoint = endpoint;
             app.reset_sandbox_state();
-            // Immediately refresh data for the new gateway.
+            // Re-fetch the providers_v2 capability for the new gateway
+            // before refreshing data, so provider CRUD controls reflect
+            // the correct mode.
+            fetch_providers_v2_setting(app).await;
             refresh_data(app).await;
         }
         Err(e) => {

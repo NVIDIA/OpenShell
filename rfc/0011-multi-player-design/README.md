@@ -129,7 +129,8 @@ Supervisor section above).
 | Provider management (`Create`, `Get`, `List`, `Update`, `Delete`) | read-write | read-write (own ws) | read (no creds) | none |
 | Provider attachment (`Attach`, `Detach`, `ListSandboxProviders`) | read-write | read-write (own ws) | read-write (own ws) | none |
 | Services (`Expose`, `Get`, `List`, `Delete`) | read-write | read-write (own ws) | read-write (own ws) | none |
-| Gateway config (`GetGatewayConfig`, `UpdateConfig` with `global: true`) | read-write | none | none | none |
+| Gateway config read (`GetGatewayConfig`) | read | read | read | none |
+| Gateway config write (`UpdateConfig` with `global: true`) | read-write | none | none | none |
 | Sandbox config and policy (`GetSandboxConfig`, non-global `UpdateConfig`) | read-write | read-write (own ws) | read (own ws) | read-write (own sandbox, policy sync only) |
 | Policy draft inspection (`GetDraftPolicy`, `GetDraftHistory`) | read | read (own ws) | read (own ws) | `GetDraftPolicy` for own sandbox only |
 | Policy draft decisions (`Approve`, `Reject`, `Edit`, `Undo`, `Clear`) | read-write | read-write (own ws) | none | none |

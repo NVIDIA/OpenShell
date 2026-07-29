@@ -569,7 +569,9 @@ AND EXISTS (
             write!(
                 sql,
                 "\nAND json_extract(w.\"labels\", '$.\"{}\"') = ?{}",
-                key.replace('\\', "\\\\").replace('"', "\\\""),
+                key.replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\'', "''"),
                 param_idx
             )
             .unwrap();
