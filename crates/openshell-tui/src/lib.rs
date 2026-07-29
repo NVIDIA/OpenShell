@@ -78,6 +78,7 @@ pub async fn run(
 
     let mut events = EventHandler::new(Duration::from_secs(2));
 
+    fetch_providers_v2_setting(&mut app).await;
     refresh_gateway_list(&mut app);
     refresh_data(&mut app).await;
 
@@ -1996,6 +1997,30 @@ fn spawn_draft_approve_all(
 // Data refresh
 // ---------------------------------------------------------------------------
 
+async fn fetch_providers_v2_setting(app: &mut App) {
+    let req = openshell_core::proto::GetGatewayConfigRequest {};
+    match tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await {
+        Ok(Ok(resp)) => {
+            let response = resp.into_inner();
+            let enabled = response
+                .settings
+                .get(openshell_core::settings::PROVIDERS_V2_ENABLED_KEY)
+                .and_then(|s| match &s.value {
+                    Some(openshell_core::proto::setting_value::Value::BoolValue(v)) => Some(*v),
+                    _ => None,
+                })
+                .unwrap_or(false);
+            app.providers_v2_enabled = enabled;
+        }
+        Ok(Err(e)) => {
+            app.status_text = format!("failed to fetch gateway config: {}", e.message());
+        }
+        Err(_) => {
+            app.status_text = "gateway config fetch timed out".to_string();
+        }
+    }
+}
+
 async fn refresh_data(app: &mut App) {
     refresh_health(app).await;
     refresh_global_settings(app).await;
@@ -2090,7 +2115,6 @@ async fn refresh_providers(app: &mut App) {
                 return;
             }
         };
-    app.providers_v2_enabled = true;
     let providers = response.providers;
 
     let profiles: ProviderProfileCache = if app.providers_v2_enabled {

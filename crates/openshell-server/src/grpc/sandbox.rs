@@ -3113,7 +3113,7 @@ mod tests {
 
         let response = handle_create_sandbox(
             &state,
-            Request::new(CreateSandboxRequest {
+            authed_request(CreateSandboxRequest {
                 name: "partial-id".to_string(),
                 spec: Some(openshell_core::proto::SandboxSpec {
                     policy: Some(policy),
@@ -3142,7 +3142,7 @@ mod tests {
 
         let fetched_process = handle_get_sandbox(
             &state,
-            Request::new(GetSandboxRequest {
+            authed_request(GetSandboxRequest {
                 name: "partial-id".to_string(),
                 workspace: String::new(),
             }),
@@ -3178,7 +3178,7 @@ mod tests {
 
         let response = handle_create_sandbox(
             &state,
-            Request::new(CreateSandboxRequest {
+            authed_request(CreateSandboxRequest {
                 name: "kube-partial-id".to_string(),
                 spec: Some(openshell_core::proto::SandboxSpec {
                     policy: Some(policy),

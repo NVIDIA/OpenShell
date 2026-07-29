@@ -13515,4 +13515,28 @@ mod tests {
             err.code()
         );
     }
+
+    #[tokio::test]
+    async fn get_gateway_config_accessible_without_platform_admin() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        let mut req = Request::new(GetGatewayConfigRequest {});
+        req.extensions_mut().insert(Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: "workspace-user".to_string(),
+                display_name: None,
+                roles: vec![],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        }));
+
+        let response = handle_get_gateway_config(&state, req).await;
+        assert!(
+            response.is_ok(),
+            "GetGatewayConfig must not require Platform Admin; got {:?}",
+            response.unwrap_err()
+        );
+    }
 }

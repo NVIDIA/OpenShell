@@ -568,8 +568,8 @@ AND EXISTS (
             let param_idx = 4 + i;
             write!(
                 sql,
-                "\nAND json_extract(w.\"labels\", '$.{}') = ?{}",
-                key.replace('\'', "''"),
+                "\nAND json_extract(w.\"labels\", '$.\"{}\"') = ?{}",
+                key.replace('\\', "\\\\").replace('"', "\\\""),
                 param_idx
             )
             .unwrap();

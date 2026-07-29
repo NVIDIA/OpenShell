@@ -1935,3 +1935,84 @@ async fn membership_and_label_selector_filters_both() {
         .unwrap();
     assert_eq!(page3.len(), 0, "page 3 should be empty");
 }
+
+#[tokio::test]
+async fn membership_and_label_selector_handles_dotted_keys() {
+    let store = test_store().await;
+
+    store
+        .put(
+            "workspace",
+            "ws-dot-id",
+            "ws-dot",
+            "",
+            b"p1",
+            Some(r#"{"example.com/env":"prod","simple":"yes"}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            "workspace",
+            "ws-plain-id",
+            "ws-plain",
+            "",
+            b"p2",
+            Some(r#"{"env":"prod"}"#),
+        )
+        .await
+        .unwrap();
+
+    store
+        .put("workspace_member", "m1", "alice", "ws-dot", b"", None)
+        .await
+        .unwrap();
+    store
+        .put("workspace_member", "m2", "alice", "ws-plain", b"", None)
+        .await
+        .unwrap();
+
+    // Dotted key selector matches only ws-dot
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "example.com/env=prod",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1, "dotted key should match ws-dot");
+    assert_eq!(results[0].name, "ws-dot");
+
+    // Combining dotted and simple keys
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "example.com/env=prod,simple=yes",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name, "ws-dot");
+
+    // Dotted key with wrong value returns nothing
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "example.com/env=staging",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 0, "wrong value for dotted key");
+}
