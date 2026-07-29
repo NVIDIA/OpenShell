@@ -412,8 +412,9 @@ impl PodmanComputeDriver {
     /// Report the gateway exposure needed by Podman's standard local callback aliases.
     ///
     /// Rootful Podman binds the exact bridge address behind the sandbox alias.
-    /// Rootless networking follows the host's default-route interface, while
-    /// Podman Machine forwards the alias to gateway loopback.
+    /// Rootless pasta follows the host's default-route interface, while Podman
+    /// Machine forwards the alias to gateway loopback. Other rootless helpers
+    /// cannot use a direct host listener.
     pub fn gateway_listener_requirements(
         &self,
     ) -> Result<Vec<GatewayListenerRequirement>, ComputeDriverError> {
@@ -444,32 +445,19 @@ impl PodmanComputeDriver {
 
         #[cfg(target_os = "linux")]
         {
-            if self.config.host_gateway_ip.trim().is_empty() && self.rootless {
-                let rootless_network_cmd = self.rootless_network_cmd.trim();
-                if matches!(rootless_network_cmd, "" | "pasta" | "slirp4netns") {
-                    let helper = if rootless_network_cmd.is_empty() {
-                        "legacy Podman"
-                    } else {
-                        rootless_network_cmd
-                    };
+            if self.rootless {
+                validate_rootless_local_callback_helper(&self.rootless_network_cmd)?;
+
+                if self.config.host_gateway_ip.trim().is_empty() {
                     return Ok(vec![GatewayListenerRequirement {
-                        reason: format!(
-                            "Podman rootless {helper} callback uses the host default-route interface"
-                        ),
+                        reason:
+                            "Podman rootless pasta callback uses the host default-route interface"
+                                .to_string(),
                         selector: Some(Selector::DefaultRouteInterface(
                             GatewayDefaultRouteInterfaceRequirement {},
                         )),
                     }]);
                 }
-
-                let reported = if rootless_network_cmd.is_empty() {
-                    "<missing>"
-                } else {
-                    rootless_network_cmd
-                };
-                return Err(ComputeDriverError::Precondition(format!(
-                    "Podman rootless network helper '{reported}' is unsupported for local gateway callback aliases; configure pasta or slirp4netns, set host_gateway_ip, or use an explicitly remote grpc_endpoint"
-                )));
             }
 
             let gateway_ip = if self.config.host_gateway_ip.trim().is_empty() {
@@ -1069,6 +1057,25 @@ fn check_subuid_range() {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn validate_rootless_local_callback_helper(
+    rootless_network_cmd: &str,
+) -> Result<(), ComputeDriverError> {
+    let rootless_network_cmd = rootless_network_cmd.trim();
+    if rootless_network_cmd == "pasta" {
+        return Ok(());
+    }
+
+    let reported = if rootless_network_cmd.is_empty() {
+        "<missing>"
+    } else {
+        rootless_network_cmd
+    };
+    Err(ComputeDriverError::Precondition(format!(
+        "Podman rootless network helper '{reported}' does not support direct local gateway callbacks; configure pasta or use an explicitly remote grpc_endpoint"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1288,6 +1295,20 @@ mod tests {
     }
 
     #[test]
+    fn rootless_slirp_allows_remote_callback_endpoint() {
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "https://gateway.internal:9000".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+        driver.rootless = true;
+        driver.rootless_network_cmd = "slirp4netns".to_string();
+
+        let requirements = driver.gateway_listener_requirements().unwrap();
+
+        assert!(requirements.is_empty());
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn rootful_local_callback_alias_requests_discovered_network_gateway() {
         let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
@@ -1327,45 +1348,58 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn rootless_supported_helpers_request_default_route_interface() {
-        for rootless_network_cmd in ["pasta", "slirp4netns", ""] {
-            let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
-                grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
-                ..PodmanComputeConfig::default()
-            });
-            driver.rootless = true;
-            driver.rootless_network_cmd = rootless_network_cmd.to_string();
-
-            let requirements = driver.gateway_listener_requirements().unwrap();
-
-            assert!(
-                matches!(
-                    requirements[0].selector,
-                    Some(Selector::DefaultRouteInterface(_))
-                ),
-                "rootless helper '{rootless_network_cmd}' should use the default route"
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn rootless_unsupported_network_helper_is_rejected() {
+    fn rootless_pasta_requests_default_route_interface() {
         let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
             grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
             ..PodmanComputeConfig::default()
         });
         driver.rootless = true;
-        driver.rootless_network_cmd = "unknown-helper".to_string();
+        driver.rootless_network_cmd = "pasta".to_string();
+
+        let requirements = driver.gateway_listener_requirements().unwrap();
+
+        assert!(matches!(
+            requirements[0].selector,
+            Some(Selector::DefaultRouteInterface(_))
+        ));
+    }
+
+    #[test]
+    fn rootless_non_pasta_helpers_are_rejected() {
+        for (rootless_network_cmd, reported) in [
+            ("slirp4netns", "slirp4netns"),
+            ("", "<missing>"),
+            ("unknown-helper", "unknown-helper"),
+        ] {
+            let err = validate_rootless_local_callback_helper(rootless_network_cmd).unwrap_err();
+
+            assert!(matches!(err, ComputeDriverError::Precondition(_)));
+            assert!(err.to_string().contains(reported));
+            assert!(err.to_string().contains("configure pasta"));
+            assert!(err.to_string().contains("remote grpc_endpoint"));
+        }
+    }
+
+    #[test]
+    fn rootless_pasta_is_accepted_for_local_callbacks() {
+        validate_rootless_local_callback_helper("pasta").unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rootless_slirp_rejects_explicit_host_gateway_override() {
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
+            host_gateway_ip: "10.90.1.1".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+        driver.rootless = true;
+        driver.rootless_network_cmd = "slirp4netns".to_string();
 
         let err = driver.gateway_listener_requirements().unwrap_err();
 
-        assert!(
-            matches!(err, ComputeDriverError::Precondition(_)),
-            "unsupported helper should fail precondition: {err}"
-        );
-        assert!(err.to_string().contains("unknown-helper"));
-        assert!(err.to_string().contains("configure pasta or slirp4netns"));
+        assert!(matches!(err, ComputeDriverError::Precondition(_)));
+        assert!(err.to_string().contains("slirp4netns"));
     }
 
     #[tokio::test]

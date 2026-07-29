@@ -178,12 +178,12 @@ Common findings:
 - Supervisor cannot call back: check callback endpoint and gateway logs.
 - Gateway exits before becoming healthy with a callback-listener discovery
   error: inspect `podman info --debug`, the configured Podman network, and the
-  host's IPv4 default route. Rootless pasta, slirp4netns, and Podman 4's
-  unreported legacy helper use the private source address selected by that
-  route; rootful Podman uses the bridge gateway address.
-- An unsupported rootless helper requires an explicit `host_gateway_ip` or an
-  explicitly remote `grpc_endpoint`. Do not work around discovery failures by
-  broadening the primary gateway listener to `0.0.0.0`.
+  host's IPv4 default route. Rootless pasta uses the private source address
+  selected by that route; rootful Podman uses the bridge gateway address.
+- Rootless slirp4netns, another named helper, or missing helper metadata
+  requires an explicitly remote `grpc_endpoint`. An explicit `host_gateway_ip`
+  cannot bypass slirp4netns host-loopback isolation. Do not work around
+  discovery failures by broadening the primary gateway listener to `0.0.0.0`.
 
 ### Step 6: Check Kubernetes Helm Gateways
 

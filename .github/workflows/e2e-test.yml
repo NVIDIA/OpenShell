@@ -131,20 +131,17 @@ jobs:
     # Run directly on the Ubuntu host so the test observes the host's AppArmor
     # and unprivileged-user-namespace policy. A privileged job container masks
     # the restrictions that production rootless Podman installations enforce.
+    # Ubuntu 26.04 provides the supported Podman 5.x and pasta combination.
+    # Re-add older/slirp4netns environments when direct callbacks through a
+    # rootless-network namespace relay are supported.
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Ubuntu 24.04 matches the environment reported in #2069 and ships
-          # Podman 4.x. The probe records whether AppArmor blocks the drop.
-          - runner: ubuntu-24.04
-            podman_major: "4"
-            podman_package_version: "4.9.3+ds1-1ubuntu0.2"
-            conmon_package_version: "2.1.10+ds1-1build2"
-          # Ubuntu 26.04 provides the supported Podman 5.x coverage for
-          # comparison with the Ubuntu 24.04 environment.
+          # Keep package versions explicit so hosted-runner tool overrides
+          # cannot silently change the supported test environment.
           - runner: ubuntu-26.04
             podman_major: "5"
             podman_package_version: "5.7.0+ds2-3build1"
@@ -199,7 +196,6 @@ jobs:
             pkg-config \
             "conmon=${{ matrix.conmon_package_version }}" \
             "podman=${{ matrix.podman_package_version }}" \
-            slirp4netns \
             uidmap
           # Hosted runners can place newer Podman and conmon binaries under
           # /usr/local ahead of Ubuntu's packages. Select the distro CLI and
@@ -238,6 +234,7 @@ jobs:
           test "$(command -v podman)" = "/usr/bin/podman"
           test "$(podman info --format '{{.Host.Conmon.Path}}')" = "/usr/bin/conmon"
           test "$(podman info --format '{{.Host.Security.Rootless}}')" = "true"
+          test "$(podman info --format '{{.Host.RootlessNetworkCmd}}')" = "pasta"
           test "$(sudo sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "1"
           echo "=== host ==="
           uname -a

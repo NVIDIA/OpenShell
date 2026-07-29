@@ -259,20 +259,20 @@ Before the gateway binds its serving sockets, the driver reports the callback
 listener required by the selected topology:
 
 - Rootful Linux Podman reports the configured bridge's gateway address exactly.
-- Rootless Linux Podman using pasta or slirp4netns requests the private IPv4
-  source address selected by the host's default route. Podman 4 does not report
-  its selected helper through the API, so an empty helper value uses the same
-  legacy-compatible requirement. This avoids guessing among private interfaces
-  on a multihomed host.
-- Rootless Linux Podman reporting another named helper cannot infer a safe local
-  callback listener. The driver fails startup unless `host_gateway_ip` is set
-  or `grpc_endpoint` names an explicitly remote endpoint.
+- Rootless Linux Podman explicitly reporting pasta requests the private IPv4
+  source address selected by the host's default route. This avoids guessing
+  among private interfaces on a multihomed host.
+- Rootless Linux Podman reporting slirp4netns, another named helper, or no
+  helper cannot use a direct local callback listener. The driver fails startup
+  unless `grpc_endpoint` names an explicitly remote endpoint. Supporting
+  slirp4netns requires a relay inside Podman's rootless network namespace.
 - Podman Machine requests IPv4 loopback because gvproxy terminates the host
   forwarding path there.
 - An explicitly remote callback endpoint requests no additional local listener.
 
-On Linux, an explicit `host_gateway_ip` is reported exactly because the driver
-maps both local callback aliases to that literal. Podman Machine still requests
+On Linux, an explicit `host_gateway_ip` is reported exactly for rootful Podman
+and rootless pasta because the driver maps both local callback aliases to that
+literal. Other rootless helpers still fail closed. Podman Machine requests
 gateway loopback because its configured address is guest-visible and gvproxy
 terminates that route on host loopback. The gateway validates and binds every
 accepted callback listener; the primary listener can remain on loopback.
