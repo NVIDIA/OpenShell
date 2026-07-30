@@ -996,9 +996,12 @@ mod tests {
 
     #[test]
     fn short_hash_handles_multibyte_characters() {
-        // "aaaaaaaaaaaaé" is 14 bytes (12 'a' + one 2-byte 'é') and 13 chars.
-        // The old byte-slice at 12 would split 'é' and panic.
+        // 12 'a' + one 2-byte 'é' is 14 bytes and 13 chars; byte 12 is exactly
+        // the 'é' boundary, so even the old byte-slice would not panic here.
         assert_eq!(short_hash("aaaaaaaaaaaaé"), "aaaaaaaaaaaa");
+        // 11 'a' + 2-byte 'é' + 'x': a byte-slice at 12 would split 'é' and
+        // panic; slicing at the 13th character boundary keeps 'é' intact.
+        assert_eq!(short_hash("aaaaaaaaaaaéx"), "aaaaaaaaaaaé");
         // A 12-char hash ending in a multi-byte char is returned unchanged.
         assert_eq!(short_hash("aaaaaaaaaaaé"), "aaaaaaaaaaaé");
         // All-multi-byte input still slices on a character boundary.
