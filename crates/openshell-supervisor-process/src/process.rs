@@ -142,6 +142,7 @@ pub(crate) fn prepare_child_sandbox(
 
 const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::OCI_IMAGE_USER,
+    openshell_core::sandbox_env::OCI_WORKSPACE_IDENTITY,
     openshell_core::sandbox_env::SANDBOX_UID,
     openshell_core::sandbox_env::SANDBOX_GID,
     openshell_core::sandbox_env::SANDBOX_TOKEN,
@@ -1394,6 +1395,101 @@ fn validate_oci_workspace_in_subprocess(
     ))
 }
 
+/// Drop a one-shot workspace probe to the completed sandbox identity, validate
+/// using the kernel's real path-access checks, and return a normalized identity
+/// attestation for the final supervisor.
+#[cfg(unix)]
+pub fn validate_oci_workspace_as_process_identity(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+    workdir: &Path,
+) -> Result<String> {
+    validate_sandbox_user_with_identity(policy, resolved_identity)?;
+    validate_sandbox_group_with_identity(policy, resolved_identity)?;
+    let (uid, gid, mut supplementary_gids) =
+        resolve_filesystem_identity(policy, resolved_identity)?;
+    let uid = uid.ok_or_else(|| miette::miette!("workspace probe UID is unresolved"))?;
+    let gid = gid.ok_or_else(|| miette::miette!("workspace probe GID is unresolved"))?;
+    supplementary_gids.sort_unstable_by_key(|group| group.as_raw());
+    supplementary_gids.dedup();
+
+    if nix::unistd::geteuid().is_root() {
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "haiku",
+            target_os = "redox"
+        )))]
+        nix::unistd::setgroups(&supplementary_gids).into_diagnostic()?;
+        nix::unistd::setgid(gid).into_diagnostic()?;
+        nix::unistd::setuid(uid).into_diagnostic()?;
+    }
+
+    let effective_identity = (nix::unistd::geteuid(), nix::unistd::getegid());
+    if effective_identity != (uid, gid) {
+        return Err(miette::miette!(
+            "workspace probe privilege drop failed: expected {uid}:{gid}, got {}:{}",
+            effective_identity.0,
+            effective_identity.1
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    validate_oci_workspace_as_effective_identity(workdir)?;
+    #[cfg(not(target_os = "linux"))]
+    validate_oci_workspace(
+        workdir,
+        Some(effective_identity.0),
+        Some(effective_identity.1),
+        &supplementary_gids,
+    )?;
+    Ok(workspace_identity_attestation(
+        Some(uid),
+        Some(gid),
+        &supplementary_gids,
+    ))
+}
+
+/// Normalize a completed process identity for comparison with the immutable
+/// image probe.
+#[cfg(unix)]
+pub fn workspace_identity_attestation(
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    supplementary_gids: &[Gid],
+) -> String {
+    let mut groups = supplementary_gids
+        .iter()
+        .map(|group| group.as_raw())
+        .collect::<Vec<_>>();
+    groups.sort_unstable();
+    groups.dedup();
+    format!(
+        "{}:{}:{}",
+        uid.map_or_else(String::new, |value| value.as_raw().to_string()),
+        gid.map_or_else(String::new, |value| value.as_raw().to_string()),
+        groups
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+/// Resolve and normalize the completed policy/driver identity without changing
+/// process credentials.
+#[cfg(unix)]
+pub fn resolved_workspace_identity_attestation(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+) -> Result<String> {
+    let (uid, gid, supplementary_gids) = resolve_filesystem_identity(policy, resolved_identity)?;
+    Ok(workspace_identity_attestation(
+        uid,
+        gid,
+        &supplementary_gids,
+    ))
+}
+
 #[cfg(unix)]
 fn validate_workspace_component(
     path: &Path,
@@ -1427,6 +1523,7 @@ fn validate_workspace_component(
             path.display()
         ));
     }
+    reject_special_workspace_filesystem(path)?;
     let required = if is_workspace { 0o3 } else { 0o1 };
     if !identity_has_permissions(&metadata, uid, gid, supplementary_gids, required) {
         let requirement = if is_workspace {
@@ -1450,6 +1547,7 @@ pub fn validate_oci_workspace_as_effective_identity(root: &Path) -> Result<()> {
     let open_flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut current_path = PathBuf::from("/");
     let mut current_fd = rustix::fs::open("/", open_flags, Mode::empty()).into_diagnostic()?;
+    reject_special_workspace_filesystem_fd(&current_fd, &current_path)?;
     rustix::fs::accessat(
         &current_fd,
         ".",
@@ -1464,6 +1562,7 @@ pub fn validate_oci_workspace_as_effective_identity(root: &Path) -> Result<()> {
     })?;
 
     let last_component = components.len().saturating_sub(1);
+
     for (index, component) in components.into_iter().enumerate() {
         current_path.push(&component);
         let stat = rustix::fs::statat(&current_fd, &component, AtFlags::SYMLINK_NOFOLLOW).map_err(
@@ -1509,19 +1608,68 @@ pub fn validate_oci_workspace_as_effective_identity(root: &Path) -> Result<()> {
             )
         })?;
 
-        let next_fd = rustix::fs::openat(&current_fd, &component, open_flags, Mode::empty())
+        current_fd = rustix::fs::openat(&current_fd, &component, open_flags, Mode::empty())
             .map_err(|error| {
                 miette::miette!(
                     "failed to open image workspace path component '{}': {error}",
                     current_path.display()
                 )
             })?;
+        reject_special_workspace_filesystem_fd(&current_fd, &current_path)?;
         if is_workspace {
-            validate_effective_workspace_write(&next_fd, &current_path)?;
+            validate_effective_workspace_write(&current_fd, &current_path)?;
         }
-        current_fd = next_fd;
     }
 
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reject_special_workspace_filesystem_fd(fd: &impl std::os::fd::AsFd, path: &Path) -> Result<()> {
+    let fs = rustix::fs::fstatfs(fd).into_diagnostic()?;
+    #[allow(clippy::cast_sign_loss)]
+    reject_special_workspace_filesystem_type(path, fs.f_type as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn reject_special_workspace_filesystem(path: &Path) -> Result<()> {
+    // Linux filesystem magic values for virtual/kernel-managed filesystems.
+    // The decision is based on the mounted filesystem, not its conventional
+    // distro path, so renamed or unusually mounted control filesystems remain
+    // protected without rejecting ordinary application directories.
+    let fs = rustix::fs::statfs(path).into_diagnostic()?;
+    #[allow(clippy::cast_sign_loss)]
+    let filesystem_type = fs.f_type as u64;
+    reject_special_workspace_filesystem_type(path, filesystem_type)
+}
+
+#[cfg(target_os = "linux")]
+fn reject_special_workspace_filesystem_type(path: &Path, filesystem_type: u64) -> Result<()> {
+    const SPECIAL_FILESYSTEMS: &[u64] = &[
+        0x0000_1cd1, // devpts
+        0x0000_9fa0, // proc
+        0x0102_1994, // tmpfs (including the container /dev tree)
+        0x1980_0202, // mqueue
+        0x0027_e0eb, // cgroup
+        0x4249_4e4d, // bpf
+        0x6265_6572, // sysfs
+        0x6367_7270, // cgroup2
+        0x6462_6720, // debugfs
+        0x7363_6673, // securityfs
+        0x7472_6163, // tracefs
+    ];
+    if SPECIAL_FILESYSTEMS.contains(&filesystem_type) {
+        return Err(miette::miette!(
+            "workspace path component '{}' is on a kernel-managed filesystem (type {filesystem_type:#x})",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+fn reject_special_workspace_filesystem(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1831,17 +1979,20 @@ pub fn prepare_filesystem_with_identity(
 
     let (uid, gid, supplementary_gids) = resolve_filesystem_identity(policy, resolved_identity)?;
 
-    // Docker owns workspace resolution and must make the selected root usable
-    // by the final effective identity, including when both policy identity
-    // fields were explicit. Validate it before processing any user-authored
-    // read-write paths so an unsafe image path fails first. Other drivers
-    // retain their preparation.
+    // Docker and Podman own workspace resolution and must make the selected
+    // root usable by the final effective identity, including when both policy
+    // identity fields were explicit. Validate it before processing any
+    // user-authored read-write paths so an unsafe image path fails first.
+    // Other drivers retain their preparation.
     if prepare_workspace {
         let workspace = workdir.ok_or_else(|| {
             miette::miette!("local container driver did not supply a workspace workdir")
         })?;
         let workspace = Path::new(workspace);
-        if workspace == Path::new(openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT) {
+        if workspace == Path::new(openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT)
+            || std::env::var_os(openshell_core::sandbox_env::OCI_WORKSPACE_IDENTITY)
+                .is_some_and(|value| !value.is_empty())
+        {
             info!(path = %workspace.display(), ?uid, ?gid, "Preparing managed workspace");
             prepare_oci_workspace(workspace, uid, gid, &supplementary_gids)?;
         } else {
@@ -1867,8 +2018,8 @@ pub fn prepare_filesystem_with_identity(
     }
 
     // Retain the existing Kubernetes/OpenShift behavior for driver-injected
-    // numeric identities. Docker clears this variable and does not receive
-    // identity-specific workspace preparation.
+    // numeric identities. Docker and Podman clear this variable and do not
+    // receive identity-specific workspace preparation.
     if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok_and(|uid| !uid.is_empty()) {
         let sandbox_home = Path::new("/sandbox");
         if sandbox_home.exists() {
@@ -3010,6 +3161,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn workspace_identity_attestation_sorts_and_deduplicates_groups() {
+        assert_eq!(
+            workspace_identity_attestation(
+                Some(Uid::from_raw(1000)),
+                Some(Gid::from_raw(1001)),
+                &[
+                    Gid::from_raw(1003),
+                    Gid::from_raw(1002),
+                    Gid::from_raw(1003),
+                ],
+            ),
+            "1000:1001:1002,1003"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn validate_oci_workspace_rejects_unwritable_directory() {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
@@ -3155,6 +3323,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn effective_identity_validation_uses_kernel_access_checks() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let root = dir.path().canonicalize().unwrap().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        validate_oci_workspace_as_effective_identity(&root)
+            .expect("current identity can write and enter its directory");
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let error = validate_oci_workspace_as_effective_identity(&root).unwrap_err();
+        assert!(error.to_string().contains("not writable"));
     }
 
     #[cfg(unix)]

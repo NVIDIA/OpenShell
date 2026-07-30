@@ -33,6 +33,7 @@ const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 /// to confirm the cross-sandbox IDOR guard fires.
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const VALIDATE_WORKSPACE_SUBCOMMAND: &str = "validate-workspace";
+const PROBE_WORKSPACE_SUBCOMMAND: &str = "probe-workspace";
 
 /// Default `--mode` value: run both supervisor leaves in a single binary.
 const DEFAULT_MODE: &str = "network,process";
@@ -272,7 +273,76 @@ fn validate_workspace(args: &[String]) -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn validate_workspace(_args: &[String]) -> Result<()> {
     Err(miette::miette!(
-        "workspace validation is only supported on Unix"
+        "workspace validation is only supported on Linux"
+    ))
+}
+
+/// Internal one-shot command used by Podman to validate the immutable image
+/// before the final workspace volume covers its OCI workdir.
+#[derive(Parser, Debug)]
+#[command(name = "probe-workspace", hide = true)]
+struct ProbeWorkspaceArgs {
+    #[arg(long)]
+    workdir: String,
+    #[arg(long)]
+    oci_user: String,
+    #[arg(long)]
+    run_as_user: Option<String>,
+    #[arg(long)]
+    run_as_group: Option<String>,
+    #[arg(long)]
+    discover_policy_identity: bool,
+}
+
+#[cfg(unix)]
+fn probe_workspace(args: &[String]) -> Result<()> {
+    use openshell_core::policy::{
+        FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
+    };
+    use openshell_supervisor_process::identity::{DriverIdentity, resolve_process_identity};
+
+    let args = ProbeWorkspaceArgs::try_parse_from(
+        std::iter::once(PROBE_WORKSPACE_SUBCOMMAND.to_string()).chain(args.iter().cloned()),
+    )
+    .into_diagnostic()?;
+    let process = if args.discover_policy_identity {
+        openshell_sandbox::discover_process_policy_from_disk_or_default()
+    } else {
+        ProcessPolicy {
+            run_as_user: args.run_as_user,
+            run_as_group: args.run_as_group,
+        }
+    };
+    let mut policy = SandboxPolicy {
+        version: 0,
+        filesystem: FilesystemPolicy::default(),
+        network: NetworkPolicy::default(),
+        landlock: LandlockPolicy::default(),
+        process,
+    };
+    let resolved_identity = resolve_process_identity(
+        &mut policy,
+        &DriverIdentity::OciUser {
+            declaration: args.oci_user,
+        },
+    )?;
+    let identity =
+        openshell_supervisor_process::process::validate_oci_workspace_as_process_identity(
+            &policy,
+            resolved_identity,
+            Path::new(&args.workdir),
+        )?;
+    println!(
+        "OPENSHELL_WORKSPACE_IDENTITY={}",
+        serde_json::to_string(&identity).into_diagnostic()?
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn probe_workspace(_args: &[String]) -> Result<()> {
+    Err(miette::miette!(
+        "workspace probing is only supported on Unix"
     ))
 }
 
@@ -527,6 +597,9 @@ fn main() -> Result<()> {
     if raw_args.get(1).map(String::as_str) == Some(VALIDATE_WORKSPACE_SUBCOMMAND) {
         return validate_workspace(&raw_args[2..]);
     }
+    if raw_args.get(1).map(String::as_str) == Some(PROBE_WORKSPACE_SUBCOMMAND) {
+        return probe_workspace(&raw_args[2..]);
+    }
 
     let args = Args::parse();
 
@@ -719,6 +792,36 @@ mod tests {
         ];
 
         validate_workspace(&args).expect("current identity should retain workspace authority");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_probe_subcommand_resolves_final_policy_identity() {
+        let uid = nix::unistd::geteuid().as_raw();
+        let gid = nix::unistd::getegid().as_raw();
+        if uid < 1000 || gid < 1000 {
+            // Process policies intentionally reject system identities. Local
+            // macOS users commonly have IDs below 1000, so this test cannot
+            // exercise the credential transition for those accounts.
+            return;
+        }
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+        let root = dir.path().canonicalize().unwrap().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let args = vec![
+            "--workdir".to_string(),
+            root.display().to_string(),
+            "--oci-user".to_string(),
+            "unused".to_string(),
+            "--run-as-user".to_string(),
+            uid.to_string(),
+            "--run-as-group".to_string(),
+            gid.to_string(),
+        ];
+
+        probe_workspace(&args).expect("current identity should retain workspace authority");
     }
 
     /// Drives `copy_self`'s file-copy logic against an arbitrary source path

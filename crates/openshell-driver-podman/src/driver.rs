@@ -54,6 +54,10 @@ pub struct PodmanComputeDriver {
     rootless: bool,
     /// Rootless network helper reported by Podman, such as `pasta`.
     rootless_network_cmd: String,
+    /// Serializes container image-volume attachment and removal. Rootless
+    /// Podman can otherwise detach a shared type=image mount while another
+    /// sandbox container is starting.
+    container_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
     gpu_inventory_refresh: Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>,
 }
@@ -85,6 +89,15 @@ fn validated_container_name(sandbox: &DriverSandbox) -> Result<String, ComputeDr
     crate::client::validate_name(&name)
         .map_err(|e| ComputeDriverError::Precondition(e.to_string()))?;
     Ok(name)
+}
+
+fn workspace_probe_name(container_name: &str) -> String {
+    const SUFFIX: &str = "-workdir-probe";
+    let keep = 255usize.saturating_sub(SUFFIX.len());
+    format!(
+        "{}{SUFFIX}",
+        &container_name[..container_name.len().min(keep)]
+    )
 }
 
 fn podman_volume_is_bind_backed(volume: &VolumeInspect) -> bool {
@@ -222,6 +235,36 @@ fn podman_gpu_selection_error(err: CdiGpuSelectionError) -> ComputeDriverError {
     ComputeDriverError::Precondition(err.to_string())
 }
 
+const WORKSPACE_IDENTITY_MARKER: &str = "OPENSHELL_WORKSPACE_IDENTITY=";
+
+fn parse_workspace_identity(logs: &str) -> Result<String, ComputeDriverError> {
+    logs.match_indices(WORKSPACE_IDENTITY_MARKER)
+        .filter_map(|(start, _)| {
+            logs[start + WORKSPACE_IDENTITY_MARKER.len()..]
+                .split(|character: char| character.is_control())
+                .next()
+        })
+        .find_map(|identity| serde_json::from_str::<String>(identity).ok())
+        .ok_or_else(|| {
+            ComputeDriverError::Precondition(
+                "OCI WorkingDir validation probe did not report its process identity".to_string(),
+            )
+        })
+}
+
+fn sanitized_probe_diagnostic(logs: &str) -> String {
+    let sanitized = logs
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .collect::<String>();
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() {
+        "no probe diagnostic was emitted".to_string()
+    } else {
+        sanitized.chars().take(2048).collect()
+    }
+}
+
 /// Resolve the socket to connect to: explicit configuration wins, otherwise
 /// fall back to `detect`. Returns an error if neither resolves.
 ///
@@ -243,6 +286,80 @@ fn resolve_socket_path(
 }
 
 impl PodmanComputeDriver {
+    async fn validate_image_workspace(
+        &self,
+        sandbox: &DriverSandbox,
+        container_name: &str,
+        inspected_image: &crate::client::ImageInspect,
+    ) -> Result<Option<String>, ComputeDriverError> {
+        let probe_name = workspace_probe_name(container_name);
+        crate::client::validate_name(&probe_name)
+            .map_err(|error| ComputeDriverError::Precondition(error.to_string()))?;
+        let Some(spec) = container::build_workspace_probe_spec(
+            sandbox,
+            &self.config,
+            inspected_image,
+            &probe_name,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let start = {
+            let _lifecycle_guard = self.container_lifecycle_lock.lock().await;
+            self.client
+                .create_container(&spec)
+                .await
+                .map_err(ComputeDriverError::from)?;
+            self.client
+                .start_container(&probe_name)
+                .await
+                .map_err(ComputeDriverError::from)
+        };
+        let validation = async {
+            start?;
+            let exit_code = self
+                .client
+                .wait_container(&probe_name)
+                .await
+                .map_err(ComputeDriverError::from)?;
+            let logs = self.client.container_logs(&probe_name).await;
+            if exit_code == 0 {
+                let logs = logs.map_err(ComputeDriverError::from)?;
+                parse_workspace_identity(&logs).map(Some)
+            } else {
+                let diagnostic = logs.map_or_else(
+                    |error| format!("unable to read probe diagnostic: {error}"),
+                    |logs| sanitized_probe_diagnostic(&logs),
+                );
+                Err(ComputeDriverError::Precondition(format!(
+                    "OCI WorkingDir validation failed for image '{}' (probe exited with code {exit_code}): {diagnostic}",
+                    inspected_image.id,
+                )))
+            }
+        }
+        .await;
+        let cleanup = {
+            let _lifecycle_guard = self.container_lifecycle_lock.lock().await;
+            self.client
+                .remove_container(&probe_name, self.config.stop_timeout_secs)
+                .await
+        };
+        match (validation, cleanup) {
+            (Ok(identity), Ok(())) => Ok(identity),
+            (Ok(_), Err(error)) => Err(ComputeDriverError::from(error)),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(cleanup_error)) => {
+                warn!(
+                    probe = %probe_name,
+                    %cleanup_error,
+                    "Failed to remove workspace validation probe"
+                );
+                Err(error)
+            }
+        }
+    }
+
     /// Create a new driver, verifying the Podman socket is reachable.
     pub async fn new(mut config: PodmanComputeConfig) -> Result<Self, PodmanApiError> {
         const MAX_PING_RETRIES: u32 = 5;
@@ -391,6 +508,7 @@ impl PodmanComputeDriver {
             network_gateway_ip,
             rootless,
             rootless_network_cmd,
+            container_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,
@@ -692,11 +810,9 @@ impl PodmanComputeDriver {
                 "podman image '{image}' inspection did not return an immutable image ID"
             )));
         }
-        let image_user = inspected_image
-            .config
-            .as_ref()
-            .map_or("", |config| config.user.as_str());
-
+        let workspace_identity = self
+            .validate_image_workspace(sandbox, &name, &inspected_image)
+            .await?;
         for image in
             container::podman_driver_image_mount_sources(sandbox, self.config.enable_bind_mounts)
                 .map_err(ComputeDriverError::Precondition)?
@@ -761,8 +877,8 @@ impl PodmanComputeDriver {
             token_secret_name.as_deref(),
             gpu_devices.as_deref(),
             image,
-            &inspected_image.id,
-            image_user,
+            &inspected_image,
+            workspace_identity.as_deref(),
         ) {
             Ok(spec) => spec,
             Err(e) => {
@@ -770,8 +886,31 @@ impl PodmanComputeDriver {
                 return Err(e);
             }
         };
-        match self.client.create_container(&spec).await {
-            Ok(_) => {}
+        // Podman implements the supervisor as a shared type=image mount.
+        // Keep attach/start atomic with respect to another sandbox's removal.
+        let lifecycle_result = {
+            let _lifecycle_guard = self.container_lifecycle_lock.lock().await;
+            match self.client.create_container(&spec).await {
+                Ok(_) => match self.client.start_container(&name).await {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        warn!(
+                            sandbox_name = %sandbox.name,
+                            error = %e,
+                            "Failed to start container; cleaning up"
+                        );
+                        let _ = self
+                            .client
+                            .remove_container(&name, self.config.stop_timeout_secs)
+                            .await;
+                        Err(e)
+                    }
+                },
+                Err(e) => Err(e),
+            }
+        };
+        match lifecycle_result {
+            Ok(()) => {}
             Err(PodmanApiError::Conflict(_)) => {
                 // Clean up the volume we just created. It is keyed by *this*
                 // sandbox's ID, not the conflicting container's ID (which
@@ -784,21 +923,6 @@ impl PodmanComputeDriver {
                 cleanup_created().await;
                 return Err(ComputeDriverError::from(e));
             }
-        }
-
-        // 5. Start container.
-        if let Err(e) = self.client.start_container(&name).await {
-            warn!(
-                sandbox_name = %sandbox.name,
-                error = %e,
-                "Failed to start container; cleaning up"
-            );
-            let _ = self
-                .client
-                .remove_container(&name, self.config.stop_timeout_secs)
-                .await;
-            cleanup_created().await;
-            return Err(ComputeDriverError::from(e));
         }
 
         info!(
@@ -862,17 +986,20 @@ impl PodmanComputeDriver {
         };
         info!(sandbox_id = %sandbox_id, container = %container_id, "Deleting sandbox container");
 
-        // Keep stop, timeout, and removal in one Podman operation. Splitting
-        // stop and remove can race with another container starting an image
-        // mount when the stop reaches its timeout.
-        let container_existed = match self
-            .client
-            .remove_container(&container_id, self.config.stop_timeout_secs)
-            .await
-        {
-            Ok(()) => true,
-            Err(PodmanApiError::NotFound(_)) => false,
-            Err(e) => return Err(ComputeDriverError::from(e)),
+        // Keep stop, timeout, and removal in one Podman operation. Removing a
+        // container detaches its type=image mounts, so do not overlap it with
+        // another sandbox container's create/start window.
+        let container_existed = {
+            let _lifecycle_guard = self.container_lifecycle_lock.lock().await;
+            match self
+                .client
+                .remove_container(&container_id, self.config.stop_timeout_secs)
+                .await
+            {
+                Ok(()) => true,
+                Err(PodmanApiError::NotFound(_)) => false,
+                Err(e) => return Err(ComputeDriverError::from(e)),
+            }
         };
 
         // Remove workspace volume.
@@ -1009,6 +1136,7 @@ impl PodmanComputeDriver {
             network_gateway_ip: None,
             rootless: false,
             rootless_network_cmd: String::new(),
+            container_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,
@@ -2058,6 +2186,90 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn workspace_probe_waits_for_success_and_always_removes_container() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "workspace-probe-success",
+            vec![
+                StubResponse::new(StatusCode::CREATED, "{}"),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(StatusCode::OK, r#"{"StatusCode":0}"#),
+                StubResponse::new(
+                    StatusCode::OK,
+                    "OPENSHELL_WORKSPACE_IDENTITY=\"1234:1235:\"\n",
+                ),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+            ],
+        );
+        let driver = test_driver(socket_path.clone());
+        let mut sandbox = plain_sandbox("sandbox-probe", "demo");
+        sandbox.spec = Some(DriverSandboxSpec::default());
+        let image = crate::client::ImageInspect {
+            id: "sha256:immutable".into(),
+            config: Some(crate::client::ImageConfig {
+                user: "1234:1235".into(),
+                working_dir: "/workspace".into(),
+            }),
+        };
+        let name = validated_container_name(&sandbox).unwrap();
+
+        let identity = driver
+            .validate_image_workspace(&sandbox, &name, &image)
+            .await
+            .expect("successful probe should pass");
+        assert_eq!(identity.as_deref(), Some("1234:1235:"));
+
+        handle.await.expect("stub task should finish");
+        let requests = request_log.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[0].contains("/libpod/containers/create"));
+        assert!(requests[1].contains("/start"));
+        assert!(requests[2].contains("/wait?condition=exited"));
+        assert!(requests[3].contains("/logs?"));
+        assert!(requests[4].starts_with("DELETE "));
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn workspace_probe_removes_container_after_validation_failure() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "workspace-probe-failure",
+            vec![
+                StubResponse::new(StatusCode::CREATED, "{}"),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(StatusCode::OK, r#"{"StatusCode":1}"#),
+                StubResponse::new(
+                    StatusCode::OK,
+                    "image workspace path component '/workspace' is not writable and traversable\n",
+                ),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+            ],
+        );
+        let driver = test_driver(socket_path.clone());
+        let mut sandbox = plain_sandbox("sandbox-probe-fail", "demo");
+        sandbox.spec = Some(DriverSandboxSpec::default());
+        let image = crate::client::ImageInspect {
+            id: "sha256:immutable".into(),
+            config: Some(crate::client::ImageConfig {
+                user: "1234:1235".into(),
+                working_dir: "/workspace".into(),
+            }),
+        };
+        let name = validated_container_name(&sandbox).unwrap();
+
+        let error = driver
+            .validate_image_workspace(&sandbox, &name, &image)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exited with code 1"));
+        assert!(error.to_string().contains("not writable and traversable"));
+
+        handle.await.expect("stub task should finish");
+        let requests = request_log.lock().unwrap();
+        assert!(requests.last().unwrap().starts_with("DELETE "));
+        let _ = fs::remove_file(socket_path);
+    }
+
     fn secret_delete_request(sandbox_id: &str) -> String {
         format!(
             "DELETE {}",
@@ -2244,5 +2456,30 @@ mod tests {
             )
         );
         let _ = fs::remove_file(socket_path);
+    }
+
+    #[test]
+    fn workspace_identity_parser_accepts_plain_and_multiplexed_logs() {
+        assert_eq!(
+            parse_workspace_identity(
+                "probe startup\nOPENSHELL_WORKSPACE_IDENTITY=\"1234:1235:7,8\"\n"
+            )
+            .unwrap(),
+            "1234:1235:7,8"
+        );
+        assert_eq!(
+            parse_workspace_identity(
+                "\u{1}\0\0\0\0\0\0.OPENSHELL_WORKSPACE_IDENTITY=\"1234:1235:\"\n"
+            )
+            .unwrap(),
+            "1234:1235:"
+        );
+        assert!(
+            parse_workspace_identity(
+                "OPENSHELL_WORKSPACE_IDENTITY=not-json\n\
+                 OPENSHELL_WORKSPACE_IDENTITY={\"uid\":1234}\n"
+            )
+            .is_err()
+        );
     }
 }

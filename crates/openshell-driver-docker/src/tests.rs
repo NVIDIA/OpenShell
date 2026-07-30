@@ -45,6 +45,7 @@ fn test_sandbox() -> DriverSandbox {
             }),
             resource_requirements: None,
             sandbox_token: String::new(),
+            workspace_validation_identity: None,
         }),
         status: None,
         workspace: String::new(),
@@ -578,6 +579,10 @@ fn build_environment_protects_oci_identity_metadata() {
         (openshell_core::sandbox_env::OCI_IMAGE_USER, "spoofed"),
         (openshell_core::sandbox_env::SANDBOX_UID, "9999"),
         (openshell_core::sandbox_env::SANDBOX_GID, "9999"),
+        (
+            openshell_core::sandbox_env::OCI_WORKSPACE_IDENTITY,
+            "9999:9999:",
+        ),
     ] {
         spec.environment.insert(key.to_string(), value.to_string());
     }
@@ -590,6 +595,10 @@ fn build_environment_protects_oci_identity_metadata() {
     )));
     assert!(env.contains(&format!("{}=", openshell_core::sandbox_env::SANDBOX_UID)));
     assert!(env.contains(&format!("{}=", openshell_core::sandbox_env::SANDBOX_GID)));
+    assert!(env.contains(&format!(
+        "{}=",
+        openshell_core::sandbox_env::OCI_WORKSPACE_IDENTITY
+    )));
     assert!(!env.iter().any(|entry| entry.ends_with("=spoofed")));
     assert!(!env.iter().any(|entry| entry.ends_with("=9999")));
 }

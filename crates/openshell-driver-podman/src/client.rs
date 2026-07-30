@@ -25,6 +25,7 @@ const API_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum allowed size for the event stream line buffer (1 MB).
 const MAX_EVENT_BUFFER: usize = 1_048_576;
+const MAX_CONTAINER_LOG_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PodmanApiError {
@@ -117,6 +118,16 @@ pub struct ContainerState {
     pub finished_at: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum ContainerWaitResponse {
+    ExitCode(i64),
+    Status {
+        #[serde(rename = "StatusCode")]
+        status_code: i64,
+    },
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct HealthState {
@@ -177,6 +188,8 @@ pub struct ImageInspect {
 pub struct ImageConfig {
     #[serde(default)]
     pub user: String,
+    #[serde(default)]
+    pub working_dir: String,
 }
 
 /// A container summary returned by the list API.
@@ -352,6 +365,43 @@ impl PodmanClient {
         Ok((status, bytes))
     }
 
+    /// Send a request while retaining at most `max_bytes` of the response.
+    async fn send_request_bounded(
+        &self,
+        req: Request<Full<Bytes>>,
+        timeout: Duration,
+        max_bytes: usize,
+    ) -> Result<(hyper::StatusCode, Bytes), PodmanApiError> {
+        use hyper::body::Body;
+
+        let mut sender = self.connect().await?;
+        let response = tokio::time::timeout(timeout, sender.send_request(req))
+            .await
+            .map_err(|_| PodmanApiError::Timeout(timeout))?
+            .map_err(|error| PodmanApiError::Connection(error.to_string()))?;
+        let status = response.status();
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut body = response.into_body();
+        let mut bytes = Vec::with_capacity(max_bytes.min(4096));
+        while bytes.len() < max_bytes {
+            let frame = tokio::time::timeout_at(
+                deadline,
+                std::future::poll_fn(|context| Pin::new(&mut body).poll_frame(context)),
+            )
+            .await
+            .map_err(|_| PodmanApiError::Timeout(timeout))?;
+            let Some(frame) = frame else {
+                break;
+            };
+            let frame = frame.map_err(|error| PodmanApiError::Connection(error.to_string()))?;
+            if let Some(data) = frame.data_ref() {
+                let remaining = max_bytes - bytes.len();
+                bytes.extend_from_slice(&data[..data.len().min(remaining)]);
+            }
+        }
+        Ok((status, Bytes::from(bytes)))
+    }
+
     /// Perform a versioned HTTP request and return status + body bytes.
     async fn request(
         &self,
@@ -457,6 +507,22 @@ impl PodmanClient {
         .await
     }
 
+    /// Wait for a container to exit and return its exit code.
+    pub async fn wait_container(&self, name: &str) -> Result<i64, PodmanApiError> {
+        validate_name(name)?;
+        let response: ContainerWaitResponse = self
+            .request_json(
+                hyper::Method::POST,
+                &format!("/libpod/containers/{name}/wait?condition=exited"),
+                None,
+            )
+            .await?;
+        Ok(match response {
+            ContainerWaitResponse::ExitCode(code) => code,
+            ContainerWaitResponse::Status { status_code } => status_code,
+        })
+    }
+
     /// Stop a container with a grace period in seconds.
     pub async fn stop_container(
         &self,
@@ -522,6 +588,27 @@ impl PodmanClient {
             None,
         )
         .await
+    }
+
+    /// Fetch a bounded tail of stdout and stderr from a container.
+    pub async fn container_logs(&self, name: &str) -> Result<String, PodmanApiError> {
+        validate_name(name)?;
+        let req = Self::build_request(
+            hyper::Method::GET,
+            &format!(
+                "/{API_VERSION}/libpod/containers/{name}/logs?stdout=true&stderr=true&tail=20&timestamps=false"
+            ),
+            Full::new(Bytes::new()),
+            None,
+        );
+        let (status, bytes) = self
+            .send_request_bounded(req, API_TIMEOUT, MAX_CONTAINER_LOG_BYTES)
+            .await?;
+        if status.is_success() {
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        } else {
+            Err(error_from_response(status.as_u16(), &bytes))
+        }
     }
 
     /// List containers matching label filters (e.g. `&["openshell.managed=true"]`).
@@ -973,12 +1060,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inspect_image_reads_immutable_id_and_oci_user() {
+    async fn inspect_image_reads_immutable_id_and_oci_config() {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "inspect-image",
             vec![StubResponse::new(
                 StatusCode::OK,
-                r#"{"Id":"sha256:immutable","Config":{"User":"app:staff"}}"#,
+                r#"{"Id":"sha256:immutable","Config":{"User":"app:staff","WorkingDir":"/workspace/project"}}"#,
             )],
         );
         let client = PodmanClient::new(socket_path.clone());
@@ -992,6 +1079,13 @@ mod tests {
         assert_eq!(
             image.config.as_ref().map(|config| config.user.as_str()),
             Some("app:staff")
+        );
+        assert_eq!(
+            image
+                .config
+                .as_ref()
+                .map(|config| config.working_dir.as_str()),
+            Some("/workspace/project")
         );
         handle.await.expect("stub task should finish");
         assert_eq!(
@@ -1053,6 +1147,36 @@ mod tests {
             .expect("container removal should retain the API timeout for cleanup");
 
         handle.await.expect("stub task should finish");
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn container_logs_fetches_bounded_stdout_and_stderr_tail() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "container-logs",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                "workspace validation failed\n",
+            )],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let logs = client
+            .container_logs("workdir-probe")
+            .await
+            .expect("container logs should be returned");
+
+        assert_eq!(logs, "workspace validation failed\n");
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            [
+                "GET /v5.0.0/libpod/containers/workdir-probe/logs?stdout=true&stderr=true&tail=20&timestamps=false"
+            ]
+        );
         let _ = std::fs::remove_file(socket_path);
     }
 }

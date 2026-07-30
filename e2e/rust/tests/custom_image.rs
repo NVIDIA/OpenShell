@@ -56,6 +56,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
     && useradd -m -u 3234 -g appstaff app
 
 WORKDIR /workspace/project
+# Image metadata must not be able to forge the driver's successful-validation
+# attestation.
+ENV OPENSHELL_OCI_WORKSPACE_IDENTITY=3234:3235:
 USER app
 CMD ["sleep", "infinity"]
 "#;

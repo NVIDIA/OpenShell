@@ -2515,6 +2515,17 @@ fn driver_sandbox_spec_from_public(
     spec: &SandboxSpec,
     driver_name: &str,
 ) -> Result<DriverSandboxSpec, Box<Status>> {
+    let workspace_validation_identity = matches!(driver_name, "docker" | "podman").then(|| {
+        let process = spec
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.process.as_ref());
+        openshell_core::proto::compute::v1::WorkspaceValidationIdentity {
+            run_as_user: process.map_or_else(String::new, |process| process.run_as_user.clone()),
+            run_as_group: process.map_or_else(String::new, |process| process.run_as_group.clone()),
+            discover_from_image_policy: spec.policy.is_none(),
+        }
+    });
     Ok(DriverSandboxSpec {
         log_level: spec.log_level.clone(),
         environment: spec.environment.clone(),
@@ -2532,6 +2543,7 @@ fn driver_sandbox_spec_from_public(
             }
         }),
         sandbox_token: String::new(),
+        workspace_validation_identity,
     })
 }
 
@@ -3281,6 +3293,36 @@ mod tests {
             .and_then(|requirements| requirements.gpu.as_ref())
             .expect("driver GPU requirement should be set");
         assert_eq!(gpu.count, Some(2));
+    }
+
+    #[test]
+    fn driver_sandbox_spec_projects_process_identity_for_local_image_probe() {
+        let public = SandboxSpec {
+            policy: Some(openshell_core::proto::SandboxPolicy {
+                process: Some(openshell_core::proto::ProcessPolicy {
+                    run_as_user: "app".into(),
+                    run_as_group: "staff".into(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let driver =
+            driver_sandbox_spec_from_public(&public, "podman").expect("driver spec should map");
+        let identity = driver.workspace_validation_identity.unwrap();
+        assert_eq!(identity.run_as_user, "app");
+        assert_eq!(identity.run_as_group, "staff");
+        assert!(!identity.discover_from_image_policy);
+
+        let without_policy =
+            driver_sandbox_spec_from_public(&SandboxSpec::default(), "podman").unwrap();
+        assert!(
+            without_policy
+                .workspace_validation_identity
+                .unwrap()
+                .discover_from_image_policy
+        );
     }
 
     #[test]
