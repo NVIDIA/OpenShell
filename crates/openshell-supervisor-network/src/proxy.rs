@@ -3646,18 +3646,11 @@ fn endpoint_credentials_for_request(
             revision: None,
         };
     };
-    let revision_before = credentials.revision();
-    let resolver = credentials.resolver_for_endpoint(host, port, canonical_path);
-    let revision_after = credentials.revision();
-    if revision_before != revision_after {
-        return ForwardEndpointCredentials {
-            resolver: None,
-            revision: None,
-        };
-    }
+    let (resolver, revision) =
+        credentials.resolver_for_endpoint_with_revision(host, port, canonical_path);
     ForwardEndpointCredentials {
         resolver,
-        revision: Some(revision_before),
+        revision: Some(revision),
     }
 }
 
@@ -8824,6 +8817,47 @@ network_policies:
         assert_eq!(malformed, "/[INVALID_REQUEST_TARGET]");
         assert!(!malformed.contains("API_TOKEN"));
         assert!(!malformed.contains("real-secret"));
+    }
+
+    #[test]
+    fn forward_credentials_capture_endpoint_resolver_and_revision_together() {
+        use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+
+        let state = ProviderCredentialState::from_bound_environment(
+            42,
+            TestHashMap::from([("API_TOKEN".to_string(), "secret".to_string())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.com".to_string(),
+                        port: 80,
+                        path: "/allowed/**".to_string(),
+                    }],
+                    credential_identity: "provider-a:API_TOKEN".to_string(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("bound provider state");
+
+        let credentials = endpoint_credentials_for_request(
+            Some(&state),
+            None,
+            "api.example.com",
+            80,
+            "/allowed/v1",
+        );
+        assert_eq!(credentials.revision, Some(42));
+        assert_eq!(
+            credentials
+                .resolver
+                .expect("endpoint resolver")
+                .resolve_placeholder("openshell:resolve:env:v42_API_TOKEN"),
+            Some("secret")
+        );
     }
 
     #[test]

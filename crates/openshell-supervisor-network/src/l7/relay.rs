@@ -114,18 +114,10 @@ fn scoped_context_for_request(
         return Some(scoped);
     }
     let credentials = ctx.provider_credentials.as_ref()?;
-    let revision_before = credentials.revision();
-    let resolver = credentials.resolver_for_endpoint(&ctx.host, ctx.port, &request.target);
-    let revision_after = credentials.revision();
-    if revision_before != revision_after {
-        // The resolver and revision were not observed from one stable
-        // generation. Fail closed instead of retaining either snapshot.
-        scoped.secret_resolver = None;
-        scoped.provider_credential_revision = None;
-        return Some(scoped);
-    }
+    let (resolver, revision) =
+        credentials.resolver_for_endpoint_with_revision(&ctx.host, ctx.port, &request.target);
     scoped.secret_resolver = resolver;
-    scoped.provider_credential_revision = Some(revision_before);
+    scoped.provider_credential_revision = Some(revision);
     Some(scoped)
 }
 
@@ -2512,6 +2504,45 @@ mod tests {
             .resolver_for_endpoint("denied.example.test", 443, "/outside")
             .expect("endpoint-scoped resolver");
         (state, resolver)
+    }
+
+    #[test]
+    fn scoped_context_captures_endpoint_resolver_and_revision_together() {
+        let state = ProviderCredentialState::from_bound_environment(
+            42,
+            TestHashMap::from([("API_TOKEN".to_string(), "secret".to_string())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_TOKEN".to_string(),
+                endpoint_binding("provider-a:API_TOKEN"),
+            )]),
+            Vec::new(),
+        )
+        .expect("bound provider state");
+        let ctx = L7EvalContext {
+            host: "allowed.example.test".to_string(),
+            port: 443,
+            provider_credentials: Some(state),
+            ..Default::default()
+        };
+        let request = crate::l7::provider::L7Request {
+            action: "GET".to_string(),
+            target: "/allowed/v1".to_string(),
+            query_params: TestHashMap::new(),
+            raw_header: b"GET /allowed/v1 HTTP/1.1\r\nHost: allowed.example.test\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+
+        let scoped = scoped_context_for_request(&ctx, &request).expect("scoped context");
+        assert_eq!(scoped.provider_credential_revision, Some(42));
+        assert_eq!(
+            scoped
+                .secret_resolver
+                .expect("endpoint resolver")
+                .resolve_placeholder("openshell:resolve:env:v42_API_TOKEN"),
+            Some("secret")
+        );
     }
 
     async fn run_single_config_credential_mismatch(
