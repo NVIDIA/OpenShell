@@ -1088,6 +1088,9 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         credential_signing: endpoint.credential_signing.clone(),
         signing_service: endpoint.signing_service.clone(),
         signing_region: endpoint.signing_region.clone(),
+        // Credential bindings reference a concrete sandbox provider instance
+        // and therefore cannot be authored by a reusable provider profile.
+        credential_binding: None,
     }
 }
 
