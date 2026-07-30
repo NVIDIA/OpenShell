@@ -206,6 +206,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | sandboxServiceAccount.annotations | object | `{}` | Annotations to add to the generated sandbox service account. |
 | sandboxServiceAccount.create | bool | `true` | Create a service account for sandbox pods. |
 | sandboxServiceAccount.name | string | `""` | Existing service account name for sandbox pods when sandboxServiceAccount.create is false. |
+| sandboxServiceAccount.openshift.binaryAwareSCC | bool | `false` | Create a minimal SecurityContextConstraints for sandbox pods and grant it to the sandbox ServiceAccount. Required on OpenShift for "sidecar" and "cni-sidecar" topologies when supervisor.sidecar.processBinaryAwareNetworkPolicy is true: the network sidecar must run as UID 0 with SYS_PTRACE and DAC_READ_SEARCH to inspect cross-UID /proc, which restricted-v2 forbids. The SCC is minimal — it adds only those two capabilities plus the image volume type over the restricted baseline; everything else stays locked down (no privileged, no host namespaces, drop ALL, seccomp runtime/default). Creates a SecurityContextConstraints + ClusterRole + ClusterRoleBinding. |
 | securityContext.allowPrivilegeEscalation | bool | `false` | Whether the gateway container can gain additional privileges. |
 | securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the gateway container. |
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |

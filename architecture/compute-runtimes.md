@@ -256,6 +256,15 @@ OpenShift (Multus / OVN-Kubernetes) there is no appendable `.conflist`, so
 `vendor-cni-chain` auxiliary-chain directory and stores plugin credentials in a
 persistent `stateDir`. Neither mode modifies a CNO-managed file.
 
+On OpenShift, binary-aware network policy also requires a purpose-built
+SecurityContextConstraints for sandbox pods: the network sidecar runs as UID 0
+with `SYS_PTRACE` and `DAC_READ_SEARCH` to inspect cross-UID `/proc`, which
+`restricted-v2` forbids. `sandboxServiceAccount.openshift.binaryAwareSCC` creates
+a minimal SCC (the `restricted-v2` baseline plus only those two capabilities, UID
+0, and the `image` volume type) and binds it to the sandbox ServiceAccount.
+Disabling `processBinaryAwareNetworkPolicy` drops the capability requirement and
+lets the stock `restricted-v2` SCC apply.
+
 ## Images
 
 The gateway image and Helm chart are built from this repository. Sandbox images
