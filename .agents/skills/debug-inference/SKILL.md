@@ -252,6 +252,13 @@ the mismatch: policy admission and credential endpoint authorization are
 separate checks, and the provider profile should authorize only intended
 credential recipients.
 
+If the response reports `request_authority_mismatch`, compare the HTTP request
+authority with the CONNECT tunnel endpoint. The host and effective port must
+match. For a tunnel to `api.example.com:8443`, send
+`Host: api.example.com:8443`; omitting the non-default port makes the request
+authority use the transport default and OpenShell rejects it. An absolute-form
+request target must use the same authority.
+
 Attach or detach a provider on an existing sandbox with `openshell sandbox provider attach <sandbox> <provider>` and `openshell sandbox provider detach <sandbox> <provider>`.
 
 Use the `generate-sandbox-policy` skill when the user needs help authoring policy YAML.
@@ -362,6 +369,7 @@ Both commands should return the upstream model list.
 | `inference.local` works but a platform function fails | User route is configured but `sandbox-system` is missing or wrong | `openshell inference get --system`; configure or update with `--system`; inspect supervisor logs |
 | Direct call to external host is denied | Missing policy or provider attachment | Update `network_policies` and launch sandbox with the right provider |
 | Direct call returns `credential_endpoint_mismatch` | Attached provider profile does not authorize the request host, port, or path | Inspect the provider profile endpoints; select or update the profile only if it intentionally authorizes that recipient |
+| Direct call returns `request_authority_mismatch` | HTTP authority does not match the CONNECT host and effective port | Include the explicit non-default port in `Host` and use the same authority in absolute-form targets |
 | SDK fails on empty auth token | Client requires a non-empty API key even though OpenShell injects the real one | Use any placeholder token such as `test` |
 | Upstream timeout from container to host-local backend | Host firewall or network config blocks container-to-host traffic | Allow the Docker bridge subnet to reach the inference port on the host gateway IP (see firewall fix section above) |
 
