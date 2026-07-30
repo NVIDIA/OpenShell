@@ -1,13 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+{{- $mode := .Values.cni.mode | default "conflist" -}}
 {{- if and (eq (.Values.supervisor.topology | default "combined") "cni-sidecar") (not .Values.cni.enabled) -}}
 {{- fail "supervisor.topology=cni-sidecar requires cni.enabled=true so the OpenShell chained CNI plugin is installed on every node" -}}
 {{- end }}
 {{- if .Values.cni.enabled }}
+{{- if not (has $mode (list "conflist" "multus-chain")) -}}
+{{- fail "cni.mode must be \"conflist\" or \"multus-chain\"" -}}
+{{- end }}
+{{- if and (eq $mode "multus-chain") (not .Values.cni.chainDir) -}}
+{{- fail "cni.mode=multus-chain requires cni.chainDir" -}}
+{{- end }}
 {{- $sandboxNamespace := .Values.server.sandboxNamespace | default .Release.Namespace }}
 {{- $cniLogFile := .Values.cni.logFile | default "/var/log/openshell-cni.log" }}
 {{- $cniLogDir := dir $cniLogFile }}
+{{- $stateDir := .Values.cni.confDir }}
+{{- if eq $mode "multus-chain" }}
+{{- $stateDir = .Values.cni.stateDir | default .Values.cni.confDir }}
+{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -42,15 +53,15 @@ spec:
             - -ec
             - |
               bin_dir="/host{{ .Values.cni.binDir }}"
-              conf_dir="/host{{ .Values.cni.confDir }}"
-              host_conf_dir="{{ .Values.cni.confDir }}"
+              state_dir="/host{{ $stateDir }}"
+              host_state_dir="{{ $stateDir }}"
               log_file="{{ $cniLogFile }}"
               host_log_file="/host${log_file}"
-              kubeconfig="${conf_dir}/openshell-cni-kubeconfig"
-              token_file="${conf_dir}/openshell-cni-token"
-              ca_file="${conf_dir}/openshell-cni-ca.crt"
-              plugin_config="${conf_dir}/openshell-cni-plugin.json"
-              mkdir -p "${bin_dir}" "${conf_dir}"
+              kubeconfig="${state_dir}/openshell-cni-kubeconfig"
+              token_file="${state_dir}/openshell-cni-token"
+              ca_file="${state_dir}/openshell-cni-ca.crt"
+              plugin_config="${state_dir}/openshell-cni-plugin.json"
+              mkdir -p "${bin_dir}" "${state_dir}"
               touch "${host_log_file}"
               chmod 0644 "${host_log_file}"
               install -m 0755 /openshell-cni "${bin_dir}/openshell-cni"
@@ -65,11 +76,11 @@ spec:
               - name: cluster
                 cluster:
                   server: https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}
-                  certificate-authority: ${host_conf_dir}/openshell-cni-ca.crt
+                  certificate-authority: ${host_state_dir}/openshell-cni-ca.crt
               users:
               - name: openshell-cni
                 user:
-                  token-file: ${host_conf_dir}/openshell-cni-token
+                  token-file: ${host_state_dir}/openshell-cni-token
               contexts:
               - name: openshell-cni
                 context:
@@ -80,13 +91,15 @@ spec:
               {
                 "type": "openshell-cni",
                 "openshell": {
-                  "kubeconfig": "${host_conf_dir}/openshell-cni-kubeconfig",
+                  "kubeconfig": "${host_state_dir}/openshell-cni-kubeconfig",
                   "sandboxNamespaces": [{{ $sandboxNamespace | quote }}],
                   "logLevel": {{ .Values.cni.logLevel | quote }},
                   "logFile": "${log_file}"
                 }
               }
               EOF
+              {{- if eq $mode "conflist" }}
+              conf_dir="/host{{ .Values.cni.confDir }}"
               {{- if .Values.cni.configFile }}
               target="${conf_dir}/{{ .Values.cni.configFile }}"
               {{- else }}
@@ -104,7 +117,20 @@ spec:
                 .plugins = ((.plugins // []) | map(select(.type != "openshell-cni")) + [$openshell[0]])
               ' "${target}" > "${tmp}"
               mv "${tmp}" "${target}"
-              echo "OpenShell CNI installed; plugin log ${log_file}; firewall backend selected during CNI ADD"
+              echo "OpenShell CNI installed (conflist mode); plugin log ${log_file}; firewall backend selected during CNI ADD"
+              {{- else }}
+              chain_dir="/host{{ .Values.cni.chainDir }}"
+              chain_conf="${chain_dir}/openshell-cni.conf"
+              mkdir -p "${chain_dir}"
+              write_chain_conf() {
+                _tmp="$(mktemp "${chain_dir}/openshell-cni.XXXXXX")"
+                jq -n --slurpfile openshell "${plugin_config}" \
+                  '{"cniVersion": "1.0.0", "name": "openshell-cni"} + $openshell[0]' > "${_tmp}"
+                mv "${_tmp}" "${chain_conf}"
+              }
+              write_chain_conf
+              echo "OpenShell CNI installed (multus-chain mode) at ${chain_conf}; plugin log ${log_file}; firewall backend selected during CNI ADD"
+              {{- end }}
               tail -n 0 -F "${host_log_file}" &
               tail_pid="$!"
               trap 'kill "${tail_pid}" 2>/dev/null || true; exit 0' INT TERM
@@ -112,6 +138,9 @@ spec:
               while true; do
                 cp /var/run/secrets/kubernetes.io/serviceaccount/token "${token_file}"
                 chmod 0600 "${token_file}"
+                {{- if eq $mode "multus-chain" }}
+                [ -f "${chain_conf}" ] || write_chain_conf
+                {{- end }}
                 sleep 300
               done
           securityContext:
@@ -124,6 +153,7 @@ spec:
                   - sh
                   - -ec
                   - |
+                    {{- if eq $mode "conflist" }}
                     conf_dir="/host{{ .Values.cni.confDir }}"
                     for target in "${conf_dir}"/*.conflist; do
                       [ -f "${target}" ] || continue
@@ -137,16 +167,26 @@ spec:
                       ' "${target}" > "${tmp}"
                       mv "${tmp}" "${target}"
                     done
+                    {{- else }}
+                    rm -f "/host{{ .Values.cni.chainDir }}/openshell-cni.conf"
+                    {{- end }}
                     rm -f \
-                      "${conf_dir}/openshell-cni-ca.crt" \
-                      "${conf_dir}/openshell-cni-kubeconfig" \
-                      "${conf_dir}/openshell-cni-plugin.json" \
-                      "${conf_dir}/openshell-cni-token"
+                      "/host{{ $stateDir }}/openshell-cni-ca.crt" \
+                      "/host{{ $stateDir }}/openshell-cni-kubeconfig" \
+                      "/host{{ $stateDir }}/openshell-cni-plugin.json" \
+                      "/host{{ $stateDir }}/openshell-cni-token"
           volumeMounts:
             - name: cni-bin
               mountPath: /host{{ .Values.cni.binDir }}
+            {{- if eq $mode "conflist" }}
             - name: cni-conf
               mountPath: /host{{ .Values.cni.confDir }}
+            {{- else }}
+            - name: cni-chain
+              mountPath: /host{{ .Values.cni.chainDir }}
+            - name: cni-state
+              mountPath: /host{{ $stateDir }}
+            {{- end }}
             - name: cni-log
               mountPath: /host{{ $cniLogDir }}
           {{- with .Values.cni.resources }}
@@ -158,10 +198,21 @@ spec:
           hostPath:
             path: {{ .Values.cni.binDir | quote }}
             type: DirectoryOrCreate
+        {{- if eq $mode "conflist" }}
         - name: cni-conf
           hostPath:
             path: {{ .Values.cni.confDir | quote }}
             type: Directory
+        {{- else }}
+        - name: cni-chain
+          hostPath:
+            path: {{ .Values.cni.chainDir | quote }}
+            type: DirectoryOrCreate
+        - name: cni-state
+          hostPath:
+            path: {{ $stateDir | quote }}
+            type: DirectoryOrCreate
+        {{- end }}
         - name: cni-log
           hostPath:
             path: {{ $cniLogDir | quote }}

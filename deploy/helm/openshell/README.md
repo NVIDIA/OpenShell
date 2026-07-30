@@ -163,6 +163,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | certManager.serverIssuerRef | object | `{"group":"","kind":"","name":""}` | Override the issuerRef for the external server Certificate (e.g. a real ACME ClusterIssuer for a publicly-trusted cert on an external hostname). When set, the chart creates a second server certificate from this issuer with only the hostnames in serverDnsNames; the internal server certificate is always signed by the chart's own CA. Leave name empty to use the chart CA for all server certificates (default). Requires certManager.enabled=true. |
 | cni.affinity | object | `{}` |  |
 | cni.binDir | string | `"/opt/cni/bin"` | Host CNI binary directory. |
+| cni.chainDir | string | `""` | Host Multus vendor-cni-chain directory. Only used when mode is "multus-chain". The installer writes openshell-cni.conf here. |
 | cni.confDir | string | `"/etc/cni/net.d"` | Host CNI config directory. |
 | cni.configFile | string | `""` | Host CNI conflist filename patched by the installer. Empty selects the first non-OpenShell .conflist. |
 | cni.enabled | bool | `false` | Install the OpenShell chained CNI plugin with a privileged node DaemonSet. Required when supervisor.topology is "cni-sidecar". |
@@ -171,8 +172,10 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | cni.image.tag | string | `""` | CNI installer image tag. Empty uses supervisor.image.tag, then chart appVersion. |
 | cni.logFile | string | `"/var/log/openshell-cni.log"` | Host log file written by the OpenShell CNI plugin and tailed by the installer DaemonSet. |
 | cni.logLevel | string | `"info"` | Log level passed to the OpenShell CNI plugin. |
+| cni.mode | string | `"conflist"` | CNI installer strategy. "conflist" appends the OpenShell plugin to an existing CNI .conflist (k3s / vanilla). "multus-chain" writes a standalone plugin .conf into a Multus vendor-cni-chain subdirectory (OpenShift), which never modifies a CNO-managed file. |
 | cni.nodeSelector | object | `{}` |  |
 | cni.resources | object | `{}` |  |
+| cni.stateDir | string | `""` | Persistent host directory for plugin credentials (kubeconfig, token, ca.crt) in "multus-chain" mode. Empty falls back to confDir. Must not be a tmpfs path such as one under /run. |
 | cni.tolerations | list | `[]` |  |
 | fullnameOverride | string | `""` | Override the full generated resource name. |
 | grpcRoute.enabled | bool | `false` | Create a Gateway API GRPCRoute for the gateway service. |
