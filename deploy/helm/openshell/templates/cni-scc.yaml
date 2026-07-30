@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if and .Values.cni.enabled .Values.cni.openshift.privilegedSCC }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "openshell.fullname" . }}-cni-scc
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cni
+rules:
+  - apiGroups:
+      - security.openshift.io
+    resources:
+      - securitycontextconstraints
+    resourceNames:
+      - privileged
+    verbs:
+      - use
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "openshell.fullname" . }}-cni-scc
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cni
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "openshell.fullname" . }}-cni-scc
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openshell.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

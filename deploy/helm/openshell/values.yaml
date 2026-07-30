@@ -102,6 +102,11 @@ cni:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  openshift:
+    # -- Grant the privileged SecurityContextConstraints to the CNI
+    # ServiceAccount. Required on OpenShift for the privileged installer
+    # DaemonSet. Creates a ClusterRole + ClusterRoleBinding.
+    privilegedSCC: false
 
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []

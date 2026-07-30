@@ -161,6 +161,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | cni.logLevel | string | `"info"` | Log level passed to the OpenShell CNI plugin. |
 | cni.mode | string | `"conflist"` | CNI installer strategy. "conflist" appends the OpenShell plugin to an existing CNI .conflist (k3s / vanilla). "multus-chain" writes a standalone plugin .conf into a Multus vendor-cni-chain subdirectory (OpenShift), which never modifies a CNO-managed file. |
 | cni.nodeSelector | object | `{}` |  |
+| cni.openshift.privilegedSCC | bool | `false` | Grant the privileged SecurityContextConstraints to the CNI ServiceAccount. Required on OpenShift for the privileged installer DaemonSet. Creates a ClusterRole + ClusterRoleBinding. |
 | cni.resources | object | `{}` |  |
 | cni.stateDir | string | `""` | Persistent host directory for plugin credentials (kubeconfig, token, ca.crt) in "multus-chain" mode. Empty falls back to confDir. Must not be a tmpfs path such as one under /run. |
 | cni.tolerations | list | `[]` |  |
