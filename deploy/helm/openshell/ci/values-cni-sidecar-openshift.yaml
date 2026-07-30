@@ -20,3 +20,10 @@ cni:
 
 supervisor:
   topology: cni-sidecar
+
+sandboxServiceAccount:
+  openshift:
+    # Sandbox pods run the network sidecar as UID 0 with SYS_PTRACE and
+    # DAC_READ_SEARCH for binary-aware policy; restricted-v2 forbids this, so
+    # grant the sandbox SA the minimal purpose-built SCC.
+    binaryAwareSCC: true

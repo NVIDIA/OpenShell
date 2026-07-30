@@ -80,6 +80,14 @@ Create the name of the service account assigned to sandbox pods
 {{- end }}
 
 {{/*
+Name of the minimal SecurityContextConstraints (and its ClusterRole/binding)
+granted to sandbox pods on OpenShift for binary-aware network policy.
+*/}}
+{{- define "openshell.sandboxSccName" -}}
+{{- printf "%s-sandbox" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
 Gateway image reference. Uses image.tag when set; falls back to .Chart.AppVersion
 so a released chart automatically pulls the matching image without extra overrides.
 */}}
