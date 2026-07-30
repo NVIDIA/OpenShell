@@ -60,6 +60,15 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
+Name of the ServiceAccount used by the CNI installer DaemonSet. Dedicated so
+the privileged SCC and pod-get RBAC stay scoped to the CNI installer rather
+than the shared gateway service account.
+*/}}
+{{- define "openshell.cniServiceAccountName" -}}
+{{- printf "%s-cni" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
 Create the name of the service account assigned to sandbox pods
 */}}
 {{- define "openshell.sandboxServiceAccountName" -}}

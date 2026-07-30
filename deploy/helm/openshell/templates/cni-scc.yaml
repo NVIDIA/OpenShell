@@ -32,6 +32,6 @@ roleRef:
   name: {{ include "openshell.fullname" . }}-cni-scc
 subjects:
   - kind: ServiceAccount
-    name: {{ include "openshell.serviceAccountName" . }}
+    name: {{ include "openshell.cniServiceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
