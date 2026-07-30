@@ -2244,7 +2244,10 @@ impl IntermediateTokenCache {
             let now_ms = crate::persistence::current_time_ms();
             tokens.retain(|_, cached| cached.expires_at_ms > now_ms);
             if tokens.len() >= MAX_INTERMEDIATE_TOKEN_CACHE_ENTRIES
-                && let Some(evict_key) = tokens.keys().next().cloned()
+                && let Some(evict_key) = tokens
+                    .iter()
+                    .min_by_key(|(_, cached)| cached.expires_at_ms)
+                    .map(|(k, _)| k.clone())
             {
                 tokens.remove(&evict_key);
             }
