@@ -77,6 +77,16 @@ pub enum PolicyMergeWarning {
         port: u32,
         incoming: String,
     },
+    /// An `AddRule` operation that would normally fold into an overlapping rule
+    /// stayed on its requested rule name, because folding would have granted a
+    /// binary-to-endpoint pair the operation never declared.
+    KeptRequestedRuleNameToAvoidWidening {
+        rule_name: String,
+        /// Rule the endpoint-overlap fallback would otherwise have folded into.
+        overlapping_rule_name: String,
+        /// Rendered inheritance conflict that folding would have caused.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for PolicyMergeWarning {
@@ -130,9 +140,22 @@ impl std::fmt::Display for PolicyMergeWarning {
                 f,
                 "endpoint {host}:{port} already uses explicit rules; incoming access preset '{incoming}' was ignored"
             ),
+            Self::KeptRequestedRuleNameToAvoidWidening {
+                rule_name,
+                overlapping_rule_name,
+                reason,
+            } => write!(
+                f,
+                "kept add-rule '{rule_name}' on its own rule instead of folding it into overlapping rule '{overlapping_rule_name}': {reason}"
+            ),
         }
     }
 }
+
+/// Rendered name for the any-binary scope in operator-facing merge errors. An
+/// empty binary list on a rule authorizes every binary, which has no path to
+/// print.
+pub const ANY_BINARY_SCOPE: &str = "any binary";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyMergeError {
@@ -152,12 +175,14 @@ pub enum PolicyMergeError {
         /// Rendered effective contract the operation asked for.
         incoming: String,
     },
-    /// A newly added binary would inherit an existing endpoint authorization
-    /// that the incoming rule did not declare.
+    /// Newly added binary scope would inherit an existing endpoint
+    /// authorization that the incoming rule did not declare.
     NewBinaryWouldInheritAuthorization {
         operation_index: usize,
         rule_name: String,
-        binary_path: String,
+        /// Rendered binary scope the operation adds, either a concrete path or
+        /// [`ANY_BINARY_SCOPE`].
+        binary_scope: String,
         host: String,
         ports: Vec<u32>,
     },
@@ -170,6 +195,22 @@ pub enum PolicyMergeError {
         ports: Vec<u32>,
         /// Existing binary scope the operation must also declare to proceed.
         undeclared_binaries: Vec<String>,
+    },
+    /// Several rules carry the same endpoint, so an operation that identifies
+    /// its target by host and port alone cannot say which binary scope it means.
+    AmbiguousEndpointRule {
+        host: String,
+        port: u32,
+        /// Rendered rule, and path where one is set, for each endpoint the host
+        /// and port resolves to. Sorted.
+        targets: Vec<String>,
+    },
+    /// A remove-binary operation targeted a rule that authorizes any binary,
+    /// where there is no binary entry to remove.
+    CannotRemoveBinaryFromAnyBinaryScope {
+        operation_index: usize,
+        rule_name: String,
+        binary_path: String,
     },
     InvalidEndpointReference {
         host: String,
@@ -223,12 +264,12 @@ impl std::fmt::Display for PolicyMergeError {
             Self::NewBinaryWouldInheritAuthorization {
                 operation_index,
                 rule_name,
-                binary_path,
+                binary_scope,
                 host,
                 ports,
             } => write!(
                 f,
-                "merge operation {operation_index} add-rule '{rule_name}' would grant new binary '{binary_path}' undeclared authorization for {host} on ports {ports:?}"
+                "merge operation {operation_index} add-rule '{rule_name}' would grant {binary_scope} undeclared authorization for {host} on ports {ports:?}"
             ),
             Self::ExistingBinariesWouldInheritAuthorization {
                 operation_index,
@@ -240,6 +281,23 @@ impl std::fmt::Display for PolicyMergeError {
                 f,
                 "merge operation {operation_index} add-rule '{rule_name}' would grant existing binaries new or changed authorization for {host} on ports {ports:?}; also declare {}",
                 undeclared_binaries.join(", ")
+            ),
+            Self::AmbiguousEndpointRule {
+                host,
+                port,
+                targets,
+            } => write!(
+                f,
+                "endpoint {host}:{port} resolves to {}; this operation selects its target by host and port alone, so it cannot say which binary scope and L7 surface to widen. Replace the policy with the full YAML instead",
+                targets.join(", ")
+            ),
+            Self::CannotRemoveBinaryFromAnyBinaryScope {
+                operation_index,
+                rule_name,
+                binary_path,
+            } => write!(
+                f,
+                "merge operation {operation_index} cannot remove binary '{binary_path}' from rule '{rule_name}' because the rule authorizes any binary; replace the policy with an explicit binary list or remove the rule"
             ),
             Self::InvalidEndpointReference { host, port } => {
                 write!(f, "invalid endpoint reference '{host}:{port}'")
@@ -303,38 +361,71 @@ pub struct PolicyMergeResult {
 /// must be loaded. Runtime-defaulted scalars are compared by effective value so
 /// omitted defaults do not cause false negatives while explicit policy changes
 /// do not become wildcards. Different loaded rules may jointly cover the
-/// proposal, but every binary-by-endpoint pair must be present in that union.
+/// proposal, but every binary-by-port pair must be present in that union.
+///
+/// The atomic authorization unit is one binary reaching one host, path, and
+/// port. Ports travel as a set on the wire, but the loaded policy may spread
+/// them across rules, so each port resolves independently against the whole
+/// union instead of requiring one loaded endpoint to carry them all.
 ///
 /// Coverage asks whether the loaded policy contains the proposal, not whether
 /// the two are identical. The loaded endpoint is a superset of any proposal
 /// that merged into an endpoint carrying earlier authorizations, so
-/// `endpoint_authorization_covers` compares merge-widened fields by containment
-/// and only exact-matches the fields the merge never widens.
+/// `endpoint_attributes_cover` compares merge-widened fields by containment,
+/// treats an unset proposal value as unspecified for fields the merge retains,
+/// and exact-matches only the fields the proposal actually set.
 pub fn policy_covers_rule(policy: &SandboxPolicy, proposed: &NetworkPolicyRule) -> bool {
     if proposed.endpoints.is_empty() {
         return false;
     }
     proposed.endpoints.iter().all(|target_endpoint| {
-        if proposed.binaries.is_empty() {
-            return policy.network_policies.values().any(|rule| {
-                rule.binaries.is_empty()
-                    && rule
-                        .endpoints
-                        .iter()
-                        .any(|endpoint| endpoint_authorization_covers(endpoint, target_endpoint))
-            });
-        }
+        authorization_ports(target_endpoint)
+            .into_iter()
+            .all(|target_port| {
+                if proposed.binaries.is_empty() {
+                    // An any-binary proposal needs a loaded any-binary scope. A
+                    // rule restricted to named binaries authorizes only those
+                    // binaries, so it can never stand in for "any".
+                    return policy.network_policies.values().any(|rule| {
+                        rule.binaries.is_empty()
+                            && rule_authorizes(rule, target_endpoint, target_port)
+                    });
+                }
 
-        proposed.binaries.iter().all(|target_binary| {
-            policy.network_policies.values().any(|rule| {
-                binary_scope_covers(rule, target_binary)
-                    && rule
-                        .endpoints
-                        .iter()
-                        .any(|endpoint| endpoint_authorization_covers(endpoint, target_endpoint))
+                proposed.binaries.iter().all(|target_binary| {
+                    policy.network_policies.values().any(|rule| {
+                        binary_scope_covers(rule, target_binary)
+                            && rule_authorizes(rule, target_endpoint, target_port)
+                    })
+                })
             })
-        })
     })
+}
+
+/// True when some endpoint on `rule` authorizes `proposed` at `port`.
+fn rule_authorizes(
+    rule: &NetworkPolicyRule,
+    proposed: &NetworkEndpoint,
+    port: Option<u32>,
+) -> bool {
+    rule.endpoints
+        .iter()
+        .any(|endpoint| endpoint_authorization_covers_port(endpoint, proposed, port))
+}
+
+/// The authorization units an endpoint declares, one per port.
+///
+/// `None` represents an endpoint that declares no port at all. Returning it
+/// keeps the unit list non-empty, because an empty list would make the callers'
+/// `all()` vacuously true and report an endpoint that no loaded rule matches as
+/// covered.
+fn authorization_ports(endpoint: &NetworkEndpoint) -> Vec<Option<u32>> {
+    let ports = canonical_ports(endpoint);
+    if ports.is_empty() {
+        vec![None]
+    } else {
+        ports.into_iter().map(Some).collect()
+    }
 }
 
 fn binary_scope_covers(rule: &NetworkPolicyRule, proposed: &NetworkBinary) -> bool {
@@ -345,34 +436,66 @@ fn binary_scope_covers(rule: &NetworkPolicyRule, proposed: &NetworkBinary) -> bo
             .any(|binary| binary.path == proposed.path)
 }
 
-fn endpoint_authorization_covers(loaded: &NetworkEndpoint, proposed: &NetworkEndpoint) -> bool {
-    if !loaded.host.eq_ignore_ascii_case(&proposed.host)
-        || loaded.path != proposed.path
-        || !ports_cover(loaded, proposed)
-        || !protocols_match(&loaded.protocol, &proposed.protocol)
-        || effective_tls(&loaded.tls) != effective_tls(&proposed.tls)
-        || effective_enforcement(&loaded.enforcement)
-            != effective_enforcement(&proposed.enforcement)
-        || !mcp_contracts_match(loaded, proposed)
+/// Coverage for a single atomic authorization unit: `loaded` authorizes
+/// `proposed` at `port`. `None` means the proposal declares no port, which
+/// places no constraint on the loaded port set.
+fn endpoint_authorization_covers_port(
+    loaded: &NetworkEndpoint,
+    proposed: &NetworkEndpoint,
+    port: Option<u32>,
+) -> bool {
+    if let Some(port) = port
+        && !canonical_ports(loaded).contains(&port)
     {
         return false;
     }
+    endpoint_attributes_cover(loaded, proposed)
+}
 
+/// Coverage for everything about an endpoint except its ports.
+fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoint) -> bool {
+    // Host and path identify the endpoint rather than describe it:
+    // `endpoints_overlap` only ever merges endpoints that already agree on
+    // both, so a difference here is a different endpoint, not an unmet request.
+    if !loaded.host.eq_ignore_ascii_case(&proposed.host) || loaded.path != proposed.path {
+        return false;
+    }
+
+    // Fields `merge_endpoint` retains rather than widens. An unset proposal
+    // value is unspecified, not a request for the default: the merge leaves the
+    // loaded value in place and reports success, so comparing effective values
+    // would report a proposal that did land as uncovered and leave the
+    // `policy.local /wait` long poll spinning until its deadline. A set value
+    // still has to match, because the merge would have kept the loaded value
+    // and the proposal genuinely is not in effect.
+    if !proposed.protocol.is_empty() && !protocols_match(&loaded.protocol, &proposed.protocol) {
+        return false;
+    }
+    if !proposed.tls.is_empty() && effective_tls(&loaded.tls) != effective_tls(&proposed.tls) {
+        return false;
+    }
+    if !proposed.enforcement.is_empty()
+        && effective_enforcement(&loaded.enforcement)
+            != effective_enforcement(&proposed.enforcement)
+    {
+        return false;
+    }
     if !proposed.access.is_empty() && loaded.access != proposed.access {
         return false;
     }
 
-    // Split by how `merge_endpoint` treats each field.
-    //
+    // The MCP contract is compared unconditionally in both directions because
+    // `ensure_mcp_contract_compatible` rejects a merge that would give one host
+    // and port two contracts. A mismatch here therefore cannot be a proposal
+    // that landed, in either direction.
+    if !mcp_contracts_match(loaded, proposed) {
+        return false;
+    }
+
     // Widened fields (list appends and `|=` flags) use containment: merging
     // into an endpoint that already carries them leaves the loaded copy a
     // superset of the proposal, so equality would report "not covered" for a
-    // proposal that did land and leave the `/wait` long-poll spinning until
-    // its deadline.
-    //
-    // Retained fields keep exact comparison: the merge never widens them, so a
-    // difference means the incoming value was dropped in favor of the existing
-    // one and the proposal genuinely is not loaded.
+    // proposal that did land.
     contains_all(&loaded.rules, &proposed.rules)
         && contains_all(&loaded.deny_rules, &proposed.deny_rules)
         && contains_all(&loaded.allowed_ips, &proposed.allowed_ips)
@@ -386,14 +509,49 @@ fn endpoint_authorization_covers(loaded: &NetworkEndpoint, proposed: &NetworkEnd
             proposed.request_body_credential_rewrite,
         )
         && flag_covers(loaded.advisor_proposed, proposed.advisor_proposed)
-        && loaded.persisted_queries == proposed.persisted_queries
-        && loaded.graphql_persisted_queries == proposed.graphql_persisted_queries
-        && loaded.graphql_max_body_bytes == proposed.graphql_max_body_bytes
-        && loaded.credential_signing == proposed.credential_signing
-        && loaded.signing_service == proposed.signing_service
-        && loaded.signing_region == proposed.signing_region
+        // Fields the merge neither widens nor retains: it drops them entirely.
+        // An unset proposal value asks for nothing and is satisfied by whatever
+        // is loaded; a set value that differs was dropped, so the proposal is
+        // not in effect and coverage must stay false until it is resubmitted in
+        // a form the merge preserves.
+        && unset_or_equal(&proposed.persisted_queries, &loaded.persisted_queries, String::is_empty)
+        && unset_or_equal(
+            &proposed.graphql_persisted_queries,
+            &loaded.graphql_persisted_queries,
+            HashMap::is_empty,
+        )
+        && unset_or_equal(
+            &proposed.graphql_max_body_bytes,
+            &loaded.graphql_max_body_bytes,
+            |value| *value == 0,
+        )
+        && unset_or_equal(
+            &proposed.credential_signing,
+            &loaded.credential_signing,
+            String::is_empty,
+        )
+        && unset_or_equal(
+            &proposed.signing_service,
+            &loaded.signing_service,
+            String::is_empty,
+        )
+        && unset_or_equal(
+            &proposed.signing_region,
+            &loaded.signing_region,
+            String::is_empty,
+        )
         && (endpoint_uses_mcp(loaded)
-            || loaded.json_rpc_max_body_bytes == proposed.json_rpc_max_body_bytes)
+            || unset_or_equal(
+                &proposed.json_rpc_max_body_bytes,
+                &loaded.json_rpc_max_body_bytes,
+                |value| *value == 0,
+            ))
+}
+
+/// Coverage for a field whose proposal value may be unset. An unset proposal
+/// value expresses no requirement, so it is covered by any loaded value.
+fn unset_or_equal<T: PartialEq>(proposed: &T, loaded: &T, is_unset: impl Fn(&T) -> bool) -> bool {
+    is_unset(proposed) || proposed == loaded
 }
 
 /// Containment for a field the merge appends to: every proposed entry must be
@@ -407,17 +565,6 @@ fn contains_all<T: PartialEq>(loaded: &[T], proposed: &[T]) -> bool {
 /// missing from the loaded endpoint.
 fn flag_covers(loaded: bool, proposed: bool) -> bool {
     loaded || !proposed
-}
-
-fn endpoint_authorizations_equivalent(left: &NetworkEndpoint, right: &NetworkEndpoint) -> bool {
-    endpoint_authorization_covers(left, right) && endpoint_authorization_covers(right, left)
-}
-
-fn ports_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoint) -> bool {
-    let loaded_ports = canonical_ports(loaded);
-    canonical_ports(proposed)
-        .iter()
-        .all(|port| loaded_ports.contains(port))
 }
 
 fn protocols_match(left: &str, right: &str) -> bool {
@@ -560,6 +707,7 @@ fn apply_operation(
             port,
             deny_rules,
         } => {
+            ensure_endpoint_target_is_unambiguous(policy, host, *port)?;
             let endpoint = find_endpoint_mut(policy, host, *port).ok_or_else(|| {
                 PolicyMergeError::EndpointNotFound {
                     host: host.clone(),
@@ -576,6 +724,7 @@ fn apply_operation(
             append_unique_deny_rules(&mut endpoint.deny_rules, deny_rules);
         }
         PolicyMergeOp::AddAllowRules { host, port, rules } => {
+            ensure_endpoint_target_is_unambiguous(policy, host, *port)?;
             let endpoint = find_endpoint_mut(policy, host, *port).ok_or_else(|| {
                 PolicyMergeError::EndpointNotFound {
                     host: host.clone(),
@@ -590,9 +739,28 @@ fn apply_operation(
             rule_name,
             binary_path,
         } => {
+            // An empty binary list authorizes every binary, so there is no entry
+            // to drop and narrowing the rule would mean naming every binary that
+            // should keep access. Reject instead of reporting a success that
+            // leaves the target binary authorized.
+            if policy
+                .network_policies
+                .get(rule_name)
+                .is_some_and(|rule| rule.binaries.is_empty())
+            {
+                return Err(PolicyMergeError::CannotRemoveBinaryFromAnyBinaryScope {
+                    operation_index,
+                    rule_name: rule_name.clone(),
+                    binary_path: binary_path.clone(),
+                });
+            }
+
             let should_remove = if let Some(rule) = policy.network_policies.get_mut(rule_name) {
                 let original_len = rule.binaries.len();
                 rule.binaries.retain(|binary| binary.path != *binary_path);
+                // Removing the last named binary deletes the rule rather than
+                // leaving an empty list behind, which would silently widen the
+                // rule to every binary.
                 original_len != rule.binaries.len() && rule.binaries.is_empty()
             } else {
                 false
@@ -633,7 +801,8 @@ fn add_rule(
     // provider rule's binary list. The agent's contribution is kept on its
     // own rule key, the prover sees the actual narrow proposal, and the
     // reviewer gets honest signal about what's being added.
-    let target_key = if policy.network_policies.contains_key(rule_name) {
+    let requested_key_exists = policy.network_policies.contains_key(rule_name);
+    let target_key = if requested_key_exists {
         Some(rule_name.to_string())
     } else {
         let mut keys: Vec<_> = policy.network_policies.keys().cloned().collect();
@@ -650,25 +819,87 @@ fn add_rule(
             })
     };
 
-    if let Some(key) = target_key {
-        let existing_rule = policy
-            .network_policies
-            .get_mut(&key)
-            .expect("existing rule must be present");
-        merge_rules(
-            existing_rule,
-            &incoming_rule,
-            operation_index,
-            rule_name,
-            warnings,
-        )?;
-    } else {
-        policy
-            .network_policies
-            .insert(rule_name.to_string(), incoming_rule);
+    match target_key {
+        // The operation named this rule, so an inheritance conflict is the
+        // answer the proposer needs: declare the rule's whole binary and
+        // endpoint scope, or target a different rule.
+        Some(key) if requested_key_exists => {
+            let existing_rule = policy
+                .network_policies
+                .get_mut(&key)
+                .expect("existing rule must be present");
+            merge_rules(
+                existing_rule,
+                &incoming_rule,
+                operation_index,
+                rule_name,
+                warnings,
+            )?;
+        }
+        // The overlap fallback chose this rule. Folding is a convenience for
+        // incremental refinement, not something the operation asked for, so a
+        // conflict it creates is not the proposer's error to fix: keeping the
+        // proposal on its requested key authorizes exactly the product the
+        // operation declared and nothing else. Merging into a copy keeps the
+        // rejected attempt from leaving partial edits behind.
+        Some(key) => {
+            let mut candidate = policy
+                .network_policies
+                .get(&key)
+                .expect("existing rule must be present")
+                .clone();
+            let mut candidate_warnings = Vec::new();
+            match merge_rules(
+                &mut candidate,
+                &incoming_rule,
+                operation_index,
+                rule_name,
+                &mut candidate_warnings,
+            ) {
+                Ok(()) => {
+                    policy.network_policies.insert(key, candidate);
+                    warnings.extend(candidate_warnings);
+                }
+                Err(error) if is_authorization_inheritance_conflict(&error) => {
+                    // Surface the skipped fold. The operator asked for one rule
+                    // and gets two, and the same host and port now appears in
+                    // both, which changes which rule later host-and-port
+                    // operations resolve to.
+                    warnings.push(PolicyMergeWarning::KeptRequestedRuleNameToAvoidWidening {
+                        rule_name: rule_name.to_string(),
+                        overlapping_rule_name: key,
+                        reason: error.to_string(),
+                    });
+                    policy
+                        .network_policies
+                        .insert(rule_name.to_string(), incoming_rule);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        None => {
+            policy
+                .network_policies
+                .insert(rule_name.to_string(), incoming_rule);
+        }
     }
 
     Ok(())
+}
+
+/// True for the merge errors that exist only because two authorizations share
+/// one rule, so moving the incoming authorization to its own rule resolves them.
+///
+/// An MCP contract conflict is deliberately excluded. The supervisor establishes
+/// one inspection contract per host and port rather than per rule, so two
+/// contracts for the same endpoint stay ambiguous in separate rules and the
+/// operation has to be rejected wherever it lands.
+fn is_authorization_inheritance_conflict(error: &PolicyMergeError) -> bool {
+    matches!(
+        error,
+        PolicyMergeError::NewBinaryWouldInheritAuthorization { .. }
+            | PolicyMergeError::ExistingBinariesWouldInheritAuthorization { .. }
+    )
 }
 
 fn merge_rules(
@@ -709,7 +940,17 @@ fn merge_rules(
     )?;
 
     existing_rule.endpoints = merged_endpoints;
-    append_unique_binaries(&mut existing_rule.binaries, &incoming_rule.binaries);
+    if incoming_rule.binaries.is_empty() {
+        // An incoming any-binary scope replaces the restricted scope instead of
+        // appending to it. Appending an empty list would leave the existing
+        // binaries in place, so the operation would report success while never
+        // authorizing the scope it asked for and coverage would never converge.
+        // The inheritance check above already required this operation to
+        // declare every merged endpoint before the widening is allowed.
+        existing_rule.binaries.clear();
+    } else {
+        append_unique_binaries(&mut existing_rule.binaries, &incoming_rule.binaries);
+    }
     warnings.extend(endpoint_warnings);
     Ok(())
 }
@@ -883,45 +1124,71 @@ fn ensure_authorization_inheritance_is_declared(
         .iter()
         .map(|binary| binary.path.as_str())
         .collect();
-    // An existing empty list already authorizes any binary, so no incoming
-    // concrete path can expand that side of the Cartesian product.
-    let new_binary = if existing_rule.binaries.is_empty() {
+    // Binary scope the operation adds to the rule. An empty incoming list means
+    // any binary, which introduces every binary outside the existing list, so it
+    // widens this side of the Cartesian product just as a new concrete path does
+    // and has to declare the endpoints it will reach. An existing empty list
+    // already authorizes any binary, so nothing incoming can widen it further.
+    let new_binary_scope = if existing_rule.binaries.is_empty() {
         None
+    } else if incoming_rule.binaries.is_empty() {
+        Some(ANY_BINARY_SCOPE.to_string())
     } else {
         incoming_rule
             .binaries
             .iter()
             .find(|binary| !existing_binary_paths.contains(binary.path.as_str()))
+            .map(|binary| format!("binary '{}'", binary.path))
     };
     let undeclared_binaries = undeclared_existing_binaries(existing_rule, incoming_rule);
 
     for endpoint in merged_endpoints {
-        if let Some(binary) = new_binary
-            && !incoming_rule
+        let units = authorization_ports(endpoint);
+
+        if let Some(binary_scope) = &new_binary_scope {
+            // Adoption depends on the declaration and this endpoint, not on the
+            // port, so it is resolved once per endpoint rather than per port.
+            let declarations: Vec<NetworkEndpoint> = incoming_rule
                 .endpoints
                 .iter()
-                .any(|declared| endpoint_authorization_covers(declared, endpoint))
-        {
-            return Err(PolicyMergeError::NewBinaryWouldInheritAuthorization {
-                operation_index,
-                rule_name: rule_name.to_string(),
-                binary_path: binary.path.clone(),
-                host: endpoint.host.clone(),
-                ports: canonical_ports(endpoint),
-            });
+                .map(|declared| adopt_unset_retained_fields(declared, endpoint))
+                .collect();
+            // The operation may declare one endpoint's ports across several
+            // incoming endpoints, so each port is checked against every
+            // declaration rather than against a single one.
+            let undeclared_ports: Vec<Option<u32>> = units
+                .iter()
+                .copied()
+                .filter(|port| !operation_declares(&declarations, endpoint, *port))
+                .collect();
+            if !undeclared_ports.is_empty() {
+                return Err(PolicyMergeError::NewBinaryWouldInheritAuthorization {
+                    operation_index,
+                    rule_name: rule_name.to_string(),
+                    binary_scope: binary_scope.clone(),
+                    host: endpoint.host.clone(),
+                    ports: undeclared_ports.into_iter().flatten().collect(),
+                });
+            }
         }
 
-        let endpoint_is_new_or_changed = !existing_rule
-            .endpoints
+        let changed_ports: Vec<Option<u32>> = units
             .iter()
-            .any(|existing| endpoint_authorizations_equivalent(existing, endpoint));
-        if endpoint_is_new_or_changed && !undeclared_binaries.is_empty() {
+            .copied()
+            .filter(|port| {
+                !existing_rule
+                    .endpoints
+                    .iter()
+                    .any(|existing| authorization_unit_unchanged(existing, endpoint, *port))
+            })
+            .collect();
+        if !changed_ports.is_empty() && !undeclared_binaries.is_empty() {
             return Err(
                 PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
                     operation_index,
                     rule_name: rule_name.to_string(),
                     host: endpoint.host.clone(),
-                    ports: canonical_ports(endpoint),
+                    ports: changed_ports.into_iter().flatten().collect(),
                     undeclared_binaries,
                 },
             );
@@ -929,6 +1196,106 @@ fn ensure_authorization_inheritance_is_declared(
     }
 
     Ok(())
+}
+
+/// True when the operation itself declares the authorization `merged` grants at
+/// `port`, anywhere in `declarations`.
+///
+/// `declarations` must already have been through `adopt_unset_retained_fields`
+/// against `merged`.
+fn operation_declares(
+    declarations: &[NetworkEndpoint],
+    merged: &NetworkEndpoint,
+    port: Option<u32>,
+) -> bool {
+    declarations
+        .iter()
+        .any(|declared| endpoint_authorization_covers_port(declared, merged, port))
+}
+
+/// Fills a declaration's unset carry-over fields from the endpoint it is being
+/// judged against.
+///
+/// A carry-over field is one the merge never widens: it either retains the
+/// existing value (`protocol`, `tls`, `enforcement`, `access`) or ignores the
+/// incoming value entirely (the signing and GraphQL fields). Either way the new
+/// binary receives whatever the endpoint already carried, and the operation
+/// cannot change it, so a declaration that leaves the field unset expresses no
+/// opinion rather than a request for the default. Comparing the unset value
+/// against the merged one would reject a complete declaration over a field the
+/// operation never tried to change, and for `enforcement` it would reject
+/// specifically because the binary is about to receive the stricter mode.
+///
+/// Every carry-over field has to be listed here. Missing one costs a false
+/// rejection of a complete declaration, which is why adoption is written as an
+/// explicit allow-list rather than by copying `merged` and restoring the widened
+/// fields: forgetting a field in that direction would silently satisfy the
+/// declaration instead.
+///
+/// This is the declaration direction only. Coverage still exact-matches a value
+/// the proposal actually set, because there the question is whether the
+/// proposer's own request took effect.
+fn adopt_unset_retained_fields(
+    declared: &NetworkEndpoint,
+    merged: &NetworkEndpoint,
+) -> NetworkEndpoint {
+    let mut adopted = declared.clone();
+    if adopted.protocol.is_empty() {
+        adopted.protocol.clone_from(&merged.protocol);
+    }
+    if adopted.tls.is_empty() {
+        adopted.tls.clone_from(&merged.tls);
+    }
+    if adopted.enforcement.is_empty() {
+        adopted.enforcement.clone_from(&merged.enforcement);
+    }
+    // `merge_endpoint` only touches `access` when the incoming endpoint carries
+    // an access preset or explicit rules, so an endpoint declaring neither keeps
+    // whatever preset is already loaded.
+    if adopted.access.is_empty() && adopted.rules.is_empty() {
+        adopted.access.clone_from(&merged.access);
+    }
+    if adopted.persisted_queries.is_empty() {
+        adopted
+            .persisted_queries
+            .clone_from(&merged.persisted_queries);
+    }
+    if adopted.graphql_persisted_queries.is_empty() {
+        adopted
+            .graphql_persisted_queries
+            .clone_from(&merged.graphql_persisted_queries);
+    }
+    if adopted.graphql_max_body_bytes == 0 {
+        adopted.graphql_max_body_bytes = merged.graphql_max_body_bytes;
+    }
+    if adopted.credential_signing.is_empty() {
+        adopted
+            .credential_signing
+            .clone_from(&merged.credential_signing);
+    }
+    if adopted.signing_service.is_empty() {
+        adopted.signing_service.clone_from(&merged.signing_service);
+    }
+    if adopted.signing_region.is_empty() {
+        adopted.signing_region.clone_from(&merged.signing_region);
+    }
+    if adopted.json_rpc_max_body_bytes == 0 {
+        adopted.json_rpc_max_body_bytes = merged.json_rpc_max_body_bytes;
+    }
+    adopted
+}
+
+/// True when `existing` already authorizes exactly what `merged` authorizes at
+/// `port`. Equivalence rather than coverage: an existing endpoint authorizing
+/// strictly less has changed, and the rule's other binaries would inherit the
+/// difference.
+fn authorization_unit_unchanged(
+    existing: &NetworkEndpoint,
+    merged: &NetworkEndpoint,
+    port: Option<u32>,
+) -> bool {
+    endpoint_authorization_covers_port(existing, merged, port)
+        && endpoint_authorization_covers_port(merged, existing, port)
 }
 
 /// Existing binary scope the incoming rule failed to declare. Empty means the
@@ -1033,6 +1400,53 @@ fn find_matching_endpoint_mut<'a>(
     endpoints
         .iter_mut()
         .find(|endpoint| endpoints_overlap(endpoint, target))
+}
+
+/// Every endpoint `host:port` resolves to, rendered with its owning rule.
+///
+/// `endpoint_matches_host_port` deliberately ignores `path`, and
+/// `endpoints_overlap` treats a different path as a different endpoint, so one
+/// rule can own several matching endpoints. Counting rules alone would miss
+/// that, so this counts endpoints.
+fn matching_endpoint_targets(policy: &SandboxPolicy, host: &str, port: u32) -> Vec<String> {
+    let mut targets: Vec<String> = policy
+        .network_policies
+        .iter()
+        .filter(|(key, _)| !is_provider_rule_name(key))
+        .flat_map(|(key, rule)| {
+            rule.endpoints
+                .iter()
+                .filter(|endpoint| endpoint_matches_host_port(endpoint, host, port))
+                .map(move |endpoint| {
+                    if endpoint.path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{key} (path '{}')", endpoint.path)
+                    }
+                })
+        })
+        .collect();
+    targets.sort();
+    targets
+}
+
+/// Fails closed when `host:port` resolves to more than one endpoint, because
+/// appending an L7 rule widens authorization for every binary on whichever
+/// endpoint is picked, and the operation cannot say which one it means.
+fn ensure_endpoint_target_is_unambiguous(
+    policy: &SandboxPolicy,
+    host: &str,
+    port: u32,
+) -> Result<(), PolicyMergeError> {
+    let targets = matching_endpoint_targets(policy, host, port);
+    if targets.len() > 1 {
+        return Err(PolicyMergeError::AmbiguousEndpointRule {
+            host: host.to_string(),
+            port,
+            targets,
+        });
+    }
+    Ok(())
 }
 
 fn find_endpoint_mut<'a>(
@@ -1316,8 +1730,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        DEFAULT_JSON_RPC_MAX_BODY_BYTES, PolicyMergeError, PolicyMergeOp, PolicyMergeWarning,
-        generated_rule_name, merge_policy, policy_covers_rule,
+        ANY_BINARY_SCOPE, DEFAULT_JSON_RPC_MAX_BODY_BYTES, PolicyMergeError, PolicyMergeOp,
+        PolicyMergeWarning, generated_rule_name, merge_policy, policy_covers_rule,
     };
     use crate::restrictive_default_policy;
     use openshell_core::proto::{
@@ -1512,11 +1926,11 @@ mod tests {
             error,
             PolicyMergeError::NewBinaryWouldInheritAuthorization {
                 operation_index: 0,
-                binary_path,
+                binary_scope,
                 host,
                 ports,
                 ..
-            } if binary_path == "/usr/bin/untrusted"
+            } if binary_scope == "binary '/usr/bin/untrusted'"
                 && host == "admin.example.com"
                 && ports == vec![443]
         ));
@@ -1555,10 +1969,10 @@ mod tests {
             error,
             PolicyMergeError::NewBinaryWouldInheritAuthorization {
                 operation_index: 0,
-                binary_path,
+                binary_scope,
                 host,
                 ..
-            } if binary_path == "/usr/bin/untrusted" && host == "mcp.example.com"
+            } if binary_scope == "binary '/usr/bin/untrusted'" && host == "mcp.example.com"
         ));
     }
 
@@ -3115,6 +3529,784 @@ mod tests {
         assert!(
             merged.binaries.iter().any(|b| b.path == "/usr/bin/curl"),
             "user rule should have absorbed the incoming curl binary"
+        );
+    }
+
+    fn endpoint_with_ports(host: &str, ports: &[u32]) -> NetworkEndpoint {
+        NetworkEndpoint {
+            host: host.to_string(),
+            port: ports.first().copied().unwrap_or_default(),
+            ports: ports.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// A proposal that omits a field the merge retains still has to read back as
+    /// covered. The merge keeps the loaded value and reports success, so
+    /// requiring the proposal to match the loaded value would leave the
+    /// `policy.local /wait` long poll spinning against a policy that did load.
+    #[test]
+    fn coverage_treats_an_omitted_retained_field_as_unspecified() {
+        for (field, loaded_endpoint) in [
+            (
+                "enforcement",
+                NetworkEndpoint {
+                    enforcement: "enforce".to_string(),
+                    ..endpoint("api.example.com", 443)
+                },
+            ),
+            (
+                "protocol",
+                NetworkEndpoint {
+                    protocol: "rest".to_string(),
+                    ..endpoint("api.example.com", 443)
+                },
+            ),
+            (
+                "tls",
+                NetworkEndpoint {
+                    tls: "skip".to_string(),
+                    ..endpoint("api.example.com", 443)
+                },
+            ),
+        ] {
+            let existing =
+                rule_with_authorizations("existing", vec![loaded_endpoint], &["/usr/bin/trusted"]);
+            // The proposal declares the whole binary scope and leaves the
+            // retained field unset, so the merge accepts it unchanged.
+            let proposal = rule_with_authorizations(
+                "existing",
+                vec![endpoint("api.example.com", 443)],
+                &["/usr/bin/trusted"],
+            );
+
+            let result = merge_policy(
+                policy_with_rule("existing", existing),
+                &[PolicyMergeOp::AddRule {
+                    rule_name: "existing".to_string(),
+                    rule: proposal.clone(),
+                }],
+            )
+            .unwrap_or_else(|error| panic!("omitting {field} should merge cleanly: {error}"));
+
+            assert!(
+                policy_covers_rule(&result.policy, &proposal),
+                "a proposal omitting {field} merged cleanly, so it must read back as covered"
+            );
+        }
+    }
+
+    /// A rule's port list is a set of independent authorizations, so the loaded
+    /// policy may spread one proposed endpoint's ports across several rules.
+    #[test]
+    fn coverage_resolves_each_port_across_the_loaded_rule_union() {
+        let mut policy = policy_with_rule(
+            "https",
+            rule_with_authorizations(
+                "https",
+                vec![endpoint_with_ports("api.example.com", &[443])],
+                &["/usr/bin/client"],
+            ),
+        );
+        policy.network_policies.insert(
+            "alt_https".to_string(),
+            rule_with_authorizations(
+                "alt_https",
+                vec![endpoint_with_ports("api.example.com", &[8443])],
+                &["/usr/bin/client"],
+            ),
+        );
+
+        let proposed = rule_with_authorizations(
+            "combined",
+            vec![endpoint_with_ports("api.example.com", &[443, 8443])],
+            &["/usr/bin/client"],
+        );
+
+        assert!(
+            policy_covers_rule(&policy, &proposed),
+            "two loaded rules covering one port each authorize the same traffic \
+             as one rule covering both"
+        );
+    }
+
+    /// An endpoint that declares no port at all still needs a matching loaded
+    /// endpoint. Iterating an empty port list would make the coverage `all()`
+    /// vacuously true and report an unmatched proposal as covered.
+    #[test]
+    fn coverage_rejects_a_portless_endpoint_no_loaded_rule_matches() {
+        let policy = policy_with_rule(
+            "existing",
+            rule_with_authorizations(
+                "existing",
+                vec![endpoint("api.example.com", 443)],
+                &["/usr/bin/client"],
+            ),
+        );
+        let proposed = rule_with_authorizations(
+            "other",
+            vec![NetworkEndpoint {
+                host: "unrelated.example.com".to_string(),
+                ..Default::default()
+            }],
+            &["/usr/bin/client"],
+        );
+
+        assert!(
+            !policy_covers_rule(&policy, &proposed),
+            "no loaded rule mentions the proposed host, so coverage must fail closed"
+        );
+    }
+
+    /// A complete declaration may arrive split across several incoming
+    /// endpoints. Requiring one declaration to cover the whole merged endpoint
+    /// would reject a new binary that did declare every port it will reach.
+    #[test]
+    fn new_binary_may_declare_one_endpoints_ports_across_several_declarations() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![endpoint_with_ports("api.example.com", &[443, 8443])],
+            &["/usr/bin/trusted"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![
+                endpoint_with_ports("api.example.com", &[443]),
+                endpoint_with_ports("api.example.com", &[8443]),
+            ],
+            &["/usr/bin/trusted", "/usr/bin/second"],
+        );
+
+        let result = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("the new binary declared both ports, just in separate endpoints");
+
+        let merged = &result.policy.network_policies["existing"];
+        assert!(merged.binaries.iter().any(|b| b.path == "/usr/bin/second"));
+    }
+
+    /// The complement: a split declaration that misses a port is still an
+    /// implicit grant and must be rejected, naming the port left undeclared.
+    #[test]
+    fn new_binary_split_declaration_must_still_cover_every_port() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![endpoint_with_ports("api.example.com", &[443, 8443])],
+            &["/usr/bin/trusted"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![endpoint_with_ports("api.example.com", &[443])],
+            &["/usr/bin/trusted", "/usr/bin/second"],
+        );
+
+        let error = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect_err("port 8443 was never declared for the new binary");
+
+        assert!(matches!(
+            error,
+            PolicyMergeError::NewBinaryWouldInheritAuthorization { ports, .. }
+                if ports == vec![8443]
+        ));
+    }
+
+    /// An incoming empty binary list means any binary, which widens a
+    /// restricted rule to every binary on the system. It has to declare the
+    /// rule's whole endpoint scope first, exactly like a new concrete path.
+    #[test]
+    fn any_binary_proposal_cannot_inherit_undeclared_endpoints() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![
+                endpoint("api.example.com", 443),
+                endpoint("admin.example.com", 443),
+            ],
+            &["/usr/bin/trusted"],
+        );
+        let incoming =
+            rule_with_authorizations("existing", vec![endpoint("api.example.com", 443)], &[]);
+
+        let error = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect_err("any-binary scope would reach the undeclared admin endpoint");
+
+        assert!(matches!(
+            error,
+            PolicyMergeError::NewBinaryWouldInheritAuthorization { binary_scope, host, .. }
+                if binary_scope == ANY_BINARY_SCOPE && host == "admin.example.com"
+        ));
+    }
+
+    /// Once the declaration is complete the promotion has to be applied.
+    /// Appending an empty binary list would leave the restricted scope in place,
+    /// so the operation would report success while authorizing nothing it asked
+    /// for and coverage would never converge.
+    #[test]
+    fn any_binary_proposal_replaces_a_restricted_scope_once_fully_declared() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![endpoint("api.example.com", 443)],
+            &["/usr/bin/trusted"],
+        );
+        let incoming =
+            rule_with_authorizations("existing", vec![endpoint("api.example.com", 443)], &[]);
+
+        let result = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming.clone(),
+            }],
+        )
+        .expect("the proposal declared the rule's only endpoint");
+
+        assert!(
+            result.policy.network_policies["existing"]
+                .binaries
+                .is_empty(),
+            "the any-binary scope the operation asked for must be applied"
+        );
+        assert!(
+            policy_covers_rule(&result.policy, &incoming),
+            "an applied any-binary scope must read back as covered"
+        );
+    }
+
+    /// The overlap fallback is a convenience for incremental refinement, not
+    /// something the operation requested. When folding would grant undeclared
+    /// authorization, the proposal keeps its own rule name instead, which
+    /// authorizes exactly the product it declared. Without this the documented
+    /// "put the new authorization in a separate rule" remediation is
+    /// unreachable for any endpoint that overlaps an existing rule.
+    #[test]
+    fn overlapping_partial_authorization_keeps_its_requested_rule_name() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![
+                endpoint("api.example.com", 443),
+                endpoint("admin.example.com", 443),
+            ],
+            &["/usr/bin/trusted"],
+        );
+
+        let result = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "narrow_grant".to_string(),
+                rule: rule_with_authorizations(
+                    "narrow_grant",
+                    vec![endpoint("api.example.com", 443)],
+                    &["/usr/bin/limited"],
+                ),
+            }],
+        )
+        .expect("a partial grant must land on its own rule rather than be rejected");
+
+        let narrow = result
+            .policy
+            .network_policies
+            .get("narrow_grant")
+            .expect("the requested key must be preserved when folding would widen");
+        assert_eq!(narrow.binaries.len(), 1);
+        assert_eq!(narrow.endpoints.len(), 1);
+
+        // Skipping the fold has to be visible: the operator asked for one rule
+        // and got two, and later host-and-port operations now have two
+        // candidate rules to resolve against.
+        assert!(
+            result.warnings.iter().any(|warning| matches!(
+                warning,
+                PolicyMergeWarning::KeptRequestedRuleNameToAvoidWidening {
+                    rule_name,
+                    overlapping_rule_name,
+                    ..
+                } if rule_name == "narrow_grant" && overlapping_rule_name == "existing"
+            )),
+            "got warnings: {:?}",
+            result.warnings
+        );
+
+        // The existing rule keeps its own product untouched: the limited binary
+        // never gains the admin endpoint.
+        let untouched = &result.policy.network_policies["existing"];
+        assert_eq!(untouched.binaries.len(), 1);
+        assert!(
+            untouched
+                .binaries
+                .iter()
+                .all(|b| b.path != "/usr/bin/limited")
+        );
+    }
+
+    /// Folding stays the default when it grants nothing new, so incremental
+    /// refinement under a fresh rule name still consolidates.
+    #[test]
+    fn overlapping_complete_authorization_still_folds_into_the_existing_rule() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![endpoint("api.example.com", 443)],
+            &["/usr/bin/trusted"],
+        );
+
+        let result = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "refinement".to_string(),
+                rule: rule_with_authorizations(
+                    "refinement",
+                    vec![endpoint("api.example.com", 443)],
+                    &["/usr/bin/trusted", "/usr/bin/second"],
+                ),
+            }],
+        )
+        .expect("the operation declared the rule's whole scope");
+
+        assert!(
+            !result.policy.network_policies.contains_key("refinement"),
+            "a complete declaration should still fold into the overlapping rule"
+        );
+        assert_eq!(result.policy.network_policies["existing"].binaries.len(), 2);
+    }
+
+    /// An MCP contract conflict is not resolved by moving the authorization to
+    /// another rule, because the supervisor establishes one contract per host
+    /// and port. It must propagate even on the fallback path.
+    #[test]
+    fn overlapping_mcp_contract_conflict_is_not_deflected_to_a_separate_rule() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![mcp_endpoint(
+                "mcp.example.com",
+                &[443],
+                None,
+                None,
+                65536,
+                vec![mcp_tool_rule("existing-tool")],
+            )],
+            &["/usr/bin/trusted"],
+        );
+
+        let error = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "second_contract".to_string(),
+                rule: rule_with_authorizations(
+                    "second_contract",
+                    vec![mcp_endpoint(
+                        "mcp.example.com",
+                        &[443],
+                        None,
+                        None,
+                        131_072,
+                        vec![mcp_tool_rule("other-tool")],
+                    )],
+                    &["/usr/bin/trusted"],
+                ),
+            }],
+        )
+        .expect_err("one host and port cannot carry two inspection contracts");
+
+        assert!(matches!(
+            error,
+            PolicyMergeError::McpContractConflict { .. }
+        ));
+    }
+
+    /// The round-trip property the whole design rests on: whatever the gateway
+    /// accepts must immediately read back as covered, or `/wait` hangs.
+    #[test]
+    fn every_accepted_merge_reads_back_as_covered() {
+        let cases: Vec<(&str, NetworkPolicyRule, NetworkPolicyRule)> = vec![
+            (
+                "omitted enforcement against an enforced endpoint",
+                rule_with_authorizations(
+                    "existing",
+                    vec![NetworkEndpoint {
+                        enforcement: "enforce".to_string(),
+                        ..endpoint("api.example.com", 443)
+                    }],
+                    &["/usr/bin/trusted"],
+                ),
+                rule_with_authorizations(
+                    "existing",
+                    vec![endpoint("api.example.com", 443)],
+                    &["/usr/bin/trusted"],
+                ),
+            ),
+            (
+                "split ports declared across two endpoints",
+                rule_with_authorizations(
+                    "existing",
+                    vec![endpoint_with_ports("api.example.com", &[443, 8443])],
+                    &["/usr/bin/trusted"],
+                ),
+                rule_with_authorizations(
+                    "existing",
+                    vec![
+                        endpoint_with_ports("api.example.com", &[443]),
+                        endpoint_with_ports("api.example.com", &[8443]),
+                    ],
+                    &["/usr/bin/trusted", "/usr/bin/second"],
+                ),
+            ),
+            (
+                "any-binary promotion",
+                rule_with_authorizations(
+                    "existing",
+                    vec![endpoint("api.example.com", 443)],
+                    &["/usr/bin/trusted"],
+                ),
+                rule_with_authorizations("existing", vec![endpoint("api.example.com", 443)], &[]),
+            ),
+        ];
+
+        for (label, existing, proposal) in cases {
+            let result = merge_policy(
+                policy_with_rule("existing", existing),
+                &[PolicyMergeOp::AddRule {
+                    rule_name: "existing".to_string(),
+                    rule: proposal.clone(),
+                }],
+            )
+            .unwrap_or_else(|error| panic!("{label} should merge: {error}"));
+
+            assert!(
+                policy_covers_rule(&result.policy, &proposal),
+                "{label}: the merge was accepted, so coverage must report it loaded"
+            );
+        }
+    }
+
+    /// A declaration that leaves a retained field unset expresses no opinion
+    /// about it. Rejecting on that field would refuse a complete declaration
+    /// over a mode the operation never tried to change, and for enforcement it
+    /// would refuse specifically because the binary receives the stricter mode.
+    #[test]
+    fn declaration_may_omit_retained_fields_it_does_not_change() {
+        for (field, loaded_endpoint) in [
+            (
+                "enforcement",
+                NetworkEndpoint {
+                    enforcement: "enforce".to_string(),
+                    ..endpoint("api.example.com", 443)
+                },
+            ),
+            (
+                "protocol",
+                NetworkEndpoint {
+                    protocol: "rest".to_string(),
+                    ..endpoint("api.example.com", 443)
+                },
+            ),
+            (
+                "tls",
+                NetworkEndpoint {
+                    tls: "skip".to_string(),
+                    ..endpoint("api.example.com", 443)
+                },
+            ),
+            (
+                "access",
+                NetworkEndpoint {
+                    protocol: "rest".to_string(),
+                    access: "read-only".to_string(),
+                    ..endpoint("api.example.com", 443)
+                },
+            ),
+            (
+                "credential_signing",
+                NetworkEndpoint {
+                    credential_signing: "sigv4".to_string(),
+                    signing_service: "s3".to_string(),
+                    signing_region: "us-west-2".to_string(),
+                    ..endpoint("api.example.com", 443)
+                },
+            ),
+            (
+                "persisted_queries",
+                NetworkEndpoint {
+                    persisted_queries: "allow_registered".to_string(),
+                    graphql_max_body_bytes: 4096,
+                    ..endpoint("api.example.com", 443)
+                },
+            ),
+            (
+                "json_rpc_max_body_bytes",
+                NetworkEndpoint {
+                    json_rpc_max_body_bytes: 65536,
+                    ..endpoint("api.example.com", 443)
+                },
+            ),
+        ] {
+            let existing =
+                rule_with_authorizations("existing", vec![loaded_endpoint], &["/usr/bin/trusted"]);
+            // Declares the whole scope, but says nothing about the carry-over
+            // field the endpoint already carries.
+            let incoming = rule_with_authorizations(
+                "existing",
+                vec![endpoint("api.example.com", 443)],
+                &["/usr/bin/trusted", "/usr/bin/second"],
+            );
+
+            merge_policy(
+                policy_with_rule("existing", existing),
+                &[PolicyMergeOp::AddRule {
+                    rule_name: "existing".to_string(),
+                    rule: incoming,
+                }],
+            )
+            .unwrap_or_else(|error| {
+                panic!("a declaration omitting {field} covers the whole scope: {error}")
+            });
+        }
+    }
+
+    /// Omitting a retained field is not the same as contradicting one. A
+    /// declaration that names a different protocol still has to be rejected.
+    #[test]
+    fn declaration_that_contradicts_a_retained_field_is_still_rejected() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                protocol: "rest".to_string(),
+                ..endpoint("api.example.com", 443)
+            }],
+            &["/usr/bin/trusted"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                protocol: "websocket".to_string(),
+                ..endpoint("api.example.com", 443)
+            }],
+            &["/usr/bin/trusted", "/usr/bin/second"],
+        );
+
+        let error = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect_err("the declaration describes a protocol the merge will not apply");
+
+        assert!(matches!(
+            error,
+            PolicyMergeError::NewBinaryWouldInheritAuthorization { .. }
+        ));
+    }
+
+    /// `AddAllowRules` and `AddDenyRules` name their target by host and port
+    /// alone, so when two rules carry that endpoint they cannot say which binary
+    /// scope to widen. Picking one silently would add the rule to whichever key
+    /// sorts first.
+    #[test]
+    fn l7_operations_reject_an_endpoint_carried_by_several_rules() {
+        let mut policy = policy_with_rule(
+            "broad",
+            rule_with_authorizations(
+                "broad",
+                vec![NetworkEndpoint {
+                    protocol: "rest".to_string(),
+                    rules: vec![rest_rule("GET", "/public")],
+                    ..endpoint("api.example.com", 443)
+                }],
+                &["/usr/bin/trusted", "/usr/bin/limited"],
+            ),
+        );
+        policy.network_policies.insert(
+            "narrow".to_string(),
+            rule_with_authorizations(
+                "narrow",
+                vec![NetworkEndpoint {
+                    protocol: "rest".to_string(),
+                    rules: vec![rest_rule("GET", "/public")],
+                    ..endpoint("api.example.com", 443)
+                }],
+                &["/usr/bin/other"],
+            ),
+        );
+
+        for operation in [
+            PolicyMergeOp::AddAllowRules {
+                host: "api.example.com".to_string(),
+                port: 443,
+                rules: vec![rest_rule("POST", "/admin")],
+            },
+            PolicyMergeOp::AddDenyRules {
+                host: "api.example.com".to_string(),
+                port: 443,
+                deny_rules: Vec::new(),
+            },
+        ] {
+            let error = merge_policy(policy.clone(), &[operation])
+                .expect_err("two rules carry this endpoint, so the target is ambiguous");
+
+            assert!(
+                matches!(
+                    &error,
+                    PolicyMergeError::AmbiguousEndpointRule { targets, .. }
+                        if targets == &["broad".to_string(), "narrow".to_string()]
+                ),
+                "got {error:?}"
+            );
+        }
+    }
+
+    /// A single rule can own several endpoints on one host and port, because
+    /// `endpoints_overlap` treats a different path as a different endpoint.
+    /// Counting owning rules would miss this and let the operation land on
+    /// whichever endpoint happens to sit first in the vector.
+    #[test]
+    fn l7_operations_reject_two_paths_on_one_host_and_port_within_a_rule() {
+        let policy = policy_with_rule(
+            "versioned",
+            rule_with_authorizations(
+                "versioned",
+                vec![
+                    NetworkEndpoint {
+                        protocol: "rest".to_string(),
+                        path: "/v1".to_string(),
+                        rules: vec![rest_rule("GET", "/public")],
+                        ..endpoint("api.example.com", 443)
+                    },
+                    NetworkEndpoint {
+                        protocol: "rest".to_string(),
+                        path: "/v2".to_string(),
+                        rules: vec![rest_rule("GET", "/public")],
+                        ..endpoint("api.example.com", 443)
+                    },
+                ],
+                &["/usr/bin/trusted"],
+            ),
+        );
+
+        let error = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddAllowRules {
+                host: "api.example.com".to_string(),
+                port: 443,
+                rules: vec![rest_rule("POST", "/admin")],
+            }],
+        )
+        .expect_err("one host and port resolves to two endpoints on this rule");
+
+        assert!(
+            matches!(
+                &error,
+                PolicyMergeError::AmbiguousEndpointRule { targets, .. }
+                    if targets == &[
+                        "versioned (path '/v1')".to_string(),
+                        "versioned (path '/v2')".to_string(),
+                    ]
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// The unambiguous case must keep working, or every incremental L7 update
+    /// breaks.
+    #[test]
+    fn l7_operations_still_apply_when_one_rule_carries_the_endpoint() {
+        let policy = policy_with_rule(
+            "only",
+            rule_with_authorizations(
+                "only",
+                vec![NetworkEndpoint {
+                    protocol: "rest".to_string(),
+                    rules: vec![rest_rule("GET", "/public")],
+                    ..endpoint("api.example.com", 443)
+                }],
+                &["/usr/bin/trusted"],
+            ),
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddAllowRules {
+                host: "api.example.com".to_string(),
+                port: 443,
+                rules: vec![rest_rule("POST", "/issues")],
+            }],
+        )
+        .expect("a single owning rule is unambiguous");
+
+        assert_eq!(
+            result.policy.network_policies["only"].endpoints[0]
+                .rules
+                .len(),
+            2
+        );
+    }
+
+    /// Removing a binary from an any-binary rule has no entry to drop, so
+    /// reporting success would leave the operator believing a revocation landed
+    /// while the rule still authorizes every binary.
+    #[test]
+    fn remove_binary_rejects_an_any_binary_rule_instead_of_doing_nothing() {
+        let policy = policy_with_rule(
+            "wide",
+            rule_with_authorizations("wide", vec![endpoint("api.example.com", 443)], &[]),
+        );
+
+        let error = merge_policy(
+            policy,
+            &[PolicyMergeOp::RemoveBinary {
+                rule_name: "wide".to_string(),
+                binary_path: "/usr/bin/untrusted".to_string(),
+            }],
+        )
+        .expect_err("an any-binary rule has no binary entry to remove");
+
+        assert!(matches!(
+            error,
+            PolicyMergeError::CannotRemoveBinaryFromAnyBinaryScope { rule_name, binary_path, .. }
+                if rule_name == "wide" && binary_path == "/usr/bin/untrusted"
+        ));
+    }
+
+    /// Removing the last named binary deletes the rule rather than leaving an
+    /// empty list, which would silently widen it to every binary.
+    #[test]
+    fn remove_binary_deletes_the_rule_rather_than_widening_it() {
+        let policy = policy_with_rule(
+            "narrow",
+            rule_with_authorizations(
+                "narrow",
+                vec![endpoint("api.example.com", 443)],
+                &["/usr/bin/only"],
+            ),
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::RemoveBinary {
+                rule_name: "narrow".to_string(),
+                binary_path: "/usr/bin/only".to_string(),
+            }],
+        )
+        .expect("removing the last binary is a valid revocation");
+
+        assert!(
+            !result.policy.network_policies.contains_key("narrow"),
+            "an emptied rule must be removed, not left authorizing any binary"
         );
     }
 }

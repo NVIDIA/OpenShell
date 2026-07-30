@@ -4406,6 +4406,8 @@ fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
         | openshell_policy::PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
             ..
         }
+        | openshell_policy::PolicyMergeError::AmbiguousEndpointRule { .. }
+        | openshell_policy::PolicyMergeError::CannotRemoveBinaryFromAnyBinaryScope { .. }
         | openshell_policy::PolicyMergeError::EndpointNotFound { .. }
         | openshell_policy::PolicyMergeError::EndpointHasNoL7Inspection { .. }
         | openshell_policy::PolicyMergeError::UnsupportedEndpointProtocol { .. }
@@ -5354,12 +5356,14 @@ mod tests {
             openshell_policy::PolicyMergeError::NewBinaryWouldInheritAuthorization {
                 operation_index: 2,
                 rule_name: "existing".to_string(),
-                binary_path: "/usr/bin/client".to_string(),
+                binary_scope: "binary '/usr/bin/client'".to_string(),
                 host: "mcp.example.com".to_string(),
                 ports: vec![443],
             },
         );
         assert_eq!(inheritance.code(), Code::FailedPrecondition);
+        // The proposer has to know which binary scope triggered the rejection.
+        assert!(inheritance.message().contains("/usr/bin/client"));
 
         let existing_scope = map_policy_merge_error(
             openshell_policy::PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
@@ -5374,6 +5378,29 @@ mod tests {
         // The proposer has to know which binaries to add, so the remediation
         // detail must survive into the status message.
         assert!(existing_scope.message().contains("/usr/bin/other"));
+
+        // Both of these describe a well-formed request the current policy state
+        // forbids, so they are preconditions rather than argument errors.
+        let ambiguous =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::AmbiguousEndpointRule {
+                host: "api.example.com".to_string(),
+                port: 443,
+                targets: vec!["broad".to_string(), "narrow".to_string()],
+            });
+        assert_eq!(ambiguous.code(), Code::FailedPrecondition);
+        // The operator has to know which rules collide to pick a way forward.
+        assert!(ambiguous.message().contains("broad"));
+        assert!(ambiguous.message().contains("narrow"));
+
+        let any_binary = map_policy_merge_error(
+            openshell_policy::PolicyMergeError::CannotRemoveBinaryFromAnyBinaryScope {
+                operation_index: 4,
+                rule_name: "wide".to_string(),
+                binary_path: "/usr/bin/untrusted".to_string(),
+            },
+        );
+        assert_eq!(any_binary.code(), Code::FailedPrecondition);
+        assert!(any_binary.message().contains("/usr/bin/untrusted"));
     }
 
     // ---- Sandbox IDOR guard (issue #1354) ----
