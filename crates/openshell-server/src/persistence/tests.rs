@@ -1770,3 +1770,313 @@ async fn list_by_scope_returns_resource_version() {
         "list_by_scope must return the actual resource_version, not a default"
     );
 }
+
+#[tokio::test]
+async fn membership_and_label_selector_filters_both() {
+    let store = test_store().await;
+
+    // Workspace objects (object_type="workspace", workspace="")
+    store
+        .put(
+            "workspace",
+            "ws-a-id",
+            "ws-a",
+            "",
+            b"p1",
+            Some(r#"{"env":"prod"}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            "workspace",
+            "ws-b-id",
+            "ws-b",
+            "",
+            b"p2",
+            Some(r#"{"env":"dev"}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            "workspace",
+            "ws-c-id",
+            "ws-c",
+            "",
+            b"p3",
+            Some(r#"{"env":"prod","team":"platform"}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            "workspace",
+            "ws-d-id",
+            "ws-d",
+            "",
+            b"p4",
+            Some(r#"{"env":"prod"}"#),
+        )
+        .await
+        .unwrap();
+
+    // Member objects: alice is a member of ws-a, ws-b, ws-c but NOT ws-d
+    store
+        .put("workspace_member", "m1-id", "alice", "ws-a", b"m1", None)
+        .await
+        .unwrap();
+    store
+        .put("workspace_member", "m2-id", "alice", "ws-b", b"m2", None)
+        .await
+        .unwrap();
+    store
+        .put("workspace_member", "m3-id", "alice", "ws-c", b"m3", None)
+        .await
+        .unwrap();
+
+    // env=prod AND alice is a member → ws-a, ws-c (not ws-b: wrong label, not ws-d: no membership)
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "env=prod",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2, "should match ws-a and ws-c");
+    let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&"ws-a"));
+    assert!(names.contains(&"ws-c"));
+
+    // env=prod,team=platform AND alice is a member → ws-c only
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "env=prod,team=platform",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1, "should match ws-c only");
+    assert_eq!(results[0].name, "ws-c");
+
+    // env=staging AND alice is a member → empty
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "env=staging",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 0, "no workspace has env=staging");
+
+    // bob has no memberships → empty even though label matches exist
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "bob",
+            "env=prod",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 0, "bob has no memberships");
+
+    // Paging: limit=1 on the env=prod query
+    let page1 = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "env=prod",
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page1.len(), 1, "page 1 should have 1 result");
+
+    let page2 = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "env=prod",
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page2.len(), 1, "page 2 should have 1 result");
+
+    let page3 = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "env=prod",
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page3.len(), 0, "page 3 should be empty");
+}
+
+#[tokio::test]
+async fn membership_and_label_selector_handles_dotted_keys() {
+    let store = test_store().await;
+
+    store
+        .put(
+            "workspace",
+            "ws-dot-id",
+            "ws-dot",
+            "",
+            b"p1",
+            Some(r#"{"example.com/env":"prod","simple":"yes"}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            "workspace",
+            "ws-plain-id",
+            "ws-plain",
+            "",
+            b"p2",
+            Some(r#"{"env":"prod"}"#),
+        )
+        .await
+        .unwrap();
+
+    store
+        .put("workspace_member", "m1", "alice", "ws-dot", b"", None)
+        .await
+        .unwrap();
+    store
+        .put("workspace_member", "m2", "alice", "ws-plain", b"", None)
+        .await
+        .unwrap();
+
+    // Dotted key selector matches only ws-dot
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "example.com/env=prod",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1, "dotted key should match ws-dot");
+    assert_eq!(results[0].name, "ws-dot");
+
+    // Combining dotted and simple keys
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "example.com/env=prod,simple=yes",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name, "ws-dot");
+
+    // Dotted key with wrong value returns nothing
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "example.com/env=staging",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 0, "wrong value for dotted key");
+}
+
+/// Single quotes in label keys must not break the SQL query (CWE-89
+/// defense-in-depth). The gRPC validation layer rejects such keys, but the
+/// persistence layer must handle them safely regardless.
+#[tokio::test]
+async fn membership_selector_escapes_adversarial_label_key() {
+    let store = test_store().await;
+
+    store
+        .put(
+            "workspace",
+            "ws-sq-id",
+            "ws-sq",
+            "",
+            b"p1",
+            Some(r#"{"it's":"here"}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .put("workspace_member", "m1", "alice", "ws-sq", b"", None)
+        .await
+        .unwrap();
+
+    // A key containing a single quote must not cause a SQL error.
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "it's=here",
+            10,
+            0,
+        )
+        .await;
+    assert!(
+        results.is_ok(),
+        "single-quote key must not cause SQL error: {:?}",
+        results.unwrap_err()
+    );
+
+    // A key designed to break out of the SQL string literal must not match
+    // unrelated rows or cause an error.
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "x' OR '1'='1=pwned",
+            10,
+            0,
+        )
+        .await;
+    assert!(
+        results.is_ok(),
+        "SQL injection attempt must not cause SQL error: {:?}",
+        results.unwrap_err()
+    );
+    assert_eq!(
+        results.unwrap().len(),
+        0,
+        "SQL injection must not match rows"
+    );
+}

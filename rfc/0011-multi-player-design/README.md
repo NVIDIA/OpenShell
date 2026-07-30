@@ -86,7 +86,7 @@ roles:
 |------|-------------|
 | **Platform Admin** | Runtime role with full visibility across all workspaces. Creates workspaces, assigns Workspace Admins, and sets gateway-wide default policies. |
 | **Workspace Admin** | Manages users, providers, policies, and quotas within a single workspace. Cannot change gateway infra or access other workspaces. |
-| **User** | Creates sandboxes and accesses all sandboxes within assigned workspaces. Uses credentials available in those workspaces. Default role for OIDC-authenticated principals, both human and machine. |
+| **User** | Creates sandboxes and accesses all sandboxes within assigned workspaces. Uses credentials available in those workspaces. Assigned through a workspace membership record for both human and machine identities. |
 
 ### Sandbox Supervisor
 
@@ -122,16 +122,20 @@ Supervisor section above).
 | Domain | Platform Admin | Workspace Admin | User | Sandbox Supervisor |
 |--------|---------------|-----------------|------|--------------------|
 | Workspace lifecycle (`Create`, `Get`, `List`, `Delete`) | read-write | read (own) | read (own) | none |
-| Workspace membership (`Add`, `Remove`, `List`) | read-write | read-write (own ws, no admin assign) | none | none |
-| Sandbox lifecycle (`Create`, `Get`, `List`, `Delete`) | read-write | read-write (own ws) | read-write (own ws) | read (own sandbox) |
-| Sandbox data-plane (`Exec`, `ForwardTcp`, `CreateSshSession`, `RelayStream`) | full | full (own ws) | full (own ws) | none |
-| Sandbox observability (`GetSandboxLogs`, `ListSandboxPolicies`, `GetSandboxPolicyStatus`) | read | read (own ws) | read (own ws) | own sandbox |
+| Workspace membership (`Add`, `Remove`, `List`) | read-write | read-write (own ws, no admin assign) | read (own ws) | none |
+| Sandbox lifecycle (`Create`, `Get`, `List`, `Delete`) | read-write | read-write (own ws) | read-write (own ws) | none |
+| Sandbox data-plane (`Exec`, `ForwardTcp`, `CreateSshSession`) | full | full (own ws) | full (own ws) | none |
+| Sandbox observability (`GetSandboxLogs`, `ListSandboxPolicies`, `GetSandboxPolicyStatus`) | read | read (own ws) | read (own ws) | none |
 | Provider management (`Create`, `Get`, `List`, `Update`, `Delete`) | read-write | read-write (own ws) | read (no creds) | none |
-| Provider attachment (`Attach`, `Detach`, `ListSandboxProviders`) | read-write | read-write (own ws) | read (own ws) | none |
+| Provider attachment (`Attach`, `Detach`, `ListSandboxProviders`) | read-write | read-write (own ws) | read-write (own ws) | none |
 | Services (`Expose`, `Get`, `List`, `Delete`) | read-write | read-write (own ws) | read-write (own ws) | none |
-| Gateway config (`GetGatewayConfig`, `UpdateConfig`) | read-write | none | none | none |
-| Policy drafts (`SubmitPolicyAnalysis`, `Approve`, etc.) | read-write | read-write (own ws) | none | none |
-| Supervisor path (`ConnectSupervisor`, `IssueSandboxToken`, `RefreshSandboxToken`, `GetSandboxProviderEnvironment`, `PushSandboxLogs`, `ReportPolicyStatus`) | none | none | none | own sandbox |
+| Gateway config read (`GetGatewayConfig`) | read | read | read | none |
+| Gateway config write (`UpdateConfig` with `global: true`) | read-write | none | none | none |
+| Sandbox config and policy (`GetSandboxConfig`, non-global `UpdateConfig`) | read-write | read-write (own ws) | read (own ws) | read-write (own sandbox, policy sync only) |
+| Policy draft inspection (`GetDraftPolicy`, `GetDraftHistory`) | read | read (own ws) | read (own ws) | `GetDraftPolicy` for own sandbox only |
+| Policy draft decisions (`Approve`, `Reject`, `Edit`, `Undo`, `Clear`) | read-write | read-write (own ws) | none | none |
+| Policy analysis submission (`SubmitPolicyAnalysis`) | none | none | none | own sandbox |
+| Supervisor path (`ConnectSupervisor`, `RelayStream`, `IssueSandboxToken`, `RefreshSandboxToken`, `GetSandboxProviderEnvironment`, `PushSandboxLogs`, `ReportPolicyStatus`) | none | none | none | own sandbox |
 
 **Control-plane audit log.** Every mutating gRPC call emits an OCSF
 `ApiActivity` event recording the principal, action, target resource, and
@@ -153,7 +157,9 @@ its own `ObjectMeta` is unused, following the same convention as Kubernetes
 Namespace objects). Workspace-level configuration — quota limits, policy
 overrides, and Workspace Admin role bindings — are properties on the Workspace
 resource. The gateway exposes `CreateWorkspace`, `GetWorkspace`,
-`ListWorkspaces`, and `DeleteWorkspace` RPCs, gated to Platform Admins.
+`ListWorkspaces`, and `DeleteWorkspace` RPCs. Create and delete require Platform
+Admin; get and list return workspaces visible through membership, while
+Platform Admins can see all workspaces.
 Sandbox and provider create operations validate that the referenced workspace
 exists, rejecting unknown workspace values.
 
@@ -285,7 +291,7 @@ Workspace membership is managed through three RPCs:
   their own workspace but cannot assign the Workspace Admin role.
 - `RemoveWorkspaceMember(workspace, principal_subject)` — same access pattern.
 - `ListWorkspaceMembers(workspace)` — Platform Admins can list any workspace;
-  Workspace Admins can list their own.
+  Workspace Admins and Users can list their own.
 
 Principal subjects are the OIDC `sub` claim from the configured identity
 provider. The gateway does not maintain a user directory — membership
@@ -323,8 +329,10 @@ Within a workspace, access varies by resource type:
 - **Provider profiles.** Provider profiles are type definitions that describe
   what a provider type needs (credentials, endpoints, filesystem paths).
   Profiles have two-tier scoping: platform-scoped profiles are managed by
-  Platform Admins and visible to all workspaces; workspace-scoped profiles
-  are managed by Workspace Admins and visible only within their workspace.
+  Platform Admins and appear to workspace members through the merged
+  workspace-scoped catalog; querying platform scope directly (`--global`)
+  requires Platform Admin. Workspace-scoped profiles are managed by Workspace
+  Admins and visible only within their workspace.
   The same profile ID can exist at both platform and workspace scope — the
   workspace profile shadows the platform profile for workspace-scoped
   operations, with the platform profile as the fallback when no workspace
@@ -412,8 +420,8 @@ metadata, middleware authentication, and per-handler guards — extends to
 workspace-scoped enforcement without architectural changes.
 
 **Proto-driven method metadata.** Authorization rules are declared as custom
-options on each proto RPC method, making the proto definition the single
-source of truth for the API contract and its access control:
+options on each proto RPC method. The proto definition is the source of truth
+for each method's baseline authentication mode, role, and OIDC scope:
 
 ```proto
 import "google/protobuf/descriptor.proto";
@@ -422,6 +430,7 @@ message AuthorizationRule {
   string auth_mode = 1;       // "bearer", "sandbox", "dual", "unauthenticated"
   string workspace_role = 2;  // "user", "admin"
   string global_role = 3;     // "platform_admin"
+  string scope = 4;           // e.g. "sandbox:read", on the bearer path
 }
 
 extend google.protobuf.MethodOptions {
@@ -434,13 +443,25 @@ Each RPC carries its authorization requirement:
 ```proto
 service OpenShell {
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse) {
-    option (authorization) = { auth_mode: "bearer", workspace_role: "user" };
+    option (authorization) = {
+      auth_mode: "bearer"
+      workspace_role: "user"
+      scope: "sandbox:write"
+    };
   }
   rpc CreateProvider(CreateProviderRequest) returns (CreateProviderResponse) {
-    option (authorization) = { auth_mode: "bearer", workspace_role: "admin" };
+    option (authorization) = {
+      auth_mode: "bearer"
+      workspace_role: "admin"
+      scope: "provider:write"
+    };
   }
   rpc CreateWorkspace(CreateWorkspaceRequest) returns (CreateWorkspaceResponse) {
-    option (authorization) = { auth_mode: "bearer", global_role: "platform_admin" };
+    option (authorization) = {
+      auth_mode: "bearer"
+      global_role: "platform_admin"
+      scope: "workspace:write"
+    };
   }
   rpc ConnectSupervisor(stream SupervisorMessage) returns (stream GatewayMessage) {
     option (authorization) = { auth_mode: "sandbox" };
@@ -448,38 +469,64 @@ service OpenShell {
 }
 ```
 
-The gateway already compiles a `FileDescriptorSet` at build time and embeds
-it in the binary (`openshell_core::FILE_DESCRIPTOR_SET`). Adding
-`prost_reflect::DescriptorPool` allows the runtime to resolve custom
-extensions natively — no build.rs code generation, no external tooling:
+The gateway compiles a `FileDescriptorSet` at build time and embeds it in the
+binary (`openshell_core::FILE_DESCRIPTOR_SET`).
+`prost_reflect::DescriptorPool` resolves custom extensions natively without
+additional code generation or external tooling:
 
 ```rust
-static DESCRIPTOR_POOL: LazyLock<DescriptorPool> = LazyLock::new(|| {
-    DescriptorPool::decode(openshell_core::FILE_DESCRIPTOR_SET)
-        .expect("decode descriptor pool")
+static TABLE: LazyLock<Result<DescriptorAuthTable, String>> = LazyLock::new(|| {
+    DescriptorAuthTable::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET)
 });
 ```
 
-At startup the middleware walks the pool's methods, reads the
-`(authorization)` extension from each `MethodDescriptor::options()`, and
-builds the lookup table keyed by gRPC method path. This replaces the current
-`#[rpc_authz]` proc macro and per-service `AUTH_METADATA` tables — the proto
-definition becomes the single source of truth for both the API contract and
-its access control. The middleware calls the same `method_authz::lookup()`
-function at request dispatch time; only the source of the table changes.
+At startup the gateway walks the pool's methods, reads the `(authorization)`
+extension from each `MethodDescriptor::options()`, and builds the lookup table
+keyed by gRPC method path. Bearer and dual methods must declare exactly one of
+`workspace_role` or `global_role` and must declare `scope`. Authentication-only
+methods require an explicit allowlist entry; `GetCurrentUser` is the only such
+method. Invalid or incomplete metadata returns a configuration error before
+the gateway touches the database or binds a listener.
 
-The existing exhaustiveness tests switch from `prost_types::FileDescriptorSet`
-to `DescriptorPool` and assert that every method in the pool carries a valid
-`(authorization)` option, catching missing annotations at `cargo test` time.
+The descriptor table replaces the `#[rpc_authz]` proc macro and per-service
+`AUTH_METADATA` tables as the runtime source. Removing the now-unused macro
+crate is cleanup rather than an authorization dependency. The middleware calls
+`method_authz::lookup()` at request dispatch time to enforce the declared
+baseline. A declared scope is enforced when the gateway configures an OIDC
+scope claim; an empty scope-claim setting disables scope enforcement.
+
+The exhaustiveness test constructs the table directly and asserts that every
+method in the descriptor pool carries a complete, valid `(authorization)`
+option. This catches missing or incomplete annotations at `cargo test` time.
 
 This follows the pattern established by `google.api.http` annotations for
 REST gateway generation: the proto carries the metadata, the descriptor pool
 resolves it, and the runtime consumes it directly.
 
-**Workspace on every scoped request.** Since resource names are
-unique-within-workspace, every workspace-scoped RPC includes the workspace in
-its request message. A `WorkspaceScoped` trait implemented on each request type
-provides uniform access:
+**Data-dependent escalation.** Method metadata cannot express authorization
+that depends on a request field. Handlers may strengthen, but never weaken,
+the declared baseline for these cases:
+
+- `all_workspaces: true` requires Platform Admin on cross-workspace list RPCs.
+- `global: true` requires Platform Admin for global configuration and policy
+  reads or writes.
+- An empty provider-profile workspace selects platform scope and requires
+  Platform Admin.
+- Assigning the Workspace Admin membership role requires Platform Admin even
+  though adding a Workspace User requires only Workspace Admin.
+
+The `global` and empty provider-profile scope branches currently cover nine
+RPCs. The count is not the invariant; the invariant is that every
+request-selected platform operation performs an explicit Platform Admin check.
+
+**Workspace resolution and structural hardening.** Request messages that
+operate directly on a workspace-scoped collection carry a workspace field.
+Data-plane operations that identify a sandbox by name or ID resolve the
+workspace from the stored sandbox record before authorizing, so a
+caller-supplied workspace cannot redirect access to another workspace.
+
+The final Phase 2 structural hardening adds a `WorkspaceScoped` trait for
+request-carried workspace fields:
 
 ```rust
 trait WorkspaceScoped {
@@ -487,21 +534,28 @@ trait WorkspaceScoped {
 }
 ```
 
-**Single authorization path.** A shared `authorize_workspace` function replaces
-per-handler authorization boilerplate. It extracts the principal from request
-extensions, checks for Platform Admin global role bypass, resolves
-workspace membership from the durable store, and verifies the membership role
-meets the method's declared minimum:
+As part of this hardening, the middleware will place the resolved
+`DescriptorAuthEntry` in request extensions so handlers derive the minimum
+workspace role from the annotation. A shared `authorize_workspace` function
+checks for Platform Admin bypass, resolves membership from the durable store,
+and returns an `AuthorizedWorkspace` whose workspace value is the only value
+used for subsequent store access:
 
 ```rust
-let principal = authorize_workspace(
-    &request, WorkspaceRole::User, &self.membership,
-)?;
+let authorized = authorize_workspace(
+    &state.store,
+    &state.admin_role,
+    &principal,
+    request.workspace(),
+    descriptor_min_role,
+).await?;
+let workspace = authorized.workspace;
 ```
 
-Every workspace-scoped handler uses this one-line call. The middleware layer
-is unchanged: it authenticates the caller, inserts the principal into request
-extensions, and the handler resolves workspace authorization.
+The current implementation already centralizes membership checks in
+`authorize_workspace`, but handlers still pass a minimum role and may discard
+the returned workspace. Completing this type-state flow makes it harder for a
+handler to authorize one workspace and access another.
 
 ### Authorization Boundaries (Kubernetes Deployments)
 
@@ -937,6 +991,22 @@ openshell sandbox list --workspace team-ml
 openshell provider list --workspace team-ml
 ```
 
+#### Current identity
+
+`openshell whoami` calls the authentication-only `GetCurrentUser` RPC and
+prints the identity validated by the gateway. It remains available when the
+caller has no workspace memberships, so users can obtain the stable subject an
+administrator needs for a membership record.
+
+```shell
+openshell whoami
+openshell whoami --output json
+```
+
+The response includes the subject, display name when available, identity
+provider, roles, and scopes. The CLI does not derive these values from an
+unverified local token payload.
+
 #### Cross-workspace listing
 
 Platform Admins can list resources across all workspaces using the
@@ -1021,7 +1091,8 @@ foundations. The work can be phased to deliver value incrementally:
 
 - **Phase 1: Workspace and membership model.** Add the `Workspace` resource
   with standard `ObjectMeta` and `CreateWorkspace`, `GetWorkspace`,
-  `ListWorkspaces`, `DeleteWorkspace` RPCs gated to Platform Admins. Add
+  `ListWorkspaces`, `DeleteWorkspace` RPCs. Gate create and delete to Platform
+  Admins, and filter get and list by workspace membership. Add
   `workspace` field to `ObjectMeta` for Sandbox and Provider resources,
   validated against existing workspaces on create. All workspace-scoped
   resources inherit workspace from their parent sandbox or workspace context:
@@ -1097,11 +1168,19 @@ foundations. The work can be phased to deliver value incrementally:
 - **Phase 2: Expanded role model and authorization enforcement.** Extend the
   RBAC system from two-tier (admin/user) to three user roles (Platform Admin,
   Workspace Admin, User). Add proto-driven authorization metadata via custom
-  method options and `prost_reflect::DescriptorPool`. Implement
-  `authorize_workspace()` and `WorkspaceScoped` trait for workspace-scoped
-  access guards in gRPC handlers. Replace the `#[rpc_authz]` proc macro with
-  descriptor pool-based lookup. Add Workspace Admin role with per-workspace
-  management capabilities.
+  method options, including OIDC scopes, and
+  `prost_reflect::DescriptorPool`. Reject incomplete metadata before server
+  startup. Implement `authorize_workspace()` for workspace-scoped access
+  guards, add the authentication-only `GetCurrentUser` identity RPC, and add
+  Workspace Admin role with per-workspace management capabilities. Complete
+  the `WorkspaceScoped` type-state flow so the annotation supplies the minimum
+  role and the authorized workspace supplies the store key. Replace
+  `#[rpc_authz]` uses and per-service metadata tables with descriptor metadata;
+  remove the now-unused macro crate in follow-up cleanup. Because OpenShell
+  is pre-stable, Phase 2 deliberately does not backfill workspace membership
+  records or add a permissive grace mode. Platform Admins grant memberships
+  explicitly; `openshell whoami` and authorization denial hints expose the
+  validated subject needed to do so.
 
 - **Phase 3: Kubernetes driver — managed mode (default).** The driver creates
   Kubernetes namespaces on demand using the naming convention

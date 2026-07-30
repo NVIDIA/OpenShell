@@ -114,6 +114,13 @@ DOCKER_NETWORK_NAME=""
 DOCKER_NETWORK_CONNECTED_CONTAINER=""
 DOCKER_NETWORK_MANAGED=0
 GPU_MODE="${OPENSHELL_E2E_DOCKER_GPU:-0}"
+OIDC_MODE="${OPENSHELL_E2E_OIDC_GATEWAY:-0}"
+OIDC_ISSUER="${OPENSHELL_E2E_OIDC_ISSUER:-}"
+
+if [ "${OIDC_MODE}" = "1" ] && [ -z "${OIDC_ISSUER}" ]; then
+  echo "ERROR: OPENSHELL_E2E_OIDC_ISSUER is required when OPENSHELL_E2E_OIDC_GATEWAY=1" >&2
+  exit 2
+fi
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -435,8 +442,10 @@ fi
 
 PKI_DIR="${WORKDIR}/pki"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
+export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
 
 HOST_PORT=$(e2e_pick_port)
+HEALTH_PORT=$(e2e_pick_port)
 STATE_DIR="${XDG_STATE_HOME}"
 mkdir -p "${STATE_DIR}"
 JWT_DIR="${STATE_DIR}/jwt"
@@ -479,7 +488,12 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf '[openshell]\nversion = 1\n\n'
   printf '[openshell.gateway]\nlog_level = "info"\n\n'
   e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-docker-${HOST_PORT}"
-  e2e_write_gateway_mtls_auth_config
+  if [ "${OIDC_MODE}" != "1" ]; then
+    e2e_write_gateway_mtls_auth_config
+    if [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
+      e2e_write_gateway_oidc_config "${OPENSHELL_OIDC_ISSUER}"
+    fi
+  fi
   printf '[openshell.drivers.docker]\n'
   printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
   printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
@@ -500,12 +514,24 @@ GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"
   --bind-address 0.0.0.0
   --port "${HOST_PORT}"
+  --health-port "${HEALTH_PORT}"
   --drivers docker
   --tls-cert "${PKI_DIR}/server/tls.crt"
   --tls-key "${PKI_DIR}/server/tls.key"
-  --tls-client-ca "${PKI_DIR}/ca.crt"
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
 )
+
+if [ "${OIDC_MODE}" = "1" ]; then
+  GATEWAY_ARGS+=(
+    --oidc-issuer "${OIDC_ISSUER}"
+    --oidc-audience openshell-cli
+    --oidc-scopes-claim scope
+  )
+else
+  GATEWAY_ARGS+=(
+    --tls-client-ca "${PKI_DIR}/ca.crt"
+  )
+fi
 
 e2e_write_gateway_args_file "${GATEWAY_ARGS_FILE}" "${GATEWAY_ARGS[@]}"
 e2e_export_gateway_restart_metadata \
@@ -520,26 +546,35 @@ printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"
 
 GATEWAY_NAME="openshell-e2e-docker-${HOST_PORT}"
 CLI_GATEWAY_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
-e2e_register_mtls_gateway \
-  "${XDG_CONFIG_HOME}" \
-  "${GATEWAY_NAME}" \
-  "${CLI_GATEWAY_ENDPOINT}" \
-  "${HOST_PORT}" \
-  "${PKI_DIR}"
+if [ "${OIDC_MODE}" = "1" ]; then
+  export OPENSHELL_E2E_OIDC_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
+else
+  e2e_register_mtls_gateway \
+    "${XDG_CONFIG_HOME}" \
+    "${GATEWAY_NAME}" \
+    "${CLI_GATEWAY_ENDPOINT}" \
+    "${HOST_PORT}" \
+    "${PKI_DIR}" \
+    "${OPENSHELL_OIDC_ISSUER:-}"
+fi
 
 export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
 export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-180}"
 
+if [ "${OIDC_MODE}" = "1" ] || [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
+  export OPENSHELL_E2E_OIDC=1
+  export OPENSHELL_E2E_OIDC_SCOPES=1
+fi
+
 echo "Waiting for gateway to become healthy..."
 elapsed=0
 timeout=120
-last_status_output=""
 while [ "${elapsed}" -lt "${timeout}" ]; do
   if ! kill -0 "${GATEWAY_PID}" 2>/dev/null; then
     echo "ERROR: openshell-gateway exited before becoming healthy"
     exit 1
   fi
-  if last_status_output="$("${CLI_BIN}" status 2>&1)"; then
+  if curl -sf "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
     echo "Gateway healthy after ${elapsed}s."
     break
   fi
@@ -548,13 +583,6 @@ while [ "${elapsed}" -lt "${timeout}" ]; do
 done
 if [ "${elapsed}" -ge "${timeout}" ]; then
   echo "ERROR: gateway did not become healthy within ${timeout}s"
-  echo "=== last openshell status output ==="
-  if [ -n "${last_status_output}" ]; then
-    printf '%s\n' "${last_status_output}"
-  else
-    echo "<no output>"
-  fi
-  echo "=== end openshell status output ==="
   exit 1
 fi
 

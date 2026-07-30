@@ -8,6 +8,7 @@
 
 #![allow(clippy::result_large_err)] // Validation returns Result<_, Status>
 
+use openshell_core::ComputeDriverKind;
 use openshell_core::proto::{
     ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
 };
@@ -15,15 +16,33 @@ use prost::Message;
 use tonic::Status;
 
 use super::{
-    MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN,
-    MAX_METADATA_ANNOTATIONS_ENTRIES, MAX_NAME_LEN, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
-    MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN,
-    MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
+    MAX_ENVIRONMENT_ENTRIES, MAX_LABEL_SELECTOR_PAIRS, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN,
+    MAX_MAP_VALUE_LEN, MAX_METADATA_ANNOTATIONS_ENTRIES, MAX_NAME_LEN, MAX_POLICY_SIZE,
+    MAX_PROVIDER_CONFIG_ENTRIES, MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN,
+    MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN,
+    MAX_TEMPLATE_STRUCT_SIZE,
 };
 
 // ---------------------------------------------------------------------------
 // Exec request validation
 // ---------------------------------------------------------------------------
+
+/// Preserve process-identity omission only for the local OCI-aware drivers.
+///
+/// Kubernetes, VM, and unknown/remote drivers retain the legacy persisted
+/// `sandbox:sandbox` defaults so existing policy hashes and live-update
+/// workflows do not change.
+pub(super) fn normalize_process_identity_for_driver(
+    policy: &mut ProtoSandboxPolicy,
+    driver_kind: Option<ComputeDriverKind>,
+) {
+    if !matches!(
+        driver_kind,
+        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman)
+    ) {
+        openshell_policy::ensure_sandbox_process_identity(policy);
+    }
+}
 
 /// Maximum number of arguments in the command array.
 pub(super) const MAX_EXEC_COMMAND_ARGS: usize = 1024;
@@ -619,10 +638,17 @@ pub(super) fn validate_label_selector(selector: &str) -> Result<(), Status> {
         return Ok(());
     }
 
+    let mut count = 0usize;
     for pair in selector.split(',') {
         let pair = pair.trim();
         if pair.is_empty() {
             continue;
+        }
+        count += 1;
+        if count > MAX_LABEL_SELECTOR_PAIRS {
+            return Err(Status::invalid_argument(format!(
+                "label selector exceeds {MAX_LABEL_SELECTOR_PAIRS} pair limit"
+            )));
         }
 
         let parts: Vec<&str> = pair.splitn(2, '=').collect();
@@ -1634,7 +1660,61 @@ mod tests {
         assert!(err.message().contains("exceeds 63 characters"));
     }
 
+    #[test]
+    fn validate_label_selector_rejects_too_many_pairs() {
+        let pairs: Vec<String> = (0..65).map(|i| format!("k{i}=v{i}")).collect();
+        let selector = pairs.join(",");
+        let err = validate_label_selector(&selector).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("64 pair limit"));
+    }
+
+    #[test]
+    fn validate_label_selector_accepts_max_pairs() {
+        let pairs: Vec<String> = (0..64).map(|i| format!("k{i}=v{i}")).collect();
+        let selector = pairs.join(",");
+        assert!(validate_label_selector(&selector).is_ok());
+    }
+
     // ---- Policy safety ----
+
+    #[test]
+    fn process_identity_omission_is_driver_scoped() {
+        use openshell_core::proto::ProcessPolicy;
+
+        for driver in [ComputeDriverKind::Docker, ComputeDriverKind::Podman] {
+            let mut policy = ProtoSandboxPolicy {
+                process: Some(ProcessPolicy {
+                    run_as_user: "1234".into(),
+                    run_as_group: String::new(),
+                }),
+                ..Default::default()
+            };
+            normalize_process_identity_for_driver(&mut policy, Some(driver));
+            assert!(
+                policy.process.unwrap().run_as_group.is_empty(),
+                "{driver:?} must preserve omission"
+            );
+        }
+
+        for driver in [
+            Some(ComputeDriverKind::Kubernetes),
+            Some(ComputeDriverKind::Vm),
+            None,
+        ] {
+            let mut policy = ProtoSandboxPolicy {
+                process: Some(ProcessPolicy {
+                    run_as_user: "1234".into(),
+                    run_as_group: String::new(),
+                }),
+                ..Default::default()
+            };
+            normalize_process_identity_for_driver(&mut policy, driver);
+            let process = policy.process.unwrap();
+            assert_eq!(process.run_as_user, "1234");
+            assert_eq!(process.run_as_group, "sandbox");
+        }
+    }
 
     #[test]
     fn validate_policy_safety_rejects_root_user() {
