@@ -28,6 +28,7 @@ struct ProviderCredentialStateInner {
     current_resolver: Option<Arc<SecretResolver>>,
     combined_resolver: Option<Arc<SecretResolver>>,
     suppressed_keys: HashSet<String>,
+    non_secret_environment_keys: HashSet<String>,
     static_credential_bindings: HashMap<String, StaticCredentialBinding>,
     known_static_credential_keys: HashSet<String>,
     static_credential_identity_epochs: HashMap<String, StaticCredentialIdentityEpoch>,
@@ -86,6 +87,7 @@ impl ProviderCredentialState {
                 current_resolver,
                 combined_resolver,
                 suppressed_keys: HashSet::new(),
+                non_secret_environment_keys: HashSet::new(),
                 static_credential_bindings: HashMap::new(),
                 known_static_credential_keys: HashSet::new(),
                 static_credential_identity_epochs: HashMap::new(),
@@ -121,6 +123,7 @@ impl ProviderCredentialState {
                 revision,
                 &static_credential_bindings,
             );
+            inner.non_secret_environment_keys = non_secret_environment_keys.into_iter().collect();
             inner.static_credential_bindings = static_credential_bindings;
         }
         Ok(state)
@@ -148,6 +151,7 @@ impl ProviderCredentialState {
                 current_resolver: None,
                 combined_resolver: None,
                 suppressed_keys: HashSet::new(),
+                non_secret_environment_keys: HashSet::new(),
                 static_credential_bindings: HashMap::new(),
                 known_static_credential_keys: HashSet::new(),
                 static_credential_identity_epochs: HashMap::new(),
@@ -183,6 +187,7 @@ impl ProviderCredentialState {
         inner.generations.clear();
         inner.current_resolver = None;
         inner.combined_resolver = None;
+        inner.non_secret_environment_keys.clear();
         inner.static_credential_bindings.clear();
         inner.known_static_credential_keys.clear();
         inner.static_credential_identity_epochs.clear();
@@ -302,10 +307,13 @@ impl ProviderCredentialState {
             .expect("provider credential state poisoned");
         let mut env = inner.current.child_env.clone();
 
-        let has_gcp_metadata = env.contains_key("GCE_METADATA_HOST");
+        let has_gcp_metadata = env.contains_key("GCE_METADATA_HOST")
+            && inner
+                .non_secret_environment_keys
+                .contains("GCE_METADATA_HOST");
         let has_gcp_config = google_cloud::STATIC_CONFIG_KEYS
             .iter()
-            .any(|k| env.contains_key(*k));
+            .any(|key| env.contains_key(*key) && inner.non_secret_environment_keys.contains(*key));
 
         if !has_gcp_metadata && !has_gcp_config {
             return env;
@@ -335,7 +343,10 @@ impl ProviderCredentialState {
         // Un-placeholderize non-secret config vars so SDKs can read them
         // at process startup before any HTTP flows through the proxy.
         if let Some(ref resolver) = inner.combined_resolver {
-            for key in google_cloud::STATIC_CONFIG_KEYS {
+            for key in google_cloud::STATIC_CONFIG_KEYS
+                .iter()
+                .filter(|key| inner.non_secret_environment_keys.contains(**key))
+            {
                 let placeholder = crate::secrets::placeholder_for_env_key(key);
                 if let Some(value) = resolver.resolve_placeholder(&placeholder) {
                     env.insert(key.to_string(), value.to_string());
@@ -416,6 +427,7 @@ impl ProviderCredentialState {
         }
         inner.combined_resolver =
             merge_resolvers(&inner.generations, inner.current_resolver.as_ref());
+        inner.non_secret_environment_keys.clear();
         inner.current.child_env.len()
     }
 
@@ -478,6 +490,7 @@ impl ProviderCredentialState {
             revision,
             &static_credential_bindings,
         );
+        inner.non_secret_environment_keys = non_secret_environment_keys.into_iter().collect();
         inner.static_credential_bindings = static_credential_bindings;
         Ok(inner.current.child_env.len())
     }
@@ -509,6 +522,7 @@ impl ProviderCredentialState {
         inner.generations.clear();
         inner.current_resolver = None;
         inner.combined_resolver = None;
+        inner.non_secret_environment_keys.clear();
         inner.static_credential_bindings.clear();
         inner.static_credential_identity_epochs.clear();
     }
@@ -1052,7 +1066,7 @@ mod tests {
 
     #[test]
     fn child_env_with_gcp_resolved_overrides_gcp_static_vars() {
-        let state = ProviderCredentialState::from_environment(
+        let state = ProviderCredentialState::from_bound_environment(
             1,
             HashMap::from([
                 ("GCE_METADATA_HOST".to_string(), "marker".to_string()),
@@ -1065,7 +1079,17 @@ mod tests {
             ]),
             HashMap::new(),
             HashMap::new(),
-        );
+            HashMap::from([(
+                "GCP_ADC_ACCESS_TOKEN".to_string(),
+                binding("oauth2.googleapis.com", 443, "/**"),
+            )]),
+            vec![
+                "GCE_METADATA_HOST".to_string(),
+                "GCP_PROJECT_ID".to_string(),
+                "CLOUD_ML_REGION".to_string(),
+            ],
+        )
+        .expect("classified GCP environment");
         let env = state.child_env_with_gcp_resolved();
 
         assert_eq!(
@@ -1096,7 +1120,7 @@ mod tests {
 
     #[test]
     fn child_env_with_gcp_resolved_handles_missing_config_keys() {
-        let state = ProviderCredentialState::from_environment(
+        let state = ProviderCredentialState::from_bound_environment(
             1,
             HashMap::from([
                 ("GCE_METADATA_HOST".to_string(), "marker".to_string()),
@@ -1104,7 +1128,13 @@ mod tests {
             ]),
             HashMap::new(),
             HashMap::new(),
-        );
+            HashMap::from([(
+                "GCP_ADC_ACCESS_TOKEN".to_string(),
+                binding("oauth2.googleapis.com", 443, "/**"),
+            )]),
+            vec!["GCE_METADATA_HOST".to_string()],
+        )
+        .expect("classified GCP environment");
         let env = state.child_env_with_gcp_resolved();
 
         assert_eq!(
@@ -1222,7 +1252,7 @@ mod tests {
 
     #[test]
     fn child_env_with_gcp_resolved_resolves_vertex_vars_without_metadata_host() {
-        let state = ProviderCredentialState::from_environment(
+        let state = ProviderCredentialState::from_bound_environment(
             1,
             HashMap::from([
                 ("GOOSE_PROVIDER".to_string(), "gcp_vertex_ai".to_string()),
@@ -1234,7 +1264,14 @@ mod tests {
             ]),
             HashMap::new(),
             HashMap::new(),
-        );
+            HashMap::new(),
+            vec![
+                "GOOSE_PROVIDER".to_string(),
+                "ANTHROPIC_VERTEX_PROJECT_ID".to_string(),
+                "VERTEX_LOCATION".to_string(),
+            ],
+        )
+        .expect("classified Vertex environment");
         let env = state.child_env_with_gcp_resolved();
         assert_eq!(
             env.get("GOOSE_PROVIDER").map(String::as_str),
@@ -1252,6 +1289,66 @@ mod tests {
         assert!(
             !env.contains_key("GCE_METADATA_IP"),
             "metadata synthetic vars should not be injected without GCE_METADATA_HOST"
+        );
+    }
+
+    #[test]
+    fn child_env_with_gcp_resolved_only_unwraps_explicitly_non_secret_config() {
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([
+                (
+                    "GOOGLE_CLOUD_PROJECT".to_string(),
+                    "initial-project-config".to_string(),
+                ),
+                (
+                    "GCP_PROJECT_ID".to_string(),
+                    "visible-project-config".to_string(),
+                ),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            vec![
+                "GOOGLE_CLOUD_PROJECT".to_string(),
+                "GCP_PROJECT_ID".to_string(),
+            ],
+        )
+        .expect("classified GCP environment");
+
+        state
+            .install_bound_environment(
+                2,
+                HashMap::from([
+                    (
+                        "GOOGLE_CLOUD_PROJECT".to_string(),
+                        "bound-project-secret".to_string(),
+                    ),
+                    (
+                        "GCP_PROJECT_ID".to_string(),
+                        "visible-project-config".to_string(),
+                    ),
+                ]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([(
+                    "GOOGLE_CLOUD_PROJECT".to_string(),
+                    binding("example.googleapis.com", 443, "/**"),
+                )]),
+                vec!["GCP_PROJECT_ID".to_string()],
+            )
+            .expect("refreshed GCP environment");
+
+        let env = state.child_env_with_gcp_resolved();
+        assert_eq!(
+            env.get("GCP_PROJECT_ID").map(String::as_str),
+            Some("visible-project-config"),
+            "explicitly non-secret GCP config should be visible to the workload"
+        );
+        assert_eq!(
+            env.get("GOOGLE_CLOUD_PROJECT").map(String::as_str),
+            Some("openshell:resolve:env:v2_GOOGLE_CLOUD_PROJECT"),
+            "a reserved GCP name classified as a bound credential must stay placeholderized"
         );
     }
 

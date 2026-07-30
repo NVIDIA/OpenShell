@@ -308,7 +308,7 @@ pub async fn run_sandbox(
                             .status(StatusId::Failure)
                             .state(StateId::Disabled, "fail_closed")
                             .message(format!(
-                                "Rejected provider environment bindings; no provider credentials are active: {error}"
+                                "Rejected provider environment bindings; static provider credentials were revoked; fetched dynamic token grants remain active: {error}"
                             ))
                             .build()
                     );
@@ -3147,7 +3147,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                                 .status(StatusId::Failure)
                                 .state(StateId::Disabled, "fail_closed")
                                 .message(format!(
-                                    "Rejected provider environment refresh; previous provider credentials are not active: {error}"
+                                    "Rejected provider environment refresh; static provider credentials were revoked; fetched dynamic token grants remain active: {error}"
                                 ))
                                 .build()
                         );
@@ -3181,7 +3181,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                     warn!(
                         error = %e,
                         provider_env_revision = result.provider_env_revision,
-                        "Settings poll: failed to refresh provider environment; previous provider credentials are not active"
+                        "Settings poll: failed to refresh provider environment; static provider credentials were revoked; previous dynamic token grants remain active"
                     );
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -3189,7 +3189,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                             .status(StatusId::Failure)
                             .state(StateId::Disabled, "fail_closed")
                             .message(
-                                "Provider environment refresh failed; previous provider credentials are not active"
+                                "Provider environment refresh failed; static provider credentials were revoked; previous dynamic token grants remain active"
                             )
                             .build()
                     );

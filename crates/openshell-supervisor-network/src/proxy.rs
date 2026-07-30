@@ -3616,6 +3616,7 @@ fn forward_telemetry_path(target_uri: &str) -> String {
         .unwrap_or_else(|_| "/[INVALID_REQUEST_TARGET]".to_string())
 }
 
+#[cfg(test)]
 fn endpoint_secret_resolver(
     provider_credentials: Option<&ProviderCredentialState>,
     fallback: Option<Arc<SecretResolver>>,
@@ -3623,9 +3624,41 @@ fn endpoint_secret_resolver(
     port: u16,
     canonical_path: &str,
 ) -> Option<Arc<SecretResolver>> {
-    provider_credentials.map_or(fallback, |credentials| {
-        credentials.resolver_for_endpoint(host, port, canonical_path)
-    })
+    endpoint_credentials_for_request(provider_credentials, fallback, host, port, canonical_path)
+        .resolver
+}
+
+struct ForwardEndpointCredentials {
+    resolver: Option<Arc<SecretResolver>>,
+    revision: Option<u64>,
+}
+
+fn endpoint_credentials_for_request(
+    provider_credentials: Option<&ProviderCredentialState>,
+    fallback: Option<Arc<SecretResolver>>,
+    host: &str,
+    port: u16,
+    canonical_path: &str,
+) -> ForwardEndpointCredentials {
+    let Some(credentials) = provider_credentials else {
+        return ForwardEndpointCredentials {
+            resolver: fallback,
+            revision: None,
+        };
+    };
+    let revision_before = credentials.revision();
+    let resolver = credentials.resolver_for_endpoint(host, port, canonical_path);
+    let revision_after = credentials.revision();
+    if revision_before != revision_after {
+        return ForwardEndpointCredentials {
+            resolver: None,
+            revision: None,
+        };
+    }
+    ForwardEndpointCredentials {
+        resolver,
+        revision: Some(revision_before),
+    }
 }
 
 struct PreparedForwardTarget {
@@ -3633,16 +3666,11 @@ struct PreparedForwardTarget {
     raw_query: Option<String>,
     upstream_target: String,
     telemetry_path: String,
-    secret_resolver: Option<Arc<SecretResolver>>,
 }
 
 fn prepare_forward_target(
     target: &str,
     canonicalize_options: crate::l7::path::CanonicalizeOptions,
-    provider_credentials: Option<&ProviderCredentialState>,
-    fallback: Option<Arc<SecretResolver>>,
-    host: &str,
-    port: u16,
 ) -> Result<PreparedForwardTarget, crate::l7::path::CanonicalizeError> {
     let (canonical, raw_query) =
         crate::l7::path::canonicalize_request_target(target, &canonicalize_options)?;
@@ -3655,15 +3683,11 @@ fn prepare_forward_target(
             || canonical.path.clone(),
             |query| format!("{}?{query}", canonical.path),
         );
-    let secret_resolver =
-        endpoint_secret_resolver(provider_credentials, fallback, host, port, &canonical.path);
-
     Ok(PreparedForwardTarget {
         canonical_path: canonical.path,
         raw_query,
         upstream_target,
         telemetry_path,
-        secret_resolver,
     })
 }
 
@@ -3861,18 +3885,16 @@ fn rewrite_forward_request(
     }
 
     // Fail-closed: scan for any remaining unresolved placeholders
-    if secret_resolver.is_some() {
-        let scan_end = if request_body_credential_rewrite {
-            rewritten_header_end
-        } else {
-            output.len()
-        };
-        let output_str = String::from_utf8_lossy(&output[..scan_end]);
-        if output_str.contains(secrets::PLACEHOLDER_PREFIX_PUBLIC)
-            || output_str.contains(secrets::PROVIDER_ALIAS_MARKER_PUBLIC)
-        {
-            return Err(secrets::UnresolvedPlaceholderError::unavailable("header"));
-        }
+    let scan_end = if request_body_credential_rewrite {
+        rewritten_header_end
+    } else {
+        output.len()
+    };
+    let output_str = String::from_utf8_lossy(&output[..scan_end]);
+    if output_str.contains(secrets::PLACEHOLDER_PREFIX_PUBLIC)
+        || output_str.contains(secrets::PROVIDER_ALIAS_MARKER_PUBLIC)
+    {
+        return Err(secrets::UnresolvedPlaceholderError::unavailable("header"));
     }
 
     Ok(output)
@@ -3940,6 +3962,7 @@ fn complete_chunked_body_prefix_len(bytes: &[u8]) -> Option<usize> {
 
 struct ForwardRelayOptions<'a> {
     generation_guard: &'a PolicyGenerationGuard,
+    credential_generation: Option<crate::l7::rest::CredentialGenerationGuard<'a>>,
     websocket_extensions: crate::l7::rest::WebSocketExtensionMode,
     secret_resolver: Option<&'a SecretResolver>,
     request_body_credential_rewrite: bool,
@@ -3983,6 +4006,7 @@ where
         upstream,
         crate::l7::rest::RelayRequestOptions {
             resolver: options.secret_resolver,
+            credential_generation: options.credential_generation,
             generation_guard: Some(options.generation_guard),
             websocket_extensions: options.websocket_extensions,
             request_body_credential_rewrite: options.request_body_credential_rewrite,
@@ -4298,14 +4322,7 @@ async fn handle_forward_proxy(
         }),
         ..Default::default()
     };
-    let prepared_target = match prepare_forward_target(
-        &path,
-        canonicalize_options,
-        provider_credentials.as_ref(),
-        secret_resolver,
-        &host_lc,
-        port,
-    ) {
+    let prepared_target = match prepare_forward_target(&path, canonicalize_options) {
         Ok(prepared) => prepared,
         Err(error) => {
             let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -4341,11 +4358,10 @@ async fn handle_forward_proxy(
         .map_or_else(std::collections::HashMap::new, |query| {
             crate::l7::rest::parse_query_params(query).unwrap_or_default()
         });
-    let secret_resolver = prepared_target.secret_resolver;
     let mut l7_ctx = relay::http_context(
         &decision,
         provider_credentials,
-        secret_resolver.clone(),
+        secret_resolver,
         activity_tx.cloned(),
         dynamic_credentials.clone(),
         agent_proposals,
@@ -4983,6 +4999,30 @@ async fn handle_forward_proxy(
             return Ok(());
         }
     };
+    // Static credentials are intentionally acquired only after every
+    // asynchronous admission step. Holding an endpoint-scoped resolver across
+    // middleware or token-grant awaits would let a revoked generation reach
+    // the upstream.
+    let endpoint_credentials = endpoint_credentials_for_request(
+        l7_ctx.provider_credentials.as_ref(),
+        l7_ctx.secret_resolver.clone(),
+        &host_lc,
+        port,
+        &path,
+    );
+    let secret_resolver = endpoint_credentials.resolver;
+    let credential_generation = match (
+        l7_ctx.provider_credentials.as_ref(),
+        endpoint_credentials.revision,
+    ) {
+        (Some(state), Some(revision)) => Some(crate::l7::rest::CredentialGenerationGuard::new(
+            state, revision,
+        )),
+        _ => None,
+    };
+    if let Some(guard) = credential_generation {
+        guard.ensure_current()?;
+    }
 
     // 9. Rewrite request and forward to upstream
     let rewritten = match rewrite_forward_request(
@@ -5070,6 +5110,7 @@ async fn handle_forward_proxy(
         &mut upstream,
         ForwardRelayOptions {
             generation_guard: &forward_generation_guard,
+            credential_generation,
             websocket_extensions,
             secret_resolver: secret_resolver.as_deref(),
             request_body_credential_rewrite,
@@ -5359,6 +5400,71 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    struct BlockingForwardMiddleware {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[tonic::async_trait]
+    impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
+        for BlockingForwardMiddleware
+    {
+        async fn describe(
+            &self,
+            _request: tonic::Request<()>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::MiddlewareManifest>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::MiddlewareManifest {
+                    name: "test/blocking-forward".into(),
+                    service_version: "test".into(),
+                    bindings: vec![openshell_core::proto::MiddlewareBinding {
+                        operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpRequest
+                            as i32,
+                        phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
+                            as i32,
+                        max_body_bytes: 8192,
+                        timeout: String::new(),
+                    }],
+                },
+            ))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: tonic::Request<openshell_core::proto::ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(tonic::Response::new(
+                openshell_core::proto::HttpRequestResult {
+                    decision: openshell_core::proto::Decision::Allow as i32,
+                    ..Default::default()
+                },
+            ))
+        }
+    }
 
     async fn drive_raw_request_through_handler(raw: Vec<u8>) -> Vec<u8> {
         let policy = include_str!("../data/sandbox-policy.rego");
@@ -6054,6 +6160,127 @@ network_policies:
         }
     }
 
+    #[tokio::test]
+    async fn forward_reacquires_static_credentials_after_blocked_middleware() {
+        use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let engine = OpaEngine::from_strings(policy, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("generation guard");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let runner = openshell_supervisor_middleware::ChainRunner::new(Arc::new(
+            BlockingForwardMiddleware {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+        ));
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([("API_TOKEN".to_string(), "real-secret".to_string())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.test".to_string(),
+                        port: 80,
+                        path: "/allowed/**".to_string(),
+                    }],
+                    credential_identity: "provider-a:API_TOKEN".to_string(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("bound provider state");
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 80,
+            request_default_port: Some(80),
+            policy_name: "forward".into(),
+            binary_path: "/usr/bin/node".into(),
+            provider_credentials: Some(state.clone()),
+            secret_resolver: state.resolver(),
+            ..Default::default()
+        };
+        let raw = b"GET http://api.example.test/allowed/../outside HTTP/1.1\r\nHost: api.example.test\r\nAuthorization: Bearer openshell:resolve:env:v1_API_TOKEN\r\n\r\n";
+        let prepared = prepare_forward_target(
+            "/allowed/../outside",
+            crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .expect("canonical target");
+        assert_eq!(prepared.canonical_path, "/outside");
+        let request = crate::l7::rest::request_from_buffered_http(
+            "GET",
+            &prepared.canonical_path,
+            &prepared.upstream_target,
+            canonicalize_forward_host_header(raw, "api.example.test").unwrap(),
+        )
+        .unwrap();
+        let pipeline = ForwardMiddlewarePipeline {
+            ctx: &ctx,
+            scheme: "http",
+            runner: &runner,
+            generation_guard: &guard,
+            l7_reevaluation: None,
+        };
+        let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            name: "blocker".into(),
+            implementation: "test/blocking-forward".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }];
+        let (_app, mut client) = tokio::io::duplex(8192);
+        let revoke = async {
+            entered.notified().await;
+            state.revoke_static_provider_environment(2);
+            release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(pipeline.apply(request, &mut client, chain), revoke);
+        let request = match outcome.expect("middleware pipeline") {
+            crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request,
+            crate::l7::middleware::MiddlewareApplyResult::Denied { .. } => {
+                panic!("blocking middleware should allow after release")
+            }
+        };
+
+        let credentials = endpoint_credentials_for_request(
+            ctx.provider_credentials.as_ref(),
+            ctx.secret_resolver.clone(),
+            &ctx.host,
+            ctx.port,
+            &prepared.canonical_path,
+        );
+        assert!(
+            credentials.resolver.is_none(),
+            "revoked live state must supersede the connection-open resolver"
+        );
+        let rewrite = rewrite_forward_request(
+            &request.raw_header,
+            request.raw_header.len(),
+            &prepared.upstream_target,
+            "api.example.test",
+            credentials.resolver.as_deref(),
+            false,
+        );
+        assert!(
+            rewrite.is_err(),
+            "revoked credential placeholder must fail before upstream relay"
+        );
+
+        let (proxy_upstream, mut upstream) = tokio::io::duplex(8192);
+        drop(proxy_upstream);
+        let mut forwarded = Vec::new();
+        upstream.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "revoked forward credential request must not reach upstream"
+        );
+    }
+
     #[test]
     fn forward_l7_allowed_activity_is_deferred_until_after_ssrf() {
         let (tx, mut rx) = mpsc::channel(4);
@@ -6197,6 +6424,7 @@ network_policies:
             &mut proxy_to_upstream,
             ForwardRelayOptions {
                 generation_guard: &guard,
+                credential_generation: None,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: resolver,
                 request_body_credential_rewrite,
@@ -6386,6 +6614,7 @@ network_policies:
                 &mut proxy_to_upstream,
                 ForwardRelayOptions {
                     generation_guard: guard,
+                    credential_generation: None,
                     websocket_extensions,
                     secret_resolver: None,
                     request_body_credential_rewrite: false,
@@ -8623,17 +8852,18 @@ network_policies:
         let placeholder = "openshell:resolve:env:v1_API_TOKEN";
 
         for raw_path in ["/allowed/../outside", "/allowed/%2e%2e/outside"] {
-            let prepared = prepare_forward_target(
-                raw_path,
-                crate::l7::path::CanonicalizeOptions::default(),
+            let prepared =
+                prepare_forward_target(raw_path, crate::l7::path::CanonicalizeOptions::default())
+                    .expect("prepared target");
+            assert_eq!(prepared.canonical_path, "/outside");
+            let resolver = endpoint_secret_resolver(
                 Some(&state),
                 state.resolver(),
                 "api.example.com",
                 80,
+                &prepared.canonical_path,
             )
-            .expect("prepared target");
-            assert_eq!(prepared.canonical_path, "/outside");
-            let resolver = prepared.secret_resolver.expect("scoped resolver");
+            .expect("scoped resolver");
             let error = resolver
                 .rewrite_header_value(placeholder)
                 .expect_err("canonical endpoint must deny traversal");
@@ -9386,6 +9616,7 @@ network_policies:
             &mut proxy_to_upstream,
             ForwardRelayOptions {
                 generation_guard: &guard,
+                credential_generation: None,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: Some(&resolver),
                 request_body_credential_rewrite: true,
@@ -9464,6 +9695,7 @@ network_policies:
             &mut proxy_to_upstream,
             ForwardRelayOptions {
                 generation_guard: &guard,
+                credential_generation: None,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: Some(&resolver),
                 request_body_credential_rewrite: false,
@@ -9551,6 +9783,7 @@ network_policies:
             &mut proxy_to_upstream,
             ForwardRelayOptions {
                 generation_guard: &guard,
+                credential_generation: None,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: None,
                 request_body_credential_rewrite: false,
@@ -9599,6 +9832,7 @@ network_policies:
             &mut proxy_to_upstream,
             ForwardRelayOptions {
                 generation_guard: &guard,
+                credential_generation: None,
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: None,
                 request_body_credential_rewrite: false,
