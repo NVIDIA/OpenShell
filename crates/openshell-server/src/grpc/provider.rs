@@ -28,7 +28,6 @@ use openshell_policy::ProviderPolicyLayer;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::error::Error as StdError;
 use tonic::Status;
 use tracing::warn;
 
@@ -2174,18 +2173,14 @@ use openshell_providers::{
     normalize_profile_id, normalize_provider_type, strategy_output_env_key, strategy_output_spec,
     strategy_primary_env_key, validate_profile_set,
 };
-use serde::Deserialize;
 use std::sync::{Arc, LazyLock, RwLock};
 use tonic::{Request, Response};
 
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{MinWorkspaceRole, authorize_workspace, require_platform_admin};
-
-const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
-const DEFAULT_CLIENT_ASSERTION_TYPE: &str =
-    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
-const DEFAULT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
-const MAX_OAUTH_ERROR_FIELD_LEN: usize = 256;
+use openshell_core::oauth::{
+    self, TokenExchangeParams, effective_client_assertion_type, effective_token_type,
+};
 const DEFAULT_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
 const MAX_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS: i64 = 3600;
 const INTERMEDIATE_TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
@@ -2230,21 +2225,21 @@ impl IntermediateTokenCache {
         }
     }
 
-    fn get(&self, key: &str) -> Option<TokenExchangeResponseBody> {
+    fn get(&self, key: &str) -> Option<oauth::OAuthTokenResponse> {
         let now_ms = crate::persistence::current_time_ms();
         let tokens = self.tokens.read().ok()?;
         let cached = tokens.get(key)?;
         if cached.expires_at_ms <= now_ms {
             return None;
         }
-        Some(TokenExchangeResponseBody {
+        Some(oauth::OAuthTokenResponse {
             access_token: cached.access_token.clone(),
             expires_in: cached.expires_at_ms.saturating_sub(now_ms) / 1000,
             token_type: cached.token_type.clone(),
         })
     }
 
-    fn set(&self, key: String, token: &TokenExchangeResponseBody, expires_at_ms: i64) {
+    fn set(&self, key: String, token: &oauth::OAuthTokenResponse, expires_at_ms: i64) {
         if let Ok(mut tokens) = self.tokens.write() {
             let now_ms = crate::persistence::current_time_ms();
             tokens.retain(|_, cached| cached.expires_at_ms > now_ms);
@@ -2263,21 +2258,6 @@ impl IntermediateTokenCache {
             );
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenExchangeResponseBody {
-    access_token: String,
-    #[serde(default)]
-    expires_in: i64,
-    #[serde(default)]
-    token_type: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OAuthErrorResponse {
-    error: Option<String>,
-    error_description: Option<String>,
 }
 
 async fn authorize_and_resolve_profile_workspace(
@@ -2304,6 +2284,7 @@ async fn authorize_and_resolve_profile_workspace(
         super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace).await
     }
 }
+
 pub(super) async fn handle_create_provider(
     state: &Arc<ServerState>,
     request: Request<CreateProviderRequest>,
@@ -3796,7 +3777,7 @@ fn intermediate_token_cache_key(input: IntermediateTokenCacheKeyInput<'_>) -> St
 }
 
 fn intermediate_token_cache_expires_at_ms(
-    token: &TokenExchangeResponseBody,
+    token: &oauth::OAuthTokenResponse,
     cache_ttl_seconds: i64,
     subject_token_expires_at_ms: i64,
     supervisor_svid_exp_seconds: i64,
@@ -3938,17 +3919,6 @@ async fn validate_supervisor_jwt_svid(
     Ok(unverified)
 }
 
-fn format_error_chain(prefix: &str, error: &dyn StdError) -> String {
-    let mut message = format!("{prefix}: {error}");
-    let mut source = error.source();
-    while let Some(err) = source {
-        message.push_str(": ");
-        message.push_str(&err.to_string());
-        source = err.source();
-    }
-    message
-}
-
 fn parse_unverified_spiffe_claims(token: &str) -> Result<SpiffeJwtClaims, Status> {
     parse_unverified_jwt_svid_claims(token).map_err(jwt_svid_parse_error_status)
 }
@@ -3965,112 +3935,23 @@ async fn perform_intermediate_token_exchange(
     subject_token_type: &str,
     audience: &str,
     requested_token_type: &str,
-) -> Result<TokenExchangeResponseBody, Status> {
-    let token_endpoint_url = parse_token_endpoint_url(token_endpoint)?;
-    let client_assertion_type = effective_client_assertion_type(client_assertion_type);
-    let subject_token_type = effective_token_type(subject_token_type);
-    let requested_token_type = effective_token_type(requested_token_type);
-    let form_params = [
-        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
-        ("client_assertion_type", client_assertion_type),
-        ("client_assertion", gateway_jwt_svid),
-        ("subject_token", subject_token),
-        ("subject_token_type", subject_token_type),
-        ("audience", audience),
-        ("requested_token_type", requested_token_type),
-    ];
-
-    let response = token_exchange_http_client()?
-        .post(token_endpoint_url)
-        .form(&form_params)
-        .send()
-        .await
-        .map_err(|e| {
-            Status::internal(format_error_chain(
-                "provider token exchange request failed",
-                &e,
-            ))
-        })?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read response body>".to_string());
-        return Err(Status::failed_precondition(token_exchange_failure_message(
-            status, &body,
-        )));
-    }
-    let body = response
-        .json::<TokenExchangeResponseBody>()
-        .await
-        .map_err(|e| {
-            Status::internal(format!(
-                "provider token exchange response parse failed: {e}"
-            ))
-        })?;
-    validate_oauth_access_token(&body.access_token)?;
-    Ok(body)
-}
-
-fn parse_token_endpoint_url(token_endpoint: &str) -> Result<reqwest::Url, Status> {
-    let url = reqwest::Url::parse(token_endpoint)
-        .map_err(|_| Status::invalid_argument("token_endpoint must be an absolute URL"))?;
-    if token_endpoint_transport_allowed(&url) {
-        return Ok(url);
-    }
-    Err(Status::invalid_argument(
-        "token_endpoint must use https, except http for loopback or in-cluster service hosts",
-    ))
-}
-
-fn token_endpoint_transport_allowed(url: &reqwest::Url) -> bool {
-    match url.scheme() {
-        "https" => true,
-        "http" => url
-            .host_str()
-            .is_some_and(|host| is_loopback_host(host) || is_kubernetes_service_host(host)),
-        _ => false,
-    }
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let host = host.trim_matches(['[', ']']);
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
-        Ok(std::net::IpAddr::V6(v6)) => {
-            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-        }
-        Err(_) => false,
-    }
-}
-
-fn is_kubernetes_service_host(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    let labels = host.split('.').collect::<Vec<_>>();
-    let is_service_name = labels.len() == 3 && labels[2] == "svc";
-    let is_cluster_local_service =
-        labels.len() == 5 && labels[2] == "svc" && labels[3] == "cluster" && labels[4] == "local";
-    (is_service_name || is_cluster_local_service) && labels.iter().all(|label| !label.is_empty())
-}
-
-fn effective_client_assertion_type(client_assertion_type: &str) -> &str {
-    if client_assertion_type.trim().is_empty() {
-        DEFAULT_CLIENT_ASSERTION_TYPE
-    } else {
-        client_assertion_type
-    }
-}
-
-fn effective_token_type(token_type: &str) -> &str {
-    if token_type.trim().is_empty() {
-        DEFAULT_TOKEN_TYPE
-    } else {
-        token_type
-    }
+) -> Result<oauth::OAuthTokenResponse, Status> {
+    let client = token_exchange_http_client()?;
+    oauth::post_oauth_token_exchange(
+        client,
+        token_endpoint,
+        &TokenExchangeParams {
+            client_assertion: gateway_jwt_svid,
+            client_assertion_type,
+            subject_token,
+            subject_token_type,
+            audience,
+            scopes: &[],
+            requested_token_type,
+        },
+    )
+    .await
+    .map_err(|e| Status::failed_precondition(e.to_string()))
 }
 
 fn effective_jwt_svid_audience(token_endpoint: &str, jwt_svid_audience: &str) -> String {
@@ -4089,77 +3970,6 @@ fn derive_issuer_from_token_endpoint(token_endpoint: &str) -> String {
         }
     }
     token_endpoint.to_string()
-}
-
-fn validate_oauth_access_token(token: &str) -> Result<(), Status> {
-    if token.is_empty() || !is_token68(token) {
-        return Err(Status::internal(
-            "provider token exchange returned a malformed access token",
-        ));
-    }
-    Ok(())
-}
-
-fn is_token68(token: &str) -> bool {
-    let mut padding_started = false;
-    let mut saw_value = false;
-    for byte in token.bytes() {
-        if byte == b'=' {
-            padding_started = true;
-            continue;
-        }
-        if padding_started || !is_token68_value_byte(byte) {
-            return false;
-        }
-        saw_value = true;
-    }
-    saw_value
-}
-
-fn is_token68_value_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
-}
-
-fn token_exchange_failure_message(status: reqwest::StatusCode, body: &str) -> String {
-    let Ok(error_response) = serde_json::from_str::<OAuthErrorResponse>(body) else {
-        return format!("provider token exchange failed with status {status}");
-    };
-    let error = error_response
-        .error
-        .as_deref()
-        .map(sanitize_oauth_error_field)
-        .filter(|value| !value.is_empty());
-    let description = error_response
-        .error_description
-        .as_deref()
-        .map(sanitize_oauth_error_field)
-        .filter(|value| !value.is_empty());
-    match (error, description) {
-        (Some(error), Some(description)) => {
-            format!(
-                "provider token exchange failed with status {status}: error={error}; error_description={description}"
-            )
-        }
-        (Some(error), None) => {
-            format!("provider token exchange failed with status {status}: error={error}")
-        }
-        (None, Some(description)) => {
-            format!(
-                "provider token exchange failed with status {status}: error_description={description}"
-            )
-        }
-        (None, None) => format!("provider token exchange failed with status {status}"),
-    }
-}
-
-fn sanitize_oauth_error_field(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .take(MAX_OAUTH_ERROR_FIELD_LEN)
-        .collect::<String>()
-        .trim()
-        .to_string()
 }
 
 pub(super) async fn handle_get_provider_refresh_status(
