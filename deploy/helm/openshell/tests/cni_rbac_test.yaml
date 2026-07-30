@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: cni rbac
+templates:
+  - templates/cni-rbac.yaml
+tests:
+  - it: does not render by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders service account, role and binding when cni enabled
+    set:
+      cni.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 3
+      - documentIndex: 0
+        isKind:
+          of: ServiceAccount
+      - documentIndex: 0
+        matchRegex:
+          path: metadata.name
+          pattern: -cni$
+      - documentIndex: 1
+        isKind:
+          of: Role
+      - documentIndex: 1
+        contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - pods
+            verbs:
+              - get
+      - documentIndex: 2
+        isKind:
+          of: RoleBinding
+      - documentIndex: 2
+        matchRegex:
+          path: subjects[0].name
+          pattern: -cni$
+      - documentIndex: 2
+        matchRegex:
+          path: roleRef.name
+          pattern: -cni$
+
+  - it: scopes cni pod-get role to the explicit sandbox namespace
+    set:
+      cni.enabled: true
+      server.sandboxNamespace: agents
+    asserts:
+      - documentIndex: 1
+        equal:
+          path: metadata.namespace
+          value: agents
+      - documentIndex: 2
+        equal:
+          path: metadata.namespace
+          value: agents

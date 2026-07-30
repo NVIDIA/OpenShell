@@ -42,3 +42,7 @@ tests:
       - documentIndex: 1
         isKind:
           of: ClusterRoleBinding
+      - documentIndex: 1
+        matchRegex:
+          path: subjects[0].name
+          pattern: -cni$
