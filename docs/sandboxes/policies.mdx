@@ -546,6 +546,7 @@ When triaging denied requests, check:
 - Calling binary path to confirm which `binaries` entry needs to be added or adjusted.
 - HTTP method and path for REST endpoints, or `GET` / `WEBSOCKET_TEXT` and the upgraded request path for WebSocket endpoints, to confirm which `rules` entry needs to be added or adjusted.
 - `credential_endpoint_mismatch` in sandbox logs to confirm that policy admitted the request but the attached provider profile did not authorize its credential for that host, port, and path.
+- `request_authority_mismatch` in the response or sandbox logs to confirm that the HTTP request authority differs from the authorized tunnel endpoint. For a CONNECT tunnel to `api.example.com:8443`, send `Host: api.example.com:8443`; omitting the non-default port makes the request authority use the transport default and OpenShell rejects it. Absolute-form request targets must use the same host and port.
 
 Then push the updated policy as described above.
 

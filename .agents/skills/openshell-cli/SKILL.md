@@ -128,6 +128,13 @@ when a placeholder is present but requests receive
 `credential_endpoint_mismatch`. A profileless static provider fails closed
 because the gateway cannot construct a binding.
 
+When an inspected request receives `request_authority_mismatch`, compare its
+HTTP authority with the CONNECT tunnel endpoint. The host and effective port
+must match. For a tunnel to `api.example.com:8443`, send
+`Host: api.example.com:8443`; `Host: api.example.com` omits the non-default
+port and is rejected. An absolute-form request target must use the same
+authority.
+
 Profile-backed provider policy composition is controlled by the gateway-global
 `providers_v2_enabled` setting. Static credential endpoint binding remains
 active even when policy composition is disabled:
