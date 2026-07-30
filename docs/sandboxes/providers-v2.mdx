@@ -131,12 +131,13 @@ the provider revokes resolution for placeholders already held by running
 processes.
 
 <Warning>
-Static credentials require a provider profile with at least one usable
-endpoint. If any attached static provider lacks complete binding metadata, the
-sandbox rejects the provider environment update and keeps no static provider
-credentials active. Import a custom profile, create a replacement provider
-whose `--type` is that profile ID, attach the replacement, and detach the
-profileless provider.
+Static credentials from a selected provider profile require at least one usable
+endpoint. OpenShell withholds only the static credential keys and associated
+expiry and binding metadata from an endpointless selected profile. It retains
+that provider's generated non-secret configuration and valid endpoint-bound
+static credentials from other attached providers. For a custom static
+credential, import a profile with the intended endpoint selectors and use that
+profile as the provider type.
 </Warning>
 
 After upgrading a gateway and supervisor to a release with endpoint binding,
@@ -551,7 +552,7 @@ Use an ISO/RFC3339 timestamp or Unix epoch milliseconds. Use `0` as the timestam
 
 OpenShell skips expired provider credentials when it builds a sandbox provider environment. Running sandboxes also reject expired retained credential generations during placeholder resolution, so stale placeholders fail closed instead of forwarding unresolved or expired credential material.
 
-The gateway sends a complete host, port, and path binding for every static credential key. Supervisors reject incomplete binding metadata and clear previously active provider material when a refresh fails validation. Refer to [Static Credential Endpoint Binding](#understand-static-credential-endpoint-binding) for matching, denial, lifecycle, and migration behavior.
+The gateway sends a complete host, port, and path binding for every emitted static credential key. It withholds static credential keys from endpointless selected profiles with their expiry and binding metadata. Supervisors reject other incomplete binding metadata and clear previously active provider material when a refresh fails validation. Refer to [Static Credential Endpoint Binding](#understand-static-credential-endpoint-binding) for matching, denial, lifecycle, and migration behavior.
 
 ## Configure Credential Refresh
 

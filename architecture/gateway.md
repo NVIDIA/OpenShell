@@ -439,11 +439,12 @@ gateway classifies each returned environment entry as either a credential or
 non-secret provider configuration and associates every credential key with the
 host, port, and path selectors from its effective provider profile. It withholds
 static credential material from supervisors that do not advertise binding
-support. If a static credential has no usable endpoint, the gateway returns its
-incomplete binding metadata with the valid dynamic credential snapshot. The
-supervisor then revokes all static material while keeping the dynamic snapshot
-active. Provider environment revisions include profile endpoint and binding
-changes.
+support. If a selected provider profile has no usable endpoint, the gateway
+withholds only that profile's static credential keys and their expiry and
+binding metadata. It continues to return provider-generated non-secret
+configuration, valid endpoint-bound static credentials from other attached
+providers, and the dynamic credential snapshot. Provider environment revisions
+include profile endpoint and binding changes.
 
 ## Inference Resolution
 
