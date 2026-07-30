@@ -7574,7 +7574,7 @@ mod tests {
             with_user(Request::new(UpdateConfigRequest {
                 name: "policy-binding".to_string(),
                 workspace: "default".to_string(),
-                policy: Some(next_policy),
+                policy: Some(next_policy.clone()),
                 ..Default::default()
             })),
         )
@@ -7611,6 +7611,50 @@ mod tests {
         assert_eq!(
             next_environment.static_credential_bindings["CLOUD_TOKEN"].endpoints[0].host,
             "api2.cloud.example"
+        );
+
+        let mut unbound_policy = next_policy;
+        unbound_policy
+            .network_policies
+            .get_mut("cloud_api")
+            .unwrap()
+            .endpoints[0]
+            .credential_binding = None;
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "policy-binding".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(unbound_policy),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("removing a policy binding must succeed");
+        let unbound_environment = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-policy-binding".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_ne!(
+            next_environment.provider_env_revision, unbound_environment.provider_env_revision,
+            "removing the binding must rotate the provider environment revision"
+        );
+        assert!(
+            !unbound_environment.environment.contains_key("CLOUD_TOKEN"),
+            "removing the only binding must withhold the static credential"
+        );
+        assert!(
+            !unbound_environment
+                .static_credential_bindings
+                .contains_key("CLOUD_TOKEN"),
+            "an endpointless profile must not emit incomplete binding metadata"
         );
     }
 
