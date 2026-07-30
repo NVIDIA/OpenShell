@@ -1,13 +1,13 @@
 # RHAIV auto-tag workflow for the OpenShell midstream fork.
-# Creates +rhaiv.N tags based on the latest upstream version tag.
+# Creates -rhaiv.N tags based on the latest upstream version tag.
 #
 # Logic:
-#   1. Find the latest upstream-style tag (vX.Y.Z, no +rhaiv suffix)
-#   2. If no vX.Y.Z+rhaiv.0 exists, create it
-#   3. If vX.Y.Z+rhaiv.N exists, create vX.Y.Z+rhaiv.(N+1)
-#   4. Skip if no new commits since the last +rhaiv.N tag
+#   1. Find the latest upstream-style tag (vX.Y.Z, no -rhaiv suffix)
+#   2. If no vX.Y.Z-rhaiv.0 exists, create it
+#   3. If vX.Y.Z-rhaiv.N exists, create vX.Y.Z-rhaiv.(N+1)
+#   4. Skip if no new commits since the last -rhaiv.N tag
 #
-# When upstream syncs a new vX.Y.Z, the next run creates +rhaiv.0 for it.
+# When upstream syncs a new vX.Y.Z, the next run creates -rhaiv.0 for it.
 
 name: RHAIV Auto-Tag
 
@@ -36,8 +36,9 @@ jobs:
       - name: Determine next rhaiv tag
         id: version
         run: |
-          # Find the latest upstream tag (vX.Y.Z without +rhaiv suffix)
-          latest_upstream=$(git tag -l 'v*.*.*' --sort=-v:refname | grep -v '+rhaiv' | head -1)
+          # Find the latest upstream tag (vX.Y.Z, no rhaiv suffix).
+          # Exclude both the current -rhaiv form and the legacy +rhaiv form.
+          latest_upstream=$(git tag -l 'v*.*.*' --sort=-v:refname | grep -v -- '[-+]rhaiv' | head -1)
           if [ -z "$latest_upstream" ]; then
             echo "::error::No upstream v*.*.* tags found"
             exit 1
@@ -51,22 +52,22 @@ jobs:
           echo "Latest upstream tag: $latest_upstream"
 
           # Find the latest rhaiv tag for this upstream version
-          latest_rhaiv=$(git tag -l "${latest_upstream}+rhaiv.*" --sort=-v:refname | head -1)
+          latest_rhaiv=$(git tag -l "${latest_upstream}-rhaiv.*" --sort=-v:refname | head -1)
 
           if [ -z "$latest_rhaiv" ]; then
-            next="${latest_upstream}+rhaiv.0"
+            next="${latest_upstream}-rhaiv.0"
             compare_ref="$latest_upstream"
             echo "No existing rhaiv tags for $latest_upstream"
           else
-            current_n=$(echo "$latest_rhaiv" | grep -oP '\+rhaiv\.\K[0-9]+')
+            current_n=$(echo "$latest_rhaiv" | grep -oP -- '-rhaiv\.\K[0-9]+')
             next_n=$((current_n + 1))
-            next="${latest_upstream}+rhaiv.${next_n}"
+            next="${latest_upstream}-rhaiv.${next_n}"
             compare_ref="$latest_rhaiv"
             echo "Latest rhaiv tag: $latest_rhaiv (N=$current_n)"
           fi
 
           # Validate generated tag format
-          if ! echo "$next" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+\+rhaiv\.[0-9]+$'; then
+          if ! echo "$next" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+-rhaiv\.[0-9]+$'; then
             echo "::error::Generated tag '$next' has unexpected format"
             exit 1
           fi
