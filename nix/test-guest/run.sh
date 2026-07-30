@@ -332,6 +332,7 @@ qemu_log=${run_dir}/qemu.log
 qemu_pid=
 ssh_port=
 ssh_args=()
+ssh_forward_args=()
 scp_args=()
 ansible_config=${run_dir}/ansible.cfg
 ansible_inventory=${run_dir}/inventory.ini
@@ -439,11 +440,6 @@ for attempt in $(seq 1 5); do
 		done
 	fi
 	netdev_arg="user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
-	for forward_spec in "${forward_ports[@]}"; do
-		host_port=${forward_spec%%:*}
-		guest_port=${forward_spec#*:}
-		netdev_arg+=",hostfwd=tcp:127.0.0.1:${host_port}-:${guest_port}"
-	done
 	: >"${qemu_log}"
 	echo "==> Booting ${distro} (${TEST_GUEST_ARCHITECTURE}) with QEMU/${TEST_GUEST_ACCELERATOR}"
 	"${TEST_GUEST_QEMU}" \
@@ -519,6 +515,16 @@ scp_args=(
 	-o StrictHostKeyChecking=no
 	-o UserKnownHostsFile=/dev/null
 )
+if [ "${#forward_ports[@]}" -gt 0 ]; then
+	ssh_forward_args+=(-o ExitOnForwardFailure=yes)
+	for forward_spec in "${forward_ports[@]}"; do
+		host_port=${forward_spec%%:*}
+		guest_port=${forward_spec#*:}
+		ssh_forward_args+=(
+			-L "127.0.0.1:${host_port}:127.0.0.1:${guest_port}"
+		)
+	done
+fi
 
 echo "==> Waiting up to ${ssh_wait_seconds} seconds for SSH on 127.0.0.1:${ssh_port}"
 ssh_ready=0
@@ -635,12 +641,13 @@ ssh "${ssh_args[@]}" -O exit openshell@127.0.0.1 >/dev/null 2>&1 || true
 
 echo "==> Test guest ready: ${distro} (SSH port ${ssh_port})"
 if [ "${#guest_command[@]}" -eq 0 ]; then
-	ssh -t "${ssh_args[@]}" openshell@127.0.0.1
+	ssh -t "${ssh_args[@]}" "${ssh_forward_args[@]}" openshell@127.0.0.1
 else
 	printf -v quoted_command '%q ' "${guest_command[@]}"
 	# quoted_command is shell-escaped locally before it reaches the guest.
 	# shellcheck disable=SC2029
-	ssh "${ssh_args[@]}" openshell@127.0.0.1 "bash -lc $(printf '%q' "${quoted_command}")"
+	ssh "${ssh_args[@]}" "${ssh_forward_args[@]}" \
+		openshell@127.0.0.1 "bash -lc $(printf '%q' "${quoted_command}")"
 fi
 
 echo "==> Shutting down ${distro}"
