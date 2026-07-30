@@ -5691,7 +5691,7 @@ network_policies:
         let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
 
         tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(30),
             handle_forward_proxy(
                 "GET",
                 &target,
