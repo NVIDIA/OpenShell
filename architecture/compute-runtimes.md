@@ -291,6 +291,13 @@ annotates sandbox pods so the chained CNI plugin can read the proxy UID and
 enforcement mode, and both the agent container and long-running network sidecar
 stay non-root with no added Linux capabilities.
 
+The CNI installer supports two modes. `conflist` (default) appends the
+`openshell-cni` plugin to an existing CNI `.conflist` (k3s / vanilla). On
+OpenShift (Multus / OVN-Kubernetes) there is no appendable `.conflist`, so
+`multus-chain` writes a standalone plugin `.conf` into the Multus
+`vendor-cni-chain` auxiliary-chain directory and stores plugin credentials in a
+persistent `stateDir`. Neither mode modifies a CNO-managed file.
+
 ## Images
 
 The gateway image and Helm chart are built from this repository. Sandbox images
