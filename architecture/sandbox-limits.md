@@ -94,6 +94,7 @@ streaming HTTP middleware to use the same process-wide budget.
 | Concurrent parsed WebSocket text assemblies | 32 active, 64 waiters | Shared process-wide across all parsed relays. Additional messages close with `1013` before payload allocation or reading when both bounds are full. |
 | Parsed WebSocket fragments per message | 4,096 | Close with `1002`. |
 | Parsed WebSocket text assembly | 30 s input idle, 2 min total | Close with `1002`; the total includes initial and continuation payloads, continuation headers, and interleaved control frames. These deliberately permissive initial bounds can be tightened, or made operator-tunable within platform bounds, after production behavior is understood. |
+| Parsed WebSocket text forwarding | 2 min total | End the relay and release assembly capacity. A timeout does not append a close frame to a partially written data frame. |
 | Parsed raw WebSocket binary frame | 16 MiB | Close with `1002`; binary messages are relayed rather than inspected. |
 | HTTP relay waiting for EOF | 5 s input idle | End the relay with a timeout. |
 | TLS certificate cache | 256 hosts | Clear the cache before inserting another host. |
@@ -102,7 +103,7 @@ Ordinary allowed traffic is streamed rather than accumulated to a
 connection-sized buffer. A parsing or transformation feature introduces a
 buffer only when it owns an explicit bound.
 
-Every parsed WebSocket text message acquires network-owned assembly capacity before payload allocation or reading, including relays used only for native policy, credential rewriting, compression, or a disabled fail-open middleware session. The process-lifetime budget survives policy reloads, and the assembly retains its permit through decompression, policy and middleware evaluation, credential rewriting, and upstream forwarding. Active middleware sessions additionally acquire shared middleware work before buffering. Input progress resets only the idle deadline. Every timeout and terminal parser error releases both permits through ordinary ownership. Queue exhaustion emits a payload-free network denial event.
+Every parsed WebSocket text message acquires network-owned assembly capacity before payload allocation or reading, including relays used only for native policy, credential rewriting, compression, or a disabled fail-open middleware session. The process-lifetime budget survives policy reloads, and the assembly retains its permit through decompression, policy and middleware evaluation, credential rewriting, and upstream forwarding. Active middleware sessions additionally acquire shared middleware work before buffering. Input progress resets only the idle deadline. Forwarding uses one total deadline across the complete frame header, payload, and flush. Every timeout and terminal parser error releases both permits through ordinary ownership. Queue exhaustion emits a payload-free network denial event.
 
 The operator middleware `max_payload_bytes` ceiling applies to payloads exposed
 through HTTP-body and WebSocket text-message bindings. It does not replace the

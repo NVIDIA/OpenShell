@@ -30,6 +30,7 @@ const MAX_RAW_FRAME_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MESSAGE_FRAGMENTS: usize = 4096;
 const TEXT_MESSAGE_ASSEMBLY_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const TEXT_MESSAGE_ASSEMBLY_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+const TEXT_MESSAGE_FORWARD_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(120);
 const COPY_BUF_SIZE: usize = 8192;
 const OPCODE_CONTINUATION: u8 = 0x0;
 const OPCODE_TEXT: u8 = 0x1;
@@ -1162,13 +1163,6 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     ensure_generation_current(host, port, options)?;
 
     if replacements == 0 && !middleware_transformed && !force_reframe && !compressed {
-        writer.write_all(&frame.raw_header).await.map_err(|error| {
-            terminate(
-                WebSocketTerminationCause::PeerDisconnect,
-                miette!("websocket upstream write failed: {error}"),
-            )
-        })?;
-        ensure_generation_current(host, port, options)?;
         let mut payload = text.into_bytes();
         let mask_key = frame.mask_key.ok_or_else(|| {
             WebSocketTermination::from(FrameError::protocol(
@@ -1177,19 +1171,16 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
             ))
         })?;
         apply_mask(&mut payload, mask_key);
-        writer.write_all(&payload).await.map_err(|error| {
-            terminate(
-                WebSocketTerminationCause::PeerDisconnect,
-                miette!("websocket upstream write failed: {error}"),
-            )
-        })?;
-        writer.flush().await.map_err(|error| {
-            terminate(
-                WebSocketTerminationCause::PeerDisconnect,
-                miette!("websocket upstream flush failed: {error}"),
-            )
-        })?;
-        return Ok(());
+        return write_text_frame_guarded(
+            writer,
+            &frame.raw_header,
+            &payload,
+            host,
+            port,
+            options.policy_name,
+            options.generation_guard,
+        )
+        .await;
     }
 
     if replacements > 0 {
@@ -1598,25 +1589,57 @@ async fn write_masked_text_frame_guarded<W: AsyncWrite + Unpin>(
     generation_guard: Option<&PolicyGenerationGuard>,
 ) -> WebSocketRelayResult<()> {
     let (header, masked) = masked_frame_parts(OPCODE_TEXT, rsv, payload);
-    writer.write_all(&header).await.map_err(|error| {
-        terminate(
-            WebSocketTerminationCause::PeerDisconnect,
-            miette!("websocket upstream write failed: {error}"),
-        )
-    })?;
+    write_text_frame_guarded(
+        writer,
+        &header,
+        &masked,
+        host,
+        port,
+        policy_name,
+        generation_guard,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_text_frame_guarded<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    header: &[u8],
+    payload: &[u8],
+    host: &str,
+    port: u16,
+    policy_name: &str,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> WebSocketRelayResult<()> {
     ensure_generation_guard_current(host, port, policy_name, generation_guard)?;
-    writer.write_all(&masked).await.map_err(|error| {
-        terminate(
-            WebSocketTerminationCause::PeerDisconnect,
-            miette!("websocket upstream write failed: {error}"),
-        )
-    })?;
-    writer.flush().await.map_err(|error| {
-        terminate(
-            WebSocketTerminationCause::PeerDisconnect,
-            miette!("websocket upstream flush failed: {error}"),
-        )
+    tokio::time::timeout(TEXT_MESSAGE_FORWARD_TOTAL_TIMEOUT, async {
+        writer.write_all(header).await.map_err(|error| {
+            terminate(
+                WebSocketTerminationCause::PeerDisconnect,
+                miette!("websocket upstream write failed: {error}"),
+            )
+        })?;
+        writer.write_all(payload).await.map_err(|error| {
+            terminate(
+                WebSocketTerminationCause::PeerDisconnect,
+                miette!("websocket upstream write failed: {error}"),
+            )
+        })?;
+        writer.flush().await.map_err(|error| {
+            terminate(
+                WebSocketTerminationCause::PeerDisconnect,
+                miette!("websocket upstream flush failed: {error}"),
+            )
+        })
     })
+    .await
+    .map_err(|_| {
+        terminate(
+            WebSocketTerminationCause::PeerDisconnect,
+            miette!("websocket upstream forwarding total timeout"),
+        )
+    })??;
+    ensure_generation_guard_current(host, port, policy_name, generation_guard)
 }
 
 fn masked_frame_parts(opcode: u8, rsv: u8, payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -2111,6 +2134,46 @@ network_policies:
         assert!(!task.is_finished(), "fixture task must be pending");
     }
 
+    struct ReloadAfterFirstWrite {
+        engine: Arc<OpaEngine>,
+        output: Vec<u8>,
+        writes: usize,
+    }
+
+    impl AsyncWrite for ReloadAfterFirstWrite {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            this.output.extend_from_slice(buffer);
+            this.writes += 1;
+            if this.writes == 1 {
+                this.engine
+                    .replace_middleware_registry(
+                        openshell_supervisor_middleware::MiddlewareRegistry::default(),
+                    )
+                    .expect("invalidate generation after frame header");
+            }
+            std::task::Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     fn relay_options_with_budget(budget: WebSocketAssemblyBudget) -> RelayOptions<'static> {
         RelayOptions {
             policy_name: "test-policy",
@@ -2274,6 +2337,111 @@ network_policies:
                 .expect("waiting admission result"),
             WebSocketAssemblyAdmissionOutcome::Admitted(_)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upstream_forwarding_timeout_releases_assembly_capacity() {
+        let budget = WebSocketAssemblyBudget::new(1, 0);
+        let assembly_admission = match budget.reserve().await.expect("reserve assembly") {
+            WebSocketAssemblyAdmissionOutcome::Admitted(admission) => admission,
+            WebSocketAssemblyAdmissionOutcome::QueueExhausted => {
+                panic!("fresh assembly budget must admit")
+            }
+        };
+        let payload = vec![b'x'; 64];
+        let frame_bytes = masked_frame(true, OPCODE_TEXT, &payload);
+        let mut frame = test_frame_header(true, OPCODE_TEXT, payload.len() as u64);
+        frame.raw_header = frame_bytes[..6].to_vec();
+        let (mut writer, _non_reading_upstream) = tokio::io::duplex(1);
+        let forwarding = tokio::spawn(async move {
+            let mut options = relay_options_with_budget(WebSocketAssemblyBudget::new(1, 0));
+            relay_text_payload(
+                &mut writer,
+                &frame,
+                payload,
+                assembly_admission,
+                None,
+                false,
+                false,
+                "gateway.example.test",
+                443,
+                &mut options,
+            )
+            .await
+        });
+        wait_for_stalled_task(&forwarding).await;
+        assert!(matches!(
+            budget.reserve().await.expect("attempt shed admission"),
+            WebSocketAssemblyAdmissionOutcome::QueueExhausted
+        ));
+
+        tokio::time::advance(TEXT_MESSAGE_FORWARD_TOTAL_TIMEOUT + StdDuration::from_millis(1))
+            .await;
+        let error = forwarding
+            .await
+            .expect("join forwarding")
+            .expect_err("non-reading upstream must time out");
+        assert_eq!(error.cause, WebSocketTerminationCause::PeerDisconnect);
+        assert!(
+            error
+                .error
+                .to_string()
+                .contains("upstream forwarding total timeout")
+        );
+        assert!(matches!(
+            budget
+                .reserve()
+                .await
+                .expect("reserve after forwarding timeout"),
+            WebSocketAssemblyAdmissionOutcome::Admitted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reload_after_frame_header_preserves_frame_boundary_before_close() {
+        let engine = Arc::new(
+            OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").expect("test policy"),
+        );
+        let generation_guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("generation guard");
+        let payload = b"complete-frame";
+        let (header, masked) = masked_frame_parts(OPCODE_TEXT, 0, payload);
+        let mut writer = ReloadAfterFirstWrite {
+            engine,
+            output: Vec::new(),
+            writes: 0,
+        };
+
+        let error = write_text_frame_guarded(
+            &mut writer,
+            &header,
+            &masked,
+            "gateway.example.test",
+            443,
+            "test-policy",
+            Some(&generation_guard),
+        )
+        .await
+        .expect_err("reload after header must close after completing the frame");
+        assert_eq!(error.cause, WebSocketTerminationCause::PolicyReload);
+
+        write_masked_close(&mut writer, &1012u16.to_be_bytes())
+            .await
+            .expect("write typed close");
+        let frame_len = header.len() + masked.len();
+        assert_eq!(&writer.output[..header.len()], header);
+        assert_eq!(&writer.output[header.len()..frame_len], masked);
+        let close = &writer.output[frame_len..];
+        assert_eq!(close[0] & 0x0f, OPCODE_CLOSE);
+        assert_eq!(
+            u16::from_be_bytes(
+                decode_masked_payload(close)[..2]
+                    .try_into()
+                    .expect("close code"),
+            ),
+            1012
+        );
     }
 
     async fn run_client_to_server_with_graphql_policy(
@@ -3659,11 +3827,115 @@ network_policies:
             "api.openai.com",
             443,
             "rest-api",
-            Ok(()),
+            Ok(crate::l7::provider::RelayOutcome::Reusable),
         )
         .await
         .expect_err("reload before upgrade must terminate");
         assert!(session.is_none());
+        assert!(matches!(
+            observed.recv().await,
+            Some(ObservedWebSocketRequest::SessionEnd(
+                openshell_core::proto::WebSocketSessionEndReason::PolicyReload
+            ))
+        ));
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware server")
+            .expect("middleware server");
+    }
+
+    #[tokio::test]
+    async fn reload_after_forwarded_upgrade_uses_typed_close_path() {
+        use openshell_supervisor_middleware::MiddlewareRegistry;
+
+        let (session, mut observed, shutdown_tx, server_task) =
+            recording_middleware_session("wss").await;
+        let engine =
+            OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").expect("test policy");
+        let generation_guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("generation guard");
+        engine
+            .replace_middleware_registry(MiddlewareRegistry::default())
+            .expect("invalidate generation");
+        let mut session = Some(session);
+        let upgrade_response = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let (mut client_app, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, mut upstream_app) = tokio::io::duplex(4096);
+        relay_client
+            .write_all(upgrade_response)
+            .await
+            .expect("forward upgrade response");
+
+        let outcome = crate::l7::relay::finalize_websocket_pre_upgrade(
+            &mut session,
+            &generation_guard,
+            "api.openai.com",
+            443,
+            "rest-api",
+            Ok(crate::l7::provider::RelayOutcome::Upgraded {
+                overflow: Vec::new(),
+                websocket_permessage_deflate: false,
+                websocket_subprotocol: None,
+            }),
+        )
+        .await
+        .expect("upgraded outcome must reach typed close path");
+        let crate::l7::provider::RelayOutcome::Upgraded {
+            overflow,
+            websocket_permessage_deflate,
+            websocket_subprotocol,
+        } = outcome
+        else {
+            panic!("expected upgraded outcome")
+        };
+
+        let error = crate::l7::relay::handle_upgrade(
+            &mut relay_client,
+            &mut relay_upstream,
+            overflow,
+            "api.openai.com",
+            443,
+            crate::l7::relay::UpgradeRelayOptions {
+                websocket_request: true,
+                websocket: crate::l7::relay::WebSocketUpgradeBehavior {
+                    permessage_deflate: websocket_permessage_deflate,
+                    ..Default::default()
+                },
+                assembly_budget: Some(WebSocketAssemblyBudget::default()),
+                generation_guard: Some(&generation_guard),
+                policy_name: "rest-api".into(),
+                middleware_session: session.take(),
+                selected_subprotocol: websocket_subprotocol,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("stale upgraded connection must close");
+        assert!(error.to_string().contains("policy generation is stale"));
+
+        let mut client_output = Vec::new();
+        client_app
+            .read_to_end(&mut client_output)
+            .await
+            .expect("read upgrade and close");
+        assert_eq!(&client_output[..upgrade_response.len()], upgrade_response);
+        assert_eq!(
+            &client_output[upgrade_response.len()..],
+            &[0x88, 0x02, 0x03, 0xf4]
+        );
+        let upstream_close = read_one_frame(&mut upstream_app).await;
+        assert_eq!(upstream_close[0] & 0x0f, OPCODE_CLOSE);
+        assert_eq!(
+            u16::from_be_bytes(
+                decode_masked_payload(&upstream_close)[..2]
+                    .try_into()
+                    .expect("upstream close code"),
+            ),
+            1012
+        );
         assert!(matches!(
             observed.recv().await,
             Some(ObservedWebSocketRequest::SessionEnd(

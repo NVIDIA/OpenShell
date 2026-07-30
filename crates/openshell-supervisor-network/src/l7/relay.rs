@@ -1362,15 +1362,16 @@ pub(crate) fn emit_policy_reload(
     );
 }
 
-pub(crate) async fn finalize_websocket_pre_upgrade<T>(
+pub(crate) async fn finalize_websocket_pre_upgrade(
     session: &mut Option<openshell_supervisor_middleware::WebSocketSession>,
     guard: &PolicyGenerationGuard,
     host: &str,
     port: u16,
     policy_name: &str,
-    result: Result<T>,
-) -> Result<T> {
+    result: Result<RelayOutcome>,
+) -> Result<RelayOutcome> {
     match result {
+        Ok(value @ RelayOutcome::Upgraded { .. }) => Ok(value),
         Ok(value) => {
             if let Err(error) = guard.ensure_current() {
                 emit_policy_reload(guard, host, port, policy_name);
