@@ -332,6 +332,26 @@ supervisor:
 The OpenShell CNI installer requires privileged node access so it can copy the
 plugin into the host CNI binary directory and patch the node CNI conflist.
 
+### OpenShift (Multus / OVN-Kubernetes)
+
+On OpenShift the default network is managed by the Cluster Network Operator and
+there is no CNI `.conflist` to append to. Use `cni.mode: multus-chain`, which
+injects the OpenShell plugin through the Multus `vendor-cni-chain` auxiliary chain
+without modifying any operator-managed file. The installer also needs the
+`privileged` SecurityContextConstraints.
+
+Install with the provided overlay:
+
+```shell
+helm install openshell deploy/helm/openshell \
+  -f deploy/helm/openshell/ci/values-cni-sidecar-openshift.yaml
+```
+
+This sets `cni.binDir: /var/lib/cni/bin`, `cni.chainDir:
+/run/multus/cni/net.d/vendor-cni-chain`, a persistent `cni.stateDir`, and
+`cni.openshift.privilegedSCC: true`. It requires a Multus thick daemon with
+`auxiliaryCNIChainName` configured (default on OpenShift 4.x).
+
 Leave `topology` unset, or set it to `combined`, to keep the original
 single-container supervisor path. For Helm installs, leave
 `supervisor.topology` unset or set it to `combined`.
