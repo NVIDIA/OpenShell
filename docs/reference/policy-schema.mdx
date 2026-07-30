@@ -52,7 +52,7 @@ Controls filesystem access inside the sandbox. Paths not listed in either `read_
 |---|---|---|---|
 | `include_workdir` | bool | No | When `true`, automatically adds the agent's working directory to `read_write`. |
 | `read_only` | list of strings | No | Paths the agent can read but not modify. Typically system directories like `/usr`, `/lib`, `/etc`. |
-| `read_write` | list of strings | No | Paths the agent can read and write. Typically `/sandbox` (working directory) and `/tmp`. |
+| `read_write` | list of strings | No | Paths the agent can read and write. Typically `/tmp`; set `include_workdir: true` to add the driver-resolved working directory. |
 
 **Validation constraints:**
 
@@ -76,7 +76,6 @@ filesystem_policy:
     - /dev/urandom
     - /etc
   read_write:
-    - /sandbox
     - /tmp
     - /dev/null
 ```

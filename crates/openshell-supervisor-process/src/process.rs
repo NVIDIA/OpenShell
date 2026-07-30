@@ -19,6 +19,8 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(any(test, unix))]
 use std::path::Path;
 use std::path::PathBuf;
@@ -76,6 +78,35 @@ impl ResolvedProcessIdentity {
     #[must_use]
     pub const fn uses_oci_user_fallback(self) -> bool {
         self.uid.is_some() || self.gid.is_some()
+    }
+}
+
+/// Resolved process workspace and its child-environment semantics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResolvedWorkspace {
+    root: Option<String>,
+    use_as_home: bool,
+}
+
+impl ResolvedWorkspace {
+    #[must_use]
+    pub fn new(root: Option<String>, use_as_home: bool) -> Self {
+        Self { root, use_as_home }
+    }
+
+    #[must_use]
+    pub fn root(&self) -> Option<&str> {
+        self.root.as_deref()
+    }
+
+    #[must_use]
+    pub fn owned_root(&self) -> Option<String> {
+        self.root.clone()
+    }
+
+    #[must_use]
+    pub fn home(&self) -> Option<&str> {
+        self.use_as_home.then(|| self.root()).flatten()
     }
 }
 
@@ -527,7 +558,7 @@ impl ProcessHandle {
     pub fn spawn(
         program: &str,
         args: &[String],
-        workdir: Option<&str>,
+        workspace: &ResolvedWorkspace,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -539,7 +570,7 @@ impl ProcessHandle {
         Self::spawn_impl(
             program,
             args,
-            workdir,
+            workspace,
             interactive,
             policy,
             resolved_identity,
@@ -560,7 +591,7 @@ impl ProcessHandle {
     pub fn spawn(
         program: &str,
         args: &[String],
-        workdir: Option<&str>,
+        workspace: &ResolvedWorkspace,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -571,7 +602,7 @@ impl ProcessHandle {
         Self::spawn_impl(
             program,
             args,
-            workdir,
+            workspace,
             interactive,
             policy,
             resolved_identity,
@@ -586,7 +617,7 @@ impl ProcessHandle {
     fn spawn_impl(
         program: &str,
         args: &[String],
-        workdir: Option<&str>,
+        workspace: &ResolvedWorkspace,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -611,8 +642,11 @@ impl ProcessHandle {
 
         inject_provider_env(&mut cmd, provider_env);
 
-        if let Some(dir) = workdir {
+        if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
+        }
+        if let Some(home) = workspace.home() {
+            cmd.env("HOME", home);
         }
 
         if matches!(policy.network.mode, NetworkMode::Proxy) {
@@ -651,7 +685,7 @@ impl ProcessHandle {
         // pre_exec context cannot reliably emit structured logs.
         #[cfg(target_os = "linux")]
         if enforcement_mode.enforces_child_sandbox() {
-            sandbox::linux::log_sandbox_readiness(policy, workdir);
+            sandbox::linux::log_sandbox_readiness(policy, workspace.root());
         }
 
         // Phase 1: Prepare Landlock ruleset by opening PathFds.
@@ -660,7 +694,7 @@ impl ProcessHandle {
         // runs as the sandbox UID, so inaccessible paths are unavailable to
         // the workload and best-effort compatibility skips them.
         #[cfg(target_os = "linux")]
-        let prepared_sandbox = prepare_child_sandbox(policy, workdir, enforcement_mode)
+        let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), enforcement_mode)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
         #[cfg(target_os = "linux")]
         let supervisor_identity_mount = if enforcement_mode.uses_privileged_process_setup() {
@@ -741,7 +775,7 @@ impl ProcessHandle {
     fn spawn_impl(
         program: &str,
         args: &[String],
-        workdir: Option<&str>,
+        workspace: &ResolvedWorkspace,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -763,8 +797,11 @@ impl ProcessHandle {
 
         inject_provider_env(&mut cmd, provider_env);
 
-        if let Some(dir) = workdir {
+        if let Some(dir) = workspace.root() {
             cmd.current_dir(dir);
+        }
+        if let Some(home) = workspace.home() {
+            cmd.env("HOME", home);
         }
 
         if matches!(policy.network.mode, NetworkMode::Proxy) {
@@ -796,7 +833,7 @@ impl ProcessHandle {
         #[cfg(unix)]
         {
             let policy = policy.clone();
-            let workdir = workdir.map(str::to_string);
+            let workdir = workspace.owned_root();
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
@@ -1253,6 +1290,303 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
 }
 
 #[cfg(unix)]
+fn prepare_oci_workspace(
+    root: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    supplementary_gids: &[Gid],
+) -> Result<()> {
+    prepare_oci_workspace_with(root, uid, gid, supplementary_gids, &nix::unistd::chown)
+}
+
+/// Validate that selecting an image-provided OCI workdir does not grant the
+/// sandbox identity any filesystem authority it lacked in the immutable image.
+///
+/// Every path component must be a real directory (never a symlink), every
+/// parent must already be traversable, and the final directory must already be
+/// writable and traversable. No ownership or mode bits are changed.
+#[cfg(unix)]
+pub fn validate_oci_workspace(
+    root: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    supplementary_gids: &[Gid],
+) -> Result<()> {
+    let components = validated_workspace_components(root, false)?;
+    let mut current = PathBuf::from("/");
+    validate_workspace_component(&current, uid, gid, supplementary_gids, false)?;
+    let last_component = components.len().saturating_sub(1);
+    for (index, component) in components.into_iter().enumerate() {
+        current.push(component);
+        validate_workspace_component(
+            &current,
+            uid,
+            gid,
+            supplementary_gids,
+            index == last_component,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_workspace_component(
+    path: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    supplementary_gids: &[Gid],
+    is_workspace: bool,
+) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            miette::miette!(
+                "image workspace path component '{}' does not exist",
+                path.display()
+            )
+        } else {
+            miette::miette!(
+                "failed to inspect image workspace path component '{}': {error}",
+                path.display()
+            )
+        }
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(miette::miette!(
+            "workspace path component '{}' is a symlink — refusing to follow it",
+            path.display()
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(miette::miette!(
+            "workspace path component '{}' is not a directory",
+            path.display()
+        ));
+    }
+    reject_special_workspace_filesystem(path)?;
+
+    let required = if is_workspace { 0o3 } else { 0o1 };
+    if !identity_has_permissions(&metadata, uid, gid, supplementary_gids, required) {
+        let requirement = if is_workspace {
+            "writable and traversable"
+        } else {
+            "traversable"
+        };
+        return Err(miette::miette!(
+            "workspace path component '{}' is not {requirement} by the sandbox identity in the image",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reject_special_workspace_filesystem(path: &Path) -> Result<()> {
+    // Linux filesystem magic values for virtual/kernel-managed filesystems.
+    // The decision is based on the mounted filesystem, not its conventional
+    // distro path, so renamed or unusually mounted control filesystems remain
+    // protected without rejecting ordinary application directories.
+    let fs = rustix::fs::statfs(path).into_diagnostic()?;
+    #[allow(clippy::cast_sign_loss)]
+    let filesystem_type = fs.f_type as u64;
+    reject_special_workspace_filesystem_type(path, filesystem_type)
+}
+
+#[cfg(target_os = "linux")]
+fn reject_special_workspace_filesystem_type(path: &Path, filesystem_type: u64) -> Result<()> {
+    const SPECIAL_FILESYSTEMS: &[u64] = &[
+        0x0000_1cd1, // devpts
+        0x0000_9fa0, // proc
+        0x0102_1994, // tmpfs (including the container /dev tree)
+        0x1980_0202, // mqueue
+        0x0027_e0eb, // cgroup
+        0x4249_4e4d, // bpf
+        0x6265_6572, // sysfs
+        0x6367_7270, // cgroup2
+        0x6462_6720, // debugfs
+        0x7363_6673, // securityfs
+        0x7472_6163, // tracefs
+    ];
+    if SPECIAL_FILESYSTEMS.contains(&filesystem_type) {
+        return Err(miette::miette!(
+            "workspace path component '{}' is on a kernel-managed filesystem (type {filesystem_type:#x})",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+fn reject_special_workspace_filesystem(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Prepare only the resolved `OpenShell` workspace directory itself.
+///
+/// Image-provided children retain their declared ownership. This avoids
+/// crossing symlinks or user-provided nested mounts.
+#[cfg(unix)]
+fn prepare_oci_workspace_with(
+    root: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    supplementary_gids: &[Gid],
+    do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
+) -> Result<()> {
+    let components = validated_workspace_components(root, true)?;
+
+    let last_component = components.len().saturating_sub(1);
+    let mut current = PathBuf::from("/");
+    for (index, component) in components.into_iter().enumerate() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(miette::miette!(
+                    "workspace path component '{}' is a symlink — refusing to follow it",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(miette::miette!(
+                    "workspace path component '{}' is not a directory",
+                    current.display()
+                ));
+            }
+            Ok(metadata) => {
+                if index != last_component
+                    && !identity_can_traverse(&metadata, uid, gid, supplementary_gids)
+                {
+                    return Err(miette::miette!(
+                        "workspace parent '{}' is not traversable by the sandbox identity",
+                        current.display()
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).into_diagnostic()?;
+                std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755))
+                    .into_diagnostic()?;
+            }
+            Err(error) => return Err(error).into_diagnostic(),
+        }
+    }
+
+    do_chown(root, uid, gid).into_diagnostic()?;
+
+    let metadata = std::fs::symlink_metadata(root).into_diagnostic()?;
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o300 != 0o300 {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode | 0o300))
+            .into_diagnostic()?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validated_workspace_components(
+    root: &Path,
+    allow_managed_fallback: bool,
+) -> Result<Vec<std::ffi::OsString>> {
+    let root_str = root
+        .to_str()
+        .ok_or_else(|| miette::miette!("workspace path must be valid UTF-8"))?;
+    let validated_root = openshell_core::driver_mounts::resolve_oci_workspace_root(root_str)
+        .map_err(|error| miette::miette!(error))?;
+    if Path::new(&validated_root) != root
+        || (!allow_managed_fallback
+            && validated_root == openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT)
+    {
+        return Err(miette::miette!(
+            "workspace path '{}' must be a normalized absolute {}path",
+            root.display(),
+            if allow_managed_fallback {
+                "non-root "
+            } else {
+                "non-fallback "
+            }
+        ));
+    }
+
+    root.components()
+        .skip(1)
+        .map(|component| match component {
+            std::path::Component::Normal(component) => Ok(component.to_os_string()),
+            _ => Err(miette::miette!(
+                "workspace path '{}' must be normalized",
+                root.display()
+            )),
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn identity_can_traverse(
+    metadata: &std::fs::Metadata,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    supplementary_gids: &[Gid],
+) -> bool {
+    identity_has_permissions(metadata, uid, gid, supplementary_gids, 0o1)
+}
+
+#[cfg(unix)]
+fn identity_has_permissions(
+    metadata: &std::fs::Metadata,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    supplementary_gids: &[Gid],
+    required: u32,
+) -> bool {
+    let user_id = uid.unwrap_or_else(nix::unistd::geteuid).as_raw();
+    if user_id == 0 {
+        return true;
+    }
+
+    let group_id = gid.unwrap_or_else(nix::unistd::getegid).as_raw();
+    let mode = metadata.permissions().mode();
+    if metadata.uid() == user_id {
+        mode & (required << 6) == required << 6
+    } else if metadata.gid() == group_id
+        || supplementary_gids
+            .iter()
+            .any(|supplementary_gid| supplementary_gid.as_raw() == metadata.gid())
+    {
+        mode & (required << 3) == required << 3
+    } else {
+        mode & required == required
+    }
+}
+
+#[cfg(not(any(
+    target_os = "aix",
+    target_os = "haiku",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "redox",
+    target_os = "solaris"
+)))]
+fn named_user_supplementary_groups(user_name: &str, primary_gid: Gid) -> Result<Vec<Gid>> {
+    let user_name = CString::new(user_name).map_err(|_| miette::miette!("Invalid user name"))?;
+    nix::unistd::getgrouplist(user_name.as_c_str(), primary_gid).into_diagnostic()
+}
+
+#[cfg(any(
+    target_os = "aix",
+    target_os = "haiku",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "redox",
+    target_os = "solaris"
+))]
+#[allow(clippy::unnecessary_wraps)]
+fn named_user_supplementary_groups(_user_name: &str, _primary_gid: Gid) -> Result<Vec<Gid>> {
+    // Privilege dropping does not call initgroups on these targets.
+    Ok(Vec::new())
+}
+
+#[cfg(unix)]
 fn chown_children(
     dir: &Path,
     uid: Option<Uid>,
@@ -1315,32 +1649,97 @@ fn chown_recursive(
 /// UIDs/GIDs (passed directly to `chown` without a passwd lookup).
 #[cfg(unix)]
 pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
-    prepare_filesystem_with_identity(policy, ResolvedProcessIdentity::default())
+    prepare_filesystem_with_identity(policy, ResolvedProcessIdentity::default(), None, false)
 }
 
 #[cfg(unix)]
 pub fn prepare_filesystem_with_identity(
     policy: &SandboxPolicy,
     resolved_identity: ResolvedProcessIdentity,
+    workdir: Option<&str>,
+    prepare_workspace: bool,
 ) -> Result<()> {
     use nix::unistd::chown;
-    use nix::unistd::{Gid, Uid};
-
-    let user_name = match policy.process.run_as_user.as_deref() {
-        Some(name) if !name.is_empty() => Some(name),
-        _ => None,
-    };
-    let group_name = match policy.process.run_as_group.as_deref() {
-        Some(name) if !name.is_empty() => Some(name),
-        _ => None,
-    };
 
     // If no user/group configured, nothing to do
-    if user_name.is_none() && group_name.is_none() {
+    if policy
+        .process
+        .run_as_user
+        .as_deref()
+        .is_none_or(str::is_empty)
+        && policy
+            .process
+            .run_as_group
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
         return Ok(());
     }
 
-    // Resolve UID: numeric values are passed directly; names resolve via passwd.
+    let (uid, gid, supplementary_gids) = resolve_filesystem_identity(policy, resolved_identity)?;
+
+    // Docker owns workspace resolution and must make the selected root usable
+    // by the final effective identity, including when both policy identity
+    // fields were explicit. Validate it before processing any user-authored
+    // read-write paths so an unsafe image path fails first. Other drivers
+    // retain their preparation.
+    if prepare_workspace {
+        let workspace = workdir.ok_or_else(|| {
+            miette::miette!("local container driver did not supply a workspace workdir")
+        })?;
+        let workspace = Path::new(workspace);
+        if workspace == Path::new(openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT) {
+            info!(path = %workspace.display(), ?uid, ?gid, "Preparing managed workspace");
+            prepare_oci_workspace(workspace, uid, gid, &supplementary_gids)?;
+        } else {
+            info!(path = %workspace.display(), ?uid, ?gid, "Validating image workspace authority");
+            validate_oci_workspace(workspace, uid, gid, &supplementary_gids)?;
+        }
+    }
+
+    // Create missing read_write paths and only chown the ones we created.
+    for path in &policy.filesystem.read_write {
+        if prepare_read_write_path(path)? {
+            debug!(
+                path = %path.display(),
+                ?uid,
+                ?gid,
+                "Setting ownership on newly created read_write path"
+            );
+            chown(path, uid, gid).into_diagnostic()?;
+        }
+    }
+
+    // Retain the existing Kubernetes/OpenShift behavior for driver-injected
+    // numeric identities. Docker clears this variable and does not receive
+    // identity-specific workspace preparation.
+    if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok_and(|uid| !uid.is_empty()) {
+        let sandbox_home = Path::new("/sandbox");
+        if sandbox_home.exists() {
+            info!(?uid, ?gid, "Chowning /sandbox for driver-injected UID/GID");
+            chown_sandbox_home(sandbox_home, uid, gid)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn resolve_filesystem_identity(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+) -> Result<(Option<Uid>, Option<Gid>, Vec<Gid>)> {
+    let user_name = policy
+        .process
+        .run_as_user
+        .as_deref()
+        .filter(|name| !name.is_empty());
+    let group_name = policy
+        .process
+        .run_as_group
+        .as_deref()
+        .filter(|name| !name.is_empty());
+
     let uid = match resolved_identity.uid() {
         Some(uid) => Some(Uid::from_raw(uid)),
         None => match user_name {
@@ -1364,31 +1763,31 @@ pub fn prepare_filesystem_with_identity(
         },
     };
 
-    // Create missing read_write paths and only chown the ones we created.
-    for path in &policy.filesystem.read_write {
-        if prepare_read_write_path(path)? {
-            debug!(
-                path = %path.display(),
-                ?uid,
-                ?gid,
-                "Setting ownership on newly created read_write path"
-            );
-            chown(path, uid, gid).into_diagnostic()?;
+    let supplementary_gids = match user_name {
+        Some(name) if name.parse::<u32>().is_err() => {
+            let primary_gid = if let Some(gid) = gid {
+                gid
+            } else {
+                let uid =
+                    uid.ok_or_else(|| miette::miette!("Failed to resolve sandbox user '{name}'"))?;
+                User::from_uid(uid)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("Failed to resolve user from UID {uid}"))?
+                    .gid
+            };
+            if resolved_identity.uid().is_some() {
+                crate::identity::resolve_oci_supplementary_gids(name, primary_gid.as_raw())?
+                    .into_iter()
+                    .map(Gid::from_raw)
+                    .collect()
+            } else {
+                named_user_supplementary_groups(name, primary_gid)?
+            }
         }
-    }
+        _ => Vec::new(),
+    };
 
-    // Retain the existing Kubernetes/OpenShift behavior for driver-injected
-    // numeric identities. Docker and Podman clear this variable and do not
-    // receive identity-specific workspace preparation.
-    if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok_and(|uid| !uid.is_empty()) {
-        let sandbox_home = Path::new("/sandbox");
-        if sandbox_home.exists() {
-            info!(?uid, ?gid, "Chowning /sandbox for driver-injected UID/GID");
-            chown_sandbox_home(sandbox_home, uid, gid)?;
-        }
-    }
-
-    Ok(())
+    Ok((uid, gid, supplementary_gids))
 }
 
 #[cfg(not(unix))]
@@ -1402,19 +1801,6 @@ pub fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
 #[allow(clippy::similar_names)]
 pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
     drop_privileges_with_identity(policy, ResolvedProcessIdentity::default())
-}
-
-#[cfg(unix)]
-fn should_clear_supplementary_groups(
-    current_uid: Uid,
-    target_uid: Uid,
-    user_name: Option<&str>,
-    resolved_identity: ResolvedProcessIdentity,
-) -> bool {
-    resolved_identity.uses_oci_user_fallback()
-        && target_uid != current_uid
-        && !(user_name.is_some_and(|name| name.parse::<u32>().is_err())
-            && resolved_identity.uid().is_none())
 }
 
 #[cfg(unix)]
@@ -1512,23 +1898,21 @@ pub fn drop_privileges_with_identity(
         };
 
     if target_uid != nix::unistd::geteuid() {
-        if should_clear_supplementary_groups(
-            nix::unistd::geteuid(),
-            target_uid,
-            user_name,
-            resolved_identity,
-        ) {
-            // OCI-derived users do not have a trustworthy NSS
-            // supplementary-group source. Clear the root supervisor's
-            // inherited groups before changing UID/GID. Platform-resolved and
-            // explicit numeric identities retain their pre-OCI behavior.
+        if resolved_identity.uses_oci_user_fallback() {
+            // OCI named users use the bounded /etc/group parser shared with
+            // workspace validation. Numeric OCI users resolve to an empty
+            // list. Never retain the root supervisor's inherited groups.
             #[cfg(not(any(
                 target_os = "macos",
                 target_os = "ios",
                 target_os = "haiku",
                 target_os = "redox"
             )))]
-            nix::unistd::setgroups(&[]).into_diagnostic()?;
+            {
+                let (_, _, supplementary_gids) =
+                    resolve_filesystem_identity(policy, resolved_identity)?;
+                nix::unistd::setgroups(&supplementary_gids).into_diagnostic()?;
+            }
         } else if let Some(ref user_name) = initgroups_name {
             let user_cstr = CString::new(user_name.as_str())
                 .map_err(|_| miette::miette!("Invalid user name"))?;
@@ -1753,43 +2137,6 @@ mod tests {
 
         assert!(validate_sandbox_user_with_identity(&policy, resolved).is_err());
         assert!(validate_sandbox_group_with_identity(&policy, resolved).is_ok());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn only_oci_numeric_user_paths_clear_supplementary_groups_before_uid_drop() {
-        let current_uid = Uid::from_raw(0);
-        let target_uid = Uid::from_raw(1234);
-
-        assert!(!should_clear_supplementary_groups(
-            current_uid,
-            target_uid,
-            Some("1234"),
-            ResolvedProcessIdentity::default(),
-        ));
-        assert!(should_clear_supplementary_groups(
-            current_uid,
-            target_uid,
-            Some("1234"),
-            ResolvedProcessIdentity::new(None, Some(1235)),
-        ));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn supplementary_group_clearing_preserves_explicit_named_user_behavior() {
-        assert!(!should_clear_supplementary_groups(
-            Uid::from_raw(0),
-            Uid::from_raw(1234),
-            Some("app"),
-            ResolvedProcessIdentity::default(),
-        ));
-        assert!(!should_clear_supplementary_groups(
-            Uid::from_raw(1234),
-            Uid::from_raw(1234),
-            Some("1234"),
-            ResolvedProcessIdentity::new(None, Some(1235)),
-        ));
     }
 
     #[test]
@@ -2435,6 +2782,418 @@ mod tests {
             &fake_chown,
         );
         assert!(result.is_err(), "non-EROFS errors should propagate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_chowns_only_root() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        let child = root.join("image-content.txt");
+        std::fs::write(&child, "image-owned").unwrap();
+
+        let chowned = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&chowned);
+        let fake_chown =
+            move |path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+                observed.lock().unwrap().push(path.to_path_buf());
+                Ok(())
+            };
+
+        prepare_oci_workspace_with(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &[],
+            &fake_chown,
+        )
+        .expect("workspace root should be prepared");
+
+        assert_eq!(*chowned.lock().unwrap(), vec![root]);
+        assert!(child.exists(), "image-provided child should be untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_oci_workspace_accepts_existing_owner_writable_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        validate_oci_workspace(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &[],
+        )
+        .expect("image owner already has write and traverse authority");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_oci_workspace_accepts_supplementary_group_write_authority() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+        let root = dir.path().canonicalize().unwrap().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o070)).unwrap();
+        let metadata = std::fs::symlink_metadata(&root).unwrap();
+
+        validate_oci_workspace(
+            &root,
+            Some(Uid::from_raw(metadata.uid().wrapping_add(1))),
+            Some(Gid::from_raw(metadata.gid().wrapping_add(1))),
+            &[Gid::from_raw(metadata.gid())],
+        )
+        .expect("supplementary group already has write and traverse authority");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_oci_workspace_rejects_unwritable_directory() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+        let root = dir.path().canonicalize().unwrap().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = std::fs::symlink_metadata(&root).unwrap();
+
+        let error = validate_oci_workspace(
+            &root,
+            Some(Uid::from_raw(metadata.uid().wrapping_add(1))),
+            Some(Gid::from_raw(metadata.gid().wrapping_add(1))),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not writable and traversable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_oci_workspace_rejects_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("missing");
+
+        let error = validate_oci_workspace(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not exist"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_oci_workspace_rejects_restrictive_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap().join("private");
+        let root = parent.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let metadata = std::fs::symlink_metadata(&parent).unwrap();
+
+        let error = validate_oci_workspace(
+            &root,
+            Some(Uid::from_raw(metadata.uid().wrapping_add(1))),
+            Some(Gid::from_raw(metadata.gid().wrapping_add(1))),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not traversable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_oci_workspace_rejects_symlink_component() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let target = base.join("target");
+        let link = base.join("link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = validate_oci_workspace(
+            &link,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_oci_workspace_rejects_kernel_filesystem_by_metadata() {
+        let error = validate_oci_workspace(
+            Path::new("/proc"),
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("kernel-managed filesystem"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_makes_existing_root_owner_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        prepare_oci_workspace_with(&root, None, None, &[], &|_, _, _| Ok(()))
+            .expect("read-only workspace root should be prepared");
+
+        let mode = std::fs::symlink_metadata(&root)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_rejects_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let target = base.join("real");
+        let link = base.join("link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let err = prepare_oci_workspace(
+            &link,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_rejects_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let target = base.join("real");
+        let parent_link = base.join("parent-link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &parent_link).unwrap();
+
+        let err = prepare_oci_workspace(
+            &parent_link.join("workspace"),
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected parent symlink rejection: {err}"
+        );
+        assert!(
+            !target.join("workspace").exists(),
+            "workspace must not be created through a symlink parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_rejects_parent_traversal() {
+        let err = prepare_oci_workspace(
+            Path::new("/tmp/workspace/../escape"),
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must be normalized"),
+            "expected traversal rejection: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_rejects_inaccessible_existing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap().join("workspace");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = std::fs::symlink_metadata(&parent).unwrap();
+        let different_user = Uid::from_raw(metadata.uid().wrapping_add(1));
+        let different_group = Gid::from_raw(metadata.gid().wrapping_add(1));
+        let root = parent.join("project");
+
+        let error = prepare_oci_workspace_with(
+            &root,
+            Some(different_user),
+            Some(different_group),
+            &[],
+            &|_, _, _| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("is not traversable"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !root.exists(),
+            "workspace must not be created below an inaccessible parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_accepts_supplementary_group_parent() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o710)).unwrap();
+        let parent = dir.path().canonicalize().unwrap().join("workspace");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o710)).unwrap();
+        let metadata = std::fs::symlink_metadata(&parent).unwrap();
+        let different_user = Uid::from_raw(metadata.uid().wrapping_add(1));
+        let different_group = Gid::from_raw(metadata.gid().wrapping_add(1));
+        let supplementary_group = Gid::from_raw(metadata.gid());
+        let root = parent.join("project");
+
+        prepare_oci_workspace_with(
+            &root,
+            Some(different_user),
+            Some(different_group),
+            &[supplementary_group],
+            &|_, _, _| Ok(()),
+        )
+        .expect("supplementary group execute permission should allow traversal");
+
+        assert!(root.is_dir());
+    }
+
+    #[cfg(not(any(
+        target_os = "aix",
+        target_os = "haiku",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "redox",
+        target_os = "solaris"
+    )))]
+    #[test]
+    fn named_user_supplementary_groups_include_primary_group() {
+        let user = User::from_uid(nix::unistd::geteuid())
+            .expect("resolve current UID")
+            .expect("current user exists");
+
+        let groups = named_user_supplementary_groups(&user.name, user.gid)
+            .expect("resolve named-user supplementary groups");
+
+        assert!(groups.contains(&user.gid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_rejects_non_directory_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("sandbox");
+        std::fs::write(&root, "not a directory").unwrap();
+
+        let error = prepare_oci_workspace(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("is not a directory"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_propagates_root_chown_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        let fake_chown = |_path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+            Err(nix::errno::Errno::EROFS)
+        };
+
+        let error = prepare_oci_workspace_with(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &[],
+            &fake_chown,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Read-only file system"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_creates_missing_root() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("missing")
+            .join("sandbox");
+        let chowned = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&chowned);
+        let fake_chown =
+            move |path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+                observed.lock().unwrap().push(path.to_path_buf());
+                Ok(())
+            };
+
+        prepare_oci_workspace_with(
+            &missing,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &[],
+            &fake_chown,
+        )
+        .expect("missing OCI workspace should be created");
+
+        assert!(missing.is_dir());
+        assert_eq!(
+            std::fs::symlink_metadata(missing.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(*chowned.lock().unwrap(), vec![missing]);
     }
 
     #[cfg(unix)]

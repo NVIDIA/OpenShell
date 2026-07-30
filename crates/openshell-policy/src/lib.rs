@@ -1070,7 +1070,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
                 "/etc".into(),
                 "/var/log".into(),
             ],
-            read_write: vec!["/sandbox".into(), "/tmp".into(), "/dev/null".into()],
+            read_write: vec!["/tmp".into(), "/dev/null".into()],
         }),
         landlock: Some(LandlockPolicy {
             compatibility: "best_effort".into(),
@@ -1650,8 +1650,8 @@ network_policies:
             "read_only should contain /usr"
         );
         assert!(
-            fs.read_write.iter().any(|p| p == "/sandbox"),
-            "read_write should contain /sandbox"
+            !fs.read_write.iter().any(|p| p == "/sandbox"),
+            "the workspace should be granted through include_workdir, not a literal /sandbox path"
         );
         assert!(
             fs.read_write.iter().any(|p| p == "/tmp"),

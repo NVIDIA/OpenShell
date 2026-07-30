@@ -332,6 +332,68 @@ fn find_group_by_name(path: &Path, name: &str) -> Result<Option<GroupEntry>> {
     })
 }
 
+/// Resolve supplementary groups declared for an OCI named user without
+/// consulting NSS. Numeric OCI users have no trustworthy group-membership
+/// name and therefore receive no supplementary groups.
+pub fn resolve_oci_supplementary_gids(declaration: &str, primary_gid: u32) -> Result<Vec<u32>> {
+    resolve_oci_supplementary_gids_at(declaration, primary_gid, Path::new(GROUP_PATH))
+}
+
+fn resolve_oci_supplementary_gids_at(
+    declaration: &str,
+    primary_gid: u32,
+    group_path: &Path,
+) -> Result<Vec<u32>> {
+    let (user, _) = split_oci_declaration(declaration);
+    validate_component(user, "OCI user")?;
+    if user.parse::<u32>().is_ok() {
+        return Ok(Vec::new());
+    }
+
+    let content = read_account_file(group_path)?;
+    let mut gids = vec![primary_gid];
+    for line in content.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.len() > MAX_ACCOUNT_LINE_SIZE {
+            return Err(miette::miette!(
+                "account file '{}' contains an oversized line",
+                group_path.display()
+            ));
+        }
+        let fields = line.split(':').collect::<Vec<_>>();
+        if fields.len() != 4
+            || fields
+                .iter()
+                .any(|field| field.len() > MAX_ACCOUNT_FIELD_SIZE)
+        {
+            return Err(miette::miette!(
+                "group membership entry in '{}' is malformed",
+                group_path.display()
+            ));
+        }
+        if !fields[3].split(',').any(|member| member == user) {
+            continue;
+        }
+        let gid = fields[2].parse::<u32>().map_err(|_| {
+            miette::miette!(
+                "group membership GID in '{}' is malformed",
+                group_path.display()
+            )
+        })?;
+        if gid == 0 {
+            return Err(miette::miette!(
+                "OCI user '{user}' is a member of prohibited GID 0"
+            ));
+        }
+        gids.push(gid);
+    }
+    gids.sort_unstable();
+    gids.dedup();
+    Ok(gids)
+}
+
 fn find_unique<T>(
     path: &Path,
     mut select: impl FnMut(&[&str]) -> Option<Result<T>>,
@@ -663,6 +725,35 @@ mod tests {
             resolved,
             ResolvedProcessIdentity::new(Some(1234), Some(4321))
         );
+    }
+
+    #[test]
+    fn named_oci_user_resolves_bounded_supplementary_groups() {
+        let (_dir, _passwd, group) = account_files(
+            "",
+            "primary:x:1235:\nvideo:x:44:app,other\naudio:x:63:other\nrender:x:107:app\n",
+        );
+
+        let gids = resolve_oci_supplementary_gids_at("app:primary", 1235, &group).unwrap();
+        assert_eq!(gids, vec![44, 107, 1235]);
+    }
+
+    #[test]
+    fn numeric_oci_user_has_no_named_supplementary_groups() {
+        let dir = tempdir().unwrap();
+        let missing_group = dir.path().join("missing-group");
+
+        let gids = resolve_oci_supplementary_gids_at("1234:1235", 1235, &missing_group).unwrap();
+        assert!(gids.is_empty());
+    }
+
+    #[test]
+    fn oci_supplementary_membership_rejects_root_group() {
+        let (_dir, _passwd, group) = account_files("", "root:x:0:app\n");
+
+        let error =
+            resolve_oci_supplementary_gids_at("app", 1235, &group).expect_err("GID 0 must fail");
+        assert!(error.to_string().contains("prohibited GID 0"));
     }
 
     #[test]

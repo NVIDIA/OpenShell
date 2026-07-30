@@ -5,6 +5,11 @@
 
 use std::path::Path;
 
+use crate::driver_utils::{
+    SANDBOX_TOKEN_MOUNT_PATH, SUPERVISOR_CONTAINER_DIR, TLS_CA_MOUNT_PATH, TLS_CERT_MOUNT_PATH,
+    TLS_KEY_MOUNT_PATH, UPSTREAM_PROXY_AUTH_MOUNT_PATH,
+};
+
 /// `SELinux` relabelling mode for bind mounts.
 ///
 /// On hosts with `SELinux` enabled (e.g. Fedora, RHEL) a bind-mounted path
@@ -25,12 +30,27 @@ pub enum SelinuxLabel {
     Private,
 }
 
-const RESERVED_MOUNT_TARGETS: &[&str] = &[
-    "/opt/openshell",
-    "/etc/openshell",
-    "/etc/openshell-tls",
+/// Paths mounted or created by the local container supervisor.
+///
+/// Keep this list tied to concrete `OpenShell` control resources. Workspace
+/// safety itself is enforced from the image's ownership and mode metadata,
+/// not by guessing which distro paths are sensitive.
+const OPENSHELL_CONTROL_PATHS: &[&str] = &[
+    SUPERVISOR_CONTAINER_DIR,
+    TLS_CA_MOUNT_PATH,
+    TLS_CERT_MOUNT_PATH,
+    TLS_KEY_MOUNT_PATH,
+    SANDBOX_TOKEN_MOUNT_PATH,
+    UPSTREAM_PROXY_AUTH_MOUNT_PATH,
+    // Kubernetes mounts the sandbox client certificate secret here.
+    "/etc/openshell-tls/client",
+    "/etc/openshell-tls/proxy",
     "/run/netns",
 ];
+
+/// Compatibility workspace used when an OCI image has no usable working
+/// directory and by drivers whose workspace remains fixed.
+pub const DEFAULT_WORKSPACE_ROOT: &str = "/sandbox";
 
 /// Validate a non-empty driver mount source.
 pub fn validate_mount_source(source: &str, field: &str) -> Result<(), String> {
@@ -78,51 +98,99 @@ pub fn validate_mount_subpath(subpath: &str) -> Result<(), String> {
 }
 
 /// Validate a container-side mount target for user-supplied driver mounts.
+///
+/// Workspace collisions depend on the inspected image's resolved working
+/// directory and are checked separately by `validate_workspace_mount_target`.
 pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
-    if target.is_empty() {
-        return Err("mount target must not be empty".to_string());
-    }
-    if target != target.trim() {
-        return Err("mount target must not contain surrounding whitespace".to_string());
-    }
-    if target.as_bytes().contains(&0) {
-        return Err("mount target must not contain NUL bytes".to_string());
-    }
-    if !target.starts_with('/') {
-        return Err("mount target must be an absolute container path".to_string());
-    }
-    if target != "/" {
-        let segments = target.split('/').skip(1).collect::<Vec<_>>();
-        let has_internal_empty_segment = segments
-            .iter()
-            .take(segments.len().saturating_sub(1))
-            .any(|segment| segment.is_empty());
-        if has_internal_empty_segment || segments.contains(&".") {
-            return Err(
-                "mount target must be normalized and must not contain empty path segments or '.'"
-                    .to_string(),
-            );
-        }
-    }
-    let path = Path::new(target);
-    if path == Path::new("/") {
-        return Err("mount target must not be the container root".to_string());
-    }
-    if path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err("mount target must not contain '..'".to_string());
-    }
-    if path == Path::new("/sandbox") {
-        return Err("mount target '/sandbox' is reserved for the OpenShell workspace".to_string());
-    }
-    for reserved in RESERVED_MOUNT_TARGETS {
-        if path_is_or_under(path, Path::new(reserved)) {
+    let normalized = normalize_absolute_container_path(target, "mount target")?;
+    let path = Path::new(&normalized);
+    for reserved in OPENSHELL_CONTROL_PATHS {
+        let reserved = Path::new(reserved);
+        if paths_overlap(path, reserved) {
             return Err(format!(
-                "mount target '{target}' conflicts with reserved OpenShell path '{reserved}'"
+                "mount target '{target}' conflicts with reserved OpenShell path '{}'",
+                reserved.display()
             ));
         }
+    }
+    Ok(())
+}
+
+/// Resolve an OCI image working directory to the internal workspace root used
+/// by local container drivers.
+///
+/// Empty declarations and `/` use the compatibility fallback. Non-empty
+/// declarations must already be normalized absolute paths so the inspected
+/// value and the path passed to the supervisor cannot be interpreted
+/// differently.
+pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
+    if working_dir.is_empty() || working_dir == "/" {
+        return Ok(DEFAULT_WORKSPACE_ROOT.to_string());
+    }
+    let workspace_root = normalize_absolute_container_path(working_dir, "OCI WorkingDir")?;
+    for control_path in OPENSHELL_CONTROL_PATHS {
+        validate_workspace_control_path(&workspace_root, control_path)?;
+    }
+
+    Ok(workspace_root)
+}
+
+fn normalize_absolute_container_path(value: &str, field: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if value != value.trim() {
+        return Err(format!("{field} must not contain surrounding whitespace"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    if !value.starts_with('/') {
+        return Err(format!("{field} must be an absolute container path"));
+    }
+
+    let segments = value.split('/').skip(1).collect::<Vec<_>>();
+    let has_internal_empty_segment = segments
+        .iter()
+        .take(segments.len().saturating_sub(1))
+        .any(|segment| segment.is_empty());
+    if has_internal_empty_segment || segments.contains(&".") || segments.contains(&"..") {
+        return Err(format!(
+            "{field} must be normalized without empty, '.', or '..' path segments"
+        ));
+    }
+
+    let normalized = value.trim_end_matches('/');
+    if normalized.is_empty() {
+        return Err(format!("{field} must not be the container root"));
+    }
+    Ok(normalized.to_string())
+}
+
+/// Reject a workspace that contains or is contained by an `OpenShell` control
+/// path. Drivers use this for runtime-configured paths such as the SSH socket.
+pub fn validate_workspace_control_path(
+    workspace_root: &str,
+    control_path: &str,
+) -> Result<(), String> {
+    let workspace = Path::new(workspace_root);
+    let control = Path::new(control_path);
+    if paths_overlap(workspace, control) {
+        return Err(format!(
+            "OCI WorkingDir '{workspace_root}' conflicts with OpenShell control path '{control_path}'"
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a user-supplied mount that would replace or contain the resolved
+/// workspace root. Mounts below the workspace remain valid.
+pub fn validate_workspace_mount_target(target: &str, workspace_root: &str) -> Result<(), String> {
+    let normalized_target = normalize_mount_target(target);
+    if path_is_or_under(Path::new(workspace_root), Path::new(&normalized_target)) {
+        return Err(format!(
+            "mount target '{target}' is reserved for the OpenShell workspace"
+        ));
     }
     Ok(())
 }
@@ -140,6 +208,10 @@ pub fn path_is_or_under(path: &Path, parent: &Path) -> bool {
     path == parent || path.starts_with(parent)
 }
 
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    path_is_or_under(left, right) || path_is_or_under(right, left)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,17 +223,91 @@ mod tests {
     }
 
     #[test]
-    fn container_target_rejects_workspace_root_only() {
-        let err = validate_container_mount_target("/sandbox/").unwrap_err();
+    fn container_target_workspace_reservation_is_dynamic() {
+        validate_container_mount_target("/sandbox/").unwrap();
+        validate_workspace_mount_target("/sandbox/", "/sandbox").unwrap_err();
+        validate_workspace_mount_target("/workspace/", "/sandbox").unwrap();
+        validate_workspace_mount_target("/workspace/cache", "/workspace").unwrap();
+        validate_workspace_mount_target("/workspace", "/workspace/project").unwrap_err();
+        validate_workspace_mount_target("/workspace-other", "/workspace/project").unwrap();
+    }
 
-        assert!(err.contains("reserved for the OpenShell workspace"));
+    #[test]
+    fn oci_workspace_root_uses_fallback_and_accepts_normalized_absolute_paths() {
+        assert_eq!(resolve_oci_workspace_root("").unwrap(), "/sandbox");
+        assert_eq!(resolve_oci_workspace_root("/").unwrap(), "/sandbox");
+        assert_eq!(
+            resolve_oci_workspace_root("/workspace/project/").unwrap(),
+            "/workspace/project"
+        );
+        assert_eq!(
+            resolve_oci_workspace_root("/workspace with spaces").unwrap(),
+            "/workspace with spaces"
+        );
+    }
+
+    #[test]
+    fn oci_workspace_root_rejects_relative_and_malformed_paths() {
+        for invalid in [
+            "workspace",
+            "./workspace",
+            "/workspace/../etc",
+            "/workspace/./project",
+            "/workspace//project",
+            "/workspace\0project",
+            "/workspace ",
+            "/workspace\nproject",
+        ] {
+            assert!(
+                resolve_oci_workspace_root(invalid).is_err(),
+                "expected '{invalid}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn oci_workspace_root_rejects_only_openshell_control_path_collisions() {
+        for invalid in [
+            "/etc",
+            "/opt",
+            "/opt/openshell",
+            "/opt/openshell/bin/project",
+            "/etc/openshell/tls/client",
+            "/etc/openshell/auth",
+            "/run",
+            "/run/netns/project",
+        ] {
+            assert!(
+                resolve_oci_workspace_root(invalid).is_err(),
+                "expected control-path workspace '{invalid}' to be rejected"
+            );
+        }
+
+        for valid in [
+            "/app",
+            "/etc/project",
+            "/home/app",
+            "/opt/app",
+            "/usr/bin/project",
+            "/usr/src/app",
+            "/var/lib/app",
+            "/var/app/current",
+            "/var/task",
+            "/var/www/app",
+        ] {
+            assert_eq!(
+                resolve_oci_workspace_root(valid).unwrap(),
+                valid,
+                "expected application workspace '{valid}' to remain valid"
+            );
+        }
     }
 
     #[test]
     fn container_target_rejects_reserved_openshell_tls_legacy_path() {
-        let err = validate_container_mount_target("/etc/openshell-tls/client").unwrap_err();
+        let err = validate_container_mount_target("/etc/openshell-tls/proxy/client").unwrap_err();
 
-        assert!(err.contains("/etc/openshell-tls"));
+        assert!(err.contains("/etc/openshell-tls/proxy"));
     }
 
     #[test]
@@ -203,15 +349,15 @@ mod tests {
     fn mount_target_rejects_internal_empty_or_dot_segments() {
         assert_eq!(
             validate_container_mount_target("/sandbox/work//tmp").unwrap_err(),
-            "mount target must be normalized and must not contain empty path segments or '.'"
+            "mount target must be normalized without empty, '.', or '..' path segments"
         );
         assert_eq!(
             validate_container_mount_target("/sandbox/work/./tmp").unwrap_err(),
-            "mount target must be normalized and must not contain empty path segments or '.'"
+            "mount target must be normalized without empty, '.', or '..' path segments"
         );
         assert_eq!(
             validate_container_mount_target("/sandbox/work/../../tmp").unwrap_err(),
-            "mount target must not contain '..'"
+            "mount target must be normalized without empty, '.', or '..' path segments"
         );
         validate_container_mount_target("/sandbox/work/").unwrap();
     }

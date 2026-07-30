@@ -312,6 +312,10 @@ fn validate_kubernetes_driver_volume_mounts(
         }
 
         driver_mounts::validate_container_mount_target(&mount.mount_path)?;
+        driver_mounts::validate_workspace_mount_target(
+            &mount.mount_path,
+            driver_mounts::DEFAULT_WORKSPACE_ROOT,
+        )?;
         let normalized_mount_path = driver_mounts::normalize_mount_target(&mount.mount_path);
         if !mount_paths.insert(normalized_mount_path.clone()) {
             return Err(format!(
@@ -1601,7 +1605,11 @@ fn apply_supervisor_sideload(
         // Override command to use the side-loaded supervisor binary
         container.insert(
             "command".to_string(),
-            serde_json::json!([format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH)]),
+            serde_json::json!([
+                format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH),
+                "--workdir",
+                driver_mounts::DEFAULT_WORKSPACE_ROOT
+            ]),
         );
 
         // Force the supervisor to run as root (UID 0). Sandbox images may set
@@ -1917,7 +1925,9 @@ fn apply_supervisor_sidecar_topology(
             "command".to_string(),
             serde_json::json!([
                 format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH),
-                "--mode=process"
+                "--mode=process",
+                "--workdir",
+                driver_mounts::DEFAULT_WORKSPACE_ROOT
             ]),
         );
 
@@ -4056,13 +4066,24 @@ mod tests {
             "init container must not depend on a shell"
         );
 
-        // Agent container command should be overridden to the emptyDir path
+        // `--workdir` is optional for standalone supervisor invocations and
+        // has no implicit default, so Kubernetes must pass its fixed workspace.
         let command = pod_template["spec"]["containers"][0]["command"]
             .as_array()
             .expect("command should be set");
         assert_eq!(
             command[0].as_str().unwrap(),
             format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox")
+        );
+        assert_eq!(
+            command,
+            serde_json::json!([
+                format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox"),
+                "--workdir",
+                driver_mounts::DEFAULT_WORKSPACE_ROOT
+            ])
+            .as_array()
+            .unwrap()
         );
 
         // Agent volume mount should be read-only
@@ -4211,7 +4232,9 @@ mod tests {
             agent["command"],
             serde_json::json!([
                 format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox"),
-                "--mode=process"
+                "--mode=process",
+                "--workdir",
+                driver_mounts::DEFAULT_WORKSPACE_ROOT
             ])
         );
         assert_eq!(agent["securityContext"]["runAsUser"], 1500);

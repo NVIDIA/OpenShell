@@ -223,16 +223,22 @@ openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ### Upload and download files
 
 ```bash
-# Upload local files to sandbox
-openshell sandbox upload my-sandbox ./src /sandbox/src
+# Upload local files to the sandbox working directory
+openshell sandbox upload my-sandbox ./src
 
-# Download files from sandbox
-openshell sandbox download my-sandbox /sandbox/output ./local-output
+# Download a path relative to the sandbox working directory
+openshell sandbox download my-sandbox output ./local-output
 ```
 
 Uploads honor `.gitignore` by default. Add `--no-git-ignore` only when ignored files are intentionally in scope.
 
 Uploads preserve symlinks, including dangling symlinks, instead of dereferencing their targets. A symlink source bypasses Git-aware filtering so the link itself is archived.
+
+When the upload destination is omitted, the CLI discovers the remote working
+directory. Uploading a named directory merges it into an existing directory of
+the same name, overwriting matching entries without deleting unrelated entries.
+Downloads accept paths relative to that working directory or absolute paths
+within it.
 
 ### Execute a non-interactive command
 
