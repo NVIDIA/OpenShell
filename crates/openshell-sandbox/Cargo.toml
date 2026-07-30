@@ -54,15 +54,13 @@ tracing-appender = { workspace = true }
 
 [features]
 default = ["telemetry", "bundled-ca-roots"]
-## Compile in telemetry activity collection (forwards to openshell-core/telemetry).
-## On by default; build with `--no-default-features` for a telemetry-free sandbox
-## supervisor that never collects or forwards activity summaries.
-telemetry = ["openshell-core/telemetry"]
-bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 ## Convenience alias: all defaults except bundled CA roots. Use
 ## `--no-default-features --features system-ca-roots` to build a supervisor
 ## that uses the platform trust store with telemetry intact.
 system-ca-roots = ["telemetry"]
+
+telemetry = ["openshell-core/telemetry"]
+bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
 openshell-core = { path = "../openshell-core", features = ["test-helpers"] }
