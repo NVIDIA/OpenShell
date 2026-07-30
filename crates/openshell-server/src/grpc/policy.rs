@@ -4406,6 +4406,8 @@ fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
         | openshell_policy::PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
             ..
         }
+        | openshell_policy::PolicyMergeError::UndeclaredPortWouldChange { .. }
+        | openshell_policy::PolicyMergeError::ConflictingMcpContractsForEndpoint { .. }
         | openshell_policy::PolicyMergeError::AmbiguousEndpointRule { .. }
         | openshell_policy::PolicyMergeError::CannotRemoveBinaryFromAnyBinaryScope { .. }
         | openshell_policy::PolicyMergeError::EndpointNotFound { .. }
@@ -5391,6 +5393,33 @@ mod tests {
         // The operator has to know which rules collide to pick a way forward.
         assert!(ambiguous.message().contains("broad"));
         assert!(ambiguous.message().contains("narrow"));
+
+        let undeclared_port = map_policy_merge_error(
+            openshell_policy::PolicyMergeError::UndeclaredPortWouldChange {
+                operation_index: 5,
+                rule_name: "existing".to_string(),
+                host: "api.example.com".to_string(),
+                ports: vec![8443],
+            },
+        );
+        assert_eq!(undeclared_port.code(), Code::FailedPrecondition);
+        // The proposer has to know which port to declare.
+        assert!(undeclared_port.message().contains("8443"));
+
+        let mcp_conflict = map_policy_merge_error(
+            openshell_policy::PolicyMergeError::ConflictingMcpContractsForEndpoint {
+                host: "mcp.example.com".to_string(),
+                port: 443,
+                contracts: vec![
+                    "mcp(strict_tool_names=true, allow_all_known_mcp_methods=false, max_body_bytes=65536)"
+                        .to_string(),
+                    "mcp(strict_tool_names=true, allow_all_known_mcp_methods=false, max_body_bytes=131072)"
+                        .to_string(),
+                ],
+            },
+        );
+        assert_eq!(mcp_conflict.code(), Code::FailedPrecondition);
+        assert!(mcp_conflict.message().contains("131072"));
 
         let any_binary = map_policy_merge_error(
             openshell_policy::PolicyMergeError::CannotRemoveBinaryFromAnyBinaryScope {

@@ -506,11 +506,16 @@ The CLI validates the argument shapes before it sends the request. The gateway t
 - an update names an existing rule and adds a binary to it without declaring every endpoint and port that rule already authorizes.
 - an update names an existing rule and adds or changes an endpoint on it without declaring every binary that rule already authorizes.
 - an update widens a rule to any binary without declaring every endpoint that rule already authorizes.
-- an update gives one host and port two different MCP inspection contracts.
+- an update changes an endpoint without declaring every port that endpoint carries.
+- an update gives one host and port two different MCP inspection contracts, including through separate rules or different paths.
 
 A rule authorizes every listed binary to reach every listed endpoint and port, so merging a binary and an endpoint into the same rule authorizes that pair too. The gateway rejects the whole batch rather than granting a pair the update did not ask for. The error names the binary scope and the ports involved, and lists the binaries you still need to declare. An empty binary list means any binary, so widening a rule to any binary is subject to the same requirement.
 
 You can declare the scope across several `--add-endpoint` arguments. The update is complete as long as every binary-to-port pair the merged rule ends up authorizing appears somewhere in the update.
+
+An endpoint's allow rules, deny rules, and allowed IPs apply to every port that endpoint carries, so an update that changes any of them has to name every one of those ports. Declaring `api.example.com:443` alone on an endpoint that also serves `8443` is rejected, because the change would reach `8443` as well. Declaring every existing binary does not lift this requirement; the two are separate axes of the same product.
+
+The sandbox resolves one MCP inspection contract per host and port, and it matches on host and port without consulting the path. Two MCP endpoints on the same host and port therefore cannot carry different strict-tool-name, method-profile, or body-limit settings, even under different paths or in separate rules. An update that would create that state is rejected. A policy that already contains such a conflict is left alone so unrelated updates still apply, but it should be repaired with full YAML replacement.
 
 To grant one binary access to only part of an existing rule's endpoints, send it under its own `--rule-name`. The gateway normally folds an update into an existing rule that shares an endpoint, but it keeps your rule name whenever folding would grant authorization you did not declare, so the narrow grant lands as its own rule authorizing exactly what you asked for. The update reports that it kept your rule name and names the rule it would otherwise have folded into. An MCP contract conflict is the exception: one host and port carry a single inspection contract regardless of which rule holds them, so a conflicting update is rejected rather than moved to a separate rule.
 

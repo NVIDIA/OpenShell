@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use openshell_core::proto::{
     L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
@@ -77,6 +77,13 @@ pub enum PolicyMergeWarning {
         port: u32,
         incoming: String,
     },
+    /// An `AddRule` named binaries for a rule that already authorizes any
+    /// binary, so the wider existing scope was kept rather than narrowed.
+    ExistingAnyBinaryScopeRetained {
+        rule_name: String,
+        /// Binary paths the operation named.
+        incoming: Vec<String>,
+    },
     /// An `AddRule` operation that would normally fold into an overlapping rule
     /// stayed on its requested rule name, because folding would have granted a
     /// binary-to-endpoint pair the operation never declared.
@@ -140,6 +147,14 @@ impl std::fmt::Display for PolicyMergeWarning {
                 f,
                 "endpoint {host}:{port} already uses explicit rules; incoming access preset '{incoming}' was ignored"
             ),
+            Self::ExistingAnyBinaryScopeRetained {
+                rule_name,
+                incoming,
+            } => write!(
+                f,
+                "rule '{rule_name}' already authorizes any binary; kept that scope instead of narrowing it to {}",
+                incoming.join(", ")
+            ),
             Self::KeptRequestedRuleNameToAvoidWidening {
                 rule_name,
                 overlapping_rule_name,
@@ -195,6 +210,22 @@ pub enum PolicyMergeError {
         ports: Vec<u32>,
         /// Existing binary scope the operation must also declare to proceed.
         undeclared_binaries: Vec<String>,
+    },
+    /// A widened field would land on a port the operation never named, because
+    /// the field merges into an endpoint carrying more ports than were declared.
+    UndeclaredPortWouldChange {
+        operation_index: usize,
+        rule_name: String,
+        host: String,
+        ports: Vec<u32>,
+    },
+    /// One host and port would carry more than one effective MCP inspection
+    /// contract, which the supervisor resolves by match order rather than policy.
+    ConflictingMcpContractsForEndpoint {
+        host: String,
+        port: u32,
+        /// Rendered effective contracts found at this host and port, sorted.
+        contracts: Vec<String>,
     },
     /// Several rules carry the same endpoint, so an operation that identifies
     /// its target by host and port alone cannot say which binary scope it means.
@@ -281,6 +312,24 @@ impl std::fmt::Display for PolicyMergeError {
                 f,
                 "merge operation {operation_index} add-rule '{rule_name}' would grant existing binaries new or changed authorization for {host} on ports {ports:?}; also declare {}",
                 undeclared_binaries.join(", ")
+            ),
+            Self::UndeclaredPortWouldChange {
+                operation_index,
+                rule_name,
+                host,
+                ports,
+            } => write!(
+                f,
+                "merge operation {operation_index} add-rule '{rule_name}' would change authorization for {host} on undeclared ports {ports:?}; declare every port of the endpoint it modifies"
+            ),
+            Self::ConflictingMcpContractsForEndpoint {
+                host,
+                port,
+                contracts,
+            } => write!(
+                f,
+                "{host}:{port} would carry more than one MCP inspection contract ({}); the sandbox resolves one contract per host and port, so these cannot coexist even in different rules or under different paths",
+                contracts.join(", ")
             ),
             Self::AmbiguousEndpointRule {
                 host,
@@ -642,10 +691,12 @@ pub fn merge_policy(
     // Validate and apply in request order. `merged` is private until every
     // operation succeeds, so failures remain atomic without allowing a later
     // malformed operation to replace the error from an earlier operation.
+    let conflicts_before = conflicting_mcp_host_ports(&policy);
     for (operation_index, operation) in operations.iter().enumerate() {
         validate_operation(operation_index, operation)?;
         apply_operation(&mut merged, operation_index, operation, &mut warnings)?;
     }
+    ensure_no_new_mcp_contract_conflicts(&merged, &conflicts_before)?;
 
     let changed = merged != policy;
     Ok(PolicyMergeResult {
@@ -653,6 +704,75 @@ pub fn merge_policy(
         warnings,
         changed,
     })
+}
+
+/// Host and port pairs whose MCP endpoints do not agree on one inspection
+/// contract, mapped to the rendered contracts in play.
+///
+/// The supervisor selects an endpoint's extended configuration by host and port
+/// alone: `endpoint_matches_request` never consults `path`, and the first match
+/// wins. Two MCP endpoints on one host and port therefore make the effective
+/// strict-tool-name, method-profile, and body-limit contract depend on
+/// evaluation order rather than on policy. `merge_endpoint` cannot catch this on
+/// its own, because it only compares endpoints that fold together, and a
+/// differing path or a separate rule keeps them apart.
+fn conflicting_mcp_host_ports(policy: &SandboxPolicy) -> BTreeMap<(String, u32), Vec<String>> {
+    let mut contracts: BTreeMap<(String, u32), Vec<(EffectiveMcpContract, String)>> =
+        BTreeMap::new();
+    for rule in policy.network_policies.values() {
+        for endpoint in &rule.endpoints {
+            // Provider-composed rules are deliberately included: the supervisor
+            // resolves one contract per host and port regardless of which rule
+            // contributed the endpoint.
+            let Some(contract) = effective_mcp_contract(endpoint) else {
+                continue;
+            };
+            for port in canonical_ports(endpoint) {
+                contracts
+                    .entry((endpoint.host.to_ascii_lowercase(), port))
+                    .or_default()
+                    .push((contract, describe_mcp_contract(endpoint)));
+            }
+        }
+    }
+
+    contracts
+        .into_iter()
+        .filter_map(|(key, found)| {
+            let first = found.first()?.0;
+            if found.iter().all(|(contract, _)| *contract == first) {
+                return None;
+            }
+            let mut rendered: Vec<String> =
+                found.into_iter().map(|(_, rendered)| rendered).collect();
+            rendered.sort();
+            rendered.dedup();
+            Some((key, rendered))
+        })
+        .collect()
+}
+
+/// Rejects an operation that introduces an MCP contract conflict.
+///
+/// Only conflicts absent from `before` are rejected. A policy that already
+/// carries one, for instance through a provider profile composed outside this
+/// merge, would otherwise make every later update fail with an error the
+/// operation did nothing to cause.
+fn ensure_no_new_mcp_contract_conflicts(
+    merged: &SandboxPolicy,
+    before: &BTreeMap<(String, u32), Vec<String>>,
+) -> Result<(), PolicyMergeError> {
+    for ((host, port), contracts) in conflicting_mcp_host_ports(merged) {
+        if before.contains_key(&(host.clone(), port)) {
+            continue;
+        }
+        return Err(PolicyMergeError::ConflictingMcpContractsForEndpoint {
+            host,
+            port,
+            contracts,
+        });
+    }
+    Ok(())
 }
 
 fn validate_operation(
@@ -833,6 +953,7 @@ fn add_rule(
                 &incoming_rule,
                 operation_index,
                 rule_name,
+                &key,
                 warnings,
             )?;
         }
@@ -854,6 +975,7 @@ fn add_rule(
                 &incoming_rule,
                 operation_index,
                 rule_name,
+                &key,
                 &mut candidate_warnings,
             ) {
                 Ok(()) => {
@@ -907,6 +1029,10 @@ fn merge_rules(
     incoming_rule: &NetworkPolicyRule,
     operation_index: usize,
     rule_name: &str,
+    // Key of the rule actually being modified. Differs from `rule_name` when the
+    // endpoint-overlap fallback folded the operation into another rule, so
+    // warnings name the rule the operator would have to inspect.
+    target_rule_name: &str,
     warnings: &mut Vec<PolicyMergeWarning>,
 ) -> Result<(), PolicyMergeError> {
     // A rule authorizes the Cartesian product of its binaries and endpoints.
@@ -940,7 +1066,23 @@ fn merge_rules(
     )?;
 
     existing_rule.endpoints = merged_endpoints;
-    if incoming_rule.binaries.is_empty() {
+    if existing_rule.binaries.is_empty() {
+        // The rule already authorizes any binary, so an incoming named list is
+        // a subset of what is already granted. Appending it would make the list
+        // non-empty and revoke every binary the operation did not name, turning
+        // an additive operation into a silent mass revocation. Keep the wider
+        // scope and say so; narrowing is `RemoveBinary` or a full replacement.
+        if !incoming_rule.binaries.is_empty() {
+            warnings.push(PolicyMergeWarning::ExistingAnyBinaryScopeRetained {
+                rule_name: target_rule_name.to_string(),
+                incoming: incoming_rule
+                    .binaries
+                    .iter()
+                    .map(|binary| binary.path.clone())
+                    .collect(),
+            });
+        }
+    } else if incoming_rule.binaries.is_empty() {
         // An incoming any-binary scope replaces the restricted scope instead of
         // appending to it. Appending an empty list would leave the existing
         // binaries in place, so the operation would report success while never
@@ -1182,6 +1324,27 @@ fn ensure_authorization_inheritance_is_declared(
                     .any(|existing| authorization_unit_unchanged(existing, endpoint, *port))
             })
             .collect();
+
+        // Every changed port must be named by the operation, whether or not the
+        // rule's binary scope is fully declared. Widened fields merge into the
+        // endpoint as a whole, so a change declared for one port of a
+        // multi-port endpoint reaches that endpoint's other ports too. Checking
+        // this only alongside undeclared binaries would let an operation that
+        // lists every existing binary widen an undeclared port.
+        let undeclared_changed_ports: Vec<Option<u32>> = changed_ports
+            .iter()
+            .copied()
+            .filter(|port| !operation_names_port(incoming_rule, endpoint, *port))
+            .collect();
+        if !undeclared_changed_ports.is_empty() {
+            return Err(PolicyMergeError::UndeclaredPortWouldChange {
+                operation_index,
+                rule_name: rule_name.to_string(),
+                host: endpoint.host.clone(),
+                ports: undeclared_changed_ports.into_iter().flatten().collect(),
+            });
+        }
+
         if !changed_ports.is_empty() && !undeclared_binaries.is_empty() {
             return Err(
                 PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
@@ -1196,6 +1359,25 @@ fn ensure_authorization_inheritance_is_declared(
     }
 
     Ok(())
+}
+
+/// True when the operation names `port` on an endpoint matching `merged`'s host
+/// and path.
+///
+/// This asks only whether the operation addressed the port, not whether it
+/// restated the endpoint's authorization. Pre-existing authorization on a port
+/// the operation names is not something the operation granted, but a widened
+/// field landing on a port the operation never named is.
+fn operation_names_port(
+    incoming_rule: &NetworkPolicyRule,
+    merged: &NetworkEndpoint,
+    port: Option<u32>,
+) -> bool {
+    incoming_rule.endpoints.iter().any(|declared| {
+        declared.host.eq_ignore_ascii_case(&merged.host)
+            && declared.path == merged.path
+            && port.is_none_or(|port| canonical_ports(declared).contains(&port))
+    })
 }
 
 /// True when the operation itself declares the authorization `merged` grants at
@@ -3525,10 +3707,24 @@ mod tests {
              got keys: {:?}",
             result.policy.network_policies.keys().collect::<Vec<_>>()
         );
+        // The existing rule declares no binaries, which authorizes any binary.
+        // Absorbing the incoming path would make the list non-empty and revoke
+        // every other process, so the wider scope is kept and reported instead.
         let merged = &result.policy.network_policies["custom_github"];
         assert!(
-            merged.binaries.iter().any(|b| b.path == "/usr/bin/curl"),
-            "user rule should have absorbed the incoming curl binary"
+            merged.binaries.is_empty(),
+            "an any-binary rule must not be narrowed by an additive operation; got {:?}",
+            merged.binaries
+        );
+        assert!(
+            result.warnings.iter().any(|warning| matches!(
+                warning,
+                PolicyMergeWarning::ExistingAnyBinaryScopeRetained { rule_name, incoming }
+                    if rule_name == "custom_github"
+                        && incoming == &["/usr/bin/curl".to_string()]
+            )),
+            "got warnings: {:?}",
+            result.warnings
         );
     }
 
@@ -4307,6 +4503,329 @@ mod tests {
         assert!(
             !result.policy.network_policies.contains_key("narrow"),
             "an emptied rule must be removed, not left authorizing any binary"
+        );
+    }
+
+    /// Widened fields merge into an endpoint as a whole, so a change declared
+    /// for one port of a multi-port endpoint reaches the endpoint's other ports.
+    /// Declaring every existing binary must not exempt the operation from
+    /// naming the ports its change lands on.
+    #[test]
+    fn declaring_every_binary_does_not_license_an_undeclared_port() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                protocol: "rest".to_string(),
+                rules: vec![rest_rule("GET", "/x")],
+                ..endpoint_with_ports("api.example.com", &[443, 8443])
+            }],
+            &["/usr/bin/only"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                protocol: "rest".to_string(),
+                rules: vec![rest_rule("POST", "/y")],
+                ..endpoint_with_ports("api.example.com", &[443])
+            }],
+            &["/usr/bin/only"],
+        );
+
+        let error = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect_err("POST would also land on the undeclared port 8443");
+
+        assert!(
+            matches!(
+                &error,
+                PolicyMergeError::UndeclaredPortWouldChange { ports, host, .. }
+                    if ports == &[8443] && host == "api.example.com"
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// Naming every port the change lands on is accepted, so the incremental
+    /// flow still works once the operation is explicit about its scope.
+    #[test]
+    fn naming_every_changed_port_is_accepted() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                protocol: "rest".to_string(),
+                rules: vec![rest_rule("GET", "/x")],
+                ..endpoint_with_ports("api.example.com", &[443, 8443])
+            }],
+            &["/usr/bin/only"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                protocol: "rest".to_string(),
+                rules: vec![rest_rule("POST", "/y")],
+                ..endpoint_with_ports("api.example.com", &[443, 8443])
+            }],
+            &["/usr/bin/only"],
+        );
+
+        let result = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("the operation named both ports the change reaches");
+
+        assert_eq!(
+            result.policy.network_policies["existing"].endpoints[0]
+                .rules
+                .len(),
+            2
+        );
+    }
+
+    /// The supervisor resolves one MCP contract per host and port, matching on
+    /// host and port without consulting the path, so two contracts cannot
+    /// coexist even under different paths on the same rule.
+    #[test]
+    fn two_mcp_contracts_on_one_host_and_port_are_rejected_across_paths() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                path: "/a".to_string(),
+                ..mcp_endpoint(
+                    "mcp.example.com",
+                    &[443],
+                    None,
+                    None,
+                    65536,
+                    vec![mcp_tool_rule("first")],
+                )
+            }],
+            &["/usr/bin/only"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                path: "/b".to_string(),
+                ..mcp_endpoint(
+                    "mcp.example.com",
+                    &[443],
+                    None,
+                    None,
+                    131_072,
+                    vec![mcp_tool_rule("second")],
+                )
+            }],
+            &["/usr/bin/only"],
+        );
+
+        let error = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect_err("a differing path does not license a second inspection contract");
+
+        assert!(
+            matches!(
+                &error,
+                PolicyMergeError::ConflictingMcpContractsForEndpoint { host, port, contracts }
+                    if host == "mcp.example.com" && *port == 443 && contracts.len() == 2
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// The same conflict across two rules is equally unsafe, because the
+    /// supervisor does not care which rule contributed the endpoint.
+    #[test]
+    fn two_mcp_contracts_on_one_host_and_port_are_rejected_across_rules() {
+        let policy = policy_with_rule(
+            "first_rule",
+            rule_with_authorizations(
+                "first_rule",
+                vec![mcp_endpoint(
+                    "mcp.example.com",
+                    &[443],
+                    None,
+                    None,
+                    65536,
+                    vec![mcp_tool_rule("first")],
+                )],
+                &["/usr/bin/a"],
+            ),
+        );
+
+        let error = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "second_rule".to_string(),
+                rule: rule_with_authorizations(
+                    "second_rule",
+                    vec![NetworkEndpoint {
+                        path: "/other".to_string(),
+                        ..mcp_endpoint(
+                            "mcp.example.com",
+                            &[443],
+                            None,
+                            None,
+                            131_072,
+                            vec![mcp_tool_rule("second")],
+                        )
+                    }],
+                    &["/usr/bin/b"],
+                ),
+            }],
+        )
+        .expect_err("a separate rule does not license a second inspection contract");
+
+        assert!(matches!(
+            error,
+            PolicyMergeError::ConflictingMcpContractsForEndpoint { .. }
+        ));
+    }
+
+    /// Matching contracts on one host and port are fine, so splitting an MCP
+    /// surface across paths or rules stays possible when the contract agrees.
+    #[test]
+    fn matching_mcp_contracts_on_one_host_and_port_are_accepted() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                path: "/a".to_string(),
+                ..mcp_endpoint(
+                    "mcp.example.com",
+                    &[443],
+                    None,
+                    None,
+                    65536,
+                    vec![mcp_tool_rule("first")],
+                )
+            }],
+            &["/usr/bin/only"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                path: "/b".to_string(),
+                ..mcp_endpoint(
+                    "mcp.example.com",
+                    &[443],
+                    None,
+                    None,
+                    65536,
+                    vec![mcp_tool_rule("second")],
+                )
+            }],
+            &["/usr/bin/only"],
+        );
+
+        merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("identical contracts resolve the same way whichever endpoint matches first");
+    }
+
+    /// A conflict already present in the baseline must not make every later
+    /// update fail with an error the operation did nothing to cause.
+    #[test]
+    fn a_preexisting_mcp_conflict_does_not_block_an_unrelated_update() {
+        let mut policy = policy_with_rule(
+            "first_rule",
+            rule_with_authorizations(
+                "first_rule",
+                vec![mcp_endpoint(
+                    "mcp.example.com",
+                    &[443],
+                    None,
+                    None,
+                    65536,
+                    vec![mcp_tool_rule("first")],
+                )],
+                &["/usr/bin/a"],
+            ),
+        );
+        policy.network_policies.insert(
+            "second_rule".to_string(),
+            rule_with_authorizations(
+                "second_rule",
+                vec![NetworkEndpoint {
+                    path: "/other".to_string(),
+                    ..mcp_endpoint(
+                        "mcp.example.com",
+                        &[443],
+                        None,
+                        None,
+                        131_072,
+                        vec![mcp_tool_rule("second")],
+                    )
+                }],
+                &["/usr/bin/b"],
+            ),
+        );
+
+        merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "unrelated".to_string(),
+                rule: rule_with_authorizations(
+                    "unrelated",
+                    vec![endpoint("other.example.com", 443)],
+                    &["/usr/bin/c"],
+                ),
+            }],
+        )
+        .expect("an unrelated endpoint must not inherit a baseline conflict");
+    }
+
+    /// An additive operation must never revoke access. Appending a named binary
+    /// to a rule that authorizes any binary would restrict it to that one path.
+    #[test]
+    fn naming_binaries_does_not_narrow_an_any_binary_rule() {
+        let existing =
+            rule_with_authorizations("existing", vec![endpoint("api.example.com", 443)], &[]);
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![endpoint("api.example.com", 443)],
+            &["/usr/bin/a"],
+        );
+
+        let result = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming.clone(),
+            }],
+        )
+        .expect("naming a binary already covered by any-binary is additive");
+
+        assert!(
+            result.policy.network_policies["existing"]
+                .binaries
+                .is_empty(),
+            "the any-binary scope must survive; got {:?}",
+            result.policy.network_policies["existing"].binaries
+        );
+        assert!(result.warnings.iter().any(|warning| matches!(
+            warning,
+            PolicyMergeWarning::ExistingAnyBinaryScopeRetained { .. }
+        )));
+        assert!(
+            policy_covers_rule(&result.policy, &incoming),
+            "an any-binary rule covers the named binary, so coverage must converge"
         );
     }
 }
