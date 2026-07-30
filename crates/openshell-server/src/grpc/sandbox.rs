@@ -2931,7 +2931,7 @@ mod tests {
 
         let error = handle_detach_sandbox_provider(
             &state,
-            Request::new(DetachSandboxProviderRequest {
+            authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-gcp".to_string(),
                 expected_resource_version: 0,
