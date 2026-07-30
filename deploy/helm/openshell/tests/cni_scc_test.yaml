@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: cni scc
+templates:
+  - templates/cni-scc.yaml
+tests:
+  - it: does not render by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: does not render when cni enabled but scc disabled
+    set:
+      cni.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders clusterrole and binding when privilegedSCC enabled
+    set:
+      cni.enabled: true
+      cni.openshift.privilegedSCC: true
+    asserts:
+      - hasDocuments:
+          count: 2
+      - documentIndex: 0
+        isKind:
+          of: ClusterRole
+      - documentIndex: 0
+        contains:
+          path: rules
+          content:
+            apiGroups:
+              - security.openshift.io
+            resources:
+              - securitycontextconstraints
+            resourceNames:
+              - privileged
+            verbs:
+              - use
+      - documentIndex: 1
+        isKind:
+          of: ClusterRoleBinding
