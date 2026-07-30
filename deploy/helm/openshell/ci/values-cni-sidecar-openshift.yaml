@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Overlay for the Kubernetes CNI-sidecar topology on OpenShift (Multus / OVN-K).
+# Injects the OpenShell chained plugin via the Multus vendor-cni-chain auxiliary
+# chain instead of patching a CNI .conflist, and grants the privileged SCC.
+
+cni:
+  enabled: true
+  mode: multus-chain
+  # OpenShift cri-o plugin_dirs use /var/lib/cni/bin; /opt/cni/bin does not exist.
+  binDir: /var/lib/cni/bin
+  # Multus vendor-cni-chain subdirectory (derived from the clusterNetwork path in
+  # 00-multus.conf). Tmpfs, so it is re-asserted by the installer loop.
+  chainDir: /run/multus/cni/net.d/vendor-cni-chain
+  # Persistent directory for plugin credentials (chainDir is tmpfs).
+  stateDir: /etc/kubernetes/cni/openshell
+  openshift:
+    privilegedSCC: true
+
+supervisor:
+  topology: cni-sidecar
