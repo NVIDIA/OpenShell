@@ -1012,6 +1012,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_credentials(
     for record in records {
         let name = &record.name;
         let provider = &record.provider;
+        let mut provider_env = HashMap::new();
         let profile_id =
             normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
         let profile =
@@ -1060,7 +1061,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_credentials(
                 if expires_at_ms > 0 {
                     expires.entry(key.clone()).or_insert(expires_at_ms);
                 }
-                env.entry(key.clone()).or_insert_with(|| value.clone());
+                provider_env.insert(key.clone(), value.clone());
                 static_credential_keys.insert(key.clone());
                 if let Some(endpoints) = &profile_endpoints {
                     if record.object_id.is_empty() {
@@ -1106,7 +1107,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_credentials(
                 {
                     expires.entry(key.clone()).or_insert(expires_at_ms);
                 }
-                env.entry(key.clone()).or_insert(value);
+                provider_env.insert(key.clone(), value);
                 static_credential_keys.insert(key.clone());
                 if let Some(endpoints) = &profile_endpoints {
                     if record.object_id.is_empty() {
@@ -1131,7 +1132,14 @@ pub(super) async fn resolve_provider_environment_from_records_with_credentials(
             }
         }
 
-        registry.inject_env(provider, &mut env);
+        // Build each provider's emitted environment independently so another
+        // provider's earlier output cannot change how this provider classifies
+        // or populates its own keys. Cross-provider credential/config
+        // collisions have already been rejected by the validation above.
+        registry.inject_env(provider, &mut provider_env);
+        for (key, value) in provider_env {
+            env.entry(key).or_insert(value);
+        }
     }
 
     Ok(ProviderEnvironment {
@@ -1538,7 +1546,8 @@ async fn validate_provider_environment_keys_unique_at(
     candidate_provider: Option<&Provider>,
     now_ms: i64,
 ) -> Result<(), Status> {
-    let mut seen = HashMap::<String, String>::new();
+    let mut seen_credentials = HashMap::<String, String>::new();
+    let mut seen_plugin_config = HashMap::<String, String>::new();
     let mut dynamic_bindings = Vec::new();
     for name in provider_names {
         let provider = match candidate_provider {
@@ -1552,17 +1561,13 @@ async fn validate_provider_environment_keys_unique_at(
                 })?,
         };
         let provider_name = provider.object_name().to_string();
-        for key in active_provider_environment_keys(store, &provider, now_ms).await? {
-            if let Some(first_provider) = seen.get(&key) {
-                if first_provider != &provider_name {
-                    return Err(Status::failed_precondition(format!(
-                        "credential env key '{key}' is provided by both provider '{first_provider}' and provider '{provider_name}'; use provider-specific env names"
-                    )));
-                }
-            } else {
-                seen.insert(key, provider_name.clone());
-            }
-        }
+        validate_provider_environment_key_ownership(
+            &mut seen_credentials,
+            &mut seen_plugin_config,
+            &provider_name,
+            active_provider_environment_keys(store, &provider, now_ms).await?,
+            provider_plugin_environment_keys(&provider),
+        )?;
         dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
             catalog, &provider,
         ));
@@ -1577,35 +1582,91 @@ async fn validate_provider_environment_records_unique_at(
     records: &[ProviderEnvironmentRecord],
     now_ms: i64,
 ) -> Result<(), Status> {
-    let mut seen = HashMap::<String, String>::new();
+    let mut seen_credentials = HashMap::<String, String>::new();
+    let mut seen_plugin_config = HashMap::<String, String>::new();
     let mut dynamic_bindings = Vec::new();
     for record in records {
         let provider = &record.provider;
-        for key in active_provider_environment_keys_for_identity(
-            store,
-            provider,
-            &record.object_id,
-            now_ms,
-        )
-        .await?
-        {
-            if let Some(first_provider) = seen.get(&key) {
-                if first_provider != &record.name {
-                    return Err(Status::failed_precondition(format!(
-                        "credential env key '{key}' is provided by both provider '{first_provider}' and provider '{}'; use provider-specific env names",
-                        record.name
-                    )));
-                }
-            } else {
-                seen.insert(key, record.name.clone());
-            }
-        }
+        validate_provider_environment_key_ownership(
+            &mut seen_credentials,
+            &mut seen_plugin_config,
+            &record.name,
+            active_provider_environment_keys_for_identity(
+                store,
+                provider,
+                &record.object_id,
+                now_ms,
+            )
+            .await?,
+            provider_plugin_environment_keys(provider),
+        )?;
         dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
             catalog, provider,
         ));
     }
     validate_dynamic_token_grant_bindings_unambiguous(&dynamic_bindings)?;
     Ok(())
+}
+
+fn provider_plugin_environment_keys(provider: &Provider) -> Vec<String> {
+    let mut plugin_environment = HashMap::new();
+    openshell_providers::ProviderRegistry::new().inject_env(provider, &mut plugin_environment);
+    plugin_environment.into_keys().collect()
+}
+
+fn validate_provider_environment_key_ownership(
+    seen_credentials: &mut HashMap<String, String>,
+    seen_plugin_config: &mut HashMap<String, String>,
+    provider_name: &str,
+    credential_keys: Vec<String>,
+    plugin_config_keys: Vec<String>,
+) -> Result<(), Status> {
+    for key in credential_keys {
+        if let Some(first_provider) = seen_credentials.get(&key) {
+            if first_provider != provider_name {
+                return Err(Status::failed_precondition(format!(
+                    "credential env key '{key}' is provided by both provider '{first_provider}' and provider '{provider_name}'; use provider-specific env names"
+                )));
+            }
+        } else {
+            seen_credentials.insert(key.clone(), provider_name.to_string());
+        }
+        if let Some(config_provider) = seen_plugin_config.get(&key)
+            && config_provider != provider_name
+        {
+            return Err(provider_credential_config_key_collision(
+                &key,
+                provider_name,
+                config_provider,
+            ));
+        }
+    }
+
+    for key in plugin_config_keys {
+        if let Some(credential_provider) = seen_credentials.get(&key)
+            && credential_provider != provider_name
+        {
+            return Err(provider_credential_config_key_collision(
+                &key,
+                credential_provider,
+                provider_name,
+            ));
+        }
+        seen_plugin_config
+            .entry(key)
+            .or_insert_with(|| provider_name.to_string());
+    }
+    Ok(())
+}
+
+fn provider_credential_config_key_collision(
+    key: &str,
+    credential_provider: &str,
+    config_provider: &str,
+) -> Status {
+    Status::failed_precondition(format!(
+        "credential env key '{key}' from provider '{credential_provider}' conflicts with provider-generated config from provider '{config_provider}'; use provider-specific env names"
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8039,6 +8100,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_environment_rejects_plugin_config_credential_collision_in_both_orders() {
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "google-config".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                r#type: "google-cloud".to_string(),
+                credentials: std::iter::once((
+                    "GCP_ACCESS_TOKEN".to_string(),
+                    "google-token".to_string(),
+                ))
+                .collect(),
+                config: std::iter::once(("project_id".to_string(), "config-project".to_string()))
+                    .collect(),
+                credential_expires_at_ms: HashMap::new(),
+                profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        create_provider_record(
+            &store,
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "static-credential".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                r#type: "gitlab".to_string(),
+                credentials: std::iter::once((
+                    "GCP_PROJECT_ID".to_string(),
+                    "credential-value".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let attachment_orders = [
+            vec!["google-config".to_string(), "static-credential".to_string()],
+            vec!["static-credential".to_string(), "google-config".to_string()],
+        ];
+        let mut messages = Vec::new();
+        for providers in attachment_orders {
+            let validation_error =
+                validate_provider_environment_keys_unique(&store, "default", &providers)
+                    .await
+                    .unwrap_err();
+            assert_eq!(validation_error.code(), Code::FailedPrecondition);
+
+            let resolution_error = resolve_provider_environment(&store, "default", &providers)
+                .await
+                .unwrap_err();
+            assert_eq!(resolution_error.code(), Code::FailedPrecondition);
+            assert_eq!(validation_error.message(), resolution_error.message());
+            assert!(resolution_error.message().contains("GCP_PROJECT_ID"));
+            assert!(resolution_error.message().contains("static-credential"));
+            assert!(resolution_error.message().contains("google-config"));
+            messages.push(resolution_error.message().to_string());
+        }
+        assert_eq!(
+            messages[0], messages[1],
+            "collision rejection must not depend on attachment order"
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_provider_env_injects_vertex_agent_config() {
         let store = test_store().await;
         create_provider_record(
@@ -8432,6 +8582,122 @@ mod tests {
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(err.message().contains("collision"));
         assert!(err.message().contains("MS_GRAPH_ACCESS_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn update_provider_rejects_plugin_config_credential_collision() {
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "google-config".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                r#type: "google-cloud".to_string(),
+                credentials: std::iter::once((
+                    "GCP_ACCESS_TOKEN".to_string(),
+                    "google-token".to_string(),
+                ))
+                .collect(),
+                config: std::iter::once(("project_id".to_string(), "config-project".to_string()))
+                    .collect(),
+                credential_expires_at_ms: HashMap::new(),
+                profile_workspace: "default".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        create_provider_record(
+            &store,
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "credential-provider".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                r#type: "gitlab".to_string(),
+                credentials: std::iter::once((
+                    "GITLAB_TOKEN".to_string(),
+                    "gitlab-token".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                profile_workspace: "default".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-plugin-config-collision".to_string(),
+                    name: "plugin-config-collision".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec![
+                        "google-config".to_string(),
+                        "credential-provider".to_string(),
+                    ],
+                    ..SandboxSpec::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let err = update_provider_record(
+            &store,
+            "default",
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "credential-provider".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                r#type: String::new(),
+                credentials: std::iter::once((
+                    "GCP_PROJECT_ID".to_string(),
+                    "credential-value".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                profile_workspace: "default".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("GCP_PROJECT_ID"));
+        assert!(err.message().contains("credential-provider"));
+        assert!(err.message().contains("google-config"));
     }
 
     #[tokio::test]
