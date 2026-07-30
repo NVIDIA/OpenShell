@@ -760,3 +760,25 @@ describe('enum name maps', () => {
     });
   }
 });
+
+describe('raw escape hatch', () => {
+  it('reaches uncurated RPCs and returns generated wire messages', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      getGatewayConfig: () => ({ settings: {}, settingsRevision: 42n }),
+    });
+
+    // An RPC with no curated wrapper is still reachable through raw.
+    const cfg = await sandbox.raw.getGatewayConfig({});
+    expect(cfg.settingsRevision).toBe(42n);
+
+    // raw returns the full generated message: the enum stays numeric, where the
+    // curated get() would lowercase status.phase to 'ready'.
+    const resp = await sandbox.raw.getSandbox({ name: 'sb' });
+    expect(resp.sandbox?.status?.phase).toBe(SandboxPhase.READY);
+    expect(resp.sandbox?.metadata?.name).toBe('sb');
+
+    // The shared transport is exposed for building extra clients.
+    expect(sandbox.transport).toBeDefined();
+  });
+});

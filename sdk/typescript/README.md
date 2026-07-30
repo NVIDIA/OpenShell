@@ -116,6 +116,35 @@ await client.sandbox.setSetting(name, 'feature.enabled', { value: { case: 'boolV
 
 Sandbox-scoped `setPolicy` may only change `networkPolicies`; static fields (`filesystem`, `landlock`, `process`) must match the create-time policy. Sandbox-scoped setting deletes are rejected by the gateway, so only upsert (`setSetting`) is exposed here.
 
+## Surface and roadmap
+
+The SDK's goal is agent parity: anything the OpenShell gateway can do should be reachable from typed code, not only the CLI. The API is organized as scoped sub-clients over one shared connection, mirroring the CLI's verbs.
+
+- `client.sandbox` (`SandboxClient`) is available today: sandbox lifecycle, exec, forward, SSH, sandbox-scoped providers, config, and policy.
+- `client.gateway` (`GatewayClient`) is planned: gateway-scoped config and settings, health, and cluster status.
+- `client.providers` (`ProviderClient`) is planned: gateway-scoped provider CRUD and profiles.
+
+`health()` lives at the root today and will move under `client.gateway` (with a root alias) when that lands.
+
+Curated methods are added deliberately, so some gateway RPCs are not yet wrapped in a typed helper. Rather than ship methods that exist but throw, the SDK omits what it has not curated and gives you the raw escape hatch below to reach the full gateway surface today. Omission means "not yet ergonomic," never "impossible."
+
+### Advanced: raw escape hatch
+
+`client.raw` is a generated client for every gateway RPC, including surface the curated sub-clients do not wrap yet (gateway config, provider CRUD, policy status, watch, logs, and the full observed `Sandbox`). `client.transport` is the shared connection, so extra clients reuse one socket. Generated request and response types live at `@nvidia/openshell-sdk/raw`.
+
+```ts
+import { OpenShellClient } from '@nvidia/openshell-sdk'
+import type { GetGatewayConfigResponse } from '@nvidia/openshell-sdk/raw'
+
+const client = await OpenShellClient.connect({ gateway, oidcToken })
+
+// Reach RPCs the curated surface does not wrap yet:
+const cfg: GetGatewayConfigResponse = await client.raw.getGatewayConfig({})
+const status = await client.raw.getSandboxPolicyStatus({ name: 'my-sandbox', version: 0, global: false })
+```
+
+The raw layer returns the generated wire messages verbatim, preserving proto distinctions (an omitted optional versus an explicitly empty map) that the curated types may smooth over. As curated sub-clients land, prefer them; `raw` stays as the always-available floor.
+
 ## Boundaries
 
 The SDK ships primitives, not the CLI's terminal experience. Some things are intentionally out of scope:
