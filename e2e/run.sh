@@ -153,6 +153,7 @@ if [ -n "${vm}" ] || [ "${#with_configurations[@]}" -gt 0 ]; then
 		vm=ubuntu
 	fi
 fi
+vm_uses_podman=0
 if [ "${mode}" = vm ]; then
 	if [[ ! ${vm} =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
 		die "invalid VM distro name: ${vm}"
@@ -177,6 +178,9 @@ if [ "${mode}" = vm ]; then
 	for configuration in "${with_configurations[@]}"; do
 		if ! catalog_has_entry "${vm_catalog}" Configurations "${configuration}"; then
 			die "unknown VM configuration in the Nix test-guest catalog: ${configuration}"
+		fi
+		if [ "${configuration}" = podman ]; then
+			vm_uses_podman=1
 		fi
 	done
 fi
@@ -391,6 +395,18 @@ else
 	runtime_log="${run_dir}/vm.log"
 	guest_launcher="${run_dir}/launch-gateway.sh"
 	guest_launcher_path=/home/openshell/.cache/openshell-e2e/bin/launch-gateway
+	guest_supervisor_archive_path=/home/openshell/.cache/openshell-e2e/supervisor.tar
+	supervisor_archive=
+	if [ "${vm_uses_podman}" -eq 1 ]; then
+		if ! command -v tar >/dev/null 2>&1; then
+			die "tar is required for Podman VM mode"
+		fi
+		supervisor_rootfs="${run_dir}/supervisor-rootfs"
+		supervisor_archive="${run_dir}/supervisor.tar"
+		mkdir -p "${supervisor_rootfs}"
+		install -m 0555 "${linux_sandbox_bin}" "${supervisor_rootfs}/openshell-sandbox"
+		tar -C "${supervisor_rootfs}" -cf "${supervisor_archive}" openshell-sandbox
+	fi
 	config_payload="$(base64 <"${gateway_config}" | tr -d '\r\n')"
 	jwt_signing_payload="$(base64 <"${jwt_source_dir}/signing.pem" | tr -d '\r\n')"
 	jwt_public_payload="$(base64 <"${jwt_source_dir}/public.pem" | tr -d '\r\n')"
@@ -416,6 +432,33 @@ export XDG_CONFIG_HOME=\${state_root}/xdg/config
 export XDG_CACHE_HOME=\${state_root}/xdg/cache
 export XDG_DATA_HOME=\${state_root}/xdg/data
 export XDG_STATE_HOME=\${state_root}/xdg/state
+if [ -f "${guest_supervisor_archive_path}" ]; then
+	podman --url "unix:///run/user/\$(id -u)/podman/podman.sock" import \
+		--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+		"${guest_supervisor_archive_path}" \
+		localhost/openshell/supervisor:e2e-vm >/dev/null
+	relay_socket=\${state_root}/podman-gateway.sock
+	rm -f "\${relay_socket}"
+	socat "UNIX-LISTEN:\${relay_socket},fork" TCP:127.0.0.1:8080 &
+	host_relay_pid=\$!
+	for _ in \$(seq 1 50); do
+		[ -S "\${relay_socket}" ] && break
+		sleep 0.1
+	done
+	if [ ! -S "\${relay_socket}" ] || ! kill -0 "\${host_relay_pid}" 2>/dev/null; then
+		echo "ERROR: failed to start the host-side Podman gateway relay" >&2
+		exit 1
+	fi
+	env -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_STATE_HOME \
+		podman unshare --rootless-netns \
+		socat TCP-LISTEN:8080,bind=0.0.0.0,reuseaddr,fork "UNIX-CONNECT:\${relay_socket}" &
+	network_relay_pid=\$!
+	sleep 1
+	if ! kill -0 "\${network_relay_pid}" 2>/dev/null; then
+		echo "ERROR: failed to start the rootless-network Podman gateway relay" >&2
+		exit 1
+	fi
+fi
 cd /home/openshell
 exec /usr/local/bin/openshell-gateway \
 	--config "\${config_path}" \
@@ -438,6 +481,9 @@ EOF
 		--copy "${guest_launcher}:${guest_launcher_path}"
 		--forward-port "${host_port}:${guest_port}"
 	)
+	if [ -n "${supervisor_archive}" ]; then
+		vm_args+=(--copy "${supervisor_archive}:${guest_supervisor_archive_path}")
+	fi
 	if [ "${keep}" -eq 1 ]; then
 		vm_args+=(--keep)
 	fi
