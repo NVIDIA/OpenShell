@@ -329,6 +329,17 @@ class Openshell < Formula
     (var/"log/openshell").mkpath
     system bin/"openshell-gateway", "generate-certs", "--output-dir", var/"openshell/tls", "--server-san", "host.openshell.internal"
 
+    gateway_config = var/"openshell/gateway.toml"
+    unless gateway_config.exist?
+      gateway_config.write <<~TOML
+        [openshell]
+        version = 1
+
+        [openshell.gateway]
+        bind_address = "[::1]:{LOCAL_GATEWAY_PORT}"
+      TOML
+    end
+
     entitlements = var/"openshell/openshell-driver-vm.entitlements.plist"
     entitlements.atomic_write <<~XML
       <?xml version="1.0" encoding="UTF-8"?>
@@ -357,7 +368,7 @@ class Openshell < Formula
         brew services restart openshell
 
       Register it with the OpenShell CLI:
-        openshell gateway add https://127.0.0.1:{LOCAL_GATEWAY_PORT} --local --name openshell
+        openshell gateway add https://[::1]:{LOCAL_GATEWAY_PORT} --local --name openshell
     EOS
   end
 

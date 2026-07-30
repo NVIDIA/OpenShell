@@ -31,7 +31,8 @@ Options:
   -h, --help           Show this help
 
 Omit --vm and --with to run the gateway on the host. Supplying --with without
---vm selects the Ubuntu test guest. Set OPENSHELL_E2E_KEEP=1 to retain state.
+--vm selects Fedora for the Podman driver and Ubuntu otherwise. Set
+OPENSHELL_E2E_KEEP=1 to retain state.
 EOF
 }
 
@@ -154,7 +155,11 @@ mode=host
 if [ -n "${vm}" ] || [ "${#with_configurations[@]}" -gt 0 ]; then
 	mode=vm
 	if [ -z "${vm}" ]; then
-		vm=ubuntu
+		if [ "${gateway_driver}" = podman ]; then
+			vm=fedora
+		else
+			vm=ubuntu
+		fi
 	fi
 fi
 if [ "${mode}" = vm ]; then
@@ -166,6 +171,9 @@ if [ "${mode}" = vm ]; then
 			die "invalid VM configuration name: ${configuration}"
 		fi
 	done
+	if [ "${gateway_driver}" = podman ] && [ "${vm}" = ubuntu ]; then
+		die "the Ubuntu 24.04 guest lacks the Podman 5 pasta helper required for sandbox callbacks; use --vm fedora --with podman"
+	fi
 	if ! command -v nix >/dev/null 2>&1; then
 		die "Nix is required for VM mode"
 	fi

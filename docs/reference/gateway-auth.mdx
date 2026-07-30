@@ -45,10 +45,10 @@ Set these environment variables before starting the gateway:
 | `OPENSHELL_TLS_CLIENT_CA` | Path to the CA certificate that verifies CLI client certificates. |
 | `OPENSHELL_ENABLE_MTLS_AUTH` | Set to `true` to authenticate CLI callers from verified client certificates. Defaults on for local Docker, Podman, and VM gateways with no OIDC issuer. |
 
-For local access, the server certificate must be valid for the endpoint the CLI uses. Include `localhost` and `127.0.0.1` in the certificate SANs when users connect to a local gateway through loopback.
+For local access, the server certificate must be valid for the endpoint the CLI uses. Include `localhost`, `127.0.0.1`, and `::1` in the certificate SANs when users connect to a local gateway through loopback.
 
-Package-managed local gateways on Homebrew, Debian, and RPM generate this bundle automatically for the `openshell` gateway name and use `https://127.0.0.1:17670` by default.
-When you register a package-managed local gateway with `openshell gateway add https://127.0.0.1:17670 --local --name openshell`, the CLI refreshes its mTLS bundle from the package-managed TLS directory.
+Package-managed local gateways generate this bundle automatically for the `openshell` gateway name. Homebrew uses `https://[::1]:17670` by default; Debian and RPM use `https://127.0.0.1:17670`.
+When you register a package-managed local gateway with `openshell gateway add <endpoint> --local --name openshell`, the CLI refreshes its mTLS bundle from the package-managed TLS directory.
 On Homebrew, the gateway service also mirrors the Docker sandbox client bundle into `$HOME/.local/state/openshell/homebrew/tls` before startup so Docker Desktop can bind-mount the files into sandbox containers.
 
 The CLI loads its mTLS bundle from `~/.config/openshell/gateways/<name>/mtls/`:

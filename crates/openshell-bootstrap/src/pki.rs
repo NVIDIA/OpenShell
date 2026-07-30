@@ -39,6 +39,7 @@ pub const DEFAULT_SERVER_SANS: &[&str] = &[
     "host.docker.internal",
     "host.containers.internal",
     "127.0.0.1",
+    "::1",
 ];
 
 /// Generate a complete PKI bundle: CA, server cert, and client cert.
@@ -190,5 +191,7 @@ mod tests {
     fn default_server_sans_include_local_container_hostnames() {
         assert!(DEFAULT_SERVER_SANS.contains(&"host.docker.internal"));
         assert!(DEFAULT_SERVER_SANS.contains(&"host.containers.internal"));
+        assert!(DEFAULT_SERVER_SANS.contains(&"127.0.0.1"));
+        assert!(DEFAULT_SERVER_SANS.contains(&"::1"));
     }
 }
