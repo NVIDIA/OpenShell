@@ -270,10 +270,11 @@ jobs:
 
   e2e-vm:
     name: E2E (rust-vm)
-    # libkrun needs KVM, so this job must run directly on a GitHub-hosted
-    # Linux VM. GitHub-hosted macOS runners do not support nested
-    # virtualization, and a job container would hide the host KVM device.
-    runs-on: ubuntu-24.04
+    # libkrun needs KVM, so this job must run directly on a larger
+    # GitHub-hosted Linux runner with nested virtualization. Standard Linux
+    # runners can expose /dev/kvm while denying opens from child processes,
+    # and a job container would hide the host KVM device.
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 90
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -314,8 +315,10 @@ jobs:
           fi
           sudo chmod 0666 /dev/kvm
           ls -l /dev/kvm
-          test -r /dev/kvm
-          test -w /dev/kvm
+          # Shell access bits do not detect device-cgroup or LSM denials.
+          # Opening the device exercises the same boundary as libkrun.
+          exec 3</dev/kvm
+          exec 3<&-
 
       - name: Install system dependencies
         run: |
