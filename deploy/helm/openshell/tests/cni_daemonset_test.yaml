@@ -69,3 +69,55 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: supervisor.topology=cni-sidecar requires cni.enabled=true so the OpenShell chained CNI plugin is installed on every node
+
+  - it: renders multus-chain conf and state volumes when mode is multus-chain
+    template: templates/cni-daemonset.yaml
+    set:
+      cni.enabled: true
+      cni.mode: multus-chain
+      cni.chainDir: /run/multus/cni/net.d/vendor-cni-chain
+      cni.stateDir: /etc/kubernetes/cni/openshell
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: cni-chain
+            mountPath: /host/run/multus/cni/net.d/vendor-cni-chain
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: cni-state
+            mountPath: /host/etc/kubernetes/cni/openshell
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: cni-conf
+            mountPath: /host/etc/cni/net.d
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'multus-chain mode'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: '"name": "openshell-cni"'
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.preStop.exec.command[2]
+          pattern: 'openshell-cni\.conf'
+
+  - it: fails multus-chain mode without a chain dir
+    template: templates/cni-daemonset.yaml
+    set:
+      cni.enabled: true
+      cni.mode: multus-chain
+      cni.chainDir: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: cni.mode=multus-chain requires cni.chainDir
+
+  - it: fails on an unknown cni mode
+    template: templates/cni-daemonset.yaml
+    set:
+      cni.enabled: true
+      cni.mode: bogus
+    asserts:
+      - failedTemplate:
+          errorMessage: cni.mode must be "conflist" or "multus-chain"
