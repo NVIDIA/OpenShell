@@ -229,6 +229,33 @@ def test_profileless_provider_credentials_fail_closed(
             assert url == "NOT_SET"
 
 
+def test_endpointless_profile_credentials_fail_closed_without_policy_binding(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """Endpointless profile credentials are withheld without an explicit binding."""
+    with provider(
+        sandbox_client._stub,
+        name="e2e-test-google-cloud-without-policy-binding",
+        provider_type="google-cloud",
+        credentials={"GCP_ADC_ACCESS_TOKEN": "gcp-e2e-token"},
+    ) as provider_name:
+        spec = datamodel_pb2.SandboxSpec(
+            policy=_default_policy(),
+            providers=[provider_name],
+        )
+
+        def read_gcp_token() -> str:
+            import os
+
+            return os.environ.get("GCP_ADC_ACCESS_TOKEN", "NOT_SET")
+
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            result = sb.exec_python(read_gcp_token)
+            assert result.exit_code == 0, result.stderr
+            assert result.stdout.strip() == "NOT_SET"
+
+
 def test_endpointless_profile_credentials_use_explicit_policy_binding(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
