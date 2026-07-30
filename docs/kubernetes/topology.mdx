@@ -348,9 +348,31 @@ helm install openshell deploy/helm/openshell \
 ```
 
 This sets `cni.binDir: /var/lib/cni/bin`, `cni.chainDir:
-/run/multus/cni/net.d/vendor-cni-chain`, a persistent `cni.stateDir`, and
-`cni.openshift.privilegedSCC: true`. It requires a Multus thick daemon with
-`auxiliaryCNIChainName` configured (default on OpenShift 4.x).
+/run/multus/cni/net.d/vendor-cni-chain`, a persistent `cni.stateDir`,
+`cni.openshift.privilegedSCC: true`, and
+`sandboxServiceAccount.openshift.binaryAwareSCC: true`. It requires a Multus
+thick daemon with `auxiliaryCNIChainName` configured (default on OpenShift 4.x).
+
+#### Sandbox pod SecurityContextConstraints
+
+With `supervisor.sidecar.processBinaryAwareNetworkPolicy` enabled (the default),
+the network sidecar runs as UID 0 with the `SYS_PTRACE` and `DAC_READ_SEARCH`
+capabilities so it can inspect the agent process's `/proc` entries across UID
+boundaries. OpenShift's `restricted-v2` SCC forbids UID 0 and those
+capabilities, so the sandbox ServiceAccount needs a purpose-built SCC.
+
+Setting `sandboxServiceAccount.openshift.binaryAwareSCC: true` creates a minimal
+SCC — the `restricted-v2` baseline plus only UID 0, `SYS_PTRACE`,
+`DAC_READ_SEARCH`, and the `image` volume type used to sideload the supervisor
+binary — and a ClusterRole/ClusterRoleBinding granting it to the sandbox
+ServiceAccount. Everything else stays locked down: no privileged container, no
+host namespaces, `allowPrivilegeEscalation: false`, drop `ALL`, and the
+`runtime/default` seccomp profile.
+
+To run with lower privileges at the cost of binary matching, set
+`supervisor.sidecar.processBinaryAwareNetworkPolicy: false`; the sidecar then
+runs as `proxyUid` without the extra capabilities, and the built-in
+`restricted-v2` SCC suffices (leave `binaryAwareSCC` unset).
 
 Leave `topology` unset, or set it to `combined`, to keep the original
 single-container supervisor path. For Helm installs, leave

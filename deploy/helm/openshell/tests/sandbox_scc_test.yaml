@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: sandbox scc
+templates:
+  - templates/sandbox-scc.yaml
+tests:
+  - it: does not render by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders scc, clusterrole and binding when binaryAwareSCC enabled
+    set:
+      sandboxServiceAccount.openshift.binaryAwareSCC: true
+    asserts:
+      - hasDocuments:
+          count: 3
+      - documentIndex: 0
+        isKind:
+          of: SecurityContextConstraints
+      - documentIndex: 0
+        equal:
+          path: allowPrivilegedContainer
+          value: false
+      - documentIndex: 0
+        equal:
+          path: allowPrivilegeEscalation
+          value: false
+      - documentIndex: 0
+        equal:
+          path: requiredDropCapabilities
+          value:
+            - ALL
+      - documentIndex: 0
+        equal:
+          path: allowedCapabilities
+          value:
+            - SYS_PTRACE
+            - DAC_READ_SEARCH
+      - documentIndex: 0
+        equal:
+          path: runAsUser.type
+          value: RunAsAny
+      - documentIndex: 0
+        contains:
+          path: volumes
+          content: image
+      - documentIndex: 1
+        isKind:
+          of: ClusterRole
+      - documentIndex: 1
+        contains:
+          path: rules
+          content:
+            apiGroups:
+              - security.openshift.io
+            resources:
+              - securitycontextconstraints
+            resourceNames:
+              - RELEASE-NAME-openshell-sandbox
+            verbs:
+              - use
+      - documentIndex: 2
+        isKind:
+          of: ClusterRoleBinding
+      - documentIndex: 2
+        matchRegex:
+          path: subjects[0].name
+          pattern: -sandbox$
+      - documentIndex: 2
+        matchRegex:
+          path: roleRef.name
+          pattern: -sandbox-scc$
+
+  - it: binds the scc to an existing sandbox service account name
+    set:
+      sandboxServiceAccount.openshift.binaryAwareSCC: true
+      sandboxServiceAccount.create: false
+      sandboxServiceAccount.name: custom-sandbox-sa
+    asserts:
+      - documentIndex: 2
+        equal:
+          path: subjects[0].name
+          value: custom-sandbox-sa
+
+  - it: scopes the scc binding subject to the explicit sandbox namespace
+    set:
+      sandboxServiceAccount.openshift.binaryAwareSCC: true
+      server.sandboxNamespace: agents
+    asserts:
+      - documentIndex: 2
+        equal:
+          path: subjects[0].namespace
+          value: agents
