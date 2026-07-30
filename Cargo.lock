@@ -4046,6 +4046,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-otel"
+version = "0.0.0"
+dependencies = [
+ "http 1.4.0",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "openshell-policy"
 version = "0.0.0"
 dependencies = [
@@ -4196,6 +4211,7 @@ dependencies = [
  "openshell-driver-podman",
  "openshell-gateway-interceptors",
  "openshell-ocsf",
+ "openshell-otel",
  "openshell-policy",
  "openshell-prover",
  "openshell-providers",
@@ -4203,7 +4219,6 @@ dependencies = [
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "opentelemetry",
- "opentelemetry-otlp",
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "petname",

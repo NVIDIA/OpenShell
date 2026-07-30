@@ -615,7 +615,8 @@ replace the existing logging paths.
 export: the table's presence is the on-switch, and `OTEL_EXPORTER_OTLP_ENDPOINT`
 is ignored so enablement has a single source. TOML decides whether and where
 to export; the SDK's `OTEL_*` variables tune how. Transport is OTLP over gRPC
-only.
+only. Shared provider, resource, and tracing-layer construction lives in
+`openshell-otel`.
 
 Span emission requires no per-handler instrumentation. The `tower_http`
 `TraceLayer` in `multiplex.rs` opens a span per inbound request, and that span
