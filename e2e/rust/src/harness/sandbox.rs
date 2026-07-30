@@ -35,30 +35,43 @@ const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(600);
 /// Upper bound for best-effort sandbox deletion during test teardown.
 const SANDBOX_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Coordinates sandbox creation and cleanup across the E2E suite.
+/// Coordinates sandbox creation and cleanup in the Podman E2E lane.
 ///
-/// Parallel tests share an external gateway and compute runtime. Without
-/// coordination, automatic cleanup from one test can overlap sandbox creation
-/// in another test, leaking teardown across test boundaries and exposing
-/// backend-specific lifecycle races.
+/// A standalone Podman reproducer confirmed that removing a container with an
+/// image volume can race with another container attaching the same image. The
+/// E2E suite can trigger that Podman issue when automatic cleanup from one test
+/// overlaps sandbox creation in another test.
 ///
 /// Creates take a shared lock so concurrent-create coverage is preserved.
-/// Cleanup takes an exclusive lock so lifecycle teardown never overlaps
-/// creation in this test harness. This is intentionally not a
-/// production-driver lock: serializing a driver would reduce supported
-/// lifecycle concurrency.
-static E2E_LIFECYCLE_GATE: OnceLock<Arc<RwLock<()>>> = OnceLock::new();
+/// Cleanup takes an exclusive lock so Podman image-volume detach never overlaps
+/// attach in this test harness. This is intentionally not a production-driver
+/// lock: serializing the driver would reduce supported lifecycle concurrency.
+static PODMAN_E2E_LIFECYCLE_GATE: OnceLock<Arc<RwLock<()>>> = OnceLock::new();
 
-async fn create_guard() -> OwnedRwLockReadGuard<()> {
-    Arc::clone(E2E_LIFECYCLE_GATE.get_or_init(|| Arc::new(RwLock::new(()))))
-        .read_owned()
-        .await
+fn is_podman_e2e() -> bool {
+    std::env::var("OPENSHELL_E2E_DRIVER").as_deref() == Ok("podman")
 }
 
-async fn cleanup_guard() -> OwnedRwLockWriteGuard<()> {
-    Arc::clone(E2E_LIFECYCLE_GATE.get_or_init(|| Arc::new(RwLock::new(()))))
-        .write_owned()
-        .await
+async fn create_guard() -> Option<OwnedRwLockReadGuard<()>> {
+    if !is_podman_e2e() {
+        return None;
+    }
+    Some(
+        Arc::clone(PODMAN_E2E_LIFECYCLE_GATE.get_or_init(|| Arc::new(RwLock::new(()))))
+            .read_owned()
+            .await,
+    )
+}
+
+async fn cleanup_guard() -> Option<OwnedRwLockWriteGuard<()>> {
+    if !is_podman_e2e() {
+        return None;
+    }
+    Some(
+        Arc::clone(PODMAN_E2E_LIFECYCLE_GATE.get_or_init(|| Arc::new(RwLock::new(()))))
+            .write_owned()
+            .await,
+    )
 }
 
 async fn delete_sandbox(name: &str) {
