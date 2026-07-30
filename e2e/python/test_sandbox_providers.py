@@ -229,6 +229,52 @@ def test_profileless_provider_credentials_fail_closed(
             assert url == "NOT_SET"
 
 
+def test_endpointless_profile_credentials_use_explicit_policy_binding(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """An endpointless profile emits credentials only with an explicit binding."""
+    with provider(
+        sandbox_client._stub,
+        name="e2e-test-google-cloud-policy-binding",
+        provider_type="google-cloud",
+        credentials={"GCP_ADC_ACCESS_TOKEN": "gcp-e2e-token"},
+    ) as provider_name:
+        policy = _default_policy()
+        policy.network_policies["gcp_storage"].CopyFrom(
+            sandbox_pb2.NetworkPolicyRule(
+                name="gcp_storage",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="storage.googleapis.com",
+                        port=443,
+                        protocol="rest",
+                        access="full",
+                        credential_binding=sandbox_pb2.NetworkCredentialBinding(
+                            provider=provider_name
+                        ),
+                    )
+                ],
+            )
+        )
+        spec = datamodel_pb2.SandboxSpec(
+            policy=policy,
+            providers=[provider_name],
+        )
+
+        def read_gcp_token() -> str:
+            import os
+
+            return os.environ.get("GCP_ADC_ACCESS_TOKEN", "NOT_SET")
+
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            result = sb.exec_python(read_gcp_token)
+            assert result.exit_code == 0, result.stderr
+            assert _is_placeholder_for_env_key(
+                result.stdout.strip(), "GCP_ADC_ACCESS_TOKEN"
+            )
+
+
 def test_nvidia_provider_injects_nvidia_api_key_env_var(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,

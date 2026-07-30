@@ -190,7 +190,10 @@ fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<
 /// cannot compete with the single L7/connection-config endpoint selected for
 /// that request.
 fn endpoint_contributes_request_pipeline_metadata(endpoint: &NetworkEndpoint) -> bool {
-    !endpoint.protocol.is_empty() || !endpoint.allowed_ips.is_empty() || !endpoint.tls.is_empty()
+    !endpoint.protocol.is_empty()
+        || !endpoint.allowed_ips.is_empty()
+        || !endpoint.tls.is_empty()
+        || endpoint.credential_binding.is_some()
 }
 
 fn request_pipeline_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<String> {
@@ -252,6 +255,20 @@ fn request_pipeline_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -
         "signing_region",
         &left.signing_region,
         &right.signing_region,
+    );
+    push_conflict(
+        &mut conflicts,
+        "credential_binding.provider",
+        &left
+            .credential_binding
+            .as_ref()
+            .map(|binding| binding.provider.as_str())
+            .unwrap_or_default(),
+        &right
+            .credential_binding
+            .as_ref()
+            .map(|binding| binding.provider.as_str())
+            .unwrap_or_default(),
     );
 
     if left.protocol.eq_ignore_ascii_case("graphql")
@@ -893,6 +910,27 @@ mod tests {
                 .conflicts
                 .iter()
                 .any(|field| field.contains("allow_encoded_slash"))
+        );
+    }
+
+    #[test]
+    fn credential_binding_conflicts_are_rejected_on_same_endpoint() {
+        let mut left = endpoint("api.example.com", 443);
+        left.credential_binding = Some(openshell_core::proto::NetworkCredentialBinding {
+            provider: "provider-a".to_string(),
+        });
+        let mut right = endpoint("api.example.com", 443);
+        right.credential_binding = Some(openshell_core::proto::NetworkCredentialBinding {
+            provider: "provider-b".to_string(),
+        });
+
+        let ambiguities = find_endpoint_ambiguities(&policy_with(left, right));
+        assert_eq!(ambiguities.len(), 1);
+        assert!(
+            ambiguities[0]
+                .conflicts
+                .iter()
+                .any(|field| field.contains("credential_binding.provider"))
         );
     }
 

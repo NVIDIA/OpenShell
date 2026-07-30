@@ -587,10 +587,26 @@ pub(super) async fn load_provider_environment_records(
     Ok(records)
 }
 
+#[cfg(test)]
 pub(super) async fn resolve_provider_environment_from_records(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
     records: &[ProviderEnvironmentRecord],
+) -> Result<ProviderEnvironment, Status> {
+    resolve_provider_environment_from_records_with_policy_bindings(
+        store,
+        catalog,
+        records,
+        &HashMap::new(),
+    )
+    .await
+}
+
+pub(super) async fn resolve_provider_environment_from_records_with_policy_bindings(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[ProviderEnvironmentRecord],
+    policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
 ) -> Result<ProviderEnvironment, Status> {
     if records.is_empty() {
         return Ok(ProviderEnvironment::default());
@@ -628,7 +644,28 @@ pub(super) async fn resolve_provider_environment_from_records(
                 })
                 .collect::<Vec<_>>()
         });
-        let profile_has_no_usable_endpoint = profile_endpoints.as_ref().is_some_and(Vec::is_empty);
+        let policy_endpoints = policy_bindings.get(name);
+        let effective_endpoints = match (&profile_endpoints, policy_endpoints) {
+            (Some(profile_endpoints), Some(_policy_endpoints)) if !profile_endpoints.is_empty() => {
+                return Err(Status::failed_precondition(format!(
+                    "provider '{name}' profile already defines credential endpoints; \
+                     remove credential_binding from the sandbox policy endpoint"
+                )));
+            }
+            (Some(profile_endpoints), Some(policy_endpoints)) => {
+                debug_assert!(profile_endpoints.is_empty());
+                Some(policy_endpoints)
+            }
+            (Some(profile_endpoints), None) => Some(profile_endpoints),
+            (None, Some(_)) => {
+                return Err(Status::failed_precondition(format!(
+                    "provider '{name}' has no provider profile; policy credential binding \
+                     requires an endpointless provider profile"
+                )));
+            }
+            (None, None) => None,
+        };
+        let has_no_usable_endpoint = effective_endpoints.is_some_and(Vec::is_empty);
 
         for (key, value) in &provider.credentials {
             if is_non_injectable_provider_credential(provider, key) {
@@ -640,7 +677,7 @@ pub(super) async fn resolve_provider_environment_from_records(
                 continue;
             }
             if is_valid_env_key(key) {
-                if profile_has_no_usable_endpoint {
+                if has_no_usable_endpoint {
                     // Static credentials need a complete binding. Do not send
                     // endpointless profile credentials as invalid metadata,
                     // because one rejected key would revoke every unrelated
@@ -671,7 +708,7 @@ pub(super) async fn resolve_provider_environment_from_records(
                 }
                 provider_env.insert(key.clone(), value.clone());
                 static_credential_keys.insert(key.clone());
-                if let Some(endpoints) = &profile_endpoints {
+                if let Some(endpoints) = effective_endpoints {
                     if record.object_id.is_empty() {
                         return Err(Status::failed_precondition(format!(
                             "provider '{name}' has no stable object identity"
@@ -2203,6 +2240,17 @@ fn profiles_from_import_items(
             });
             continue;
         };
+        for (index, endpoint) in profile.endpoints.iter().enumerate() {
+            if endpoint.credential_binding.is_some() {
+                diagnostics.push(ProfileValidationDiagnostic {
+                    source: source.clone(),
+                    profile_id: profile.id.clone(),
+                    field: format!("endpoints[{index}].credential_binding"),
+                    message: "credential_binding references a concrete sandbox provider and is only valid in sandbox policy".to_string(),
+                    severity: "error".to_string(),
+                });
+            }
+        }
         profiles.push((source, ProviderTypeProfile::from_proto(profile)));
     }
     (profiles, diagnostics)
@@ -2395,6 +2443,7 @@ async fn profile_attached_sandbox_diagnostics(
         let sandbox_name = sandbox.object_name().to_string();
         let sandbox_workspace = sandbox.object_workspace().to_string();
         let spec = sandbox.spec.as_ref().expect("filtered by scan_sandboxes");
+        let base_policy = super::policy::current_base_policy_for_sandbox(store, &sandbox).await?;
         let mut bindings = Vec::new();
         let mut provider_layers = Vec::new();
         let mut imported_profiles_used = Vec::<(String, String)>::new();
@@ -2444,13 +2493,28 @@ async fn profile_attached_sandbox_diagnostics(
                     !endpoint_ports(endpoint.port, &endpoint.ports).is_empty()
                         && !endpoint.host.trim().is_empty()
                 });
-                if has_static_credentials && !has_usable_endpoint {
+                let has_policy_binding = super::policy::policy_has_credential_binding_for_provider(
+                    &base_policy,
+                    provider_name,
+                );
+                if has_static_credentials && !has_usable_endpoint && !has_policy_binding {
                     diagnostics.push(ProfileValidationDiagnostic {
                         source: source.clone(),
                         profile_id: profile_id.to_string(),
                         field: "endpoints".to_string(),
                         message: format!(
                             "{operation} would leave static provider credentials without an authorized endpoint on sandbox '{sandbox_name}'"
+                        ),
+                        severity: "error".to_string(),
+                    });
+                }
+                if has_usable_endpoint && has_policy_binding {
+                    diagnostics.push(ProfileValidationDiagnostic {
+                        source: source.clone(),
+                        profile_id: profile_id.to_string(),
+                        field: "endpoints".to_string(),
+                        message: format!(
+                            "{operation} would give provider '{provider_name}' both profile endpoint bindings and sandbox policy credential bindings on sandbox '{sandbox_name}'"
                         ),
                         severity: "error".to_string(),
                     });
@@ -2507,25 +2571,22 @@ async fn profile_attached_sandbox_diagnostics(
                 });
             }
         }
-        if validate_policy_composition {
-            let base_policy =
-                super::policy::current_base_policy_for_sandbox(store, &sandbox).await?;
-            if let Err(error) =
+        if validate_policy_composition
+            && let Err(error) =
                 super::policy::validate_candidate_effective_policy(&base_policy, &provider_layers)
-            {
-                for (source, profile_id) in &imported_profiles_used {
-                    diagnostics.push(ProfileValidationDiagnostic {
-                        source: source.clone(),
-                        profile_id: profile_id.clone(),
-                        field: "endpoints".to_string(),
-                        message: format!(
-                            "{operation} would create ambiguous network endpoints on sandbox \
-                             '{sandbox_name}': {}",
-                            error.message()
-                        ),
-                        severity: "error".to_string(),
-                    });
-                }
+        {
+            for (source, profile_id) in &imported_profiles_used {
+                diagnostics.push(ProfileValidationDiagnostic {
+                    source: source.clone(),
+                    profile_id: profile_id.clone(),
+                    field: "endpoints".to_string(),
+                    message: format!(
+                        "{operation} would create ambiguous network endpoints on sandbox \
+                         '{sandbox_name}': {}",
+                        error.message()
+                    ),
+                    severity: "error".to_string(),
+                });
             }
         }
     }
@@ -6857,6 +6918,60 @@ mod tests {
                 .get("GITHUB_TOKEN")
                 .is_some_and(|binding| !binding.endpoints.is_empty()),
             "the valid credential must retain its endpoint binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_binds_endpointless_profile_from_policy() {
+        let store = test_store().await;
+        let mut google_cloud = google_cloud_provider(HashMap::from([(
+            "project_id".to_string(),
+            "sandbox-project".to_string(),
+        )]));
+        google_cloud.credentials = HashMap::from([(
+            "GCP_ADC_ACCESS_TOKEN".to_string(),
+            "google-token".to_string(),
+        )]);
+        create_provider_record(&store, "default", google_cloud)
+            .await
+            .unwrap();
+
+        let provider_names = ["my-google-cloud".to_string()];
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap();
+        let records = load_provider_environment_records(&store, "default", &provider_names)
+            .await
+            .unwrap();
+        let policy_bindings = HashMap::from([(
+            "my-google-cloud".to_string(),
+            vec![StaticCredentialEndpointBinding {
+                host: "storage.googleapis.com".to_string(),
+                port: 443,
+                path: "/**".to_string(),
+            }],
+        )]);
+
+        let result = resolve_provider_environment_from_records_with_policy_bindings(
+            &store,
+            &catalog,
+            &records,
+            &policy_bindings,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.get("GCP_ADC_ACCESS_TOKEN"),
+            Some(&"google-token".to_string())
+        );
+        assert_eq!(
+            result
+                .static_credential_bindings
+                .get("GCP_ADC_ACCESS_TOKEN")
+                .map(|binding| binding.endpoints.as_slice()),
+            Some(policy_bindings["my-google-cloud"].as_slice())
         );
     }
 
