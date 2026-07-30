@@ -1,0 +1,45 @@
+[Unit]
+Description=OpenShell Gateway (user)
+Documentation=https://github.com/NVIDIA/OpenShell
+After=podman.socket
+Wants=podman.socket
+
+[Service]
+Type=exec
+# On first start the unit seeds a default TOML config and generates PKI.
+# Client certs are placed in ~/.config/openshell/gateways/openshell/mtls/ so
+# the CLI discovers them automatically.
+# See /usr/share/doc/openshell-gateway/ for details.
+
+# Seed a default TOML config on first start. On upgrade, replace only the exact
+# schema-v1 config previously seeded by this package; preserve edited files.
+# %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
+ExecStartPre=%{_libexecdir}/%{name}-gateway-migrate-config %%E/openshell/gateway.toml /usr/share/openshell-gateway/gateway.toml.default /usr/share/openshell-gateway/gateway.toml.default.v1
+
+# Reject an invalid selected configuration before generating certificates or
+# starting the gateway. The environment file below applies to every command.
+ExecStartPre=/usr/bin/openshell-gateway config preflight
+
+# Auto-generate PKI on first start if not present.
+# The default local TLS dir uses %%h because %%S resolves differently across
+# systemd user-manager versions. gateway.env may override this path.
+Environment=OPENSHELL_LOCAL_TLS_DIR=%%h/.local/state/openshell/tls
+ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal
+
+# gateway.env is honored for backward compatibility with pre-1415 installs.
+# New installs use runtime defaults; create gateway.toml to override.
+# See TROUBLESHOOTING.md for the env-to-TOML migration guide.
+EnvironmentFile=-%%E/openshell/gateway.env
+ExecStart=/usr/bin/openshell-gateway
+StateDirectory=openshell
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=default.target
