@@ -6,6 +6,8 @@ use futures::Stream;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+#[cfg(target_os = "linux")]
+use openshell_driver_vm::check_kvm_access;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, procguard, run_vm};
@@ -24,6 +26,10 @@ use tracing_subscriber::EnvFilter;
 #[command(version = VERSION)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    #[cfg(target_os = "linux")]
+    #[arg(long, hide = true, default_value_t = false)]
+    check_kvm_access: bool,
+
     #[arg(long, hide = true, default_value_t = false)]
     internal_run_vm: bool,
 
@@ -166,6 +172,12 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    #[cfg(target_os = "linux")]
+    if args.check_kvm_access {
+        check_kvm_access().map_err(|err| miette::miette!("{err}"))?;
+        return Ok(());
+    }
+
     if args.internal_run_vm {
         // We intentionally defer procguard arming until `run_vm()` so
         // that the only arm is the one that knows how to clean up
@@ -647,6 +659,13 @@ mod tests {
         let args = Args::parse_from(["openshell-driver-vm"]);
         let err = compute_driver_listen_mode(&args).expect_err("default TCP should be disabled");
         assert!(err.contains("--bind-socket is required"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_kvm_access_preflight() {
+        let args = Args::parse_from(["openshell-driver-vm", "--check-kvm-access"]);
+        assert!(args.check_kvm_access);
     }
 
     #[test]

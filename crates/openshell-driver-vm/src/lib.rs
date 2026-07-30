@@ -17,6 +17,8 @@ pub use lifecycle::{
     LaunchPlan, LifecycleError, LifecycleExtension, LifecycleExtensionRegistry, LifecycleResult,
     RestoreContext,
 };
+#[cfg(target_os = "linux")]
+pub use runtime::check_kvm_access;
 pub use runtime::{
     VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, cleanup_stale_tap_interfaces,
     configured_runtime_dir, run_vm,

@@ -1401,7 +1401,7 @@ fn path_to_cstring(path: &Path) -> Result<CString, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn check_kvm_access() -> Result<(), String> {
+pub fn check_kvm_access() -> Result<(), String> {
     std::fs::OpenOptions::new()
         .read(true)
         .open("/dev/kvm")
