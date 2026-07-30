@@ -93,12 +93,11 @@ one file at a time and rejects stale resource versions. When
 instances of that type on the next sandbox config sync.
 
 <Warning>
-Static credentials require a built-in or imported provider profile with at
-least one endpoint. OpenShell does not activate static credentials from a
-profileless provider because it cannot determine where those credentials are
-safe to use. The legacy `generic` provider type has no built-in endpoint
-profile. Import a custom profile and use its ID as `--type` for custom
-credentials.
+Static credentials require a built-in or imported provider profile. Profiles
+normally define at least one endpoint. An endpointless profile requires an
+explicit `credential_binding.provider` on a sandbox policy endpoint. OpenShell
+does not activate static credentials from a profileless provider because it
+cannot determine which credential definition applies.
 </Warning>
 
 ## Manage Providers
@@ -260,7 +259,8 @@ openshell sandbox create --provider my-claude --provider my-github -- claude
 
 Each `--provider` flag attaches one provider. The sandbox receives eligible
 credentials from every attached provider as placeholders at runtime. Each
-static credential resolves only for endpoints in that provider's profile.
+static credential resolves only for endpoints in that provider's profile, or
+for explicitly bound sandbox policy endpoints when the profile is endpointless.
 Profile-managed providers also contribute provider-generated network policy
 entries when `providers_v2_enabled` is enabled at the gateway. When the setting
 is disabled, endpoint binding still applies, but provider-generated policy does
@@ -303,18 +303,22 @@ placeholder, the proxy resolves it immediately before forwarding the request.
 Static credential resolution has two independent authorization boundaries:
 
 1. Network policy must allow the calling binary and request destination.
-2. The credential's provider profile must include the request host, port, and
-   path.
+2. The credential binding must include the request host, port, and path. Profile
+   endpoints provide the binding by default. An endpointless profile can use a
+   sandbox policy endpoint that names the attached provider instance through
+   `credential_binding.provider`.
 
-Both checks must pass. Adding an endpoint to sandbox policy does not expand
-where an attached provider credential can resolve. Likewise, a provider profile
-endpoint does not grant network access unless provider policy composition or
-the sandbox's own policy allows the request.
+Both checks must pass. A provider profile endpoint does not grant network access
+unless provider policy composition or the sandbox's own policy allows the
+request. A plain sandbox policy endpoint does not grant credential use unless
+the profile already covers it or the endpoint explicitly binds an endpointless
+provider.
 
 Endpoint binding applies whether `providers_v2_enabled` is enabled or disabled.
 The setting controls provider policy composition only. Every static credential
-declared by a provider currently receives the complete endpoint set from that
-provider's profile.
+declared by a provider receives the complete endpoint set from that provider's
+profile, or the explicitly bound sandbox policy endpoints for an endpointless
+profile.
 
 Credential resolution requires the proxy to handle the request as HTTP. Raw
 `tls: skip` and non-HTTP tunnels remain opaque and do not support credential
@@ -340,7 +344,7 @@ bodies, or WebSocket binary frames.
 
 ### Fail-closed behavior
 
-If policy allows a request but the credential's profile does not include the
+If policy allows a request but the credential binding does not include the
 request endpoint, the proxy rejects the request with HTTP 403 and the
 `credential_endpoint_mismatch` reason. It emits a denied activity event and a
 security finding without recording the secret, placeholder, environment key, or
@@ -362,10 +366,11 @@ the profile's `api.github.com:443` and `github.com:443` endpoints. Even if a
 sandbox policy allows `uploads.example.com:443`, sending either placeholder
 there returns `credential_endpoint_mismatch`.
 
-For a custom service, define the credential and its allowed endpoints in a
-custom provider profile, import the profile, and create the provider with the
-profile ID as its type. Refer to [Provider Profiles](/sandboxes/providers-v2#provider-profiles)
-for the profile workflow and schema.
+For a custom service, define the credential in a custom provider profile. Put
+stable endpoints in the profile, or leave the profile endpointless and bind
+each concrete provider instance from sandbox policy. Refer to [Provider
+Profiles](/sandboxes/providers-v2#provider-profiles) for the profile workflow
+and schema.
 
 ## Supported Provider Types
 
