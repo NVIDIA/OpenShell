@@ -51,6 +51,9 @@ tests:
       - matchRegex:
           path: spec.template.spec.containers[0].lifecycle.preStop.exec.command[2]
           pattern: 'select\(\.type != "openshell-cni"\)'
+      - matchRegex:
+          path: spec.template.spec.serviceAccountName
+          pattern: -cni$
 
   - it: scopes cni annotation lookup to explicit sandbox namespace
     template: templates/cni-daemonset.yaml
@@ -102,6 +105,16 @@ tests:
       - matchRegex:
           path: spec.template.spec.containers[0].lifecycle.preStop.exec.command[2]
           pattern: 'openshell-cni\.conf'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'host_state_dir="/etc/kubernetes/cni/openshell"'
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: cni-state
+            hostPath:
+              path: /etc/kubernetes/cni/openshell
+              type: DirectoryOrCreate
 
   - it: fails multus-chain mode without a chain dir
     template: templates/cni-daemonset.yaml

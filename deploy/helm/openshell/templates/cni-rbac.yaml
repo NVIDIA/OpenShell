@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if .Values.cni.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "openshell.cniServiceAccountName" . }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cni
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "openshell.cniServiceAccountName" . }}
+  namespace: {{ include "openshell.sandboxNamespace" . }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cni
+rules:
+  # The CNI plugin reads the sandbox pod's annotations during CNI ADD to
+  # decide whether to install bypass-prevention rules in the pod netns.
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "openshell.cniServiceAccountName" . }}
+  namespace: {{ include "openshell.sandboxNamespace" . }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cni
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "openshell.cniServiceAccountName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openshell.cniServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
