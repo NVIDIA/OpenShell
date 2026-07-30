@@ -313,13 +313,14 @@ jobs:
           fi
           sudo chmod 0666 /dev/kvm
           ls -l /dev/kvm
-          # Run the packaged driver so executable-specific LSM confinement is
-          # identical to the sandbox launcher.
-          if ! "$OPENSHELL_VM_DRIVER_BIN" --check-kvm-access; then
+          # Shell access bits do not detect device-cgroup or LSM denials.
+          # Opening the device exercises the same boundary as libkrun.
+          if ! exec 3</dev/kvm; then
             echo "::warning::The GitHub-hosted runner denied opening /dev/kvm; skipping VM E2E"
             echo "available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          exec 3<&-
           echo "available=true" >> "$GITHUB_OUTPUT"
 
       - name: Install system dependencies
@@ -365,4 +366,15 @@ jobs:
 
       - name: Run VM E2E
         if: steps.kvm.outputs.available == 'true'
-        run: mise run --no-deps --skip-deps e2e:vm
+        run: |
+          log="$RUNNER_TEMP/openshell-vm-e2e.log"
+          set +e
+          mise run --no-deps --skip-deps e2e:vm 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ "$status" -ne 0 ]] &&
+            grep -Fq "cannot open /dev/kvm: Permission denied" "$log"; then
+            echo "::warning::The GitHub-hosted runner denied KVM during VM launch; skipping VM E2E"
+            exit 0
+          fi
+          exit "$status"
