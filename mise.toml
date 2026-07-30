@@ -22,6 +22,9 @@ lockfile_platforms = ["linux-x64", "linux-arm64", "macos-arm64"]
 python = "3.14.5"
 rust = "1.95.0"
 node = "24.15.0"
+# Builds the openshell-containerd-shim cgo library for openshell-driver-vm
+# (crates/openshell-driver-vm/goshim/); see tasks/scripts/vm/build-containerd-shim.sh.
+go = "1.26.4"
 kubectl = "1.36.1"
 uv = "0.10.12"
 protoc = "29.6"

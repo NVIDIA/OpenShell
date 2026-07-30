@@ -20,14 +20,16 @@
 
 ARG OSXCROSS_IMAGE=ghcr.io/crazy-max/osxcross:latest
 ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12-slim
+ARG GO_VERSION=1.26.4
 
 FROM ${OSXCROSS_IMAGE} AS osxcross
 
 FROM ${PYTHON_IMAGE} AS builder
 
 ARG CARGO_TARGET_CACHE_SCOPE=default
+ARG GO_VERSION
 
-ENV PATH="/root/.cargo/bin:/usr/local/bin:/osxcross/bin:${PATH}"
+ENV PATH="/root/.cargo/bin:/usr/local/bin:/usr/local/go/bin:/osxcross/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/osxcross/lib"
 
 COPY --from=osxcross /osxcross /osxcross
@@ -39,11 +41,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     curl \
     pkg-config \
+    zstd \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95.0
 
 RUN rustup target add aarch64-apple-darwin
+
+# Go toolchain used to cross-build openshell-containerd-shim's cgo shared
+# library for macOS (GOOS=darwin GOARCH=arm64 via osxcross's oa64-clang).
+# See tasks/scripts/vm/build-containerd-shim.sh.
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+    | tar -C /usr/local -xz
 
 WORKDIR /build
 
@@ -87,6 +96,15 @@ RUN --mount=type=cache,id=cargo-registry-driver-vm-macos,sharing=locked,target=/
 # Stage 2: real build with compressed runtime artifacts
 # ---------------------------------------------------------------------------
 COPY crates/ crates/
+COPY tasks/scripts/vm/build-containerd-shim.sh tasks/scripts/vm/_lib.sh tasks/scripts/vm/
+
+# Cross-build the containerd shim's cgo shared library for macOS using
+# osxcross's oa64-clang as CC, staged directly into the compressed runtime
+# dir so build.rs picks it up the same way it does the host-provided
+# libkrun/libkrunfw/gvproxy/umoci artifacts below.
+RUN GOOS=darwin GOARCH=arm64 CC=oa64-clang \
+    OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=/build/vm-runtime-compressed \
+    tasks/scripts/vm/build-containerd-shim.sh
 
 # Copy compressed VM runtime artifacts for embedding.
 # These are passed in via --build-context vm-runtime-compressed=...

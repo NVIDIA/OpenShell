@@ -22,6 +22,8 @@ fn main() {
             "gvproxy.zst",
             "openshell-sandbox.zst",
             "umoci.zst",
+            "libopenshell_containerd_shim.so.zst",
+            "libopenshell_containerd_shim.dylib.zst",
         ] {
             println!("cargo:rerun-if-changed={dir}/{name}");
         }
@@ -31,14 +33,28 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
-    let (libkrun_name, libkrunfw_name) = match target_os.as_str() {
-        "macos" => ("libkrun.dylib", "libkrunfw.5.dylib"),
-        "linux" => ("libkrun.so", "libkrunfw.so.5"),
+    let (libkrun_name, libkrunfw_name, containerd_shim_name) = match target_os.as_str() {
+        "macos" => (
+            "libkrun.dylib",
+            "libkrunfw.5.dylib",
+            "libopenshell_containerd_shim.dylib",
+        ),
+        "linux" => (
+            "libkrun.so",
+            "libkrunfw.so.5",
+            "libopenshell_containerd_shim.so",
+        ),
         _ => {
             println!("cargo:warning=VM runtime not available for {target_os}-{target_arch}");
             generate_stub_resources(
                 &out_dir,
-                &["libkrun", "libkrunfw", "openshell-sandbox.zst", "umoci.zst"],
+                &[
+                    "libkrun",
+                    "libkrunfw",
+                    "openshell-sandbox.zst",
+                    "umoci.zst",
+                    "libopenshell_containerd_shim",
+                ],
             );
             return;
         }
@@ -57,6 +73,7 @@ fn main() {
                 "gvproxy.zst",
                 "openshell-sandbox.zst",
                 "umoci.zst",
+                &format!("{containerd_shim_name}.zst"),
             ],
         );
         return;
@@ -76,6 +93,7 @@ fn main() {
                 "gvproxy.zst",
                 "openshell-sandbox.zst",
                 "umoci.zst",
+                &format!("{containerd_shim_name}.zst"),
             ],
         );
         return;
@@ -93,6 +111,10 @@ fn main() {
             "openshell-sandbox.zst".to_string(),
         ),
         ("umoci.zst".to_string(), "umoci.zst".to_string()),
+        (
+            format!("{containerd_shim_name}.zst"),
+            format!("{containerd_shim_name}.zst"),
+        ),
     ];
 
     let mut all_found = true;
@@ -136,6 +158,7 @@ fn main() {
                 "gvproxy.zst",
                 "openshell-sandbox.zst",
                 "umoci.zst",
+                &format!("{containerd_shim_name}.zst"),
             ],
         );
     }

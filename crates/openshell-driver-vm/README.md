@@ -35,7 +35,7 @@ Sandbox guests execute `/opt/openshell/bin/openshell-sandbox` as PID 1 inside th
 mise run gateway:vm
 ```
 
-First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/gvproxy/umoci and `mise run vm:supervisor` builds the bundled guest supervisor. Subsequent runs are cached.
+First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/gvproxy/umoci, builds `libopenshell_containerd_shim` from `goshim/`, and `mise run vm:supervisor` builds the bundled guest supervisor. Subsequent runs are cached.
 
 By default `mise run gateway:vm`:
 
@@ -170,16 +170,26 @@ background. The driver publishes platform events for image resolution, cache
 hits/misses, layer pulls, rootfs preparation, overlay creation, and VM launcher
 startup so the CLI can show progress through the existing sandbox watch stream.
 
+Registry image resolution and pulling (manifest/config/layer fetch, digest
+verification, OCI Image Layout construction) are implemented in Go on top of
+containerd's client libraries (`core/remotes/docker`, `pkg/archive`) rather
+than a hand-rolled registry client, in
+[`goshim/`](goshim/). That Go code is built as a small cgo shared library
+(`libopenshell_containerd_shim`) and loaded at runtime the same way the
+driver loads libkrun — there is no live `containerd` daemon involved. See
+[`src/containerd_shim.rs`](src/containerd_shim.rs) for the Rust side.
+
 The VM driver keeps two image caches. The bootstrap cache is a controlled
-`rootfs.ext4` used to boot the guest init and OpenShell supervisor. The prepared
-image cache is used when the requested sandbox image differs from the bootstrap
-image: the host downloads registry layers into a valid OCI layout, attaches that
-payload to a temporary bootstrap VM, and guest init runs `umoci raw unpack` onto
-Linux-owned ext4 storage. The resulting disk is cached under
-`<state-dir>/images/<cache-id>/rootfs.ext4` and attached read-only to later
-sandboxes. Local Docker images are still exported as rootfs tar archives and
-prepared inside the bootstrap VM. Set `OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to
-tune registry layer download parallelism (default `4`, maximum `16`).
+`rootfs.ext4` used to boot the guest init and OpenShell supervisor: the shim
+pulls the image and applies its layers directly onto the host-side rootfs
+directory before it's formatted into an ext4 disk. The prepared image cache
+is used when the requested sandbox image differs from the bootstrap image:
+the shim pulls registry layers into a valid OCI layout, the host attaches
+that payload to a temporary bootstrap VM, and guest init runs
+`umoci raw unpack` onto Linux-owned ext4 storage. The resulting disk is
+cached under `<state-dir>/images/<cache-id>/rootfs.ext4` and attached
+read-only to later sandboxes. Local Docker images are still exported as
+rootfs tar archives and prepared inside the bootstrap VM.
 Both caches are scoped by source image identity and OpenShell version, so an
 OpenShell upgrade builds a fresh guest rootfs instead of reusing one with an old
 embedded supervisor.
@@ -233,6 +243,7 @@ Each table is created atomically via `nft -f` on VM start and torn down atomical
 
 - macOS on Apple Silicon, or Linux on aarch64/x86_64 with KVM
 - Rust toolchain
+- Go toolchain (`mise` installs it; see `[tools]` in the repo's `mise.toml`) to build `goshim/` into `libopenshell_containerd_shim` via cgo. `CGO_ENABLED=1` and a working C compiler are required (already present alongside the Rust toolchain).
 - e2fsprogs (`mke2fs` or `mkfs.ext4`, plus `debugfs`) for root and overlay disk image creation and QEMU environment injection
 - Guest-supervisor cross-compile toolchain (needed on macOS, and on Linux when host arch ≠ guest arch):
   - Matching rustup target: `rustup target add aarch64-unknown-linux-gnu` (or `x86_64-unknown-linux-gnu` for an amd64 guest)

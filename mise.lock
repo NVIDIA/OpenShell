@@ -94,6 +94,22 @@ checksum = "sha256:29caf036bdbb4e6f07afea31706b6f386cb5a4db9a46a3a8b462b9b78157e
 url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.22.3/cargo-zigbuild-aarch64-apple-darwin.tar.xz"
 url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/405676922"
 
+[[tools.go]]
+version = "1.26.4"
+backend = "core:go"
+
+[tools.go."platforms.linux-arm64"]
+checksum = "sha256:ef758ae7c6cf9267c9c0ef080b8965f453d89ab2d25d9eb22de4405925238768"
+url = "https://dl.google.com/go/go1.26.4.linux-arm64.tar.gz"
+
+[tools.go."platforms.linux-x64"]
+checksum = "sha256:1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f"
+url = "https://dl.google.com/go/go1.26.4.linux-amd64.tar.gz"
+
+[tools.go."platforms.macos-arm64"]
+checksum = "sha256:b62ad2b6d7d2464f12a5bcad7ff47f19d08325773b5efd21610e445a05a9bf53"
+url = "https://dl.google.com/go/go1.26.4.darwin-arm64.tar.gz"
+
 [[tools.helm]]
 version = "4.2.0"
 backend = "aqua:helm/helm"

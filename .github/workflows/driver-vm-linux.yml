@@ -165,10 +165,16 @@ jobs:
           OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${PWD}/target/vm-runtime-compressed" \
             tasks/scripts/vm/build-supervisor-bundle.sh --arch "${{ matrix.guest_arch }}"
 
+      - name: Build containerd shim
+        run: |
+          set -euo pipefail
+          OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${PWD}/target/vm-runtime-compressed" \
+            mise x -- tasks/scripts/vm/build-containerd-shim.sh
+
       - name: Verify embedded driver inputs
         run: |
           set -euo pipefail
-          for file in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst umoci.zst openshell-sandbox.zst; do
+          for file in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst umoci.zst openshell-sandbox.zst libopenshell_containerd_shim.so.zst; do
             test -s "target/vm-runtime-compressed/${file}"
           done
 

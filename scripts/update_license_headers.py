@@ -37,6 +37,7 @@ LICENSE_ID = "Apache-2.0"
 COMMENT_STYLES: dict[str, str] = {
     ".rs": "//",
     ".proto": "//",
+    ".go": "//",
     ".py": "#",
     ".sh": "#",
     ".toml": "#",
@@ -62,6 +63,10 @@ EXCLUDE_FILES: set[str] = {
     "Cargo.lock",
     "uv.lock",
     ".gitlab-ci.yml",
+    # go.mod/go.sum are rewritten by `go mod tidy`, which strips leading
+    # comments; treat them like other lockfile-adjacent manifests.
+    "go.mod",
+    "go.sum",
 }
 
 # Glob-style directory prefixes to also skip (CI / editor config dirs).
