@@ -415,6 +415,14 @@ else
 #!/usr/bin/env bash
 set -euo pipefail
 
+report_timing() {
+	local label=\$1
+	local started_at=\$2
+
+	echo "==> Timing: \${label}: \$((SECONDS - started_at))s"
+}
+
+phase_started_at=\${SECONDS}
 umask 077
 state_root=/home/openshell/.cache/openshell-e2e
 config_path=\${state_root}/gateway.toml
@@ -432,11 +440,15 @@ export XDG_CONFIG_HOME=\${state_root}/xdg/config
 export XDG_CACHE_HOME=\${state_root}/xdg/cache
 export XDG_DATA_HOME=\${state_root}/xdg/data
 export XDG_STATE_HOME=\${state_root}/xdg/state
+report_timing "guest gateway setup" "\${phase_started_at}"
 if [ -f "${guest_supervisor_archive_path}" ]; then
+	phase_started_at=\${SECONDS}
 	podman --url "unix:///run/user/\$(id -u)/podman/podman.sock" import \
 		--change 'ENTRYPOINT ["/openshell-sandbox"]' \
 		"${guest_supervisor_archive_path}" \
 		localhost/openshell/supervisor:e2e-vm >/dev/null
+	report_timing "Podman supervisor import" "\${phase_started_at}"
+	phase_started_at=\${SECONDS}
 	relay_socket=\${state_root}/podman-gateway.sock
 	rm -f "\${relay_socket}"
 	socat "UNIX-LISTEN:\${relay_socket},fork" TCP:127.0.0.1:8080 &
@@ -458,6 +470,7 @@ if [ -f "${guest_supervisor_archive_path}" ]; then
 		echo "ERROR: failed to start the rootless-network Podman gateway relay" >&2
 		exit 1
 	fi
+	report_timing "Podman network relays" "\${phase_started_at}"
 fi
 cd /home/openshell
 exec /usr/local/bin/openshell-gateway \
@@ -477,10 +490,12 @@ EOF
 	done
 	vm_args+=(
 		--copy "${guest_gateway_bin}:/usr/local/bin/openshell-gateway"
-		--copy "${linux_sandbox_bin}:/home/openshell/.cache/openshell-e2e/bin/openshell-sandbox"
 		--copy "${guest_launcher}:${guest_launcher_path}"
 		--forward-port "${host_port}:${guest_port}"
 	)
+	if [ "${vm_uses_podman}" -eq 0 ]; then
+		vm_args+=(--copy "${linux_sandbox_bin}:/home/openshell/.cache/openshell-e2e/bin/openshell-sandbox")
+	fi
 	if [ -n "${supervisor_archive}" ]; then
 		vm_args+=(--copy "${supervisor_archive}:${guest_supervisor_archive_path}")
 	fi
@@ -543,6 +558,10 @@ wait_for_gateway() {
 		if probe_gateway "${probe_log}" &&
 			grep -q "Connected" "${probe_log}"; then
 			echo "==> Gateway ready after ${elapsed}s"
+			if [ "${mode}" = vm ] && grep -q '^==> Timing:' "${runtime_log}"; then
+				echo "==> VM gateway readiness breakdown"
+				sed -n 's/^==> Timing: /    /p' "${runtime_log}"
+			fi
 			return 0
 		fi
 		sleep 1
