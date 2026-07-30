@@ -1033,6 +1033,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_credentials(
                 })
                 .collect::<Vec<_>>()
         });
+        let profile_has_no_usable_endpoint = profile_endpoints.as_ref().is_some_and(Vec::is_empty);
 
         for (key, value) in &provider.credentials {
             if is_non_injectable_provider_credential(provider, key) {
@@ -1044,6 +1045,18 @@ pub(super) async fn resolve_provider_environment_from_records_with_credentials(
                 continue;
             }
             if is_valid_env_key(key) {
+                if profile_has_no_usable_endpoint {
+                    // Static credentials need a complete binding. Do not send
+                    // endpointless profile credentials as invalid metadata,
+                    // because one rejected key would revoke every unrelated
+                    // static credential in the supervisor snapshot.
+                    warn!(
+                        provider_name = %name,
+                        key = %key,
+                        "withholding static provider credential from endpointless profile"
+                    );
+                    continue;
+                }
                 let expires_at_ms = provider
                     .credential_expires_at_ms
                     .get(key)
@@ -7716,6 +7729,85 @@ mod tests {
                 .static_credential_bindings
                 .get("CLAUDE_API_KEY")
                 .is_some_and(|binding| !binding.endpoints.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_withholds_endpointless_profile_credentials_independently() {
+        let store = test_store().await;
+        let expires_at_ms = crate::persistence::current_time_ms() + 60_000;
+        let mut google_cloud = google_cloud_provider(HashMap::from([(
+            "project_id".to_string(),
+            "sandbox-project".to_string(),
+        )]));
+        google_cloud.credentials = HashMap::from([(
+            "GCP_ADC_ACCESS_TOKEN".to_string(),
+            "google-token".to_string(),
+        )]);
+        google_cloud.credential_expires_at_ms =
+            HashMap::from([("GCP_ADC_ACCESS_TOKEN".to_string(), expires_at_ms)]);
+        create_provider_record(&store, "default", google_cloud)
+            .await
+            .unwrap();
+
+        let mut github = provider_with_values("bound-github", "github");
+        github.credentials =
+            HashMap::from([("GITHUB_TOKEN".to_string(), "github-token".to_string())]);
+        github.config.clear();
+        create_provider_record(&store, "default", github)
+            .await
+            .unwrap();
+
+        let result = resolve_provider_environment(
+            &store,
+            "default",
+            &["my-google-cloud".to_string(), "bound-github".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !result.contains_key("GCP_ADC_ACCESS_TOKEN"),
+            "endpointless static credentials must be withheld"
+        );
+        assert!(
+            !result
+                .credential_expires_at_ms
+                .contains_key("GCP_ADC_ACCESS_TOKEN"),
+            "withheld static credentials must not retain expiry metadata"
+        );
+        assert!(
+            !result
+                .static_credential_keys
+                .contains("GCP_ADC_ACCESS_TOKEN"),
+            "withheld static credentials must not be classified as static"
+        );
+        assert!(
+            !result
+                .static_credential_bindings
+                .contains_key("GCP_ADC_ACCESS_TOKEN"),
+            "endpointless static credentials must not emit an invalid binding"
+        );
+        assert!(
+            result.contains_key("GCE_METADATA_HOST"),
+            "provider-generated non-secret GCP configuration must be retained"
+        );
+
+        assert_eq!(
+            result.get("GITHUB_TOKEN"),
+            Some(&"github-token".to_string()),
+            "a valid provider must not be suppressed by an endpointless provider"
+        );
+        assert!(
+            result.static_credential_keys.contains("GITHUB_TOKEN"),
+            "the valid credential must retain its static classification"
+        );
+        assert!(
+            result
+                .static_credential_bindings
+                .get("GITHUB_TOKEN")
+                .is_some_and(|binding| !binding.endpoints.is_empty()),
+            "the valid credential must retain its endpoint binding"
         );
     }
 
