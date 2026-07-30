@@ -474,11 +474,16 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         .config_file
         .as_ref()
         .and_then(|f| f.openshell.gateway.otlp.as_ref());
+    let gateway_resource = crate::otel_tracing::GatewayResourceAttributes::new(
+        Some(prepared.config.name.as_str()),
+        prepared.config.compute_drivers.first().map(String::as_str),
+    );
     let (tracing_handle, setup_error) = crate::tracing_setup::install(
         EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level)),
         &tracing_log_bus,
         otlp_config,
+        gateway_resource,
     );
 
     let has_client_ca = prepared

@@ -478,7 +478,7 @@ pub async fn spawn(
         .arg("--expected-peer-pid")
         .arg(std::process::id().to_string());
     command.arg("--log-level").arg(&config.log_level);
-    append_otlp_args(&mut command, otlp_config);
+    append_otlp_args(&mut command, otlp_config, &config.name);
     command
         .arg("--openshell-endpoint")
         .arg(&vm_config.grpc_endpoint);
@@ -521,9 +521,10 @@ pub async fn spawn(
 }
 
 #[cfg(unix)]
-fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>) {
+fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>, gateway_name: &str) {
     if let Some(config) = otlp_config {
         command.arg("--otlp-endpoint").arg(&config.endpoint);
+        command.arg("--gateway-name").arg(gateway_name);
     }
 }
 
@@ -621,7 +622,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn vm_driver_command_includes_gateway_otlp_endpoint() {
+    fn vm_driver_command_includes_gateway_otlp_configuration() {
         let mut command = tokio::process::Command::new("openshell-driver-vm");
         append_otlp_args(
             &mut command,
@@ -629,6 +630,7 @@ mod tests {
                 endpoint: "http://collector.internal:4317".to_string(),
                 service_name: Some("custom-gateway".to_string()),
             }),
+            "production-us-west",
         );
 
         let args = command
@@ -636,7 +638,15 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(args, ["--otlp-endpoint", "http://collector.internal:4317"]);
+        assert_eq!(
+            args,
+            [
+                "--otlp-endpoint",
+                "http://collector.internal:4317",
+                "--gateway-name",
+                "production-us-west"
+            ]
+        );
     }
 
     #[tokio::test]

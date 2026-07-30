@@ -663,10 +663,12 @@ between a trace and its log lines. Store and compute-driver spans become
 children of the request span. Reconciliation, provider refresh, and
 driver-watch loops create their own operation spans because they have no
 inbound request to provide a parent. gRPC status is recorded when response
-trailers arrive.
+trailers arrive. Gateway spans carry resource attributes for the gateway
+identity and configured compute driver.
 
-The gateway forwards OTLP configuration and W3C trace context to managed
-external drivers. Each driver exports under its own service name.
+The gateway forwards OTLP configuration, its configured gateway name, and W3C
+trace context to managed external drivers. Each driver exports under its own
+service name and carries the gateway name as a resource attribute.
 
 Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
 failure stops the gateway from serving: a malformed endpoint is logged at
