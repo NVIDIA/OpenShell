@@ -6467,7 +6467,7 @@ mod tests {
 
         let error = super::super::sandbox::handle_attach_sandbox_provider(
             &state,
-            Request::new(openshell_core::proto::AttachSandboxProviderRequest {
+            authed_request(openshell_core::proto::AttachSandboxProviderRequest {
                 sandbox_name: "provider-ambiguity".to_string(),
                 provider_name: "candidate-provider".to_string(),
                 expected_resource_version: 0,

@@ -4099,7 +4099,7 @@ mod tests {
         });
         let imported = handle_import_provider_profiles(
             &state,
-            Request::new(ImportProviderProfilesRequest {
+            authed_request(ImportProviderProfilesRequest {
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(initial_profile),
                     source: "fanout.yaml".to_string(),
@@ -4167,7 +4167,7 @@ mod tests {
         });
         let response = handle_update_provider_profiles(
             &state,
-            Request::new(UpdateProviderProfilesRequest {
+            authed_request(UpdateProviderProfilesRequest {
                 profile: Some(ProviderProfileImportItem {
                     profile: Some(conflicting_profile),
                     source: "fanout.yaml".to_string(),
@@ -4189,7 +4189,7 @@ mod tests {
         }));
         let stored = handle_get_provider_profile(
             &state,
-            Request::new(GetProviderProfileRequest {
+            authed_request(GetProviderProfileRequest {
                 id: "fanout-ambiguity".to_string(),
                 workspace: "default".to_string(),
             }),
