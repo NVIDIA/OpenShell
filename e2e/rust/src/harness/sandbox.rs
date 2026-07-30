@@ -7,10 +7,11 @@
 //! is dropped, replacing the `trap cleanup EXIT` pattern from the bash tests.
 
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use tokio::time::timeout;
 
 use super::binary::openshell_cmd;
@@ -30,6 +31,44 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
 /// base image), so 600s accommodates extraction + workspace-init + pod
 /// startup.
 const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Upper bound for best-effort sandbox deletion during test teardown.
+const SANDBOX_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Coordinates sandbox creation and cleanup across the E2E suite.
+///
+/// Parallel tests share an external gateway and compute runtime. Without
+/// coordination, automatic cleanup from one test can overlap sandbox creation
+/// in another test, leaking teardown across test boundaries and exposing
+/// backend-specific lifecycle races.
+///
+/// Creates take a shared lock so concurrent-create coverage is preserved.
+/// Cleanup takes an exclusive lock so lifecycle teardown never overlaps
+/// creation in this test harness. This is intentionally not a
+/// production-driver lock: serializing a driver would reduce supported
+/// lifecycle concurrency.
+static E2E_LIFECYCLE_GATE: OnceLock<Arc<RwLock<()>>> = OnceLock::new();
+
+async fn create_guard() -> OwnedRwLockReadGuard<()> {
+    Arc::clone(E2E_LIFECYCLE_GATE.get_or_init(|| Arc::new(RwLock::new(()))))
+        .read_owned()
+        .await
+}
+
+async fn cleanup_guard() -> OwnedRwLockWriteGuard<()> {
+    Arc::clone(E2E_LIFECYCLE_GATE.get_or_init(|| Arc::new(RwLock::new(()))))
+        .write_owned()
+        .await
+}
+
+async fn delete_sandbox(name: &str) {
+    let _lifecycle_guard = cleanup_guard().await;
+    let mut cmd = openshell_cmd();
+    cmd.arg("sandbox").arg("delete").arg(name);
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+
+    let _ = timeout(SANDBOX_CLEANUP_TIMEOUT, cmd.status()).await;
+}
 
 /// RAII guard that deletes a sandbox on drop.
 ///
@@ -67,6 +106,7 @@ impl SandboxGuard {
     /// Returns an error if the CLI exits with a non-zero status or the sandbox
     /// name cannot be parsed from the output.
     pub async fn create(args: &[&str]) -> Result<Self, String> {
+        let _lifecycle_guard = create_guard().await;
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox").arg("create");
         for arg in args {
@@ -139,6 +179,7 @@ impl SandboxGuard {
         command: &[&str],
         ready_marker: &str,
     ) -> Result<Self, String> {
+        let _lifecycle_guard = create_guard().await;
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox").arg("create").arg("--keep");
         for arg in create_args {
@@ -264,6 +305,7 @@ impl SandboxGuard {
         uploads: &[(&str, &str)],
         command: &[&str],
     ) -> Result<Self, String> {
+        let _lifecycle_guard = create_guard().await;
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox").arg("create");
         for (local, dest) in uploads {
@@ -511,12 +553,7 @@ impl SandboxGuard {
             let _ = child.wait().await;
         }
 
-        // Delete the sandbox.
-        let mut cmd = openshell_cmd();
-        cmd.arg("sandbox").arg("delete").arg(&self.name);
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
-
-        let _ = cmd.status().await;
+        delete_sandbox(&self.name).await;
     }
 }
 
@@ -526,14 +563,15 @@ impl Drop for SandboxGuard {
             return;
         }
 
-        // We need to run async cleanup in a sync Drop. Use block_in_place to
-        // avoid blocking the tokio runtime. This is acceptable for test code.
         let name = self.name.clone();
         let mut child = self.child.take();
 
-        // Attempt cleanup with a new runtime if we're not inside one, or
-        // block_in_place if we are.
-        std::thread::spawn(move || {
+        // Cleanup uses a separate runtime because Drop cannot await. Join the
+        // thread so teardown completes before the guard disappears; detaching
+        // it allowed cleanup to leak into a later test or be terminated when
+        // the test process exited.
+        let cleanup_name = name.clone();
+        let cleanup = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("create cleanup runtime");
             rt.block_on(async {
                 if let Some(ref mut child) = child {
@@ -541,11 +579,11 @@ impl Drop for SandboxGuard {
                     let _ = child.wait().await;
                 }
 
-                let mut cmd = openshell_cmd();
-                cmd.arg("sandbox").arg("delete").arg(&name);
-                cmd.stdout(Stdio::null()).stderr(Stdio::null());
-                let _ = cmd.status().await;
+                delete_sandbox(&name).await;
             });
         });
+        if cleanup.join().is_err() {
+            eprintln!("sandbox cleanup thread panicked for {cleanup_name}");
+        }
     }
 }
