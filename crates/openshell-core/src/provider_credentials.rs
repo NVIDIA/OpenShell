@@ -389,9 +389,15 @@ impl ProviderCredentialState {
     /// expired. The `expires_in` defaults to 3600 when expiry is unknown.
     pub fn gcp_token_response(&self) -> Option<(String, i64)> {
         const DEFAULT_EXPIRES_IN: i64 = 3600;
-        let resolver = self.resolver()?;
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        let resolver = inner.current_resolver.as_ref()?;
         for key in crate::google_cloud::TOKEN_ENV_KEYS {
-            let placeholder = crate::secrets::placeholder_for_env_key(key);
+            let Some(placeholder) = inner.current.child_env.get(*key).cloned() else {
+                continue;
+            };
             if resolver.resolve_placeholder(&placeholder).is_none() {
                 continue;
             }
@@ -1395,9 +1401,9 @@ mod tests {
             HashMap::new(),
         );
         let (placeholder, _) = state.gcp_token_response().expect("should find token");
-        assert!(
-            placeholder.contains("GCP_SA_ACCESS_TOKEN"),
-            "SA token should win over ADC, got: {placeholder}"
+        assert_eq!(
+            placeholder, "openshell:resolve:env:v1_GCP_SA_ACCESS_TOKEN",
+            "metadata must return the current revision-scoped SA placeholder"
         );
     }
 
@@ -1410,7 +1416,10 @@ mod tests {
             HashMap::new(),
         );
         let (placeholder, _) = state.gcp_token_response().expect("should find ADC token");
-        assert!(placeholder.contains("GCP_ADC_ACCESS_TOKEN"));
+        assert_eq!(
+            placeholder, "openshell:resolve:env:v1_GCP_ADC_ACCESS_TOKEN",
+            "metadata must return the current revision-scoped ADC placeholder"
+        );
     }
 
     #[test]
