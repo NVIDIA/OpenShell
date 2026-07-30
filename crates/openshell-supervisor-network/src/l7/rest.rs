@@ -717,6 +717,7 @@ where
         upstream,
         RelayRequestOptions {
             resolver,
+            credential_generation: None,
             generation_guard,
             websocket_extensions: WebSocketExtensionMode::Preserve,
             request_body_credential_rewrite: false,
@@ -740,6 +741,7 @@ pub(crate) enum WebSocketExtensionMode {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) resolver: Option<&'a SecretResolver>,
+    pub(crate) credential_generation: Option<CredentialGenerationGuard<'a>>,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) websocket_extensions: WebSocketExtensionMode,
     pub(crate) request_body_credential_rewrite: bool,
@@ -748,6 +750,38 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) signing_region: &'a str,
     pub(crate) host: &'a str,
     pub(crate) port: u16,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CredentialGenerationGuard<'a> {
+    state: &'a openshell_core::provider_credentials::ProviderCredentialState,
+    revision: u64,
+}
+
+impl<'a> CredentialGenerationGuard<'a> {
+    pub(crate) fn new(
+        state: &'a openshell_core::provider_credentials::ProviderCredentialState,
+        revision: u64,
+    ) -> Self {
+        Self { state, revision }
+    }
+
+    pub(crate) fn ensure_current(self) -> Result<()> {
+        if self.state.revision() == self.revision {
+            Ok(())
+        } else {
+            Err(miette!(
+                "provider credential generation changed before upstream write"
+            ))
+        }
+    }
+}
+
+fn ensure_credential_generation_current(options: RelayRequestOptions<'_>) -> Result<()> {
+    if let Some(guard) = options.credential_generation {
+        guard.ensure_current()?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn relay_http_request_with_options_guarded<C, U>(
@@ -760,6 +794,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    ensure_credential_generation_current(options)?;
     let header_end = req
         .raw_header
         .windows(4)
@@ -938,6 +973,7 @@ where
                             secret_key,
                             session_token,
                         )?;
+                        ensure_credential_generation_current(options)?;
                         upstream.write_all(&signed).await.into_diagnostic()?;
                     } else {
                         // Sign headers only, stream body through.
@@ -957,6 +993,7 @@ where
                             session_token,
                             signable_body,
                         )?;
+                        ensure_credential_generation_current(options)?;
                         upstream
                             .write_all(&signed_headers)
                             .await
@@ -1040,11 +1077,13 @@ where
             options.generation_guard,
         )
         .await?;
+        ensure_credential_generation_current(options)?;
         upstream.write_all(&body.headers).await.into_diagnostic()?;
         if !body.body.is_empty() {
             upstream.write_all(&body.body).await.into_diagnostic()?;
         }
     } else {
+        ensure_credential_generation_current(options)?;
         upstream
             .write_all(&rewrite_result.rewritten)
             .await

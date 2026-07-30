@@ -46,6 +46,13 @@ pub(super) fn http_context(
     dynamic_credentials: Option<DynamicCredentials>,
     agent_proposals: openshell_core::proposals::AgentProposals,
 ) -> L7EvalContext {
+    // Provider-backed credentials must be acquired from the live state for
+    // each request after middleware/token-grant awaits. Keep only the legacy
+    // resolver fallback when no live provider state exists.
+    let secret_resolver = provider_credentials
+        .is_none()
+        .then_some(secret_resolver)
+        .flatten();
     let policy_name = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone().unwrap_or_default(),
         NetworkAction::Deny { .. } => String::new(),
@@ -73,6 +80,7 @@ pub(super) fn http_context(
             .collect(),
         secret_resolver,
         provider_credentials,
+        provider_credential_revision: None,
         activity_tx,
         dynamic_credentials: dynamic_credentials.clone(),
         token_grant_resolver: dynamic_credentials
@@ -343,6 +351,7 @@ mod tests {
             cmdline_paths: vec![],
             secret_resolver: None,
             provider_credentials: None,
+            provider_credential_revision: None,
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
