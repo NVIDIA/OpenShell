@@ -302,7 +302,8 @@ without changing enforcement content. The supervisor acknowledges that newer
 revision without reloading identical policy. If the revision also requires
 middleware or policy-runtime reconciliation, acknowledgement waits until that
 reconciliation succeeds. Global policies, local overrides, equal or older
-versions, and different hashes do not use this shortcut.
+versions, and different hashes do not use this shortcut. Success telemetry is
+emitted only after the gateway accepts the resulting loaded-status report.
 
 Policy status delivery uses a FIFO background worker. Retryable delivery
 failures retain the ordered update and retry with capped exponential backoff;
