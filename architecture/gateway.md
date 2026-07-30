@@ -157,8 +157,15 @@ does not grant sandbox identity. Kubernetes deployments use the
 gateway-minted JWT bootstrap path: the supervisor starts with a projected
 ServiceAccount token, exchanges it for a gateway-minted sandbox JWT, and uses
 that JWT on subsequent gateway RPCs.
-User-facing mutations are authorized by role policy when OIDC or edge identity
-is enabled.
+User-facing RPCs are authorized by descriptor-declared role and scope policy
+when OIDC or edge identity is enabled. The OIDC admin role grants platform-wide
+access and bypasses workspace membership checks. Workspace Admin and Workspace
+User roles are durable membership records keyed by workspace and authenticated
+subject. Handlers resolve the resource workspace and require sufficient
+membership after the middleware validates the global role and optional scope.
+The authenticated `GetCurrentUser` endpoint exposes the gateway's validated
+user subject, display name, roles, scopes, and identity provider for CLI
+identity inspection without client-side token decoding.
 
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only

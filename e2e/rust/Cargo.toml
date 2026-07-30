@@ -30,7 +30,13 @@ e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
+e2e-oidc-pkce = []
 e2e-vm = ["e2e", "e2e-host-gateway"]
+
+[[test]]
+name = "oidc_pkce"
+path = "tests/oidc_pkce.rs"
+required-features = ["e2e-oidc-pkce"]
 
 [[test]]
 name = "custom_image"
@@ -140,6 +146,7 @@ rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = "0.0.12"
+url = "2"
 
 [dev-dependencies]
 serial_test = "3"

@@ -38,20 +38,21 @@ use openshell_core::proto::{
     CreateSandboxRequest, CreateSshSessionRequest, DeleteInferenceRouteRequest,
     DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
     DeleteSandboxRequest, DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest,
-    ExposeServiceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
-    GetInferenceRouteRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, GpuResourceRequirements,
-    ImportProviderProfilesRequest, LintProviderProfilesRequest, ListProviderProfilesRequest,
-    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxProvidersRequest,
-    ListSandboxesRequest, ListServicesRequest, PolicySource, PolicyStatus, Provider,
-    ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
-    ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
-    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
-    SetInferenceRouteRequest, SettingScope, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
-    exec_sandbox_event, setting_value, tcp_forward_init,
+    ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
+    GetGatewayConfigRequest, GetInferenceRouteRequest, GetProviderProfileRequest,
+    GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
+    GetSandboxRequest, GetServiceRequest, GpuResourceRequirements, ImportProviderProfilesRequest,
+    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
+    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
+    ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
+    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
+    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
+    RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
+    SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope,
+    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
+    UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
+    setting_value, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -113,6 +114,65 @@ impl ProgressOutput {
     fn is_plain(&self) -> bool {
         matches!(self, Self::Plain)
     }
+}
+
+#[derive(Debug, Clone)]
+struct CurrentUserView {
+    subject: String,
+    display_name: Option<String>,
+    roles: Vec<String>,
+    scopes: Vec<String>,
+    identity_provider: String,
+}
+
+/// Show the identity validated by the selected gateway.
+pub async fn whoami(server: &str, tls: &TlsOptions, output: &str) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let identity = client
+        .get_current_user(GetCurrentUserRequest {})
+        .await
+        .map_err(|err| match err.code() {
+            Code::Unimplemented => miette!("whoami is not supported by this gateway version"),
+            Code::Unauthenticated => miette!("whoami requires authentication: {err}"),
+            _ => miette!("get_current_user failed: {err}"),
+        })?
+        .into_inner();
+
+    let view = CurrentUserView {
+        subject: identity.subject,
+        display_name: (!identity.display_name.is_empty()).then_some(identity.display_name),
+        roles: identity.roles,
+        scopes: identity.scopes,
+        identity_provider: identity.identity_provider,
+    };
+    print_current_user(&view, output)
+}
+
+fn print_current_user(view: &CurrentUserView, output: &str) -> Result<()> {
+    if crate::output::print_output_single(output, view, current_user_to_json)? {
+        return Ok(());
+    }
+
+    println!("{}", "Current User".cyan().bold());
+    println!();
+    println!("  {} {}", "Subject:".dimmed(), view.subject);
+    if let Some(display_name) = &view.display_name {
+        println!("  {} {}", "Name:".dimmed(), display_name);
+    }
+    println!("  {} {}", "Provider:".dimmed(), view.identity_provider);
+    println!("  {} {}", "Roles:".dimmed(), view.roles.join(", "));
+    println!("  {} {}", "Scopes:".dimmed(), view.scopes.join(", "));
+    Ok(())
+}
+
+fn current_user_to_json(view: &CurrentUserView) -> serde_json::Value {
+    serde_json::json!({
+        "subject": &view.subject,
+        "display_name": &view.display_name,
+        "roles": &view.roles,
+        "scopes": &view.scopes,
+        "identity_provider": &view.identity_provider,
+    })
 }
 
 /// Validate system prerequisites for running a gateway.
@@ -420,11 +480,17 @@ pub async fn sandbox_create(
         }
         None => None,
     };
-    let providers_v2_enabled = gateway_providers_v2_enabled(&mut client).await?;
+    let inferred_provider = inferred_provider_type(command);
+    let providers_v2_enabled =
+        if inferred_provider.is_some() && auto_providers_override != Some(false) {
+            gateway_providers_v2_enabled(&mut client).await?
+        } else {
+            false
+        };
     let inferred_types: Vec<String> = if providers_v2_enabled {
         Vec::new()
     } else {
-        inferred_provider_type(command).into_iter().collect()
+        inferred_provider.into_iter().collect()
     };
     let configured_providers = ensure_required_providers(
         &mut client,

@@ -16,10 +16,11 @@ use prost::Message;
 use tonic::Status;
 
 use super::{
-    MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN,
-    MAX_METADATA_ANNOTATIONS_ENTRIES, MAX_NAME_LEN, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
-    MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN,
-    MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
+    MAX_ENVIRONMENT_ENTRIES, MAX_LABEL_SELECTOR_PAIRS, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN,
+    MAX_MAP_VALUE_LEN, MAX_METADATA_ANNOTATIONS_ENTRIES, MAX_NAME_LEN, MAX_POLICY_SIZE,
+    MAX_PROVIDER_CONFIG_ENTRIES, MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN,
+    MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN,
+    MAX_TEMPLATE_STRUCT_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -637,10 +638,17 @@ pub(super) fn validate_label_selector(selector: &str) -> Result<(), Status> {
         return Ok(());
     }
 
+    let mut count = 0usize;
     for pair in selector.split(',') {
         let pair = pair.trim();
         if pair.is_empty() {
             continue;
+        }
+        count += 1;
+        if count > MAX_LABEL_SELECTOR_PAIRS {
+            return Err(Status::invalid_argument(format!(
+                "label selector exceeds {MAX_LABEL_SELECTOR_PAIRS} pair limit"
+            )));
         }
 
         let parts: Vec<&str> = pair.splitn(2, '=').collect();
@@ -1650,6 +1658,22 @@ mod tests {
         let err = validate_label_selector(&selector).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("exceeds 63 characters"));
+    }
+
+    #[test]
+    fn validate_label_selector_rejects_too_many_pairs() {
+        let pairs: Vec<String> = (0..65).map(|i| format!("k{i}=v{i}")).collect();
+        let selector = pairs.join(",");
+        let err = validate_label_selector(&selector).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("64 pair limit"));
+    }
+
+    #[test]
+    fn validate_label_selector_accepts_max_pairs() {
+        let pairs: Vec<String> = (0..64).map(|i| format!("k{i}=v{i}")).collect();
+        let selector = pairs.join(",");
+        assert!(validate_label_selector(&selector).is_ok());
     }
 
     // ---- Policy safety ----

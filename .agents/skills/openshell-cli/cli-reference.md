@@ -39,6 +39,7 @@ openshell
 │   ├── list
 │   └── select [name]
 ├── status
+├── whoami [--output <format>]
 ├── inference
 │   ├── set --provider --model
 │   ├── update [--provider] [--model]
@@ -185,6 +186,15 @@ Show server connectivity, authentication status, and version for the active
 gateway. Connectivity uses the public health RPC; authentication is checked
 with the protected gateway-info capability query and can fail while the gateway
 remains connected.
+
+### `openshell whoami`
+
+Show the authenticated user identity: subject, display name, roles, scopes, and
+identity provider. Requires an authenticated gateway connection.
+
+| Flag | Description |
+|------|-------------|
+| `--output <FORMAT>` | Output format: `table` (default), `json`, or `yaml` |
 
 ---
 
