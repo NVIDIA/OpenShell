@@ -439,12 +439,19 @@ openshell sandbox delete my-sandbox
 
 Every sandbox moves through a defined set of phases:
 
-| Phase        | Description                                                                                                                            |
-| ------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy.                                    |
-| Ready        | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
-| Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                   |
-| Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                  |
+| Phase        | Description                                                                                                                                                    |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Provisioning | The runtime is setting up the sandbox environment, or the gateway is waiting for the sandbox supervisor to establish its authenticated control session.       |
+| Ready        | The sandbox is running and its supervisor control session is connected. You can connect, execute commands, sync files, and view logs.                          |
+| Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                                           |
+| Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |
+
+The compute backend can become ready before the sandbox supervisor connects to
+the gateway. During this interval, the sandbox remains in `Provisioning` and
+reports a `Ready=False` condition with the reason `SupervisorNotConnected`.
+After a gateway restart, an existing sandbox can return to `Provisioning`
+temporarily while its supervisor reconnects. Wait for the phase to return to
+`Ready` before you connect to the sandbox or execute commands.
 
 ## Sandbox Compute Drivers
 

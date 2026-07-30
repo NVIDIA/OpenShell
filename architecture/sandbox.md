@@ -32,7 +32,7 @@ only when the set is already empty; any other outcome fails the spawn.
 4. It starts the policy proxy and local SSH server.
 5. It opens a supervisor session back to the gateway for connect, exec, file
    sync, config polling, and log push.
-6. It launches the agent command as the restricted sandbox user.
+6. It launches the agent command as the resolved restricted identity.
 
 ## Isolation Layers
 

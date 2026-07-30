@@ -1,0 +1,88 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# PROTOTYPE: Install per-run artifacts in a disposable test guest.
+
+- name: Install test artifacts
+  hosts: test_vm
+  become: true
+  gather_facts: false
+
+  vars:
+    test_guest_packages: []
+    test_guest_copies: []
+    test_guest_package_staging_dir: /tmp/openshell-test-guest/packages
+
+  tasks:
+    - name: Install guest packages
+      when: test_guest_packages | length > 0
+      block:
+        - name: Create package staging directory
+          ansible.builtin.file:
+            path: "{{ test_guest_package_staging_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Upload guest packages
+          ansible.builtin.copy:
+            src: "{{ item }}"
+            dest: >-
+              {{ test_guest_package_staging_dir }}/package-{{
+              ansible_loop.index0 }}.{{ test_guest_package_family }}
+            mode: "0644"
+          loop: "{{ test_guest_packages }}"
+          loop_control:
+            extended: true
+            label: "{{ item }}"
+          register: test_guest_staged_packages
+
+        - name: Refresh Debian package metadata
+          ansible.builtin.apt:
+            update_cache: true
+          when: test_guest_package_family == "deb"
+
+        - name: Install Debian packages
+          ansible.builtin.apt:
+            deb: "{{ item.dest }}"
+            state: present
+          loop: "{{ test_guest_staged_packages.results }}"
+          loop_control:
+            label: "{{ item.dest }}"
+          when: test_guest_package_family == "deb"
+
+        - name: Install RPM packages
+          ansible.builtin.dnf:
+            name: "{{ item.dest }}"
+            # --install explicitly selects this local test artifact.
+            disable_gpg_check: true
+            state: present
+          loop: "{{ test_guest_staged_packages.results }}"
+          loop_control:
+            label: "{{ item.dest }}"
+          when: test_guest_package_family == "rpm"
+
+      always:
+        - name: Remove staged guest packages
+          ansible.builtin.file:
+            path: "{{ test_guest_package_staging_dir }}"
+            state: absent
+
+    - name: Create artifact destination directories
+      ansible.builtin.file:
+        path: "{{ item.destination | dirname }}"
+        state: directory
+      loop: "{{ test_guest_copies }}"
+      loop_control:
+        label: "{{ item.destination }}"
+
+    - name: Copy executable artifacts
+      ansible.builtin.copy:
+        src: "{{ item.source }}"
+        dest: "{{ item.destination }}"
+        owner: root
+        group: root
+        mode: "0755"
+      loop: "{{ test_guest_copies }}"
+      loop_control:
+        label: "{{ item.destination }}"

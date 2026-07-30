@@ -119,17 +119,24 @@ Sets the OS-level identity for the agent process inside the sandbox.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `run_as_user` | string | No | The user name or UID the agent process runs as. Default: `sandbox`. |
-| `run_as_group` | string | No | The group name or GID the agent process runs as. Default: `sandbox`. |
+| `run_as_user` | string | No | Overrides the user name or UID selected by the compute driver. Docker and Podman fall back to the image's OCI `USER`. |
+| `run_as_group` | string | No | Overrides the group name or GID selected by the compute driver. Docker and Podman fall back to the image's OCI `USER`. |
 
-**Validation constraint:** Neither `run_as_user` nor `run_as_group` can be set to `root` or `0`. Policies that request root process identity are rejected at creation or update time.
+**Validation constraint:** An explicit policy value must be `sandbox` or a
+numeric UID/GID in the allowed sandbox range. Docker and Podman may select
+other named identities or non-root system IDs only through OCI `USER`
+fallback. Root identities are always rejected.
+
+Omission is preserved independently for each field. For example, setting only
+`run_as_user` keeps that explicit user while allowing the active driver to
+select the group.
 
 Example:
 
 ```yaml showLineNumbers={false}
 process:
-  run_as_user: sandbox
-  run_as_group: sandbox
+  run_as_user: "1500"
+  run_as_group: "1500"
 ```
 
 ## Network Policies

@@ -115,6 +115,17 @@ pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
 /// supervisor drops privileges to a group other than the UID's primary group.
 pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
 
+/// Raw OCI `Config.User` declaration from the immutable image selected by a
+/// local container driver.
+///
+/// Docker and Podman overwrite this value with the image declaration,
+/// including an empty string when the image has no `USER`, and clear
+/// [`SANDBOX_UID`] and [`SANDBOX_GID`]. Drivers with an authoritative numeric
+/// identity overwrite this value with an empty string while supplying both
+/// numeric fields. The supervisor resolves omitted policy identity fields from
+/// OCI only for the former contract.
+pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
+
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the

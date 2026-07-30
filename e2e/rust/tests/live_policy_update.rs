@@ -103,10 +103,6 @@ filesystem_policy:
 landlock:
   compatibility: best_effort
 
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-
 network_policies:
 {network_rules}"
     );
@@ -141,10 +137,6 @@ filesystem_policy:
 
 landlock:
   compatibility: best_effort
-
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
 ";
 
     file.write_all(policy.as_bytes())
@@ -253,8 +245,8 @@ fn list_output_contains_version(output: &str, version: u32) -> bool {
 
 /// Test the full live policy update lifecycle:
 ///
-/// 1. Create sandbox with `--keep`
-/// 2. Set policy A, verify initial version >= 1
+/// 1. Create sandbox with policy A and `--keep`
+/// 2. Verify initial version >= 1
 /// 3. Push same policy A -> version unchanged (idempotent)
 /// 4. Push policy B (adds example.com) with `--wait` -> new version
 /// 5. Push policy B again -> idempotent
@@ -277,29 +269,14 @@ async fn live_policy_update_round_trip() {
         .expect("policy B path should be utf-8")
         .to_string();
 
-    // --- Create a long-running sandbox ---
-    let mut guard =
-        SandboxGuard::create_keep(&["sh", "-c", "echo Ready && sleep infinity"], "Ready")
-            .await
-            .expect("create keep sandbox");
-
-    // --- Set initial policy A ---
-    let r = run_cli(&[
-        "policy",
-        "set",
-        &guard.name,
-        "--policy",
-        &policy_a_path,
-        "--wait",
-        "--timeout",
-        "120",
-    ])
-    .await;
-    assert!(
-        r.success,
-        "policy set A should succeed (exit {:?}):\n{}",
-        r.exit_code, r.output
-    );
+    // --- Create a long-running sandbox with its startup-only policy fields ---
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &["--policy", &policy_a_path, "--no-tty"],
+        &["sh", "-c", "echo Ready && sleep infinity"],
+        "Ready",
+    )
+    .await
+    .expect("create keep sandbox with policy A");
 
     // --- Verify initial policy version ---
     let r = run_cli(&["policy", "get", &guard.name]).await;
@@ -451,10 +428,9 @@ async fn live_policy_update_round_trip() {
 
 /// Test live policy update from an initially empty network policy:
 ///
-/// 1. Create sandbox with `--keep`
-/// 2. Set policy with no network rules
-/// 3. Push policy with a network rule using `--wait`
-/// 4. Verify the version bumped
+/// 1. Create sandbox with no network rules and `--keep`
+/// 2. Push policy with a network rule using `--wait`
+/// 3. Verify the version bumped
 #[tokio::test]
 async fn live_policy_update_from_empty_network_policies() {
     let empty_policy = write_empty_network_policy().expect("write empty network policy");
@@ -471,29 +447,16 @@ async fn live_policy_update_from_empty_network_policies() {
         .expect("full policy path should be utf-8")
         .to_string();
 
-    // Create sandbox with empty network policy.
-    let mut guard =
-        SandboxGuard::create_keep(&["sh", "-c", "echo Ready && sleep infinity"], "Ready")
-            .await
-            .expect("create keep sandbox");
-
-    // Set initial empty policy.
-    let r = run_cli(&[
-        "policy",
-        "set",
-        &guard.name,
-        "--policy",
-        &empty_path,
-        "--wait",
-        "--timeout",
-        "120",
-    ])
-    .await;
-    assert!(
-        r.success,
-        "policy set (empty) should succeed (exit {:?}):\n{}",
-        r.exit_code, r.output
-    );
+    // Create the sandbox with the empty network policy so subsequent live
+    // updates retain the same startup-only filesystem, landlock, and process
+    // fields.
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &["--policy", &empty_path, "--no-tty"],
+        &["sh", "-c", "echo Ready && sleep infinity"],
+        "Ready",
+    )
+    .await
+    .expect("create keep sandbox with empty network policy");
 
     let r = run_cli(&["policy", "get", &guard.name]).await;
     assert!(

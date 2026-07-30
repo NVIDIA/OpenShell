@@ -37,11 +37,17 @@
           projectRootFile = "flake.nix";
           programs.nixfmt.enable = true;
         };
+        testGuest = import ./nix/test-guest { inherit pkgs; };
       in
       {
+        apps.test-guest = testGuest.app;
+        apps.test-guest-cache = testGuest.cacheApp;
+
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rustToolchain
+            # Assemble Debian artifacts on macOS and Linux.
+            dpkg
             # Required to find packages
             pkg-config
             # Required for bindgen generation.

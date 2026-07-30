@@ -135,6 +135,9 @@ data:
     {{- if .Values.server.workspaceDefaultStorageSize }}
     workspace_default_storage_size = {{ .Values.server.workspaceDefaultStorageSize | quote }}
     {{- end }}
+    {{- if .Values.server.workspaceStorageClass }}
+    workspace_storage_class      = {{ .Values.server.workspaceStorageClass | quote }}
+    {{- end }}
     {{- if .Values.server.defaultRuntimeClassName }}
     default_runtime_class_name   = {{ .Values.server.defaultRuntimeClassName | quote }}
     {{- end }}

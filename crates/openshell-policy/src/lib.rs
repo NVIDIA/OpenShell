@@ -954,8 +954,7 @@ const SANDBOX_NAME: &str = "sandbox";
 /// `u32` within the range `[MIN_SANDBOX_UID, MAX_SANDBOX_UID]`.
 ///
 /// Rejects:
-/// - The empty string (callers should use `ensure_sandbox_process_identity`
-///   to fill defaults before validation)
+/// - The empty string (represents an omitted policy field)
 /// - UID 0 or values below `MIN_SANDBOX_UID`
 /// - Values above `MAX_SANDBOX_UID`
 /// - Non-numeric strings other than `"sandbox"` (e.g. `"root"`, `"nobody"`)
@@ -1053,9 +1052,10 @@ pub const LEGACY_CONTAINER_POLICY_PATH: &str = "/etc/navigator/policy.yaml";
 /// Return a restrictive default policy suitable for sandboxes that have no
 /// explicit policy configured.
 ///
-/// This policy grants filesystem access to standard system paths, runs as the
-/// `sandbox` user, enables Landlock in best-effort mode, and **blocks all
-/// network access** (no network policies, no inference routing).
+/// This policy grants filesystem access to standard system paths, leaves
+/// process identity selection to the compute runtime, enables Landlock in
+/// best-effort mode, and **blocks all network access** (no network policies,
+/// no inference routing).
 pub fn restrictive_default_policy() -> SandboxPolicy {
     SandboxPolicy {
         version: 1,
@@ -1075,20 +1075,17 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
         landlock: Some(LandlockPolicy {
             compatibility: "best_effort".into(),
         }),
-        process: Some(ProcessPolicy {
-            run_as_user: "sandbox".into(),
-            run_as_group: "sandbox".into(),
-        }),
+        process: None,
         network_policies: HashMap::new(),
         network_middlewares: HashMap::default(),
     }
 }
 
-/// Ensure the policy has `run_as_user: sandbox` and `run_as_group: sandbox`.
+/// Fill omitted process identity fields with the legacy `sandbox` defaults.
 ///
-/// If the process section is missing, or either field is empty, this fills in
-/// the required `"sandbox"` value. Call this before validation so that
-/// policies without an explicit process section get the correct default.
+/// Docker and Podman preserve omission so their supervisors can fall back to
+/// OCI `Config.User`. Other drivers call this before validation and
+/// persistence to retain the existing public policy representation.
 pub fn ensure_sandbox_process_identity(policy: &mut SandboxPolicy) {
     let process = policy.process.get_or_insert_with(ProcessPolicy::default);
     if process.run_as_user.is_empty() {
@@ -1112,7 +1109,7 @@ const MAX_PATH_LENGTH: usize = 4096;
 /// A safety violation found in a sandbox policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyViolation {
-    /// `run_as_user` or `run_as_group` is not "sandbox".
+    /// An explicit `run_as_user` or `run_as_group` is unsafe.
     InvalidProcessIdentity { field: &'static str, value: String },
     /// A filesystem path contains `..` components.
     PathTraversal { path: String },
@@ -1277,7 +1274,7 @@ impl fmt::Display for PolicyViolation {
 /// error vs. logged warning).
 ///
 /// Checks performed:
-/// - `run_as_user` / `run_as_group` must be "sandbox"
+/// - Explicit `run_as_user` / `run_as_group` fields must be safe identities
 /// - Filesystem paths must be absolute (start with `/`)
 /// - Filesystem paths must not contain `..` components
 /// - Read-write paths must not be overly broad (just `/`)
@@ -1292,18 +1289,17 @@ pub fn validate_sandbox_policy(
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
     let mut violations = Vec::new();
 
-    // Check process identity — must be "sandbox" or a numeric UID/GID
-    // within the acceptable sandbox range.
-    // `ensure_sandbox_process_identity` should be called before this to
-    // fill in defaults; any invalid value is rejected.
+    // Omitted process identity fields are resolved by the compute runtime.
+    // Explicit fields must be "sandbox" or a numeric UID/GID within the
+    // acceptable sandbox range.
     if let Some(ref process) = policy.process {
-        if !is_valid_sandbox_identity(&process.run_as_user) {
+        if !process.run_as_user.is_empty() && !is_valid_sandbox_identity(&process.run_as_user) {
             violations.push(PolicyViolation::InvalidProcessIdentity {
                 field: "run_as_user",
                 value: process.run_as_user.clone(),
             });
         }
-        if !is_valid_sandbox_identity(&process.run_as_group) {
+        if !process.run_as_group.is_empty() && !is_valid_sandbox_identity(&process.run_as_group) {
             violations.push(PolicyViolation::InvalidProcessIdentity {
                 field: "run_as_group",
                 value: process.run_as_group.clone(),
@@ -1664,11 +1660,9 @@ network_policies:
     }
 
     #[test]
-    fn restrictive_default_has_process_identity() {
+    fn restrictive_default_omits_process_identity() {
         let policy = restrictive_default_policy();
-        let proc = policy.process.expect("must have process policy");
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
+        assert!(policy.process.is_none());
     }
 
     #[test]
@@ -1691,6 +1685,46 @@ network_policies:
         assert_eq!(policy.version, 1);
         assert!(policy.network_policies.is_empty());
         assert!(policy.filesystem.is_none());
+    }
+
+    #[test]
+    fn process_identity_omission_survives_yaml_round_trip() {
+        let policy = parse_sandbox_policy("version: 1\nprocess:\n  run_as_user: \"1234\"\n")
+            .expect("partial process identity should parse");
+        let process = policy.process.as_ref().expect("process section");
+        assert_eq!(process.run_as_user, "1234");
+        assert!(process.run_as_group.is_empty());
+        assert!(validate_sandbox_policy(&policy).is_ok());
+
+        let yaml = serialize_sandbox_policy(&policy).expect("partial identity should serialize");
+        assert!(yaml.contains("run_as_user"));
+        assert!(!yaml.contains("run_as_group"));
+        let reparsed = parse_sandbox_policy(&yaml).expect("round trip should parse");
+        assert!(reparsed.process.unwrap().run_as_group.is_empty());
+    }
+
+    #[test]
+    fn ensure_sandbox_process_identity_fills_each_omitted_field() {
+        let cases = [
+            (None, None, "sandbox", "sandbox"),
+            (Some("1234"), None, "1234", "sandbox"),
+            (None, Some("1235"), "sandbox", "1235"),
+            (Some("1234"), Some("1235"), "1234", "1235"),
+        ];
+
+        for (user, group, expected_user, expected_group) in cases {
+            let mut policy = restrictive_default_policy();
+            policy.process = Some(ProcessPolicy {
+                run_as_user: user.unwrap_or_default().to_string(),
+                run_as_group: group.unwrap_or_default().to_string(),
+            });
+
+            ensure_sandbox_process_identity(&mut policy);
+
+            let process = policy.process.expect("normalized process policy");
+            assert_eq!(process.run_as_user, expected_user);
+            assert_eq!(process.run_as_group, expected_group);
+        }
     }
 
     #[test]
@@ -1817,38 +1851,6 @@ network_policies:
         )
         .expect_err("unknown JSON-RPC config fields must be rejected");
         assert!(err.to_string().contains("on_parse_error"));
-    }
-
-    #[test]
-    fn ensure_sandbox_process_identity_fills_defaults() {
-        let mut policy = restrictive_default_policy();
-        policy.process = None;
-        ensure_sandbox_process_identity(&mut policy);
-        let proc = policy.process.unwrap();
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
-    }
-
-    #[test]
-    fn ensure_sandbox_process_identity_fills_empty_strings() {
-        let mut policy = restrictive_default_policy();
-        policy.process = Some(ProcessPolicy {
-            run_as_user: String::new(),
-            run_as_group: String::new(),
-        });
-        ensure_sandbox_process_identity(&mut policy);
-        let proc = policy.process.unwrap();
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
-    }
-
-    #[test]
-    fn ensure_sandbox_process_identity_preserves_sandbox() {
-        let mut policy = restrictive_default_policy();
-        ensure_sandbox_process_identity(&mut policy);
-        let proc = policy.process.unwrap();
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
     }
 
     #[test]
@@ -2363,14 +2365,25 @@ network_policies:
     }
 
     #[test]
-    fn validate_rejects_empty_run_as_user() {
+    fn validate_accepts_omitted_process_fields() {
         let mut policy = restrictive_default_policy();
         policy.process = Some(ProcessPolicy {
             run_as_user: String::new(),
             run_as_group: String::new(),
         });
-        let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert_eq!(violations.len(), 2);
+        assert!(validate_sandbox_policy(&policy).is_ok());
+
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "sandbox".into(),
+            run_as_group: String::new(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
+
+        policy.process = Some(ProcessPolicy {
+            run_as_user: String::new(),
+            run_as_group: "1234".into(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
     #[test]

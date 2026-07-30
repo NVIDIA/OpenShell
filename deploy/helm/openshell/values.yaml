@@ -187,6 +187,11 @@ server:
   # Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi").
   # Empty = built-in default (2Gi).
   workspaceDefaultStorageSize: ""
+  # -- Kubernetes StorageClass for the workspace PVC in sandbox pods.
+  # Empty (default) = omit storageClassName, using the cluster's default
+  # StorageClass. Set this on clusters with no default StorageClass, otherwise
+  # the workspace PVC stays Pending and the sandbox never starts.
+  workspaceStorageClass: ""
   # -- Default Kubernetes runtimeClassName for sandbox pods.
   # Applied when a CreateSandbox request does not specify one.
   # Empty (default) = omit the field, using the cluster's default RuntimeClass.
