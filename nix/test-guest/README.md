@@ -5,14 +5,14 @@ SPDX-License-Identifier: Apache-2.0
 
 # Test Guests
 
-This prototype uses Nix, QEMU, and Ansible to boot and configure disposable Linux VMs for testing OpenShell packages and binaries. It supports HVF on Apple Silicon macOS, KVM on native-architecture Linux hosts, and a slower TCG fallback on Linux when KVM is unavailable. The ARM64 fallback switches to QEMU's bundled EDK2 firmware, which is validated with TCG. A separate Linux-only app boots the pinned ARM64 guest with TCG on either an x86_64 or ARM64 host for performance comparisons.
+This prototype uses Nix, QEMU, and Ansible to boot and configure disposable Linux VMs for testing OpenShell packages and binaries. It supports HVF on Apple Silicon macOS, KVM on native-architecture Linux hosts, and a slower TCG fallback on Linux when KVM is unavailable.
 
 ## Requirements
 
 - Nix with flakes enabled.
-- Apple Silicon macOS with HVF, or a Linux host. The default app uses KVM when `/dev/kvm` is available and falls back to QEMU TCG otherwise.
+- Apple Silicon macOS with HVF, or a native-architecture Linux host. Linux uses KVM when `/dev/kvm` is available and falls back to QEMU TCG otherwise.
 - Enough local capacity for a four-vCPU, 4 GiB guest and a disposable disk overlay.
-- Artifacts matching the guest architecture.
+- Native-architecture artifacts. TCG emulates the guest CPU on Linux but does not enable cross-architecture guests.
 
 The first run downloads the selected cloud image and VM runtime. Nix reuses those immutable inputs on later runs, while each guest starts from a fresh writable overlay.
 
@@ -46,7 +46,7 @@ nix/test-guest/
 - `configuration/*.yml` are host-executed Ansible playbooks that layer optional capabilities onto a base guest. Configurations remain independent and run in the order supplied with repeated `--with` arguments.
 - `README.md` documents the supported combinations and developer interface.
 
-The root [`flake.nix`](../../flake.nix) exposes this directory as the native-architecture `test-guest` app, the `test-guest-cache` app, and the Linux-only `test-guest-arm64-tcg` app. Debian artifact creation remains outside the guest harness in [`tasks/scripts/package-deb.sh`](../../tasks/scripts/package-deb.sh); the runner only installs or copies artifacts that already exist.
+The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-guest` and `test-guest-cache` apps. Debian artifact creation remains outside the guest harness in [`tasks/scripts/package-deb.sh`](../../tasks/scripts/package-deb.sh); the runner only installs or copies artifacts that already exist.
 
 ## Supported configurations
 
@@ -62,18 +62,6 @@ List the available distros and configurations:
 ```shell
 nix run .#test-guest -- --list
 ```
-
-## Benchmark ARM64 TCG across Linux hosts
-
-Boot the pinned ARM64 Ubuntu image with QEMU TCG, validate the guest over SSH, and shut it down:
-
-```shell
-nix run .#test-guest-arm64-tcg -- \
-  --distro ubuntu \
-  -- true
-```
-
-Run the same command on x86_64 and ARM64 Linux hosts to compare TCG boot behavior. The app holds the ARM64 cloud image, QEMU version, firmware, vCPU count, and memory constant. The runner prints the elapsed time from QEMU startup until SSH becomes ready.
 
 ## Open an interactive VM
 
@@ -124,12 +112,7 @@ Configurations are Ansible playbooks stored under `nix/test-guest/configuration/
 
 Configurations run in the order provided on the command line. OpenShell packages and copied binaries are installed after all configurations succeed.
 
-A configuration can install executable hooks under
-`/usr/local/libexec/openshell-test-guest/post-copy.d`. The runner invokes them
-in lexical order after all `--install` and `--copy` artifacts are present and
-before the requested guest command starts. For example, the Podman
-configuration uses a hook to prepare checkout-built E2E artifacts in the
-guest's rootless Podman store.
+`--install` packages and `--copy` executables are applied by a dedicated per-run Ansible playbook. They are not stored in prepared VM cache entries.
 
 ## Prepared VM cache
 
@@ -171,7 +154,12 @@ A cache build boots and configures a disposable VM, runs the internal sealing sc
 
 The key includes the pinned base-image identity, guest architecture, ordered configuration file digests, Ansible version, cache generation, and sealing script digest. Installed packages, copied binaries, forwarded ports, and guest commands are never cached.
 
-Normal `test-guest` runs automatically use an exact valid local entry after rechecking its disk checksum and QCOW2 structure. They create a fresh writable overlay, cloud-init instance, machine ID, and SSH identity. On a local miss, the runner uses the pinned cloud image and applies configurations normally. Set `OPENSHELL_TEST_GUEST_CACHE_DISABLE=1` to bypass local lookup.
+Normal `test-guest` runs automatically use an exact valid local entry after
+rechecking its disk checksum and QCOW2 structure. On a local miss, the runner
+invokes the cache builder and stores the prepared disk before continuing. It
+then creates a fresh writable overlay, cloud-init instance, machine ID, and SSH
+identity from that entry. Set `OPENSHELL_TEST_GUEST_CACHE_DISABLE=1` to bypass
+both local lookup and automatic population.
 
 The default cache directory is `${XDG_CACHE_HOME:-$HOME/.cache}/openshell/test-guest`. Override it with `--cache-dir` on the cache command or `OPENSHELL_TEST_GUEST_CACHE_DIR` for either app.
 
@@ -209,7 +197,7 @@ nix run .#test-guest -- \
   -- openshell --version
 ```
 
-For an x86_64 Linux guest, supply x86_64 binaries and use `package:deb:amd64`. The package architecture must match the guest architecture.
+For an x86_64 Linux guest, supply x86_64 binaries and use `package:deb:amd64`. The package architecture must match the host and guest architecture.
 
 `--install` is repeatable. Debian packages are accepted by Ubuntu; RPM packages are accepted by CentOS, Fedora, and Rocky Linux. This prototype can install an existing RPM but does not build one.
 
@@ -246,10 +234,13 @@ Arguments after `--` are executed inside the guest. Without a command, the runne
 
 ## Lifecycle
 
-Each invocation checks for an exact prepared local cache entry. On a miss, Nix realizes the hash-pinned cloud image and the runner applies the selected configurations. It then:
+Each invocation ensures an exact prepared local cache entry exists. On a miss,
+the cache builder realizes the hash-pinned cloud image, applies the selected
+configurations, seals and validates the prepared disk, and stores it locally.
+The runner then:
 
 1. Creates a temporary QCOW2 overlay backed by the prepared cache disk or pinned cloud image.
-2. Boots QEMU with HVF, KVM, or the Linux TCG fallback. Native ARM64 Linux guests use QEMU's bundled EDK2 firmware when KVM is unavailable.
+2. Boots QEMU with HVF, KVM, or the Linux TCG fallback.
 3. Creates a fresh cloud-init instance and ephemeral SSH key.
 4. Applies the selected Ansible configurations only when the base is not prepared.
 5. Installs or copies the supplied artifacts.
@@ -262,7 +253,7 @@ Use `--keep` to preserve the overlay, cloud-init seed, SSH key, and serial log f
 
 ## Current limitations
 
-- The default `test-guest` app uses a guest matching the host architecture. `test-guest-arm64-tcg` is the supported cross-architecture exception on Linux.
+- Host and guest architectures must match.
 - TCG is slower than hardware virtualization and uses a longer SSH readiness timeout.
 - Prepared cache entries are architecture-specific and match the exact ordered configuration list.
 - OCI pulls transfer a complete compressed standalone disk; incremental disk layers are not implemented.

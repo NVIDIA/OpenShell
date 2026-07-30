@@ -396,6 +396,46 @@ impl Store {
         ))
     }
 
+    /// List objects of `object_type` that have a related `member_type` record
+    /// whose `name` column matches `member_name` in the same workspace.
+    pub async fn list_with_membership(
+        &self,
+        object_type: &str,
+        member_type: &str,
+        member_name: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch!(self.list_with_membership(
+            object_type,
+            member_type,
+            member_name,
+            limit,
+            offset
+        ))
+    }
+
+    /// List objects of `object_type` that have a related `member_type` record
+    /// whose `name` column matches `member_name`, with label selector filtering.
+    pub async fn list_with_membership_and_selector(
+        &self,
+        object_type: &str,
+        member_type: &str,
+        member_name: &str,
+        label_selector: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch!(self.list_with_membership_and_selector(
+            object_type,
+            member_type,
+            member_name,
+            label_selector,
+            limit,
+            offset
+        ))
+    }
+
     /// List objects by type across all workspaces with label selector filtering.
     pub async fn list_all_with_selector(
         &self,
@@ -496,6 +536,50 @@ impl Store {
             .into_iter()
             .map(decode_record)
             .collect()
+    }
+
+    /// List and decode objects that have a related membership record, with
+    /// pagination. See [`Store::list_with_membership`] for details.
+    pub async fn list_messages_with_membership<
+        T: Message + Default + ObjectType + SetResourceVersion,
+    >(
+        &self,
+        member_type: &str,
+        member_name: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<T>> {
+        self.list_with_membership(T::object_type(), member_type, member_name, limit, offset)
+            .await?
+            .into_iter()
+            .map(decode_record)
+            .collect()
+    }
+
+    /// List and decode objects that have a related membership record, with
+    /// label selector filtering and pagination.
+    pub async fn list_messages_with_membership_and_selector<
+        T: Message + Default + ObjectType + SetResourceVersion,
+    >(
+        &self,
+        member_type: &str,
+        member_name: &str,
+        label_selector: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<T>> {
+        self.list_with_membership_and_selector(
+            T::object_type(),
+            member_type,
+            member_name,
+            label_selector,
+            limit,
+            offset,
+        )
+        .await?
+        .into_iter()
+        .map(decode_record)
+        .collect()
     }
 
     /// List and decode protobuf messages across all workspaces with label

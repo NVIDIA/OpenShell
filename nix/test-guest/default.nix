@@ -3,37 +3,15 @@
 
 # PROTOTYPE: Composable distro VMs for installing and exercising artifacts.
 
-{
-  pkgs,
-  architecture ? if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64",
-  accelerator ? null,
-  useQemuFirmware ? false,
-}:
+{ pkgs }:
 
 let
-  hostArchitecture = if pkgs.stdenv.hostPlatform.isAarch64 then "aarch64" else "x86_64";
-  isAarch64 = architecture == "aarch64";
+  isAarch64 = pkgs.stdenv.hostPlatform.isAarch64;
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
-  guestMatchesHost = architecture == hostArchitecture;
-  qemu = pkgs.qemu.override { hostCpuOnly = guestMatchesHost; };
+  architecture = if isAarch64 then "aarch64" else "x86_64";
+  qemu = pkgs.qemu.override { hostCpuOnly = true; };
   qemuBinary =
     if isAarch64 then "${qemu}/bin/qemu-system-aarch64" else "${qemu}/bin/qemu-system-x86_64";
-  selectedAccelerator =
-    if accelerator != null then
-      accelerator
-    else if isDarwin then
-      if guestMatchesHost then "hvf" else "tcg"
-    else if guestMatchesHost then
-      "kvm"
-    else
-      "tcg";
-  firmwareCode =
-    if useQemuFirmware && isAarch64 then
-      "${qemu}/share/qemu/edk2-aarch64-code.fd"
-    else
-      pkgs.OVMF.firmware;
-  firmwareVars =
-    if useQemuFirmware && isAarch64 then "${qemu}/share/qemu/edk2-arm-vars.fd" else pkgs.OVMF.variables;
 
   distros = {
     ubuntu = import ./distros/ubuntu.nix { inherit pkgs architecture; };
@@ -75,6 +53,7 @@ let
   runtimeInputs = [
     qemu
     pkgs.python3Packages.ansible-core
+    pkgs.python3Packages.virt-firmware
     pkgs.coreutils
     pkgs.gnugrep
     pkgs.jq
@@ -91,18 +70,15 @@ let
     export OPENSHELL_TEST_GUEST_DISTROS=${distroCatalog}
     export OPENSHELL_TEST_GUEST_CONFIGURATIONS=${configurationCatalog}
     export OPENSHELL_TEST_GUEST_CACHE_LIB=${./cache-lib.sh}
+    export OPENSHELL_TEST_GUEST_CACHE_RUNNER=${./cache.sh}
     export OPENSHELL_TEST_GUEST_CACHE_SEAL=${./cache-seal.sh}
     export OPENSHELL_TEST_GUEST_RUNNER=${./run.sh}
     export TEST_GUEST_BASH=${pkgs.bash}/bin/bash
     export TEST_GUEST_QEMU=${qemuBinary}
-    export TEST_GUEST_FIRMWARE_CODE=${firmwareCode}
-    export TEST_GUEST_FIRMWARE_VARS=${firmwareVars}
-    ${pkgs.lib.optionalString isAarch64 ''
-      export TEST_GUEST_TCG_FIRMWARE_CODE=${qemu}/share/qemu/edk2-aarch64-code.fd
-      export TEST_GUEST_TCG_FIRMWARE_VARS=${qemu}/share/qemu/edk2-arm-vars.fd
-    ''}
+    export TEST_GUEST_FIRMWARE_CODE=${pkgs.OVMF.firmware}
+    export TEST_GUEST_FIRMWARE_VARS=${pkgs.OVMF.variables}
     export TEST_GUEST_MACHINE=${if isAarch64 then "virt" else "q35"}
-    export TEST_GUEST_ACCELERATOR=${selectedAccelerator}
+    export TEST_GUEST_ACCELERATOR=${if isDarwin then "hvf" else "kvm"}
     export TEST_GUEST_ARCHITECTURE=${architecture}
     export TEST_GUEST_ANSIBLE_VERSION=${pkgs.python3Packages.ansible-core.version}
     export TEST_GUEST_CACHE_GENERATION=1

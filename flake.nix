@@ -38,21 +38,10 @@
           programs.nixfmt.enable = true;
         };
         testGuest = import ./nix/test-guest { inherit pkgs; };
-        testGuestArm64Tcg = import ./nix/test-guest {
-          inherit pkgs;
-          accelerator = "tcg";
-          architecture = "aarch64";
-          useQemuFirmware = true;
-        };
       in
       {
-        apps = {
-          test-guest = testGuest.app;
-          test-guest-cache = testGuest.cacheApp;
-        }
-        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-          test-guest-arm64-tcg = testGuestArm64Tcg.app;
-        };
+        apps.test-guest = testGuest.app;
+        apps.test-guest-cache = testGuest.cacheApp;
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [

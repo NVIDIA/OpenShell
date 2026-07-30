@@ -52,12 +52,15 @@ Use an `http://` endpoint only for trusted local port-forwarding or a protected 
 
 ```bash
 openshell status
+openshell whoami
 ```
 
 Confirm the gateway is reachable, authentication is valid or not required, and
 the output shows a version. `Status: Connected` only proves the public health
 endpoint is reachable; inspect the separate `Authentication` line before
-running protected commands.
+running protected commands. `openshell whoami` reports the identity validated
+by the gateway, including the subject an administrator uses for workspace
+membership. Add `--output json` for automation.
 
 ### Step 3: Create a sandbox
 
@@ -422,6 +425,12 @@ The `--from` flag accepts a Dockerfile path, a directory containing a Dockerfile
 
 Local Dockerfile and directory builds require a local gateway because the CLI builds through the local Docker daemon. Use a registry image reference for remote gateways. Bare community names resolve under `ghcr.io/nvidia/openshell-community/sandboxes` unless `OPENSHELL_COMMUNITY_REGISTRY` overrides the prefix.
 
+For Docker and Podman gateways, custom images should declare a non-root OCI
+`USER`. Each explicit `process.run_as_user` or `process.run_as_group` policy
+field wins independently; omitted fields fall back to the image declaration.
+An image with no `USER` fails before readiness unless policy supplies both
+fields.
+
 ### Forward ports
 
 ```bash
@@ -619,6 +628,7 @@ $ openshell sandbox upload --help
 |------|---------|
 | Register local port-forwarded gateway | `openshell gateway add http://127.0.0.1:8080 --local --name local` |
 | Check gateway health and authentication | `openshell status` |
+| Show authenticated identity and subject | `openshell whoami` |
 | List/switch gateways | `openshell gateway select [name]` |
 | Connect directly to a gateway | `openshell --gateway-endpoint <url> status` |
 | Create sandbox (interactive) | `openshell sandbox create` |

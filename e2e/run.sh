@@ -139,6 +139,10 @@ gateway_config_source=${gateway_config}
 if ! gateway_config="$(resolve_file "${gateway_config_source}")"; then
 	die "gateway config does not exist: ${gateway_config_source}"
 fi
+gateway_driver="$(python3 -c '
+import sys, tomllib
+print(tomllib.load(open(sys.argv[1], "rb"))["openshell"]["gateway"]["compute_drivers"][0])
+' "${gateway_config}")"
 if [[ ! ${suite_name} =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
 	die "suite name must contain only lowercase letters, digits, and hyphens: ${suite_name}"
 fi
@@ -279,6 +283,15 @@ done
 run_parent="${ROOT}/.cache/openshell-e2e/runs"
 mkdir -p "${run_parent}"
 run_dir="$(mktemp -d "${run_parent%/}/run.XXXXXX")"
+if ! command -v tar >/dev/null 2>&1; then
+	die "tar is required to package the supervisor image"
+fi
+supervisor_image=localhost/openshell/supervisor:e2e-vm
+supervisor_rootfs="${run_dir}/supervisor-rootfs"
+supervisor_archive="${run_dir}/supervisor.tar"
+mkdir -p "${supervisor_rootfs}"
+install -m 0555 "${linux_sandbox_bin}" "${supervisor_rootfs}/openshell-sandbox"
+tar -C "${supervisor_rootfs}" -cf "${supervisor_archive}" openshell-sandbox
 child_pid=
 runtime_log=
 keep=0
@@ -372,10 +385,21 @@ export OPENSHELL_GATEWAY="${gateway_name}"
 export OPENSHELL_BIN="${host_cli_bin}"
 
 if [ "${mode}" = host ]; then
-	e2e_align_docker_host_with_cli_context
-	staged_supervisor="${host_runtime_dir}/.cache/openshell-e2e/bin/openshell-sandbox"
-	mkdir -p "$(dirname "${staged_supervisor}")"
-	ln -sfn "${linux_sandbox_bin}" "${staged_supervisor}"
+	case "${gateway_driver}" in
+	docker)
+		e2e_align_docker_host_with_cli_context
+		docker import \
+			--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+			"${supervisor_archive}" \
+			"${supervisor_image}" >/dev/null
+		;;
+	podman)
+		podman import \
+			--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+			"${supervisor_archive}" \
+			"${supervisor_image}" >/dev/null
+		;;
+	esac
 
 	runtime_log="${run_dir}/gateway.log"
 	echo "==> Starting host gateway at ${gateway_endpoint}"
@@ -391,6 +415,7 @@ else
 	runtime_log="${run_dir}/vm.log"
 	guest_launcher="${run_dir}/launch-gateway.sh"
 	guest_launcher_path=/home/openshell/.cache/openshell-e2e/bin/launch-gateway
+	guest_supervisor_archive_path=/home/openshell/.cache/openshell-e2e/supervisor.tar
 	config_payload="$(base64 <"${gateway_config}" | tr -d '\r\n')"
 	jwt_signing_payload="$(base64 <"${jwt_source_dir}/signing.pem" | tr -d '\r\n')"
 	jwt_public_payload="$(base64 <"${jwt_source_dir}/public.pem" | tr -d '\r\n')"
@@ -399,6 +424,14 @@ else
 #!/usr/bin/env bash
 set -euo pipefail
 
+report_timing() {
+	local label=\$1
+	local started_at=\$2
+
+	echo "==> Timing: \${label}: \$((SECONDS - started_at))s"
+}
+
+phase_started_at=\${SECONDS}
 umask 077
 state_root=/home/openshell/.cache/openshell-e2e
 config_path=\${state_root}/gateway.toml
@@ -416,10 +449,54 @@ export XDG_CONFIG_HOME=\${state_root}/xdg/config
 export XDG_CACHE_HOME=\${state_root}/xdg/cache
 export XDG_DATA_HOME=\${state_root}/xdg/data
 export XDG_STATE_HOME=\${state_root}/xdg/state
+report_timing "guest gateway setup" "\${phase_started_at}"
+phase_started_at=\${SECONDS}
+case '${gateway_driver}' in
+docker)
+	docker import \
+		--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+		"${guest_supervisor_archive_path}" \
+		"${supervisor_image}" >/dev/null
+	;;
+podman)
+	podman --url "unix:///run/user/\$(id -u)/podman/podman.sock" import \
+		--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+		"${guest_supervisor_archive_path}" \
+		"${supervisor_image}" >/dev/null
+	;;
+esac
+report_timing "${gateway_driver} supervisor import" "\${phase_started_at}"
+if [ '${gateway_driver}' = podman ]; then
+	phase_started_at=\${SECONDS}
+	# Keep the primary gateway listener on loopback and bridge the rootless
+	# container callback path temporarily. Remove this relay when #2492 lands.
+	relay_socket=\${state_root}/podman-gateway.sock
+	rm -f "\${relay_socket}"
+	socat "UNIX-LISTEN:\${relay_socket},fork" TCP:127.0.0.1:8080 &
+	host_relay_pid=\$!
+	for _ in \$(seq 1 50); do
+		[ -S "\${relay_socket}" ] && break
+		sleep 0.1
+	done
+	if [ ! -S "\${relay_socket}" ] || ! kill -0 "\${host_relay_pid}" 2>/dev/null; then
+		echo "ERROR: failed to start the host-side Podman gateway relay" >&2
+		exit 1
+	fi
+	env -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_STATE_HOME \
+		podman unshare --rootless-netns \
+		socat TCP-LISTEN:8080,bind=0.0.0.0,reuseaddr,fork "UNIX-CONNECT:\${relay_socket}" &
+	network_relay_pid=\$!
+	sleep 1
+	if ! kill -0 "\${network_relay_pid}" 2>/dev/null; then
+		echo "ERROR: failed to start the rootless-network Podman gateway relay" >&2
+		exit 1
+	fi
+	report_timing "Podman network relays" "\${phase_started_at}"
+fi
 cd /home/openshell
 exec /usr/local/bin/openshell-gateway \
 	--config "\${config_path}" \
-	--bind-address 0.0.0.0 \
+	--bind-address 127.0.0.1 \
 	--port ${guest_port} \
 	--disable-tls
 EOF
@@ -434,8 +511,8 @@ EOF
 	done
 	vm_args+=(
 		--copy "${guest_gateway_bin}:/usr/local/bin/openshell-gateway"
-		--copy "${linux_sandbox_bin}:/home/openshell/.cache/openshell-e2e/bin/openshell-sandbox"
 		--copy "${guest_launcher}:${guest_launcher_path}"
+		--copy "${supervisor_archive}:${guest_supervisor_archive_path}"
 		--forward-port "${host_port}:${guest_port}"
 	)
 	if [ "${keep}" -eq 1 ]; then
@@ -474,6 +551,21 @@ wait_for_gateway() {
 	local elapsed=0
 	local process_status
 	local probe_log="${run_dir}/gateway-probe.log"
+	local reported_timings=0
+	local timing_count
+
+	report_vm_progress() {
+		if [ "${mode}" != vm ]; then
+			return
+		fi
+		timing_count="$(grep -c '^==> Timing:' "${runtime_log}" || true)"
+		if [ "${timing_count}" -le "${reported_timings}" ]; then
+			return
+		fi
+		sed -n 's/^==> Timing: /    /p' "${runtime_log}" |
+			sed -n "$((reported_timings + 1)),${timing_count}p"
+		reported_timings=${timing_count}
+	}
 
 	echo "==> Waiting up to ${gateway_ready_timeout}s for gateway readiness"
 	while :; do
@@ -494,8 +586,10 @@ wait_for_gateway() {
 			fi
 			return "${process_status}"
 		fi
+		report_vm_progress
 		if probe_gateway "${probe_log}" &&
 			grep -q "Connected" "${probe_log}"; then
+			report_vm_progress
 			echo "==> Gateway ready after ${elapsed}s"
 			return 0
 		fi

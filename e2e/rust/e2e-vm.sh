@@ -33,8 +33,8 @@
 #      `com.apple.security.hypervisor` entitlement).
 #   4. Writes a per-run gateway config with `[openshell.drivers.vm]`
 #      settings, starts the gateway with `--config <run-state>/gateway.toml`
-#      on a random free port, waits for `Server listening`, then runs the
-#      selected Rust e2e tests.
+#      on a random free port, waits for an authenticated gateway status
+#      request to succeed, then runs the selected Rust e2e tests.
 #   5. Tears the gateway down and (on failure) preserves the gateway
 #      log and every VM serial console log for post-mortem.
 #
@@ -280,36 +280,8 @@ e2e_write_gateway_args_file "${GATEWAY_ARGS_FILE}" "${GATEWAY_ARGS[@]}"
 GATEWAY_PID=$!
 printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"
 
-# ── Wait for gateway readiness ───────────────────────────────────────
-#
-# The gateway logs `INFO openshell_server: Server listening
-# address=0.0.0.0:<port>` after its tonic listener is up. That is the
-# only signal the smoke test needs — the VM driver is spawned eagerly
-# but sandboxes are created on demand, so "Server listening" is the
-# right gate here.
-
-echo "==> Waiting for gateway readiness (timeout ${GATEWAY_READY_TIMEOUT}s)"
-elapsed=0
-while ! grep -q 'Server listening' "${GATEWAY_LOG}" 2>/dev/null; do
-  if ! kill -0 "${GATEWAY_PID}" 2>/dev/null; then
-    echo "ERROR: openshell-gateway exited before becoming ready"
-    exit 1
-  fi
-  if [ "${elapsed}" -ge "${GATEWAY_READY_TIMEOUT}" ]; then
-    echo "ERROR: openshell-gateway did not become ready after ${GATEWAY_READY_TIMEOUT}s"
-    exit 1
-  fi
-  sleep 1
-  elapsed=$((elapsed + 1))
-done
-
-echo "==> Gateway ready after ${elapsed}s"
-
-# ── Run the smoke test ───────────────────────────────────────────────
-#
-# The CLI uses the raw endpoint but still resolves matching metadata so it
-# can find the mTLS client bundle.
-
+# Register the gateway before polling so readiness exercises the same mTLS
+# client path as the smoke tests.
 CLI_GATEWAY_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
 e2e_register_mtls_gateway \
   "${XDG_CONFIG_HOME}" \
@@ -317,8 +289,49 @@ e2e_register_mtls_gateway \
   "${CLI_GATEWAY_ENDPOINT}" \
   "${HOST_PORT}" \
   "${PKI_DIR}"
-
 export OPENSHELL_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
+
+# ── Wait for gateway readiness ───────────────────────────────────────
+#
+# Poll the authenticated gRPC health path instead of coupling readiness to a
+# particular gateway log message. The VM driver is spawned eagerly, while
+# sandboxes are created on demand.
+
+echo "==> Waiting for gateway readiness (timeout ${GATEWAY_READY_TIMEOUT}s)"
+elapsed=0
+last_status_output=""
+while [ "${elapsed}" -lt "${GATEWAY_READY_TIMEOUT}" ]; do
+  if ! kill -0 "${GATEWAY_PID}" 2>/dev/null; then
+    echo "ERROR: openshell-gateway exited before becoming ready"
+    exit 1
+  fi
+  if last_status_output="$("${CLI_BIN}" status --output json 2>&1)" &&
+    printf '%s\n' "${last_status_output}" |
+      grep -Eq '"status"[[:space:]]*:[[:space:]]*"connected"'; then
+    echo "==> Gateway ready after ${elapsed}s"
+    break
+  fi
+  sleep 2
+  elapsed=$((elapsed + 2))
+done
+
+if [ "${elapsed}" -ge "${GATEWAY_READY_TIMEOUT}" ]; then
+  echo "ERROR: openshell-gateway did not become ready after ${GATEWAY_READY_TIMEOUT}s"
+  echo "=== last openshell status output ==="
+  if [ -n "${last_status_output}" ]; then
+    printf '%s\n' "${last_status_output}"
+  else
+    echo "<no output>"
+  fi
+  echo "=== end openshell status output ==="
+  exit 1
+fi
+
+# ── Run the smoke test ───────────────────────────────────────────────
+#
+# The CLI uses the raw endpoint but still resolves matching metadata so it
+# can find the mTLS client bundle.
+
 export OPENSHELL_E2E_EXPECT_VM_OVERLAY=1
 export OPENSHELL_E2E_DRIVER="vm"
 export OPENSHELL_E2E_VM_STATE_DIR="${RUN_STATE_DIR}"

@@ -263,6 +263,7 @@ const HELP_TEMPLATE: &str = "\
 \x1b[1mGATEWAY COMMANDS\x1b[0m
   gateway:     Manage gateways
   status:      Show gateway status and information
+  whoami:      Show the authenticated user identity
   inference:   Manage inference configuration
   doctor:      Diagnose gateway issues
 
@@ -583,6 +584,14 @@ enum Commands {
     /// Show gateway status and information.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Status {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Show the identity validated by the gateway.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Whoami {
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
@@ -2313,6 +2322,16 @@ async fn main() -> Result<()> {
         }
 
         // -----------------------------------------------------------
+        // Top-level current identity
+        // -----------------------------------------------------------
+        Some(Commands::Whoami { output }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name);
+            run::whoami(&ctx.endpoint, &tls, output.as_str()).await?;
+        }
+
+        // -----------------------------------------------------------
         // Top-level forward (was `sandbox forward`)
         // -----------------------------------------------------------
         Some(Commands::Forward {
@@ -3922,6 +3941,19 @@ mod tests {
 
         assert_eq!(cli.gateway.as_deref(), Some("demo"));
         assert!(matches!(cli.command, Some(Commands::Status { .. })));
+    }
+
+    #[test]
+    fn whoami_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "whoami", "--output", "json"])
+            .expect("whoami --output json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Whoami {
+                output: OutputFormat::Json
+            })
+        ));
     }
 
     #[test]

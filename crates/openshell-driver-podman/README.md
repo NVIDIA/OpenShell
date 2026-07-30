@@ -7,6 +7,16 @@ driver runs in-process within the gateway server and delegates all sandbox
 isolation enforcement to the `openshell-sandbox` supervisor binary, which is
 sideloaded into each container via an OCI image volume mount.
 
+Before creating the container, the driver inspects the final sandbox image and
+captures its immutable image ID and raw OCI `Config.User`. Container creation
+uses that image ID with pulling disabled, preventing a mutable tag from changing
+between inspection and launch. The supervisor runs as root, resolves omitted
+policy identity fields from the image declaration, and drops only agent
+children to the completed identity. Named OCI components remain names after
+validation; a missing group is filled with the user's numeric primary GID. Explicit
+`process.run_as_user` and `process.run_as_group` values take precedence
+independently.
+
 For a rootless networking deep dive, see [NETWORKING.md](NETWORKING.md).
 
 ## Architecture
@@ -186,7 +196,7 @@ graph TB
         subgraph Container["Sandbox Container"]
             SV["Supervisor<br/>(root in user ns)"]
             subgraph NestedNS["Nested Network Namespace"]
-                SP["Sandbox Process<br/>(sandbox user)"]
+                SP["Sandbox Process<br/>(resolved non-root identity)"]
                 VE2["veth1: 10.200.0.2"]
             end
             VE1["veth0: 10.200.0.1<br/>(CONNECT proxy)"]

@@ -145,11 +145,12 @@ test-specific packages, copied binaries, forwarded ports, or commands.
 Prepared disks are flattened, sanitized QCOW2 images. The local cache keeps them
 read-only and each test receives a fresh writable overlay and cloud-init
 identity. The optional shared cache stores the compressed standalone disk and
-its compatibility metadata as a custom OCI artifact. Normal test runs consume
-local entries only; the separate cache app owns OCI pulls, trusted builds, and
-explicit publication. OCI pulls require a trusted manifest digest and retain
-that provenance with the local entry; mutable tags are used only for explicit
-publication.
+its compatibility metadata as a custom OCI artifact. Normal test runs ensure
+the exact local entry exists, invoking the cache builder automatically on a
+miss before booting a disposable overlay. The separate cache app owns OCI
+pulls and explicit publication. OCI pulls require a trusted manifest digest
+and retain that provenance with the local entry; mutable tags are used only
+for explicit publication.
 
 ## Python Wheel Packaging
 
@@ -176,19 +177,6 @@ The high-level CI model:
 4. Merge-group checks run against GitHub's temporary queue branch for the final integration state.
 5. Gate jobs verify that the mirror branch matches the PR head, or that the merge-group workflow ran for the queued SHA, and that the expected non-gate workflow actually ran.
 6. Release workflows rebuild and publish binaries, wheels, images, and docs.
-
-After each successful Release Dev run, the release canary smoke-tests published
-artifacts. Linux package installs run in native-architecture Ubuntu and Fedora
-QEMU guests on public AMD64 and ARM64 GitHub runners. The VM harness uses KVM
-when available and falls back to TCG otherwise. The ARM64 fallback uses QEMU's
-bundled EDK2 firmware, which is validated under TCG on both public Linux host
-architectures. Separate jobs retain macOS Homebrew, Ubuntu Snap, and kind-based
-Helm coverage.
-
-A manual `arm64_tcg_benchmark` dispatch mode skips the artifact canaries and
-boots the same pinned ARM64 Ubuntu cloud image under QEMU TCG on public x86_64
-and ARM64 Linux runners. The comparison keeps the native ARM64 runner as the
-production host while verifying that x86_64 TCG remains a viable fallback.
 
 See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 

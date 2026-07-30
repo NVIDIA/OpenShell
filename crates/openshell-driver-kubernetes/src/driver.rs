@@ -848,6 +848,7 @@ impl KubernetesComputeDriver {
             enable_user_namespaces: self.config.enable_user_namespaces,
             app_armor_profile: self.config.app_armor_profile.as_ref(),
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
+            workspace_storage_class: &self.config.workspace_storage_class,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
             provider_spiffe_enabled: self.config.provider_spiffe_enabled(),
@@ -1624,21 +1625,15 @@ fn apply_supervisor_sideload(
             volume_mounts.push(supervisor_volume_mount());
         }
 
-        // Inject resolved sandbox UID/GID as environment variables so the
-        // supervisor can use them directly without /etc/passwd lookups.
+        // Inject the protected resolved identity contract. Clearing the OCI
+        // input prevents image or user environment from selecting a
+        // conflicting identity path.
         let env = container
             .entry("env")
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut();
         if let Some(env) = env {
-            env.push(serde_json::json!({
-                "name": openshell_core::sandbox_env::SANDBOX_UID.to_string(),
-                "value": sandbox_uid.to_string(),
-            }));
-            env.push(serde_json::json!({
-                "name": openshell_core::sandbox_env::SANDBOX_GID.to_string(),
-                "value": sandbox_gid.to_string(),
-            }));
+            apply_resolved_identity_env(env, sandbox_uid, sandbox_gid);
         }
     }
 }
@@ -1728,16 +1723,7 @@ fn supervisor_sidecar_env(
         openshell_core::sandbox_env::PROXY_TLS_DIR,
         SIDECAR_TLS_MOUNT_PATH,
     );
-    upsert_env(
-        &mut env,
-        openshell_core::sandbox_env::SANDBOX_UID,
-        &params.sandbox_uid.to_string(),
-    );
-    upsert_env(
-        &mut env,
-        openshell_core::sandbox_env::SANDBOX_GID,
-        &params.sandbox_gid.to_string(),
-    );
+    apply_resolved_identity_env(&mut env, params.sandbox_uid, params.sandbox_gid);
     if !params.process_binary_aware_network_policy {
         upsert_env(
             &mut env,
@@ -2015,16 +2001,7 @@ fn apply_supervisor_sidecar_topology(
                 openshell_core::sandbox_env::PROXY_TLS_DIR,
                 SIDECAR_TLS_MOUNT_PATH,
             );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::SANDBOX_UID,
-                &params.sandbox_uid.to_string(),
-            );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::SANDBOX_GID,
-                &params.sandbox_gid.to_string(),
-            );
+            apply_resolved_identity_env(env, params.sandbox_uid, params.sandbox_gid);
         }
     }
 
@@ -2155,24 +2132,36 @@ fn apply_workspace_persistence(
 ///
 /// Provides a single PVC named "workspace" that backs the `/sandbox`
 /// directory.  The init container seeds it from the image on first use.
-fn default_workspace_volume_claim_templates(storage_size: &str) -> serde_json::Value {
+///
+/// When `storage_class` is non-empty, it is written to the PVC's
+/// `storageClassName`. An empty value omits the field so the cluster's
+/// default `StorageClass` applies. Clusters with no default `StorageClass`
+/// must set this to prevent the PVC from staying `Pending`.
+fn default_workspace_volume_claim_templates(
+    storage_size: &str,
+    storage_class: &str,
+) -> serde_json::Value {
     let size = if storage_size.is_empty() {
         DEFAULT_WORKSPACE_STORAGE_SIZE
     } else {
         storage_size
     };
+    let mut spec = serde_json::json!({
+        "accessModes": ["ReadWriteOnce"],
+        "resources": {
+            "requests": {
+                "storage": size
+            }
+        }
+    });
+    if !storage_class.is_empty() {
+        spec["storageClassName"] = serde_json::json!(storage_class);
+    }
     serde_json::json!([{
         "metadata": {
             "name": WORKSPACE_VOLUME_NAME
         },
-        "spec": {
-            "accessModes": ["ReadWriteOnce"],
-            "resources": {
-                "requests": {
-                    "storage": size
-                }
-            }
-        }
+        "spec": spec
     }])
 }
 
@@ -2197,6 +2186,7 @@ struct SandboxPodParams<'a> {
     enable_user_namespaces: bool,
     app_armor_profile: Option<&'a AppArmorProfile>,
     workspace_default_storage_size: &'a str,
+    workspace_storage_class: &'a str,
     default_runtime_class_name: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
     /// for the bootstrap `IssueSandboxToken` exchange.
@@ -2231,6 +2221,7 @@ impl Default for SandboxPodParams<'_> {
             enable_user_namespaces: false,
             app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
+            workspace_storage_class: "",
             default_runtime_class_name: "",
             sa_token_ttl_secs: 3600,
             provider_spiffe_enabled: false,
@@ -2328,7 +2319,10 @@ fn sandbox_to_k8s_spec(
     if inject_workspace {
         root.insert(
             "volumeClaimTemplates".to_string(),
-            default_workspace_volume_claim_templates(params.workspace_default_storage_size),
+            default_workspace_volume_claim_templates(
+                params.workspace_default_storage_size,
+                params.workspace_storage_class,
+            ),
         );
     }
 
@@ -3015,6 +3009,23 @@ fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
     }
 
     env.push(serde_json::json!({"name": name, "value": value}));
+}
+
+fn apply_resolved_identity_env(env: &mut Vec<serde_json::Value>, uid: u32, gid: u32) {
+    remove_env(env, openshell_core::sandbox_env::OCI_IMAGE_USER);
+    remove_env(env, openshell_core::sandbox_env::SANDBOX_UID);
+    remove_env(env, openshell_core::sandbox_env::SANDBOX_GID);
+    upsert_env(env, openshell_core::sandbox_env::OCI_IMAGE_USER, "");
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::SANDBOX_UID,
+        &uid.to_string(),
+    );
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::SANDBOX_GID,
+        &gid.to_string(),
+    );
 }
 
 fn remove_env(env: &mut Vec<serde_json::Value>, name: &str) {
@@ -3909,6 +3920,59 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_sideload_replaces_spoofed_identity_environment() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "custom-image:latest",
+                    "env": [
+                        {"name": openshell_core::sandbox_env::OCI_IMAGE_USER, "value": "spoofed"},
+                        {"name": openshell_core::sandbox_env::SANDBOX_UID, "value": "9999"},
+                        {"name": openshell_core::sandbox_env::SANDBOX_GID, "value": "9999"},
+                        {"name": openshell_core::sandbox_env::OCI_IMAGE_USER, "value": "duplicate"}
+                    ]
+                }]
+            }
+        });
+
+        apply_supervisor_sideload(
+            &mut pod_template,
+            "supervisor-image:latest",
+            "IfNotPresent",
+            SupervisorSideloadMethod::InitContainer,
+            1500,
+            1600,
+        );
+
+        let agent = &pod_template["spec"]["containers"][0];
+        let env = agent["env"].as_array().unwrap();
+        for name in [
+            openshell_core::sandbox_env::OCI_IMAGE_USER,
+            openshell_core::sandbox_env::SANDBOX_UID,
+            openshell_core::sandbox_env::SANDBOX_GID,
+        ] {
+            assert_eq!(
+                env.iter().filter(|item| item["name"] == name).count(),
+                1,
+                "{name} must have one driver-owned value"
+            );
+        }
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::OCI_IMAGE_USER),
+            Some("")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SANDBOX_UID),
+            Some("1500")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SANDBOX_GID),
+            Some("1600")
+        );
+    }
+
+    #[test]
     fn supervisor_sideload_adds_security_context_when_missing() {
         let mut pod_template = serde_json::json!({
             "spec": {
@@ -4112,6 +4176,20 @@ mod tests {
         let pod_template = sandbox_template_to_k8s(
             &SandboxTemplate {
                 image: "agent-image:latest".to_string(),
+                environment: std::collections::HashMap::from([
+                    (
+                        openshell_core::sandbox_env::OCI_IMAGE_USER.to_string(),
+                        "spoofed".to_string(),
+                    ),
+                    (
+                        openshell_core::sandbox_env::SANDBOX_UID.to_string(),
+                        "9999".to_string(),
+                    ),
+                    (
+                        openshell_core::sandbox_env::SANDBOX_GID.to_string(),
+                        "9999".to_string(),
+                    ),
+                ]),
                 ..SandboxTemplate::default()
             },
             false,
@@ -4188,6 +4266,10 @@ mod tests {
             rendered_env(agent, openshell_core::sandbox_env::SANDBOX_UID),
             Some("1500")
         );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::OCI_IMAGE_USER),
+            Some("")
+        );
 
         let sidecar = containers
             .iter()
@@ -4232,6 +4314,10 @@ mod tests {
         assert_eq!(
             rendered_env(sidecar, openshell_core::sandbox_env::SANDBOX_GID),
             Some("1500")
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::OCI_IMAGE_USER),
+            Some("")
         );
         assert_eq!(
             rendered_env(sidecar, openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET),
@@ -5714,14 +5800,14 @@ mod tests {
 
     #[test]
     fn default_workspace_vct_uses_provided_storage_size() {
-        let vct = default_workspace_volume_claim_templates("5Gi");
+        let vct = default_workspace_volume_claim_templates("5Gi", "");
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, "5Gi");
     }
 
     #[test]
     fn default_workspace_vct_falls_back_to_const_when_empty() {
-        let vct = default_workspace_volume_claim_templates("");
+        let vct = default_workspace_volume_claim_templates("", "");
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
     }
@@ -5920,5 +6006,43 @@ mod tests {
             data: serde_json::json!({}),
         };
         assert!(sandbox_id_from_object(&obj).is_err());
+    }
+
+    #[test]
+    fn default_workspace_vct_sets_storage_class_when_provided() {
+        let vct = default_workspace_volume_claim_templates("5Gi", "fast-ssd");
+        assert_eq!(vct[0]["spec"]["storageClassName"], "fast-ssd");
+    }
+
+    #[test]
+    fn default_workspace_vct_omits_storage_class_when_empty() {
+        let vct = default_workspace_volume_claim_templates("5Gi", "");
+        assert!(vct[0]["spec"].get("storageClassName").is_none());
+    }
+
+    #[test]
+    fn workspace_storage_class_propagates_to_generated_cr_spec() {
+        let params = SandboxPodParams {
+            workspace_storage_class: "fast-ssd",
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&SandboxSpec::default()), &params);
+        assert_eq!(
+            cr["spec"]["volumeClaimTemplates"][0]["spec"]["storageClassName"],
+            "fast-ssd"
+        );
+    }
+
+    #[test]
+    fn workspace_storage_class_omitted_from_cr_spec_when_empty() {
+        let cr = sandbox_to_k8s_spec_for_test(
+            Some(&SandboxSpec::default()),
+            &SandboxPodParams::default(),
+        );
+        assert!(
+            cr["spec"]["volumeClaimTemplates"][0]["spec"]
+                .get("storageClassName")
+                .is_none()
+        );
     }
 }

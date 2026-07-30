@@ -81,8 +81,8 @@ cat examples/sandbox-policy-quickstart/policy.yaml
 ```yaml
 version: 1
 
-# Default sandbox filesystem and process settings.
-# These static fields are required when using `openshell policy set`
+# Default sandbox filesystem settings.
+# These filesystem fields are required when using `openshell policy set`
 # because it replaces the entire policy.
 filesystem_policy:
   include_workdir: true
@@ -90,9 +90,6 @@ filesystem_policy:
   read_write: [/sandbox, /tmp, /dev/null]
 landlock:
   compatibility: best_effort
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
 
 network_policies:
   github_api:
@@ -108,8 +105,10 @@ network_policies:
       - { path: /usr/bin/curl }
 ```
 
-The top section preserves the default sandbox filesystem and process
-settings (required because `policy set` replaces the entire policy).
+The top section preserves the default sandbox filesystem and Landlock
+settings while omitting process identity so the active compute driver can
+select it. These settings are required because `policy set` replaces the
+entire policy.
 The `network_policies` section is the interesting part: **curl may make
 GET, HEAD, and OPTIONS requests to `api.github.com` over HTTPS.
 Everything else is denied.** The proxy terminates TLS (`tls: terminate`)
