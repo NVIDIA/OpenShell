@@ -42,7 +42,9 @@ default = ["telemetry"]
 ## `--no-default-features` (plus any other features you need) for a build that
 ## contains no telemetry endpoint, no HTTP client, and no emission code at all.
 driver-extraction = ["dep:tar", "dep:tempfile"]
-telemetry = ["dep:reqwest", "dep:chrono"]
+telemetry = ["dep:reqwest", "dep:chrono", "reqwest?/blocking", "reqwest?/rustls-tls-webpki-roots"]
+## OAuth2 token request helpers used by supervisor and gateway.
+oauth = ["dep:reqwest"]
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

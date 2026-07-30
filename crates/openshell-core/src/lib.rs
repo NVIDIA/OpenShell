@@ -29,6 +29,8 @@ pub mod jwt;
 pub mod metadata;
 pub mod middleware;
 pub mod net;
+#[cfg(feature = "oauth")]
+pub mod oauth;
 pub mod paths;
 pub mod policy;
 pub mod progress;

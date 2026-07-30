@@ -34,14 +34,16 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::IpAddr;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_core::oauth::{
+    self, ACCESS_TOKEN_TYPE, OAuthTokenResponse, TokenExchangeParams, TokenGrantParams,
+    effective_client_assertion_type, effective_token_type,
+};
 use openshell_core::proto::ProviderCredentialTokenGrantType;
 use openshell_core::sandbox_env;
-use serde::Deserialize;
 use spiffe::WorkloadApiClient;
 
 /// Token cache shared across all provider token grants.
@@ -55,33 +57,9 @@ static TOKEN_GRANT_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .expect("token grant HTTP client configuration should be valid")
 });
-const MAX_OAUTH_ERROR_FIELD_LEN: usize = 256;
 const DEFAULT_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
 const TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
 const MAX_TOKEN_EXPIRES_IN_SECONDS: i64 = 3600;
-const DEFAULT_CLIENT_ASSERTION_TYPE: &str =
-    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
-const DEFAULT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
-
-/// `OAuth2` token response from the authorization server.
-#[derive(Debug, Clone, Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    token_type: String,
-    #[serde(default)]
-    expires_in: i64,
-    #[serde(default)]
-    #[allow(dead_code)]
-    scope: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OAuthErrorResponse {
-    error: Option<String>,
-    error_description: Option<String>,
-}
 
 /// Cached access token with expiration metadata.
 #[derive(Debug, Clone)]
@@ -232,17 +210,17 @@ pub async fn obtain_provider_token(request: ObtainProviderTokenRequest<'_>) -> R
                             )
                         })?;
                     validate_access_token(&intermediate.access_token)?;
-                    let intermediate_subject_token_type =
-                        final_exchange_subject_token_type(request.requested_token_type);
                     perform_token_exchange(
                         request.token_endpoint,
-                        &jwt_svid,
-                        request.client_assertion_type,
-                        &intermediate.access_token,
-                        intermediate_subject_token_type,
-                        request.audience,
-                        request.scopes,
-                        request.requested_token_type,
+                        &TokenExchangeParams {
+                            client_assertion: &jwt_svid,
+                            client_assertion_type: request.client_assertion_type,
+                            subject_token: &intermediate.access_token,
+                            subject_token_type: ACCESS_TOKEN_TYPE,
+                            audience: request.audience,
+                            scopes: request.scopes,
+                            requested_token_type: request.requested_token_type,
+                        },
                     )
                     .await
                 }
@@ -271,11 +249,8 @@ async fn obtain_provider_token_with_grant<F, Fut>(
 ) -> Result<String>
 where
     F: FnOnce(String) -> Fut,
-    Fut: Future<Output = Result<TokenResponse>>,
+    Fut: Future<Output = Result<OAuthTokenResponse>>,
 {
-    // Derive authorization server audience from token endpoint
-    // For Keycloak: https://auth.example.com/realms/openshell/protocol/openid-connect/token
-    //           -> https://auth.example.com/realms/openshell
     let jwt_audience = effective_jwt_svid_audience(input.token_endpoint, input.jwt_svid_audience);
     let cache_key = token_cache_key(TokenCacheKeyInput {
         provider_name: input.provider_name,
@@ -288,19 +263,16 @@ where
         requested_token_type: effective_token_type(input.requested_token_type),
     });
 
-    // Check cache first
     if let Some(cached) = input.cache.get(&cache_key) {
         return Ok(cached);
     }
 
     let token_response = grant(jwt_audience).await?;
-    validate_access_token(&token_response.access_token)?;
 
     let cache_ttl_seconds =
         token_cache_ttl_seconds(input.cache_ttl_override, token_response.expires_in);
     let expires_at_ms = current_time_ms().saturating_add(cache_ttl_seconds.saturating_mul(1000));
 
-    // Cache the token
     input.cache.set(
         cache_key,
         token_response.access_token.clone(),
@@ -350,221 +322,34 @@ fn provider_spiffe_workload_api_socket_from_env() -> Result<String> {
         })
 }
 
-/// Perform `OAuth2` JWT client assertion grant.
-///
-/// POSTs to the token endpoint with:
-/// - `grant_type=client_credentials`
-/// - `client_assertion_type=<configured assertion type>`
-/// - `client_assertion=<JWT-SVID>` (client identity is in the JWT's `sub` claim)
-/// - `audience=<audience>` (if provided)
-/// - `scope=<scopes>` (if provided)
-///
-/// Note: `client_id` is NOT included - the client is identified by the `sub` claim
-/// in the JWT-SVID itself.
 async fn perform_token_grant(
     token_endpoint: &str,
     jwt_svid: &str,
     client_assertion_type: &str,
     audience: &str,
     scopes: &[String],
-) -> Result<TokenResponse> {
-    let token_endpoint_url = parse_token_endpoint_url(token_endpoint)?;
-    let client_assertion_type = effective_client_assertion_type(client_assertion_type);
-    let mut form_params = vec![
-        ("grant_type", "client_credentials"),
-        ("client_assertion_type", client_assertion_type),
-        ("client_assertion", jwt_svid),
-    ];
-
-    // Add audience if provided
-    let audience_param;
-    if !audience.is_empty() {
-        audience_param = audience.to_string();
-        form_params.push(("audience", &audience_param));
-    }
-
-    // Add scopes if provided
-    let scope_param;
-    if !scopes.is_empty() {
-        scope_param = scopes.join(" ");
-        form_params.push(("scope", &scope_param));
-    }
-
-    // POST to token endpoint
-    let response = TOKEN_GRANT_HTTP_CLIENT
-        .post(token_endpoint_url)
-        .form(&form_params)
-        .send()
-        .await
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to POST to token endpoint {token_endpoint}"))?;
-
-    // Check response status
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read response body>".to_string());
-        return Err(miette::miette!(
-            "{}",
-            token_grant_failure_message(status, &body)
-        ));
-    }
-
-    // Parse token response
-    let token_response = response
-        .json::<TokenResponse>()
-        .await
-        .into_diagnostic()
-        .wrap_err("failed to parse token response as JSON")?;
-    validate_access_token(&token_response.access_token)?;
-    Ok(token_response)
+) -> Result<OAuthTokenResponse> {
+    oauth::post_oauth_token_grant(
+        &TOKEN_GRANT_HTTP_CLIENT,
+        token_endpoint,
+        &TokenGrantParams {
+            client_assertion: jwt_svid,
+            client_assertion_type,
+            audience,
+            scopes,
+        },
+    )
+    .await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn perform_token_exchange(
     token_endpoint: &str,
-    jwt_svid: &str,
-    client_assertion_type: &str,
-    subject_token: &str,
-    subject_token_type: &str,
-    audience: &str,
-    scopes: &[String],
-    requested_token_type: &str,
-) -> Result<TokenResponse> {
-    let token_endpoint_url = parse_token_endpoint_url(token_endpoint)?;
-    let client_assertion_type = effective_client_assertion_type(client_assertion_type);
-    let subject_token_type = effective_token_type(subject_token_type);
-    let requested_token_type = effective_token_type(requested_token_type);
-    let mut form_params = vec![
-        (
-            "grant_type",
-            "urn:ietf:params:oauth:grant-type:token-exchange",
-        ),
-        ("client_assertion_type", client_assertion_type),
-        ("client_assertion", jwt_svid),
-        ("subject_token", subject_token),
-        ("subject_token_type", subject_token_type),
-        ("requested_token_type", requested_token_type),
-    ];
-
-    let audience_param;
-    if !audience.is_empty() {
-        audience_param = audience.to_string();
-        form_params.push(("audience", &audience_param));
-    }
-
-    let scope_param;
-    if !scopes.is_empty() {
-        scope_param = scopes.join(" ");
-        form_params.push(("scope", &scope_param));
-    }
-
-    let response = TOKEN_GRANT_HTTP_CLIENT
-        .post(token_endpoint_url)
-        .form(&form_params)
-        .send()
-        .await
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to POST token exchange to {token_endpoint}"))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read response body>".to_string());
-        return Err(miette::miette!(
-            "{}",
-            token_grant_failure_message(status, &body)
-        ));
-    }
-
-    let token_response = response
-        .json::<TokenResponse>()
-        .await
-        .into_diagnostic()
-        .wrap_err("failed to parse token exchange response as JSON")?;
-    validate_access_token(&token_response.access_token)?;
-    Ok(token_response)
+    params: &TokenExchangeParams<'_>,
+) -> Result<OAuthTokenResponse> {
+    oauth::post_oauth_token_exchange(&TOKEN_GRANT_HTTP_CLIENT, token_endpoint, params).await
 }
 
-fn parse_token_endpoint_url(token_endpoint: &str) -> Result<reqwest::Url> {
-    let url = reqwest::Url::parse(token_endpoint)
-        .into_diagnostic()
-        .wrap_err("token_endpoint must be an absolute URL")?;
-    if token_endpoint_transport_allowed(&url) {
-        return Ok(url);
-    }
-
-    Err(miette::miette!(
-        "token_endpoint must use https, except http for loopback or in-cluster service hosts"
-    ))
-}
-
-fn token_endpoint_transport_allowed(url: &reqwest::Url) -> bool {
-    match url.scheme() {
-        "https" => true,
-        "http" => url
-            .host_str()
-            .is_some_and(|host| is_loopback_host(host) || is_kubernetes_service_host(host)),
-        _ => false,
-    }
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let host = host.trim_matches(['[', ']']);
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(v4)) => v4.is_loopback(),
-        Ok(IpAddr::V6(v6)) => {
-            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-        }
-        Err(_) => false,
-    }
-}
-
-fn is_kubernetes_service_host(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    let labels = host.split('.').collect::<Vec<_>>();
-    let is_service_name = labels.len() == 3 && labels[2] == "svc";
-    let is_cluster_local_service =
-        labels.len() == 5 && labels[2] == "svc" && labels[3] == "cluster" && labels[4] == "local";
-    (is_service_name || is_cluster_local_service) && labels.iter().all(|label| !label.is_empty())
-}
-
-pub fn validate_access_token(token: &str) -> Result<()> {
-    if token.is_empty() || !is_token68(token) {
-        return Err(miette::miette!(
-            "token grant returned a malformed access token"
-        ));
-    }
-    Ok(())
-}
-
-fn is_token68(token: &str) -> bool {
-    let mut padding_started = false;
-    let mut saw_value = false;
-    for byte in token.bytes() {
-        if byte == b'=' {
-            padding_started = true;
-            continue;
-        }
-        if padding_started || !is_token68_value_byte(byte) {
-            return false;
-        }
-        saw_value = true;
-    }
-    saw_value
-}
-
-fn is_token68_value_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
-}
+pub use oauth::validate_access_token;
 
 fn token_cache_ttl_seconds(cache_ttl_override: i64, expires_in: i64) -> i64 {
     if cache_ttl_override > 0 {
@@ -612,26 +397,6 @@ fn effective_jwt_svid_audience(token_endpoint: &str, jwt_svid_audience: &str) ->
     } else {
         jwt_svid_audience.to_string()
     }
-}
-
-fn effective_client_assertion_type(client_assertion_type: &str) -> &str {
-    if client_assertion_type.trim().is_empty() {
-        DEFAULT_CLIENT_ASSERTION_TYPE
-    } else {
-        client_assertion_type
-    }
-}
-
-fn effective_token_type(token_type: &str) -> &str {
-    if token_type.trim().is_empty() {
-        DEFAULT_TOKEN_TYPE
-    } else {
-        token_type
-    }
-}
-
-fn final_exchange_subject_token_type(requested_token_type: &str) -> &str {
-    effective_token_type(requested_token_type)
 }
 
 fn supervisor_gateway_endpoint_from_env() -> Result<String> {
@@ -682,48 +447,6 @@ fn token_cache_key(input: TokenCacheKeyInput<'_>) -> String {
     )
 }
 
-fn token_grant_failure_message(status: reqwest::StatusCode, body: &str) -> String {
-    let Ok(error_response) = serde_json::from_str::<OAuthErrorResponse>(body) else {
-        return format!("token grant failed with status {status}");
-    };
-
-    let error = error_response
-        .error
-        .as_deref()
-        .map(sanitize_oauth_error_field)
-        .filter(|value| !value.is_empty());
-    let description = error_response
-        .error_description
-        .as_deref()
-        .map(sanitize_oauth_error_field)
-        .filter(|value| !value.is_empty());
-
-    match (error, description) {
-        (Some(error), Some(description)) => {
-            format!(
-                "token grant failed with status {status}: error={error}; error_description={description}"
-            )
-        }
-        (Some(error), None) => {
-            format!("token grant failed with status {status}: error={error}")
-        }
-        (None, Some(description)) => {
-            format!("token grant failed with status {status}: error_description={description}")
-        }
-        (None, None) => format!("token grant failed with status {status}"),
-    }
-}
-
-fn sanitize_oauth_error_field(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .take(MAX_OAUTH_ERROR_FIELD_LEN)
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
-
 /// Get current Unix timestamp in milliseconds.
 fn current_time_ms() -> i64 {
     let millis = SystemTime::now()
@@ -736,6 +459,7 @@ fn current_time_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::oauth::{ACCESS_TOKEN_TYPE, DEFAULT_CLIENT_ASSERTION_TYPE};
     use std::collections::HashMap;
     use std::sync::{
         Arc,
@@ -957,11 +681,10 @@ mod tests {
                 let grant_calls = input.grant_calls.clone();
                 async move {
                     let call = grant_calls.fetch_add(1, Ordering::SeqCst) + 1;
-                    Ok(TokenResponse {
+                    Ok(OAuthTokenResponse {
                         access_token: format!("token-{call}"),
                         token_type: "Bearer".to_string(),
                         expires_in: input.expires_in,
-                        scope: input.scopes.join(" "),
                     })
                 }
             },
@@ -1031,79 +754,6 @@ mod tests {
     }
 
     #[test]
-    fn final_exchange_subject_token_type_uses_intermediate_requested_token_type() {
-        let stored_subject_token_type = "urn:ietf:params:oauth:token-type:id_token";
-        let requested_token_type = "urn:ietf:params:oauth:token-type:access_token";
-
-        assert_ne!(stored_subject_token_type, requested_token_type);
-        assert_eq!(
-            final_exchange_subject_token_type(requested_token_type),
-            requested_token_type
-        );
-        assert_eq!(final_exchange_subject_token_type(""), DEFAULT_TOKEN_TYPE);
-    }
-
-    #[test]
-    fn validate_access_token_accepts_token68_values() {
-        for token in [
-            "abcXYZ123-._~+/",
-            "eyJhbGciOiJSUzI1NiJ9.payload.sig",
-            "token==",
-        ] {
-            validate_access_token(token).expect("token68 bearer token should be accepted");
-        }
-    }
-
-    #[test]
-    fn validate_access_token_rejects_header_injection_and_non_token68_values() {
-        for token in [
-            "",
-            "token with spaces",
-            "token\r\nX-Injected: yes",
-            "token\u{7f}",
-            "tokené",
-            "token=continued",
-            "==",
-        ] {
-            let err = validate_access_token(token)
-                .expect_err("malformed bearer token should be rejected");
-            assert_eq!(
-                err.to_string(),
-                "token grant returned a malformed access token"
-            );
-        }
-    }
-
-    #[test]
-    fn token_endpoint_url_allows_https_loopback_and_in_cluster_http() {
-        for endpoint in [
-            "https://auth.example.com/token",
-            "http://127.0.0.1:8080/token",
-            "http://[::1]:8080/token",
-            "http://token-issuer.default.svc.cluster.local/token",
-            "http://token-issuer.default.svc/token",
-        ] {
-            parse_token_endpoint_url(endpoint).expect("token endpoint should be allowed");
-        }
-    }
-
-    #[test]
-    fn token_endpoint_url_rejects_plain_http_non_cluster_hosts() {
-        for endpoint in [
-            "http://auth.example.com/token",
-            "http://keycloak/realms/openshell/protocol/openid-connect/token",
-            "http://token-issuer.default.svc.evil.com/token",
-            "ftp://auth.example.com/token",
-            "/relative/token",
-        ] {
-            assert!(
-                parse_token_endpoint_url(endpoint).is_err(),
-                "token endpoint should be rejected: {endpoint}"
-            );
-        }
-    }
-
-    #[test]
     fn token_cache_key_varies_by_resource_audience_and_scopes() {
         let provider_name = "alpha.default.svc.cluster.local\t80\t\tprovider:access_token";
         let token_endpoint =
@@ -1119,7 +769,7 @@ mod tests {
             audience: "alpha",
             scopes: &alpha_scopes,
             grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
-            requested_token_type: DEFAULT_TOKEN_TYPE,
+            requested_token_type: ACCESS_TOKEN_TYPE,
         });
         let different_audience = token_cache_key(TokenCacheKeyInput {
             provider_name,
@@ -1129,7 +779,7 @@ mod tests {
             audience: "delta",
             scopes: &alpha_scopes,
             grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
-            requested_token_type: DEFAULT_TOKEN_TYPE,
+            requested_token_type: ACCESS_TOKEN_TYPE,
         });
         let different_scopes = token_cache_key(TokenCacheKeyInput {
             provider_name,
@@ -1139,7 +789,7 @@ mod tests {
             audience: "alpha",
             scopes: &delta_scopes,
             grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
-            requested_token_type: DEFAULT_TOKEN_TYPE,
+            requested_token_type: ACCESS_TOKEN_TYPE,
         });
         let different_assertion_type = token_cache_key(TokenCacheKeyInput {
             provider_name,
@@ -1149,7 +799,7 @@ mod tests {
             audience: "alpha",
             scopes: &alpha_scopes,
             grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
-            requested_token_type: DEFAULT_TOKEN_TYPE,
+            requested_token_type: ACCESS_TOKEN_TYPE,
         });
 
         assert_ne!(base, different_audience);
@@ -1171,7 +821,7 @@ mod tests {
             audience: "alpha",
             scopes: &scopes,
             grant_type: ProviderCredentialTokenGrantType::TokenExchange,
-            requested_token_type: DEFAULT_TOKEN_TYPE,
+            requested_token_type: ACCESS_TOKEN_TYPE,
         });
         let revision_two = token_cache_key(TokenCacheKeyInput {
             provider_name: "api.example.test\t443\t/v1/**\trev:2\tprovider:access_token",
@@ -1181,7 +831,7 @@ mod tests {
             audience: "alpha",
             scopes: &scopes,
             grant_type: ProviderCredentialTokenGrantType::TokenExchange,
-            requested_token_type: DEFAULT_TOKEN_TYPE,
+            requested_token_type: ACCESS_TOKEN_TYPE,
         });
 
         assert_ne!(revision_one, revision_two);
@@ -1329,7 +979,7 @@ mod tests {
             audience,
             scopes: &scopes,
             grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
-            requested_token_type: DEFAULT_TOKEN_TYPE,
+            requested_token_type: ACCESS_TOKEN_TYPE,
         });
         cache.set(
             cache_key,
@@ -1353,61 +1003,6 @@ mod tests {
 
         assert_eq!(token, "token-1");
         assert_eq!(grant_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn obtain_provider_token_rejects_malformed_token_before_cache() {
-        let cache = TokenCache::new();
-        let scopes = vec!["read".to_string()];
-        let provider_name = "api.example.test\t443\t/v1/**\tprovider:access_token";
-        let token_endpoint = "https://auth.example.com/token";
-        let jwt_svid_audience = "https://auth.example.com";
-        let audience = "api://resource";
-
-        let err = obtain_provider_token_with_grant(
-            ObtainProviderTokenInput {
-                cache: &cache,
-                provider_name,
-                token_endpoint,
-                jwt_svid_audience,
-                client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
-                audience,
-                scopes: &scopes,
-                cache_ttl_override: 0,
-                grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
-                requested_token_type: "",
-            },
-            |_| async {
-                Ok(TokenResponse {
-                    access_token: "access-123\r\nX-Injected: yes".to_string(),
-                    token_type: "Bearer".to_string(),
-                    expires_in: 60,
-                    scope: "read".to_string(),
-                })
-            },
-        )
-        .await
-        .expect_err("malformed access token should fail before caching");
-
-        let cache_key = token_cache_key(TokenCacheKeyInput {
-            provider_name,
-            token_endpoint,
-            jwt_svid_audience,
-            client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
-            audience,
-            scopes: &scopes,
-            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
-            requested_token_type: DEFAULT_TOKEN_TYPE,
-        });
-
-        assert_eq!(
-            err.to_string(),
-            "token grant returned a malformed access token"
-        );
-        assert!(
-            cache.get(&cache_key).is_none(),
-            "malformed access token must not be cached"
-        );
     }
 
     #[tokio::test]
@@ -1631,44 +1226,5 @@ mod tests {
             err.to_string()
                 .contains("failed to parse token response as JSON")
         );
-    }
-
-    #[test]
-    fn token_grant_failure_message_reports_oauth_error_fields() {
-        let message = token_grant_failure_message(
-            reqwest::StatusCode::UNAUTHORIZED,
-            r#"{"error":"invalid_client","error_description":"Invalid client credentials"}"#,
-        );
-
-        assert_eq!(
-            message,
-            "token grant failed with status 401 Unauthorized: error=invalid_client; error_description=Invalid client credentials"
-        );
-    }
-
-    #[test]
-    fn token_grant_failure_message_omits_unstructured_response_body() {
-        let message = token_grant_failure_message(
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            "internal error containing implementation details",
-        );
-
-        assert_eq!(
-            message,
-            "token grant failed with status 500 Internal Server Error"
-        );
-    }
-
-    #[test]
-    fn token_grant_failure_message_sanitizes_oauth_error_fields() {
-        let long_description = "a".repeat(MAX_OAUTH_ERROR_FIELD_LEN + 20);
-        let body =
-            format!(r#"{{"error":"invalid_client\n","error_description":"{long_description}"}}"#);
-        let message = token_grant_failure_message(reqwest::StatusCode::UNAUTHORIZED, &body);
-
-        assert!(!message.contains('\n'));
-        assert!(message.contains("error=invalid_client"));
-        assert!(message.contains(&"a".repeat(MAX_OAUTH_ERROR_FIELD_LEN)));
-        assert!(!message.contains(&"a".repeat(MAX_OAUTH_ERROR_FIELD_LEN + 1)));
     }
 }
