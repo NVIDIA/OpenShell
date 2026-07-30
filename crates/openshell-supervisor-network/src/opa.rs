@@ -539,8 +539,6 @@ impl OpaEngine {
             .engine
             .into_inner()
             .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
-        let new_runner = ChainRunner::from_registry(registry);
-
         // Match clone_engine_for_tunnel's lock order (engine, then runner) so
         // readers can observe only the old pair or the new pair.
         let mut engine = self
@@ -551,6 +549,7 @@ impl OpaEngine {
             .middleware_runner
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
+        let new_runner = runner.with_replacement_registry(registry);
         *engine = new_engine;
         *runner = new_runner;
         self.generation.fetch_add(1, Ordering::AcqRel);
@@ -569,7 +568,7 @@ impl OpaEngine {
             .middleware_runner
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
-        *runner = ChainRunner::from_registry(registry);
+        *runner = runner.with_replacement_registry(registry);
         self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -6807,6 +6806,94 @@ network_policies:
             .await
             .expect("describe chain");
         assert!(described[0].is_resolved());
+    }
+
+    #[tokio::test]
+    async fn middleware_session_budget_survives_atomic_registry_reload() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial load should succeed");
+        let registry = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("built-in registry");
+        engine
+            .replace_middleware_registry(registry)
+            .expect("install registry");
+        let old_runner = engine.middleware_runner().expect("old runner");
+        let entry = ChainEntry {
+            name: "regex".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+            order: 0,
+            config: prost_types::Struct {
+                fields: std::iter::once((
+                    "mode".into(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue("redact".into())),
+                    },
+                ))
+                .collect(),
+            },
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        };
+        let preflight_input =
+            |session_id: String| openshell_supervisor_middleware::WebSocketPreflightInput {
+                session_id,
+                request_id: "request".into(),
+                sandbox_id: "sandbox".into(),
+                scheme: "wss".into(),
+                host: "api.openai.com".into(),
+                port: 443,
+                path: "/v1/responses".into(),
+                requested_subprotocols: Vec::new(),
+            };
+        let mut old_sessions = Vec::new();
+        for index in 0..openshell_supervisor_middleware::MAX_CONCURRENT_MIDDLEWARE_SESSIONS {
+            let preflight = old_runner
+                .preflight_websocket(
+                    std::slice::from_ref(&entry),
+                    preflight_input(format!("old-generation-{index}")),
+                )
+                .await
+                .expect("admit old-generation session");
+            old_sessions.push(preflight.session.expect("built-in inspects session"));
+        }
+
+        let replacement = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("replacement registry");
+        engine
+            .reload_policy_and_middleware_from_proto_with_pid(&proto, 0, replacement)
+            .expect("atomic policy and registry reload");
+        let current_runner = engine.middleware_runner().expect("current runner");
+        let overflow = current_runner
+            .preflight_websocket(
+                std::slice::from_ref(&entry),
+                preflight_input("new-generation-overflow".into()),
+            )
+            .await
+            .expect("capacity exhaustion is a typed preflight outcome");
+        assert!(!overflow.allowed);
+        assert!(overflow.session_capacity_exhausted);
+
+        old_sessions
+            .pop()
+            .expect("old-generation session")
+            .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+            .await;
+        let admitted = current_runner
+            .preflight_websocket(
+                std::slice::from_ref(&entry),
+                preflight_input("new-generation-admitted".into()),
+            )
+            .await
+            .expect("released capacity is reusable after reload");
+        assert!(admitted.allowed);
+        assert!(admitted.session.is_some());
     }
 
     #[tokio::test]

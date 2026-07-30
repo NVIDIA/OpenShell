@@ -148,8 +148,18 @@ impl WebSocketStage {
         self.transport.is_some()
     }
 
-    fn disable(&mut self) {
-        self.transport.take();
+    async fn disable(&mut self) {
+        self.end(WebSocketSessionEndReason::MiddlewareFailure).await;
+    }
+
+    async fn end(&mut self, reason: WebSocketSessionEndReason) {
+        if let Some(transport) = self.transport.take() {
+            let _ = tokio::time::timeout(
+                Duration::from_millis(10),
+                transport.sender.send(session_end_request(reason)),
+            )
+            .await;
+        }
     }
 }
 
@@ -448,7 +458,7 @@ impl WebSocketSession {
             let sent =
                 tokio::time::timeout(stage.entry.timeout, transport.sender.send(request)).await;
             if !matches!(sent, Ok(Ok(()))) {
-                stage.disable();
+                stage.disable().await;
                 let reason = "session_start_send_failed";
                 let mut invocation = failure_invocation(&stage.entry, None, 0, reason);
                 invocation.stage_disabled = true;
@@ -570,7 +580,7 @@ impl WebSocketSession {
                 let mut invocation =
                     failure_invocation(&stage.entry, Some(sequence), original_size, reason);
                 let fail_closed = stage.entry.entry.on_error == OnError::FailClosed;
-                stage.disable();
+                stage.disable().await;
                 invocation.stage_disabled = true;
                 invocations.push(invocation);
                 if fail_closed {
@@ -623,7 +633,9 @@ impl WebSocketSession {
                             &metadata,
                             &mut invocations,
                             saturated,
-                        ) {
+                        )
+                        .await
+                        {
                             return outcome;
                         }
                         continue;
@@ -640,7 +652,9 @@ impl WebSocketSession {
                         &metadata,
                         &mut invocations,
                         saturated,
-                    ) {
+                    )
+                    .await
+                    {
                         return outcome;
                     }
                     continue;
@@ -660,7 +674,9 @@ impl WebSocketSession {
                         &metadata,
                         &mut invocations,
                         saturated,
-                    ) {
+                    )
+                    .await
+                    {
                         return outcome;
                     }
                     continue;
@@ -676,7 +692,9 @@ impl WebSocketSession {
                         &metadata,
                         &mut invocations,
                         saturated,
-                    ) {
+                    )
+                    .await
+                    {
                         return outcome;
                     }
                     continue;
@@ -697,7 +715,9 @@ impl WebSocketSession {
                             &metadata,
                             &mut invocations,
                             saturated,
-                        ) {
+                        )
+                        .await
+                        {
                             return outcome;
                         }
                         continue;
@@ -1152,7 +1172,7 @@ fn validate_message_result(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_stage_failure(
+async fn handle_stage_failure(
     stage: &mut WebSocketStage,
     sequence: u64,
     original_size: usize,
@@ -1163,7 +1183,7 @@ fn handle_stage_failure(
     invocations: &mut Vec<WebSocketInvocation>,
     saturated: bool,
 ) -> Option<WebSocketMessageOutcome> {
-    stage.disable();
+    stage.disable().await;
     let mut invocation = failure_invocation(&stage.entry, Some(sequence), original_size, reason);
     invocation.stage_disabled = true;
     invocations.push(invocation);
@@ -1251,13 +1271,7 @@ fn failure_invocation(
 
 async fn end_stages(stages: &mut [WebSocketStage], reason: WebSocketSessionEndReason) {
     for stage in stages {
-        if let Some(transport) = stage.transport.take() {
-            let _ = tokio::time::timeout(
-                Duration::from_millis(10),
-                transport.sender.send(session_end_request(reason)),
-            )
-            .await;
-        }
+        stage.end(reason).await;
     }
 }
 
@@ -1276,5 +1290,50 @@ fn session_end_request(reason: WebSocketSessionEndReason) -> WebSocketSessionEve
                 reason: reason as i32,
             },
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn disabling_stage_sends_middleware_failure_once() {
+        let (sender, mut requests) = mpsc::channel(1);
+        let mut stage = WebSocketStage {
+            entry: DescribedChainEntry {
+                entry: ChainEntry {
+                    name: "best-effort".into(),
+                    implementation: "test/middleware".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailOpen,
+                },
+                service: None,
+                binding: None,
+                max_payload_bytes: 1024,
+                timeout: Duration::from_secs(1),
+            },
+            transport: Some(WebSocketStageTransport {
+                sender,
+                responses: Box::pin(tokio_stream::empty()),
+            }),
+        };
+
+        stage.disable().await;
+        stage.disable().await;
+
+        let event = requests.recv().await.expect("session end event");
+        let Some(web_socket_session_event::Event::SessionEnd(end)) = event.event else {
+            panic!("disabled stage must receive session end");
+        };
+        assert_eq!(
+            WebSocketSessionEndReason::try_from(end.reason),
+            Ok(WebSocketSessionEndReason::MiddlewareFailure)
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "disabled stage must receive at most one session end"
+        );
     }
 }

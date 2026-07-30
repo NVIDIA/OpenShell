@@ -42,8 +42,10 @@ New limits should follow these rules:
 
 ## Middleware
 
-Middleware limits are process-wide per sandbox because every connection shares
-one `MiddlewareRegistry`.
+Middleware limits are process-wide per sandbox. Registry replacement preserves
+the shared work, waiter, and persistent-session admission state so activity
+retained by an older generation still consumes the same process-lifetime
+budgets as new activity.
 
 | Resource | Current bound | Scope and behavior |
 |---|---:|---|
@@ -99,11 +101,14 @@ Ordinary allowed traffic is streamed rather than accumulated to a
 connection-sized buffer. A parsing or transformation feature introduces a
 buffer only when it owns an explicit bound.
 
-Parsed WebSocket text assembly acquires shared middleware work before buffering.
-The assembly state retains that permit with its buffer, compression and
-fragment state, and total deadline. Input progress resets only the idle
-deadline. Completion transfers the permit into middleware evaluation; every
-timeout and terminal parser error drops it.
+Parsed WebSocket text assembly for an active middleware session acquires shared
+middleware work before buffering. The assembly state retains that permit with
+its buffer, compression and fragment state, and total deadline. Input progress
+resets only the idle deadline. Completion transfers the permit into middleware
+evaluation; every timeout and terminal parser error drops it. Parsed relays
+used only for native policy, credential rewriting, compression, or a disabled
+fail-open middleware session retain the per-message and time bounds above but
+do not yet share aggregate assembly admission.
 
 The operator middleware `max_payload_bytes` ceiling applies to payloads exposed
 through HTTP-body and WebSocket text-message bindings. It does not replace the
@@ -155,6 +160,8 @@ resource model. Known gaps include:
   ceiling rather than narrowing it.
 - Socket read deadlines are not expressed consistently as idle plus total
   budgets across every parser.
+- Parsed WebSocket text assembly without active middleware has per-message and
+  time bounds but no process-wide aggregate admission budget.
 - There is no documented aggregate connection budget or per-destination
   fairness policy in the supervisor.
 - The policy status outbox is intentionally unbounded and can grow if policy

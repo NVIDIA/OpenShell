@@ -140,8 +140,9 @@ impl MiddlewareWorkAdmissionOutcome {
 /// One slot in the shared persistent middleware session budget.
 ///
 /// Protocol-specific session runners retain this guard while at least one
-/// streaming stage remains active. The generic registry owns admission so
-/// future streaming HTTP middleware can share the same process-wide bound.
+/// streaming stage remains active. Registry replacement preserves the shared
+/// admission state so future streaming HTTP middleware can use the same
+/// process-wide bound.
 #[derive(Debug)]
 struct MiddlewareSessionPermit {
     _session: OwnedSemaphorePermit,
@@ -1052,6 +1053,16 @@ impl ChainRunner {
         Self {
             registry: Arc::new(registry),
         }
+    }
+
+    /// Build a runner for a replacement registry while preserving process-wide
+    /// admission budgets across registry generations.
+    #[must_use]
+    pub fn with_replacement_registry(&self, mut registry: MiddlewareRegistry) -> Self {
+        registry.work_admission = Arc::clone(&self.registry.work_admission);
+        registry.work_admission_waiters = Arc::clone(&self.registry.work_admission_waiters);
+        registry.session_admission = Arc::clone(&self.registry.session_admission);
+        Self::from_registry(registry)
     }
 
     /// Reserve one unit of short-lived middleware work.
@@ -5111,6 +5122,46 @@ mod tests {
             .expect("released session capacity is reusable");
         assert!(replacement.allowed);
         assert!(replacement.session.is_some());
+    }
+
+    #[tokio::test]
+    async fn websocket_session_budget_survives_registry_replacement() {
+        let runner = builtin_runner();
+        let chain = [entry("regex-redactor", OnError::FailClosed)];
+        let mut sessions = Vec::new();
+        for index in 0..MAX_CONCURRENT_MIDDLEWARE_SESSIONS {
+            let preflight = runner
+                .preflight_websocket(
+                    &chain,
+                    websocket_preflight_input(format!("old-generation-{index}")),
+                )
+                .await
+                .expect("admit old-generation session");
+            sessions.push(preflight.session.expect("built-in inspects session"));
+        }
+
+        let replacement_registry = MiddlewareRegistry::connect_services(services(), Vec::new())
+            .await
+            .expect("connect replacement registry");
+        let replacement = runner.with_replacement_registry(replacement_registry);
+        let overflow = replacement
+            .preflight_websocket(&chain, websocket_preflight_input("new-generation-overflow"))
+            .await
+            .expect("capacity exhaustion is a typed preflight outcome");
+        assert!(!overflow.allowed);
+        assert!(overflow.session_capacity_exhausted);
+
+        sessions
+            .pop()
+            .expect("retained old-generation session")
+            .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+            .await;
+        let admitted = replacement
+            .preflight_websocket(&chain, websocket_preflight_input("new-generation-admitted"))
+            .await
+            .expect("released capacity is reusable after replacement");
+        assert!(admitted.allowed);
+        assert!(admitted.session.is_some());
     }
 
     #[tokio::test]

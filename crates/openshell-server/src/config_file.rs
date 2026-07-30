@@ -191,6 +191,7 @@ pub struct MiddlewareServiceFileConfig {
     pub grpc_endpoint: String,
     /// Operator-owned logical payload limit for every binding exposed by this
     /// service, including HTTP bodies and complete WebSocket messages.
+    #[serde(alias = "max_body_bytes")]
     pub max_payload_bytes: u64,
     /// Default RPC timeout using an integer with an `ms` or `s` suffix.
     #[serde(default)]
@@ -472,6 +473,22 @@ timeout = "2s"
         let registration =
             SupervisorMiddlewareService::from(&file.openshell.supervisor.middleware[0]);
         assert_eq!(registration.timeout, "2s");
+    }
+
+    #[test]
+    fn parses_legacy_supervisor_middleware_payload_limit() {
+        let toml = r#"
+[[openshell.supervisor.middleware]]
+name = "local-guard"
+grpc_endpoint = "http://127.0.0.1:50051"
+max_body_bytes = 262144
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("legacy middleware registration parses");
+        assert_eq!(
+            file.openshell.supervisor.middleware[0].max_payload_bytes,
+            262_144
+        );
     }
 
     #[test]
