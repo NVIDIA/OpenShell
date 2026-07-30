@@ -52,6 +52,15 @@ pub enum PersistenceError {
 }
 
 impl PersistenceError {
+    /// Whether this error is a signal the caller acts on rather than a failure.
+    ///
+    /// Both variants are how the store reports contention: `MustCreate` losing
+    /// a race is how [`crate::compute::lease`] learns the lease is held, and a
+    /// version conflict is what drives an optimistic-concurrency retry.
+    pub fn is_expected(&self) -> bool {
+        matches!(self, Self::UniqueViolation { .. } | Self::Conflict { .. })
+    }
+
     pub fn unique_violation(constraint: Option<String>, detail: Option<String>) -> Self {
         let constraint_msg = constraint
             .as_ref()
@@ -171,6 +180,20 @@ macro_rules! store_dispatch {
     };
 }
 
+/// [`store_dispatch`] for methods carrying a span, marking that span failed
+/// unless the error is one the caller is expected to act on.
+macro_rules! store_dispatch_traced {
+    ($self:ident . $method:ident ( $($arg:expr),* )) => {{
+        let result = store_dispatch!($self.$method($($arg),*));
+        if let Err(err) = &result
+            && !err.is_expected()
+        {
+            crate::otel_tracing::mark_error(&tracing::Span::current());
+        }
+        result
+    }};
+}
+
 impl Store {
     /// Returns `true` for single-replica backends (`SQLite`) where no lease
     /// coordination is needed, `false` for multi-replica backends (`Postgres`).
@@ -237,6 +260,11 @@ impl Store {
     /// * `Err(Conflict)` - Resource version mismatch (for `MatchResourceVersion`)
     /// * `Err(UniqueViolation)` - Object already exists (for `MustCreate`) or name conflict
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.put_if", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace)
+    )]
     pub async fn put_if(
         &self,
         object_type: &str,
@@ -247,7 +275,15 @@ impl Store {
         labels: Option<&str>,
         condition: WriteCondition,
     ) -> PersistenceResult<WriteResult> {
-        store_dispatch!(self.put_if(object_type, id, name, workspace, payload, labels, condition))
+        store_dispatch_traced!(self.put_if(
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            labels,
+            condition
+        ))
     }
 
     /// Delete an object by id with compare-and-swap support.
@@ -261,17 +297,27 @@ impl Store {
     /// * `Ok(true)` - Object was deleted
     /// * `Ok(false)` - Object not found
     /// * `Err(Conflict)` - Resource version mismatch
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.delete_if", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id)
+    )]
     pub async fn delete_if(
         &self,
         object_type: &str,
         id: &str,
         expected_resource_version: u64,
     ) -> PersistenceResult<bool> {
-        store_dispatch!(self.delete_if(object_type, id, expected_resource_version))
+        store_dispatch_traced!(self.delete_if(object_type, id, expected_resource_version))
     }
 
     /// Insert or update a generic named object with an application-owned scope.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.put_scoped", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, scope = %scope)
+    )]
     pub async fn put_scoped(
         &self,
         object_type: &str,
@@ -282,67 +328,120 @@ impl Store {
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
-        store_dispatch!(self.put_scoped(object_type, id, name, workspace, scope, payload, labels))
+        store_dispatch_traced!(self.put_scoped(
+            object_type,
+            id,
+            name,
+            workspace,
+            scope,
+            payload,
+            labels
+        ))
     }
 
     /// Fetch an object by id.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.get", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id)
+    )]
     pub async fn get(
         &self,
         object_type: &str,
         id: &str,
     ) -> PersistenceResult<Option<ObjectRecord>> {
-        store_dispatch!(self.get(object_type, id))
+        store_dispatch_traced!(self.get(object_type, id))
     }
 
     /// Fetch an object by name within an object type and workspace.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(
+            otel.name = "store.get_by_name", otel.status_code = tracing::field::Empty, 
+            object_type = %object_type,
+            workspace = %workspace,
+            object.name = %name
+        )
+    )]
     pub async fn get_by_name(
         &self,
         object_type: &str,
         workspace: &str,
         name: &str,
     ) -> PersistenceResult<Option<ObjectRecord>> {
-        store_dispatch!(self.get_by_name(object_type, workspace, name))
+        store_dispatch_traced!(self.get_by_name(object_type, workspace, name))
     }
 
     /// Delete an object by id.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.delete", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id)
+    )]
     pub async fn delete(&self, object_type: &str, id: &str) -> PersistenceResult<bool> {
-        store_dispatch!(self.delete(object_type, id))
+        store_dispatch_traced!(self.delete(object_type, id))
     }
 
     /// Count objects of a given type within a workspace.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.count_in_workspace", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace)
+    )]
     pub async fn count_in_workspace(
         &self,
         object_type: &str,
         workspace: &str,
     ) -> PersistenceResult<u64> {
-        store_dispatch!(self.count_in_workspace(object_type, workspace))
+        store_dispatch_traced!(self.count_in_workspace(object_type, workspace))
     }
 
     /// Delete all objects of a given type within a workspace.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.delete_all_in_workspace", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace)
+    )]
     pub async fn delete_all_in_workspace(
         &self,
         object_type: &str,
         workspace: &str,
     ) -> PersistenceResult<u64> {
-        store_dispatch!(self.delete_all_in_workspace(object_type, workspace))
+        store_dispatch_traced!(self.delete_all_in_workspace(object_type, workspace))
     }
 
     /// Delete all objects of a given type with a matching scope.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.delete_by_scope", otel.status_code = tracing::field::Empty,  object_type = %object_type, scope = %scope)
+    )]
     pub async fn delete_by_scope(&self, object_type: &str, scope: &str) -> PersistenceResult<u64> {
-        store_dispatch!(self.delete_by_scope(object_type, scope))
+        store_dispatch_traced!(self.delete_by_scope(object_type, scope))
     }
 
     /// Delete an object by name within an object type and workspace.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.delete_by_name", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace, object.name = %name)
+    )]
     pub async fn delete_by_name(
         &self,
         object_type: &str,
         workspace: &str,
         name: &str,
     ) -> PersistenceResult<bool> {
-        store_dispatch!(self.delete_by_name(object_type, workspace, name))
+        store_dispatch_traced!(self.delete_by_name(object_type, workspace, name))
     }
 
     /// List objects by type and workspace.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.list", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace)
+    )]
     pub async fn list(
         &self,
         object_type: &str,
@@ -350,23 +449,33 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        store_dispatch!(self.list(object_type, workspace, limit, offset))
+        store_dispatch_traced!(self.list(object_type, workspace, limit, offset))
     }
 
     /// List objects by type across all workspaces.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.list_by_type", otel.status_code = tracing::field::Empty,  object_type = %object_type)
+    )]
     pub async fn list_by_type(
         &self,
         object_type: &str,
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        store_dispatch!(self.list_by_type(object_type, limit, offset))
+        store_dispatch_traced!(self.list_by_type(object_type, limit, offset))
     }
 
     /// List objects by type and application-owned scope.
     ///
     /// Workspace filtering is intentionally omitted: scope values are sandbox
     /// UUIDs which are globally unique. Revisit if non-UUID scopes are introduced.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.list_by_scope", otel.status_code = tracing::field::Empty,  object_type = %object_type, scope = %scope)
+    )]
     pub async fn list_by_scope(
         &self,
         object_type: &str,
@@ -374,11 +483,21 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        store_dispatch!(self.list_by_scope(object_type, scope, limit, offset))
+        store_dispatch_traced!(self.list_by_scope(object_type, scope, limit, offset))
     }
 
     /// List objects by type and workspace with label selector filtering.
     /// Label selector format: "key1=value1,key2=value2" (comma-separated equality matches).
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(
+            otel.name = "store.list_with_selector", otel.status_code = tracing::field::Empty, 
+            object_type = %object_type,
+            workspace = %workspace,
+            label_selector = %label_selector
+        )
+    )]
     pub async fn list_with_selector(
         &self,
         object_type: &str,
@@ -387,7 +506,7 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        store_dispatch!(self.list_with_selector(
+        store_dispatch_traced!(self.list_with_selector(
             object_type,
             workspace,
             label_selector,
@@ -437,6 +556,11 @@ impl Store {
     }
 
     /// List objects by type across all workspaces with label selector filtering.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.list_all_with_selector", otel.status_code = tracing::field::Empty,  object_type = %object_type, label_selector = %label_selector)
+    )]
     pub async fn list_all_with_selector(
         &self,
         object_type: &str,
@@ -444,7 +568,12 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        store_dispatch!(self.list_all_with_selector(object_type, label_selector, limit, offset))
+        store_dispatch_traced!(self.list_all_with_selector(
+            object_type,
+            label_selector,
+            limit,
+            offset
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -812,6 +941,11 @@ pub fn parse_label_selector(selector: &str) -> PersistenceResult<HashMap<String,
 /// [`Store::update_message_cas`] to ensure every write is CAS-protected.
 #[cfg(test)]
 impl Store {
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.put", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace)
+    )]
     pub async fn put(
         &self,
         object_type: &str,
@@ -821,7 +955,7 @@ impl Store {
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
-        store_dispatch!(self.put(object_type, id, name, workspace, payload, labels))
+        store_dispatch_traced!(self.put(object_type, id, name, workspace, payload, labels))
     }
 
     pub async fn put_message<
@@ -853,6 +987,17 @@ impl Store {
             labels_json.as_deref(),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+impl Store {
+    /// Closes the backing connection pool.
+    pub(crate) async fn close_for_test(&self) {
+        match self {
+            Self::Sqlite(store) => store.close_for_test().await,
+            Self::Postgres(_) => unreachable!("tests use SQLite"),
+        }
     }
 }
 

@@ -16,12 +16,12 @@ Agent skills live in `.agents/skills/`. Your harness can discover and load them 
 
 These pipelines connect skills into end-to-end workflows. Individual skill files don't describe these relationships.
 
-- **Community inflow:** `triage-issue` → `create-spike` → `build-from-issue`
-  - Triage assesses and classifies community-filed issues. Spike investigates unknowns. Build implements.
-- **Internal development:** `create-spike` → `build-from-issue`
-  - Spike explores feasibility, then build executes once `state:agent-ready` is applied by a human.
+- **Community inflow:** `triage-issue` → human disposition and roadmap placement → `create-spike` when needed → `build-from-issue`
+  - Triage establishes facts and marks technically valid issues `state:validated`. A human applies `state:accepted` if the project should pursue the work and separately places it on the roadmap. The `agent:*` labels support unattended agents that scan for queued work: a human queues a plan with `agent:plan-requested`, the agent returns `agent:plan-ready`, and a human queues implementation with `agent:implementation-requested`. A direct user request to an agent authorizes the requested phase without those labels.
+- **Internal development:** `create-spike` → human disposition and roadmap placement → `build-from-issue`
+  - Spike explores feasibility and marks its issue `state:validated` when sufficient evidence exists. A human accepts it with `state:accepted` or declines it, separately places it on the roadmap, and optionally queues it through the `agent:*` workflow or directs an agent to it.
 - **Security:** `review-security-issue` → `fix-security-issue`
-  - Review produces a severity assessment and remediation plan. Fix implements it. Both require the `topic:security` label; fix also requires `state:agent-ready`.
+  - General build agents must not process `topic:security` issues. For unattended processing, a human queues specialized review with `agent:plan-requested`; review produces a severity assessment and remediation plan; a human queues remediation with `agent:implementation-requested`. Direct requests to the specialized skills do not require those labels.
 - **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
   - CLI manages the sandbox lifecycle; policy generation authors the YAML constraints.
 
@@ -73,7 +73,9 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 - **Bug reports** must include an agent diagnostic section — proof that the reporter's agent investigated the issue before filing. See the issue template.
 - **Feature requests** must include a design proposal, not just a "please build this" request. See the issue template.
 - **New features** must start as GitHub issues using the feature request template. Open an RFC only after an issue exists; maintainers decide when one is needed and assign RFC numbers from the issue.
+- **Issue triage** establishes technical validity and impact evidence. Agents never decide roadmap acceptance, apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`. Humans accept or decline validated work and separately place it on the roadmap. The request labels queue work for unattended agents; an explicit user instruction can instead authorize an agent to plan or implement a specific issue. OpenShell has no `priority:*` labels; roadmap association carries sequencing.
 - **PRs** must follow the PR template structure: Summary, Related Issue, Changes, Testing, Checklist.
+- **PRs for features, user-visible behavior, public APIs, architecture, or multi-PR efforts** must link an accepted issue. Small docs fixes, mechanical maintenance, and obvious localized bug fixes may state why no issue is required.
 - **PRs from unvouched external contributors** are automatically closed. See the Vouch System section above.
 - **Security vulnerabilities** must NOT be filed as GitHub issues. Follow [SECURITY.md](SECURITY.md).
 - Skills that create issues or PRs (`create-github-issue`, `create-github-pr`, `build-from-issue`) should produce output conforming to these templates.

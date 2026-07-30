@@ -305,21 +305,6 @@ jobs:
         with:
           artifact-name: ${{ inputs.vm-driver-artifact-name }}
 
-      - name: Enable KVM access
-        run: |
-          set -euo pipefail
-          if [[ ! -c /dev/kvm ]]; then
-            echo "::error::The GitHub-hosted runner did not expose /dev/kvm"
-            lscpu
-            grep -m1 -E '^(flags|Features)' /proc/cpuinfo || true
-            ls -la /dev
-            exit 1
-          fi
-          sudo chmod 0666 /dev/kvm
-          ls -l /dev/kvm
-          test -r /dev/kvm
-          test -w /dev/kvm
-
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -334,6 +319,29 @@ jobs:
             pkg-config \
             socat \
             zstd
+
+      - name: Enable KVM access
+        run: |
+          set -euo pipefail
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::The GitHub-hosted runner did not expose /dev/kvm"
+            lscpu
+            grep -m1 -E '^(flags|Features)' /proc/cpuinfo || true
+            ls -la /dev
+            exit 1
+          fi
+
+          # Package installation can restart systemd-udevd, which reapplies
+          # the default root:kvm 0660 mode. Install a persistent rule after
+          # dependencies so later udev events preserve runner access.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --settle --name-match=kvm
+
+          ls -l /dev/kvm
+          exec 3<>/dev/kvm
+          exec 3>&-
 
       - name: Validate VM host tools
         run: |

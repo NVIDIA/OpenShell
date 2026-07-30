@@ -35,6 +35,7 @@ mod http;
 mod inference;
 mod middleware;
 mod multiplex;
+mod otel_tracing;
 mod persistence;
 pub(crate) mod policy_store;
 mod provider_profile_sources;
@@ -52,6 +53,7 @@ mod tls;
 #[cfg(test)]
 pub(crate) mod tls_test_utils;
 pub mod tracing_bus;
+mod tracing_setup;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -70,6 +72,10 @@ use tracing::{debug, error, info, warn};
 
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Serializes tests that assert on captured spans, which share one exporter.
+#[cfg(test)]
+pub(crate) static TEST_TRACING_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 use compute::ComputeRuntime;
 #[cfg(test)]
