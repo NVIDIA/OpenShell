@@ -6,9 +6,13 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
-use crate::app::{App, CreateProviderPhase, ProviderKeyField};
+use crate::app::{App, CreateProviderPhase, ProviderKeyField, UpdateProviderField};
+
+use indexmap::IndexMap;
 
 use super::centered_rect;
+
+const MAX_VISIBLE_CONFIG: usize = 6;
 
 /// Draw the create provider modal overlay.
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -202,13 +206,17 @@ fn draw_enter_key(
     let warning_rows: u16 = if has_warning { 2 } else { 0 }; // warning + spacer
 
     #[allow(clippy::cast_possible_truncation)]
+    let config_rows = (form.config.len() as u16).min(MAX_VISIBLE_CONFIG as u16) + 3;
+    #[allow(clippy::cast_possible_truncation)]
     let content_height = if form.is_generic {
-        // type(1) + name(2) + spacer(1) + env_name(2) + value(2) + spacer(1) + submit(1) + status(1) + hint(1)
-        warning_rows + 12
+        // type(1) + name(2) + spacer(1) + env_name(2) + value(2) + spacer(1)
+        // + config_section + spacer(1) + submit(1) + status(1) + hint(1)
+        warning_rows + 1 + 2 + 1 + 2 + 2 + 1 + config_rows + 1 + 1 + 1 + 1
     } else {
         let num_creds = form.credentials.len().clamp(1, 8) as u16;
-        // type(1) + name(2) + spacer(1) + creds + spacer(1) + submit(1) + status(1) + hint(1)
-        warning_rows + 1 + 2 + 1 + num_creds + 1 + 1 + 1 + 1
+        // type(1) + name(2) + spacer(1) + creds + spacer(1)
+        // + config_section + spacer(1) + submit(1) + status(1) + hint(1)
+        warning_rows + 1 + 2 + 1 + num_creds + 1 + config_rows + 1 + 1 + 1 + 1
     };
     let modal_height = (content_height + 4).min(area.height.saturating_sub(2));
     let popup_area = centered_rect(modal_width, modal_height, area);
@@ -241,6 +249,17 @@ fn draw_enter_key(
         let num_creds = form.credentials.len().clamp(1, 8) as u16;
         constraints.push(Constraint::Length(num_creds)); // credential rows
     }
+
+    constraints.push(Constraint::Length(1)); // spacer before config
+    constraints.push(Constraint::Length(1)); // config keys label
+    #[allow(clippy::cast_possible_truncation)]
+    let num_config = form.config.len().min(MAX_VISIBLE_CONFIG) as u16;
+    if num_config > 0 {
+        constraints.push(Constraint::Length(num_config)); // existing config entries
+    }
+    constraints.push(Constraint::Length(1)); // config key input
+    constraints.push(Constraint::Length(1)); // config value input
+
     constraints.push(Constraint::Length(1)); // spacer
     constraints.push(Constraint::Length(1)); // submit
     constraints.push(Constraint::Length(1)); // status
@@ -361,7 +380,68 @@ fn draw_enter_key(
     }
     idx += 1;
 
-    // Spacer.
+    // Spacer before config.
+    idx += 1;
+
+    // Config Keys label.
+    let config_section_focused = matches!(
+        form.key_field,
+        ProviderKeyField::ConfigList
+            | ProviderKeyField::ConfigKeyName
+            | ProviderKeyField::ConfigKeyValue
+    );
+    let header_style = if config_section_focused {
+        t.accent_bold
+    } else {
+        t.muted
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled("Config Keys:", header_style))),
+        chunks[idx],
+    );
+    idx += 1;
+
+    // Existing config entries.
+    if !form.config.is_empty() {
+        let config_entry_active = form.key_field == ProviderKeyField::ConfigList;
+        render_config_entries(
+            frame,
+            &form.config,
+            form.config_cursor,
+            config_entry_active,
+            chunks[idx],
+            t,
+        );
+        idx += 1;
+    }
+
+    // Config key input.
+    let editing_key = form.key_field == ProviderKeyField::ConfigKeyName;
+    render_config_input_field(
+        frame,
+        "Key",
+        &form.config_key_input,
+        editing_key,
+        "key",
+        chunks[idx],
+        t,
+    );
+    idx += 1;
+
+    // Config value input.
+    let editing_val = form.key_field == ProviderKeyField::ConfigKeyValue;
+    render_config_input_field(
+        frame,
+        "Val",
+        &form.config_value_input,
+        editing_val,
+        "value",
+        chunks[idx],
+        t,
+    );
+    idx += 1;
+
+    // Spacer before submit.
     idx += 1;
 
     // Submit button.
@@ -383,20 +463,7 @@ fn draw_enter_key(
     idx += 1;
 
     // Status.
-    if let Some(ref status) = form.status {
-        let style = if status.contains("required")
-            || status.contains("failed")
-            || status.contains("Failed")
-        {
-            t.status_err
-        } else {
-            t.status_ok
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(format!("  {status}"), style))),
-            chunks[idx],
-        );
-    }
+    render_status(frame, form.status.as_deref(), chunks[idx], t);
     idx += 1;
 
     // Hint.
@@ -405,6 +472,8 @@ fn draw_enter_key(
         Span::styled(" Next ", t.muted),
         Span::styled("[S-Tab]", t.key_hint),
         Span::styled(" Prev ", t.muted),
+        Span::styled("[C-d]", t.key_hint),
+        Span::styled(" Delete ", t.muted),
         Span::styled("[Enter]", t.key_hint),
         Span::styled(" Submit ", t.muted),
         Span::styled("[Esc]", t.key_hint),
@@ -669,9 +738,14 @@ pub fn draw_update(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     };
 
-    let modal_width = 60u16.min(area.width.saturating_sub(4));
-    // name(1) + type(1) + spacer(1) + key_label(1) + value(1) + cursor_hint(1) + spacer(1) + status(1) + hint(1)
-    let content_height = 9;
+    let modal_width = 64u16.min(area.width.saturating_sub(4));
+
+    #[allow(clippy::cast_possible_truncation)]
+    let num_config = form.config.len().min(MAX_VISIBLE_CONFIG) as u16;
+    let config_rows = num_config + 3; // existing entries + label(1) + key input(1) + value input(1)
+    // name(1) + type(1) + spacer(1) + key_label(1) + value(1) + spacer(1)
+    // + config_section + spacer(1) + submit(1) + status(1) + hint(1)
+    let content_height: u16 = 1 + 1 + 1 + 1 + 1 + 1 + config_rows + 1 + 1 + 1 + 1;
     let modal_height = (content_height + 4).min(area.height.saturating_sub(2));
     let popup_area = centered_rect(modal_width, modal_height, area);
 
@@ -686,91 +760,184 @@ pub fn draw_update(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
+    let mut constraints = vec![
+        Constraint::Length(1), // name
+        Constraint::Length(1), // type
+        Constraint::Length(1), // spacer
+        Constraint::Length(1), // key label
+        Constraint::Length(1), // value input
+        Constraint::Length(1), // spacer before config
+        Constraint::Length(1), // config keys label
+    ];
+    if num_config > 0 {
+        constraints.push(Constraint::Length(num_config)); // existing config entries
+    }
+    constraints.extend([
+        Constraint::Length(1), // config key input
+        Constraint::Length(1), // config value input
+        Constraint::Length(1), // spacer before submit
+        Constraint::Length(1), // submit
+        Constraint::Length(1), // status
+        Constraint::Length(1), // hint
+        Constraint::Min(0),
+    ]);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // name
-            Constraint::Length(1), // type
-            Constraint::Length(1), // spacer
-            Constraint::Length(1), // key label
-            Constraint::Length(1), // value input
-            Constraint::Length(1), // cursor hint
-            Constraint::Length(1), // spacer
-            Constraint::Length(1), // status
-            Constraint::Length(1), // hint
-            Constraint::Min(0),
-        ])
+        .constraints(constraints)
         .split(inner);
 
+    let mut idx = 0;
+
+    // Name.
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("Name: ", t.muted),
             Span::styled(&form.provider_name, t.heading),
         ])),
-        chunks[0],
+        chunks[idx],
     );
+    idx += 1;
 
+    // Type.
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("Type: ", t.muted),
             Span::styled(&form.provider_type, t.text),
         ])),
-        chunks[1],
+        chunks[idx],
     );
+    idx += 1;
 
+    // Spacer.
+    idx += 1;
+
+    // Credential key label.
+    let cred_focused = form.focus == UpdateProviderField::CredentialValue;
     let key_label = if form.credential_key.is_empty() {
-        "New value:"
+        "New value"
     } else {
         &form.credential_key
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!("{key_label}:"),
-            t.accent_bold,
+            if cred_focused { t.accent_bold } else { t.muted },
         ))),
-        chunks[3],
+        chunks[idx],
     );
+    idx += 1;
 
-    // Mask the input value as dots.
+    // Credential value input (masked).
     let masked: String = "*".repeat(form.new_value.len());
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!("  {masked}"), t.accent),
-            Span::styled("_", t.accent),
-        ])),
-        chunks[4],
-    );
+    let cred_style = if cred_focused { t.accent } else { t.muted };
+    let mut cred_spans = vec![Span::styled(format!("  {masked}"), cred_style)];
+    if cred_focused {
+        cred_spans.push(Span::styled("_", t.accent));
+    }
+    frame.render_widget(Paragraph::new(Line::from(cred_spans)), chunks[idx]);
+    idx += 1;
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "  Type the new credential value",
-            t.muted,
-        ))),
-        chunks[5],
-    );
+    // Spacer before config.
+    idx += 1;
 
-    if let Some(ref status) = form.status {
-        let style = if status.contains("required")
-            || status.contains("failed")
-            || status.contains("Failed")
-        {
-            t.status_err
-        } else {
-            t.status_ok
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(format!("  {status}"), style))),
-            chunks[7],
+    // Config Keys label.
+    let config_section_focused = matches!(
+        form.focus,
+        UpdateProviderField::ConfigEntry
+            | UpdateProviderField::ConfigKey
+            | UpdateProviderField::ConfigValue
+    );
+    let header_style = if config_section_focused {
+        t.accent_bold
+    } else {
+        t.muted
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled("Config Keys:", header_style))),
+        chunks[idx],
+    );
+    idx += 1;
+
+    // Existing config entries.
+    if !form.config.is_empty() {
+        let config_entry_active = form.focus == UpdateProviderField::ConfigEntry;
+        render_config_entries(
+            frame,
+            &form.config,
+            form.config_cursor,
+            config_entry_active,
+            chunks[idx],
+            t,
         );
+        idx += 1;
     }
 
+    // Config key input.
+    let editing_key = form.focus == UpdateProviderField::ConfigKey;
+    render_config_input_field(
+        frame,
+        "Key",
+        &form.config_key_input,
+        editing_key,
+        "key",
+        chunks[idx],
+        t,
+    );
+    idx += 1;
+
+    // Config value input.
+    let editing_val = form.focus == UpdateProviderField::ConfigValue;
+    render_config_input_field(
+        frame,
+        "Val",
+        &form.config_value_input,
+        editing_val,
+        "value",
+        chunks[idx],
+        t,
+    );
+    idx += 1;
+
+    // Spacer before submit.
+    idx += 1;
+
+    // Submit button.
+    let submit_focused = form.focus == UpdateProviderField::Submit;
+    let submit_style = if submit_focused {
+        t.accent_bold
+    } else {
+        t.muted
+    };
+    let submit_label = if submit_focused {
+        "  > Update Provider"
+    } else {
+        "  Update Provider"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(submit_label, submit_style))),
+        chunks[idx],
+    );
+    idx += 1;
+
+    // Status.
+    render_status(frame, form.status.as_deref(), chunks[idx], t);
+    idx += 1;
+
+    // Hint.
     let hint = Line::from(vec![
+        Span::styled("[Tab]", t.key_hint),
+        Span::styled(" Next ", t.muted),
+        Span::styled("[S-Tab]", t.key_hint),
+        Span::styled(" Prev ", t.muted),
+        Span::styled("[C-d]", t.key_hint),
+        Span::styled(" Delete ", t.muted),
         Span::styled("[Enter]", t.key_hint),
-        Span::styled(" Update ", t.muted),
+        Span::styled(" Submit ", t.muted),
         Span::styled("[Esc]", t.key_hint),
         Span::styled(" Cancel", t.muted),
     ]);
-    frame.render_widget(Paragraph::new(hint), chunks[8]);
+    frame.render_widget(Paragraph::new(hint), chunks[idx]);
 }
 
 // ---------------------------------------------------------------------------
@@ -812,4 +979,118 @@ fn draw_secret_field(
         Line::from(Span::styled(format!("  {masked}"), t.muted))
     };
     frame.render_widget(Paragraph::new(display), chunks[1]);
+}
+
+fn render_config_entries(
+    frame: &mut Frame<'_>,
+    config: &IndexMap<String, String>,
+    config_cursor: usize,
+    config_focused: bool,
+    area: Rect,
+    theme: &crate::theme::Theme,
+) {
+    let total = config.len();
+    let scroll_offset = if total > MAX_VISIBLE_CONFIG {
+        config_cursor
+            .saturating_sub(MAX_VISIBLE_CONFIG - 2_usize)
+            .min(total.saturating_sub(MAX_VISIBLE_CONFIG))
+    } else {
+        0_usize
+    };
+    let take_count = MAX_VISIBLE_CONFIG.min(total.saturating_sub(scroll_offset));
+    let overflow_below = scroll_offset + take_count < total;
+    let take_count = if overflow_below {
+        take_count.saturating_sub(1_usize)
+    } else {
+        take_count
+    };
+
+    let mut config_lines: Vec<Line<'_>> = config
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(take_count)
+        .map(|(i, (key, value))| {
+            let is_selected = config_focused && i == config_cursor;
+            let style = if is_selected {
+                theme.accent_bold
+            } else {
+                theme.text
+            };
+            Line::from(vec![
+                Span::styled(format!("  {key}="), style),
+                Span::styled(
+                    value.as_str(),
+                    if is_selected {
+                        theme.accent
+                    } else {
+                        theme.muted
+                    },
+                ),
+            ])
+        })
+        .collect();
+    if overflow_below {
+        let remaining = total - scroll_offset - take_count;
+        config_lines.push(Line::from(Span::styled(
+            format!("  \u{2026}and {remaining} more"),
+            theme.muted,
+        )));
+    }
+    frame.render_widget(Paragraph::new(config_lines), area);
+}
+
+fn render_config_input_field(
+    frame: &mut Frame<'_>,
+    label: &str,
+    input: &str,
+    editing: bool,
+    placeholder: &str,
+    area: Rect,
+    theme: &crate::theme::Theme,
+) {
+    let t = theme;
+    let display = if input.is_empty() {
+        if editing {
+            "_".to_string()
+        } else {
+            placeholder.to_string()
+        }
+    } else {
+        let mut s = input.to_string();
+        if editing {
+            s.push('_');
+        }
+        s
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!("  {label}: "), t.muted),
+            Span::styled(display, if editing { t.accent } else { t.muted }),
+        ])),
+        area,
+    );
+}
+
+fn render_status(
+    frame: &mut Frame<'_>,
+    status: Option<&str>,
+    area: Rect,
+    theme: &crate::theme::Theme,
+) {
+    let t = theme;
+    if let Some(status) = status {
+        let style = if status.contains("required")
+            || status.contains("failed")
+            || status.contains("Failed")
+        {
+            t.status_err
+        } else {
+            t.status_ok
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!("  {status}"), style))),
+            area,
+        );
+    }
 }

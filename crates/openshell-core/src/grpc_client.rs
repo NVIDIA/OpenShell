@@ -444,16 +444,7 @@ fn compute_refresh_delay(slot: &TokenSlot) -> Duration {
 /// Returns the expiry in milliseconds since the Unix epoch, or `None` if
 /// the token is not a parseable JWT.
 fn parse_jwt_exp_ms(jwt: &str) -> Option<i64> {
-    use base64::Engine;
-    let mut parts = jwt.splitn(3, '.');
-    let _header = parts.next()?;
-    let payload_b64 = parts.next()?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    let exp_secs = value.get("exp")?.as_i64()?;
-    exp_secs.checked_mul(1000)
+    crate::jwt::parse_exp_secs(jwt)?.checked_mul(1000)
 }
 
 #[cfg(test)]
@@ -551,6 +542,36 @@ mod auth_tests {
     }
 }
 
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[test]
+    fn cached_client_workspace_defaults_to_empty_before_poll() {
+        let client_ws: Arc<tokio::sync::OnceCell<String>> = Arc::new(tokio::sync::OnceCell::new());
+        assert_eq!(client_ws.get().cloned().unwrap_or_default(), "");
+    }
+
+    #[test]
+    fn cached_client_workspace_returns_learned_value() {
+        let client_ws: Arc<tokio::sync::OnceCell<String>> = Arc::new(tokio::sync::OnceCell::new());
+        let _ = client_ws.set("beta".to_string());
+        assert_eq!(client_ws.get().cloned().unwrap_or_default(), "beta");
+    }
+
+    #[test]
+    fn cached_client_workspace_is_set_once() {
+        let client_ws: Arc<tokio::sync::OnceCell<String>> = Arc::new(tokio::sync::OnceCell::new());
+        let _ = client_ws.set("beta".to_string());
+        let _ = client_ws.set("gamma".to_string());
+        assert_eq!(
+            client_ws.get().cloned().unwrap_or_default(),
+            "beta",
+            "workspace should not change after first poll"
+        );
+    }
+}
+
 /// Connect to the `OpenShell` server.
 async fn connect(endpoint: &str) -> Result<OpenShellClient<AuthedChannel>> {
     let channel = connect_channel(endpoint).await?;
@@ -582,6 +603,8 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<Pro
 ///
 /// Callers that must acknowledge the exact revision they loaded should retain
 /// this snapshot instead of re-fetching metadata after policy construction.
+/// The snapshot also carries the external middleware registrations required
+/// by the policy.
 pub async fn fetch_settings_snapshot(
     endpoint: &str,
     sandbox_id: &str,
@@ -627,17 +650,14 @@ async fn sync_policy_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
     sandbox: &str,
     policy: &ProtoSandboxPolicy,
+    workspace: &str,
 ) -> Result<()> {
     client
         .update_config(UpdateConfigRequest {
             name: sandbox.to_string(),
             policy: Some(policy.clone()),
-            setting_key: String::new(),
-            setting_value: None,
-            delete_setting: false,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            workspace: workspace.to_string(),
+            ..Default::default()
         })
         .await
         .into_diagnostic()
@@ -655,6 +675,7 @@ pub async fn discover_and_sync_policy(
     sandbox_id: &str,
     sandbox: &str,
     discovered_policy: &ProtoSandboxPolicy,
+    workspace: &str,
 ) -> Result<ProtoSandboxPolicy> {
     debug!(
         endpoint = %endpoint,
@@ -666,7 +687,7 @@ pub async fn discover_and_sync_policy(
     let mut client = connect(endpoint).await?;
 
     // Sync the discovered policy to the gateway.
-    sync_policy_with_client(&mut client, sandbox, discovered_policy).await?;
+    sync_policy_with_client(&mut client, sandbox, discovered_policy, workspace).await?;
 
     // Re-fetch from the gateway to get the canonical version/hash.
     fetch_policy_with_client(&mut client, sandbox_id)
@@ -680,10 +701,15 @@ pub async fn discover_and_sync_policy(
 ///
 /// Used by the supervisor to push baseline-path-enriched policies so the
 /// gateway stores the effective policy users see via `openshell sandbox get`.
-pub async fn sync_policy(endpoint: &str, sandbox: &str, policy: &ProtoSandboxPolicy) -> Result<()> {
+pub async fn sync_policy(
+    endpoint: &str,
+    sandbox: &str,
+    policy: &ProtoSandboxPolicy,
+    workspace: &str,
+) -> Result<()> {
     debug!(endpoint = %endpoint, sandbox = %sandbox, "Syncing enriched policy to gateway");
     let mut client = connect(endpoint).await?;
-    sync_policy_with_client(&mut client, sandbox, policy).await
+    sync_policy_with_client(&mut client, sandbox, policy, workspace).await
 }
 
 /// Sync an enriched policy and return the authoritative revision snapshot.
@@ -692,9 +718,10 @@ pub async fn sync_policy_and_fetch_snapshot(
     sandbox_id: &str,
     sandbox: &str,
     policy: &ProtoSandboxPolicy,
+    workspace: &str,
 ) -> Result<SettingsPollResult> {
     let mut client = connect(endpoint).await?;
-    sync_policy_with_client(&mut client, sandbox, policy).await?;
+    sync_policy_with_client(&mut client, sandbox, policy, workspace).await?;
     fetch_settings_snapshot_with_client(&mut client, sandbox_id).await
 }
 
@@ -734,6 +761,7 @@ pub async fn fetch_provider_environment(
 #[derive(Clone)]
 pub struct CachedOpenShellClient {
     client: OpenShellClient<AuthedChannel>,
+    workspace: Arc<tokio::sync::OnceCell<String>>,
 }
 
 /// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
@@ -749,6 +777,9 @@ pub struct SettingsPollResult {
     /// When `policy_source` is `Global`, the version of the global policy revision.
     pub global_policy_version: u32,
     pub provider_env_revision: u64,
+    pub supervisor_middleware_services: Vec<crate::proto::SupervisorMiddlewareService>,
+    /// Workspace the sandbox belongs to.
+    pub workspace: String,
 }
 
 fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
@@ -762,6 +793,8 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
         settings: inner.settings,
         global_policy_version: inner.global_policy_version,
         provider_env_revision: inner.provider_env_revision,
+        supervisor_middleware_services: inner.supervisor_middleware_services,
+        workspace: inner.workspace,
     }
 }
 
@@ -776,7 +809,10 @@ impl CachedOpenShellClient {
     pub async fn connect(endpoint: &str) -> Result<Self> {
         debug!(endpoint = %endpoint, "Connecting openshell gRPC client for policy polling");
         let client = connect(endpoint).await?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            workspace: Arc::new(tokio::sync::OnceCell::new()),
+        })
     }
 
     /// Get a clone of the underlying tonic client for direct RPC calls.
@@ -795,7 +831,20 @@ impl CachedOpenShellClient {
             .await
             .into_diagnostic()?;
 
-        Ok(settings_poll_result(response.into_inner()))
+        let result = settings_poll_result(response.into_inner());
+        let _ = self.workspace.set(result.workspace.clone());
+        Ok(result)
+    }
+
+    /// Returns the workspace learned from the server, or empty if not yet polled.
+    pub fn workspace(&self) -> String {
+        self.workspace.get().cloned().unwrap_or_default()
+    }
+
+    /// Pre-seed the workspace without polling. The value is ignored if the
+    /// workspace was already learned from `poll_settings`.
+    pub fn set_workspace(&self, workspace: String) {
+        let _ = self.workspace.set(workspace);
     }
 
     /// Submit denial summaries and/or agent-authored proposals for policy analysis.
@@ -821,6 +870,7 @@ impl CachedOpenShellClient {
                 proposed_chunks,
                 network_activity_summaries,
                 analysis_mode: analysis_mode.to_string(),
+                workspace: self.workspace(),
             })
             .await
             .into_diagnostic()?;
@@ -843,6 +893,7 @@ impl CachedOpenShellClient {
             .get_draft_policy(GetDraftPolicyRequest {
                 name: sandbox_name.to_string(),
                 status_filter: status_filter.to_string(),
+                workspace: self.workspace(),
             })
             .await
             .into_diagnostic()?;

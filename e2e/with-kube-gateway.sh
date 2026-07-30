@@ -115,6 +115,24 @@ helmctl() {
   helm --kube-context "${KUBE_CONTEXT}" "$@"
 }
 
+# Return the resource reference for the gateway workload installed by the chart.
+# SQLite releases use a StatefulSet; external-database releases may use a Deployment.
+kube_workload_ref() {
+  local name="$1"
+  local namespace="${2:-${NAMESPACE}}"
+  local resource
+
+  for resource in "statefulset/${name}" "deployment/${name}"; do
+    if kctl -n "${namespace}" get "${resource}" >/dev/null 2>&1; then
+      printf '%s\n' "${resource}"
+      return 0
+    fi
+  done
+
+  echo "ERROR: gateway workload ${name} was not found in namespace ${namespace}" >&2
+  return 1
+}
+
 deploy_postgres_fixture() {
   local secret_name="$1"
   local pg_uri
@@ -320,8 +338,10 @@ run_scenario() {
   fi
 
   HEALTH_LOCAL_PORT="$(e2e_pick_port)"
-  echo "Starting kubectl port-forward sts/${RELEASE_NAME} ${HEALTH_LOCAL_PORT}:health..."
-  kctl -n "${NAMESPACE}" port-forward "sts/${RELEASE_NAME}" \
+  local workload_ref
+  workload_ref="$(kube_workload_ref "${RELEASE_NAME}")"
+  echo "Starting kubectl port-forward ${workload_ref} ${HEALTH_LOCAL_PORT}:health..."
+  kctl -n "${NAMESPACE}" port-forward "${workload_ref}" \
     "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
   PORTFORWARD_HEALTH_PID=$!
 
@@ -669,8 +689,9 @@ else
   fi
 
   HEALTH_LOCAL_PORT="$(e2e_pick_port)"
-  echo "Starting kubectl port-forward sts/${RELEASE_NAME} ${HEALTH_LOCAL_PORT}:health..."
-  kctl -n "${NAMESPACE}" port-forward "sts/${RELEASE_NAME}" \
+  WORKLOAD_REF="$(kube_workload_ref "${RELEASE_NAME}")"
+  echo "Starting kubectl port-forward ${WORKLOAD_REF} ${HEALTH_LOCAL_PORT}:health..."
+  kctl -n "${NAMESPACE}" port-forward "${WORKLOAD_REF}" \
     "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
   PORTFORWARD_HEALTH_PID=$!
 

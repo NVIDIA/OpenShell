@@ -23,10 +23,12 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 | Path | Purpose |
 |---|---|
 | `scripts/agents/run.sh` | Manifest-driven OpenShell agent launcher. |
-| `scripts/agents/gator/agent.yaml` | Gator manifest: default gateway, harness, providers, runtime, skills, and subagents. |
+| `scripts/agents/gator/agent.yaml` | Gator manifest: immutable payload version, default gateway, harness, providers, runtime, skills, and subagents. |
 | `scripts/agents/gator/Dockerfile` | Gator sandbox image source. Local launches build this image through OpenShell. |
 | `scripts/agents/gator/policy.yaml` | Sandbox policy for the gator agent. |
 | `scripts/agents/gator/bin/gh` | Gator-specific `gh` wrapper and same-SHA duplicate-post guard. |
+| `scripts/agents/gator/bin/review-feedback-ledger` | Builds tree-aware review scope, durable findings, convergence telemetry, and checkpoint state. |
+| `scripts/agents/gator/bin/validate-review-findings` | Enforces the blocker evidence schema and downgrades unsupported hypotheses. |
 | `scripts/agents/gator/prompts/gator.md` | Rendered top-level prompt template baked into the payload. |
 | `scripts/agents/gator/skills/gator-gate/SKILL.md` | In-sandbox gator state-machine skill. |
 | `scripts/agents/gator/logs/` | Background launch and supervisor logs. |
@@ -123,11 +125,11 @@ pr_number="<digits-only>"
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 ```
 
-Use a restricted sandbox-name character set:
+Use the portable Kubernetes DNS-1123 sandbox-name format even when the selected gateway currently uses another driver:
 
 ```bash
 sandbox_name="gator-pr-${pr_number}-supervised"
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 ```
 
 For local image contexts passed to `--from`, use an agent-created path such as `mktemp -d`; do not pass raw user-supplied paths without validating that they are expected local Dockerfile contexts.
@@ -144,7 +146,7 @@ pr_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-supervised"
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
@@ -165,7 +167,7 @@ issue_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$issue_number" =~ ^[0-9]+$ ]] || { echo "invalid issue number" >&2; exit 1; }
 sandbox_name="gator-issue-${issue_number}-supervised"
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
@@ -186,7 +188,7 @@ issue_number="<digits-only>"
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 [[ "$issue_number" =~ ^[0-9]+$ ]] || { echo "invalid issue number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-supervised"
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
@@ -207,7 +209,7 @@ pr_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-supervised"
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
@@ -228,7 +230,7 @@ pr_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-gpt56sol-supervised"
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 CODEX_MODEL=gpt-5.6-sol \
 ./scripts/agents/run.sh \
@@ -250,7 +252,7 @@ pr_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-gpt56sol-supervised"
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 tmp_context="$(mktemp -d "${TMPDIR:-/tmp}/gator-codex-XXXXXX")"
 cp -R scripts/agents/gator/. "$tmp_context"/
 
@@ -283,6 +285,7 @@ Read that file directly. Important markers:
 - `OpenAI Codex v...` plus `model: ...` confirms the Codex CLI and model actually used.
 - `OPENSHELL_AGENT_RESULT {...}` is the bounded-cycle sentinel. In watch mode, the supervisor sleeps and relaunches after this line.
 - `openshell-agent: still running watch cycle ...` is a heartbeat during long active model cycles.
+- `review_feedback_lookup_failed` means Gator could not build the required cross-SHA feedback ledger and deliberately skipped a context-free review.
 
 ### Inspect Active Sandboxes
 
@@ -290,7 +293,7 @@ Read that file directly. Important markers:
 gateway_name="<selected-gateway-name>"
 sandbox_name="<safe-sandbox-name>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 openshell --gateway "$gateway_name" sandbox list
 openshell --gateway "$gateway_name" sandbox get "$sandbox_name"
@@ -305,12 +308,19 @@ If `sandbox get` is not supported by the local CLI shape, use `openshell sandbox
 | `status=waiting` | Normal watch wait. | Leave sandbox running. |
 | `status=blocked` | Human/process blocker. | Read reason; decide whether a human action is needed. |
 | `status=transient_failure` | Retryable infrastructure/auth/transport issue. | Let supervisor retry unless repeated failures hit the configured cap. |
-| `status=terminal_failure` | Unrecoverable agent failure. | Inspect log and fix/relaunch. |
+| `status=terminal_failure` | Unrecoverable or stale immutable payload. | Inspect the reason; rebuild/relaunch for `stale_gator_payload`. |
 | `status=complete` | Target closed, merged, or one-shot complete. | Delete sandbox if no longer needed. |
 
 ## Restarting A Gator
 
 Restart when the payload must change, the sandbox is wedged without a sentinel, the model/tooling version changed, or a transient failure repeats past the useful retry point.
+
+Increment `payload_version` in `scripts/agents/gator/agent.yaml` whenever a
+merged change alters the Gator prompt, gate skill, reviewer contract, write
+guard, ledger, or bundled validator. Existing immutable watchers cannot replace
+their own payload. New-version watchers detect later published versions and
+stop with `stale_gator_payload`; relaunch every still-active older watcher after
+the version bump is published.
 
 Before deleting, check that the sandbox is truly stale or that the operator asked for a restart. If a bounded review cycle is actively running and still producing useful output, prefer leaving it alone.
 
@@ -318,7 +328,7 @@ Before deleting, check that the sandbox is truly stale or that the operator aske
 gateway_name="<selected-gateway-name>"
 sandbox_name="<safe-sandbox-name>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 openshell --gateway "$gateway_name" sandbox delete "$sandbox_name"
 ./scripts/agents/run.sh \

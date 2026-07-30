@@ -17,7 +17,9 @@ mod sidecar_control;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -52,17 +54,9 @@ use openshell_ocsf::{
 /// `run_sandbox()` startup via `openshell_ocsf::ctx::set_ctx`.
 pub(crate) use openshell_ocsf::ctx::ctx as ocsf_ctx;
 
-/// Process-wide flag for the agent-driven policy proposal surface.
-/// Set once during `run_sandbox()` startup and updated by the settings poll
-/// loop when `agent_policy_proposals_enabled` changes. Read by the
-/// `policy.local` route handler and the L7 deny body's `next_steps` builder
-/// to gate the agent-controlled mutation surface. Exposed `pub(crate)` so
-/// unit tests in sibling modules can flip the flag through a serialized
-/// guard (see `policy_local::tests::ProposalsFlagGuard`).
-pub(crate) use openshell_core::proposals::AGENT_PROPOSALS_ENABLED;
-
 use openshell_core::denial::DenialEvent;
 use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
+use openshell_core::proposals::AgentProposals;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_network::opa::OpaEngine;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
@@ -103,9 +97,10 @@ pub async fn run_sandbox(
     _health_check: bool,
     _health_port: u16,
     inference_routes: Option<String>,
-    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
+    ocsf_enabled: Arc<AtomicBool>,
     network_enabled: bool,
     process_enabled: bool,
+    upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
 ) -> Result<i32> {
     let (program, args) = command
         .split_first()
@@ -160,52 +155,50 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (mut policy, opa_engine, retained_proto, loaded_policy_origin) =
-        if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
-            load_policy_from_sidecar_bootstrap(bootstrap)?
-        } else {
-            load_policy(
-                sandbox_id.clone(),
-                sandbox,
-                openshell_endpoint.clone(),
-                policy_rules,
-                policy_data,
-            )
-            .await?
-        };
+    let (
+        mut policy,
+        opa_engine,
+        retained_proto,
+        middleware_registry_status,
+        loaded_policy_origin,
+        initial_agent_proposals_enabled,
+    ) = if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
+        let (policy, opa_engine, retained_proto, loaded_policy_origin) =
+            load_policy_from_sidecar_bootstrap(bootstrap)?;
+        (
+            policy,
+            opa_engine,
+            retained_proto,
+            MiddlewareRegistryStatus::Synchronized,
+            loaded_policy_origin,
+            bootstrap.agent_proposals_enabled,
+        )
+    } else {
+        load_policy(
+            sandbox_id.clone(),
+            sandbox,
+            openshell_endpoint.clone(),
+            policy_rules,
+            policy_data,
+        )
+        .await?
+    };
 
-    // Override the policy's process identity with the driver-resolved UID/GID
-    // from the pod environment. The policy defaults to the name "sandbox" which
-    // resolves via /etc/passwd, but the driver may have chosen a different
-    // numeric UID (e.g. from OpenShift SCC annotations).
-    // Validate overrides against the same rules as the policy layer to prevent
-    // env-injected values (e.g. GID 0) from bypassing policy restrictions.
-    if let Ok(uid) = std::env::var(openshell_core::sandbox_env::SANDBOX_UID)
-        && !uid.is_empty()
-    {
-        if !openshell_policy::is_valid_sandbox_identity(&uid) {
-            return Err(miette::miette!(
-                "OPENSHELL_SANDBOX_UID contains invalid sandbox identity '{uid}'; \
-                 expected 'sandbox' or a numeric UID in range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
-            ));
-        }
-        policy.process.run_as_user = Some(uid);
-    }
-    if let Ok(gid) = std::env::var(openshell_core::sandbox_env::SANDBOX_GID)
-        && !gid.is_empty()
-    {
-        if !openshell_policy::is_valid_sandbox_identity(&gid) {
-            return Err(miette::miette!(
-                "OPENSHELL_SANDBOX_GID contains invalid sandbox identity '{gid}'; \
-                 expected 'sandbox' or a numeric GID in range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_UID,
-                openshell_policy::MAX_SANDBOX_UID,
-            ));
-        }
-        policy.process.run_as_group = Some(gid);
-    }
+    // Normalize the active driver's identity contract once, while both the
+    // policy and launched image filesystem are available. Kubernetes and
+    // OpenShift retain their authoritative numeric pair; Docker and Podman
+    // fill only omitted policy fields from OCI Config.User.
+    #[cfg(unix)]
+    let resolved_process_identity = {
+        let driver_identity = openshell_supervisor_process::identity::DriverIdentity::from_env()?;
+        openshell_supervisor_process::identity::resolve_process_identity(
+            &mut policy,
+            &driver_identity,
+        )?
+    };
+    #[cfg(not(unix))]
+    let resolved_process_identity =
+        openshell_supervisor_process::process::ResolvedProcessIdentity::default();
 
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let (provider_credentials, mut provider_env) =
@@ -282,25 +275,23 @@ pub async fn run_sandbox(
             let provider_env = provider_credentials.child_env_with_gcp_resolved();
             (provider_credentials, provider_env)
         };
+
+    // Shared agent-proposals feature flag. Seed from the same initial settings
+    // snapshot that produced the policy so networking and process setup agree
+    // before the poll loop starts reconciling later changes.
+    let agent_proposals = AgentProposals::new(initial_agent_proposals_enabled);
+
     let process_control_writer = process_control_connection
         .as_ref()
         .map(|connection| connection.writer.clone());
     let mut process_control_closed = None;
     if let Some(connection) = process_control_connection {
         process_control_closed = Some(connection.closed);
-        spawn_sidecar_control_update_watcher(connection.updates, provider_credentials.clone());
-    }
-
-    // Initialize the agent-proposals feature flag. Default false until the
-    // initial settings fetch (or the poll loop) tells us otherwise. The flag
-    // gates the skill install, the policy.local route handler, and the L7
-    // deny body's `next_steps` field — see `agent_proposals_enabled()`.
-    let proposals_enabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if AGENT_PROPOSALS_ENABLED
-        .set(proposals_enabled.clone())
-        .is_err()
-    {
-        debug!("agent proposals flag already initialized, keeping existing");
+        spawn_sidecar_control_update_watcher(
+            connection.updates,
+            provider_credentials.clone(),
+            agent_proposals.clone(),
+        );
     }
 
     // Shared PID: set after process spawn so the proxy can look up
@@ -353,6 +344,11 @@ pub async fn run_sandbox(
     #[cfg(not(target_os = "linux"))]
     drop(bypass_activity_tx);
 
+    // Workspace watch: the policy poll loop learns the workspace from
+    // GetSandboxConfig and broadcasts it. Flush tasks and the policy.local
+    // API read the current value so proposals target the correct workspace.
+    let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
+
     let networking = if network_enabled {
         #[cfg(target_os = "linux")]
         let proxy_bind_ip = netns
@@ -376,6 +372,9 @@ pub async fn run_sandbox(
                 inference_routes.as_deref(),
                 denial_tx,
                 activity_tx,
+                agent_proposals.clone(),
+                workspace_rx.clone(),
+                &upstream_proxy_args,
             )
             .await?,
         )
@@ -408,6 +407,7 @@ pub async fn run_sandbox(
                 policy_proto: proto.clone(),
                 provider_env_revision: provider_credentials.snapshot().revision,
                 provider_child_env: provider_env.clone(),
+                agent_proposals_enabled: agent_proposals.enabled(),
                 proxy_ca_cert_path: ca_paths.as_ref().map(|paths| paths.0.clone()),
                 proxy_ca_bundle_path: ca_paths.as_ref().map(|paths| paths.1.clone()),
             },
@@ -474,20 +474,31 @@ pub async fn run_sandbox(
             .unwrap_or(10);
 
         let aggregator = denial_aggregator::DenialAggregator::new(rx, flush_interval_secs);
+        let denial_workspace_gate = workspace_rx.clone();
+        let denial_workspace_rx = workspace_rx.clone();
 
         tokio::spawn(async move {
             aggregator
-                .run(|summaries| {
-                    let endpoint = agg_endpoint.clone();
-                    let sandbox_name = agg_name.clone();
-                    async move {
-                        if let Err(e) =
-                            flush_proposals_to_gateway(&endpoint, &sandbox_name, summaries).await
-                        {
-                            warn!(error = %e, "Failed to flush denial summaries to gateway");
+                .run(
+                    |summaries| {
+                        let endpoint = agg_endpoint.clone();
+                        let sandbox_name = agg_name.clone();
+                        let workspace = denial_workspace_rx.borrow().clone();
+                        async move {
+                            if let Err(e) = flush_proposals_to_gateway(
+                                &endpoint,
+                                &sandbox_name,
+                                &workspace,
+                                summaries,
+                            )
+                            .await
+                            {
+                                warn!(error = %e, "Failed to flush denial summaries to gateway");
+                            }
                         }
-                    }
-                })
+                    },
+                    move || !denial_workspace_gate.borrow().is_empty(),
+                )
                 .await;
         });
     }
@@ -508,20 +519,31 @@ pub async fn run_sandbox(
         );
 
         let aggregator = activity_aggregator::ActivityAggregator::new(rx, flush_interval_secs);
+        let activity_workspace_gate = workspace_rx.clone();
+        let activity_workspace_rx = workspace_rx.clone();
 
         tokio::spawn(async move {
             aggregator
-                .run(move |summary| {
-                    let endpoint = agg_endpoint.clone();
-                    let sandbox_name = agg_name.clone();
-                    async move {
-                        if let Err(e) =
-                            flush_activity_to_gateway(&endpoint, &sandbox_name, summary).await
-                        {
-                            warn!(error = %e, "Failed to flush activity summary to gateway");
+                .run(
+                    move |summary| {
+                        let endpoint = agg_endpoint.clone();
+                        let sandbox_name = agg_name.clone();
+                        let workspace = activity_workspace_rx.borrow().clone();
+                        async move {
+                            if let Err(e) = flush_activity_to_gateway(
+                                &endpoint,
+                                &sandbox_name,
+                                &workspace,
+                                summary,
+                            )
+                            .await
+                            {
+                                warn!(error = %e, "Failed to flush activity summary to gateway");
+                            }
                         }
-                    }
-                })
+                    },
+                    move || !activity_workspace_gate.borrow().is_empty(),
+                )
                 .await;
         });
     }
@@ -555,7 +577,10 @@ pub async fn run_sandbox(
             ocsf_enabled: poll_ocsf_enabled,
             provider_credentials: poll_provider_credentials,
             policy_local_ctx: poll_policy_local,
+            agent_proposals: agent_proposals.clone(),
+            middleware_registry_status,
             sidecar_control_publisher: sidecar_control_publisher.clone(),
+            workspace_tx,
         };
 
         tokio::spawn(async move {
@@ -666,12 +691,14 @@ pub async fn run_sandbox(
             ssh_socket_path,
             sidecar_network_enforcement,
             &process_policy,
+            resolved_process_identity,
             process_enforcement_mode,
             entrypoint_pid,
             entrypoint_started_tx,
             provider_credentials,
             provider_env,
             ca_file_paths,
+            agent_proposals.clone(),
             #[cfg(target_os = "linux")]
             netns.as_ref(),
             #[cfg(target_os = "linux")]
@@ -832,11 +859,12 @@ fn load_policy_from_sidecar_bootstrap(
 fn spawn_sidecar_control_update_watcher(
     mut updates: tokio::sync::mpsc::UnboundedReceiver<sidecar_control::ControlUpdate>,
     provider_credentials: ProviderCredentialState,
+    agent_proposals: AgentProposals,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(update) = updates.recv().await {
             match update {
-                sidecar_control::ControlUpdate::ProviderEnvUpdated {
+                sidecar_control::ControlUpdate::ProviderEnv {
                     revision,
                     provider_child_env,
                 } => {
@@ -857,7 +885,7 @@ fn spawn_sidecar_control_update_watcher(
                             .build()
                     );
                 }
-                sidecar_control::ControlUpdate::PolicyUpdated {
+                sidecar_control::ControlUpdate::Policy {
                     policy_proto,
                     policy_hash,
                     config_revision,
@@ -867,6 +895,19 @@ fn spawn_sidecar_control_update_watcher(
                         policy_hash,
                         config_revision,
                         "Received sidecar policy update for process supervisor"
+                    );
+                }
+                sidecar_control::ControlUpdate::AgentProposals {
+                    enabled,
+                    config_revision,
+                } => {
+                    apply_agent_proposals_enabled(
+                        &agent_proposals,
+                        enabled,
+                        "sidecar control",
+                        Some(config_revision),
+                        None,
+                        skills::install_static_skills,
                     );
                 }
             }
@@ -887,8 +928,9 @@ fn spawn_sidecar_entrypoint_handler(
     tokio::spawn(async move {
         let mut session_started = false;
         let mut trusted_supervisor_pid = None;
+        let terminating = Arc::new(AtomicBool::new(false));
         while let Some(started) = entrypoint_rx.recv().await {
-            entrypoint_pid.store(started.pid, std::sync::atomic::Ordering::Release);
+            entrypoint_pid.store(started.pid, Ordering::Release);
             if started.start_session {
                 info!(
                     pid = started.pid,
@@ -935,11 +977,13 @@ fn spawn_sidecar_entrypoint_handler(
                     trusted_ssh_socket_path.clone(),
                     None,
                     Some(supervisor_pid),
+                    Arc::clone(&terminating),
                 );
                 session_started = true;
                 info!("sidecar supervisor session task spawned");
             }
         }
+        terminating.store(true, Ordering::Release);
     });
 }
 
@@ -972,12 +1016,14 @@ fn process_policy_for_topology(
 async fn flush_proposals_to_gateway(
     endpoint: &str,
     sandbox_name: &str,
+    workspace: &str,
     summaries: Vec<denial_aggregator::FlushableDenialSummary>,
 ) -> Result<()> {
     use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::{DenialSummary, L7RequestSample};
 
     let client = CachedOpenShellClient::connect(endpoint).await?;
+    client.set_workspace(workspace.to_string());
 
     let proto_summaries: Vec<DenialSummary> = summaries
         .into_iter()
@@ -1040,12 +1086,14 @@ async fn flush_proposals_to_gateway(
 async fn flush_activity_to_gateway(
     endpoint: &str,
     sandbox_name: &str,
+    workspace: &str,
     summary: activity_aggregator::FlushableActivitySummary,
 ) -> Result<()> {
     use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::{DenialGroupCount, NetworkActivitySummary};
 
     let client = CachedOpenShellClient::connect(endpoint).await?;
+    client.set_workspace(workspace.to_string());
 
     let proto_summary = NetworkActivitySummary {
         network_activity_count: summary.network_activity_count,
@@ -1787,7 +1835,9 @@ async fn load_policy(
     SandboxPolicy,
     Option<Arc<OpaEngine>>,
     Option<openshell_core::proto::SandboxPolicy>,
+    MiddlewareRegistryStatus,
     LoadedPolicyOrigin,
+    bool,
 )> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
@@ -1801,10 +1851,22 @@ async fn load_policy(
                 "Loading OPA policy engine from local files [rules:{policy_file} data:{data_file}]"
             ))
             .build());
-        let engine = OpaEngine::from_files(
+        let validate_middleware_config = |implementation: &str, config: &prost_types::Struct| {
+            openshell_supervisor_middleware_builtins::validate_config(implementation, config)
+                .map_err(|error| error.to_string())
+        };
+        let engine = OpaEngine::from_files_with_middleware_config(
             std::path::Path::new(policy_file),
             std::path::Path::new(data_file),
+            Some(&validate_middleware_config),
         )?;
+        let middleware_registry =
+            openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+                openshell_supervisor_middleware_builtins::services(),
+                Vec::new(),
+            )
+            .await?;
+        engine.replace_middleware_registry(middleware_registry)?;
         let config = engine.query_sandbox_config()?;
         let mut policy = SandboxPolicy {
             version: 1,
@@ -1817,11 +1879,14 @@ async fn load_policy(
             process: config.process,
         };
         enrich_sandbox_baseline_paths(&mut policy);
+        // File mode has no operator-registered middleware to connect.
         return Ok((
             policy,
             Some(Arc::new(engine)),
             None,
+            MiddlewareRegistryStatus::Synchronized,
             LoadedPolicyOrigin::LocalOverride,
+            false,
         ));
     }
 
@@ -1865,12 +1930,14 @@ async fn load_policy(
 
             // Sync and re-fetch over a single connection to avoid extra
             // TLS handshakes.
+            let ws = snapshot.workspace.clone();
             snapshot = grpc_retry("Policy discovery sync", || {
                 openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
                     endpoint,
                     id,
                     sandbox,
                     &discovered,
+                    &ws,
                 )
             })
             .await?;
@@ -1897,6 +1964,7 @@ async fn load_policy(
                     id,
                     sandbox_name,
                     &sync_policy,
+                    &snapshot.workspace,
                 )
                 .await
                 {
@@ -1934,14 +2002,55 @@ async fn load_policy(
         // container hasn't started yet. After the entrypoint spawns, the
         // engine is rebuilt with the real PID for symlink resolution.
         info!("Creating OPA engine from proto policy data");
-        let opa_engine = match OpaEngine::from_proto(&proto_policy) {
-            Ok(engine) => Some(Arc::new(engine)),
+        let engine = match OpaEngine::from_proto(&proto_policy) {
+            Ok(engine) => engine,
             Err(e) => {
                 report_initial_policy_failure(endpoint, id, loaded_policy_revision.as_ref(), &e)
                     .await;
                 return Err(e);
             }
         };
+
+        // Install the in-process catalog before any external connection can
+        // fail. A newly started sandbox must always be able to resolve built-in
+        // bindings, even while operator-run services are unavailable.
+        install_builtin_middleware_registry(&engine).await?;
+
+        // Connect operator-registered middleware services. A connect/describe
+        // failure keeps the built-in registry active so each request's
+        // `on_error` policy governs matched traffic. The policy poll loop
+        // retries the install without waiting for a config change.
+        let middleware_services = snapshot.supervisor_middleware_services.clone();
+        let middleware_registry_status = if middleware_services.is_empty() {
+            MiddlewareRegistryStatus::Synchronized
+        } else if let Err(error) = grpc_retry("Middleware connect", || {
+            openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+                openshell_supervisor_middleware_builtins::services(),
+                middleware_services.clone(),
+            )
+        })
+        .await
+        .and_then(|registry| engine.replace_middleware_registry(registry))
+        {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .state(StateId::Other, "degraded")
+                    .unmapped(
+                        "supervisor_middleware_service_count",
+                        serde_json::json!(middleware_services.len())
+                    )
+                    .message(format!(
+                        "Supervisor middleware connect failed at startup; continuing with built-in middleware only, per-request on_error governs matched requests [error:{error}]"
+                    ))
+                    .build()
+            );
+            MiddlewareRegistryStatus::NeedsReconciliation
+        } else {
+            MiddlewareRegistryStatus::Synchronized
+        };
+        let opa_engine = Some(Arc::new(engine));
 
         let policy = match SandboxPolicy::try_from(proto_policy.clone()) {
             Ok(policy) => policy,
@@ -1955,9 +2064,11 @@ async fn load_policy(
             policy,
             opa_engine,
             Some(proto_policy),
+            middleware_registry_status,
             LoadedPolicyOrigin::Gateway {
                 revision: loaded_policy_revision,
             },
+            agent_proposals_enabled_from_settings(&snapshot.settings),
         ));
     }
 
@@ -2075,6 +2186,45 @@ fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::S
             restrictive_default_policy()
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MiddlewareRegistryStatus {
+    Synchronized,
+    NeedsReconciliation,
+}
+
+/// True when the installed middleware registry no longer matches the desired
+/// service set and must be rebuilt (reconnecting every delivered service).
+///
+/// A policy-only change never requires a rebuild: middleware configs were
+/// validated at gateway admission and the installed registry's manifests
+/// already cover the unchanged service set, so requiring the services to be
+/// reachable would only let a middleware outage block the policy update.
+fn middleware_registry_needs_rebuild(
+    registry_status: MiddlewareRegistryStatus,
+    current_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
+) -> bool {
+    registry_status == MiddlewareRegistryStatus::NeedsReconciliation
+        || current_services != desired_services
+}
+
+fn gateway_policy_runtime_needs_reconciliation(
+    reloads_gateway_policy: bool,
+    current_policy_hash: &str,
+    desired_policy_hash: &str,
+    current_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    registry_status: MiddlewareRegistryStatus,
+) -> bool {
+    reloads_gateway_policy
+        && (current_policy_hash != desired_policy_hash
+            || middleware_registry_needs_rebuild(
+                registry_status,
+                current_services,
+                desired_services,
+            ))
 }
 
 /// Identity returned with the exact policy snapshot used to construct OPA.
@@ -2360,10 +2510,88 @@ struct PolicyPollLoopContext {
     loaded_policy_origin: LoadedPolicyOrigin,
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
-    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
+    ocsf_enabled: Arc<AtomicBool>,
     provider_credentials: ProviderCredentialState,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
+    agent_proposals: AgentProposals,
+    middleware_registry_status: MiddlewareRegistryStatus,
     sidecar_control_publisher: Option<sidecar_control::Publisher>,
+    workspace_tx: tokio::sync::watch::Sender<String>,
+}
+
+async fn connect_middleware_registry(
+    services: &[openshell_core::proto::SupervisorMiddlewareService],
+) -> Result<openshell_supervisor_middleware::MiddlewareRegistry> {
+    openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+        openshell_supervisor_middleware_builtins::services(),
+        services.to_vec(),
+    )
+    .await
+}
+
+async fn install_builtin_middleware_registry(opa_engine: &OpaEngine) -> Result<()> {
+    let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+        openshell_supervisor_middleware_builtins::services(),
+        Vec::new(),
+    )
+    .await?;
+    opa_engine.replace_middleware_registry(registry)
+}
+
+async fn reconcile_middleware_registry(
+    opa_engine: &OpaEngine,
+    desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    current_services: &mut Vec<openshell_core::proto::SupervisorMiddlewareService>,
+    status: &mut MiddlewareRegistryStatus,
+) {
+    if *status == MiddlewareRegistryStatus::Synchronized
+        && desired_services == current_services.as_slice()
+    {
+        return;
+    }
+
+    match connect_middleware_registry(desired_services)
+        .await
+        .and_then(|registry| opa_engine.replace_middleware_registry(registry))
+    {
+        Ok(()) => {
+            current_services.clear();
+            current_services.extend_from_slice(desired_services);
+            *status = MiddlewareRegistryStatus::Synchronized;
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Enabled, "loaded")
+                    .unmapped(
+                        "supervisor_middleware_service_count",
+                        serde_json::json!(current_services.len())
+                    )
+                    .message(format!(
+                        "Supervisor middleware registry reloaded [service_count:{}]",
+                        current_services.len()
+                    ))
+                    .build()
+            );
+        }
+        Err(error) => {
+            // Emit only on the transition into the failed state to avoid
+            // repeating the same finding on every poll during an outage.
+            if *status == MiddlewareRegistryStatus::Synchronized {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Other, "failed")
+                        .message(format!(
+                            "Supervisor middleware registry reload failed, keeping last-known-good registry [error:{error}]"
+                        ))
+                        .build()
+                );
+            }
+            *status = MiddlewareRegistryStatus::NeedsReconciliation;
+        }
+    }
 }
 
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
@@ -2382,10 +2610,14 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     let mut current_config_revision: u64 = 0;
     let mut current_provider_env_revision: u64 = ctx.provider_credentials.snapshot().revision;
     let mut current_policy_hash = String::new();
+    let mut current_middleware_services = Vec::new();
+    let mut middleware_registry_status = ctx.middleware_registry_status;
     let mut current_settings: std::collections::HashMap<
         String,
         openshell_core::proto::EffectiveSetting,
     > = std::collections::HashMap::new();
+    let reloads_gateway_policy = ctx.loaded_policy_origin.allows_gateway_policy_reload();
+    let mut last_failed_runtime_revision: Option<(u64, String)> = None;
 
     // A first poll that does not match the policy already loaded into OPA must
     // pass through the normal reconciliation path immediately. It must never
@@ -2396,33 +2628,54 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     // policy revision the supervisor actually loaded. A mismatched result is
     // reconciled below instead of being recorded as already applied.
     match client.poll_settings(&ctx.sandbox_id).await {
-        Ok(result) => match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
-            InitialPollDisposition::Acknowledge(candidate) => {
-                apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-                current_config_revision = candidate.config_revision;
-                current_policy_hash.clone_from(&candidate.policy_hash);
-                current_settings = result.settings;
-                enqueue_policy_status(
-                    &status_sender,
-                    PolicyStatusUpdate::initial_loaded(&candidate),
-                );
-                debug!(
-                    config_revision = current_config_revision,
-                    "Settings poll: initial policy matches loaded revision"
-                );
+        Ok(result) => {
+            let _ = ctx.workspace_tx.send(client.workspace());
+            match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
+                InitialPollDisposition::Acknowledge(candidate) => {
+                    apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_agent_proposals_enabled(
+                        &ctx.agent_proposals,
+                        agent_proposals_enabled_from_settings(&result.settings),
+                        "initial settings poll",
+                        Some(candidate.config_revision),
+                        ctx.sidecar_control_publisher.as_ref(),
+                        skills::install_static_skills,
+                    );
+                    current_config_revision = candidate.config_revision;
+                    current_policy_hash.clone_from(&candidate.policy_hash);
+                    current_middleware_services = result.supervisor_middleware_services;
+                    current_settings = result.settings;
+                    enqueue_policy_status(
+                        &status_sender,
+                        PolicyStatusUpdate::initial_loaded(&candidate),
+                    );
+                    debug!(
+                        config_revision = current_config_revision,
+                        "Settings poll: initial policy matches loaded revision"
+                    );
+                }
+                InitialPollDisposition::Reconcile => pending_result = Some(result),
+                InitialPollDisposition::TrackOnly => {
+                    apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    apply_agent_proposals_enabled(
+                        &ctx.agent_proposals,
+                        agent_proposals_enabled_from_settings(&result.settings),
+                        "initial settings poll",
+                        Some(result.config_revision),
+                        ctx.sidecar_control_publisher.as_ref(),
+                        skills::install_static_skills,
+                    );
+                    current_config_revision = result.config_revision;
+                    current_policy_hash = result.policy_hash.clone();
+                    current_middleware_services = result.supervisor_middleware_services;
+                    current_settings = result.settings;
+                    debug!(
+                        config_revision = current_config_revision,
+                        "Settings poll: tracking gateway config while preserving local policy override"
+                    );
+                }
             }
-            InitialPollDisposition::Reconcile => pending_result = Some(result),
-            InitialPollDisposition::TrackOnly => {
-                apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-                current_config_revision = result.config_revision;
-                current_policy_hash = result.policy_hash.clone();
-                current_settings = result.settings;
-                debug!(
-                    config_revision = current_config_revision,
-                    "Settings poll: tracking gateway config while preserving local policy override"
-                );
-            }
-        },
+        }
         Err(e) => {
             warn!(error = %e, "Settings poll: failed to fetch initial version, will retry");
         }
@@ -2435,7 +2688,10 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         } else {
             tokio::time::sleep(interval).await;
             match client.poll_settings(&ctx.sandbox_id).await {
-                Ok(result) => result,
+                Ok(result) => {
+                    let _ = ctx.workspace_tx.send(client.workspace());
+                    result
+                }
                 Err(e) => {
                     debug!(error = %e, "Settings poll: server unreachable, will retry");
                     continue;
@@ -2443,29 +2699,59 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             }
         };
 
+        let config_changed = result.config_revision != current_config_revision;
         let provider_env_changed = result.provider_env_revision != current_provider_env_revision;
-        if result.config_revision == current_config_revision && !provider_env_changed {
+        let policy_changed = result.policy_hash != current_policy_hash;
+        let middleware_registry_changed = middleware_registry_needs_rebuild(
+            middleware_registry_status,
+            &current_middleware_services,
+            &result.supervisor_middleware_services,
+        );
+        let policy_runtime_changed = gateway_policy_runtime_needs_reconciliation(
+            reloads_gateway_policy,
+            &current_policy_hash,
+            &result.policy_hash,
+            &current_middleware_services,
+            &result.supervisor_middleware_services,
+            middleware_registry_status,
+        );
+
+        // A local policy override is not coupled to the gateway policy
+        // snapshot, so its service registry can still be reconciled alone.
+        // Gateway policy snapshots, however, must install policy and registry
+        // as one generation below.
+        if !reloads_gateway_policy {
+            reconcile_middleware_registry(
+                &ctx.opa_engine,
+                &result.supervisor_middleware_services,
+                &mut current_middleware_services,
+                &mut middleware_registry_status,
+            )
+            .await;
+        }
+
+        if !config_changed && !provider_env_changed && !policy_runtime_changed {
             continue;
         }
 
-        let policy_changed = result.policy_hash != current_policy_hash;
+        if config_changed || provider_env_changed {
+            // Log which settings changed.
+            log_setting_changes(&current_settings, &result.settings);
 
-        // Log which settings changed.
-        log_setting_changes(&current_settings, &result.settings);
-
-        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .state(StateId::Other, "detected")
-            .unmapped("old_config_revision", serde_json::json!(current_config_revision))
-            .unmapped("new_config_revision", serde_json::json!(result.config_revision))
-            .unmapped("policy_changed", serde_json::json!(policy_changed))
-            .unmapped("provider_env_changed", serde_json::json!(provider_env_changed))
-            .message(format!(
-                "Settings poll: config change detected [old_revision:{current_config_revision} new_revision:{} policy_changed:{policy_changed} provider_env_changed:{provider_env_changed}]",
-                result.config_revision
-            ))
-            .build());
+            ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Other, "detected")
+                .unmapped("old_config_revision", serde_json::json!(current_config_revision))
+                .unmapped("new_config_revision", serde_json::json!(result.config_revision))
+                .unmapped("policy_changed", serde_json::json!(policy_changed))
+                .unmapped("provider_env_changed", serde_json::json!(provider_env_changed))
+                .message(format!(
+                    "Settings poll: config change detected [old_revision:{current_config_revision} new_revision:{} policy_changed:{policy_changed} provider_env_changed:{provider_env_changed}]",
+                    result.config_revision
+                ))
+                .build());
+        }
 
         if provider_env_changed {
             match openshell_core::grpc_client::fetch_provider_environment(
@@ -2516,86 +2802,131 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             }
         }
 
-        // Only reload OPA when the policy payload actually changed.
-        if policy_changed && ctx.loaded_policy_origin.allows_gateway_policy_reload() {
-            let Some(policy) = result.policy.as_ref() else {
-                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                    .severity(SeverityId::Medium)
-                    .status(StatusId::Failure)
-                    .state(StateId::Other, "skipped")
-                    .message("Settings poll: policy hash changed but no policy payload present; skipping reload")
-                    .build());
-                current_config_revision = result.config_revision;
-                current_policy_hash = result.policy_hash;
-                current_settings = result.settings;
-                continue;
+        if policy_runtime_changed {
+            let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
+            let runtime_result = match result.policy.as_ref() {
+                Some(policy) if middleware_registry_changed => {
+                    match connect_middleware_registry(&result.supervisor_middleware_services).await
+                    {
+                        Ok(registry) => ctx
+                            .opa_engine
+                            .reload_policy_and_middleware_from_proto_with_pid(
+                                policy, pid, registry,
+                            ),
+                        Err(error) => Err(error),
+                    }
+                }
+                // Policy-only change: the installed registry already matches
+                // the delivered service set, so swap the engine alone. This
+                // must not require middleware reachability.
+                Some(policy) => ctx.opa_engine.reload_from_proto_with_pid(policy, pid),
+                None => Err(miette::miette!(
+                    "runtime reload requires a policy payload but none was returned"
+                )),
             };
 
-            let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
-            match ctx.opa_engine.reload_from_proto_with_pid(policy, pid) {
+            match runtime_result {
                 Ok(()) => {
-                    if let Some(policy_local_ctx) = ctx.policy_local_ctx.as_ref() {
-                        policy_local_ctx.set_current_policy(policy.clone()).await;
-                    }
-                    if let Some(publisher) = ctx.sidecar_control_publisher.as_ref() {
-                        publisher.publish_policy(
-                            policy.clone(),
-                            result.policy_hash.clone(),
-                            result.config_revision,
-                        );
-                    }
-                    if result.global_policy_version > 0 {
-                        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Informational)
-                            .status(StatusId::Success)
-                            .state(StateId::Enabled, "loaded")
-                            .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
-                            .unmapped("global_version", serde_json::json!(result.global_policy_version))
-                            .message(format!(
-                                "Policy reloaded successfully (global) [policy_hash:{} global_version:{}]",
-                                result.policy_hash,
-                                result.global_policy_version
-                            ))
-                            .build());
-                    } else {
-                        ocsf_emit!(
-                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                    let policy = result
+                        .policy
+                        .as_ref()
+                        .expect("successful runtime reload requires a policy payload");
+                    if policy_changed {
+                        if let Some(policy_local_ctx) = ctx.policy_local_ctx.as_ref() {
+                            policy_local_ctx.set_current_policy(policy.clone()).await;
+                        }
+                        if let Some(publisher) = ctx.sidecar_control_publisher.as_ref() {
+                            publisher.publish_policy(
+                                policy.clone(),
+                                result.policy_hash.clone(),
+                                result.config_revision,
+                            );
+                        }
+                        if result.global_policy_version > 0 {
+                            ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
                                 .severity(SeverityId::Informational)
                                 .status(StatusId::Success)
                                 .state(StateId::Enabled, "loaded")
                                 .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                                .unmapped("global_version", serde_json::json!(result.global_policy_version))
                                 .message(format!(
-                                    "Policy reloaded successfully [policy_hash:{}]",
-                                    result.policy_hash
+                                    "Policy reloaded successfully (global) [policy_hash:{} global_version:{}]",
+                                    result.policy_hash,
+                                    result.global_policy_version
                                 ))
-                                .build()
-                        );
+                                .build());
+                        } else {
+                            ocsf_emit!(
+                                ConfigStateChangeBuilder::new(ocsf_ctx())
+                                    .severity(SeverityId::Informational)
+                                    .status(StatusId::Success)
+                                    .state(StateId::Enabled, "loaded")
+                                    .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                                    .message(format!(
+                                        "Policy reloaded successfully [policy_hash:{}]",
+                                        result.policy_hash
+                                    ))
+                                    .build()
+                            );
+                        }
+                        if result.version > 0 && result.policy_source == PolicySource::Sandbox {
+                            enqueue_policy_status(
+                                &status_sender,
+                                PolicyStatusUpdate::loaded(result.version),
+                            );
+                        }
                     }
-                    if result.version > 0 && result.policy_source == PolicySource::Sandbox {
-                        enqueue_policy_status(
-                            &status_sender,
-                            PolicyStatusUpdate::loaded(result.version),
-                        );
+
+                    if middleware_registry_changed {
+                        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .unmapped(
+                                "supervisor_middleware_service_count",
+                                serde_json::json!(result.supervisor_middleware_services.len())
+                            )
+                            .message(format!(
+                                "Supervisor policy runtime reloaded atomically [service_count:{}]",
+                                result.supervisor_middleware_services.len()
+                            ))
+                            .build());
                     }
+
+                    current_policy_hash.clone_from(&result.policy_hash);
+                    current_middleware_services.clone_from(&result.supervisor_middleware_services);
+                    middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
+                    last_failed_runtime_revision = None;
                 }
                 Err(e) => {
-                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .state(StateId::Other, "failed")
-                        .unmapped("version", serde_json::json!(result.version))
-                        .unmapped("error", serde_json::json!(e.to_string()))
-                        .message(format!(
-                            "Policy reload failed, keeping last-known-good policy [version:{} error:{e}]",
-                            result.version
-                        ))
-                        .build());
-                    if result.version > 0 && result.policy_source == PolicySource::Sandbox {
-                        enqueue_policy_status(
-                            &status_sender,
-                            PolicyStatusUpdate::failed(result.version, e.to_string()),
-                        );
+                    let failed_revision = (result.config_revision, result.policy_hash.clone());
+                    if last_failed_runtime_revision.as_ref() != Some(&failed_revision) {
+                        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .state(StateId::Other, "failed")
+                            .unmapped("version", serde_json::json!(result.version))
+                            .unmapped("error", serde_json::json!(e.to_string()))
+                            .message(format!(
+                                "Policy and middleware runtime reload failed, keeping last-known-good runtime [version:{} error:{e}]",
+                                result.version
+                            ))
+                            .build());
+                        if policy_changed
+                            && result.version > 0
+                            && result.policy_source == PolicySource::Sandbox
+                        {
+                            enqueue_policy_status(
+                                &status_sender,
+                                PolicyStatusUpdate::failed(result.version, e.to_string()),
+                            );
+                        }
                     }
+                    last_failed_runtime_revision = Some(failed_revision);
+                    // Nothing was installed, so the registry status still
+                    // describes the live registry. The retry is driven by the
+                    // persisting hash/service-set mismatch (or an existing
+                    // NeedsReconciliation), not by degrading the status here.
                 }
             }
         }
@@ -2608,43 +2939,27 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         // off picks up the surface without a recreate. We never uninstall on
         // a true→false transition: stale skill content on disk is harmless
         // because route_request and agent_next_steps both gate on the live
-        // atomic, so the agent that reads the skill will see 404s and an
+        // shared flag, so the agent that reads the skill will see 404s and an
         // empty `next_steps` array regardless.
-        if let Some(flag) = AGENT_PROPOSALS_ENABLED.get() {
-            let new_proposals = extract_bool_setting(
-                &result.settings,
-                openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY,
-            )
-            .unwrap_or(false);
-            let prev_proposals = flag.swap(new_proposals, Ordering::Relaxed);
-            if new_proposals != prev_proposals {
-                info!(
-                    agent_policy_proposals_enabled = new_proposals,
-                    "agent-driven policy proposals toggled"
-                );
-                if new_proposals && !prev_proposals {
-                    match skills::install_static_skills() {
-                        Ok(installed) => info!(
-                            path = %installed.policy_advisor.display(),
-                            "Installed sandbox agent skill on toggle-on"
-                        ),
-                        Err(error) => warn!(
-                            error = %error,
-                            "Failed to install sandbox agent skill on toggle-on"
-                        ),
-                    }
-                }
-            }
-        }
+        apply_agent_proposals_enabled(
+            &ctx.agent_proposals,
+            agent_proposals_enabled_from_settings(&result.settings),
+            "settings poll",
+            Some(result.config_revision),
+            ctx.sidecar_control_publisher.as_ref(),
+            skills::install_static_skills,
+        );
 
         current_config_revision = result.config_revision;
-        current_policy_hash = result.policy_hash;
+        if !reloads_gateway_policy {
+            current_policy_hash = result.policy_hash;
+        }
         current_settings = result.settings;
     }
 }
 
 fn apply_ocsf_json_setting(
-    enabled: &std::sync::atomic::AtomicBool,
+    enabled: &AtomicBool,
     settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
 ) {
     use std::sync::atomic::Ordering;
@@ -2670,6 +2985,52 @@ fn extract_bool_setting(
             setting_value::Value::BoolValue(b) => Some(*b),
             _ => None,
         })
+}
+
+fn agent_proposals_enabled_from_settings(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) -> bool {
+    extract_bool_setting(
+        settings,
+        openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY,
+    )
+    .unwrap_or(false)
+}
+
+fn apply_agent_proposals_enabled(
+    agent_proposals: &AgentProposals,
+    enabled: bool,
+    source: &'static str,
+    config_revision: Option<u64>,
+    sidecar_control_publisher: Option<&sidecar_control::Publisher>,
+    install_static_skills: impl FnOnce() -> Result<skills::InstalledSkills>,
+) {
+    let previously_enabled = agent_proposals.swap_enabled(enabled);
+    if enabled == previously_enabled {
+        return;
+    }
+
+    info!(
+        agent_policy_proposals_enabled = enabled,
+        source, config_revision, "agent-driven policy proposals toggled"
+    );
+
+    if let (Some(publisher), Some(config_revision)) = (sidecar_control_publisher, config_revision) {
+        publisher.publish_agent_proposals(enabled, config_revision);
+    }
+
+    if enabled && !previously_enabled {
+        match install_static_skills() {
+            Ok(installed) => info!(
+                path = %installed.policy_advisor.display(),
+                "Installed sandbox agent skill on toggle-on"
+            ),
+            Err(error) => warn!(
+                error = %error,
+                "Failed to install sandbox agent skill on toggle-on"
+            ),
+        }
+    }
 }
 
 /// Log individual setting changes between two snapshots.
@@ -2753,7 +3114,7 @@ mod tests {
     use openshell_core::policy::{
         FilesystemPolicy, LandlockPolicy, NetworkMode, NetworkPolicy, ProcessPolicy, ProxyPolicy,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn proxy_policy(http_addr: Option<std::net::SocketAddr>) -> SandboxPolicy {
         SandboxPolicy {
@@ -2825,9 +3186,13 @@ mod tests {
             1,
             std::collections::HashMap::from([("TOKEN".to_string(), "old".to_string())]),
         );
-        let handle = spawn_sidecar_control_update_watcher(rx, provider_credentials.clone());
+        let handle = spawn_sidecar_control_update_watcher(
+            rx,
+            provider_credentials.clone(),
+            AgentProposals::default(),
+        );
 
-        tx.send(sidecar_control::ControlUpdate::ProviderEnvUpdated {
+        tx.send(sidecar_control::ControlUpdate::ProviderEnv {
             revision: 2,
             provider_child_env: std::collections::HashMap::from([(
                 "TOKEN".to_string(),
@@ -2853,7 +3218,7 @@ mod tests {
             Some("new")
         );
 
-        tx.send(sidecar_control::ControlUpdate::ProviderEnvUpdated {
+        tx.send(sidecar_control::ControlUpdate::ProviderEnv {
             revision: 1,
             provider_child_env: std::collections::HashMap::from([(
                 "TOKEN".to_string(),
@@ -2871,6 +3236,72 @@ mod tests {
             Some("new")
         );
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn sidecar_control_agent_proposals_update_flips_shared_state() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let provider_credentials =
+            ProviderCredentialState::from_child_env_snapshot(0, std::collections::HashMap::new());
+        let agent_proposals = AgentProposals::new(true);
+        let handle =
+            spawn_sidecar_control_update_watcher(rx, provider_credentials, agent_proposals.clone());
+
+        tx.send(sidecar_control::ControlUpdate::AgentProposals {
+            enabled: false,
+            config_revision: 5,
+        })
+        .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !agent_proposals.enabled() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        handle.abort();
+    }
+
+    #[test]
+    fn apply_agent_proposals_enabled_installs_only_on_false_to_true() {
+        let agent_proposals = AgentProposals::default();
+        let installs = AtomicUsize::new(0);
+
+        apply_agent_proposals_enabled(&agent_proposals, true, "test", Some(1), None, || {
+            installs.fetch_add(1, Ordering::Relaxed);
+            Ok(skills::InstalledSkills {
+                policy_advisor: std::path::PathBuf::from("/tmp/policy_advisor.md"),
+                policy_advisor_skill: std::path::PathBuf::from("/tmp/SKILL.md"),
+                agents: None,
+            })
+        });
+        assert!(agent_proposals.enabled());
+        assert_eq!(installs.load(Ordering::Relaxed), 1);
+
+        apply_agent_proposals_enabled(&agent_proposals, true, "test", Some(2), None, || {
+            installs.fetch_add(1, Ordering::Relaxed);
+            Ok(skills::InstalledSkills {
+                policy_advisor: std::path::PathBuf::from("/tmp/policy_advisor.md"),
+                policy_advisor_skill: std::path::PathBuf::from("/tmp/SKILL.md"),
+                agents: None,
+            })
+        });
+        assert_eq!(installs.load(Ordering::Relaxed), 1);
+
+        apply_agent_proposals_enabled(&agent_proposals, false, "test", Some(3), None, || {
+            installs.fetch_add(1, Ordering::Relaxed);
+            Ok(skills::InstalledSkills {
+                policy_advisor: std::path::PathBuf::from("/tmp/policy_advisor.md"),
+                policy_advisor_skill: std::path::PathBuf::from("/tmp/SKILL.md"),
+                agents: None,
+            })
+        });
+        assert!(!agent_proposals.enabled());
+        assert_eq!(installs.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -2894,6 +3325,24 @@ mod tests {
         assert!(!enabled.load(Ordering::Relaxed));
     }
 
+    #[test]
+    fn agent_proposals_setting_enables_from_initial_settings_snapshot() {
+        let mut settings = std::collections::HashMap::new();
+        settings.insert(
+            openshell_core::settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY.to_string(),
+            effective_bool(true),
+        );
+
+        assert!(agent_proposals_enabled_from_settings(&settings));
+    }
+
+    #[test]
+    fn agent_proposals_setting_defaults_false_when_unset() {
+        let settings = std::collections::HashMap::new();
+
+        assert!(!agent_proposals_enabled_from_settings(&settings));
+    }
+
     // ---- Policy disk discovery tests ----
 
     #[test]
@@ -2902,9 +3351,10 @@ mod tests {
         let policy = discover_policy_from_path(path);
         // Restrictive default has no network policies.
         assert!(policy.network_policies.is_empty());
-        // But does have filesystem and process policies.
+        // It keeps filesystem restrictions while leaving identity to the
+        // active compute driver.
         assert!(policy.filesystem.is_some());
-        assert!(policy.process.is_some());
+        assert!(policy.process.is_none());
     }
 
     #[test]
@@ -2974,9 +3424,7 @@ filesystem_policy:
 
         let policy = discover_policy_from_path(&path);
         // Falls back to restrictive default because of root user.
-        let proc = policy.process.unwrap();
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
+        assert!(policy.process.is_none());
     }
 
     #[test]
@@ -3008,7 +3456,136 @@ filesystem_policy:
             settings: std::collections::HashMap::new(),
             global_policy_version: 0,
             provider_env_revision: 0,
+            supervisor_middleware_services: Vec::new(),
+            workspace: String::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_external_startup_registry_build_preserves_installed_builtins() {
+        let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
+        install_builtin_middleware_registry(&engine)
+            .await
+            .expect("install built-in middleware registry");
+        let builtins_generation = engine.current_generation();
+        assert_eq!(builtins_generation, 1);
+
+        let invalid_external = openshell_core::proto::SupervisorMiddlewareService {
+            name: "unavailable-guard".into(),
+            grpc_endpoint: "http://127.0.0.1:1".into(),
+            max_body_bytes: 1024,
+            ..Default::default()
+        };
+        connect_middleware_registry(&[invalid_external])
+            .await
+            .expect_err("unavailable external service must not replace built-ins");
+
+        assert_eq!(engine.current_generation(), builtins_generation);
+    }
+
+    #[test]
+    fn failed_gateway_runtime_snapshot_is_retried_without_revision_change() {
+        let services = Vec::new();
+
+        assert!(gateway_policy_runtime_needs_reconciliation(
+            true,
+            "hash-v1",
+            "hash-v1",
+            &services,
+            &services,
+            MiddlewareRegistryStatus::NeedsReconciliation,
+        ));
+        assert!(!gateway_policy_runtime_needs_reconciliation(
+            true,
+            "hash-v1",
+            "hash-v1",
+            &services,
+            &services,
+            MiddlewareRegistryStatus::Synchronized,
+        ));
+    }
+
+    #[test]
+    fn gateway_runtime_reconciliation_tracks_policy_and_service_changes() {
+        let no_services = Vec::new();
+        let desired_services = vec![openshell_core::proto::SupervisorMiddlewareService {
+            name: "guard".into(),
+            ..Default::default()
+        }];
+
+        assert!(gateway_policy_runtime_needs_reconciliation(
+            true,
+            "hash-v1",
+            "hash-v2",
+            &no_services,
+            &no_services,
+            MiddlewareRegistryStatus::Synchronized,
+        ));
+        assert!(gateway_policy_runtime_needs_reconciliation(
+            true,
+            "hash-v1",
+            "hash-v1",
+            &no_services,
+            &desired_services,
+            MiddlewareRegistryStatus::Synchronized,
+        ));
+        assert!(!gateway_policy_runtime_needs_reconciliation(
+            false,
+            "local-policy",
+            "hash-v2",
+            &no_services,
+            &desired_services,
+            MiddlewareRegistryStatus::NeedsReconciliation,
+        ));
+    }
+
+    #[test]
+    fn policy_only_change_does_not_rebuild_middleware_registry() {
+        let services = vec![openshell_core::proto::SupervisorMiddlewareService {
+            name: "guard".into(),
+            ..Default::default()
+        }];
+
+        // The runtime must reconcile, but the registry (and therefore
+        // middleware reachability) is not part of that reconciliation.
+        assert!(gateway_policy_runtime_needs_reconciliation(
+            true,
+            "hash-v1",
+            "hash-v2",
+            &services,
+            &services,
+            MiddlewareRegistryStatus::Synchronized,
+        ));
+        assert!(!middleware_registry_needs_rebuild(
+            MiddlewareRegistryStatus::Synchronized,
+            &services,
+            &services,
+        ));
+    }
+
+    #[test]
+    fn registry_rebuild_requires_service_set_change_or_degraded_registry() {
+        let no_services = Vec::new();
+        let desired_services = vec![openshell_core::proto::SupervisorMiddlewareService {
+            name: "guard".into(),
+            ..Default::default()
+        }];
+
+        assert!(middleware_registry_needs_rebuild(
+            MiddlewareRegistryStatus::Synchronized,
+            &no_services,
+            &desired_services,
+        ));
+        assert!(middleware_registry_needs_rebuild(
+            MiddlewareRegistryStatus::NeedsReconciliation,
+            &desired_services,
+            &desired_services,
+        ));
+        assert!(!middleware_registry_needs_rebuild(
+            MiddlewareRegistryStatus::Synchronized,
+            &desired_services,
+            &desired_services,
+        ));
     }
 
     #[test]
@@ -3158,5 +3735,22 @@ filesystem_policy:
                 PolicyStatusUpdate::loaded(version)
             );
         }
+    }
+
+    #[test]
+    fn settings_snapshot_carries_workspace_for_policy_sync() {
+        let mut snapshot = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        snapshot.workspace = "beta".to_string();
+
+        let revision = LoadedPolicyRevision::from_snapshot(&snapshot);
+        assert_eq!(revision.version, 1);
+        assert_eq!(
+            snapshot.workspace, "beta",
+            "workspace must survive the snapshot so sync_policy_and_fetch_snapshot receives it"
+        );
     }
 }

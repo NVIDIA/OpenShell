@@ -8,7 +8,7 @@
 //! principals for every method outside this supervisor-to-gateway allowlist;
 //! handlers still perform same-sandbox checks on request bodies.
 //!
-//! The allowlist is derived from per-handler `#[rpc_auth(...)]` annotations:
+//! The allowlist is derived from proto-level `(authorization)` annotations:
 //! a method is callable by a sandbox principal when its declared auth mode is
 //! `sandbox` or `dual`.
 
@@ -49,10 +49,10 @@ mod tests {
             "/openshell.v1.OpenShell/ApproveDraftChunk"
         ));
         assert!(!is_sandbox_callable(
-            "/openshell.inference.v1.Inference/GetClusterInference"
+            "/openshell.inference.v1.Inference/GetInferenceRoute"
         ));
         assert!(!is_sandbox_callable(
-            "/openshell.inference.v1.Inference/SetClusterInference"
+            "/openshell.inference.v1.Inference/SetInferenceRoute"
         ));
     }
 }

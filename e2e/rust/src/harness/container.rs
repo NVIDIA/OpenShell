@@ -182,6 +182,149 @@ impl ContainerHttpServer {
     }
 }
 
+/// A generic support container running on the shared e2e container network.
+///
+/// Unlike [`ContainerHttpServer`], this helper requires the network mode used
+/// by the Docker/Podman gateway lanes (`OPENSHELL_E2E_NETWORK_NAME`), probes
+/// readiness with a plain TCP connect instead of an HTTP GET (so it can host
+/// non-HTTP fixtures such as forward proxies and TLS servers), and exposes the
+/// container's logs and network IP for test assertions.
+pub struct SupportContainer {
+    /// Network alias other containers on the e2e network reach this one by.
+    pub alias: String,
+    container_id: String,
+    network: String,
+    engine: ContainerEngine,
+}
+
+impl SupportContainer {
+    /// Start a `python3 -c <script>` container with `alias` on the shared e2e
+    /// network and wait until `ready_port` accepts TCP connections inside the
+    /// container.
+    pub async fn start_python(alias: &str, script: &str, ready_port: u16) -> Result<Self, String> {
+        let engine = ContainerEngine::from_env()?;
+        let network = e2e_network_name().ok_or_else(|| {
+            "SupportContainer requires OPENSHELL_E2E_NETWORK_NAME (managed gateway network mode)"
+                .to_string()
+        })?;
+
+        let output = engine
+            .command()
+            .args([
+                "run",
+                "--detach",
+                "--entrypoint",
+                "python3",
+                "--network",
+                &network,
+                "--network-alias",
+                alias,
+                DEFAULT_TEST_SERVER_IMAGE,
+                "-c",
+                script,
+            ])
+            .output()
+            .map_err(|e| format!("start {} support container: {e}", engine.name()))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if !output.status.success() {
+            return Err(format!(
+                "{} run failed (exit {:?}):\n{stderr}",
+                engine.name(),
+                output.status.code()
+            ));
+        }
+
+        let container = Self {
+            alias: alias.to_string(),
+            container_id: stdout,
+            network,
+            engine,
+        };
+        container.wait_until_listening(ready_port).await?;
+        Ok(container)
+    }
+
+    async fn wait_until_listening(&self, port: u16) -> Result<(), String> {
+        let probe = format!(
+            "import socket; socket.create_connection(('127.0.0.1', {port}), timeout=1).close()"
+        );
+        let deadline = timeout(Duration::from_secs(60), async {
+            let mut tick = interval(Duration::from_millis(500));
+            loop {
+                tick.tick().await;
+                let output = self
+                    .engine
+                    .command()
+                    .args(["exec", &self.container_id, "python3", "-c", &probe])
+                    .output()
+                    .ok();
+                if output.is_some_and(|o| o.status.success()) {
+                    return;
+                }
+            }
+        })
+        .await;
+        deadline.map_err(|_| {
+            format!(
+                "support container '{}' did not listen on port {port} within 60s.\nLogs:\n{}",
+                self.alias,
+                self.logs().unwrap_or_else(|err| err)
+            )
+        })
+    }
+
+    /// Combined stdout/stderr logs of the container.
+    pub fn logs(&self) -> Result<String, String> {
+        let output = self
+            .engine
+            .command()
+            .args(["logs", &self.container_id])
+            .output()
+            .map_err(|e| format!("read {} container logs: {e}", self.engine.name()))?;
+        Ok(format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+
+    /// The container's IP address on the shared e2e network.
+    pub fn ip(&self) -> Result<String, String> {
+        let format = format!(
+            "{{{{with index .NetworkSettings.Networks \"{}\"}}}}{{{{.IPAddress}}}}{{{{end}}}}",
+            self.network
+        );
+        let output = self
+            .engine
+            .command()
+            .args(["inspect", "--format", &format, &self.container_id])
+            .output()
+            .map_err(|e| format!("inspect {} container: {e}", self.engine.name()))?;
+        let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() || ip.is_empty() {
+            return Err(format!(
+                "could not resolve IP of support container '{}' on network '{}':\n{}",
+                self.alias,
+                self.network,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(ip)
+    }
+}
+
+impl Drop for SupportContainer {
+    fn drop(&mut self) {
+        let _ = self
+            .engine
+            .command()
+            .args(["rm", "-f", &self.container_id])
+            .output();
+    }
+}
+
 fn normalized_env(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)

@@ -166,6 +166,7 @@ that crate's `README.md`.
 | [Security Policy](security-policy.md) | Policy model, enforcement layers, policy updates, policy advisor, and security logging. |
 | [Compute Runtimes](compute-runtimes.md) | Docker, Podman, Kubernetes, VM, sandbox images, and runtime-specific responsibilities. |
 | [Build](build.md) | Build artifacts, CI/E2E, docs site validation, and release packaging. |
+| [Google Vertex AI Provider](google-vertex-ai-provider.md) | Implementation reference for the `google-vertex-ai` provider, from CLI through gateway to sandbox. |
 
 ## `rfc/` vs `architecture/`
 

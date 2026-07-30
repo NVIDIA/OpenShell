@@ -14,21 +14,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl iproute2 nftables \
     && rm -rf /var/lib/apt/lists/*
 
-# The sandbox user is injected at runtime by the compute driver.
-# Kubernetes: resolved from OpenShift SCC namespace annotations or explicit
-# sandbox_uid config. VM: resolves to 10001 by default, configurable in
-# gateway TOML.
-#
-# Images no longer need a baked-in "sandbox" user — numeric UIDs are accepted
-# and the driver passes them directly to setuid()/chown() at sandbox start.
-# If your image requires a passwd entry for tools like ssh or sudo, add one
-# manually (e.g. RUN useradd -m -u 1500 deploy).
+RUN groupadd --gid 1500 app \
+    && useradd --uid 1500 --gid app --create-home app
 
-RUN install -d /sandbox
+RUN install -d -o app -g app /sandbox
 WORKDIR /sandbox
-COPY app.py .
+COPY --chown=app:app app.py .
 
 EXPOSE 8080
+
+# Docker and Podman use this non-root identity when policy omits either process
+# identity field. OpenShell starts the supervisor as root and drops only agent
+# children to this account.
+USER app
 
 # NOTE: The sandbox supervisor replaces CMD at runtime.  Pass the start
 # command explicitly:  openshell sandbox create ... -- python /sandbox/app.py

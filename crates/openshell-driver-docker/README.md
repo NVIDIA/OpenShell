@@ -6,11 +6,26 @@ The driver manages sandbox containers through the local Docker daemon with the
 `bollard` client. It is intended for developer environments where Docker is
 already available and running Kubernetes would be unnecessary.
 
+The driver connects to `[openshell.drivers.docker].socket_path` when configured.
+Otherwise, it uses the first standard local Docker socket that responds to an
+API ping, which is the same selection mechanism used by gateway auto-detection.
+An explicitly selected Docker driver falls back to `/var/run/docker.sock` when
+no candidate responds.
+
 ## Runtime Model
 
 The gateway runs as a host process. The Docker driver creates one container per
 sandbox and starts the `openshell-sandbox` supervisor inside that container. The
 supervisor then creates the nested sandbox namespace for the agent process.
+
+Before creating the container, the driver inspects the final sandbox image and
+captures its immutable image ID and raw OCI `Config.User`. Container creation
+uses that image ID, preventing a mutable tag from changing between inspection
+and launch. The supervisor runs as root, resolves omitted policy identity fields
+from the image declaration, and drops only agent children to the resulting
+identity. Named OCI components remain names after validation; a missing group
+is filled with the user's numeric primary GID. Explicit `process.run_as_user`
+and `process.run_as_group` values take precedence independently.
 
 Docker containers join an OpenShell-managed bridge network. The driver injects
 `host.openshell.internal` and `host.docker.internal` so supervisors have stable

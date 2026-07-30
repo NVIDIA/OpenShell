@@ -830,10 +830,6 @@ filesystem_policy:
 landlock:
   compatibility: best_effort
 
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-
 network_policies:
   github_readonly:
     name: github_readonly
@@ -858,7 +854,10 @@ network_policies:
       - { path: /usr/local/bin/claude }
 ```
 
-The agent notes that `filesystem_policy`, `landlock`, and `process` are sensible defaults that may need adjustment, and that gateway inference is configured separately via `openshell inference set/get` rather than an `inference` policy block.
+The agent notes that `filesystem_policy` and `landlock` are sensible defaults
+that may need adjustment. Process identity is omitted so the compute driver can
+select it. Gateway inference is configured separately via `openshell inference
+set/get` rather than an `inference` policy block.
 
 ---
 

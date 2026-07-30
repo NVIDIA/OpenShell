@@ -20,12 +20,14 @@ openshell-core = { path = "../openshell-core", default-features = false }
 openshell-driver-docker = { path = "../openshell-driver-docker" }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
 openshell-driver-podman = { path = "../openshell-driver-podman" }
+openshell-gateway-interceptors = { path = "../openshell-gateway-interceptors" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-router = { path = "../openshell-router" }
-openshell-server-macros = { path = "../openshell-server-macros" }
+openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
+openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 
 # Kubernetes client (used by the `generate-certs` subcommand)
 kube = { workspace = true }
@@ -37,6 +39,7 @@ tokio = { workspace = true }
 # gRPC
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 prost = { workspace = true }
+prost-reflect = { workspace = true }
 prost-types = { workspace = true }
 
 # HTTP server
@@ -66,6 +69,12 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# OpenTelemetry (OTLP trace export, opt-in via [openshell.gateway.otlp])
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
 # Metrics
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
@@ -80,6 +89,8 @@ toml = { workspace = true }
 tokio-stream = { workspace = true }
 sqlx = { workspace = true }
 reqwest = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-sts = { workspace = true }
 uuid = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }
@@ -113,6 +124,11 @@ rcgen = { version = "0.13", features = ["crypto", "pem"] }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 wiremock = "0.6"
+# `testing` provides InMemorySpanExporter, so span assertions do not need a
+# collector, a network hop, or a flush barrier.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# Supports asserting that the gateway sends spans over OTLP.
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
 
 [lints]
 workspace = true

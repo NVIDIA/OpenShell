@@ -19,10 +19,10 @@ use openshell_core::gpu::{
 use openshell_core::proto::compute::v1::{
     DriverSandbox, GetCapabilitiesResponse, GpuResourceRequirements,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 impl From<PodmanApiError> for ComputeDriverError {
     fn from(value: PodmanApiError) -> Self {
@@ -62,12 +62,12 @@ struct ValidatedPodmanSandbox<'a> {
     gpu_requirements: Option<&'a GpuResourceRequirements>,
 }
 
-/// Construct and validate a container name from a sandbox name.
+/// Construct and validate a container name from a sandbox.
 ///
-/// Combines the prefix with the sandbox name and validates the result
-/// against Podman's naming rules before any resources are created.
-fn validated_container_name(sandbox_name: &str) -> Result<String, ComputeDriverError> {
-    let name = container::container_name(sandbox_name);
+/// Combines the prefix with workspace, name, and ID, then validates the
+/// result against Podman's naming rules before any resources are created.
+fn validated_container_name(sandbox: &DriverSandbox) -> Result<String, ComputeDriverError> {
+    let name = container::container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     crate::client::validate_name(&name)
         .map_err(|e| ComputeDriverError::Precondition(e.to_string()))?;
     Ok(name)
@@ -110,6 +110,57 @@ async fn cleanup_sandbox_token_secret(client: &PodmanClient, secret_name: &str) 
             secret = %secret_name,
             error = %err,
             "Failed to remove Podman sandbox token secret"
+        );
+    }
+}
+
+/// Read the operator's proxy credentials file and stage it as a per-sandbox
+/// Podman secret, so the credentials reach the supervisor through a root-only
+/// mount rather than the container environment.
+///
+/// Fails closed: when `proxy_auth_file` is configured but cannot be read or
+/// does not hold a valid `user:pass` credential, the sandbox is not created.
+/// Credential validation is shared with the in-container supervisor through
+/// [`openshell_core::driver_utils::parse_upstream_proxy_credential`], so a
+/// credential staged here can never be rejected at supervisor startup.
+async fn create_sandbox_proxy_auth_secret(
+    client: &PodmanClient,
+    config: &PodmanComputeConfig,
+    sandbox: &DriverSandbox,
+) -> Result<Option<String>, ComputeDriverError> {
+    let Some(path) = config.proxy_auth_file.as_deref() else {
+        return Ok(None);
+    };
+
+    // Bounded, blocking read shared with the supervisor: rejects non-regular
+    // files (e.g. /dev/zero) and caps the size so a hostile path cannot
+    // exhaust gateway memory.
+    let path_owned = path.to_string();
+    let raw = tokio::task::spawn_blocking(move || {
+        openshell_core::driver_utils::read_upstream_proxy_credential_file(&path_owned)
+    })
+    .await
+    .map_err(|e| ComputeDriverError::Message(format!("proxy_auth_file read task failed: {e}")))?
+    .map_err(ComputeDriverError::Message)?;
+    let credential =
+        openshell_core::driver_utils::parse_upstream_proxy_credential(&raw).map_err(|err| {
+            ComputeDriverError::InvalidArgument(format!("proxy_auth_file '{path}': {err}"))
+        })?;
+
+    let secret_name = container::proxy_auth_secret_name(&sandbox.id);
+    client
+        .create_secret(&secret_name, format!("{credential}\n").as_bytes())
+        .await
+        .map_err(ComputeDriverError::from)?;
+    Ok(Some(secret_name))
+}
+
+async fn cleanup_sandbox_proxy_auth_secret(client: &PodmanClient, secret_name: &str) {
+    if let Err(err) = client.remove_secret(secret_name).await {
+        warn!(
+            secret = %secret_name,
+            error = %err,
+            "Failed to remove Podman sandbox proxy-auth secret"
         );
     }
 }
@@ -157,22 +208,48 @@ fn podman_gpu_selection_error(err: CdiGpuSelectionError) -> ComputeDriverError {
     ComputeDriverError::Precondition(err.to_string())
 }
 
+/// Resolve the socket to connect to: explicit configuration wins, otherwise
+/// fall back to `detect`. Returns an error if neither resolves.
+///
+/// Takes `detect` as a parameter (rather than calling
+/// [`openshell_core::config::detect_podman_socket`] directly) so tests can
+/// exercise the precedence deterministically, without touching real
+/// environment variables or the filesystem.
+fn resolve_socket_path(
+    configured: Option<PathBuf>,
+    detect: impl FnOnce() -> Option<PathBuf>,
+) -> Result<PathBuf, PodmanApiError> {
+    configured.or_else(detect).ok_or_else(|| {
+        PodmanApiError::InvalidInput(
+            "no responsive Podman API socket found; set OPENSHELL_PODMAN_SOCKET \
+             or configure socket_path"
+                .to_string(),
+        )
+    })
+}
+
 impl PodmanComputeDriver {
     /// Create a new driver, verifying the Podman socket is reachable.
     pub async fn new(mut config: PodmanComputeConfig) -> Result<Self, PodmanApiError> {
         const MAX_PING_RETRIES: u32 = 5;
         const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-        if !config.socket_path.exists() {
+        let socket_path = resolve_socket_path(
+            config.socket_path.clone(),
+            openshell_core::config::detect_podman_socket,
+        )?;
+        config.socket_path = Some(socket_path.clone());
+
+        if !socket_path.exists() {
             if cfg!(target_os = "macos") {
                 warn!(
-                    path = %config.socket_path.display(),
+                    path = %socket_path.display(),
                     "Podman socket not found; is podman machine running? \
                      Try `podman machine start` or set OPENSHELL_PODMAN_SOCKET to override."
                 );
             } else {
                 warn!(
-                    path = %config.socket_path.display(),
+                    path = %socket_path.display(),
                     "Podman socket not found; is the Podman service running? \
                      Set OPENSHELL_PODMAN_SOCKET or XDG_RUNTIME_DIR to override."
                 );
@@ -185,8 +262,9 @@ impl PodmanComputeDriver {
         config.validate_tls_config()?;
         config.validate_runtime_limits()?;
         config.validate_host_gateway_ip()?;
+        config.validate_proxy_config()?;
 
-        let client = PodmanClient::new(config.socket_path.clone());
+        let client = PodmanClient::new(socket_path);
 
         // Verify connectivity, retrying briefly to tolerate transient socket
         // unavailability (e.g. podman.socket restarting after a package
@@ -451,7 +529,7 @@ impl PodmanComputeDriver {
         // Validate the composed container name early, before creating any
         // resources (volume), so we don't leave orphans when the name is
         // invalid.
-        let name = validated_container_name(&sandbox.name)?;
+        let name = validated_container_name(sandbox)?;
         let validated = self.validated_sandbox_create(sandbox).await?;
 
         let vol_name = container::volume_name(&sandbox.id);
@@ -493,6 +571,20 @@ impl PodmanComputeDriver {
             .pull_image(image, pull_policy)
             .await
             .map_err(ComputeDriverError::from)?;
+        let inspected_image = self
+            .client
+            .inspect_image(image)
+            .await
+            .map_err(ComputeDriverError::from)?;
+        if inspected_image.id.is_empty() {
+            return Err(ComputeDriverError::Precondition(format!(
+                "podman image '{image}' inspection did not return an immutable image ID"
+            )));
+        }
+        let image_user = inspected_image
+            .config
+            .as_ref()
+            .map_or("", |config| config.user.as_str());
 
         for image in
             container::podman_driver_image_mount_sources(sandbox, self.config.enable_bind_mounts)
@@ -516,6 +608,29 @@ impl PodmanComputeDriver {
                 return Err(e);
             }
         };
+        let proxy_auth_secret_name =
+            match create_sandbox_proxy_auth_secret(&self.client, &self.config, sandbox).await {
+                Ok(name) => name,
+                Err(e) => {
+                    let _ = self.client.remove_volume(&vol_name).await;
+                    if let Some(secret) = token_secret_name.as_deref() {
+                        cleanup_sandbox_token_secret(&self.client, secret).await;
+                    }
+                    return Err(e);
+                }
+            };
+
+        // Clean up the volume and both per-sandbox secrets on any failure past
+        // this point.
+        let cleanup_created = || async {
+            let _ = self.client.remove_volume(&vol_name).await;
+            if let Some(secret) = token_secret_name.as_deref() {
+                cleanup_sandbox_token_secret(&self.client, secret).await;
+            }
+            if let Some(secret) = proxy_auth_secret_name.as_deref() {
+                cleanup_sandbox_proxy_auth_secret(&self.client, secret).await;
+            }
+        };
 
         // 3. Create container.
         let gpu_devices = match self.resolve_gpu_cdi_devices(
@@ -525,25 +640,22 @@ impl PodmanComputeDriver {
         ) {
             Ok(devices) => devices,
             Err(e) => {
-                let _ = self.client.remove_volume(&vol_name).await;
-                if let Some(secret) = token_secret_name.as_deref() {
-                    cleanup_sandbox_token_secret(&self.client, secret).await;
-                }
+                cleanup_created().await;
                 return Err(e);
             }
         };
-        let spec = match container::build_container_spec_with_token_and_gpu_devices(
+        let spec = match container::build_container_spec_for_image(
             sandbox,
             &self.config,
             token_secret_name.as_deref(),
             gpu_devices.as_deref(),
+            image,
+            &inspected_image.id,
+            image_user,
         ) {
             Ok(spec) => spec,
             Err(e) => {
-                let _ = self.client.remove_volume(&vol_name).await;
-                if let Some(secret) = token_secret_name.as_deref() {
-                    cleanup_sandbox_token_secret(&self.client, secret).await;
-                }
+                cleanup_created().await;
                 return Err(e);
             }
         };
@@ -554,17 +666,11 @@ impl PodmanComputeDriver {
                 // sandbox's ID, not the conflicting container's ID (which
                 // has the same name but a different ID), so it would be
                 // orphaned otherwise.
-                let _ = self.client.remove_volume(&vol_name).await;
-                if let Some(secret) = token_secret_name.as_deref() {
-                    cleanup_sandbox_token_secret(&self.client, secret).await;
-                }
+                cleanup_created().await;
                 return Err(ComputeDriverError::AlreadyExists);
             }
             Err(e) => {
-                let _ = self.client.remove_volume(&vol_name).await;
-                if let Some(secret) = token_secret_name.as_deref() {
-                    cleanup_sandbox_token_secret(&self.client, secret).await;
-                }
+                cleanup_created().await;
                 return Err(ComputeDriverError::from(e));
             }
         }
@@ -577,10 +683,7 @@ impl PodmanComputeDriver {
                 "Failed to start container; cleaning up"
             );
             let _ = self.client.remove_container(&name).await;
-            let _ = self.client.remove_volume(&vol_name).await;
-            if let Some(secret) = token_secret_name.as_deref() {
-                cleanup_sandbox_token_secret(&self.client, secret).await;
-            }
+            cleanup_created().await;
             return Err(ComputeDriverError::from(e));
         }
 
@@ -593,75 +696,65 @@ impl PodmanComputeDriver {
         Ok(())
     }
 
+    /// Find the Podman container ID for a sandbox by its sandbox ID using label lookup.
+    async fn find_container_id(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<String>, ComputeDriverError> {
+        let id_filter = format!("{LABEL_SANDBOX_ID}={sandbox_id}");
+        let entries = self
+            .client
+            .list_containers(&[LABEL_MANAGED_FILTER, &id_filter])
+            .await
+            .map_err(ComputeDriverError::from)?;
+        Ok(entries.first().map(|e| e.id.clone()))
+    }
+
     /// Stop a sandbox container without deleting it.
-    pub async fn stop_sandbox(&self, sandbox_name: &str) -> Result<(), ComputeDriverError> {
-        let name = validated_container_name(sandbox_name)?;
-        info!(sandbox_name = %sandbox_name, container = %name, "Stopping sandbox container");
+    pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
+        let container_id = self.find_container_id(sandbox_id).await?.ok_or_else(|| {
+            ComputeDriverError::Precondition("sandbox container not found".into())
+        })?;
+        info!(sandbox_id = %sandbox_id, container = %container_id, "Stopping sandbox container");
 
         self.client
-            .stop_container(&name, self.config.stop_timeout_secs)
+            .stop_container(&container_id, self.config.stop_timeout_secs)
             .await
             .map_err(ComputeDriverError::from)
     }
 
     /// Delete a sandbox container and its workspace volume.
-    pub async fn delete_sandbox(
-        &self,
-        sandbox_id: &str,
-        sandbox_name: &str,
-    ) -> Result<bool, ComputeDriverError> {
+    pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, ComputeDriverError> {
         if sandbox_id.is_empty() {
             return Err(ComputeDriverError::Precondition(
                 "sandbox id is required".into(),
             ));
         }
-        let name = validated_container_name(sandbox_name)?;
-        info!(
-            sandbox_id = %sandbox_id,
-            sandbox_name = %sandbox_name,
-            container = %name,
-            "Deleting sandbox container"
-        );
 
-        // Use the request's stable sandbox ID as the source of truth for
-        // cleanup. Inspect is only used as a best-effort cross-check so
-        // cleanup still works if the container is already gone or mislabeled.
-        match self.client.inspect_container(&name).await {
-            Ok(inspect) => match inspect.config.labels.get(LABEL_SANDBOX_ID) {
-                Some(label_id) if label_id != sandbox_id => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        sandbox_name = %sandbox_name,
-                        container = %name,
-                        label_sandbox_id = %label_id,
-                        "Container label sandbox ID did not match delete request; cleaning up using request sandbox_id"
-                    );
-                }
-                None => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        sandbox_name = %sandbox_name,
-                        container = %name,
-                        "Container missing '{}' label; cleaning up using request sandbox_id",
-                        LABEL_SANDBOX_ID,
-                    );
-                }
-                Some(_) => {}
-            },
-            Err(PodmanApiError::NotFound(_)) => {}
-            Err(e) => return Err(ComputeDriverError::from(e)),
-        }
+        let Some(container_id) = self.find_container_id(sandbox_id).await? else {
+            debug!(sandbox_id = %sandbox_id, "Sandbox container not found (already deleted)");
+            let vol = container::volume_name(sandbox_id);
+            if let Err(e) = self.client.remove_volume(&vol).await {
+                warn!(sandbox_id = %sandbox_id, volume = %vol, error = %e, "Failed to remove workspace volume");
+            }
+            cleanup_sandbox_token_secret(&self.client, &container::token_secret_name(sandbox_id))
+                .await;
+            cleanup_sandbox_proxy_auth_secret(
+                &self.client,
+                &container::proxy_auth_secret_name(sandbox_id),
+            )
+            .await;
+            return Ok(false);
+        };
+        info!(sandbox_id = %sandbox_id, container = %container_id, "Deleting sandbox container");
 
         // Stop (best-effort).
         let _ = self
             .client
-            .stop_container(&name, self.config.stop_timeout_secs)
+            .stop_container(&container_id, self.config.stop_timeout_secs)
             .await;
 
-        // Remove container. If NotFound, the container was removed between
-        // inspect and here (TOCTOU race); proceed with volume cleanup
-        // since the workspace volume is idempotent to remove.
-        let container_existed = match self.client.remove_container(&name).await {
+        let container_existed = match self.client.remove_container(&container_id).await {
             Ok(()) => true,
             Err(PodmanApiError::NotFound(_)) => false,
             Err(e) => return Err(ComputeDriverError::from(e)),
@@ -672,37 +765,56 @@ impl PodmanComputeDriver {
         if let Err(e) = self.client.remove_volume(&vol).await {
             warn!(
                 sandbox_id = %sandbox_id,
-                sandbox_name = %sandbox_name,
                 volume = %vol,
                 error = %e,
                 "Failed to remove workspace volume"
             );
         }
         cleanup_sandbox_token_secret(&self.client, &container::token_secret_name(sandbox_id)).await;
+        cleanup_sandbox_proxy_auth_secret(
+            &self.client,
+            &container::proxy_auth_secret_name(sandbox_id),
+        )
+        .await;
 
         Ok(container_existed)
     }
 
     /// Check whether a sandbox container exists.
-    pub async fn sandbox_exists(&self, sandbox_name: &str) -> Result<bool, ComputeDriverError> {
-        let name = container::container_name(sandbox_name);
-        match self.client.inspect_container(&name).await {
-            Ok(_) => Ok(true),
-            Err(PodmanApiError::NotFound(_)) => Ok(false),
-            Err(e) => Err(ComputeDriverError::from(e)),
-        }
+    pub async fn sandbox_exists(&self, sandbox_id: &str) -> Result<bool, ComputeDriverError> {
+        let id_filter = format!("{LABEL_SANDBOX_ID}={sandbox_id}");
+        let entries = self
+            .client
+            .list_containers(&[LABEL_MANAGED_FILTER, &id_filter])
+            .await
+            .map_err(ComputeDriverError::from)?;
+        Ok(!entries.is_empty())
     }
 
-    /// Fetch a single sandbox by name.
+    /// Fetch a single sandbox by ID.
     pub async fn get_sandbox(
         &self,
-        sandbox_name: &str,
+        sandbox_id: &str,
     ) -> Result<Option<DriverSandbox>, ComputeDriverError> {
-        let name = container::container_name(sandbox_name);
-        match self.client.inspect_container(&name).await {
-            Ok(inspect) => Ok(driver_sandbox_from_inspect(&inspect)),
-            Err(PodmanApiError::NotFound(_)) => Ok(None),
-            Err(e) => Err(ComputeDriverError::from(e)),
+        let id_filter = format!("{LABEL_SANDBOX_ID}={sandbox_id}");
+        let entries = self
+            .client
+            .list_containers(&[LABEL_MANAGED_FILTER, &id_filter])
+            .await
+            .map_err(ComputeDriverError::from)?;
+        let Some(entry) = entries.first() else {
+            return Ok(None);
+        };
+        if entry.state == "running" {
+            Ok(self
+                .client
+                .inspect_container(&entry.id)
+                .await
+                .ok()
+                .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
+                .or_else(|| driver_sandbox_from_list_entry(entry)))
+        } else {
+            Ok(driver_sandbox_from_list_entry(entry))
         }
     }
 
@@ -713,7 +825,7 @@ impl PodmanComputeDriver {
     pub async fn list_sandboxes(&self) -> Result<Vec<DriverSandbox>, ComputeDriverError> {
         let entries = self
             .client
-            .list_containers(LABEL_MANAGED_FILTER)
+            .list_containers(&[LABEL_MANAGED_FILTER])
             .await
             .map_err(ComputeDriverError::from)?;
 
@@ -774,7 +886,7 @@ impl PodmanComputeDriver {
         gpu_inventory: CdiGpuInventory,
         allow_all_default_gpu: bool,
     ) -> Self {
-        let client = PodmanClient::new(config.socket_path.clone());
+        let client = PodmanClient::new(config.socket_path.clone().unwrap_or_default());
         let refresh_inventory = gpu_inventory.clone();
         Self {
             client,
@@ -848,7 +960,37 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    // ── socket resolution ───────────────────────────────────────────────
+    //
+    // These test resolve_socket_path directly with an injected detector, so
+    // they are deterministic regardless of the host's real environment
+    // variables or whether a Podman socket happens to be running.
+
+    #[test]
+    fn resolve_socket_path_prefers_explicit_configuration() {
+        let path = resolve_socket_path(Some(PathBuf::from("/explicit.sock")), || {
+            Some(PathBuf::from("/detected.sock"))
+        })
+        .unwrap();
+
+        assert_eq!(path, PathBuf::from("/explicit.sock"));
+    }
+
+    #[test]
+    fn resolve_socket_path_uses_detected_socket_when_unconfigured() {
+        let path = resolve_socket_path(None, || Some(PathBuf::from("/detected.sock"))).unwrap();
+
+        assert_eq!(path, PathBuf::from("/detected.sock"));
+    }
+
+    #[test]
+    fn resolve_socket_path_errors_when_neither_source_resolves() {
+        let err = resolve_socket_path(None, || None).unwrap_err();
+
+        assert!(err.to_string().contains("no responsive Podman API socket"));
+    }
 
     fn cdi_devices_config(device_ids: &[&str]) -> prost_types::Struct {
         prost_types::Struct {
@@ -1245,7 +1387,7 @@ mod tests {
 
     fn test_driver(socket_path: PathBuf) -> PodmanComputeDriver {
         let config = PodmanComputeConfig {
-            socket_path,
+            socket_path: Some(socket_path),
             stop_timeout_secs: 10,
             ..PodmanComputeConfig::default()
         };
@@ -1256,41 +1398,12 @@ mod tests {
         PodmanComputeDriver::for_tests(config)
     }
 
-    fn json_value(value: serde_json::Value) -> prost_types::Value {
-        match value {
-            serde_json::Value::Null => prost_types::Value { kind: None },
-            serde_json::Value::Bool(value) => prost_types::Value {
-                kind: Some(prost_types::value::Kind::BoolValue(value)),
-            },
-            serde_json::Value::Number(value) => prost_types::Value {
-                kind: value.as_f64().map(prost_types::value::Kind::NumberValue),
-            },
-            serde_json::Value::String(value) => prost_types::Value {
-                kind: Some(prost_types::value::Kind::StringValue(value)),
-            },
-            serde_json::Value::Array(values) => prost_types::Value {
-                kind: Some(prost_types::value::Kind::ListValue(
-                    prost_types::ListValue {
-                        values: values.into_iter().map(json_value).collect(),
-                    },
-                )),
-            },
-            serde_json::Value::Object(values) => prost_types::Value {
-                kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
-                    fields: values
-                        .into_iter()
-                        .map(|(key, value)| (key, json_value(value)))
-                        .collect(),
-                })),
-            },
-        }
-    }
-
     fn json_struct(value: serde_json::Value) -> prost_types::Struct {
-        match json_value(value).kind {
-            Some(prost_types::value::Kind::StructValue(value)) => value,
-            _ => panic!("expected JSON object"),
-        }
+        let serde_json::Value::Object(object) = value else {
+            panic!("expected JSON object");
+        };
+        openshell_core::proto_struct::json_object_to_struct(object)
+            .expect("test JSON must convert to a protobuf Struct")
     }
 
     fn sandbox_with_volume_mount(volume: &str) -> DriverSandbox {
@@ -1312,6 +1425,7 @@ mod tests {
                 ..Default::default()
             }),
             status: None,
+            workspace: String::new(),
         }
     }
 
@@ -1453,7 +1567,7 @@ mod tests {
             )],
         );
         let config = PodmanComputeConfig {
-            socket_path: socket_path.clone(),
+            socket_path: Some(socket_path.clone()),
             enable_bind_mounts: true,
             ..PodmanComputeConfig::default()
         };
@@ -1470,24 +1584,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_sandbox_cleans_up_with_request_id_when_container_is_already_gone() {
+    async fn delete_sandbox_cleans_up_volume_when_container_is_already_gone() {
         let sandbox_id = "sandbox-123";
-        let sandbox_name = "demo";
-        let container_name = container::container_name(sandbox_name);
         let volume_name = container::volume_name(sandbox_id);
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-not-found",
             vec![
-                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
-                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
-                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
+                // list_containers returns empty (container already gone)
+                StubResponse::new(StatusCode::OK, "[]"),
+                // remove_volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
         let driver = test_driver(socket_path.clone());
 
         let deleted = driver
-            .delete_sandbox(sandbox_id, sandbox_name)
+            .delete_sandbox(sandbox_id)
             .await
             .expect("delete should succeed");
 
@@ -1497,67 +1609,207 @@ mod tests {
             .lock()
             .expect("request log lock should not be poisoned")
             .clone();
+        assert!(requests[0].contains("/libpod/containers/json"));
         assert_eq!(
-            requests,
+            requests[1],
+            format!(
+                "DELETE {}",
+                api_path(&format!("/libpod/volumes/{volume_name}"))
+            )
+        );
+        let _ = fs::remove_file(socket_path);
+    }
+
+    /// Write a valid `user:pass` credential to a unique path for proxy-auth
+    /// secret tests. Caller removes it.
+    fn write_proxy_auth_file(test_name: &str) -> PathBuf {
+        let path = crate::test_utils::unique_socket_path(test_name).with_extension("auth");
+        fs::write(&path, "user:pass\n").expect("write proxy auth file");
+        path
+    }
+
+    fn proxy_auth_config(socket_path: PathBuf, auth_file: &Path) -> PodmanComputeConfig {
+        PodmanComputeConfig {
+            socket_path: Some(socket_path),
+            stop_timeout_secs: 10,
+            proxy_auth_file: Some(auth_file.to_string_lossy().into_owned()),
+            proxy_auth_allow_insecure: Some(true),
+            ..PodmanComputeConfig::default()
+        }
+    }
+
+    fn plain_sandbox(id: &str, name: &str) -> DriverSandbox {
+        DriverSandbox {
+            id: id.to_string(),
+            name: name.to_string(),
+            namespace: String::new(),
+            workspace: String::new(),
+            spec: None,
+            status: None,
+        }
+    }
+
+    fn secret_delete_request(sandbox_id: &str) -> String {
+        format!(
+            "DELETE {}",
+            api_path(&format!(
+                "/libpod/secrets/{}",
+                container::proxy_auth_secret_name(sandbox_id)
+            ))
+        )
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_removes_proxy_auth_secret_on_container_create_failure() {
+        // A credential secret is staged before the container is created, so a
+        // container-create failure must remove it — no credential residue.
+        let sandbox_id = "sandbox-cc";
+        let auth_file = write_proxy_auth_file("create-fail");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "create-container-fail",
             vec![
-                format!(
-                    "GET {}",
-                    api_path(&format!("/libpod/containers/{container_name}/json"))
-                ),
-                format!(
-                    "POST {}",
-                    api_path(&format!(
-                        "/libpod/containers/{container_name}/stop?timeout=10"
-                    ))
-                ),
-                format!(
-                    "DELETE {}",
-                    api_path(&format!(
-                        "/libpod/containers/{container_name}?force=true&v=true"
-                    ))
-                ),
-                format!(
-                    "DELETE {}",
-                    api_path(&format!("/libpod/volumes/{volume_name}"))
-                ),
-            ]
+                StubResponse::new(StatusCode::OK, "{}"), // pull supervisor image
+                StubResponse::new(StatusCode::OK, "{}"), // pull sandbox image
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":"1234:1235"}}"#,
+                ), // inspect sandbox image
+                StubResponse::new(StatusCode::CREATED, "{}"), // create volume
+                StubResponse::new(StatusCode::CREATED, "{}"), // create proxy-auth secret
+                StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"message":"boom"}"#), // create container
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove volume
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove proxy-auth secret
+            ],
+        );
+        let driver = test_driver_with_config(proxy_auth_config(socket_path.clone(), &auth_file));
+
+        driver
+            .create_sandbox(&plain_sandbox(sandbox_id, "demo"))
+            .await
+            .expect_err("container create should fail");
+
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert!(
+            requests.contains(&secret_delete_request(sandbox_id)),
+            "proxy-auth secret must be removed on container-create failure: {requests:?}"
+        );
+        let _ = fs::remove_file(&auth_file);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_removes_proxy_auth_secret_on_start_failure() {
+        // The container is created but fails to start; the staged credential
+        // secret must still be removed.
+        let sandbox_id = "sandbox-sf";
+        let auth_file = write_proxy_auth_file("start-fail");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "create-start-fail",
+            vec![
+                StubResponse::new(StatusCode::OK, "{}"), // pull supervisor image
+                StubResponse::new(StatusCode::OK, "{}"), // pull sandbox image
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":"1234:1235"}}"#,
+                ), // inspect sandbox image
+                StubResponse::new(StatusCode::CREATED, "{}"), // create volume
+                StubResponse::new(StatusCode::CREATED, "{}"), // create proxy-auth secret
+                StubResponse::new(StatusCode::CREATED, "{}"), // create container
+                StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"message":"boom"}"#), // start container
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove container
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove volume
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove proxy-auth secret
+            ],
+        );
+        let driver = test_driver_with_config(proxy_auth_config(socket_path.clone(), &auth_file));
+
+        driver
+            .create_sandbox(&plain_sandbox(sandbox_id, "demo"))
+            .await
+            .expect_err("container start should fail");
+
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert!(
+            requests.contains(&secret_delete_request(sandbox_id)),
+            "proxy-auth secret must be removed on start failure: {requests:?}"
+        );
+        let _ = fs::remove_file(&auth_file);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_removes_proxy_auth_secret() {
+        // Deleting a sandbox (here already gone out of band) must remove the
+        // per-sandbox proxy-auth secret so credentials never outlive it.
+        let sandbox_id = "sandbox-del";
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "delete-proxy-auth",
+            vec![
+                StubResponse::new(StatusCode::OK, "[]"), // list_containers (not found)
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove volume
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove token secret
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove proxy-auth secret
+            ],
+        );
+        let driver = test_driver(socket_path.clone());
+
+        driver
+            .delete_sandbox(sandbox_id)
+            .await
+            .expect("delete should succeed");
+
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert!(
+            requests.contains(&secret_delete_request(sandbox_id)),
+            "proxy-auth secret must be removed on delete: {requests:?}"
         );
         let _ = fs::remove_file(socket_path);
     }
 
     #[tokio::test]
-    async fn delete_sandbox_uses_request_id_when_container_label_disagrees() {
+    async fn delete_sandbox_finds_container_by_label_and_removes() {
         let sandbox_id = "sandbox-request-id";
-        let sandbox_name = "demo";
-        let container_name = container::container_name(sandbox_name);
+        let container_id = "abc123def456";
+        let container_name = "openshell-default--demo-sandbox-request-id";
         let volume_name = container::volume_name(sandbox_id);
-        let inspect_body = serde_json::json!({
-            "Id": "container-id",
-            "Name": format!("/{container_name}"),
-            "State": {
-                "Status": "running",
-                "Running": true
-            },
-            "Config": {
-                "Labels": {
-                    LABEL_SANDBOX_ID: "sandbox-label-id"
-                }
+        let list_body = serde_json::json!([{
+            "Id": container_id,
+            "Names": [container_name],
+            "State": "running",
+            "Labels": {
+                LABEL_SANDBOX_ID: sandbox_id
             }
-        })
+        }])
         .to_string();
         let (socket_path, request_log, handle) = spawn_podman_stub(
-            "delete-mismatch",
+            "delete-label-lookup",
             vec![
-                StubResponse::new(StatusCode::OK, inspect_body),
+                // list_containers by label
+                StubResponse::new(StatusCode::OK, list_body),
+                // stop_container
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // remove_container
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // remove_volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
         let driver = test_driver(socket_path.clone());
 
         let deleted = driver
-            .delete_sandbox(sandbox_id, sandbox_name)
+            .delete_sandbox(sandbox_id)
             .await
             .expect("delete should succeed");
 
@@ -1567,12 +1819,15 @@ mod tests {
             .lock()
             .expect("request log lock should not be poisoned")
             .clone();
+        assert!(requests[0].contains("/libpod/containers/json"));
+        assert!(requests[1].contains(&format!("/libpod/containers/{container_id}/stop")));
+        assert!(requests[2].contains(&format!("/libpod/containers/{container_id}")));
         assert_eq!(
-            requests[3..],
-            [format!(
+            requests[3],
+            format!(
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))
-            )]
+            )
         );
         let _ = fs::remove_file(socket_path);
     }

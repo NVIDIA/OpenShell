@@ -15,15 +15,22 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
         return;
     }
 
-    let header = Row::new(vec![
+    let show_ws = app.all_workspaces;
+
+    let mut header_cells = Vec::new();
+    if show_ws {
+        header_cells.push(Cell::from(Span::styled("WORKSPACE", t.muted)));
+    }
+    header_cells.extend([
         Cell::from(Span::styled("  NAME", t.muted)),
         Cell::from(Span::styled("TYPE", t.muted)),
         Cell::from(Span::styled("CRED KEY", t.muted)),
-    ])
-    .bottom_margin(1);
+    ]);
+    let header = Row::new(header_cells).bottom_margin(1);
 
     let rows: Vec<Row<'_>> = (0..app.provider_count)
         .map(|i| {
+            let workspace = app.provider_workspaces.get(i).map_or("", String::as_str);
             let name = app.provider_names.get(i).map_or("", String::as_str);
             let ptype = app.provider_types.get(i).map_or("", String::as_str);
             let cred_key = app.provider_cred_keys.get(i).map_or("", String::as_str);
@@ -41,19 +48,34 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
                 ]))
             };
 
-            Row::new(vec![
+            let mut cells: Vec<Cell<'_>> = Vec::new();
+            if show_ws {
+                cells.push(Cell::from(Span::styled(workspace, t.muted)));
+            }
+            cells.extend([
                 name_cell,
                 Cell::from(Span::styled(ptype, t.muted)),
                 Cell::from(Span::styled(cred_key, t.muted)),
-            ])
+            ]);
+
+            Row::new(cells)
         })
         .collect();
 
-    let widths = [
-        Constraint::Percentage(40),
-        Constraint::Percentage(25),
-        Constraint::Percentage(35),
-    ];
+    let widths: Vec<Constraint> = if show_ws {
+        vec![
+            Constraint::Percentage(20),
+            Constraint::Percentage(30),
+            Constraint::Percentage(20),
+            Constraint::Percentage(30),
+        ]
+    } else {
+        vec![
+            Constraint::Percentage(40),
+            Constraint::Percentage(25),
+            Constraint::Percentage(35),
+        ]
+    };
 
     let border_style = if focused { t.border_focused } else { t.border };
 
@@ -89,20 +111,27 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
 
 fn draw_v2(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
     let t = &app.theme;
-    let header = Row::new(vec![
+    let show_ws = app.all_workspaces;
+
+    let mut header_cells = Vec::new();
+    if show_ws {
+        header_cells.push(Cell::from(Span::styled("WORKSPACE", t.muted)));
+    }
+    header_cells.extend([
         Cell::from(Span::styled("  NAME", t.muted)),
         Cell::from(Span::styled("PROFILE", t.muted)),
         Cell::from(Span::styled("CATEGORY", t.muted)),
         Cell::from(Span::styled("CREDS", t.muted)),
         Cell::from(Span::styled("POLICY", t.muted)),
-    ])
-    .bottom_margin(1);
+    ]);
+    let header = Row::new(header_cells).bottom_margin(1);
 
     let rows: Vec<Row<'_>> = app
         .provider_entries
         .iter()
         .enumerate()
         .map(|(i, entry)| {
+            let workspace = app.provider_workspaces.get(i).map_or("", String::as_str);
             let selected = focused && i == app.provider_selected;
             let name_cell = if selected {
                 Cell::from(Line::from(vec![
@@ -122,23 +151,40 @@ fn draw_v2(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
                 t.status_warn
             };
 
-            Row::new(vec![
+            let mut cells: Vec<Cell<'_>> = Vec::new();
+            if show_ws {
+                cells.push(Cell::from(Span::styled(workspace, t.muted)));
+            }
+            cells.extend([
                 name_cell,
                 Cell::from(Span::styled(entry.profile_label(), profile_style)),
                 Cell::from(Span::styled(entry.category_label(), t.muted)),
                 Cell::from(Span::styled(entry.credential_summary(), t.muted)),
                 Cell::from(Span::styled(entry.policy_summary(), t.muted)),
-            ])
+            ]);
+
+            Row::new(cells)
         })
         .collect();
 
-    let widths = [
-        Constraint::Percentage(22),
-        Constraint::Percentage(24),
-        Constraint::Percentage(16),
-        Constraint::Percentage(18),
-        Constraint::Percentage(20),
-    ];
+    let widths: Vec<Constraint> = if show_ws {
+        vec![
+            Constraint::Percentage(12),
+            Constraint::Percentage(18),
+            Constraint::Percentage(20),
+            Constraint::Percentage(14),
+            Constraint::Percentage(16),
+            Constraint::Percentage(20),
+        ]
+    } else {
+        vec![
+            Constraint::Percentage(22),
+            Constraint::Percentage(24),
+            Constraint::Percentage(16),
+            Constraint::Percentage(18),
+            Constraint::Percentage(20),
+        ]
+    };
 
     let border_style = if focused { t.border_focused } else { t.border };
     let title = if focused && app.confirm_provider_delete {

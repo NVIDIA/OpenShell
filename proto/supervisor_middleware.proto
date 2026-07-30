@@ -1,0 +1,242 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.middleware.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+
+// SupervisorMiddleware lets an operator-run service inspect and transform
+// sandbox HTTP egress before OpenShell injects credentials.
+service SupervisorMiddleware {
+  // Describe returns the service manifest and declared bindings.
+  rpc Describe(google.protobuf.Empty) returns (MiddlewareManifest);
+
+  // ValidateConfig checks service-specific configuration for one binding.
+  rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
+
+  // EvaluateHttpRequest returns an allow, deny, or mutation decision for one
+  // buffered HTTP request.
+  rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult);
+}
+
+// MiddlewareManifest describes one middleware service and the bindings it
+// exposes. The service is the operator-run gRPC server implementing
+// SupervisorMiddleware.
+message MiddlewareManifest {
+  // Human-readable middleware service name used only for diagnostics. This is
+  // not required to match an operator-owned registration name.
+  string name = 1;
+  // Release version of the middleware service implementation, used for
+  // diagnostics.
+  string service_version = 2;
+  // Bindings exposed by this middleware service.
+  repeated MiddlewareBinding bindings = 3;
+}
+
+// MiddlewareBinding declares one operation and phase supported by a service.
+message MiddlewareBinding {
+  // Supported operation. V1 supports HTTP_REQUEST.
+  SupervisorMiddlewareOperation operation = 1;
+  // Supported evaluation phase. V1 supports PRE_CREDENTIALS.
+  SupervisorMiddlewarePhase phase = 2;
+  // Maximum request or replacement body this binding can process.
+  uint64 max_body_bytes = 3;
+  // Optional binding-specific RPC timeout. Empty uses the operator-configured
+  // service timeout, or the 500ms platform default when that is also omitted.
+  // A non-empty value may shorten but cannot extend the operator timeout.
+  // Values use an integer with an `ms` or `s` suffix and must be between
+  // 10ms and 30s.
+  string timeout = 4;
+}
+
+// ValidateConfigRequest contains one policy configuration to validate.
+message ValidateConfigRequest {
+  // Service-specific policy configuration.
+  google.protobuf.Struct config = 1;
+  // Built-in middleware name or operator-owned registration name.
+  string middleware_name = 2;
+}
+
+// ValidateConfigResponse reports whether a policy configuration is accepted.
+message ValidateConfigResponse {
+  // True when the service accepts the configuration.
+  bool valid = 1;
+  // Human-readable validation failure reason. Empty when valid is true.
+  string reason = 2;
+}
+
+// HttpRequestEvaluation contains one buffered HTTP request to evaluate.
+message HttpRequestEvaluation {
+  // Evaluation phase selected for this request.
+  SupervisorMiddlewarePhase phase = 1;
+  // Sandbox and request identity available to the supervisor.
+  // The encoded context is limited to 4 KiB.
+  RequestContext context = 2;
+  // Validated service-specific policy configuration.
+  // The encoded configuration is limited to 64 KiB.
+  google.protobuf.Struct config = 3;
+  // Destination and HTTP request target.
+  // The encoded target is limited to 32 KiB.
+  HttpRequestTarget target = 4;
+  // HTTP request headers before OpenShell injects credentials, in wire
+  // order. Repeated header names are preserved as separate entries. Protected
+  // credential, routing, framing, and hop-by-hop headers are omitted.
+  // At most 128 lines and 64 KiB of encoded headers are included.
+  repeated HttpHeader headers = 5;
+  // Buffered request body, limited to 4 MiB. Empty for a bodyless request.
+  bytes body = 6;
+  // Built-in middleware name or operator-owned registration name.
+  string middleware_name = 7;
+}
+
+// HttpHeader is one request header line.
+message HttpHeader {
+  // Lowercased header name.
+  string name = 1;
+  // Header value with surrounding whitespace trimmed.
+  string value = 2;
+}
+
+// Supervisor operation selected for middleware evaluation.
+enum SupervisorMiddlewareOperation {
+  SUPERVISOR_MIDDLEWARE_OPERATION_UNSPECIFIED = 0;
+  SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST = 1;
+}
+
+// Ordered phase within a supervisor operation.
+enum SupervisorMiddlewarePhase {
+  SUPERVISOR_MIDDLEWARE_PHASE_UNSPECIFIED = 0;
+  SUPERVISOR_MIDDLEWARE_PHASE_PRE_CREDENTIALS = 1;
+}
+
+// RequestContext identifies the sandbox request being evaluated.
+message RequestContext {
+  // Request id used to correlate middleware and supervisor logs.
+  string request_id = 1;
+  // Sandbox id that originated the request.
+  string sandbox_id = 2;
+  // Workload process that originated the request, when available.
+  Process originating_process = 3;
+}
+
+// HttpRequestTarget describes the admitted HTTP destination and request target.
+message HttpRequestTarget {
+  // Request scheme, such as "http" or "https".
+  string scheme = 1;
+  // Destination hostname selected by network policy.
+  string host = 2;
+  // Destination TCP port.
+  uint32 port = 3;
+  // HTTP request method.
+  string method = 4;
+  // Request path without the query string.
+  string path = 5;
+  // Raw request query string without the leading question mark.
+  string query = 6;
+}
+
+// Process identifies a workload process and its executable ancestry.
+message Process {
+  // Executable path for the originating process.
+  string binary = 1;
+  // Process id within the sandbox.
+  uint32 pid = 2;
+  // Executable paths for ancestor processes, nearest parent first.
+  repeated string ancestors = 3;
+}
+
+// Decision controls whether OpenShell continues processing the request.
+enum Decision {
+  // Invalid response value handled according to the policy failure mode.
+  DECISION_UNSPECIFIED = 0;
+  // Continue processing the request and apply any returned mutations.
+  DECISION_ALLOW = 1;
+  // Deny the request before credentials are injected or data is sent upstream.
+  DECISION_DENY = 2;
+}
+
+// Finding is an audit-safe observation produced during evaluation.
+message Finding {
+  // Stable, service-defined finding type.
+  string type = 1;
+  // Human-readable finding label that does not contain request content.
+  string label = 2;
+  // Number of matching observations represented by this finding.
+  uint32 count = 3;
+  // Service-defined confidence level.
+  string confidence = 4;
+  // Service-defined severity level.
+  string severity = 5;
+}
+
+// ExistingHeaderAction controls how a header write behaves when the
+// case-insensitive header name is already present. Every action writes the
+// value when the header is absent.
+enum ExistingHeaderAction {
+  EXISTING_HEADER_ACTION_UNSPECIFIED = 0;
+  // Add another field value without changing existing values.
+  EXISTING_HEADER_ACTION_APPEND = 1;
+  // Remove every existing value, then add the new value.
+  EXISTING_HEADER_ACTION_OVERWRITE = 2;
+  // Leave the existing values unchanged.
+  EXISTING_HEADER_ACTION_SKIP = 3;
+}
+
+// WriteHeader proposes one header value and defines collision behavior.
+message WriteHeader {
+  string name = 1;
+  string value = 2;
+  ExistingHeaderAction on_existing = 3;
+}
+
+// RemoveHeader removes every value for a case-insensitive header name.
+message RemoveHeader {
+  string name = 1;
+}
+
+// HeaderMutation is one ordered request-header operation.
+message HeaderMutation {
+  oneof operation {
+    WriteHeader write = 1;
+    RemoveHeader remove = 2;
+  }
+}
+
+// HttpRequestResult contains the decision and optional request mutations.
+message HttpRequestResult {
+  // Allow or deny decision for this request.
+  Decision decision = 1;
+  // Free-form service diagnostic. OpenShell does not relay this text into
+  // denied responses or security logs. Limited to 4 KiB before discarding.
+  string reason = 2;
+  // Replacement request body when has_body is true. Limited to 4 MiB.
+  bytes body = 3;
+  // True when body should replace the request body, including with an empty body.
+  bool has_body = 4;
+  // Ordered request-header mutations applied before the next middleware and
+  // before forwarding. Header writes are restricted to the
+  // "x-openshell-middleware-" namespace. Removes may target other visible
+  // request headers, but credential, routing, framing, and hop-by-hop headers
+  // are always protected. A violating result is a middleware failure handled
+  // according to the policy failure mode. At most 64 operations, 32 KiB of
+  // validated name/value data, and 64 KiB encoded are accepted.
+  repeated HeaderMutation header_mutations = 5;
+  // Audit-safe findings produced during evaluation. For operator-run services,
+  // OpenShell logs platform-owned fields derived from the operator-owned
+  // registration name rather than service-provided type, label, confidence,
+  // or metadata text.
+  // At most 32 findings of at most 4 KiB encoded each are accepted per stage.
+  // A policy selects at most 10 stages, so one chain retains at most 320.
+  repeated Finding findings = 6;
+  // Non-secret service-defined metadata included in diagnostics. At most 64
+  // entries and 32 KiB of combined key/value data are accepted.
+  map<string, string> metadata = 7;
+  // Optional stable machine-readable code for a deny decision. Codes must
+  // start with a lowercase ASCII letter and contain only lowercase ASCII
+  // letters, digits, and underscores, with a maximum length of 64 bytes.
+  // OpenShell may return this code to the requester, unlike free-form reason.
+  string reason_code = 8;
+}

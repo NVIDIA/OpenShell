@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import time
 from typing import TYPE_CHECKING
@@ -10,10 +11,42 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from openshell import InferenceRouteClient, Sandbox, SandboxClient
+from openshell import InferenceRouteClient, Sandbox, SandboxClient, WorkspaceClient
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "exclusive_gateway_config: hold an exclusive lock on gateway-global "
+        "config so no other xdist worker observes a transient global setting",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _gateway_config_guard(
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[None]:
+    """Readers-writer guard over gateway-global config mutations.
+
+    The e2e gateway is shared across xdist workers, so a test that flips a
+    gateway-global setting can leak that transient value into another worker's
+    sandbox creation. Every test holds a shared lock by default; a test marked
+    ``exclusive_gateway_config`` holds an exclusive lock, so while it mutates and
+    restores the setting no other worker is mid-test and none can observe the
+    transient value. The lock file lives in the run's shared base temp dir
+    (``getbasetemp().parent``), which is common to all xdist workers.
+    """
+    lock_path = tmp_path_factory.getbasetemp().parent / "gateway-config.lock"
+    exclusive = (
+        request.node.get_closest_marker("exclusive_gateway_config") is not None
+    )
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
 
 
 @pytest.fixture(scope="session")
@@ -31,7 +64,7 @@ def sandbox_client(cluster_name: str | None) -> Iterator[SandboxClient]:
 def ensure_sandbox_persistence_ready(sandbox_client: SandboxClient) -> None:
     for _ in range(60):
         try:
-            sandbox_client.list_ids(limit=1)
+            sandbox_client.list_ids(workspace="default", limit=1)
             return
         except grpc.RpcError as exc:
             details = exc.details() or ""
@@ -56,6 +89,7 @@ def ensure_sandbox_persistence_ready(sandbox_client: SandboxClient) -> None:
 def sandbox(cluster_name: str | None) -> Callable[..., Sandbox]:
     def _create(*, spec: object | None = None, delete_on_exit: bool = True) -> Sandbox:
         return Sandbox(
+            workspace="default",
             cluster=cluster_name,
             spec=spec,
             delete_on_exit=delete_on_exit,
@@ -70,6 +104,11 @@ def sandbox(cluster_name: str | None) -> Callable[..., Sandbox]:
 @pytest.fixture(scope="session")
 def inference_client(sandbox_client: SandboxClient) -> InferenceRouteClient:
     return InferenceRouteClient.from_sandbox_client(sandbox_client)
+
+
+@pytest.fixture(scope="session")
+def workspace_client(sandbox_client: SandboxClient) -> WorkspaceClient:
+    return WorkspaceClient.from_sandbox_client(sandbox_client)
 
 
 @pytest.fixture(scope="session")

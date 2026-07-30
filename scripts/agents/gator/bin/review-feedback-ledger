@@ -1,0 +1,456 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  review-feedback-ledger OWNER REPO PR_NUMBER
+  review-feedback-ledger --input RAW_LEDGER_INPUT.json
+EOF
+}
+
+collect_live_input() {
+    [[ "$#" -eq 3 ]] || {
+        usage
+        return 2
+    }
+
+    local owner="$1"
+    local repo="$2"
+    local pr_number="$3"
+    [[ "$owner" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+        echo "invalid repository owner" >&2
+        return 2
+    }
+    [[ "$repo" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+        echo "invalid repository name" >&2
+        return 2
+    }
+    [[ "$pr_number" =~ ^[0-9]+$ ]] || {
+        echo "invalid PR number" >&2
+        return 2
+    }
+
+    local tmp cleanup_cmd
+    tmp="$(mktemp -d)"
+    printf -v cleanup_cmd 'rm -rf -- %q' "$tmp"
+    trap "$cleanup_cmd" RETURN
+
+    gh api graphql --paginate \
+        -f owner="$owner" \
+        -f repo="$repo" \
+        -F number="$pr_number" \
+        -f query='
+query(
+  $owner: String!
+  $repo: String!
+  $number: Int!
+  $endCursor: String
+) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      author {
+        login
+      }
+      headRefOid
+      baseRefOid
+      reviewThreads(first: 100, after: $endCursor) {
+        nodes {
+          id
+          isResolved
+          isOutdated
+          path
+          line
+          resolvedBy {
+            login
+          }
+          comments(first: 100) {
+            nodes {
+              databaseId
+              author {
+                login
+              }
+              authorAssociation
+              body
+              createdAt
+              updatedAt
+              url
+              commit {
+                oid
+              }
+              pullRequestReview {
+                id
+              }
+              replyTo {
+                databaseId
+              }
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+}' > "$tmp/thread-pages.json"
+
+    gh api "repos/$owner/$repo/pulls/$pr_number/reviews?per_page=100" \
+        --paginate > "$tmp/review-pages.json"
+    gh api "repos/$owner/$repo/issues/$pr_number/comments?per_page=100" \
+        --paginate > "$tmp/issue-comment-pages.json"
+
+    local head_sha base_sha merge_base_sha patch_id
+    head_sha="$(jq -r \
+        '.data.repository.pullRequest.headRefOid // empty' \
+        "$tmp/thread-pages.json" | head -n 1)"
+    base_sha="$(jq -r \
+        '.data.repository.pullRequest.baseRefOid // empty' \
+        "$tmp/thread-pages.json" | head -n 1)"
+    [[ -n "$head_sha" && -n "$base_sha" ]] || {
+        echo "pull request tree identity missing from GitHub response" >&2
+        return 1
+    }
+    merge_base_sha="$(gh api \
+        "repos/$owner/$repo/compare/$base_sha...$head_sha" \
+        --jq '.merge_base_commit.sha')"
+    patch_id="$(
+        gh api \
+            -H 'Accept: application/vnd.github.v3.diff' \
+            "repos/$owner/$repo/pulls/$pr_number" |
+            git patch-id --stable |
+            awk 'NR == 1 { print $1 }'
+    )"
+
+    jq -n \
+        --arg head_sha "$head_sha" \
+        --arg base_sha "$base_sha" \
+        --arg merge_base_sha "$merge_base_sha" \
+        --arg patch_id "$patch_id" \
+        '{
+            head_sha: $head_sha,
+            base_sha: $base_sha,
+            merge_base_sha: $merge_base_sha,
+            patch_id: (if $patch_id == "" then null else $patch_id end)
+        }' > "$tmp/current-tree.json"
+
+    jq -n \
+        --slurpfile thread_pages "$tmp/thread-pages.json" \
+        --slurpfile review_pages "$tmp/review-pages.json" \
+        --slurpfile issue_comment_pages "$tmp/issue-comment-pages.json" \
+        --slurpfile current_tree "$tmp/current-tree.json" \
+        '{
+            thread_pages: $thread_pages,
+            review_pages: $review_pages,
+            issue_comment_pages: $issue_comment_pages,
+            current_tree: $current_tree[0]
+        }'
+}
+
+read_input() {
+    if [[ "${1:-}" == "--input" ]]; then
+        [[ "$#" -eq 2 && -r "$2" ]] || {
+            usage
+            return 2
+        }
+        cat "$2"
+        return
+    fi
+
+    collect_live_input "$@"
+}
+
+read_input "$@" | jq '
+    def thread_pull_request:
+        .data.repository.pullRequest;
+    def is_gator_body:
+        startswith("> **gator-agent**");
+    def explicit_finding_ids:
+        [scan("GATOR-[0-9A-Fa-f]{8}-[0-9]{2}")] | unique;
+    def marked_head_sha:
+        ([capture("Head SHA: `?(?<sha>[0-9A-Fa-f]{40})`?").sha][0] // null);
+    def marked_sha($field):
+        ([capture($field + ": `?(?<sha>[0-9A-Fa-f]{40})`?").sha][0] // null);
+    def marked_patch_id:
+        ([capture("Patch ID: `?(?<id>[0-9A-Fa-f]{40})`?").id][0] // null);
+    def marked_payload_version:
+        ([capture("Gator payload: `?(?<version>[0-9]+)`?").version | tonumber][0] // null);
+    def is_code_review_body:
+        contains("## PR Review Status") or contains("## Re-check After");
+
+    if has("thread_pages") then
+        .
+    else
+        {
+            thread_pages: [.],
+            review_pages: [],
+            issue_comment_pages: [],
+            current_tree: null
+        }
+    end
+    | {
+        schema_version: 3,
+        pr_author: ([.thread_pages[] | thread_pull_request.author.login][0] // null),
+        current_head_sha: (
+            [.thread_pages[] | thread_pull_request.headRefOid]
+            | map(select(. != null))
+            | .[0] // null
+        ),
+        current_base_sha: (
+            .current_tree.base_sha //
+            ([.thread_pages[] | thread_pull_request.baseRefOid]
+             | map(select(. != null))
+             | .[0] // null)
+        ),
+        current_merge_base_sha: (.current_tree.merge_base_sha // null),
+        current_patch_id: (.current_tree.patch_id // null),
+        reviews: (
+            [
+                .review_pages[]?[]?
+                | select((.body // "") | is_gator_body)
+                | {
+                    disposition_id: ("review:" + (.id | tostring)),
+                    review_id: (.id | tostring),
+                    kind: "review",
+                    is_code_review: ((.body // "") | is_code_review_body),
+                    head_sha: (.commit_id // null),
+                    base_sha: ((.body // "") | marked_sha("Base SHA")),
+                    merge_base_sha: ((.body // "") | marked_sha("Merge base SHA")),
+                    patch_id: ((.body // "") | marked_patch_id),
+                    payload_version: ((.body // "") | marked_payload_version),
+                    author: (.user.login // null),
+                    author_association: (.author_association // null),
+                    state: (.state // null),
+                    submitted_at: (.submitted_at // null),
+                    summary_body: (.body // ""),
+                    finding_ids: ((.body // "") | explicit_finding_ids)
+                }
+            ]
+            | unique_by(.disposition_id)
+            | sort_by(.submitted_at)
+        ),
+        issue_comments: (
+            [
+                .issue_comment_pages[]?[]?
+                | select((.body // "") | is_gator_body)
+                | {
+                    disposition_id: ("issue-comment:" + (.id | tostring)),
+                    comment_id: (.id | tostring),
+                    kind: "issue_comment",
+                    is_code_review: ((.body // "") | is_code_review_body),
+                    head_sha: ((.body // "") | marked_head_sha),
+                    base_sha: ((.body // "") | marked_sha("Base SHA")),
+                    merge_base_sha: ((.body // "") | marked_sha("Merge base SHA")),
+                    patch_id: ((.body // "") | marked_patch_id),
+                    payload_version: ((.body // "") | marked_payload_version),
+                    author: (.user.login // null),
+                    author_association: (.author_association // null),
+                    submitted_at: (.created_at // null),
+                    updated_at: (.updated_at // null),
+                    url: (.html_url // null),
+                    summary_body: (.body // ""),
+                    finding_ids: ((.body // "") | explicit_finding_ids)
+                }
+            ]
+            | unique_by(.disposition_id)
+            | sort_by(.submitted_at)
+        ),
+        threads: (
+            [
+                .thread_pages[]
+                | thread_pull_request.reviewThreads.nodes[]?
+                | select((.comments.nodes | length) > 0)
+                | select((.comments.nodes[0].body // "") | is_gator_body)
+                | {
+                    thread_id: .id,
+                    finding_id: (
+                        ((.comments.nodes[0].body // "") | explicit_finding_ids | .[0])
+                        // ("gator-inline-" + (.comments.nodes[0].databaseId | tostring))
+                    ),
+                    is_resolved: .isResolved,
+                    is_outdated: .isOutdated,
+                    path,
+                    line,
+                    resolved_by: (.resolvedBy.login // null),
+                    origin_review_id: (
+                        .comments.nodes[0].pullRequestReview.id // null
+                    ),
+                    comments: [
+                        .comments.nodes[]
+                        | {
+                            id: .databaseId,
+                            author: (.author.login // null),
+                            author_association: .authorAssociation,
+                            body,
+                            finding_ids: ((.body // "") | explicit_finding_ids),
+                            created_at: .createdAt,
+                            updated_at: .updatedAt,
+                            url,
+                            commit_oid: (.commit.oid // null),
+                            review_id: (.pullRequestReview.id // null),
+                            reply_to: (.replyTo.databaseId // null)
+                        }
+                    ]
+                }
+            ]
+            | unique_by(.thread_id)
+        )
+    }
+    | .dispositions = (
+        [.reviews[], .issue_comments[]]
+        | sort_by(.submitted_at)
+    )
+    | .last_reviewed_sha = (
+        [
+            .dispositions[]
+            | select(.is_code_review)
+            | .head_sha
+            | select(. != null)
+        ]
+        | last // null
+    )
+    | .last_reviewed_disposition = (
+        [.dispositions[] | select(.is_code_review and .head_sha != null)]
+        | last // null
+    )
+    | .last_reviewed_patch_id = (.last_reviewed_disposition.patch_id // null)
+    | .review_rounds = (
+        [.dispositions[] | select(.is_code_review and .head_sha != null)]
+        | unique_by(.head_sha)
+        | length
+    )
+    | .finding_bearing_head_shas = (
+        [
+            . as $ledger
+            | .dispositions[]
+            | . as $disposition
+            | select(
+                .is_code_review and
+                .head_sha != null and
+                (
+                    (.finding_ids | length) > 0 or
+                    (
+                        .summary_body
+                        | test(
+                            "(?i)(blocking findings|\\*\\*(critical|warning))"
+                        )
+                    ) or
+                    any(
+                        $ledger.threads[];
+                        any(
+                            .comments[];
+                            .commit_oid == $disposition.head_sha
+                        )
+                    )
+                )
+            )
+        ]
+        | unique_by(.head_sha)
+        | map(.head_sha)
+    )
+    | .finding_bearing_rounds = (.finding_bearing_head_shas | length)
+    | .all_finding_ids = (
+        [.dispositions[].finding_ids[], .threads[].finding_id]
+        | map(select(. != null))
+    )
+    | .finding_events = (
+        [
+            .dispositions[] as $disposition
+            | $disposition.finding_ids[]
+            | {
+                finding_id: .,
+                head_sha: $disposition.head_sha,
+                submitted_at: $disposition.submitted_at
+            }
+        ]
+    )
+    | .finding_history = (
+        [
+            .all_finding_ids[] as $finding_id
+            | {
+                finding_id: $finding_id,
+                first_seen_head_sha: (
+                    [.finding_events[]
+                     | select(.finding_id == $finding_id)
+                     | .head_sha]
+                    | map(select(. != null))
+                    | .[0] // null
+                ),
+                review_heads: (
+                    [.finding_events[]
+                     | select(.finding_id == $finding_id)
+                     | .head_sha]
+                    | map(select(. != null))
+                    | unique
+                )
+            }
+        ]
+        | unique_by(.finding_id)
+    )
+    | .review_telemetry = {
+        review_rounds: .review_rounds,
+        finding_bearing_rounds: .finding_bearing_rounds,
+        unique_findings: (.all_finding_ids | unique | length),
+        duplicate_finding_id_occurrences: (
+            (.all_finding_ids | length) - (.all_finding_ids | unique | length)
+        ),
+        findings_repeated_across_review_heads: (
+            [.finding_history[] | select((.review_heads | length) > 1)]
+            | length
+        ),
+        rounds_to_convergence: (
+            (.last_reviewed_disposition.head_sha) as $last_head
+            | if (
+                .review_rounds > 0 and
+                (.finding_bearing_head_shas | index($last_head)) == null
+              ) then .review_rounds
+              else null
+              end
+        ),
+        convergence_checkpoint_required: (.finding_bearing_rounds >= 3),
+        current_patch_matches_last_review: (
+            .current_patch_id != null and
+            .last_reviewed_patch_id != null and
+            .current_patch_id == .last_reviewed_patch_id
+        )
+    }
+    | .review_scope = {
+        mode: (
+            if .last_reviewed_sha == null then
+                "initial"
+            elif (
+                .last_reviewed_sha == .current_head_sha or
+                .review_telemetry.current_patch_matches_last_review
+            ) then
+                "already_reviewed"
+            elif .review_telemetry.convergence_checkpoint_required then
+                "human_checkpoint"
+            else
+                "follow_up"
+            end
+        ),
+        previous_reviewed_sha: .last_reviewed_sha,
+        previous_reviewed_patch_id: .last_reviewed_patch_id,
+        current_head_sha: .current_head_sha,
+        current_base_sha: .current_base_sha,
+        current_merge_base_sha: .current_merge_base_sha,
+        current_patch_id: .current_patch_id,
+        rebase_equivalent: .review_telemetry.current_patch_matches_last_review,
+        convergence_checkpoint_required:
+            .review_telemetry.convergence_checkpoint_required
+    }
+    | if .pr_author == null then
+        error("pull request not found in ledger input")
+      elif .current_head_sha == null then
+        error("pull request head SHA missing from ledger input")
+      elif .current_base_sha == null then
+        error("pull request base SHA missing from ledger input")
+      else
+        .
+      end
+'

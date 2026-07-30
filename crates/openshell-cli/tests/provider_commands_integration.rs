@@ -98,6 +98,13 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn get_current_user(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
+    ) -> Result<Response<openshell_core::proto::GetCurrentUserResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn health(
         &self,
         _request: tonic::Request<HealthRequest>,
@@ -106,6 +113,13 @@ impl OpenShell for TestOpenShell {
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
         }))
+    }
+
+    async fn get_gateway_info(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
+    ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn create_sandbox(
@@ -129,6 +143,9 @@ impl OpenShell for TestOpenShell {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 1,
+                    annotations: HashMap::new(),
+                    workspace: String::new(),
+                    deletion_timestamp_ms: 0,
                 }),
                 spec: None,
                 status: None,
@@ -343,21 +360,23 @@ impl OpenShell for TestOpenShell {
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
         if provider.credentials.is_empty() {
-            let bootstrap_allowed =
-                if let Some(profile) = openshell_providers::get_default_profile(&provider.r#type) {
-                    profile.allows_empty_provider_credentials()
-                } else {
-                    self.state
-                        .profiles
-                        .lock()
-                        .await
-                        .get(&provider.r#type)
-                        .cloned()
-                        .is_some_and(|profile| {
-                            openshell_providers::ProviderTypeProfile::from_proto(&profile)
-                                .allows_empty_provider_credentials()
-                        })
-                };
+            let bootstrap_allowed = if let Some(profile) = openshell_providers::builtin_profiles()
+                .iter()
+                .find(|profile| profile.id == provider.r#type)
+            {
+                profile.allows_empty_provider_credentials()
+            } else {
+                self.state
+                    .profiles
+                    .lock()
+                    .await
+                    .get(&provider.r#type)
+                    .cloned()
+                    .is_some_and(|profile| {
+                        openshell_providers::ProviderTypeProfile::from_proto(&profile)
+                            .allows_empty_provider_credentials()
+                    })
+            };
             if !bootstrap_allowed {
                 return Err(Status::invalid_argument(
                     "provider.credentials must not be empty",
@@ -414,7 +433,7 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
-        let mut profiles = openshell_providers::default_profiles()
+        let mut profiles = openshell_providers::builtin_profiles()
             .iter()
             .map(openshell_providers::ProviderTypeProfile::to_proto)
             .collect::<Vec<_>>();
@@ -429,7 +448,10 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
     ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
         let id = request.into_inner().id;
-        let profile = if let Some(profile) = openshell_providers::get_default_profile(&id) {
+        let profile = if let Some(profile) = openshell_providers::builtin_profiles()
+            .iter()
+            .find(|profile| profile.id == id)
+        {
             profile.to_proto()
         } else {
             self.state
@@ -604,6 +626,9 @@ impl OpenShell for TestOpenShell {
                 created_at_ms: existing_metadata.created_at_ms,
                 labels: existing_metadata.labels,
                 resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: String::new(),
+                deletion_timestamp_ms: 0,
             }),
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
@@ -612,6 +637,7 @@ impl OpenShell for TestOpenShell {
                 existing.credential_expires_at_ms,
                 provider.credential_expires_at_ms,
             ),
+            profile_workspace: existing.profile_workspace,
         };
         let updated_name = updated.object_name().to_string();
         providers.insert(updated_name, updated.clone());
@@ -982,6 +1008,55 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::ForwardTcpStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
+
+    async fn create_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::CreateWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::GetWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspaces(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspacesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspacesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn add_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::AddWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::AddWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn remove_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RemoveWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::RemoveWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspace_members(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspaceMembersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspaceMembersResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 }
 
 /// Test fixture: TLS-enabled server with matching client certs.
@@ -1063,17 +1138,27 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         &["API_KEY=abc".to_string()],
         false,
         &["profile=dev".to_string()],
+        "default",
         &ts.tls,
     )
     .await
     .expect("provider create");
 
-    run::provider_get(&ts.endpoint, "my-claude", &ts.tls)
+    run::provider_get(&ts.endpoint, "my-claude", "default", &ts.tls)
         .await
         .expect("provider get");
-    run::provider_list(&ts.endpoint, 100, 0, false, "table", &ts.tls)
-        .await
-        .expect("provider list");
+    run::provider_list(
+        &ts.endpoint,
+        100,
+        0,
+        false,
+        "table",
+        "default",
+        false,
+        &ts.tls,
+    )
+    .await
+    .expect("provider list");
 
     run::provider_update(
         &ts.endpoint,
@@ -1082,12 +1167,13 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         &["API_KEY=rotated".to_string()],
         &["profile=prod".to_string()],
         &[],
+        "default",
         &ts.tls,
     )
     .await
     .expect("provider update");
 
-    run::provider_delete(&ts.endpoint, &["my-claude".to_string()], &ts.tls)
+    run::provider_delete(&ts.endpoint, &["my-claude".to_string()], "default", &ts.tls)
         .await
         .expect("provider delete");
 }
@@ -1096,7 +1182,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
 async fn provider_list_profiles_cli_uses_profile_browsing_rpc() {
     let ts = run_server().await;
 
-    run::provider_list_profiles(&ts.endpoint, "table", &ts.tls)
+    run::provider_list_profiles(&ts.endpoint, "table", "default", &ts.tls)
         .await
         .expect("provider list-profiles");
 }
@@ -1114,19 +1200,34 @@ async fn provider_list_json_output() {
         &["ANTHROPIC_API_KEY=test-key".to_string()],
         false,
         &["region=us-west".to_string()],
+        "default",
         &ts.tls,
     )
     .await
     .expect("provider create");
 
     // Test JSON output (verifies it doesn't error)
-    run::provider_list(&ts.endpoint, 100, 0, false, "json", &ts.tls)
-        .await
-        .expect("provider list json should succeed");
+    run::provider_list(
+        &ts.endpoint,
+        100,
+        0,
+        false,
+        "json",
+        "default",
+        false,
+        &ts.tls,
+    )
+    .await
+    .expect("provider list json should succeed");
 
-    run::provider_delete(&ts.endpoint, &["test-provider".to_string()], &ts.tls)
-        .await
-        .expect("provider delete");
+    run::provider_delete(
+        &ts.endpoint,
+        &["test-provider".to_string()],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("provider delete");
 }
 
 #[tokio::test]
@@ -1142,19 +1243,34 @@ async fn provider_list_yaml_output() {
         &["ANTHROPIC_API_KEY=test-key".to_string()],
         false,
         &["region=us-west".to_string()],
+        "default",
         &ts.tls,
     )
     .await
     .expect("provider create");
 
     // Test YAML output (verifies it doesn't error)
-    run::provider_list(&ts.endpoint, 100, 0, false, "yaml", &ts.tls)
-        .await
-        .expect("provider list yaml should succeed");
+    run::provider_list(
+        &ts.endpoint,
+        100,
+        0,
+        false,
+        "yaml",
+        "default",
+        false,
+        &ts.tls,
+    )
+    .await
+    .expect("provider list yaml should succeed");
 
-    run::provider_delete(&ts.endpoint, &["test-provider".to_string()], &ts.tls)
-        .await
-        .expect("provider delete");
+    run::provider_delete(
+        &ts.endpoint,
+        &["test-provider".to_string()],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("provider delete");
 }
 
 #[tokio::test]
@@ -1162,9 +1278,18 @@ async fn provider_list_json_empty() {
     let ts = run_server().await;
 
     // Test JSON output with no providers (verifies it doesn't error on empty list)
-    run::provider_list(&ts.endpoint, 100, 0, false, "json", &ts.tls)
-        .await
-        .expect("provider list json empty should succeed");
+    run::provider_list(
+        &ts.endpoint,
+        100,
+        0,
+        false,
+        "json",
+        "default",
+        false,
+        &ts.tls,
+    )
+    .await
+    .expect("provider list json empty should succeed");
 }
 
 #[tokio::test]
@@ -1179,6 +1304,7 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
         &["MS_GRAPH_ACCESS_TOKEN=token".to_string()],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -1195,6 +1321,7 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
             secret_material_keys: &["client_secret".to_string()],
             credential_expires_at_ms: Some(1_767_225_600_000),
         },
+        "default",
         &ts.tls,
     )
     .await
@@ -1203,16 +1330,29 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
         &ts.endpoint,
         "my-graph",
         Some("MS_GRAPH_ACCESS_TOKEN"),
+        "default",
         &ts.tls,
     )
     .await
     .expect("provider refresh status");
-    run::provider_rotate(&ts.endpoint, "my-graph", "MS_GRAPH_ACCESS_TOKEN", &ts.tls)
-        .await
-        .expect("provider refresh rotate");
-    run::provider_refresh_delete(&ts.endpoint, "my-graph", "MS_GRAPH_ACCESS_TOKEN", &ts.tls)
-        .await
-        .expect("provider refresh delete");
+    run::provider_rotate(
+        &ts.endpoint,
+        "my-graph",
+        "MS_GRAPH_ACCESS_TOKEN",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("provider refresh rotate");
+    run::provider_refresh_delete(
+        &ts.endpoint,
+        "my-graph",
+        "MS_GRAPH_ACCESS_TOKEN",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("provider refresh delete");
 
     let requests = ts.state.refresh_requests.lock().await.clone();
     assert_eq!(
@@ -1253,6 +1393,7 @@ async fn provider_refresh_configure_reads_secret_material_from_env_off_argv() {
         &["GOOGLE_CHAT_ACCESS_TOKEN=pending".to_string()],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -1271,6 +1412,7 @@ async fn provider_refresh_configure_reads_secret_material_from_env_off_argv() {
             secret_material_keys: &[],
             credential_expires_at_ms: None,
         },
+        "default",
         &ts.tls,
     )
     .await
@@ -1312,6 +1454,7 @@ async fn provider_refresh_configure_rejects_key_supplied_via_both_material_and_e
             secret_material_keys: &[],
             credential_expires_at_ms: None,
         },
+        "default",
         &ts.tls,
     )
     .await
@@ -1341,6 +1484,7 @@ async fn provider_refresh_configure_fails_closed_when_secret_material_env_is_uns
             secret_material_keys: &[],
             credential_expires_at_ms: None,
         },
+        "default",
         &ts.tls,
     )
     .await
@@ -1383,6 +1527,8 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
         false,
         true,
         &[],
+        "default",
+        "default",
         &ts.tls,
     )
     .await
@@ -1423,6 +1569,7 @@ async fn provider_create_requires_runtime_credentials_for_empty_gateway_refresh_
         &[],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -1450,26 +1597,51 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
         &["GITHUB_TOKEN=ghp-test".to_string()],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
     .expect("provider create");
 
-    run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
-        .await
-        .expect("sandbox provider attach");
-    run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
-        .await
-        .expect("sandbox provider attach is idempotent");
-    run::sandbox_provider_list(&ts.endpoint, "dev-sandbox", &ts.tls)
+    run::sandbox_provider_attach(
+        &ts.endpoint,
+        "dev-sandbox",
+        "work-github",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox provider attach");
+    run::sandbox_provider_attach(
+        &ts.endpoint,
+        "dev-sandbox",
+        "work-github",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox provider attach is idempotent");
+    run::sandbox_provider_list(&ts.endpoint, "dev-sandbox", "default", &ts.tls)
         .await
         .expect("sandbox provider list");
-    run::sandbox_provider_detach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
-        .await
-        .expect("sandbox provider detach");
-    run::sandbox_provider_detach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
-        .await
-        .expect("sandbox provider detach is idempotent");
+    run::sandbox_provider_detach(
+        &ts.endpoint,
+        "dev-sandbox",
+        "work-github",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox provider detach");
+    run::sandbox_provider_detach(
+        &ts.endpoint,
+        "dev-sandbox",
+        "work-github",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox provider detach is idempotent");
 
     let requests = ts.state.sandbox_provider_requests.lock().await.clone();
     assert_eq!(
@@ -1505,10 +1677,15 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
 async fn sandbox_provider_attach_cli_surfaces_server_errors() {
     let ts = run_server().await;
 
-    let err =
-        run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "missing-provider", &ts.tls)
-            .await
-            .expect_err("missing provider should fail");
+    let err = run::sandbox_provider_attach(
+        &ts.endpoint,
+        "dev-sandbox",
+        "missing-provider",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect_err("missing provider should fail");
 
     assert!(
         err.to_string().contains("provider not found"),
@@ -1549,14 +1726,14 @@ binaries: [/usr/bin/custom]
     )
     .unwrap();
 
-    run::provider_profile_lint(&ts.endpoint, Some(&profile_path), None, &ts.tls)
+    run::provider_profile_lint(&ts.endpoint, Some(&profile_path), None, "default", &ts.tls)
         .await
         .expect("profile lint");
-    run::provider_profile_import(&ts.endpoint, Some(&profile_path), None, &ts.tls)
+    run::provider_profile_import(&ts.endpoint, Some(&profile_path), None, "default", &ts.tls)
         .await
         .expect("profile import");
     let exported_yaml =
-        run::provider_profile_export_text(&ts.endpoint, "custom-api", "yaml", &ts.tls)
+        run::provider_profile_export_text(&ts.endpoint, "custom-api", "yaml", "default", &ts.tls)
             .await
             .expect("profile export text");
     assert!(exported_yaml.contains("resource_version: 1"));
@@ -1567,9 +1744,15 @@ binaries: [/usr/bin/custom]
         )
         .replace("host: api.custom.example", "host: api.updated.example");
     std::fs::write(&profile_path, updated_yaml).unwrap();
-    run::provider_profile_update(&ts.endpoint, "custom-api", &profile_path, &ts.tls)
-        .await
-        .expect("profile update");
+    run::provider_profile_update(
+        &ts.endpoint,
+        "custom-api",
+        &profile_path,
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("profile update");
     assert_eq!(
         ts.state
             .profiles
@@ -1580,10 +1763,10 @@ binaries: [/usr/bin/custom]
             .map(|endpoint| endpoint.host.as_str()),
         Some("api.updated.example")
     );
-    run::provider_profile_export(&ts.endpoint, "custom-api", "yaml", &ts.tls)
+    run::provider_profile_export(&ts.endpoint, "custom-api", "yaml", "default", &ts.tls)
         .await
         .expect("profile export");
-    run::provider_list_profiles(&ts.endpoint, "json", &ts.tls)
+    run::provider_list_profiles(&ts.endpoint, "json", "default", &ts.tls)
         .await
         .expect("provider list-profiles json");
     run::provider_create(
@@ -1594,6 +1777,7 @@ binaries: [/usr/bin/custom]
         &["CUSTOM_API_KEY=abc".to_string()],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -1609,10 +1793,15 @@ binaries: [/usr/bin/custom]
         .expect("custom provider should be stored");
     assert_eq!(provider.r#type, "custom-api");
 
-    run::provider_delete(&ts.endpoint, &["custom-provider".to_string()], &ts.tls)
-        .await
-        .expect("custom provider delete");
-    run::provider_profile_delete(&ts.endpoint, "custom-api", &ts.tls)
+    run::provider_delete(
+        &ts.endpoint,
+        &["custom-provider".to_string()],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("custom provider delete");
+    run::provider_profile_delete(&ts.endpoint, "custom-api", "default", &ts.tls)
         .await
         .expect("profile delete");
 }
@@ -1648,6 +1837,7 @@ async fn provider_create_from_existing_uses_profile_discovery_when_v2_enabled() 
         &[],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -1681,6 +1871,7 @@ async fn provider_create_from_existing_uses_registry_discovery_when_v2_disabled(
         &[],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -1724,6 +1915,7 @@ async fn provider_create_from_existing_vertex_discovers_credentials_and_config_w
         &[],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -1779,6 +1971,7 @@ async fn provider_create_from_existing_requires_profile_when_v2_enabled() {
         &[],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -1822,6 +2015,7 @@ async fn provider_create_from_existing_fails_when_profile_discovery_finds_nothin
         &[],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -1874,13 +2068,23 @@ async fn provider_update_from_existing_uses_profile_discovery_when_v2_enabled() 
             credentials: HashMap::new(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
+            profile_workspace: "default".to_string(),
         },
     );
     let _env = EnvVarGuard::set(&[("CUSTOM_UPDATE_DISCOVERY_API_KEY", "updated-profile-secret")]);
 
-    run::provider_update(&ts.endpoint, "custom-update", true, &[], &[], &[], &ts.tls)
-        .await
-        .expect("profile-backed provider update --from-existing");
+    run::provider_update(
+        &ts.endpoint,
+        "custom-update",
+        true,
+        &[],
+        &[],
+        &[],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("profile-backed provider update --from-existing");
 
     let provider = ts
         .state
@@ -1929,14 +2133,14 @@ binaries: [/usr/bin/yaml-client]
     .unwrap();
     std::fs::write(dir.path().join("notes.txt"), "ignored").unwrap();
 
-    run::provider_profile_import(&ts.endpoint, None, Some(dir.path()), &ts.tls)
+    run::provider_profile_import(&ts.endpoint, None, Some(dir.path()), "default", &ts.tls)
         .await
         .expect("profile import --from");
 
-    run::provider_profile_export(&ts.endpoint, "custom-yaml", "yaml", &ts.tls)
+    run::provider_profile_export(&ts.endpoint, "custom-yaml", "yaml", "default", &ts.tls)
         .await
         .expect("custom-yaml should be imported");
-    run::provider_profile_export(&ts.endpoint, "custom-json", "json", &ts.tls)
+    run::provider_profile_export(&ts.endpoint, "custom-json", "json", "default", &ts.tls)
         .await
         .expect("custom-json should be imported");
 }
@@ -1976,7 +2180,7 @@ binaries:
     )
     .unwrap();
 
-    run::provider_profile_import(&ts.endpoint, Some(&profile_path), None, &ts.tls)
+    run::provider_profile_import(&ts.endpoint, Some(&profile_path), None, "default", &ts.tls)
         .await
         .expect("profile import");
 
@@ -1986,6 +2190,7 @@ binaries:
     let profile = client
         .get_provider_profile(openshell_core::proto::GetProviderProfileRequest {
             id: "advanced-api".to_string(),
+            workspace: String::new(),
         })
         .await
         .expect("get provider profile")
@@ -2020,15 +2225,16 @@ endpoints:
     .unwrap();
     std::fs::write(dir.path().join("broken.yaml"), "id: [\n").unwrap();
 
-    let err = run::provider_profile_import(&ts.endpoint, None, Some(dir.path()), &ts.tls)
-        .await
-        .expect_err("profile import --from should fail on parse errors");
+    let err =
+        run::provider_profile_import(&ts.endpoint, None, Some(dir.path()), "default", &ts.tls)
+            .await
+            .expect_err("profile import --from should fail on parse errors");
     assert!(
         err.to_string().contains("provider profile import failed"),
         "unexpected error: {err}"
     );
 
-    run::provider_profile_export(&ts.endpoint, "custom-good", "yaml", &ts.tls)
+    run::provider_profile_export(&ts.endpoint, "custom-good", "yaml", "default", &ts.tls)
         .await
         .expect_err("valid profiles should not be partially imported after local parse errors");
 }
@@ -2051,7 +2257,7 @@ endpoints:
     .unwrap();
     std::fs::write(dir.path().join("broken.yaml"), "id: [\n").unwrap();
 
-    let err = run::provider_profile_lint(&ts.endpoint, None, Some(dir.path()), &ts.tls)
+    let err = run::provider_profile_lint(&ts.endpoint, None, Some(dir.path()), "default", &ts.tls)
         .await
         .expect_err("profile lint --from should fail on parse errors");
     assert!(
@@ -2059,7 +2265,7 @@ endpoints:
         "unexpected error: {err}"
     );
 
-    run::provider_profile_export(&ts.endpoint, "custom-good", "yaml", &ts.tls)
+    run::provider_profile_export(&ts.endpoint, "custom-good", "yaml", "default", &ts.tls)
         .await
         .expect_err("lint should not import valid profiles");
 }
@@ -2076,6 +2282,7 @@ async fn provider_create_rejects_key_only_credentials_without_local_env_value() 
         &["INVALID_PAIR".to_string()],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2101,6 +2308,7 @@ async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
         &["NAV_GENERIC_TEST_KEY".to_string()],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2112,6 +2320,7 @@ async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
     let response = client
         .get_provider(GetProviderRequest {
             name: "my-generic".to_string(),
+            workspace: String::new(),
         })
         .await
         .expect("get provider should succeed")
@@ -2136,6 +2345,7 @@ async fn provider_create_rejects_combined_from_existing_and_credentials() {
         &["API_KEY=abc".to_string()],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2160,6 +2370,7 @@ async fn provider_create_rejects_combined_from_gcloud_adc_and_from_existing() {
         &[],
         true,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2185,6 +2396,7 @@ async fn provider_create_rejects_combined_from_gcloud_adc_and_credentials() {
         &["GOOGLE_VERTEX_AI_TOKEN=token".to_string()],
         true,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2211,6 +2423,7 @@ async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
         &["NAV_EMPTY_ENV_KEY".to_string()],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2236,6 +2449,7 @@ async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
         &["NVIDIA_API_KEY".to_string()],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2247,6 +2461,7 @@ async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
     let response = client
         .get_provider(GetProviderRequest {
             name: "my-nvidia".to_string(),
+            workspace: String::new(),
         })
         .await
         .expect("get provider should succeed")
@@ -2288,6 +2503,7 @@ async fn provider_create_from_gcloud_adc_happy_path() {
         &[],  // no explicit credentials; refresh bootstrap covers it
         true, // from_gcloud_adc
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2373,6 +2589,7 @@ async fn provider_create_from_gcloud_adc_rejects_service_account() {
         &[],
         true,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2410,6 +2627,7 @@ async fn provider_create_from_gcloud_adc_missing_file() {
         &[],
         true,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2443,6 +2661,7 @@ async fn provider_create_from_gcloud_adc_rejects_wrong_provider_type_before_cred
         &[],
         true,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2480,6 +2699,7 @@ async fn provider_create_from_gcloud_adc_rolls_back_provider_when_refresh_config
         &[],
         true,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2530,6 +2750,7 @@ async fn provider_create_from_gcloud_adc_warn_path_keeps_provider_when_rollback_
         &[],
         true,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2578,6 +2799,7 @@ async fn provider_create_from_gcloud_adc_rolls_back_provider_when_initial_rotate
         &[],
         true,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2618,6 +2840,7 @@ async fn provider_create_from_existing_vertex_config_only_reports_missing_vertex
         &[],
         false,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2664,6 +2887,7 @@ async fn provider_create_from_gcloud_adc_with_config_keys() {
             "VERTEX_AI_PROJECT_ID=my-gcp-project".to_string(),
             "VERTEX_AI_REGION=us-east1".to_string(),
         ],
+        "default",
         &ts.tls,
     )
     .await
@@ -2738,6 +2962,7 @@ async fn provider_create_from_gcloud_adc_missing_refresh_token() {
         &[],
         true,
         &[],
+        "default",
         &ts.tls,
     )
     .await
@@ -2780,6 +3005,7 @@ async fn provider_create_from_gcloud_adc_missing_client_secret() {
         &[],
         true,
         &[],
+        "default",
         &ts.tls,
     )
     .await

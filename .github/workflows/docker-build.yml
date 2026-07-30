@@ -96,7 +96,7 @@ jobs:
             cli)
               binary_component=cli
               binary_name=openshell
-              features="bundled-z3"
+              features=""
               has_image=false
               ;;
             *)
@@ -154,7 +154,7 @@ jobs:
             echo "arches=${arches[*]}"
             echo "binary_component=$binary_component"
             echo "binary_name=$binary_name"
-            echo "artifact_prefix=rust-binary-${component}-${binary_component}"
+            echo "artifact_prefix=rust-binary-${component}"
             echo "image_tag_base=$image_tag_base"
             echo "features=$features"
             echo "has_image=$has_image"
@@ -206,7 +206,7 @@ jobs:
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
       DOCKER_PLATFORM: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
           fetch-depth: 0

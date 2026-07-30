@@ -13,8 +13,6 @@ E2E_TEST="${OPENSHELL_E2E_DOCKER_TEST:-smoke}"
 E2E_FEATURES="${OPENSHELL_E2E_DOCKER_FEATURES:-e2e,e2e-docker}"
 DEFAULT_WORKLOAD_MANIFEST="${ROOT}/e2e/gpu/images/.build/workloads.yaml"
 
-cargo build -p openshell-cli
-
 if [ "${E2E_TEST}" = "gpu" ] && [ -z "${OPENSHELL_E2E_WORKLOAD_MANIFEST:-}" ] && [ ! -f "${DEFAULT_WORKLOAD_MANIFEST}" ]; then
   echo "note: running GPU e2e without a workload manifest; workload validation will log an explicit skip. Build one with 'mise run e2e:workloads:build' or set OPENSHELL_E2E_WORKLOAD_MANIFEST."
 fi

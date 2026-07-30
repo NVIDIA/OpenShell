@@ -63,11 +63,15 @@ impl TestOpenShell {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: String::new(),
+                    deletion_timestamp_ms: 0,
                 }),
                 r#type: provider_type.to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                profile_workspace: "default".to_string(),
             },
         );
     }
@@ -75,6 +79,13 @@ impl TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn get_current_user(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
+    ) -> Result<Response<openshell_core::proto::GetCurrentUserResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn health(
         &self,
         _request: tonic::Request<HealthRequest>,
@@ -83,6 +94,13 @@ impl OpenShell for TestOpenShell {
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
         }))
+    }
+
+    async fn get_gateway_info(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
+    ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn create_sandbox(
@@ -349,6 +367,9 @@ impl OpenShell for TestOpenShell {
                 created_at_ms: existing_metadata.created_at_ms,
                 labels: existing_metadata.labels,
                 resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: String::new(),
+                deletion_timestamp_ms: 0,
             }),
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
@@ -357,6 +378,7 @@ impl OpenShell for TestOpenShell {
                 existing.credential_expires_at_ms,
                 provider.credential_expires_at_ms,
             ),
+            profile_workspace: existing.profile_workspace,
         };
         let updated_name = updated.object_name().to_string();
         providers.insert(updated_name, updated.clone());
@@ -583,6 +605,55 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::ForwardTcpStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
+
+    async fn create_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::CreateWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::GetWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspaces(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspacesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspacesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn add_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::AddWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::AddWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn remove_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RemoveWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::RemoveWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspace_members(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspaceMembersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspaceMembersResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 }
 
 // ── test server fixture ──────────────────────────────────────────────
@@ -663,6 +734,7 @@ async fn explicit_provider_name_passes_through_when_it_exists() {
         &["nvidia".to_string()],
         &[],
         Some(true), // --auto-providers (should not matter here)
+        "default",
     )
     .await
     .expect("should succeed");
@@ -691,6 +763,7 @@ async fn explicit_provider_name_auto_creates_when_valid_type() {
         &["nvidia".to_string()],
         &[],
         Some(true), // --auto-providers to skip interactive prompt
+        "default",
     )
     .await
     .expect("should auto-create the provider");
@@ -724,6 +797,7 @@ async fn explicit_provider_name_errors_for_unrecognised_name() {
         &["my-custom-thing".to_string()],
         &[],
         Some(true),
+        "default",
     )
     .await
     .expect_err("should fail for unrecognised provider name");
@@ -755,6 +829,7 @@ async fn inferred_type_auto_creates_provider() {
         &[],
         &["claude-code".to_string()],
         Some(true), // --auto-providers
+        "default",
     )
     .await
     .expect("should auto-create the inferred provider");
@@ -784,6 +859,7 @@ async fn no_auto_providers_skips_missing_explicit_provider() {
         &["nvidia".to_string()],
         &[],
         Some(false), // --no-auto-providers
+        "default",
     )
     .await
     .expect("should succeed with empty list");
@@ -819,6 +895,7 @@ async fn explicit_and_inferred_providers_combined() {
         &["nvidia".to_string()],
         &["claude-code".to_string()],
         Some(true),
+        "default",
     )
     .await
     .expect("should create both providers");
@@ -850,6 +927,7 @@ async fn explicit_and_inferred_deduplicates() {
         &["nvidia".to_string()],
         &["nvidia".to_string()],
         Some(true),
+        "default",
     )
     .await
     .expect("should succeed");

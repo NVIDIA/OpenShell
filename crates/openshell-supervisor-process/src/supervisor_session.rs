@@ -13,6 +13,8 @@
 use std::net::IpAddr;
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
@@ -31,6 +33,7 @@ use tokio_stream::StreamExt;
 use tracing::{debug, warn};
 
 use openshell_core::grpc_client;
+use openshell_core::transport_errors::is_expected_transport_close_status;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -226,6 +229,46 @@ fn map_stream_message<T>(
     }
 }
 
+#[derive(Debug)]
+enum SessionStreamMessage<T> {
+    Message(T),
+    ExpectedShutdownClose,
+}
+
+fn supervisor_is_terminating(terminating: &AtomicBool) -> bool {
+    terminating.load(Ordering::Acquire)
+}
+
+fn expected_transport_close_during_shutdown(
+    status: &tonic::Status,
+    terminating: &AtomicBool,
+) -> bool {
+    supervisor_is_terminating(terminating) && is_expected_transport_close_status(status)
+}
+
+fn map_session_stream_message<T>(
+    message: Result<Option<T>, tonic::Status>,
+    eof_error: &'static str,
+    terminating: &AtomicBool,
+) -> Result<SessionStreamMessage<T>, Box<dyn std::error::Error + Send + Sync>> {
+    match message {
+        Ok(Some(msg)) => Ok(SessionStreamMessage::Message(msg)),
+        Ok(None) if supervisor_is_terminating(terminating) => {
+            debug!("supervisor session: stream closed during local shutdown");
+            Ok(SessionStreamMessage::ExpectedShutdownClose)
+        }
+        Ok(None) => Err(eof_error.into()),
+        Err(e) if expected_transport_close_during_shutdown(&e, terminating) => {
+            debug!(
+                error = %e,
+                "supervisor session: expected transport close during local shutdown"
+            );
+            Ok(SessionStreamMessage::ExpectedShutdownClose)
+        }
+        Err(e) => Err(format!("stream error: {e}").into()),
+    }
+}
+
 /// Spawn the supervisor session task.
 ///
 /// The task runs for the lifetime of the sandbox process, reconnecting with
@@ -236,6 +279,7 @@ pub fn spawn(
     ssh_socket_path: std::path::PathBuf,
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
+    terminating: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_session_loop(
         endpoint,
@@ -243,6 +287,7 @@ pub fn spawn(
         ssh_socket_path,
         netns_fd,
         expected_ssh_peer_pid,
+        terminating,
     ))
 }
 
@@ -252,6 +297,7 @@ async fn run_session_loop(
     ssh_socket_path: std::path::PathBuf,
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
+    terminating: Arc<AtomicBool>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
@@ -265,6 +311,7 @@ async fn run_session_loop(
             &ssh_socket_path,
             netns_fd,
             expected_ssh_peer_pid,
+            Arc::clone(&terminating),
         )
         .await
         {
@@ -295,6 +342,7 @@ async fn run_single_session(
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
+    terminating: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -358,15 +406,26 @@ async fn run_single_session(
     loop {
         tokio::select! {
             msg = inbound.message() => {
-                let msg = map_stream_message(msg, "gateway closed stream")?;
-                handle_gateway_message(
-                    &msg,
+                let msg = match map_session_stream_message(
+                    msg,
+                    "gateway closed stream",
+                    &terminating,
+                )? {
+                    SessionStreamMessage::Message(msg) => msg,
+                    SessionStreamMessage::ExpectedShutdownClose => return Ok(()),
+                };
+                let context = GatewayMessageContext {
                     sandbox_id,
                     ssh_socket_path,
                     netns_fd,
                     expected_ssh_peer_pid,
-                    &channel,
-                    &tx,
+                    channel: &channel,
+                    tx: &tx,
+                    terminating: &terminating,
+                };
+                handle_gateway_message(
+                    &msg,
+                    &context,
                 );
             }
             _ = heartbeat_interval.tick() => {
@@ -383,15 +442,17 @@ async fn run_single_session(
     }
 }
 
-fn handle_gateway_message(
-    msg: &GatewayMessage,
-    sandbox_id: &str,
-    ssh_socket_path: &std::path::Path,
+struct GatewayMessageContext<'a> {
+    sandbox_id: &'a str,
+    ssh_socket_path: &'a std::path::Path,
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
-    channel: &grpc_client::AuthedChannel,
-    tx: &mpsc::Sender<SupervisorMessage>,
-) {
+    channel: &'a grpc_client::AuthedChannel,
+    tx: &'a mpsc::Sender<SupervisorMessage>,
+    terminating: &'a Arc<AtomicBool>,
+}
+
+fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<'_>) {
     match &msg.payload {
         Some(gateway_message::Payload::Heartbeat(_)) => {
             // Gateway heartbeat — nothing to do.
@@ -399,10 +460,13 @@ fn handle_gateway_message(
         Some(gateway_message::Payload::RelayOpen(open)) => {
             let channel_id = open.channel_id.clone();
             let relay_open = open.clone();
-            let sandbox_id = sandbox_id.to_string();
-            let channel = channel.clone();
-            let ssh_socket_path = ssh_socket_path.to_path_buf();
-            let tx = tx.clone();
+            let sandbox_id = context.sandbox_id.to_string();
+            let channel = context.channel.clone();
+            let ssh_socket_path = context.ssh_socket_path.to_path_buf();
+            let tx = context.tx.clone();
+            let netns_fd = context.netns_fd;
+            let expected_ssh_peer_pid = context.expected_ssh_peer_pid;
+            let terminating = Arc::clone(context.terminating);
 
             let event = relay_open_event(openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
             ocsf_emit!(event);
@@ -416,6 +480,7 @@ fn handle_gateway_message(
                     expected_ssh_peer_pid,
                     channel,
                     tx,
+                    terminating,
                 )
                 .await
                 {
@@ -454,7 +519,7 @@ fn handle_gateway_message(
             ocsf_emit!(event);
         }
         _ => {
-            warn!(sandbox_id = %sandbox_id, "supervisor session: unexpected gateway message");
+            warn!(sandbox_id = %context.sandbox_id, "supervisor session: unexpected gateway message");
         }
     }
 }
@@ -472,6 +537,7 @@ async fn handle_relay_open(
     expected_ssh_peer_pid: Option<u32>,
     channel: grpc_client::AuthedChannel,
     tx: mpsc::Sender<SupervisorMessage>,
+    terminating: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel_id = relay_open.channel_id.clone();
     let target = match open_target(
@@ -510,10 +576,18 @@ async fn handle_relay_open(
         .map_err(|_| "outbound channel closed before init")?;
 
     // Initiate the RPC. This rides the existing HTTP/2 connection.
-    let response = client
-        .relay_stream(outbound)
-        .await
-        .map_err(|e| format!("relay_stream RPC failed: {e}"))?;
+    let response = match client.relay_stream(outbound).await {
+        Ok(response) => response,
+        Err(e) if expected_transport_close_during_shutdown(&e, &terminating) => {
+            debug!(
+                channel_id = %channel_id,
+                error = %e,
+                "relay bridge: relay_stream RPC closed during local shutdown"
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(format!("relay_stream RPC failed: {e}").into()),
+    };
     let mut inbound = response.into_inner();
 
     // Connect to the local SSH daemon on its Unix socket.
@@ -564,7 +638,15 @@ async fn handle_relay_open(
                 }
             }
             Err(e) => {
-                inbound_err = Some(format!("relay inbound errored: {e}"));
+                if expected_transport_close_during_shutdown(&e, &terminating) {
+                    debug!(
+                        channel_id = %channel_id,
+                        error = %e,
+                        "relay bridge: inbound closed during local shutdown"
+                    );
+                } else {
+                    inbound_err = Some(format!("relay inbound errored: {e}"));
+                }
                 break;
             }
         }
@@ -937,6 +1019,52 @@ mod ocsf_event_tests {
         let err = map_stream_message::<SupervisorMessage>(Ok(None), "gateway closed stream")
             .expect_err("eof should force reconnect");
         assert_eq!(err.to_string(), "gateway closed stream");
+    }
+
+    #[test]
+    fn map_session_stream_message_allows_expected_close_during_shutdown() {
+        let terminating = AtomicBool::new(true);
+        let message = map_session_stream_message::<GatewayMessage>(
+            Err(tonic::Status::unknown(
+                "h2 protocol error: error reading a body from connection",
+            )),
+            "gateway closed stream",
+            &terminating,
+        )
+        .expect("expected transport close should be non-fatal during shutdown");
+
+        assert!(matches!(
+            message,
+            SessionStreamMessage::ExpectedShutdownClose
+        ));
+    }
+
+    #[test]
+    fn map_session_stream_message_keeps_transport_close_fatal_when_not_shutting_down() {
+        let terminating = AtomicBool::new(false);
+        let err = map_session_stream_message::<GatewayMessage>(
+            Err(tonic::Status::unknown(
+                "h2 protocol error: error reading a body from connection",
+            )),
+            "gateway closed stream",
+            &terminating,
+        )
+        .expect_err("same transport close should fail before shutdown starts");
+
+        assert!(err.to_string().contains("h2 protocol error"));
+    }
+
+    #[test]
+    fn map_session_stream_message_keeps_unexpected_error_fatal_during_shutdown() {
+        let terminating = AtomicBool::new(true);
+        let err = map_session_stream_message::<GatewayMessage>(
+            Err(tonic::Status::internal("policy evaluation failed")),
+            "gateway closed stream",
+            &terminating,
+        )
+        .expect_err("non-transport errors must stay fatal");
+
+        assert!(err.to_string().contains("policy evaluation failed"));
     }
 
     #[cfg(target_os = "linux")]

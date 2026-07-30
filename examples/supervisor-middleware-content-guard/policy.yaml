@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 1
+
+network_middlewares:
+  prototype-content-guard:
+    name: Prototype content guard
+    middleware: content-guard-example
+    order: 10
+    config:
+      mode: redact
+      terms:
+        - prototype-secret
+        - internal-only
+      replacement: "[FILTERED]"
+    on_error: fail_closed
+    endpoints:
+      include:
+        - httpbin.org
+
+network_policies:
+  httpbin:
+    name: httpbin
+    endpoints:
+      - host: httpbin.org
+        port: 443
+        protocol: rest
+        rules:
+          - allow:
+              method: POST
+              path: /anything
+    binaries:
+      - path: /usr/bin/curl
+  httpbingo:
+    name: httpbingo
+    endpoints:
+      - host: httpbingo.org
+        port: 443
+        protocol: rest
+        rules:
+          - allow:
+              method: POST
+              path: /anything
+    binaries:
+      - path: /usr/bin/curl

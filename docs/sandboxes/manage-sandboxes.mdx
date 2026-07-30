@@ -20,6 +20,12 @@ Create a sandbox with a single command. For example, to create a sandbox with Cl
 openshell sandbox create -- claude
 ```
 
+For automation, use `--output json` or `--output yaml` to get machine-readable sandbox metadata after creation:
+
+```shell
+openshell sandbox create --output json
+```
+
 Every sandbox requires a gateway. Register or select one before running sandbox commands:
 
 ```shell
@@ -229,10 +235,10 @@ The Python SDK accepts the same gateway labels and selectors. Labels passed to
 from openshell import SandboxClient
 
 with SandboxClient.from_active_cluster() as client:
-    sandbox = client.create(name="deep-research-1", labels={"env": "dev", "team": "platform"})
+    sandbox = client.create(workspace="default", name="deep-research-1", labels={"env": "dev", "team": "platform"})
     assert sandbox.labels["team"] == "platform"
 
-    matches = client.list(label_selector="env=dev,team=platform")
+    matches = client.list(workspace="default", label_selector="env=dev,team=platform")
     assert sandbox.id in {s.id for s in matches}
 ```
 
@@ -309,6 +315,12 @@ Get detailed information about a specific sandbox. The output lists **Policy sou
 openshell sandbox get my-sandbox
 ```
 
+For automation, use `--output json` or `--output yaml` to get machine-readable sandbox details:
+
+```shell
+openshell sandbox get my-sandbox --output json
+```
+
 Print only that policy YAML for scripting (same effective policy, no metadata):
 
 ```shell
@@ -335,6 +347,8 @@ openshell term
 ```
 
 Use the terminal to spot blocked connections marked `action=deny` and inference-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy. Refer to [Policies](/sandboxes/policies) for the workflow.
+
+The dashboard has three panels stacked vertically: Gateways, Providers (or Global Settings), and Sandboxes. Navigate within a panel with `Up`/`Down` or `j`/`k`. At a list boundary the cursor overflows into the adjacent panel, skipping empty panels. Use `Tab`/`Shift+Tab` to cycle panels directly. Press `h`/`l` or `Left`/`Right` in the middle panel to switch between the Providers and Global Settings tabs.
 
 ## Port Forwarding
 
@@ -425,12 +439,19 @@ openshell sandbox delete my-sandbox
 
 Every sandbox moves through a defined set of phases:
 
-| Phase        | Description                                                                                                                            |
-| ------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy.                                    |
-| Ready        | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
-| Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                   |
-| Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                  |
+| Phase        | Description                                                                                                                                                    |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Provisioning | The runtime is setting up the sandbox environment, or the gateway is waiting for the sandbox supervisor to establish its authenticated control session.       |
+| Ready        | The sandbox is running and its supervisor control session is connected. You can connect, execute commands, sync files, and view logs.                          |
+| Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                                           |
+| Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |
+
+The compute backend can become ready before the sandbox supervisor connects to
+the gateway. During this interval, the sandbox remains in `Provisioning` and
+reports a `Ready=False` condition with the reason `SupervisorNotConnected`.
+After a gateway restart, an existing sandbox can return to `Provisioning`
+temporarily while its supervisor reconnects. Wait for the phase to return to
+`Ready` before you connect to the sandbox or execute commands.
 
 ## Sandbox Compute Drivers
 
@@ -441,6 +462,7 @@ For Docker, Podman, MicroVM, and Kubernetes behavior, refer to [Sandbox Compute 
 ## Next Steps
 
 - To follow a complete end-to-end example, refer to the [GitHub Sandbox](/get-started/tutorials/github-sandbox) tutorial.
+- To select a workspace or understand access roles, refer to [Manage Workspaces and Access](/sandboxes/manage-workspaces).
 - To supply API keys or tokens, refer to [Manage Providers](/sandboxes/manage-providers).
 - To control what the agent can access, refer to [Policies](/sandboxes/policies).
 - To use the default runtime image, refer to [Base Sandbox Container](#base-sandbox-container).

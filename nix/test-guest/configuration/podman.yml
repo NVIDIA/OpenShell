@@ -1,0 +1,44 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# PROTOTYPE: Configure Podman in a disposable test guest.
+
+- name: Configure Podman
+  hosts: test_vm
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Validate Podman support
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution in ["Ubuntu", "CentOS", "Fedora", "Rocky"]
+        fail_msg: >-
+          Podman is unsupported on {{ ansible_facts.distribution }}.
+
+    - name: Refresh Ubuntu package metadata
+      ansible.builtin.apt:
+        update_cache: true
+      when: ansible_facts.distribution == "Ubuntu"
+
+    - name: Install Podman dependencies
+      ansible.builtin.package:
+        name:
+          - podman
+          - socat
+        state: present
+
+    - name: Enable the rootless Podman API socket
+      ansible.builtin.systemd_service:
+        name: podman.socket
+        scope: user
+        enabled: true
+        state: started
+      become: false
+
+    - name: Verify rootless Podman
+      ansible.builtin.command:
+        cmd: podman info
+      become: false
+      changed_when: false

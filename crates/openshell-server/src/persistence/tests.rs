@@ -2,16 +2,110 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{ObjectType, PersistenceError, Store, generate_name, test_store};
-use crate::policy_store::PolicyStoreExt;
-use openshell_core::proto::{ObjectForTest, SandboxPolicy};
+use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
+use openshell_core::proto::datamodel::v1::ObjectMeta as ProtoObjectMeta;
+use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
 use prost::Message;
+use std::collections::HashMap as StdHashMap;
+
+/// A failed store call must be visible as a failure in the trace, not as a
+/// span that merely happened to return nothing.
+#[tokio::test]
+async fn failed_store_calls_are_marked_on_the_span() {
+    use crate::otel_tracing::test_collector;
+
+    let store = test_store().await;
+    let traced = test_collector::install_traced();
+    store.close_for_test().await;
+    store
+        .get("sandbox", "failed-store-call")
+        .await
+        .expect_err("a closed pool fails the query");
+
+    let span = traced.span_with("store.get", "object.id", "failed-store-call");
+
+    assert!(
+        matches!(span.status, opentelemetry::trace::Status::Error { .. }),
+        "the span carries error status so trace UIs flag it, got {:?}",
+        span.status
+    );
+}
+
+/// Losing a `MustCreate` race is how callers learn a record already exists, so
+/// the span must stay clean — otherwise every lease a replica does not win, and
+/// every gateway restart, exports as a failure.
+#[tokio::test]
+async fn expected_conflicts_leave_the_span_unmarked() {
+    use crate::otel_tracing::test_collector;
+
+    let store = test_store().await;
+    let traced = test_collector::install_traced();
+    let put = async |id: &str| {
+        store
+            .put_if(
+                "workspace",
+                id,
+                "expected-conflict",
+                "",
+                b"payload",
+                None,
+                super::WriteCondition::MustCreate,
+            )
+            .await
+    };
+
+    put("expected-conflict-first").await.expect("first write");
+    put("expected-conflict-second")
+        .await
+        .expect_err("the name is already taken");
+
+    let span = traced.span_with("store.put_if", "object.id", "expected-conflict-second");
+
+    assert_eq!(
+        span.status,
+        opentelemetry::trace::Status::Unset,
+        "a unique violation is a return value the caller acts on, got {:?}",
+        span.status
+    );
+}
+
+/// Span names stay low-cardinality so they group across object types; what
+/// each call touched is carried as attributes.
+#[tokio::test]
+async fn store_spans_record_what_they_touched_as_attributes() {
+    use crate::otel_tracing::test_collector;
+
+    let store = test_store().await;
+    store
+        .put("sandbox", "abc", "my-sandbox", "default", b"payload", None)
+        .await
+        .unwrap();
+
+    let traced = test_collector::install_traced();
+    store.get("sandbox", "abc").await.unwrap();
+    store
+        .get_by_name("sandbox", "default", "my-sandbox")
+        .await
+        .unwrap();
+    store.list("sandbox", "default", 10, 0).await.unwrap();
+
+    let by_name = traced.span_with("store.get_by_name", "object.name", "my-sandbox");
+    assert_eq!(
+        test_collector::attribute(&by_name, "object_type").as_deref(),
+        Some("sandbox"),
+        "the span records which type it queried"
+    );
+
+    traced.span_with("store.get", "object.id", "abc");
+    traced.span_with("store.list", "object_type", "sandbox");
+}
 
 #[tokio::test]
 async fn sqlite_put_get_round_trip() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "abc", "my-sandbox", b"payload", None)
+        .put("sandbox", "abc", "my-sandbox", "default", b"payload", None)
         .await
         .unwrap();
 
@@ -26,7 +120,7 @@ async fn sqlite_put_get_round_trip() {
 async fn sqlite_connect_runs_embedded_migrations() {
     let store = test_store().await;
 
-    let records = store.list("sandbox", 10, 0).await.unwrap();
+    let records = store.list("sandbox", "default", 10, 0).await.unwrap();
     assert!(records.is_empty());
 }
 
@@ -212,14 +306,14 @@ async fn sqlite_updates_timestamp() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "abc", "my-sandbox", b"payload", None)
+        .put("sandbox", "abc", "my-sandbox", "default", b"payload", None)
         .await
         .unwrap();
 
     let first = store.get("sandbox", "abc").await.unwrap().unwrap();
 
     store
-        .put("sandbox", "abc", "my-sandbox", b"payload2", None)
+        .put("sandbox", "abc", "my-sandbox", "default", b"payload2", None)
         .await
         .unwrap();
 
@@ -237,12 +331,12 @@ async fn sqlite_list_paging() {
         let name = format!("name-{idx}");
         let payload = format!("payload-{idx}");
         store
-            .put("sandbox", &id, &name, payload.as_bytes(), None)
+            .put("sandbox", &id, &name, "default", payload.as_bytes(), None)
             .await
             .unwrap();
     }
 
-    let records = store.list("sandbox", 2, 1).await.unwrap();
+    let records = store.list("sandbox", "default", 2, 1).await.unwrap();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].name, "name-1");
     assert_eq!(records[1].name, "name-2");
@@ -253,7 +347,7 @@ async fn sqlite_delete_behavior() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "abc", "my-sandbox", b"payload", None)
+        .put("sandbox", "abc", "my-sandbox", "default", b"payload", None)
         .await
         .unwrap();
 
@@ -292,12 +386,12 @@ async fn sqlite_get_by_name() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "id-1", "my-sandbox", b"payload", None)
+        .put("sandbox", "id-1", "my-sandbox", "default", b"payload", None)
         .await
         .unwrap();
 
     let record = store
-        .get_by_name("sandbox", "my-sandbox")
+        .get_by_name("sandbox", "default", "my-sandbox")
         .await
         .unwrap()
         .unwrap();
@@ -305,7 +399,10 @@ async fn sqlite_get_by_name() {
     assert_eq!(record.name, "my-sandbox");
     assert_eq!(record.payload, b"payload");
 
-    let missing = store.get_by_name("sandbox", "no-such-name").await.unwrap();
+    let missing = store
+        .get_by_name("sandbox", "default", "no-such-name")
+        .await
+        .unwrap();
     assert!(missing.is_none());
 }
 
@@ -322,7 +419,7 @@ async fn sqlite_get_message_by_name() {
     store.put_message(&object).await.unwrap();
 
     let loaded = store
-        .get_message_by_name::<ObjectForTest>("my-test")
+        .get_message_by_name::<ObjectForTest>("", "my-test")
         .await
         .unwrap()
         .unwrap();
@@ -331,7 +428,7 @@ async fn sqlite_get_message_by_name() {
     assert_eq!(loaded.count, 7);
 
     let missing = store
-        .get_message_by_name::<ObjectForTest>("no-such-name")
+        .get_message_by_name::<ObjectForTest>("", "no-such-name")
         .await
         .unwrap();
     assert!(missing.is_none());
@@ -342,14 +439,20 @@ async fn sqlite_delete_by_name() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "id-1", "my-sandbox", b"payload", None)
+        .put("sandbox", "id-1", "my-sandbox", "default", b"payload", None)
         .await
         .unwrap();
 
-    let deleted = store.delete_by_name("sandbox", "my-sandbox").await.unwrap();
+    let deleted = store
+        .delete_by_name("sandbox", "default", "my-sandbox")
+        .await
+        .unwrap();
     assert!(deleted);
 
-    let deleted_again = store.delete_by_name("sandbox", "my-sandbox").await.unwrap();
+    let deleted_again = store
+        .delete_by_name("sandbox", "default", "my-sandbox")
+        .await
+        .unwrap();
     assert!(!deleted_again);
 
     let gone = store.get("sandbox", "id-1").await.unwrap();
@@ -361,18 +464,32 @@ async fn sqlite_name_unique_per_object_type() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "id-1", "shared-name", b"payload1", None)
+        .put(
+            "sandbox",
+            "id-1",
+            "shared-name",
+            "default",
+            b"payload1",
+            None,
+        )
         .await
         .unwrap();
 
     // Same name, same object_type, different id -> upsert on name.
     store
-        .put("sandbox", "id-2", "shared-name", b"payload2", None)
+        .put(
+            "sandbox",
+            "id-2",
+            "shared-name",
+            "default",
+            b"payload2",
+            None,
+        )
         .await
         .unwrap();
 
     let record = store
-        .get_by_name("sandbox", "shared-name")
+        .get_by_name("sandbox", "default", "shared-name")
         .await
         .unwrap()
         .unwrap();
@@ -381,9 +498,60 @@ async fn sqlite_name_unique_per_object_type() {
 
     // Same name, different object_type -> should succeed.
     store
-        .put("secret", "id-3", "shared-name", b"payload3", None)
+        .put(
+            "secret",
+            "id-3",
+            "shared-name",
+            "default",
+            b"payload3",
+            None,
+        )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_name_unique_scoped_by_workspace() {
+    let store = test_store().await;
+
+    store
+        .put("sandbox", "id-1", "shared-name", "alpha", b"payload1", None)
+        .await
+        .unwrap();
+
+    // Same name, same type, different workspace -> separate records.
+    store
+        .put("sandbox", "id-2", "shared-name", "beta", b"payload2", None)
+        .await
+        .unwrap();
+
+    let alpha = store
+        .get_by_name("sandbox", "alpha", "shared-name")
+        .await
+        .unwrap()
+        .unwrap();
+    let beta = store
+        .get_by_name("sandbox", "beta", "shared-name")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alpha.id, "id-1");
+    assert_eq!(beta.id, "id-2");
+    assert_eq!(alpha.payload, b"payload1");
+    assert_eq!(beta.payload, b"payload2");
+
+    // Same name, same type, same workspace -> upsert (existing behavior).
+    store
+        .put("sandbox", "id-3", "shared-name", "alpha", b"payload3", None)
+        .await
+        .unwrap();
+    let alpha = store
+        .get_by_name("sandbox", "alpha", "shared-name")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alpha.id, "id-1", "upsert should keep original id");
+    assert_eq!(alpha.payload, b"payload3", "upsert should update payload");
 }
 
 #[tokio::test]
@@ -391,14 +559,14 @@ async fn sqlite_id_globally_unique() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "same-id", "name-a", b"payload1", None)
+        .put("sandbox", "same-id", "name-a", "default", b"payload1", None)
         .await
         .unwrap();
 
     // Same id, different object_type -> should fail because ids remain global
     // primary keys even when writes upsert on name.
     let result = store
-        .put("secret", "same-id", "name-b", b"payload2", None)
+        .put("secret", "same-id", "name-b", "default", b"payload2", None)
         .await;
     assert!(result.is_err());
 
@@ -444,6 +612,7 @@ async fn labels_round_trip() {
             "sandbox",
             "id-1",
             "labeled-sandbox",
+            "default",
             b"payload",
             Some(labels),
         )
@@ -459,11 +628,25 @@ async fn label_selector_single_match() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "id-1", "s1", b"p1", Some(r#"{"env":"prod"}"#))
+        .put(
+            "sandbox",
+            "id-1",
+            "s1",
+            "default",
+            b"p1",
+            Some(r#"{"env":"prod"}"#),
+        )
         .await
         .unwrap();
     store
-        .put("sandbox", "id-2", "s2", b"p2", Some(r#"{"env":"dev"}"#))
+        .put(
+            "sandbox",
+            "id-2",
+            "s2",
+            "default",
+            b"p2",
+            Some(r#"{"env":"dev"}"#),
+        )
         .await
         .unwrap();
     store
@@ -471,6 +654,7 @@ async fn label_selector_single_match() {
             "sandbox",
             "id-3",
             "s3",
+            "default",
             b"p3",
             Some(r#"{"env":"prod","team":"platform"}"#),
         )
@@ -478,7 +662,7 @@ async fn label_selector_single_match() {
         .unwrap();
 
     let results = store
-        .list_with_selector("sandbox", "env=prod", 10, 0)
+        .list_with_selector("sandbox", "default", "env=prod", 10, 0)
         .await
         .unwrap();
 
@@ -497,6 +681,7 @@ async fn label_selector_multiple_labels() {
             "sandbox",
             "id-1",
             "s1",
+            "default",
             b"p1",
             Some(r#"{"env":"prod","team":"platform"}"#),
         )
@@ -507,6 +692,7 @@ async fn label_selector_multiple_labels() {
             "sandbox",
             "id-2",
             "s2",
+            "default",
             b"p2",
             Some(r#"{"env":"prod","team":"data"}"#),
         )
@@ -517,6 +703,7 @@ async fn label_selector_multiple_labels() {
             "sandbox",
             "id-3",
             "s3",
+            "default",
             b"p3",
             Some(r#"{"env":"dev","team":"platform"}"#),
         )
@@ -524,7 +711,7 @@ async fn label_selector_multiple_labels() {
         .unwrap();
 
     let results = store
-        .list_with_selector("sandbox", "env=prod,team=platform", 10, 0)
+        .list_with_selector("sandbox", "default", "env=prod,team=platform", 10, 0)
         .await
         .unwrap();
 
@@ -537,12 +724,19 @@ async fn label_selector_no_match() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "id-1", "s1", b"p1", Some(r#"{"env":"prod"}"#))
+        .put(
+            "sandbox",
+            "id-1",
+            "s1",
+            "default",
+            b"p1",
+            Some(r#"{"env":"prod"}"#),
+        )
         .await
         .unwrap();
 
     let results = store
-        .list_with_selector("sandbox", "env=staging", 10, 0)
+        .list_with_selector("sandbox", "default", "env=staging", 10, 0)
         .await
         .unwrap();
 
@@ -557,25 +751,32 @@ async fn label_selector_respects_paging() {
         let id = format!("id-{idx}");
         let name = format!("name-{idx}");
         store
-            .put("sandbox", &id, &name, b"payload", Some(r#"{"env":"prod"}"#))
+            .put(
+                "sandbox",
+                &id,
+                &name,
+                "default",
+                b"payload",
+                Some(r#"{"env":"prod"}"#),
+            )
             .await
             .unwrap();
     }
 
     let page1 = store
-        .list_with_selector("sandbox", "env=prod", 2, 0)
+        .list_with_selector("sandbox", "default", "env=prod", 2, 0)
         .await
         .unwrap();
     assert_eq!(page1.len(), 2);
 
     let page2 = store
-        .list_with_selector("sandbox", "env=prod", 2, 2)
+        .list_with_selector("sandbox", "default", "env=prod", 2, 2)
         .await
         .unwrap();
     assert_eq!(page2.len(), 2);
 
     let page3 = store
-        .list_with_selector("sandbox", "env=prod", 2, 4)
+        .list_with_selector("sandbox", "default", "env=prod", 2, 4)
         .await
         .unwrap();
     assert_eq!(page3.len(), 1);
@@ -586,16 +787,23 @@ async fn empty_labels_not_matched_by_selector() {
     let store = test_store().await;
 
     store
-        .put("sandbox", "id-1", "s1", b"p1", None)
+        .put("sandbox", "id-1", "s1", "default", b"p1", None)
         .await
         .unwrap();
     store
-        .put("sandbox", "id-2", "s2", b"p2", Some(r#"{"env":"prod"}"#))
+        .put(
+            "sandbox",
+            "id-2",
+            "s2",
+            "default",
+            b"p2",
+            Some(r#"{"env":"prod"}"#),
+        )
         .await
         .unwrap();
 
     let results = store
-        .list_with_selector("sandbox", "env=prod", 10, 0)
+        .list_with_selector("sandbox", "default", "env=prod", 10, 0)
         .await
         .unwrap();
 
@@ -607,13 +815,184 @@ async fn empty_labels_not_matched_by_selector() {
 // Policy revision tests
 // ---------------------------------------------------------------------------
 
+fn policy_test_sandbox(id: &str, name: &str) -> Sandbox {
+    Sandbox {
+        metadata: Some(ProtoObjectMeta {
+            id: id.to_string(),
+            name: name.to_string(),
+            created_at_ms: 1,
+            workspace: "default".to_string(),
+            ..Default::default()
+        }),
+        spec: Some(SandboxSpec::default()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn policy_atomic_write_commits_revision_provenance_and_sandbox_projection() {
+    let store = test_store().await;
+    store
+        .put_message(&policy_test_sandbox("sandbox-atomic", "atomic"))
+        .await
+        .unwrap();
+    let current = store
+        .get_message::<Sandbox>("sandbox-atomic")
+        .await
+        .unwrap()
+        .unwrap();
+    let current_version = current.metadata.as_ref().unwrap().resource_version;
+    let policy = SandboxPolicy {
+        version: 1,
+        ..Default::default()
+    };
+    let provenance = StdHashMap::from([("signature".to_string(), "signed".to_string())]);
+
+    let updated = store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: "policy-atomic-1".to_string(),
+            sandbox_id: "sandbox-atomic".to_string(),
+            workspace: "default".to_string(),
+            version: 1,
+            policy_payload: policy.encode_to_vec(),
+            policy_hash: "hash-atomic-1".to_string(),
+            provenance: provenance.clone(),
+            expected_resource_version: current_version,
+            annotations: provenance.clone(),
+            backfill_policy: Some(policy.clone()),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        updated.metadata.as_ref().unwrap().resource_version,
+        current_version + 1
+    );
+    assert_eq!(updated.metadata.as_ref().unwrap().annotations, provenance);
+    assert_eq!(
+        updated.spec.as_ref().unwrap().policy.as_ref(),
+        Some(&policy)
+    );
+    let revision = store
+        .get_latest_policy("sandbox-atomic")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(revision.provenance, provenance);
+    store
+        .update_policy_status("sandbox-atomic", 1, "loaded", None, Some(100))
+        .await
+        .unwrap();
+    let loaded = store
+        .get_latest_policy("sandbox-atomic")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.provenance, provenance);
+}
+
+#[tokio::test]
+async fn policy_atomic_write_rolls_back_sandbox_when_revision_insert_conflicts() {
+    let store = test_store().await;
+    store
+        .put_message(&policy_test_sandbox("sandbox-rollback", "rollback"))
+        .await
+        .unwrap();
+    let policy = SandboxPolicy::default();
+    store
+        .put_policy_revision(
+            "existing-policy",
+            "sandbox-rollback",
+            "default",
+            1,
+            &policy.encode_to_vec(),
+            "existing-hash",
+        )
+        .await
+        .unwrap();
+    let before = store
+        .get_message::<Sandbox>("sandbox-rollback")
+        .await
+        .unwrap()
+        .unwrap();
+    let before_version = before.metadata.as_ref().unwrap().resource_version;
+
+    let error = store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: "conflicting-policy".to_string(),
+            sandbox_id: "sandbox-rollback".to_string(),
+            workspace: "default".to_string(),
+            version: 1,
+            policy_payload: policy.encode_to_vec(),
+            policy_hash: "conflicting-hash".to_string(),
+            provenance: StdHashMap::from([("signature".to_string(), "new".to_string())]),
+            expected_resource_version: before_version,
+            annotations: StdHashMap::from([("signature".to_string(), "new".to_string())]),
+            backfill_policy: Some(policy),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.is_unique_violation_on("objects_version_uq"));
+
+    let after = store
+        .get_message::<Sandbox>("sandbox-rollback")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.metadata.as_ref().unwrap().resource_version,
+        before_version
+    );
+    assert!(after.metadata.as_ref().unwrap().annotations.is_empty());
+    assert!(after.spec.as_ref().unwrap().policy.is_none());
+}
+
+#[tokio::test]
+async fn policy_atomic_write_persists_workspace() {
+    let store = test_store().await;
+    store
+        .put_message(&policy_test_sandbox("sandbox-ws", "ws-test"))
+        .await
+        .unwrap();
+    let current = store
+        .get_message::<Sandbox>("sandbox-ws")
+        .await
+        .unwrap()
+        .unwrap();
+    let current_version = current.metadata.as_ref().unwrap().resource_version;
+    let policy = SandboxPolicy::default();
+
+    store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: "policy-ws-1".to_string(),
+            sandbox_id: "sandbox-ws".to_string(),
+            workspace: "my-workspace".to_string(),
+            version: 1,
+            policy_payload: policy.encode_to_vec(),
+            policy_hash: "hash-ws-1".to_string(),
+            provenance: StdHashMap::new(),
+            expected_resource_version: current_version,
+            annotations: StdHashMap::new(),
+            backfill_policy: Some(policy),
+        })
+        .await
+        .unwrap();
+
+    let record = store
+        .get("sandbox_policy", "policy-ws-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.workspace, "my-workspace");
+}
+
 #[tokio::test]
 async fn policy_put_and_get_latest() {
     let store = test_store().await;
 
     let policy_v1 = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, &policy_v1, "hash1")
+        .put_policy_revision("p1", "sandbox-1", "default", 1, &policy_v1, "hash1")
         .await
         .unwrap();
 
@@ -630,7 +1009,7 @@ async fn policy_put_and_get_latest() {
     }
     .encode_to_vec();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, &policy_v2, "hash2")
+        .put_policy_revision("p2", "sandbox-1", "default", 2, &policy_v2, "hash2")
         .await
         .unwrap();
 
@@ -650,11 +1029,11 @@ async fn policy_get_by_version() {
     }
     .encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, &policy_v1, "h1")
+        .put_policy_revision("p1", "sandbox-1", "default", 1, &policy_v1, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, &policy_v2, "h2")
+        .put_policy_revision("p2", "sandbox-1", "default", 2, &policy_v2, "h2")
         .await
         .unwrap();
 
@@ -684,7 +1063,7 @@ async fn policy_update_status_and_get_loaded() {
 
     let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
+        .put_policy_revision("p1", "sandbox-1", "default", 1, &payload, "h1")
         .await
         .unwrap();
 
@@ -715,7 +1094,7 @@ async fn policy_status_failed_with_error() {
 
     let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
+        .put_policy_revision("p1", "sandbox-1", "default", 1, &payload, "h1")
         .await
         .unwrap();
 
@@ -739,15 +1118,15 @@ async fn policy_supersede_older() {
 
     let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
+        .put_policy_revision("p1", "sandbox-1", "default", 1, &payload, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, &payload, "h2")
+        .put_policy_revision("p2", "sandbox-1", "default", 2, &payload, "h2")
         .await
         .unwrap();
     store
-        .put_policy_revision("p3", "sandbox-1", 3, &payload, "h3")
+        .put_policy_revision("p3", "sandbox-1", "default", 3, &payload, "h3")
         .await
         .unwrap();
 
@@ -792,15 +1171,15 @@ async fn policy_list_ordered_by_version_desc() {
 
     let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
+        .put_policy_revision("p1", "sandbox-1", "default", 1, &payload, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, &payload, "h2")
+        .put_policy_revision("p2", "sandbox-1", "default", 2, &payload, "h2")
         .await
         .unwrap();
     store
-        .put_policy_revision("p3", "sandbox-1", 3, &payload, "h3")
+        .put_policy_revision("p3", "sandbox-1", "default", 3, &payload, "h3")
         .await
         .unwrap();
 
@@ -828,11 +1207,11 @@ async fn policy_isolation_between_sandboxes() {
     }
     .encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, &policy_s1, "h1")
+        .put_policy_revision("p1", "sandbox-1", "default", 1, &policy_s1, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-2", 1, &policy_s2, "h2")
+        .put_policy_revision("p2", "sandbox-2", "default", 1, &policy_s2, "h2")
         .await
         .unwrap();
 
@@ -930,6 +1309,7 @@ async fn cas_put_if_must_create_succeeds() {
             "sandbox",
             "id-1",
             "new-sandbox",
+            "default",
             b"payload",
             None,
             WriteCondition::MustCreate,
@@ -956,6 +1336,7 @@ async fn cas_put_if_must_create_fails_on_duplicate() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"payload1",
             None,
             WriteCondition::MustCreate,
@@ -969,6 +1350,7 @@ async fn cas_put_if_must_create_fails_on_duplicate() {
             "sandbox",
             "id-1",
             "sandbox-2",
+            "default",
             b"payload2",
             None,
             WriteCondition::MustCreate,
@@ -993,6 +1375,7 @@ async fn cas_put_if_match_version_succeeds() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"v1",
             None,
             WriteCondition::MustCreate,
@@ -1006,6 +1389,7 @@ async fn cas_put_if_match_version_succeeds() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"v2",
             None,
             WriteCondition::MatchResourceVersion(1),
@@ -1032,6 +1416,7 @@ async fn cas_put_if_match_version_fails_on_mismatch() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"v1",
             None,
             WriteCondition::MustCreate,
@@ -1045,6 +1430,7 @@ async fn cas_put_if_match_version_fails_on_mismatch() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"v2",
             None,
             WriteCondition::MatchResourceVersion(99),
@@ -1075,6 +1461,7 @@ async fn cas_delete_if_succeeds_with_correct_version() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"payload",
             None,
             WriteCondition::MustCreate,
@@ -1100,6 +1487,7 @@ async fn cas_delete_if_fails_with_wrong_version() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"payload",
             None,
             WriteCondition::MustCreate,
@@ -1132,6 +1520,7 @@ async fn cas_resource_version_increments() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"v1",
             None,
             WriteCondition::MustCreate,
@@ -1146,6 +1535,7 @@ async fn cas_resource_version_increments() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"v2",
             None,
             WriteCondition::MatchResourceVersion(1),
@@ -1160,6 +1550,7 @@ async fn cas_resource_version_increments() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"v3",
             None,
             WriteCondition::MatchResourceVersion(2),
@@ -1185,6 +1576,7 @@ async fn cas_concurrent_updates_one_succeeds() {
             "sandbox",
             "id-1",
             "sandbox-1",
+            "default",
             b"initial",
             None,
             WriteCondition::MustCreate,
@@ -1202,6 +1594,7 @@ async fn cas_concurrent_updates_one_succeeds() {
                     "sandbox",
                     "id-1",
                     "sandbox-1",
+                    "default",
                     format!("update-{i}").as_bytes(),
                     None,
                     WriteCondition::MatchResourceVersion(1),
@@ -1243,6 +1636,9 @@ async fn cas_update_message_cas_succeeds() {
             created_at_ms: 1000,
             labels: std::collections::HashMap::new(),
             resource_version: 0,
+            annotations: std::collections::HashMap::new(),
+            workspace: "default".to_string(),
+            deletion_timestamp_ms: 0,
         }),
         spec: None,
         status: None,
@@ -1282,6 +1678,9 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
             created_at_ms: 1000,
             labels: std::collections::HashMap::new(),
             resource_version: 0,
+            annotations: std::collections::HashMap::new(),
+            workspace: "default".to_string(),
+            deletion_timestamp_ms: 0,
         }),
         spec: None,
         status: None,
@@ -1333,5 +1732,489 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
             .map_or(0, |m| m.resource_version),
         2,
         "resource_version should be 2 (initial 1 + 1 successful update)"
+    );
+}
+
+#[tokio::test]
+async fn cas_update_message_cas_rejects_workspace_change() {
+    use openshell_core::proto::Sandbox;
+
+    let store = test_store().await;
+
+    let sandbox = Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "ws-immutable".to_string(),
+            name: "test-sandbox".to_string(),
+            created_at_ms: 1000,
+            labels: std::collections::HashMap::new(),
+            annotations: std::collections::HashMap::new(),
+            resource_version: 0,
+            workspace: "alpha".to_string(),
+            deletion_timestamp_ms: 0,
+        }),
+        spec: None,
+        status: None,
+    };
+
+    store.put_message(&sandbox).await.unwrap();
+
+    let err = store
+        .update_message_cas::<Sandbox, _>("ws-immutable", 0, |s| {
+            if let Some(meta) = s.metadata.as_mut() {
+                meta.workspace = "beta".to_string();
+            }
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, PersistenceError::Encode(_)),
+        "expected Encode error, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("cannot be changed"),
+        "error should mention immutability: {err}"
+    );
+}
+
+#[tokio::test]
+async fn cas_update_message_cas_rejects_name_change() {
+    use openshell_core::proto::Sandbox;
+
+    let store = test_store().await;
+
+    let sandbox = Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "name-immutable".to_string(),
+            name: "original".to_string(),
+            created_at_ms: 1000,
+            labels: std::collections::HashMap::new(),
+            annotations: std::collections::HashMap::new(),
+            resource_version: 0,
+            workspace: "default".to_string(),
+            deletion_timestamp_ms: 0,
+        }),
+        spec: None,
+        status: None,
+    };
+
+    store.put_message(&sandbox).await.unwrap();
+
+    let err = store
+        .update_message_cas::<Sandbox, _>("name-immutable", 0, |s| {
+            if let Some(meta) = s.metadata.as_mut() {
+                meta.name = "renamed".to_string();
+            }
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, PersistenceError::Encode(_)),
+        "expected Encode error, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("name cannot be changed"),
+        "error should mention name immutability: {err}"
+    );
+}
+
+#[tokio::test]
+async fn list_by_scope_returns_resource_version() {
+    let store = test_store().await;
+
+    // Create a scoped record via put_scoped (resource_version = 1).
+    store
+        .put_scoped(
+            "ssh_session",
+            "sess-1",
+            "sess-1",
+            "default",
+            "sandbox-owner-id",
+            b"payload-v1",
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Update via put_scoped (ON CONFLICT increments resource_version to 2).
+    store
+        .put_scoped(
+            "ssh_session",
+            "sess-1",
+            "sess-1",
+            "default",
+            "sandbox-owner-id",
+            b"payload-v2",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let records = store
+        .list_by_scope("ssh_session", "sandbox-owner-id", 100, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].resource_version, 2,
+        "list_by_scope must return the actual resource_version, not a default"
+    );
+}
+#[tokio::test]
+async fn membership_and_label_selector_filters_both() {
+    let store = test_store().await;
+
+    // Workspace objects (object_type="workspace", workspace="")
+    store
+        .put(
+            "workspace",
+            "ws-a-id",
+            "ws-a",
+            "",
+            b"p1",
+            Some(r#"{"env":"prod"}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            "workspace",
+            "ws-b-id",
+            "ws-b",
+            "",
+            b"p2",
+            Some(r#"{"env":"dev"}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            "workspace",
+            "ws-c-id",
+            "ws-c",
+            "",
+            b"p3",
+            Some(r#"{"env":"prod","team":"platform"}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            "workspace",
+            "ws-d-id",
+            "ws-d",
+            "",
+            b"p4",
+            Some(r#"{"env":"prod"}"#),
+        )
+        .await
+        .unwrap();
+
+    // Member objects: alice is a member of ws-a, ws-b, ws-c but NOT ws-d
+    store
+        .put("workspace_member", "m1-id", "alice", "ws-a", b"m1", None)
+        .await
+        .unwrap();
+    store
+        .put("workspace_member", "m2-id", "alice", "ws-b", b"m2", None)
+        .await
+        .unwrap();
+    store
+        .put("workspace_member", "m3-id", "alice", "ws-c", b"m3", None)
+        .await
+        .unwrap();
+
+    // env=prod AND alice is a member → ws-a, ws-c (not ws-b: wrong label, not ws-d: no membership)
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "env=prod",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2, "should match ws-a and ws-c");
+    let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&"ws-a"));
+    assert!(names.contains(&"ws-c"));
+
+    // env=prod,team=platform AND alice is a member → ws-c only
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "env=prod,team=platform",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1, "should match ws-c only");
+    assert_eq!(results[0].name, "ws-c");
+
+    // env=staging AND alice is a member → empty
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "env=staging",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 0, "no workspace has env=staging");
+
+    // bob has no memberships → empty even though label matches exist
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "bob",
+            "env=prod",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 0, "bob has no memberships");
+
+    // Paging: limit=1 on the env=prod query
+    let page1 = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "env=prod",
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page1.len(), 1, "page 1 should have 1 result");
+
+    let page2 = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "env=prod",
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page2.len(), 1, "page 2 should have 1 result");
+
+    let page3 = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "env=prod",
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page3.len(), 0, "page 3 should be empty");
+}
+
+#[tokio::test]
+async fn membership_and_label_selector_handles_dotted_keys() {
+    let store = test_store().await;
+
+    store
+        .put(
+            "workspace",
+            "ws-dot-id",
+            "ws-dot",
+            "",
+            b"p1",
+            Some(r#"{"example.com/env":"prod","simple":"yes"}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            "workspace",
+            "ws-plain-id",
+            "ws-plain",
+            "",
+            b"p2",
+            Some(r#"{"env":"prod"}"#),
+        )
+        .await
+        .unwrap();
+
+    store
+        .put("workspace_member", "m1", "alice", "ws-dot", b"", None)
+        .await
+        .unwrap();
+    store
+        .put("workspace_member", "m2", "alice", "ws-plain", b"", None)
+        .await
+        .unwrap();
+
+    // Dotted key selector matches only ws-dot
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "example.com/env=prod",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1, "dotted key should match ws-dot");
+    assert_eq!(results[0].name, "ws-dot");
+
+    // Combining dotted and simple keys
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "example.com/env=prod,simple=yes",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name, "ws-dot");
+
+    // Dotted key with wrong value returns nothing
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "example.com/env=staging",
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 0, "wrong value for dotted key");
+}
+
+/// Single quotes in label keys must not break the SQL query (CWE-89
+/// defense-in-depth). The gRPC validation layer rejects such keys, but the
+/// persistence layer must handle them safely regardless.
+#[tokio::test]
+async fn membership_selector_escapes_adversarial_label_key() {
+    let store = test_store().await;
+
+    store
+        .put(
+            "workspace",
+            "ws-sq-id",
+            "ws-sq",
+            "",
+            b"p1",
+            Some(r#"{"it's":"here"}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .put("workspace_member", "m1", "alice", "ws-sq", b"", None)
+        .await
+        .unwrap();
+
+    // A key containing a single quote must not cause a SQL error.
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "it's=here",
+            10,
+            0,
+        )
+        .await;
+    assert!(
+        results.is_ok(),
+        "single-quote key must not cause SQL error: {:?}",
+        results.unwrap_err()
+    );
+
+    // A key designed to break out of the SQL string literal must not match
+    // unrelated rows or cause an error.
+    let results = store
+        .list_with_membership_and_selector(
+            "workspace",
+            "workspace_member",
+            "alice",
+            "x' OR '1'='1=pwned",
+            10,
+            0,
+        )
+        .await;
+    assert!(
+        results.is_ok(),
+        "SQL injection attempt must not cause SQL error: {:?}",
+        results.unwrap_err()
+    );
+    assert_eq!(
+        results.unwrap().len(),
+        0,
+        "SQL injection must not match rows"
+    );
+}
+
+/// Store operations open a child span under whatever request span is active,
+/// so a trace decomposes an RPC into the storage work it did rather than
+/// bottoming out at the request boundary.
+#[tokio::test]
+async fn store_operations_export_spans_with_parents() {
+    use tracing::Instrument as _;
+
+    use crate::otel_tracing::test_collector;
+
+    let store = test_store().await;
+
+    let traced = test_collector::install_traced();
+    async {
+        store
+            .list("sandbox", "default", 10, 0)
+            .await
+            .expect("list succeeds");
+    }
+    .instrument(tracing::info_span!("request"))
+    .await;
+
+    let spans = traced.finished_spans();
+    let root = spans
+        .iter()
+        .find(|span| span.name == "request")
+        .expect("request span recorded");
+    let child = spans
+        .iter()
+        .find(|span| {
+            span.name == "store.list"
+                && span.span_context.trace_id() == root.span_context.trace_id()
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "a store span is recorded, got {:?}",
+                spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+            )
+        });
+
+    test_collector::assert_has_parent(child);
+    assert_eq!(
+        test_collector::attribute(child, "object_type").as_deref(),
+        Some("sandbox"),
+        "the store span records what it queried"
     );
 }

@@ -6,10 +6,10 @@
 //! This module implements connection-level multiplexing that routes requests
 //! to either the gRPC service or HTTP endpoints based on the request headers.
 
-use bytes::Bytes;
-use http::{HeaderValue, Request, Response};
+use bytes::{Bytes, BytesMut};
+use http::{Extensions, HeaderValue, Request, Response};
 use http_body::Body;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited, StreamBody};
 use hyper::body::Incoming;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
@@ -21,6 +21,12 @@ use openshell_core::Config;
 use openshell_core::proto::{
     inference_server::InferenceServer, open_shell_server::OpenShellServer,
 };
+use openshell_gateway_interceptors::{EvaluationContext, GatewayInterceptorRuntime};
+use opentelemetry::propagation::{Extractor, TextMapPropagator};
+use opentelemetry::trace::TraceContextExt as _;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
+use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -29,7 +35,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower::ServiceExt;
 use tower_http::request_id::{MakeRequestId, RequestId};
-use tracing::Span;
+use tracing::{Span, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
     OpenShellService, ServerState,
@@ -38,6 +45,7 @@ use crate::{
     auth::identity::Identity,
     auth::oidc::{self, OidcAuthenticator},
     auth::principal::{Principal, UserPrincipal},
+    gateway_listener::GatewayListenerScope,
     http_router,
     inference::InferenceService,
     service_http_router,
@@ -64,30 +72,110 @@ fn make_request_span<B>(req: &Request<B>) -> Span {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
 
-    if matches!(path, "/health" | "/healthz" | "/readyz") {
+    // `otel.name` and `otel.kind` are consumed by `tracing-opentelemetry` to
+    // set the exported span's name and kind; they are not emitted as
+    // attributes. See [`otel_span_name`] for why the name cannot simply be
+    // the callsite name.
+    let otel_name = otel_span_name(req.method(), path);
+
+    let span = if matches!(path, "/health" | "/healthz" | "/readyz") {
         tracing::debug_span!(
             "request",
             method = %req.method(),
             path,
             request_id,
+            otel.name = %otel_name,
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
+            http.response.status_code = tracing::field::Empty,
         )
     } else {
-        tracing::info_span!(
+        let span = tracing::info_span!(
             "request",
             method = %req.method(),
             path,
             request_id,
-        )
+            otel.name = %otel_name,
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
+            http.response.status_code = tracing::field::Empty,
+            rpc.system = tracing::field::Empty,
+            rpc.service = tracing::field::Empty,
+            rpc.method = tracing::field::Empty,
+            rpc.grpc.status_code = tracing::field::Empty,
+        );
+        // RPC-aware backends build service maps from these; without them a
+        // gRPC call is just an HTTP span.
+        if let Some((service, method)) = grpc_service_method(path) {
+            span.record("rpc.system", "grpc");
+            span.record("rpc.service", service);
+            span.record("rpc.method", method);
+        }
+        span
+    };
+
+    let propagator = TraceContextPropagator::new();
+    let parent = propagator.extract_with_context(
+        &opentelemetry::Context::new(),
+        &HeaderExtractor(req.headers()),
+    );
+    if parent.span().span_context().is_valid() {
+        let _ = span.set_parent(parent);
     }
+
+    span
 }
 
-/// Log response status and latency within the request span.
-fn log_response<B>(res: &Response<B>, latency: Duration, _span: &Span) {
+/// Log response status and latency, record protocol status, and mark failures.
+fn log_response<B>(res: &Response<B>, latency: Duration, span: &Span) {
+    let status = res.status();
+    span.record("http.response.status_code", status.as_u16());
+    record_grpc_status(res.headers(), span);
+    if status.is_server_error() {
+        crate::otel_tracing::mark_error(span);
+    }
     tracing::info!(
-        status = res.status().as_u16(),
+        status = status.as_u16(),
         latency_ms = latency.as_millis(),
         "response"
     );
+}
+
+fn record_response_trailers(
+    trailers: Option<&http::HeaderMap>,
+    _stream_duration: Duration,
+    span: &Span,
+) {
+    if let Some(trailers) = trailers {
+        record_grpc_status(trailers, span);
+    }
+}
+
+fn record_grpc_status(headers: &http::HeaderMap, span: &Span) {
+    let Some(code) = headers
+        .get("grpc-status")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+    else {
+        return;
+    };
+
+    span.record("rpc.grpc.status_code", code);
+    if code != 0 {
+        crate::otel_tracing::mark_error(span);
+    }
+}
+
+struct HeaderExtractor<'a>(&'a http::HeaderMap);
+
+impl Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(http::HeaderName::as_str).collect()
+    }
 }
 
 /// Wrap a service with the standard request-ID middleware stack.
@@ -105,7 +193,8 @@ macro_rules! request_id_middleware {
                 ::tower_http::trace::TraceLayer::new_for_http()
                     .make_span_with(make_request_span)
                     .on_request(())
-                    .on_response(log_response),
+                    .on_response(log_response)
+                    .on_eos(record_response_trailers),
             )
             .layer(::tower_http::request_id::PropagateRequestIdLayer::new(
                 x_request_id,
@@ -120,6 +209,7 @@ macro_rules! request_id_middleware {
 /// bound memory allocation from a single request. Sandbox creation is
 /// the largest payload and well within this cap under normal use.
 const MAX_GRPC_DECODE_SIZE: usize = 1_048_576;
+const MAX_INTERCEPTED_GRPC_BODY_SIZE: usize = MAX_GRPC_DECODE_SIZE + 5;
 
 /// Multiplexed gRPC/HTTP service.
 #[derive(Clone)]
@@ -140,7 +230,22 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_with_peer_identity(stream, None).await
+        self.serve_on_listener(stream, GatewayListenerScope::Primary)
+            .await
+    }
+
+    /// Serve a connection and preserve its listener purpose in request
+    /// extensions for downstream routing and policy decisions.
+    pub(crate) async fn serve_on_listener<S>(
+        &self,
+        stream: S,
+        listener_scope: GatewayListenerScope,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.serve_with_peer_identity_on_listener(stream, None, listener_scope)
+            .await
     }
 
     /// Serve a TLS connection with an optional mTLS peer identity.
@@ -152,8 +257,29 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.serve_with_peer_identity_on_listener(
+            stream,
+            peer_identity,
+            GatewayListenerScope::Primary,
+        )
+        .await
+    }
+
+    /// Serve a TLS connection and preserve its listener purpose in request
+    /// extensions for downstream routing and policy decisions.
+    pub(crate) async fn serve_with_peer_identity_on_listener<S>(
+        &self,
+        stream: S,
+        peer_identity: Option<Identity>,
+        listener_scope: GatewayListenerScope,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let openshell = OpenShellServer::new(OpenShellService::new(self.state.clone()))
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let openshell =
+            GatewayInterceptorGrpcService::new(openshell, self.state.gateway_interceptors.clone());
         let inference = InferenceServer::new(InferenceService::new(self.state.clone()))
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
@@ -182,7 +308,10 @@ impl MultiplexService {
         let grpc_service = request_id_middleware!(grpc_service);
         let http_service = request_id_middleware!(http_service);
 
-        let service = MultiplexedService::new(grpc_service, http_service);
+        let service = GatewayListenerContextService::new(
+            MultiplexedService::new(grpc_service, http_service),
+            listener_scope,
+        );
 
         let mut builder = Builder::new(TokioExecutor::new());
         // Server-side HTTP/2 keepalive: supervisors hold long-lived sessions, and without
@@ -211,15 +340,324 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let http_service = TowerToHyperService::new(request_id_middleware!(service_http_router(
-            self.state.clone()
-        )));
+        self.serve_service_http_on_listener(stream, GatewayListenerScope::Primary)
+            .await
+    }
+
+    /// Serve a plaintext service HTTP connection and preserve its listener
+    /// purpose in request extensions.
+    pub(crate) async fn serve_service_http_on_listener<S>(
+        &self,
+        stream: S,
+        listener_scope: GatewayListenerScope,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let http_service = GatewayListenerContextService::new(
+            TowerToHyperService::new(request_id_middleware!(service_http_router(
+                self.state.clone()
+            ))),
+            listener_scope,
+        );
 
         Builder::new(TokioExecutor::new())
             .serve_connection_with_upgrades(TokioIo::new(stream), http_service)
             .await?;
 
         Ok(())
+    }
+}
+
+/// Adds the immutable listener authorization scope to every served request.
+#[derive(Clone)]
+struct GatewayListenerContextService<S> {
+    inner: S,
+    listener_scope: GatewayListenerScope,
+}
+
+impl<S> GatewayListenerContextService<S> {
+    fn new(inner: S, listener_scope: GatewayListenerScope) -> Self {
+        Self {
+            inner,
+            listener_scope,
+        }
+    }
+}
+
+impl<S, B> hyper::service::Service<Request<B>> for GatewayListenerContextService<S>
+where
+    S: hyper::service::Service<Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn call(&self, mut request: Request<B>) -> Self::Future {
+        request.extensions_mut().insert(self.listener_scope);
+        self.inner.call(request)
+    }
+}
+
+/// `OpenShell` gRPC wrapper that applies configured gateway interceptors before
+/// tonic dispatches to a specific RPC handler.
+#[derive(Clone)]
+struct GatewayInterceptorGrpcService<S> {
+    inner: S,
+    interceptors: Option<GatewayInterceptorRuntime>,
+}
+
+impl<S> GatewayInterceptorGrpcService<S> {
+    fn new(inner: S, interceptors: Option<GatewayInterceptorRuntime>) -> Self {
+        Self {
+            inner,
+            interceptors,
+        }
+    }
+}
+
+impl<S> tower::Service<Request<BoxBody>> for GatewayInterceptorGrpcService<S>
+where
+    S: tower::Service<Request<BoxBody>, Response = Response<tonic::body::Body>>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
+        let interceptors = self.interceptors.clone();
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            let Some(interceptors) = interceptors else {
+                return inner.ready().await?.call(req).await;
+            };
+
+            let path = req.uri().path().to_string();
+            if !interceptors.should_intercept_path(&path) {
+                return inner.ready().await?.call(req).await;
+            }
+
+            let context = gateway_interceptor_context(req.extensions());
+            let (parts, body) = req.into_parts();
+            let body = match collect_intercepted_grpc_body(body).await {
+                Ok(body) => body,
+                Err(status) => return Ok(status.into_http()),
+            };
+
+            let intercepted = match interceptors.evaluate_request(&path, &body, &context).await {
+                Ok(intercepted) => intercepted,
+                Err(status) => return Ok(status.into_http()),
+            };
+
+            let req = Request::from_parts(
+                parts,
+                boxed_body_from_bytes(Bytes::from(intercepted.body.clone())),
+            );
+            let response = inner.ready().await?.call(req).await?;
+
+            if grpc_status_from_response(&response) != "0"
+                || !interceptors.has_post_commit(&intercepted)
+            {
+                return Ok(response);
+            }
+
+            let (response, observation) = observe_intercepted_grpc_response(response).await;
+            let (response_body, trailers) = match observation {
+                Ok(observation) => observation,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "gateway post-commit response observation failed; preserving committed response"
+                    );
+                    counter!(
+                        "openshell_gateway_interceptor_post_commit_observation_failures_total",
+                        "stage" => "response_body"
+                    )
+                    .increment(1);
+                    return Ok(response);
+                }
+            };
+            if grpc_status_from_response_and_trailers(&response, trailers.as_ref()) == "0"
+                && let Err(status) = interceptors
+                    .evaluate_post_commit(&intercepted, &response_body, &context)
+                    .await
+            {
+                warn!(
+                    error = %status,
+                    "gateway post-commit evaluation failed; preserving committed response"
+                );
+                counter!(
+                    "openshell_gateway_interceptor_post_commit_observation_failures_total",
+                    "stage" => "evaluation"
+                )
+                .increment(1);
+            }
+
+            Ok(response)
+        })
+    }
+}
+
+async fn collect_intercepted_grpc_body(body: BoxBody) -> Result<Bytes, tonic::Status> {
+    Limited::new(body, MAX_INTERCEPTED_GRPC_BODY_SIZE)
+        .collect()
+        .await
+        .map(http_body_util::Collected::to_bytes)
+        .map_err(|err| {
+            if err.downcast_ref::<LengthLimitError>().is_some() {
+                tonic::Status::resource_exhausted(format!(
+                    "gRPC request body exceeds interceptor evaluation limit of {MAX_INTERCEPTED_GRPC_BODY_SIZE} bytes"
+                ))
+            } else {
+                tonic::Status::internal(format!(
+                    "failed to read gRPC request body for interceptor evaluation: {err}"
+                ))
+            }
+        })
+}
+
+fn boxed_body_from_bytes(bytes: Bytes) -> BoxBody {
+    let body = Full::new(bytes)
+        .map_err(|never: Infallible| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
+        .boxed_unsync();
+    BoxBody(body)
+}
+
+async fn observe_intercepted_grpc_response(
+    response: Response<tonic::body::Body>,
+) -> (
+    Response<tonic::body::Body>,
+    Result<(Bytes, Option<http::HeaderMap>), String>,
+) {
+    let (parts, mut body) = response.into_parts();
+    let mut frames = Vec::new();
+    let mut bytes = BytesMut::new();
+    let mut trailers = None;
+
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Some(data) = frame.data_ref() {
+                    bytes.extend_from_slice(data);
+                }
+                if let Some(frame_trailers) = frame.trailers_ref() {
+                    trailers = Some(frame_trailers.clone());
+                }
+                frames.push(Ok(frame));
+            }
+            Err(status) => {
+                let error =
+                    format!("failed to read gRPC response for post-commit evaluation: {status}");
+                frames.push(Err(status));
+                return (
+                    Response::from_parts(parts, tonic_body_from_frames(frames)),
+                    Err(error),
+                );
+            }
+        }
+    }
+
+    (
+        Response::from_parts(parts, tonic_body_from_frames(frames)),
+        Ok((bytes.freeze(), trailers)),
+    )
+}
+
+#[cfg(test)]
+fn tonic_body_from_bytes_and_trailers(
+    bytes: Bytes,
+    trailers: Option<http::HeaderMap>,
+) -> tonic::body::Body {
+    let mut frames: Vec<Result<http_body::Frame<Bytes>, tonic::Status>> = Vec::with_capacity(2);
+    if !bytes.is_empty() {
+        frames.push(Ok(http_body::Frame::data(bytes)));
+    }
+    if let Some(trailers) = trailers {
+        frames.push(Ok(http_body::Frame::trailers(trailers)));
+    }
+    tonic_body_from_frames(frames)
+}
+
+fn tonic_body_from_frames(
+    frames: Vec<Result<http_body::Frame<Bytes>, tonic::Status>>,
+) -> tonic::body::Body {
+    tonic::body::Body::new(StreamBody::new(futures::stream::iter(frames)))
+}
+
+fn gateway_interceptor_context(extensions: &Extensions) -> EvaluationContext {
+    EvaluationContext {
+        principal: extensions
+            .get::<Principal>()
+            .map_or_else(unknown_gateway_principal, gateway_principal_fields),
+        validate_current_state: None,
+    }
+}
+
+fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
+    use crate::auth::principal::SandboxIdentitySource;
+
+    let mut fields = BTreeMap::new();
+    match principal {
+        Principal::User(user) => {
+            fields.insert("kind".to_string(), "user".to_string());
+            fields.insert("subject".to_string(), user.identity.subject.clone());
+            if let Some(display_name) = &user.identity.display_name {
+                fields.insert("display_name".to_string(), display_name.clone());
+            }
+            fields.insert(
+                "provider".to_string(),
+                identity_provider_name(user.identity.provider).to_string(),
+            );
+            if !user.identity.roles.is_empty() {
+                fields.insert("roles".to_string(), user.identity.roles.join(","));
+            }
+            if !user.identity.scopes.is_empty() {
+                fields.insert("scopes".to_string(), user.identity.scopes.join(","));
+            }
+        }
+        Principal::Sandbox(sandbox) => {
+            fields.insert("kind".to_string(), "sandbox".to_string());
+            fields.insert("sandbox_id".to_string(), sandbox.sandbox_id.clone());
+            fields.insert(
+                "source".to_string(),
+                match &sandbox.source {
+                    SandboxIdentitySource::BootstrapJwt { .. } => "bootstrap_jwt",
+                    SandboxIdentitySource::BootstrapCert { .. } => "bootstrap_cert",
+                    SandboxIdentitySource::K8sServiceAccount { .. } => "k8s_service_account",
+                }
+                .to_string(),
+            );
+            if let Some(trust_domain) = &sandbox.trust_domain {
+                fields.insert("trust_domain".to_string(), trust_domain.clone());
+            }
+        }
+        Principal::Anonymous => {
+            fields.insert("kind".to_string(), "anonymous".to_string());
+        }
+    }
+    fields
+}
+
+fn unknown_gateway_principal() -> BTreeMap<String, String> {
+    BTreeMap::from([("kind".to_string(), "unknown".to_string())])
+}
+
+fn identity_provider_name(provider: crate::auth::identity::IdentityProvider) -> &'static str {
+    match provider {
+        crate::auth::identity::IdentityProvider::Oidc => "oidc",
+        crate::auth::identity::IdentityProvider::Mtls => "mtls",
+        crate::auth::identity::IdentityProvider::CloudflareAccess => "cloudflare_access",
+        crate::auth::identity::IdentityProvider::LocalDev => "local_dev",
     }
 }
 
@@ -588,9 +1026,10 @@ where
             } else if allow_unauthenticated_users {
                 unauthenticated_dev_user_principal()
             } else {
-                // No auth configured — pass through for dev /
-                // fronting-proxy deployments.
-                return inner.ready().await?.call(req).await;
+                // No auth configured — dev / fronting-proxy deployments.
+                // Inject a local-dev principal so downstream handlers that
+                // call extract_principal() always find one.
+                unauthenticated_dev_user_principal()
             };
 
             match principal {
@@ -724,10 +1163,52 @@ fn grpc_method_from_path(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
+/// Name for the exported `OpenTelemetry` span, per the `OTel` semantic
+/// conventions: `$service/$method` for RPCs and the method for plain HTTP.
+///
+/// The gateway cannot determine route templates for proxied sandbox
+/// applications, so including the literal path would create high-cardinality
+/// operation names. The path remains available as a span attribute.
+///
+/// The `tracing` callsite name is the constant `"request"` because `tracing`
+/// requires `'static` span names, so the per-request name is carried in the
+/// `otel.name` field instead.
+fn otel_span_name(method: &http::Method, path: &str) -> String {
+    grpc_service_method(path).map_or_else(
+        || method.to_string(),
+        |(service, rpc_method)| format!("{service}/{rpc_method}"),
+    )
+}
+
+/// Split a gRPC path into its service and method.
+///
+/// A gRPC path is exactly "/package.Service/Method". Anything else — a health
+/// check, /metrics, a sandbox service URL — is plain HTTP.
+fn grpc_service_method(path: &str) -> Option<(&str, &str)> {
+    let mut segments = path.strip_prefix('/')?.split('/');
+    let service = segments.next()?;
+    let method = segments.next()?;
+    if segments.next().is_some() || !service.contains('.') || method.is_empty() {
+        return None;
+    }
+    Some((service, method))
+}
+
 fn grpc_status_from_response<B>(res: &Response<B>) -> String {
     res.headers()
         .get("grpc-status")
         .and_then(|v| v.to_str().ok())
+        .map_or_else(|| "0".to_string(), ToString::to_string)
+}
+
+fn grpc_status_from_response_and_trailers<B>(
+    res: &Response<B>,
+    trailers: Option<&http::HeaderMap>,
+) -> String {
+    trailers
+        .and_then(|trailers| trailers.get("grpc-status"))
+        .or_else(|| res.headers().get("grpc-status"))
+        .and_then(|value| value.to_str().ok())
         .map_or_else(|| "0".to_string(), ToString::to_string)
 }
 
@@ -806,9 +1287,113 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http_body_util::Empty;
+    use openshell_core::GatewayInterceptorConfig;
+    use openshell_core::proto::CreateSandboxRequest;
+    use openshell_core::proto::gateway_interceptor::v1::{
+        DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorEvaluation,
+        InterceptorManifest, InterceptorResult, InterceptorSelector, ProviderProfileSnapshot,
+        ProviderProfileSnapshotRequest,
+        gateway_interceptor_server::{GatewayInterceptor, GatewayInterceptorServer},
+    };
+    use prost::Message as _;
+    use std::convert::Infallible;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_stream::wrappers::TcpListenerStream;
     use tower::Service;
+
+    #[tokio::test]
+    async fn listener_context_service_preserves_listener_scope() {
+        let observed = Arc::new(Mutex::new(None));
+        let captured = observed.clone();
+        let inner = hyper::service::service_fn(move |request: Request<Empty<Bytes>>| {
+            *captured.lock().unwrap() = request.extensions().get::<GatewayListenerScope>().copied();
+            async move { Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new())) }
+        });
+        let service = GatewayListenerContextService::new(inner, GatewayListenerScope::Primary);
+        hyper::service::Service::call(&service, Request::new(Empty::<Bytes>::new()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(GatewayListenerScope::Primary)
+        );
+    }
+
+    #[derive(Clone)]
+    struct PostCommitTestInterceptor;
+
+    #[tonic::async_trait]
+    impl GatewayInterceptor for PostCommitTestInterceptor {
+        async fn describe(
+            &self,
+            _request: tonic::Request<DescribeRequest>,
+        ) -> Result<tonic::Response<InterceptorManifest>, tonic::Status> {
+            Ok(tonic::Response::new(InterceptorManifest {
+                name: "post-commit-test".to_string(),
+                failure_policy: "fail_open".to_string(),
+                bindings: vec![InterceptorBinding {
+                    id: "audit-create-sandbox".to_string(),
+                    selector: Some(InterceptorSelector {
+                        rpc: "openshell.v1.OpenShell/CreateSandbox".to_string(),
+                        service: String::new(),
+                        method: String::new(),
+                    }),
+                    phases: vec![GatewayInterceptorPhase::PostCommit as i32],
+                    failure_policy: "fail_open".to_string(),
+                }],
+                provider_profiles: false,
+            }))
+        }
+
+        async fn evaluate(
+            &self,
+            _request: tonic::Request<InterceptorEvaluation>,
+        ) -> Result<tonic::Response<InterceptorResult>, tonic::Status> {
+            Ok(tonic::Response::new(InterceptorResult {
+                allowed: true,
+                ..InterceptorResult::default()
+            }))
+        }
+
+        async fn snapshot_provider_profiles(
+            &self,
+            _request: tonic::Request<ProviderProfileSnapshotRequest>,
+        ) -> Result<tonic::Response<ProviderProfileSnapshot>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not a profile source"))
+        }
+    }
+
+    fn grpc_frame(message: &[u8]) -> Bytes {
+        let mut frame = Vec::with_capacity(5 + message.len());
+        frame.push(0);
+        frame.extend_from_slice(&u32::try_from(message.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(message);
+        Bytes::from(frame)
+    }
+
+    async fn post_commit_test_runtime() -> (GatewayInterceptorRuntime, tokio::task::JoinHandle<()>)
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(GatewayInterceptorServer::new(PostCommitTestInterceptor))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let runtime = openshell_gateway_interceptors::initialize(vec![GatewayInterceptorConfig {
+            name: "post-commit-test".to_string(),
+            grpc_endpoint: format!("http://{address}"),
+            ..GatewayInterceptorConfig::default()
+        }])
+        .await
+        .unwrap()
+        .unwrap();
+        (runtime, task)
+    }
 
     #[test]
     fn uuid_request_id_generates_valid_uuid() {
@@ -884,6 +1469,113 @@ mod tests {
         }
         let req = builder.body(Empty::<Bytes>::new()).unwrap();
         sender.send_request(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn intercepted_grpc_body_collection_rejects_oversized_body() {
+        let oversized = Bytes::from(vec![0_u8; MAX_INTERCEPTED_GRPC_BODY_SIZE + 1]);
+        let status = collect_intercepted_grpc_body(boxed_body_from_bytes(oversized))
+            .await
+            .expect_err("oversized body should be rejected");
+
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn intercepted_grpc_response_preserves_body_and_trailers() {
+        let bytes = Bytes::from_static(b"committed-response");
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        let response = Response::new(tonic_body_from_bytes_and_trailers(
+            bytes.clone(),
+            Some(trailers.clone()),
+        ));
+
+        let (response, observation) = observe_intercepted_grpc_response(response).await;
+        let (observed, observed_trailers) = observation.unwrap();
+
+        assert_eq!(observed, bytes);
+        assert_eq!(observed_trailers.as_ref(), Some(&trailers));
+        assert_eq!(
+            grpc_status_from_response_and_trailers(&response, observed_trailers.as_ref()),
+            "0"
+        );
+
+        let collected = response.into_body().collect().await.unwrap();
+        assert_eq!(collected.trailers(), Some(&trailers));
+        assert_eq!(collected.to_bytes(), bytes);
+    }
+
+    #[tokio::test]
+    async fn intercepted_grpc_response_preserves_body_error() {
+        let bytes = Bytes::from_static(b"committed-response-prefix");
+        let response = Response::new(tonic_body_from_frames(vec![
+            Ok(http_body::Frame::data(bytes.clone())),
+            Err(tonic::Status::unavailable("response stream failed")),
+        ]));
+
+        let (response, observation) = observe_intercepted_grpc_response(response).await;
+
+        let observation_error = observation.unwrap_err();
+        assert!(observation_error.contains("failed to read gRPC response"));
+        assert!(observation_error.contains("response stream failed"));
+        let mut body = response.into_body();
+        let data = body.frame().await.unwrap().unwrap();
+        assert_eq!(data.data_ref(), Some(&bytes));
+        let status = body.frame().await.unwrap().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "response stream failed");
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn post_commit_decode_failure_preserves_committed_response() {
+        let (runtime, interceptor_task) = post_commit_test_runtime().await;
+        let committed = Arc::new(AtomicUsize::new(0));
+        let committed_for_service = committed.clone();
+        let committed_body = Bytes::from_static(b"malformed committed gRPC response");
+        let committed_body_for_service = committed_body.clone();
+        let inner = tower::service_fn(move |_request: Request<BoxBody>| {
+            let committed = committed_for_service.clone();
+            let body = committed_body_for_service.clone();
+            async move {
+                committed.fetch_add(1, Ordering::SeqCst);
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("grpc-status", HeaderValue::from_static("0"));
+                Ok::<_, Infallible>(Response::new(tonic_body_from_bytes_and_trailers(
+                    body,
+                    Some(trailers),
+                )))
+            }
+        });
+        let mut service = GatewayInterceptorGrpcService::new(inner, Some(runtime));
+        let request_body = grpc_frame(&CreateSandboxRequest::default().encode_to_vec());
+        let request = Request::builder()
+            .uri("/openshell.v1.OpenShell/CreateSandbox")
+            .body(boxed_body_from_bytes(request_body))
+            .unwrap();
+
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+
+        assert_eq!(committed.load(Ordering::SeqCst), 1);
+        let collected = response.into_body().collect().await.unwrap();
+        assert_eq!(collected.to_bytes(), committed_body);
+        interceptor_task.abort();
+    }
+
+    #[test]
+    fn grpc_trailer_status_takes_precedence_over_headers() {
+        let response = Response::builder()
+            .header("grpc-status", "0")
+            .body(())
+            .unwrap();
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("7"));
+
+        assert_eq!(
+            grpc_status_from_response_and_trailers(&response, Some(&trailers)),
+            "7"
+        );
     }
 
     #[tokio::test]
@@ -963,7 +1655,7 @@ mod tests {
 
     impl Service<Request<()>> for CountingGrpcService {
         type Response = Response<tonic::body::Body>;
-        type Error = std::convert::Infallible;
+        type Error = Infallible;
         type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
 
         fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -995,7 +1687,7 @@ mod tests {
 
     impl Service<Request<()>> for PendingInnerService {
         type Response = Response<tonic::body::Body>;
-        type Error = std::convert::Infallible;
+        type Error = Infallible;
         type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
 
         fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -1242,7 +1934,6 @@ mod tests {
     #[test]
     fn request_id_appears_in_trace_span() {
         use tracing_subscriber::fmt::format::FmtSpan;
-        use tracing_subscriber::layer::SubscriberExt;
 
         let log_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let writer = TraceBuf(log_buf.clone());
@@ -1252,23 +1943,284 @@ mod tests {
             .with_ansi(false)
             .with_span_events(FmtSpan::CLOSE);
 
-        let subscriber = tracing_subscriber::registry().with(fmt_layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            tracing_subscriber::registry().with(fmt_layer)
+        };
+        {
+            let _traced = crate::otel_tracing::test_collector::install_scoped(subscriber);
 
-        let req = Request::builder()
-            .uri("/test-path")
-            .header("x-request-id", "trace-test-id-12345")
-            .body(Empty::<Bytes>::new())
-            .unwrap();
-        let span = make_request_span(&req);
-        drop(span.enter());
-        drop(span);
+            let req = Request::builder()
+                .uri("/test-path")
+                .header("x-request-id", "trace-test-id-12345")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let span = make_request_span(&req);
+            drop(span.enter());
+            drop(span);
+        }
 
         let output = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
         assert!(
             output.contains("trace-test-id-12345"),
             "trace output should contain the request_id recorded in the span, got: {output}"
         );
+    }
+
+    /// The `TraceLayer` creates the server span, so no gRPC handler needs
+    /// `#[instrument]`. The request ID carries into it so a trace can be
+    /// correlated with the gateway's logs.
+    #[tokio::test]
+    async fn request_span_exports_over_otlp_with_request_id() {
+        use crate::otel_tracing::test_collector;
+
+        let traced = test_collector::install_traced();
+        let req = Request::builder()
+            .uri("/openshell.v1.OpenShell/CreateSandbox")
+            .header("x-request-id", "otlp-req-id-9876")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let span = make_request_span(&req);
+        drop(span.enter());
+        drop(span);
+
+        let spans = traced.finished_spans();
+        let span = spans
+            .iter()
+            .find(|s| s.name == "openshell.v1.OpenShell/CreateSandbox")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the per-request span is recorded under its RPC name, got {:?}",
+                    spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            test_collector::attribute(span, "request_id").as_deref(),
+            Some("otlp-req-id-9876"),
+        );
+        assert_eq!(
+            test_collector::attribute(span, "path").as_deref(),
+            Some("/openshell.v1.OpenShell/CreateSandbox"),
+        );
+        assert_eq!(
+            span.span_kind,
+            opentelemetry::trace::SpanKind::Server,
+            "trace UIs lay this out as a served call, not an internal operation"
+        );
+        test_collector::assert_is_root(span);
+        assert_eq!(
+            test_collector::attribute(span, "rpc.system").as_deref(),
+            Some("grpc"),
+        );
+        assert_eq!(
+            test_collector::attribute(span, "rpc.service").as_deref(),
+            Some("openshell.v1.OpenShell"),
+        );
+        assert_eq!(
+            test_collector::attribute(span, "rpc.method").as_deref(),
+            Some("CreateSandbox"),
+        );
+    }
+
+    #[tokio::test]
+    async fn request_span_continues_the_incoming_trace() {
+        use crate::otel_tracing::test_collector;
+
+        let traced = test_collector::install_traced();
+        let req = Request::builder()
+            .uri("/openshell.v1.OpenShell/CreateSandbox")
+            .header(
+                "traceparent",
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            )
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let span = make_request_span(&req);
+        drop(span.enter());
+        drop(span);
+
+        let span = traced.span_with(
+            "openshell.v1.OpenShell/CreateSandbox",
+            "rpc.method",
+            "CreateSandbox",
+        );
+        assert_eq!(
+            span.span_context.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(
+            span.parent_span_id.to_string(),
+            "00f067aa0ba902b7",
+            "the server span is a child of the caller's span"
+        );
+    }
+
+    /// A failed request must be distinguishable from a successful one in a
+    /// trace UI, which keys off span status rather than a logged field.
+    #[tokio::test]
+    async fn request_spans_record_the_response_outcome() {
+        use crate::otel_tracing::test_collector;
+
+        let traced = test_collector::install_traced();
+        for (path, status) in [
+            ("/openshell.v1.OpenShell/CreateSandbox", 500),
+            ("/openshell.v1.OpenShell/ListSandboxes", 200),
+        ] {
+            let req = Request::builder()
+                .uri(path)
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let span = make_request_span(&req);
+            let res = Response::builder()
+                .status(status)
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let entered = span.enter();
+            log_response(&res, Duration::from_millis(3), &span);
+            drop(entered);
+            drop(span);
+        }
+
+        let spans = traced.finished_spans();
+        let failed = spans
+            .iter()
+            .find(|s| s.name == "openshell.v1.OpenShell/CreateSandbox")
+            .expect("failed request span recorded");
+        let succeeded = spans
+            .iter()
+            .find(|s| s.name == "openshell.v1.OpenShell/ListSandboxes")
+            .expect("successful request span recorded");
+
+        assert_eq!(
+            test_collector::attribute(failed, "http.response.status_code").as_deref(),
+            Some("500"),
+            "the response status is an attribute, not only a log field"
+        );
+        assert!(
+            matches!(failed.status, opentelemetry::trace::Status::Error { .. }),
+            "the span carries error status so trace UIs flag it, got {:?}",
+            failed.status
+        );
+        assert!(
+            !matches!(succeeded.status, opentelemetry::trace::Status::Error { .. }),
+            "got {:?}",
+            succeeded.status
+        );
+    }
+
+    #[tokio::test]
+    async fn request_span_records_grpc_status_from_trailers() {
+        use crate::otel_tracing::test_collector;
+
+        let traced = test_collector::install_traced();
+        let req = Request::builder()
+            .uri("/openshell.v1.OpenShell/CreateSandbox")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let span = make_request_span(&req);
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("13"));
+        record_response_trailers(Some(&trailers), Duration::from_millis(3), &span);
+        drop(span);
+
+        let span = traced.span_with(
+            "openshell.v1.OpenShell/CreateSandbox",
+            "rpc.method",
+            "CreateSandbox",
+        );
+        assert_eq!(
+            test_collector::attribute(&span, "rpc.grpc.status_code").as_deref(),
+            Some("13")
+        );
+        assert!(
+            matches!(span.status, opentelemetry::trace::Status::Error { .. }),
+            "a non-OK gRPC trailer marks the span as failed"
+        );
+    }
+
+    /// Without upstream trace context, each inbound entrypoint roots a trace
+    /// named for its RPC or HTTP method.
+    #[tokio::test]
+    async fn each_entrypoint_gets_its_own_root_span() {
+        use crate::otel_tracing::test_collector;
+
+        let paths = [
+            "/openshell.v1.OpenShell/CreateSandbox",
+            "/openshell.v1.OpenShell/ListSandboxes",
+            "/openshell.v1.OpenShell/DeleteSandbox",
+            "/openshell.inference.v1.Inference/GetInferenceBundle",
+            "/metrics",
+        ];
+
+        let traced = test_collector::install_traced();
+        for path in paths {
+            let req = Request::builder()
+                .uri(path)
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let span = make_request_span(&req);
+            drop(span.enter());
+            drop(span);
+        }
+
+        let names: std::collections::BTreeSet<String> = traced
+            .finished_spans()
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
+
+        let expected = [
+            "GET",
+            "openshell.inference.v1.Inference/GetInferenceBundle",
+            "openshell.v1.OpenShell/CreateSandbox",
+            "openshell.v1.OpenShell/DeleteSandbox",
+            "openshell.v1.OpenShell/ListSandboxes",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(
+            expected.is_subset(&names),
+            "each entrypoint exports under its own name, got {names:?}"
+        );
+        assert!(
+            !names.contains("request"),
+            "no entrypoint falls back to the generic callsite name, got {names:?}"
+        );
+    }
+
+    /// gRPC spans are named for the RPC, per the OpenTelemetry RPC semantic
+    /// conventions (`$service/$method`).
+    #[test]
+    fn grpc_request_spans_are_named_for_the_rpc() {
+        assert_eq!(
+            otel_span_name(&http::Method::POST, "/openshell.v1.OpenShell/CreateSandbox"),
+            "openshell.v1.OpenShell/CreateSandbox"
+        );
+        assert_eq!(
+            otel_span_name(
+                &http::Method::POST,
+                "/openshell.inference.v1.Inference/GetInferenceBundle"
+            ),
+            "openshell.inference.v1.Inference/GetInferenceBundle"
+        );
+    }
+
+    /// Non-RPC paths use a low-cardinality method-only name because sandbox
+    /// application routes are opaque to the gateway.
+    #[test]
+    fn http_request_spans_do_not_include_the_literal_path() {
+        assert_eq!(otel_span_name(&http::Method::GET, "/users/12345"), "GET");
+        assert_eq!(otel_span_name(&http::Method::GET, "/users/67890"), "GET");
+    }
+
+    /// A path with no service segment must not produce a span named after a
+    /// stray slash or an empty string.
+    #[test]
+    fn bare_paths_fall_back_to_the_http_shape() {
+        assert_eq!(otel_span_name(&http::Method::GET, "/"), "GET");
+        assert_eq!(otel_span_name(&http::Method::POST, "/Foo"), "POST");
     }
 
     #[test]
@@ -1376,7 +2328,7 @@ mod tests {
 
         impl<B: Send + 'static> Service<Request<B>> for PrincipalRecorder {
             type Response = Response<tonic::body::Body>;
-            type Error = std::convert::Infallible;
+            type Error = Infallible;
             type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
             fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -1678,8 +2630,8 @@ mod tests {
                 "/openshell.v1.OpenShell/DeleteSandbox",
                 "/openshell.v1.OpenShell/CreateProvider",
                 "/openshell.v1.OpenShell/ApproveDraftChunk",
-                "/openshell.inference.v1.Inference/GetClusterInference",
-                "/openshell.inference.v1.Inference/SetClusterInference",
+                "/openshell.inference.v1.Inference/GetInferenceRoute",
+                "/openshell.inference.v1.Inference/SetInferenceRoute",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
                 let chain = AuthenticatorChain::new(vec![mock]);

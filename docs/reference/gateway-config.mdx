@@ -104,6 +104,21 @@ guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 grpc_rate_limit_requests       = 120
 grpc_rate_limit_window_seconds = 60
 
+# Optional exact provider-profile source composition. When omitted, the
+# gateway uses builtin + user.
+provider_profile_sources = [
+  { type = "builtin" },
+  { type = "user" },
+]
+
+# Operator-run supervisor middleware. The gRPC endpoint must be reachable from
+# both the gateway and sandbox supervisors.
+[[openshell.supervisor.middleware]]
+name = "local-content-guard"
+grpc_endpoint = "http://host.openshell.internal:50051"
+max_body_bytes = 262144
+timeout = "500ms"
+
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
@@ -125,6 +140,11 @@ allow_unauthenticated_users = false
 [openshell.gateway.mtls_auth]
 enabled = false
 
+# OTLP export. Omit this table entirely to disable it.
+[openshell.gateway.otlp]
+endpoint     = "http://otel-collector.observability.svc:4317"
+service_name = "openshell-gateway"
+
 [openshell.gateway.oidc]
 issuer        = "https://idp.example.com/realms/openshell"
 audience      = "openshell-cli"
@@ -133,6 +153,25 @@ roles_claim   = "realm_access.roles"
 admin_role    = "openshell-admin"
 user_role     = "openshell-user"
 scopes_claim  = ""
+
+[[openshell.gateway.interceptors]]
+name               = "quota"
+grpc_endpoint      = "unix:///run/openshell/interceptors/quota.sock"
+order              = 10
+failure_policy     = "fail_closed"
+binding_policy     = "allowlist"
+timeout            = "500ms"
+max_response_bytes = 1048576
+max_patches        = 32
+
+[[openshell.gateway.interceptors.bindings]]
+rpc            = "openshell.v1.OpenShell/CreateSandbox"
+phases         = ["modify_operation", "validate"]
+failure_policy = "fail_closed"
+
+[[openshell.gateway.interceptors.bindings]]
+rpc    = "openshell.v1.OpenShell/UpdateConfig"
+phases = ["validate"]
 ```
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
@@ -140,6 +179,104 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 `[openshell.gateway.gateway_jwt] ttl_secs` controls gateway-minted sandbox JWT lifetime. When omitted, it defaults to `0`: the token `exp` claim and `expires_at_ms` response field become `0`, and the sandbox JWT does not expire. Use that default only for local single-player Docker, Podman, or VM gateways. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway uses `0`.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
+
+## OTLP Export
+
+`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export; there is no separate `enabled` flag.
+
+The gateway already uses the Rust `tracing` framework for structured logs sent to stdout and the sandbox log stream. Enabling this section adds an OpenTelemetry layer to the same tracing subscriber. It exports span trees to an OTLP collector without exporting, replacing, or redirecting the existing log events.
+
+```toml
+[openshell.gateway.otlp]
+endpoint     = "http://otel-collector.observability.svc:4317"
+service_name = "openshell-gateway"
+```
+
+`endpoint` is required and must be a valid URI. If it is malformed, the gateway logs the configuration error and continues with export disabled. It does not connect at startup: an unreachable collector produces export failures, never a failure to serve.
+
+The transport is **OTLP over gRPC only**. HTTP/protobuf and HTTP/JSON are not supported, and `OTEL_EXPORTER_OTLP_PROTOCOL` has no effect. Point `endpoint` at a collector's gRPC receiver, conventionally port `4317`, not the HTTP receiver on `4318`. A URI alone cannot distinguish the two, so an HTTP endpoint is accepted at startup and then fails on export.
+
+The OpenTelemetry SDK logs export failures after startup. Spans in a failed batch are dropped rather than retried.
+
+`service_name` sets the `service.name` resource attribute and defaults to `openshell-gateway`. The gateway also reports `service.version`.
+
+Only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce server spans named for the RPC or HTTP method. Store and compute-driver operations appear as child spans. Internal reconciliation, credential-refresh, and driver-watch loops create operation roots for their store work because no inbound request supplies a parent. The gateway continues valid W3C `traceparent` context and starts a new trace when none is supplied. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. Health endpoint spans use DEBUG level and are not exported by the default INFO filter.
+
+### Tuning
+
+This table decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys:
+
+| Variable | Effect |
+|---|---|
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | Sampling strategy and ratio. Defaults to `parentbased_always_on`. |
+| `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_EXPORT_TIMEOUT` | Batch span processor tuning. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Additional resource attributes, such as `deployment.environment=prod`. |
+| `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, `OTEL_SPAN_EVENT_COUNT_LIMIT`, `OTEL_SPAN_LINK_COUNT_LIMIT` | Per-span limits. |
+| `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_COMPRESSION`, `OTEL_EXPORTER_OTLP_TIMEOUT` | Exporter transport tuning. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | No effect. The gateway is built with the gRPC exporter only. |
+
+To sample 10% of traces:
+
+```shell
+OTEL_TRACES_SAMPLER=parentbased_traceidratio OTEL_TRACES_SAMPLER_ARG=0.1
+```
+
+`OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` are deliberately ignored. Enablement has one source, so an environment variable cannot silently turn export on or redirect it. `OTEL_RESOURCE_ATTRIBUTES` does apply and adds attributes, but a `service_name` set here wins over `OTEL_SERVICE_NAME`.
+
+The gateway flushes buffered spans during shutdown, so spans from in-flight requests survive a `SIGTERM`.
+
+## Supervisor Middleware Services
+
+Register operator-run supervisor middleware services with one or more `[[openshell.supervisor.middleware]]` entries. Registration is static and operator-owned; changing it requires restarting the gateway.
+
+```toml
+[[openshell.supervisor.middleware]]
+name = "local-content-guard"
+grpc_endpoint = "http://host.openshell.internal:50051"
+max_body_bytes = 262144
+timeout = "500ms"
+```
+
+Each service implements the supervisor middleware gRPC contract and exposes bindings through `Describe`. Policies reference the operator-owned registration `name`, attaching the complete middleware and all of its bindings. Bindings are identified by operation and phase. A manifest may expose at most one binding for each operation and phase pair; V1 supports only `HttpRequest/pre_credentials`, so a service currently exposes one binding. Registration names must be unique, and operator-run registrations cannot claim the reserved `openshell/` namespace. The service-reported manifest name is diagnostic metadata and does not need to match the registration name.
+
+The gateway connects to every registered service and validates `Describe` before it starts. The service must therefore be running before the gateway. Policy creation and full policy updates call `ValidateConfig`; an unavailable service or invalid middleware configuration rejects the policy before persistence.
+
+`max_body_bytes` is the operator limit for every binding exposed by the service. It must be greater than zero, no larger than each binding's advertised limit, and no larger than the 4 MiB platform maximum. OpenShell rejects an oversized value instead of silently clamping it. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size body and its protobuf envelope fit on the transport.
+
+`timeout` is the operator-configured service-wide RPC timeout. It accepts the same compact duration syntax as gateway interceptors: an integer followed by `ms` or `s`, such as `500ms` or `2s`. Values must be between `10ms` and `30s`, inclusive. Omit the field to use the 500 ms platform default. A binding may advertise a shorter `timeout` in the `Describe` manifest, but it cannot extend the operator-configured deadline; OpenShell uses the smaller value. OpenShell validates both levels before accepting the service. The effective timeout covers `ValidateConfig` and `EvaluateHttpRequest`; `Describe` uses the service timeout because binding metadata is not available yet.
+
+The service `grpc_endpoint` currently supports plaintext `http://` and TLS `https://` using the platform trust store. Custom trust roots, client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
+
+See [Supervisor Middleware](/extensibility/supervisor-middleware) for selection, failure, body-limit, and operational guidance.
+
+## Gateway Interceptors
+
+`[[openshell.gateway.interceptors]]` configures gateway-side interceptor services. The gateway calls each service's `Describe` RPC at startup, validates its declared OpenShell RPC bindings against the compiled service descriptor, and applies matching phases from a central gRPC middleware path. Interceptors can target only methods in the gateway's built-in allowlist of unary mutation RPCs. New RPCs are non-interceptable until they are deliberately added to that allowlist; adding one does not require handler-specific interceptor code. Request bodies are exposed as protobuf JSON objects. Fields marked secret in the protobuf schema are recursively omitted from requests and post-commit responses. Interceptors cannot patch an omitted field or a containing object.
+
+`binding_policy` controls how the manifest and operator binding configuration combine:
+
+- `dynamic` enables valid manifest bindings and treats configured entries as optional narrowing overrides. This is the compatibility default. The gateway logs a startup warning because the interceptor controls its non-secret RPC authority.
+- `allowlist` enables only configured RPC selectors and phases. The gateway ignores and logs extra manifest declarations, but fails startup when the manifest omits a configured RPC or phase.
+- `exact` requires the configured and manifest RPC selectors and phases to match exactly.
+
+Bindings under `allowlist` and `exact` require `rpc` or `service` plus `method`, and a nonempty `phases` list. They match by RPC rather than manifest binding ID. Duplicate selectors, `id`, and `disabled` are invalid in these modes; omit a binding to disable it. Binding failure policy comes from the binding, then the configured service, then defaults to `fail_closed`. Manifest failure policies do not override strict-mode operator configuration.
+
+Bindings that include `post_commit` must resolve to `failure_policy = "fail_open"`; the gateway rejects fail-closed post-commit configuration at startup. Post-commit evaluation is observational. If response observation or interceptor evaluation fails after a handler succeeds, the gateway logs and counts the failure but returns the committed response unchanged.
+
+`provider_profile_sources` selects the exact ordered provider-profile source set. Omit it to use the built-in and user-managed sources. Use `{ type = "builtin" }`, `{ type = "user" }`, and `{ type = "interceptor", name = "<configured-interceptor-name>" }` entries to compose a catalog. An interceptor entry must reference a configured service whose manifest advertises `provider_profiles = true`. Selecting only an interceptor makes that catalog authoritative; include local sources explicitly to compose them. Empty or duplicate source lists, unknown interceptor names, and duplicate normalized profile IDs fail closed. Source order controls collection and diagnostics, not override precedence.
+
+For an authoritative interceptor catalog, select only that interceptor:
+
+```toml
+[openshell.gateway]
+provider_profile_sources = [
+  { type = "interceptor", name = "provider-governance" },
+]
+```
+
+The gateway validates snapshot structure and provider-profile semantics. It treats a configured interceptor as the source trust boundary and does not verify signature, hash, or key annotations in profile payloads.
+
+`failure_policy` accepts `fail_closed` or `fail_open`. `timeout` accepts `ms` and `s` suffixes. In `dynamic` mode, binding overrides may select a manifest binding by `id`, `rpc`, or `service` plus `method`; they can disable a binding, narrow its phases, or override its failure policy.
 
 `image_pull_policy` is intentionally not a shared gateway key. Kubernetes and Docker use `Always`, `IfNotPresent`, or `Never`. Podman uses `always`, `missing`, `never`, or `newer`. Set it inside the relevant driver table.
 
@@ -190,6 +327,10 @@ host_gateway_ip                = "10.0.0.1"
 enable_user_namespaces         = false
 app_armor_profile              = "Unconfined"
 workspace_default_storage_size = "10Gi"
+# Kubernetes StorageClass for the workspace PVC. Empty (default) omits the
+# field, using the cluster's default StorageClass. Set this on clusters with no
+# default StorageClass, otherwise the workspace PVC stays Pending.
+# workspace_storage_class      = "fast-ssd"
 # Kubernetes RuntimeClass applied to sandbox pods when the API request does
 # not specify one. Empty (default) = omit the field, using the cluster default.
 # default_runtime_class_name   = "kata-containers"
@@ -234,6 +375,7 @@ log_level       = "info"
 compute_drivers = ["docker"]
 
 [openshell.drivers.docker]
+socket_path        = "/var/run/docker.sock"
 default_image      = "ghcr.io/nvidia/openshell/sandbox:latest"
 # Docker vocabulary: Always | IfNotPresent | Never. Empty behaves like IfNotPresent.
 image_pull_policy  = "IfNotPresent"
@@ -274,6 +416,8 @@ compute_drivers = ["podman"]
 
 [openshell.drivers.podman]
 # Rootless socket path. For root Podman use /run/podman/podman.sock.
+# Omit to auto-detect: the driver probes for a responsive Podman socket and
+# fails to start if none respond.
 socket_path             = "/run/user/1000/podman/podman.sock"
 default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy       = "missing"   # always | missing | never | newer
@@ -285,7 +429,7 @@ network_name            = "openshell"
 # Set "" to force Podman's host-gateway resolver.
 # host_gateway_ip       = "192.168.127.254"
 sandbox_ssh_socket_path = "/run/openshell/ssh.sock"
-stop_timeout_secs       = 10
+stop_timeout_secs       = 45
 # Defaults to the gateway version; override to pin a specific build.
 # supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 guest_tls_ca            = "/etc/openshell/certs/ca.pem"
@@ -301,6 +445,66 @@ sandbox_pids_limit      = 2048
 # but increase process churn (each check spawns a conmon subprocess).
 # Set to 0 to disable health checks entirely. Default: 10.
 health_check_interval_secs = 10
+# Corporate forward proxy for sandbox egress. When set, the in-container
+# supervisor chains policy-approved TLS tunnels through this proxy with HTTP
+# CONNECT instead of dialing destinations directly. Plain-HTTP requests are
+# not proxied and always dial the destination directly. Only http:// proxy
+# URLs in explicit http://host:port form are supported: the scheme and port
+# are both required, and a URL carrying a path, query, or fragment is
+# rejected rather than silently truncated.
+# NO_PROXY entries (hostnames, domain suffixes, IPs, CIDRs, each with an
+# optional :port qualifier) are dialed directly. A port-qualified entry only
+# bypasses that destination port. IP and CIDR entries also match hostnames
+# through their validated DNS resolution; such a match dials directly only
+# the resolved addresses inside the entry. This is an operator-owned egress
+# boundary:
+# sandbox and template environment cannot override it, and the conventional
+# HTTPS_PROXY/HTTP_PROXY/NO_PROXY variables a sandbox sets do not affect it.
+#
+# The CONNECT request sent to the proxy targets a validated resolved IP,
+# not the hostname, so the proxy performs no DNS resolution of its own and
+# the tunnel stays bound to the address that passed the sandbox's SSRF and
+# allowed_ips validation. The hostname still travels inside the tunnel (TLS
+# SNI, application Host), so destination servers behave normally. In
+# split-horizon networks, point the gateway host at the corporate resolver
+# so internal names validate to their internal addresses. If the proxy's
+# ACLs filter on hostnames and reject IP CONNECT targets, set
+# proxy_connect_by_hostname = true as a last resort: the proxy then
+# resolves the name itself, so a name that resolves differently at the
+# proxy (split-horizon DNS, rebinding) can reach destinations the sandbox
+# policy never approved, and the proxy's own ACLs become the effective
+# egress control for proxied TLS.
+#
+# Configuration is fail-closed: an invalid proxy URL is rejected at gateway
+# startup, setting no_proxy, proxy_auth_file, or proxy_connect_by_hostname
+# without a proxy URL is rejected as well, and a set-but-invalid value
+# reaching a sandbox (for example an unreadable or malformed auth file) is
+# fatal to that sandbox's supervisor instead of silently falling back to
+# direct or unauthenticated egress.
+#
+# Credentials must NOT be embedded in the URL (an inline user:pass@ is
+# rejected at startup, since it would be stored here and exposed in container
+# metadata). Instead point proxy_auth_file at a file containing "user:pass";
+# the gateway delivers it to the supervisor through a root-only secret mount.
+# The credential must use the user:pass form (non-empty user, no control
+# characters); the same validation runs at sandbox-create time and in the
+# supervisor, so a credential accepted here is never rejected in-container.
+# Keep gateway.toml and the auth file owner-readable only (mode 0600).
+#
+# WARNING: the supervisor sends the credential as a Proxy-Authorization:
+# Basic header over the plain-TCP connection to the http:// proxy. Basic
+# auth is base64, not encryption: anyone on the network path between the
+# sandbox host and the proxy can recover the credential. Because of that,
+# proxy_auth_file requires the explicit acknowledgement
+# proxy_auth_allow_insecure = true; without it the configuration is
+# rejected at gateway startup. Only opt in when the path to the proxy is a
+# trusted network segment.
+# https_proxy               = "http://proxy.corp.com:8080"
+# no_proxy                  = "*.svc.cluster.local,10.0.0.0/8"
+# proxy_auth_file           = "/etc/openshell/secrets/proxy-auth"
+# proxy_auth_allow_insecure = true
+# Last resort for hostname-filtering proxy ACLs; see the warning above.
+# proxy_connect_by_hostname = true
 ```
 
 ### MicroVM

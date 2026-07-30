@@ -10,7 +10,7 @@ use openshell_core::ComputeDriverKind;
 use openshell_core::config::DEFAULT_SERVER_PORT;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::certgen;
@@ -100,7 +100,7 @@ struct RunArgs {
     /// `kubernetes,podman`. The configuration format is future-proofed for
     /// multiple drivers, but the gateway currently requires exactly one.
     /// When unset, the gateway auto-detects the driver based on the runtime
-    /// environment (Kubernetes → Podman → Docker CLI or socket). VM is never
+    /// environment (Kubernetes → Podman → Docker). VM is never
     /// auto-detected and requires explicit configuration.
     #[arg(
         long,
@@ -372,8 +372,19 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
             args.grpc_rate_limit_requests,
             args.grpc_rate_limit_window_seconds,
         )
+        .with_gateway_interceptors(
+            file.as_ref()
+                .map(|f| f.openshell.gateway.interceptors.clone())
+                .unwrap_or_default(),
+        )
         .with_server_sans(args.server_sans.clone())
         .with_loopback_service_http(args.enable_loopback_service_http);
+    if let Some(sources) = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.provider_profile_sources.clone())
+    {
+        config = config.with_provider_profile_sources(sources);
+    }
     validate_grpc_rate_limit_args(
         args.grpc_rate_limit_requests,
         args.grpc_rate_limit_window_seconds,
@@ -429,9 +440,15 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     let prepared = prepare_server_config(&mut args, &matches)?;
 
     let tracing_log_bus = TracingLogBus::new();
-    tracing_log_bus.install_subscriber(
+    let otlp_config = prepared
+        .config_file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.otlp.as_ref());
+    let (tracing_handle, setup_error) = crate::tracing_setup::install(
         EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level)),
+        &tracing_log_bus,
+        otlp_config,
     );
 
     let has_client_ca = prepared
@@ -457,6 +474,18 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     if has_oidc {
         info!("OIDC authentication enabled");
     }
+    if let Some(err) = &setup_error {
+        error!(
+            error = %err,
+            "OTLP exporting is configured but could not be started; continuing without it"
+        );
+    } else if let Some(otlp) = prepared
+        .config_file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.otlp.as_ref())
+    {
+        info!(endpoint = %otlp.endpoint, "OTLP exporting enabled");
+    }
     if prepared.config.auth.allow_unauthenticated_users {
         warn!(
             "Unauthenticated user access enabled — only use this for trusted local development or a fully trusted fronting proxy"
@@ -476,9 +505,11 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
 
     info!(bind = %prepared.config.bind_address, "Starting OpenShell server");
 
-    Box::pin(run_server(prepared, tracing_log_bus))
-        .await
-        .into_diagnostic()
+    let result = Box::pin(run_server(prepared, tracing_log_bus)).await;
+
+    tracing_handle.shutdown();
+
+    result.into_diagnostic()
 }
 
 fn parse_compute_driver(value: &str) -> std::result::Result<String, String> {

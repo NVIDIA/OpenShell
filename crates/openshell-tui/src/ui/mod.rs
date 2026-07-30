@@ -152,6 +152,10 @@ fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled(" | ", t.muted),
     ];
 
+    parts.push(Span::styled("Workspace: ", t.text));
+    parts.push(Span::styled(app.workspace_display(), t.heading));
+    parts.push(Span::styled(" | ", t.muted));
+
     match app.screen {
         Screen::Splash => unreachable!("splash handled before draw_title_bar"),
         Screen::Dashboard => {
@@ -260,6 +264,9 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Span::styled("  ", t.text),
                 Span::styled("[c]", t.key_hint),
                 Span::styled(" Create Sandbox", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[w]", t.key_hint),
+                Span::styled(" Workspace", t.text),
                 Span::styled("  |  ", t.border),
                 Span::styled("[:]", t.muted),
                 Span::styled(" Command  ", t.muted),

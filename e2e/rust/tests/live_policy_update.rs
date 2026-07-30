@@ -103,10 +103,6 @@ filesystem_policy:
 landlock:
   compatibility: best_effort
 
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-
 network_policies:
 {network_rules}"
     );
@@ -141,10 +137,6 @@ filesystem_policy:
 
 landlock:
   compatibility: best_effort
-
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
 ";
 
     file.write_all(policy.as_bytes())
@@ -231,8 +223,7 @@ fn extract_version(output: &str) -> Option<u32> {
 
 /// Extract the policy hash from `policy get` output.
 fn extract_hash(output: &str) -> Option<String> {
-    extract_field(output, "Hash")
-        .or_else(|| extract_field(output, "Policy hash"))
+    extract_field(output, "Hash").or_else(|| extract_field(output, "Policy hash"))
 }
 
 /// Check that a version number appears in `policy list` output as a
@@ -254,8 +245,8 @@ fn list_output_contains_version(output: &str, version: u32) -> bool {
 
 /// Test the full live policy update lifecycle:
 ///
-/// 1. Create sandbox with `--keep`
-/// 2. Set policy A, verify initial version >= 1
+/// 1. Create sandbox with policy A and `--keep`
+/// 2. Verify initial version >= 1
 /// 3. Push same policy A -> version unchanged (idempotent)
 /// 4. Push policy B (adds example.com) with `--wait` -> new version
 /// 5. Push policy B again -> idempotent
@@ -265,8 +256,7 @@ fn list_output_contains_version(output: &str, version: u32) -> bool {
 async fn live_policy_update_round_trip() {
     // --- Write two distinct policy files ---
     let policy_a = write_policy(&["api.anthropic.com"]).expect("write policy A");
-    let policy_b =
-        write_policy(&["api.anthropic.com", "example.com"]).expect("write policy B");
+    let policy_b = write_policy(&["api.anthropic.com", "example.com"]).expect("write policy B");
 
     let policy_a_path = policy_a
         .path()
@@ -279,24 +269,14 @@ async fn live_policy_update_round_trip() {
         .expect("policy B path should be utf-8")
         .to_string();
 
-    // --- Create a long-running sandbox ---
-    let mut guard = SandboxGuard::create_keep(
+    // --- Create a long-running sandbox with its startup-only policy fields ---
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &["--policy", &policy_a_path, "--no-tty"],
         &["sh", "-c", "echo Ready && sleep infinity"],
         "Ready",
     )
     .await
-    .expect("create keep sandbox");
-
-    // --- Set initial policy A ---
-    let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &policy_a_path, "--wait", "--timeout", "120",
-    ])
-    .await;
-    assert!(
-        r.success,
-        "policy set A should succeed (exit {:?}):\n{}",
-        r.exit_code, r.output
-    );
+    .expect("create keep sandbox with policy A");
 
     // --- Verify initial policy version ---
     let r = run_cli(&["policy", "get", &guard.name]).await;
@@ -306,8 +286,12 @@ async fn live_policy_update_round_trip() {
         r.exit_code, r.output
     );
 
-    let initial_version = extract_version(&r.output)
-        .unwrap_or_else(|| panic!("could not parse version from policy get output:\n{}", r.output));
+    let initial_version = extract_version(&r.output).unwrap_or_else(|| {
+        panic!(
+            "could not parse version from policy get output:\n{}",
+            r.output
+        )
+    });
     assert!(
         initial_version >= 1,
         "initial policy version should be >= 1, got {initial_version}"
@@ -317,7 +301,14 @@ async fn live_policy_update_round_trip() {
 
     // --- Push same policy A again -> should be idempotent ---
     let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &policy_a_path, "--wait", "--timeout", "120",
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &policy_a_path,
+        "--wait",
+        "--timeout",
+        "120",
     ])
     .await;
     assert!(
@@ -327,7 +318,11 @@ async fn live_policy_update_round_trip() {
     );
 
     let r = run_cli(&["policy", "get", &guard.name]).await;
-    assert!(r.success, "policy get after repeat should succeed:\n{}", r.output);
+    assert!(
+        r.success,
+        "policy get after repeat should succeed:\n{}",
+        r.output
+    );
 
     let repeat_version = extract_version(&r.output)
         .unwrap_or_else(|| panic!("could not parse version after repeat:\n{}", r.output));
@@ -342,7 +337,14 @@ async fn live_policy_update_round_trip() {
 
     // --- Push policy B -> should create new version ---
     let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &policy_b_path, "--wait", "--timeout", "120",
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &policy_b_path,
+        "--wait",
+        "--timeout",
+        "120",
     ])
     .await;
     assert!(
@@ -352,7 +354,11 @@ async fn live_policy_update_round_trip() {
     );
 
     let r = run_cli(&["policy", "get", &guard.name]).await;
-    assert!(r.success, "policy get after B should succeed:\n{}", r.output);
+    assert!(
+        r.success,
+        "policy get after B should succeed:\n{}",
+        r.output
+    );
 
     let new_version = extract_version(&r.output)
         .unwrap_or_else(|| panic!("could not parse version after B:\n{}", r.output));
@@ -367,7 +373,14 @@ async fn live_policy_update_round_trip() {
 
     // --- Push policy B again -> idempotent ---
     let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &policy_b_path, "--wait", "--timeout", "120",
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &policy_b_path,
+        "--wait",
+        "--timeout",
+        "120",
     ])
     .await;
     assert!(
@@ -377,7 +390,11 @@ async fn live_policy_update_round_trip() {
     );
 
     let r = run_cli(&["policy", "get", &guard.name]).await;
-    assert!(r.success, "policy get after B repeat should succeed:\n{}", r.output);
+    assert!(
+        r.success,
+        "policy get after B repeat should succeed:\n{}",
+        r.output
+    );
 
     let repeat_b_version = extract_version(&r.output)
         .unwrap_or_else(|| panic!("could not parse version after B repeat:\n{}", r.output));
@@ -411,10 +428,9 @@ async fn live_policy_update_round_trip() {
 
 /// Test live policy update from an initially empty network policy:
 ///
-/// 1. Create sandbox with `--keep`
-/// 2. Set policy with no network rules
-/// 3. Push policy with a network rule using `--wait`
-/// 4. Verify the version bumped
+/// 1. Create sandbox with no network rules and `--keep`
+/// 2. Push policy with a network rule using `--wait`
+/// 3. Verify the version bumped
 #[tokio::test]
 async fn live_policy_update_from_empty_network_policies() {
     let empty_policy = write_empty_network_policy().expect("write empty network policy");
@@ -431,34 +447,37 @@ async fn live_policy_update_from_empty_network_policies() {
         .expect("full policy path should be utf-8")
         .to_string();
 
-    // Create sandbox with empty network policy.
-    let mut guard = SandboxGuard::create_keep(
+    // Create the sandbox with the empty network policy so subsequent live
+    // updates retain the same startup-only filesystem, landlock, and process
+    // fields.
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &["--policy", &empty_path, "--no-tty"],
         &["sh", "-c", "echo Ready && sleep infinity"],
         "Ready",
     )
     .await
-    .expect("create keep sandbox");
-
-    // Set initial empty policy.
-    let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &empty_path, "--wait", "--timeout", "120",
-    ])
-    .await;
-    assert!(
-        r.success,
-        "policy set (empty) should succeed (exit {:?}):\n{}",
-        r.exit_code, r.output
-    );
+    .expect("create keep sandbox with empty network policy");
 
     let r = run_cli(&["policy", "get", &guard.name]).await;
-    assert!(r.success, "policy get (empty) should succeed:\n{}", r.output);
+    assert!(
+        r.success,
+        "policy get (empty) should succeed:\n{}",
+        r.output
+    );
 
     let initial_version = extract_version(&r.output)
         .unwrap_or_else(|| panic!("could not parse version from empty policy:\n{}", r.output));
 
     // Push policy with network rules.
     let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &full_path, "--wait", "--timeout", "120",
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &full_path,
+        "--wait",
+        "--timeout",
+        "120",
     ])
     .await;
     assert!(
@@ -509,7 +528,13 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
     );
 
     let mut guard = SandboxGuard::create_keep_with_args(
-        &["--name", "e2e-2159-sparse-enrich", "--policy", sparse_policy, "--no-tty"],
+        &[
+            "--name",
+            "e2e-sparse-enrich",
+            "--policy",
+            sparse_policy,
+            "--no-tty",
+        ],
         &["sh", "-c", "echo Ready && sleep infinity"],
         "Ready",
     )
@@ -565,7 +590,9 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
 async fn local_policy_override_survives_gateway_policy_polls() {
     let image_context = write_local_override_image().expect("write local override image");
     let dockerfile = image_context.path().join("Dockerfile");
-    let dockerfile = dockerfile.to_str().expect("Dockerfile path should be utf-8");
+    let dockerfile = dockerfile
+        .to_str()
+        .expect("Dockerfile path should be utf-8");
 
     let gateway_policy_a_file = write_policy(&["example.com"]).expect("write gateway policy A");
     let gateway_policy_a_path = gateway_policy_a_file
@@ -584,7 +611,7 @@ async fn local_policy_override_survives_gateway_policy_polls() {
     let mut guard = SandboxGuard::create_keep_with_args(
         &[
             "--name",
-            "e2e-local-policy-override",
+            "e2e-lcl-pol-ovrd",
             "--from",
             dockerfile,
             "--policy",
@@ -611,7 +638,11 @@ async fn local_policy_override_survives_gateway_policy_polls() {
         "sandbox",
     ])
     .await;
-    assert!(initial_logs.success, "fetch initial sandbox logs:\n{}", initial_logs.output);
+    assert!(
+        initial_logs.success,
+        "fetch initial sandbox logs:\n{}",
+        initial_logs.output
+    );
     assert!(
         initial_logs
             .output
@@ -633,7 +664,11 @@ async fn local_policy_override_survives_gateway_policy_polls() {
         &gateway_policy_b_path,
     ])
     .await;
-    assert!(update.success, "publish gateway policy B:\n{}", update.output);
+    assert!(
+        update.success,
+        "publish gateway policy B:\n{}",
+        update.output
+    );
 
     // A later gateway revision must also remain observational in local mode.
     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
@@ -648,7 +683,11 @@ async fn local_policy_override_survives_gateway_policy_polls() {
         "sandbox",
     ])
     .await;
-    assert!(updated_logs.success, "fetch updated sandbox logs:\n{}", updated_logs.output);
+    assert!(
+        updated_logs.success,
+        "fetch updated sandbox logs:\n{}",
+        updated_logs.output
+    );
     assert!(
         !updated_logs.output.contains("Policy reloaded successfully"),
         "gateway policy updates must not replace the local override:\n{}",

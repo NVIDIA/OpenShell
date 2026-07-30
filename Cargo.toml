@@ -22,6 +22,7 @@ tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 prost = "0.14"
 prost-types = "0.14"
+prost-reflect = { version = "0.16.5", features = ["serde"] }
 
 # HTTP server
 axum = { version = "0.8", features = ["ws"] }
@@ -59,6 +60,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 
+# OpenTelemetry — OTLP/gRPC export. Kept in lockstep with the workspace's
+# tonic 0.14 / prost 0.14 via opentelemetry-proto's `grpc-tonic` feature.
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = { version = "0.33", default-features = false, features = ["tracing-log"] }
+
 # Metrics
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
@@ -74,9 +82,14 @@ serde_yml = "0.0.12"
 toml = "0.8"
 apollo-parser = "0.8.5"
 tower-mcp-types = "0.12.0"
+regex = "1"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+
+# AWS SDK
+aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
 
 # WebSocket
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
@@ -104,6 +117,7 @@ pin-project-lite = "0.2"
 tokio-stream = "0.1"
 protobuf-src = "1.1.0"
 url = "2"
+indexmap = "2"
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "migrate"] }

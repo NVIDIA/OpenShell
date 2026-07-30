@@ -41,6 +41,92 @@ Operators can configure a gateway-wide gRPC request rate limit. The limit is
 applied only to gRPC API traffic after protocol multiplexing; health, metrics,
 and local sandbox-service HTTP routes are not rate limited by this control.
 
+Gateway interceptors run in one middleware layer on the `openshell.v1.OpenShell`
+gRPC service after authentication and before tonic dispatches to individual
+handlers. At startup the gateway calls each configured interceptor's `Describe`
+RPC, validates declared bindings against the compiled OpenShell descriptor set,
+and builds an immutable execution plan. Only unary OpenShell methods in the
+gateway's explicit interceptable-method allowlist are decoded through the
+descriptor set into protobuf JSON, evaluated through configured phases, and
+re-encoded before the handler sees the request. New RPCs are non-interceptable
+until deliberately added to this allowlist. Interception remains centralized:
+allowlisting a unary RPC does not require method-specific gateway
+instrumentation.
+
+Each configured interceptor selects a binding policy. `dynamic` accepts valid
+manifest declarations and preserves the compatibility behavior. `allowlist`
+enables only operator-configured RPCs and phases, while `exact` requires the
+configured and declared sets to match. Strict policies match by RPC rather than
+manifest binding ID, so renaming a binding does not change authority. Provider
+profile sources remain a separate operator-controlled capability.
+
+The protobuf schema marks dedicated credential, token, and refresh-material
+fields with a custom secret option. The middleware recursively omits those
+fields from every request and post-commit response sent to an interceptor while
+retaining the complete protobuf operation for handler dispatch. JSON Patch
+paths and source paths cannot select an omitted field or replace a containing
+object. There is no configuration that exposes annotated fields.
+
+`SubmitPolicyAnalysis` is interceptable because proposed chunks can eventually
+change active policy through the gateway's approval workflow. An interceptor
+may therefore reject policy proposals while permitting telemetry-only requests.
+Gateways without a matching binding retain the standard proposal behavior.
+
+The descriptor codec uses protobuf's standard `oneof` semantics. If binary
+input contains multiple alternatives from one group, the last member on the
+wire wins. The middleware converts that selected value to ProtoJSON and
+re-encodes it before dispatch, so the interceptor and handler observe the same
+canonical request. ProtoJSON input that names multiple alternatives remains
+invalid.
+
+Modification results are atomic per binding. After applying one binding's full
+JSON Patch list, the middleware re-encodes the candidate as the request's
+protobuf type and decodes those accepted bytes back to canonical ProtoJSON.
+Invalid candidates follow that binding's failure policy: fail-open restores the
+exact pre-binding operation, while fail-closed rejects the request before
+handler dispatch. Later bindings only observe the same schema-valid operation
+that the handler will receive; protobuf map entry ordering is not treated as a
+semantic difference.
+
+Each interceptor evaluation selects exactly one phase payload:
+`modify_operation`, `validate`, or `post_commit`. Modification and validation
+payloads carry the protobuf JSON operation entering that phase. Post-commit
+payloads carry the successful committed response instead of echoing the
+request. Only the `validate` payload can also carry optional read-only
+`current_state`; modification and post-commit evaluations never receive it. The
+gateway does not yet load method-specific state, so the field remains absent;
+an absent state is distinct from an explicitly empty object. Method-specific
+state schemas and persistence-version binding are deferred until a concrete
+consumer requires them.
+
+Post-commit evaluation is strictly observational. A binding that includes
+`post_commit` must resolve to `fail_open`, or interceptor initialization fails.
+After a handler returns success, failures never replace the committed response.
+Binding failures emit the standard fail-open warning and counter; response
+observation or evaluation failures outside binding policy emit warnings and the
+`openshell_gateway_interceptor_post_commit_observation_failures_total` metric.
+The gateway reconstructs the original response frames, including trailers and
+body errors, before evaluating the observer.
+
+Interceptor manifests can also vend provider profile catalogs. Gateway
+configuration selects the exact ordered source set from the in-tree built-in
+source, the stored user source, and named profile-capable interceptors. Omitting
+the setting selects `builtin + user`; selecting only an interceptor makes it
+authoritative by omission. Every selected source uses the same snapshot,
+semantic-validation, and duplicate-detection path. Duplicate normalized profile
+IDs fail instead of creating source precedence. The gateway treats configured
+interceptors as trusted sources and does not verify signature annotations in
+their profile payloads.
+
+Each logical gateway request captures the selected sources into one validated,
+immutable effective catalog before deriving provider behavior. Policy layers,
+credential scope, injected environment material, dynamic token grants, and
+provider-environment revisions use that same catalog. Each configured source is
+therefore fetched at most once per request, and a source revision change becomes
+visible on the next request instead of partway through the current request. The
+capture emits debug diagnostics with the combined catalog revision, source fetch
+count, and profile count; it never logs provider credentials or profile material.
+
 Supported auth modes:
 
 | Mode | Use |
@@ -51,13 +137,35 @@ Supported auth modes:
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
 | OIDC | Bearer-token auth for users, with browser PKCE or client credentials login. |
 
+The CLI persists the scopes requested during OIDC login in gateway metadata and
+reuses them when refreshing an access token. This preserves the intended API
+resource selection for identity providers that bind access-token audiences to
+OAuth scopes.
+
+Gateway health and user authentication are separate probes. `OpenShell.Health`
+remains unauthenticated so deployment and load-balancer health checks do not
+depend on user credentials. The CLI uses the existing, side-effect-free
+`OpenShell.GetGatewayInfo` capability query as its protected authentication
+probe. `Unauthenticated` means the credentials were rejected, while
+`PermissionDenied` proves authentication succeeded before the caller failed
+the capability query's admin authorization check. The CLI combines the health
+and capability results so a reachable gateway with an expired or rejected
+token is reported as connected but unauthenticated.
+
 Sandbox supervisor RPCs authenticate with explicit sandbox credentials; mTLS
 does not grant sandbox identity. Kubernetes deployments use the
 gateway-minted JWT bootstrap path: the supervisor starts with a projected
 ServiceAccount token, exchanges it for a gateway-minted sandbox JWT, and uses
 that JWT on subsequent gateway RPCs.
-User-facing mutations are authorized by role policy when OIDC or edge identity
-is enabled.
+User-facing RPCs are authorized by descriptor-declared role and scope policy
+when OIDC or edge identity is enabled. The OIDC admin role grants platform-wide
+access and bypasses workspace membership checks. Workspace Admin and Workspace
+User roles are durable membership records keyed by workspace and authenticated
+subject. Handlers resolve the resource workspace and require sufficient
+membership after the middleware validates the global role and optional scope.
+The authenticated `GetCurrentUser` endpoint exposes the gateway's validated
+user subject, display name, roles, scopes, and identity provider for CLI
+identity inspection without client-side token decoding.
 
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only
@@ -143,6 +251,15 @@ populate `scope`, `version`, `status`, `dedup_key`, and `hit_count` so the
 gateway can efficiently fetch the latest policy, track load status, and manage
 advisor drafts without creating resource-specific tables.
 
+Each sandbox policy revision stores the complete provenance annotation map
+supplied with that update. The revision payload is the authoritative immutable
+record; sandbox metadata receives the same annotations only as a convenience
+projection and can retain keys from earlier revisions. Policy revision creation,
+optional first-policy backfill, metadata projection, and superseding older
+revisions commit in one database transaction. SQLite serializes this operation
+with an immediate transaction, while Postgres locks the sandbox row. A failed
+resource-version check or revision insert rolls back the entire operation.
+
 SQLite is the default local store; Postgres is supported for deployments that
 need an external database or multi-replica coordination. Both backends expose
 the same `Store` API and the same logical schema. Backend differences stay
@@ -164,7 +281,10 @@ state, SSH sessions, policy revisions, settings, inference configuration, and
 deployment records. Provider refresh material is stored as a separate object
 scoped to the provider instance through `objects.scope`; the provider record
 keeps only the current injectable credential values and optional per-credential
-expiry timestamps.
+expiry timestamps. A refresh normally mints one credential, but a strategy may
+co-mint several (AWS STS mints the access key, secret key, and session token in
+one call); the refresh state pins the resolved set of env keys it owns so
+collision checks reserve all of them before the first mint.
 
 ### Optimistic Concurrency (CAS)
 
@@ -220,7 +340,7 @@ modes:
   write. Client-facing operations that carry an `expected_resource_version`
   field use this mode: `AttachSandboxProvider`, `DetachSandboxProvider`,
   `UpdateProvider`, `UpdateProviderProfiles`, and `UpdateConfig` (policy
-  backfill path).
+  backfill and sandbox annotation updates).
 
 **Lists.** The `list_messages` and `list_messages_with_selector` helpers decode
 protobuf payloads from list results and hydrate `resource_version` from the
@@ -270,6 +390,17 @@ Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The
 sandbox supervisor polls for config revisions and hot-reloads dynamic policy
 when the policy engine accepts the update.
+
+External supervisor middleware registration is operator-owned configuration
+under `[[openshell.supervisor.middleware]]`. At startup the gateway connects to
+each service and validates its described bindings and operator body limit.
+Policies attach a complete external middleware by its operator-owned registration
+name. Manifest bindings are identified by operation and phase, and each manifest
+may declare at most one binding for an operation and phase pair.
+Before persisting a policy, the gateway asks each selected implementation to
+validate its config. The effective sandbox config contains only the registered
+services required by that policy; supervisors invoke those services directly on
+the request path.
 
 Provider credential expiry is enforced during gateway-to-sandbox credential
 resolution and again by the sandbox placeholder resolver. This keeps expired
@@ -471,6 +602,36 @@ driver's own table.
 Driver-specific values that are not part of the inheritance allowlist
 (e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
 table.
+
+### OTLP export
+
+The gateway already uses Rust's `tracing` framework for structured log events
+and request-span context consumed by stdout and the sandbox log bus. OTLP export
+adds an OpenTelemetry layer to the same subscriber. That layer turns selected
+`tracing` spans into distributed traces; it does not export log events or
+replace the existing logging paths.
+
+`[openshell.gateway.otlp]` is the only enablement path for OpenTelemetry
+export: the table's presence is the on-switch, and `OTEL_EXPORTER_OTLP_ENDPOINT`
+is ignored so enablement has a single source. TOML decides whether and where
+to export; the SDK's `OTEL_*` variables tune how. Transport is OTLP over gRPC
+only.
+
+Span emission requires no per-handler instrumentation. The `tower_http`
+`TraceLayer` in `multiplex.rs` opens a span per inbound request, and that span
+continues incoming W3C trace context when present or starts a new trace
+otherwise. It is named for the RPC and carries the request ID that also appears
+in the gateway's logs — the identifier that lets an operator pivot between a
+trace and its log lines. Store and compute-driver spans become children of the
+request span. Reconciliation, provider refresh, and driver-watch loops create
+their own operation spans because they have no inbound request to provide a
+parent. gRPC status is recorded when response trailers arrive.
+
+Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
+failure stops the gateway from serving: a malformed endpoint is logged at
+startup and disables export. Export is best-effort — the SDK logs runtime
+failures, and a failed batch is dropped rather than retried. Buffered spans
+flush after the server loop exits so `SIGTERM` does not drop in-flight traces.
 
 ### Package-managed gateway registry
 
