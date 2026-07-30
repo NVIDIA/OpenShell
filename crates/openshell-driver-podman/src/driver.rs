@@ -336,30 +336,8 @@ impl PodmanComputeDriver {
             check_subuid_range();
         }
 
-        // Ensure the bridge network exists.
-        client.ensure_network(&config.network_name).await?;
-        let network_gateway_ip = client.network_gateway_ip(&config.network_name).await?;
-        info!(
-            network = %config.network_name,
-            gateway_ip = ?network_gateway_ip,
-            "Bridge network ready"
-        );
-
-        let (gpu_inventory, allow_all_default_gpu) = local_podman_gpu_selector_state();
-        if !gpu_inventory.is_empty() {
-            info!(
-                device_count = gpu_inventory.as_slice().len(),
-                "Discovered local Podman NVIDIA CDI GPU devices"
-            );
-        }
-
-        // Auto-detect the gRPC callback endpoint when not explicitly
-        // configured. Sandbox containers use host.containers.internal
-        // (injected via hostadd with host-gateway in the container spec)
-        // to reach the gateway server on the host. The scheme is
-        // determined by whether TLS client certs are configured: when
-        // all three TLS paths are set, the endpoint uses https so the
-        // supervisor connects with mTLS.
+        // Auto-detect the gRPC callback endpoint before deciding whether this
+        // topology needs the Podman bridge gateway address.
         if config.grpc_endpoint.is_empty() {
             let scheme = if config.tls_enabled() {
                 "https"
@@ -374,6 +352,36 @@ impl PodmanComputeDriver {
                 grpc_endpoint = %config.grpc_endpoint,
                 tls = config.tls_enabled(),
                 "Auto-detected gRPC endpoint"
+            );
+        }
+
+        // Ensure the bridge network exists. Inspect its gateway only when the
+        // selected Linux callback topology will bind that exact address.
+        client.ensure_network(&config.network_name).await?;
+        let uses_local_callback_alias = Url::parse(&config.grpc_endpoint)
+            .ok()
+            .as_ref()
+            .is_some_and(callback_endpoint_uses_local_alias);
+        let needs_network_gateway_ip = cfg!(target_os = "linux")
+            && uses_local_callback_alias
+            && !rootless
+            && config.host_gateway_ip.trim().is_empty();
+        let network_gateway_ip = if needs_network_gateway_ip {
+            client.network_gateway_ip(&config.network_name).await?
+        } else {
+            None
+        };
+        info!(
+            network = %config.network_name,
+            gateway_ip = ?network_gateway_ip,
+            "Bridge network ready"
+        );
+
+        let (gpu_inventory, allow_all_default_gpu) = local_podman_gpu_selector_state();
+        if !gpu_inventory.is_empty() {
+            info!(
+                device_count = gpu_inventory.as_slice().len(),
+                "Discovered local Podman NVIDIA CDI GPU devices"
             );
         }
 
@@ -424,9 +432,7 @@ impl PodmanComputeDriver {
                 self.config.grpc_endpoint
             ))
         })?;
-        let uses_local_callback_alias = endpoint.host_str().is_some_and(|host| {
-            matches!(host, "host.containers.internal" | "host.openshell.internal")
-        });
+        let uses_local_callback_alias = callback_endpoint_uses_local_alias(&endpoint);
         if !uses_local_callback_alias {
             return Ok(Vec::new());
         }
@@ -1057,6 +1063,12 @@ fn check_subuid_range() {
     }
 }
 
+fn callback_endpoint_uses_local_alias(endpoint: &Url) -> bool {
+    endpoint
+        .host_str()
+        .is_some_and(|host| matches!(host, "host.containers.internal" | "host.openshell.internal"))
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn validate_rootless_local_callback_helper(
     rootless_network_cmd: &str,
@@ -1403,9 +1415,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn constructor_preserves_network_gateway_discovery_error() {
-        let (socket_path, request_log, handle) = spawn_podman_stub(
+    async fn constructor_preserves_required_network_gateway_discovery_error() {
+        let (socket_path, _request_log, handle) = spawn_podman_stub(
             "network-gateway-error",
+            vec![
+                StubResponse::new(StatusCode::OK, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{
+                        "host": {
+                            "cgroupVersion": "v2",
+                            "networkBackend": "netavark",
+                            "security": {"rootless": false},
+                            "remoteSocket": {"path": "/run/podman/podman.sock"}
+                        },
+                        "version": {"Version": "5.0.0"}
+                    }"#,
+                ),
+                StubResponse::new(StatusCode::CREATED, "{}"),
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"network gateway inspection failed"}"#,
+                ),
+            ],
+        );
+        let config = PodmanComputeConfig {
+            socket_path: Some(socket_path.clone()),
+            grpc_endpoint: "http://host.containers.internal:8080".to_string(),
+            ..PodmanComputeConfig::default()
+        };
+
+        let Err(err) = PodmanComputeDriver::new(config).await else {
+            panic!("required network gateway discovery failure should prevent startup");
+        };
+
+        assert!(
+            err.to_string()
+                .contains("network gateway inspection failed"),
+            "unexpected startup error: {err}"
+        );
+        handle.await.expect("stub task should finish");
+    }
+
+    #[tokio::test]
+    async fn constructor_skips_network_gateway_discovery_for_remote_callback() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "remote-callback-no-network-gateway",
             vec![
                 StubResponse::new(StatusCode::OK, ""),
                 StubResponse::new(
@@ -1419,27 +1474,20 @@ mod tests {
                     }"#,
                 ),
                 StubResponse::new(StatusCode::CREATED, "{}"),
-                StubResponse::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    r#"{"message":"network gateway inspection failed"}"#,
-                ),
             ],
         );
         let config = PodmanComputeConfig {
             socket_path: Some(socket_path.clone()),
+            grpc_endpoint: "https://gateway.example.test:9443".to_string(),
             ..PodmanComputeConfig::default()
         };
-        let network_name = config.network_name.clone();
 
-        let Err(err) = PodmanComputeDriver::new(config).await else {
-            panic!("network gateway discovery failure should prevent startup");
-        };
+        let driver = PodmanComputeDriver::new(config)
+            .await
+            .expect("remote callbacks must not require bridge gateway inspection");
 
-        assert!(
-            err.to_string()
-                .contains("network gateway inspection failed"),
-            "unexpected startup error: {err}"
-        );
+        assert!(driver.network_gateway_ip().is_none());
+        assert!(driver.gateway_listener_requirements().unwrap().is_empty());
         handle.await.expect("stub task should finish");
         assert_eq!(
             request_log
@@ -1450,10 +1498,6 @@ mod tests {
                 "GET /_ping".to_string(),
                 format!("GET {}", api_path("/libpod/info")),
                 format!("POST {}", api_path("/libpod/networks/create")),
-                format!(
-                    "GET {}",
-                    api_path(&format!("/libpod/networks/{network_name}/json"))
-                ),
             ]
         );
     }

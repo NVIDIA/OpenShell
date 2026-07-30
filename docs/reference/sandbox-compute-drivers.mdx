@@ -111,7 +111,11 @@ Docker and Podman callback listeners accept only supervisor callback gRPC
 methods. Use the gateway's primary endpoint for CLI, administrator, health,
 reflection, inference-route management, and HTTP requests. A
 `PermissionDenied` response from one of the sandbox-visible callback addresses
-is expected for those requests.
+is expected for those requests. The gateway fails startup if a callback
+requirement resolves to the exact primary listener address because one socket
+cannot preserve both authorization scopes. For the IPv4-loopback callback used
+by Podman Machine, bind the primary listener to a distinct address such as
+`[::1]:17670`.
 
 ## Docker Driver
 

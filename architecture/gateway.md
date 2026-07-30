@@ -45,6 +45,11 @@ reflection, non-callback inference APIs, and HTTP routes before normal request
 authentication. The operator-configured primary listener retains the full
 multiplexed API surface.
 
+The gateway rejects a callback requirement that resolves to the exact primary
+listener address because one socket cannot preserve two authorization scopes.
+A wildcard primary listener may cover a callback address because the accepted
+connection's concrete local address still selects the callback-only scope.
+
 The `rpc_auth` classification is also the source of truth for negotiated
 listener exposure: marking an RPC as `sandbox` or `dual` makes it callable on
 these listeners. Review such changes as both authorization and network-surface

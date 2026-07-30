@@ -103,7 +103,7 @@ fn gateway_listener_specs_with_default_route_ip(
             continue;
         };
         validate_gateway_listener_requirement(bind_address, requirement)?;
-        add_callback_listener_spec(&mut specs, *address, requirement);
+        add_callback_listener_spec(&mut specs, *address, requirement)?;
     }
 
     for requirement in requirements {
@@ -127,7 +127,7 @@ fn gateway_listener_specs_with_default_route_ip(
         }
         let address = SocketAddr::new(ip, bind_address.port());
         validate_resolved_gateway_listener(bind_address, address)?;
-        add_callback_listener_spec(&mut specs, address, requirement);
+        add_callback_listener_spec(&mut specs, address, requirement)?;
     }
 
     for requirement in requirements {
@@ -137,7 +137,7 @@ fn gateway_listener_specs_with_default_route_ip(
         validate_gateway_listener_requirement(bind_address, requirement)?;
         let address = SocketAddr::from(([127, 0, 0, 1], bind_address.port()));
         validate_resolved_gateway_listener(bind_address, address)?;
-        add_callback_listener_spec(&mut specs, address, requirement);
+        add_callback_listener_spec(&mut specs, address, requirement)?;
     }
 
     Ok(specs)
@@ -147,25 +147,34 @@ fn add_callback_listener_spec(
     specs: &mut Vec<GatewayListenerSpec>,
     address: SocketAddr,
     requirement: &GatewayListenerRequirement,
-) {
+) -> Result<()> {
     let scope = GatewayListenerScope::ComputeDriverCallback;
     if let Some(existing) = specs
         .iter_mut()
         .find(|existing| listener_covers(existing.address, address))
     {
-        if existing.address != address
-            && !existing
-                .covered_addresses
-                .iter()
-                .any(|covered| covered.address == address)
+        if existing.address == address {
+            if existing.scope == GatewayListenerScope::Primary {
+                return Err(Error::config(format!(
+                    "compute driver '{}' requested gateway callback listener {address}, but it is the same address as the primary listener; callback-only authorization cannot be preserved",
+                    requirement.driver_name()
+                )));
+            }
+            return Ok(());
+        }
+        if !existing
+            .covered_addresses
+            .iter()
+            .any(|covered| covered.address == address)
         {
             existing
                 .covered_addresses
                 .push(CoveredGatewayAddress { address, scope });
         }
-        return;
+        return Ok(());
     }
     specs.push(callback_listener_spec(address, requirement));
+    Ok(())
 }
 
 fn callback_listener_spec(
@@ -606,13 +615,17 @@ mod tests {
     }
 
     #[test]
-    fn gateway_listener_specs_skip_podman_loopback_when_primary_is_same_address() {
+    fn gateway_listener_specs_reject_callback_matching_primary_address() {
         let primary = "127.0.0.1:8080".parse().unwrap();
 
-        assert_eq!(
-            gateway_listener_specs(primary, &[podman_loopback_listener_requirement()]).unwrap(),
-            vec![primary_listener_spec(primary)]
+        let err =
+            gateway_listener_specs(primary, &[podman_loopback_listener_requirement()]).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("same address as the primary listener")
         );
+        assert!(err.to_string().contains("callback-only authorization"));
     }
 
     #[test]
@@ -682,9 +695,9 @@ mod tests {
             .expect("IPv6 wildcard and IPv4 callback listeners should both bind");
 
         assert_eq!(listeners.len(), 2);
-        assert_eq!(listeners[0].address, primary);
+        assert_eq!(listeners[0].spec.address, primary);
         assert_eq!(
-            listeners[1].address,
+            listeners[1].spec.address,
             SocketAddr::from(([127, 0, 0, 1], port))
         );
     }
