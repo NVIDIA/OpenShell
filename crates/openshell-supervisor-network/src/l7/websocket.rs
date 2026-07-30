@@ -18,6 +18,7 @@ use openshell_ocsf::{
     NetworkActivityBuilder, SeverityId, StatusId, ocsf_emit,
 };
 use std::collections::HashMap;
+use std::future::Future;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAX_TEXT_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -545,6 +546,36 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     port: u16,
     options: &RelayOptions<'_>,
 ) -> Result<()> {
+    relay_text_payload_with_before_credential_write(
+        writer,
+        frame,
+        payload,
+        force_reframe,
+        compressed,
+        host,
+        port,
+        options,
+        std::future::ready(()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn relay_text_payload_with_before_credential_write<W, F>(
+    writer: &mut W,
+    frame: &FrameHeader,
+    payload: Vec<u8>,
+    force_reframe: bool,
+    compressed: bool,
+    host: &str,
+    port: u16,
+    options: &RelayOptions<'_>,
+    before_credential_write: F,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    F: Future<Output = ()>,
+{
     let message_payload = if compressed {
         decompress_permessage_deflate(&payload)?
     } else {
@@ -552,12 +583,17 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     };
     let mut text = String::from_utf8(message_payload)
         .map_err(|_| miette!("websocket text message is not valid UTF-8"))?;
-    let live_resolver = options
-        .provider_credentials
-        .map(|credentials| credentials.resolver_for_endpoint(host, port, options.target));
+    let live_resolver = options.provider_credentials.map(|credentials| {
+        let (resolver, revision) =
+            credentials.resolver_for_endpoint_with_revision(host, port, options.target);
+        (
+            resolver,
+            crate::l7::rest::CredentialGenerationGuard::new(credentials, revision),
+        )
+    });
     let resolver = live_resolver
         .as_ref()
-        .map_or(options.resolver, |resolver| resolver.as_deref());
+        .map_or(options.resolver, |(resolver, _)| resolver.as_deref());
     let replacements = if let Some(resolver) = resolver {
         resolver
             .rewrite_websocket_text_placeholders(&mut text)
@@ -598,11 +634,19 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     if replacements > 0 {
         emit_rewrite_event(host, port, options.policy_name, replacements);
     }
-    if compressed {
-        let compressed_payload = compress_permessage_deflate(text.as_bytes())?;
-        return write_masked_frame_with_rsv(writer, OPCODE_TEXT, 0x40, &compressed_payload).await;
+    let (rsv, frame_payload) = if compressed {
+        (0x40, compress_permessage_deflate(text.as_bytes())?)
+    } else {
+        (0, text.into_bytes())
+    };
+    let rewritten_frame = masked_frame_bytes(OPCODE_TEXT, rsv, &frame_payload);
+    if replacements > 0 {
+        before_credential_write.await;
+        if let Some((_, guard)) = live_resolver {
+            guard.ensure_current()?;
+        }
     }
-    write_masked_frame(writer, OPCODE_TEXT, text.as_bytes()).await
+    write_frame_bytes(writer, &rewritten_frame).await
 }
 
 fn inspect_websocket_text_message(
@@ -889,20 +933,7 @@ where
     Ok(())
 }
 
-async fn write_masked_frame<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    opcode: u8,
-    payload: &[u8],
-) -> Result<()> {
-    write_masked_frame_with_rsv(writer, opcode, 0, payload).await
-}
-
-async fn write_masked_frame_with_rsv<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    opcode: u8,
-    rsv: u8,
-    payload: &[u8],
-) -> Result<()> {
+fn masked_frame_bytes(opcode: u8, rsv: u8, payload: &[u8]) -> Vec<u8> {
     let mut header = Vec::with_capacity(14);
     header.push(0x80 | rsv | opcode);
     match payload.len() {
@@ -925,8 +956,12 @@ async fn write_masked_frame_with_rsv<W: AsyncWrite + Unpin>(
 
     let mut masked = payload.to_vec();
     apply_mask(&mut masked, mask_key);
-    writer.write_all(&header).await.into_diagnostic()?;
-    writer.write_all(&masked).await.into_diagnostic()?;
+    header.extend_from_slice(&masked);
+    header
+}
+
+async fn write_frame_bytes<W: AsyncWrite + Unpin>(writer: &mut W, frame: &[u8]) -> Result<()> {
+    writer.write_all(frame).await.into_diagnostic()?;
     writer.flush().await.into_diagnostic()?;
     Ok(())
 }
@@ -1418,6 +1453,69 @@ network_policies:
         assert!(
             output.is_empty(),
             "invalid-refresh credential must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_rewrite_rejects_revocation_before_frame_write() {
+        let state = bound_websocket_provider_state();
+        let fallback = state.resolver().expect("upgrade-time resolver");
+        let placeholder = b"openshell:resolve:env:v1_DISCORD_BOT_TOKEN";
+        let compressed = compress_permessage_deflate(placeholder).expect("compress placeholder");
+        let frame = FrameHeader {
+            fin: true,
+            rsv: 0x40,
+            opcode: OPCODE_TEXT,
+            masked: true,
+            payload_len: compressed.len() as u64,
+            mask_key: Some([0x37, 0xfa, 0x21, 0x3d]),
+            raw_header: Vec::new(),
+        };
+        let options = RelayOptions {
+            policy_name: "test-policy",
+            resolver: Some(fallback.as_ref()),
+            provider_credentials: Some(&state),
+            target: "/socket",
+            inspector: None,
+            compression: WebSocketCompression::PermessageDeflate,
+        };
+        let reached_write = tokio::sync::Barrier::new(2);
+        let release_write = tokio::sync::Barrier::new(2);
+        let (mut relay_write, mut upstream_read) = tokio::io::duplex(4096);
+
+        let relay = relay_text_payload_with_before_credential_write(
+            &mut relay_write,
+            &frame,
+            compressed,
+            false,
+            true,
+            "gateway.example.test",
+            443,
+            &options,
+            async {
+                reached_write.wait().await;
+                release_write.wait().await;
+            },
+        );
+        let revoke = async {
+            reached_write.wait().await;
+            state.revoke_static_provider_environment(2);
+            release_write.wait().await;
+        };
+        let (result, ()) = tokio::join!(relay, revoke);
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("generation changed")),
+            "revoked credential generation must fail before the frame write: {result:?}"
+        );
+
+        drop(relay_write);
+        let mut output = Vec::new();
+        upstream_read.read_to_end(&mut output).await.unwrap();
+        assert!(
+            output.is_empty(),
+            "credential revoked before the write guard must not reach upstream"
         );
     }
 
