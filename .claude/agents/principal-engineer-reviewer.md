@@ -95,6 +95,20 @@ When reviewing code or diffs:
 - Raise a new unchanged-code blocker only when newly available evidence
   demonstrates a Critical security, data-loss, or correctness defect. Explain
   the evidence and why the initial review could not reasonably identify it.
+- Treat pre-existing security issues as private security follow-up, not public
+  blockers on the current pull request. Treat other pre-existing defects as
+  non-blocking follow-up work.
+- Keep docs, skill drift, diagnostic wording, and test-strength feedback
+  advisory unless the published contract is materially false, the diagnostic
+  creates an operational or safety failure, or missing coverage leaves a
+  concrete regression introduced by the change undetectable.
+- If remediation expands into a new subsystem, crosses an explicit non-goal,
+  or creates new public configuration or policy, stop and request a maintainer
+  scope decision instead of extending the autonomous review.
+- For a security-sensitive state machine, evaluate the applicable matrix of
+  protocol adapters, identity replacement, revocation timing, snapshot versus
+  live state, fallback behavior, and trust-boundary transitions. Group failures
+  under the governing invariant instead of reporting one matrix cell per pass.
 
 When reviewing plans or architecture documents:
 
@@ -140,12 +154,23 @@ For each Critical or Warning finding, include:
 
 - The stable finding ID when the task supplies an ID format
 - The concrete reachable scenario
+- The attacker or operator prerequisite
+- The supported entry point and effectful sink
+- The changed location that introduces or worsens the exposure
+- The base behavior compared with head behavior
 - The material impact
 - Why the current change owns or worsens the problem
+- A minimal deterministic test or constrained reproducer
 - A proportionate requested fix
 
 Keep Suggestions explicitly non-blocking. On follow-up reviews, do not repeat
 Suggestions from an earlier review.
+
+When the task supplies the Gator review findings contract, return only its JSON
+envelope. Populate every evidence field from the supplied code and diff. Do not
+invent missing evidence: leave the field absent so the validator downgrades the
+proposal to a hypothesis. In `human_checkpoint` mode, return only Critical
+defects introduced by the latest author delta.
 
 ## Security analysis
 

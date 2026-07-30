@@ -199,6 +199,7 @@ end
 
 harness_config = supported[harness] || {}
 emit "AGENT_ID", manifest.fetch("id")
+emit "AGENT_PAYLOAD_VERSION", manifest.fetch("payload_version", 1)
 emit "AGENT_DISPLAY_NAME", manifest.fetch("display_name", manifest.fetch("id"))
 emit "HARNESS", harness
 emit "HARNESS_MODEL", harness_config.fetch("model", "")
@@ -270,6 +271,9 @@ manifest.fetch("skills", []).each do |skill|
 end
 manifest.fetch("subagents", []).each do |subagent|
   uploads << [subagent.fetch("source"), subagent.fetch("destination")]
+end
+manifest.fetch("resources", []).each do |resource|
+  uploads << [resource.fetch("source"), resource.fetch("destination")]
 end
 emit "UPLOAD_COUNT", uploads.length
 uploads.each_with_index do |(source, destination), index|
@@ -560,6 +564,7 @@ values = {
   "HARNESS" => harness,
   "RUN_MODE" => run_mode,
   "POLL_INTERVAL_SECONDS" => poll_interval_seconds,
+  "PAYLOAD_VERSION" => manifest.fetch("payload_version", 1).to_s,
   "USER_PROMPT" => user_prompt,
 }
 
@@ -720,6 +725,7 @@ HARNESS_ENV_ARGS=(
     "OPENSHELL_AGENT_RUN_MODE=$RUN_MODE"
     "OPENSHELL_AGENT_POLL_INTERVAL_SECONDS=$POLL_INTERVAL_SECONDS"
     "OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES=$MAX_TRANSIENT_FAILURES"
+    "OPENSHELL_AGENT_PAYLOAD_VERSION=$AGENT_PAYLOAD_VERSION"
 )
 
 case "$HARNESS" in

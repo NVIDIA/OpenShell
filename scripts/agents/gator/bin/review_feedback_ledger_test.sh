@@ -21,6 +21,7 @@ cat > "$tmp/review-threads.json" <<'JSON'
           "login": "drew"
         },
         "headRefOid": "2222222222222222222222222222222222222222",
+        "baseRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "reviewThreads": {
           "nodes": [
             {
@@ -155,7 +156,7 @@ cat > "$tmp/reviews.json" <<'JSON'
       "login": "drew"
     },
     "author_association": "MEMBER",
-    "body": "> **gator-agent**\n\n## PR Review Status\n\nHead SHA: `1111111111111111111111111111111111111111`\n\nGeneral findings:\n- Finding ID: GATOR-11111111-01 — Keep package verification.",
+    "body": "> **gator-agent**\n\n## PR Review Status\n\nHead SHA: `1111111111111111111111111111111111111111`\nBase SHA: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`\nMerge base SHA: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`\nPatch ID: `cccccccccccccccccccccccccccccccccccccccc`\nGator payload: `2`\n\nGeneral findings:\n- Finding ID: GATOR-11111111-01 — Keep package verification.",
     "state": "COMMENTED",
     "submitted_at": "2026-07-28T19:53:23Z",
     "commit_id": "1111111111111111111111111111111111111111"
@@ -182,7 +183,7 @@ cat > "$tmp/issue-comments.json" <<'JSON'
       "login": "drew"
     },
     "author_association": "MEMBER",
-    "body": "> **gator-agent**\n\n## Re-check After Maintainer Update\n\nHead SHA: `1111111111111111111111111111111111111111`\n\nCarried finding: GATOR-11111111-02",
+    "body": "> **gator-agent**\n\n## Re-check After Maintainer Update\n\nHead SHA: `1111111111111111111111111111111111111111`\nBase SHA: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`\nMerge base SHA: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`\nPatch ID: `cccccccccccccccccccccccccccccccccccccccc`\nGator payload: `2`\n\nCarried finding: GATOR-11111111-02",
     "created_at": "2026-07-28T20:00:00Z",
     "updated_at": "2026-07-28T20:00:00Z",
     "html_url": "https://example.test/comment/9001"
@@ -208,22 +209,33 @@ jq -n \
   '{
     thread_pages: $thread_pages,
     review_pages: $review_pages,
-    issue_comment_pages: $issue_comment_pages
+    issue_comment_pages: $issue_comment_pages,
+    current_tree: {
+      head_sha: "2222222222222222222222222222222222222222",
+      base_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      merge_base_sha: "dddddddddddddddddddddddddddddddddddddddd",
+      patch_id: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
   }' > "$tmp/raw-ledger-input.json"
 
 "$LEDGER" --input "$tmp/raw-ledger-input.json" > "$tmp/ledger.json"
 
 jq -e '
-    .schema_version == 2 and
+    .schema_version == 3 and
     .pr_author == "drew" and
     .current_head_sha == "2222222222222222222222222222222222222222" and
+    .current_base_sha == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and
+    .current_merge_base_sha == "dddddddddddddddddddddddddddddddddddddddd" and
+    .current_patch_id == "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" and
     .last_reviewed_sha == "1111111111111111111111111111111111111111" and
+    .last_reviewed_patch_id == "cccccccccccccccccccccccccccccccccccccccc" and
     .review_scope.mode == "follow_up" and
     .review_scope.previous_reviewed_sha == "1111111111111111111111111111111111111111" and
     (.reviews | length) == 1 and
     (.issue_comments | length) == 1 and
     (.dispositions | length) == 2 and
     .reviews[0].finding_ids == ["GATOR-11111111-01"] and
+    .reviews[0].payload_version == 2 and
     .issue_comments[0].finding_ids == ["GATOR-11111111-02"] and
     (.reviews[0].summary_body | contains("Keep package verification")) and
     (.threads | length) == 2 and
@@ -243,6 +255,15 @@ jq -e '
           .finding_id == "GATOR-11111111-03"
     ) and
     (all(.threads[]; .thread_id != "human-only-thread"))
+    and .review_telemetry.review_rounds == 1
+    and .review_telemetry.finding_bearing_rounds == 1
+    and .review_telemetry.convergence_checkpoint_required == false
+    and (
+      .finding_history[]
+      | select(.finding_id == "GATOR-11111111-01")
+      | .first_seen_head_sha ==
+        "1111111111111111111111111111111111111111"
+    )
 ' "$tmp/ledger.json" >/dev/null
 
 jq '
@@ -255,6 +276,49 @@ jq -e '
   .last_reviewed_sha == null and
   (.dispositions | length) == 0
 ' "$tmp/initial-ledger.json" >/dev/null
+
+jq '
+  .thread_pages[0].data.repository.pullRequest.headRefOid =
+    "3333333333333333333333333333333333333333" |
+  .current_tree.head_sha = "3333333333333333333333333333333333333333" |
+  .current_tree.patch_id = "cccccccccccccccccccccccccccccccccccccccc"
+' "$tmp/raw-ledger-input.json" > "$tmp/rebase-equivalent-input.json"
+"$LEDGER" --input "$tmp/rebase-equivalent-input.json" \
+  > "$tmp/rebase-equivalent-ledger.json"
+jq -e '
+  .review_scope.mode == "already_reviewed" and
+  .review_scope.rebase_equivalent == true and
+  .review_telemetry.current_patch_matches_last_review == true
+' "$tmp/rebase-equivalent-ledger.json" >/dev/null
+
+jq '
+  .review_pages[0] += [
+    {
+      "id": 4801295796,
+      "user": {"login": "drew"},
+      "author_association": "MEMBER",
+      "body": "> **gator-agent**\n\n## PR Review Status\n\nHead SHA: `1211111111111111111111111111111111111111`\n\nGATOR-12111111-01",
+      "state": "COMMENTED",
+      "submitted_at": "2026-07-28T20:53:23Z",
+      "commit_id": "1211111111111111111111111111111111111111"
+    },
+    {
+      "id": 4801295797,
+      "user": {"login": "drew"},
+      "author_association": "MEMBER",
+      "body": "> **gator-agent**\n\n## PR Review Status\n\nHead SHA: `1311111111111111111111111111111111111111`\n\nGATOR-13111111-01",
+      "state": "COMMENTED",
+      "submitted_at": "2026-07-28T21:53:23Z",
+      "commit_id": "1311111111111111111111111111111111111111"
+    }
+  ]
+' "$tmp/raw-ledger-input.json" > "$tmp/checkpoint-input.json"
+"$LEDGER" --input "$tmp/checkpoint-input.json" > "$tmp/checkpoint-ledger.json"
+jq -e '
+  .review_scope.mode == "human_checkpoint" and
+  .review_scope.convergence_checkpoint_required == true and
+  .review_telemetry.finding_bearing_rounds == 3
+' "$tmp/checkpoint-ledger.json" >/dev/null
 
 jq '
   .thread_pages[0].data.repository.pullRequest.headRefOid =
@@ -278,6 +342,20 @@ fi
 
 rg -q 'COPY bin/review-feedback-ledger /usr/local/bin/review-feedback-ledger' \
     "$GATOR_DIR/Dockerfile"
+rg -q 'COPY bin/validate-review-findings /usr/local/bin/validate-review-findings' \
+    "$GATOR_DIR/Dockerfile"
+ruby -ryaml -e '
+  manifest = YAML.load_file(ARGV.fetch(0))
+  abort unless manifest.fetch("payload_version") == 2
+  resource = manifest.fetch("resources").find {
+    |entry| entry.fetch("id") == "gator-review-findings-schema"
+  }
+  abort unless resource.fetch("destination") ==
+    "skills/gator-gate/references/review-findings-schema.md"
+' "$GATOR_DIR/agent.yaml"
+rg -Fq 'manifest.fetch("resources", [])' "$GATOR_DIR/../run.sh"
+rg -Fq 'Gator payload version: {{PAYLOAD_VERSION}}' \
+    "$GATOR_DIR/prompts/gator.md"
 rg -q 'review-feedback-ledger NVIDIA OpenShell <pr-number>' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -q 'Every prior Gator finding is a durable review disposition' \
@@ -297,5 +375,9 @@ rg -q '### Pragmatic review calibration' \
     "$GATOR_DIR/../../../.claude/agents/principal-engineer-reviewer.md"
 rg -q 'Do not mine unchanged code for new findings' \
     "$GATOR_DIR/../../../.claude/agents/principal-engineer-reviewer.md"
+rg -q 'three finding-bearing rounds' \
+    "$GATOR_DIR/skills/gator-gate/SKILL.md"
+rg -q 'attacker_or_operator_prerequisite' \
+    "$GATOR_DIR/skills/gator-gate/references/review-findings-schema.md"
 
 printf 'PASS: gator review feedback ledger tests\n'
