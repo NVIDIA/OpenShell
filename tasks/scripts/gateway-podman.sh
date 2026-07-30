@@ -8,7 +8,7 @@
 #
 # Defaults:
 # - Plaintext HTTP on 127.0.0.1:18080 (IPv6 loopback on macOS Podman Machine)
-# - Dedicated CLI gateway "podman-dev"
+# - Gateway installation and CLI registration name "podman-dev"
 # - Persistent state under .cache/gateway-podman
 # - Supervisor sideload image openshell/supervisor:dev, refreshed on launch
 #
@@ -203,6 +203,7 @@ cat >"${CONFIG_PATH}" <<EOF
 version = 1
 
 [openshell.gateway]
+name = "${GATEWAY_NAME}"
 compute_drivers = ["podman"]
 default_image = "${SANDBOX_IMAGE}"
 disable_tls = true

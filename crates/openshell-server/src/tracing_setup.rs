@@ -13,7 +13,7 @@ use tracing_subscriber::prelude::*;
 
 use crate::ConfiguredComputeDriver;
 use crate::config_file::OtlpConfig;
-use crate::otel_tracing::SetupError;
+use crate::otel_tracing::{GatewayResourceAttributes, SetupError};
 use crate::tracing_bus::TracingLogBus;
 
 pub struct TracingHandle {
@@ -94,16 +94,17 @@ fn in_process_driver_target_prefix(driver: Option<InProcessDriverTracing>) -> Op
 fn in_process_driver_provider(
     driver: Option<InProcessDriverTracing>,
     endpoint: Option<&str>,
+    gateway_name: Option<&str>,
 ) -> (Option<SdkTracerProvider>, Option<SetupError>) {
     match driver {
         Some(InProcessDriverTracing::Docker) => {
-            openshell_driver_docker::otel_tracing::provider_for(endpoint)
+            openshell_driver_docker::otel_tracing::provider_for(endpoint, gateway_name)
         }
         Some(InProcessDriverTracing::Kubernetes) => {
-            openshell_driver_kubernetes::otel_tracing::provider_for(endpoint)
+            openshell_driver_kubernetes::otel_tracing::provider_for(endpoint, gateway_name)
         }
         Some(InProcessDriverTracing::Podman) => {
-            openshell_driver_podman::otel_tracing::provider_for(endpoint)
+            openshell_driver_podman::otel_tracing::provider_for(endpoint, gateway_name)
         }
         None => (None, None),
     }
@@ -113,6 +114,7 @@ fn in_process_driver_provider(
 fn in_process_driver_provider(
     _driver: Option<InProcessDriverTracing>,
     _endpoint: Option<&str>,
+    _gateway_name: Option<&str>,
 ) -> (Option<SdkTracerProvider>, Option<SetupError>) {
     (None, None)
 }
@@ -155,8 +157,9 @@ pub fn install(
     tracing_log_bus: &TracingLogBus,
     otlp_config: Option<&OtlpConfig>,
     driver: &ConfiguredComputeDriver,
+    gateway: GatewayResourceAttributes<'_>,
 ) -> (TracingHandle, Option<SetupError>) {
-    let (tracer_provider, setup_error) = crate::otel_tracing::provider_for(otlp_config);
+    let (tracer_provider, setup_error) = crate::otel_tracing::provider_for(otlp_config, gateway);
     let selected_driver = in_process_driver_tracing(driver);
     let driver_endpoint = selected_driver
         .is_some()
@@ -164,7 +167,7 @@ pub fn install(
         .flatten()
         .map(|config| config.endpoint.as_str());
     let (driver_tracer_provider, driver_setup_error) =
-        in_process_driver_provider(selected_driver, driver_endpoint);
+        in_process_driver_provider(selected_driver, driver_endpoint, gateway.name());
 
     tracing_subscriber::registry()
         .with(env_filter)

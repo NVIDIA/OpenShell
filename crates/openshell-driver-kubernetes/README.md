@@ -23,7 +23,9 @@ When the gateway configures `[openshell.gateway.otlp]`, Kubernetes
 compute-driver spans export to the same OTLP/gRPC collector with the service
 name `openshell-driver-kubernetes`. The driver preserves the gateway trace
 context and uses the same compute-driver RPC span names in its in-process and
-standalone forms.
+standalone forms. Standalone deployments set `--gateway-name` or
+`OPENSHELL_GATEWAY_NAME` so exported spans carry the same
+`openshell.gateway.name` resource attribute as gateway spans.
 
 When it creates an Agent Sandbox resource, the driver serializes the active W3C
 trace context into the controller-reserved `opentelemetry.io/trace-context`

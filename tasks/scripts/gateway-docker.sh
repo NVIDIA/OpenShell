@@ -199,6 +199,7 @@ cat >"${CONFIG_PATH}" <<EOF
 version = 1
 
 [openshell.gateway]
+name = "${GATEWAY_NAME}"
 compute_drivers = ["docker"]
 disable_tls = true
 

@@ -19,6 +19,7 @@ openshell-core = { path = "../openshell-core", default-features = false }
 openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
 
+opentelemetry = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
 prost = { workspace = true }
@@ -39,7 +40,6 @@ notify = "8"
 
 [dev-dependencies]
 openshell-otel-test-support = { path = "../openshell-otel-test-support" }
-opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 bytes = { workspace = true }
 http = { workspace = true }

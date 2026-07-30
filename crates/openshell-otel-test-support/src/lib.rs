@@ -16,6 +16,7 @@ use opentelemetry_proto::tonic::trace::v1::Span;
 pub struct ReceivedTraces {
     pub spans: Vec<Span>,
     pub service_names: Vec<String>,
+    pub gateway_names: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -37,18 +38,22 @@ impl TraceService for Collector {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for resource_span in request.into_inner().resource_spans {
                 if let Some(resource) = resource_span.resource {
-                    received.service_names.extend(
-                        resource
-                            .attributes
-                            .into_iter()
-                            .filter(|attribute| attribute.key == "service.name")
-                            .filter_map(|attribute| attribute.value)
-                            .filter_map(|value| value.value)
-                            .filter_map(|value| match value {
-                                opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(value) => Some(value),
-                                _ => None,
-                            }),
-                    );
+                    for attribute in resource.attributes {
+                        let Some(value) = attribute.value.and_then(|value| value.value) else {
+                            continue;
+                        };
+                        let opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                            value,
+                        ) = value
+                        else {
+                            continue;
+                        };
+                        match attribute.key.as_str() {
+                            "service.name" => received.service_names.push(value),
+                            "openshell.gateway.name" => received.gateway_names.push(value),
+                            _ => {}
+                        }
+                    }
                 }
                 for scope_span in resource_span.scope_spans {
                     received.spans.extend(scope_span.spans);

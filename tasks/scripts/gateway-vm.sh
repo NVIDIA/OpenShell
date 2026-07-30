@@ -11,7 +11,7 @@
 #
 # Defaults:
 # - Plaintext HTTP on 127.0.0.1:18081
-# - Dedicated CLI gateway "vm-dev"
+# - Gateway installation and CLI registration name "vm-dev"
 # - Persistent gateway state (SQLite DB) under .cache/gateway-vm
 # - Per-sandbox VM driver state (rootfs + compute-driver.sock) under
 #   /tmp/openshell-vm-driver-<user>-<gateway-name> so the AF_UNIX socket
@@ -324,6 +324,7 @@ cat >"${CONFIG_PATH}" <<EOF
 version = 1
 
 [openshell.gateway]
+name = "${GATEWAY_NAME}"
 compute_drivers = ["vm"]
 disable_tls = ${DISABLE_TLS}
 
