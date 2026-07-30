@@ -1499,10 +1499,12 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                 .endpoints
                 .iter()
                 .map(|e| {
-                    // Normalize port/ports: ports takes precedence, then
-                    // single port promoted to array. Rego always sees "ports".
-                    let ports: Vec<u32> = if !e.ports.is_empty() {
-                        e.ports.clone()
+                    // Normalize port/ports: filter zero ports first so OPA
+                    // never sees them, then ports takes precedence over a
+                    // single promoted port. Rego always sees "ports".
+                    let filtered: Vec<u32> = e.ports.iter().copied().filter(|&p| p > 0).collect();
+                    let ports: Vec<u32> = if !filtered.is_empty() {
+                        filtered
                     } else if e.port > 0 {
                         vec![e.port]
                     } else {
@@ -7786,5 +7788,69 @@ network_policies:
         // Zero-only ports array becomes empty; scalar port is promoted.
         assert_eq!(endpoints[0]["ports"], serde_json::json!([8080]));
         assert!(endpoints[0].get("port").is_none());
+    }
+
+    fn proto_with_endpoint_ports(port: u32, ports: Vec<u32>) -> ProtoSandboxPolicy {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "p".to_string(),
+            NetworkPolicyRule {
+                name: "p".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port,
+                    ports,
+                    ..Default::default()
+                }],
+                binaries: vec![],
+            },
+        );
+        ProtoSandboxPolicy {
+            version: 1,
+            filesystem: None,
+            landlock: None,
+            process: None,
+            network_policies,
+            network_middlewares: std::collections::HashMap::default(),
+        }
+    }
+
+    #[test]
+    fn proto_to_opa_data_json_filters_zero_ports_in_production_path() {
+        // Mixed array: zero removed, positive kept.
+        let proto = proto_with_endpoint_ports(0, vec![0, 443]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&proto_to_opa_data_json(&proto, 0)).unwrap();
+        assert_eq!(
+            parsed["network_policies"]["p"]["endpoints"][0]["ports"],
+            serde_json::json!([443])
+        );
+
+        // Zero-only array: becomes empty, no fallback to scalar port.
+        let proto = proto_with_endpoint_ports(0, vec![0]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&proto_to_opa_data_json(&proto, 0)).unwrap();
+        assert_eq!(
+            parsed["network_policies"]["p"]["endpoints"][0]["ports"],
+            serde_json::json!([])
+        );
+
+        // Zero scalar port: not promoted.
+        let proto = proto_with_endpoint_ports(0, vec![]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&proto_to_opa_data_json(&proto, 0)).unwrap();
+        assert_eq!(
+            parsed["network_policies"]["p"]["endpoints"][0]["ports"],
+            serde_json::json!([])
+        );
+
+        // Positive scalar port with zero-only array: scalar promoted.
+        let proto = proto_with_endpoint_ports(8080, vec![0]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&proto_to_opa_data_json(&proto, 0)).unwrap();
+        assert_eq!(
+            parsed["network_policies"]["p"]["endpoints"][0]["ports"],
+            serde_json::json!([8080])
+        );
     }
 }

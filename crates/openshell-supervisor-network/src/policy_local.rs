@@ -1437,6 +1437,58 @@ mod tests {
         );
     }
 
+    fn proposal_body_with_endpoint_ports(port: u32, ports: serde_json::Value) -> Vec<u8> {
+        serde_json::json!({
+            "operations": [
+                {
+                    "addRule": {
+                        "ruleName": "ports_case",
+                        "rule": {
+                            "endpoints": [
+                                {
+                                    "host": "api.example.com",
+                                    "port": port,
+                                    "ports": ports,
+                                }
+                            ],
+                            "binaries": []
+                        }
+                    }
+                }
+            ]
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_filters_mixed_zero_ports() {
+        let body = proposal_body_with_endpoint_ports(0, serde_json::json!([0, 443]));
+        let chunks = proposal_chunks_from_body(&body).unwrap();
+        let rule = chunks[0].proposed_rule.as_ref().unwrap();
+        assert_eq!(rule.endpoints[0].ports, vec![443]);
+        assert_eq!(rule.endpoints[0].port, 443);
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_rejects_zero_only_ports() {
+        let body = proposal_body_with_endpoint_ports(0, serde_json::json!([0]));
+        let err = proposal_chunks_from_body(&body).unwrap_err();
+        assert!(
+            err.contains("endpoint.port or endpoint.ports is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_zero_ports_falls_back_to_scalar_port() {
+        let body = proposal_body_with_endpoint_ports(8080, serde_json::json!([0]));
+        let chunks = proposal_chunks_from_body(&body).unwrap();
+        let rule = chunks[0].proposed_rule.as_ref().unwrap();
+        assert_eq!(rule.endpoints[0].ports, vec![8080]);
+        assert_eq!(rule.endpoints[0].port, 8080);
+    }
+
     #[test]
     fn proposal_chunks_from_body_rejects_query_in_l7_path() {
         let body = br#"{
