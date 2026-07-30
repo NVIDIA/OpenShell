@@ -4841,47 +4841,6 @@ async fn handle_forward_proxy(
         return Ok(());
     }
 
-    // 6. Connect upstream. Plain-HTTP requests always dial the destination
-    //    directly: only TLS (CONNECT) tunnels chain through the corporate
-    //    proxy, since plain-HTTP forwarding would need absolute-form requests
-    //    rather than a CONNECT tunnel.
-    let dial_result = TcpStream::connect(addrs.as_slice()).await;
-    let mut upstream = match dial_result {
-        Ok(s) => s,
-        Err(e) => {
-            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Fail)
-                .severity(SeverityId::Low)
-                .status(StatusId::Failure)
-                .http_request(HttpRequest::new(
-                    method,
-                    OcsfUrl::new("http", &host_lc, &path, port),
-                ))
-                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
-                .message(format!(
-                    "FORWARD upstream connect failed for {host_lc}:{port}: {e}"
-                ))
-                .build();
-            ocsf_emit!(event);
-            respond(
-                client,
-                &build_json_error_response(
-                    502,
-                    "Bad Gateway",
-                    "upstream_unreachable",
-                    &format!("connection to {host_lc}:{port} failed"),
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
     let middleware_path = path.split_once('?').map_or(path.as_str(), |(path, _)| path);
     let middleware_input = crate::opa::NetworkInput {
         host: host_lc.clone(),
@@ -5022,6 +4981,11 @@ async fn handle_forward_proxy(
                 error = %e,
                 "token grant failed in forward proxy"
             );
+            if let Some(session) = middleware_session.take() {
+                session
+                    .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                    .await;
+            }
             respond(
                 client,
                 &build_json_error_response(
@@ -5053,6 +5017,11 @@ async fn handle_forward_proxy(
                 error = %e,
                 "credential injection failed in forward proxy"
             );
+            if let Some(session) = middleware_session.take() {
+                session
+                    .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                    .await;
+            }
             respond(
                 client,
                 &build_json_error_response(
@@ -5077,6 +5046,11 @@ async fn handle_forward_proxy(
             "Forward proxy rejected request because policy changed before relay"
         );
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        if let Some(session) = middleware_session.take() {
+            session
+                .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                .await;
+        }
         respond(
             client,
             &build_json_error_response(
@@ -5089,7 +5063,83 @@ async fn handle_forward_proxy(
         .await?;
         return Ok(());
     }
-    let outcome = relay_rewritten_forward_request(
+
+    // Plain-HTTP requests dial the destination directly: only TLS (CONNECT)
+    // tunnels chain through the corporate proxy, since plain-HTTP forwarding
+    // would need absolute-form requests rather than a CONNECT tunnel. Dial
+    // only after every local authorization and transformation step so a
+    // rejected WebSocket preflight cannot contact the destination.
+    let dial_result = TcpStream::connect(addrs.as_slice()).await;
+    let mut upstream = match dial_result {
+        Ok(s) => s,
+        Err(e) => {
+            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .http_request(HttpRequest::new(
+                    method,
+                    OcsfUrl::new("http", &host_lc, &path, port),
+                ))
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
+                .actor_process(
+                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                        .with_cmd_line(&cmdline_str),
+                )
+                .message(format!(
+                    "FORWARD upstream connect failed for {host_lc}:{port}: {e}"
+                ))
+                .build();
+            ocsf_emit!(event);
+            if let Some(session) = middleware_session.take() {
+                session
+                    .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                    .await;
+            }
+            respond(
+                client,
+                &build_json_error_response(
+                    502,
+                    "Bad Gateway",
+                    "upstream_unreachable",
+                    &format!("connection to {host_lc}:{port} failed"),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if let Err(e) = forward_generation_guard.ensure_current() {
+        warn!(
+            host = %host_lc,
+            port,
+            captured_generation = forward_generation_guard.captured_generation(),
+            current_generation = forward_generation_guard.current_generation(),
+            error = %e,
+            "Forward proxy rejected request because policy changed during upstream connect"
+        );
+        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        if let Some(session) = middleware_session.take() {
+            session
+                .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                .await;
+        }
+        respond(
+            client,
+            &build_json_error_response(
+                403,
+                "Forbidden",
+                "policy_denied",
+                &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let outcome_result = relay_rewritten_forward_request(
         method,
         &path,
         rewritten,
@@ -5101,6 +5151,15 @@ async fn handle_forward_proxy(
             secret_resolver: secret_resolver.as_deref(),
             request_body_credential_rewrite,
         },
+    )
+    .await;
+    let outcome = crate::l7::relay::finalize_websocket_pre_upgrade(
+        &mut middleware_session,
+        &forward_generation_guard,
+        &host_lc,
+        port,
+        policy_str,
+        outcome_result,
     )
     .await?;
 
@@ -5166,6 +5225,7 @@ async fn handle_forward_proxy(
                 }
             };
             upgrade_options.generation_guard = Some(&forward_generation_guard);
+            upgrade_options.assembly_budget = Some(opa_engine.websocket_assembly_budget());
             upgrade_options.websocket.permessage_deflate = websocket_permessage_deflate;
             upgrade_options.middleware_session = middleware_session.take();
             upgrade_options.selected_subprotocol = websocket_subprotocol;
@@ -5404,6 +5464,104 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
+    struct DenyWebSocketPreflight;
+
+    #[tonic::async_trait]
+    impl openshell_core::middleware::SupervisorMiddlewareEndpoint for DenyWebSocketPreflight {
+        async fn describe(
+            &self,
+            _request: tonic::Request<()>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::MiddlewareManifest>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::MiddlewareManifest {
+                    name: "test/deny-websocket".into(),
+                    service_version: "test".into(),
+                    bindings: vec![openshell_core::proto::MiddlewareBinding {
+                        operation:
+                            openshell_core::proto::SupervisorMiddlewareOperation::WebsocketMessage
+                                as i32,
+                        phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
+                            as i32,
+                        max_payload_bytes: 1024,
+                        timeout: "1s".into(),
+                    }],
+                },
+            ))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: tonic::Request<openshell_core::proto::ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("WebSocket-only test service"))
+        }
+
+        async fn open_websocket_session(
+            &self,
+            mut receiver: mpsc::Receiver<openshell_core::proto::WebSocketSessionEvent>,
+        ) -> std::result::Result<openshell_core::middleware::WebSocketResponseStream, tonic::Status>
+        {
+            let (responses, response_stream) = mpsc::channel(1);
+            tokio::spawn(async move {
+                while let Some(event) = receiver.recv().await {
+                    if matches!(
+                        event.event,
+                        Some(openshell_core::proto::web_socket_session_event::Event::Preflight(_))
+                    ) {
+                        let _ = responses
+                            .send(Ok(openshell_core::proto::WebSocketSessionEventResult {
+                                result: Some(
+                                    openshell_core::proto::web_socket_session_event_result::Result::PreflightDecision(
+                                        openshell_core::proto::WebSocketPreflightDecision {
+                                            action: openshell_core::proto::WebSocketPreflightAction::Deny as i32,
+                                            reason: "test denial".into(),
+                                            reason_code: "test_denial".into(),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
+                            }))
+                            .await;
+                        break;
+                    }
+                }
+            });
+            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+                response_stream,
+            )))
+        }
+    }
+
+    fn non_loopback_test_ipv4() -> Option<Ipv4Addr> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("192.0.2.1:9").ok()?;
+        match socket.local_addr().ok()?.ip() {
+            IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+            _ => None,
+        }
+    }
+
     async fn drive_raw_request_through_handler(raw: Vec<u8>) -> Vec<u8> {
         let policy = include_str!("../data/sandbox-policy.rego");
         let data = r#"
@@ -5460,6 +5618,117 @@ network_policies: {}
                 "malformed request for {host} must fail at ingress"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn plaintext_websocket_preflight_denial_does_not_connect_upstream() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+        let Some(upstream_ip) = non_loopback_test_ipv4() else {
+            eprintln!("skipping: no routable non-loopback IPv4 test address");
+            return;
+        };
+
+        let upstream_listener = TcpListener::bind((upstream_ip, 0))
+            .await
+            .expect("bind upstream listener");
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let executable = std::env::current_exe().expect("current executable");
+        let data = format!(
+            r#"
+network_middlewares:
+  deny-upgrade:
+    middleware: test/deny-websocket
+    on_error: fail_closed
+    endpoints:
+      include: ["{upstream_ip}"]
+network_policies:
+  allow-upstream:
+    name: allow-upstream
+    endpoints:
+      - host: "{upstream_ip}"
+        port: {upstream_port}
+    binaries:
+      - {{ path: "{executable}" }}
+"#,
+            executable = executable.display(),
+        );
+        let engine = Arc::new(
+            OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
+                .expect("load policy"),
+        );
+        let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+            vec![Arc::new(DenyWebSocketPreflight)],
+            Vec::new(),
+        )
+        .await
+        .expect("connect test middleware");
+        engine
+            .replace_middleware_registry(registry)
+            .expect("install test middleware");
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let target = format!("http://{upstream_ip}:{upstream_port}/ws");
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        let client = tokio::spawn(async move {
+            let mut socket = TcpStream::connect(proxy_address)
+                .await
+                .expect("connect proxy");
+            let mut response = Vec::new();
+            socket
+                .read_to_end(&mut response)
+                .await
+                .expect("read proxy response");
+            response
+        });
+        let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_forward_proxy(
+                "GET",
+                &target,
+                request.as_bytes(),
+                request.len(),
+                &mut proxy_connection,
+                engine,
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(std::process::id())),
+                None,
+                AgentProposals::default(),
+                Arc::new(None),
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("denied preflight must complete without an upstream response")
+        .expect("handle denied plaintext WebSocket upgrade");
+        drop(proxy_connection);
+
+        let response = String::from_utf8(client.await.unwrap()).expect("UTF-8 response");
+        assert!(
+            response.contains("\"error\":\"middleware_denied\""),
+            "preflight must deny the upgrade: {response}"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                upstream_listener.accept()
+            )
+            .await
+            .is_err(),
+            "denied preflight must not establish an upstream connection"
+        );
     }
 
     #[tokio::test]

@@ -203,7 +203,6 @@ impl ChainRunner {
         if entries.is_empty() {
             return Ok(empty_preflight_result());
         }
-        validate_preflight_input(&input)?;
         let description = self
             .describe_chain_for(
                 entries,
@@ -222,6 +221,7 @@ impl ChainRunner {
             result.coverage = coverage;
             return Ok(result);
         }
+        validate_preflight_input(&input)?;
 
         // One permit covers the complete concurrent preflight fan-out. Permit
         // wait is deliberate backpressure and is excluded from every deadline.

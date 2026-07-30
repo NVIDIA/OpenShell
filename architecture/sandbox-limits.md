@@ -91,6 +91,7 @@ streaming HTTP middleware to use the same process-wide budget.
 | GraphQL request body | 64 KiB default | Policy can set a positive `graphql_max_body_bytes`; there is no shared platform ceiling yet. |
 | MCP or JSON-RPC request body | 64 KiB default | Policy can set a positive `max_body_bytes`; there is no shared platform ceiling yet. |
 | Parsed WebSocket client text message | 4 MiB | Close with `1009` when the complete or decompressed message is larger. |
+| Concurrent parsed WebSocket text assemblies | 32 active, 64 waiters | Shared process-wide across all parsed relays. Additional messages close with `1013` before payload allocation or reading when both bounds are full. |
 | Parsed WebSocket fragments per message | 4,096 | Close with `1002`. |
 | Parsed WebSocket text assembly | 30 s input idle, 2 min total | Close with `1002`; the total includes initial and continuation payloads, continuation headers, and interleaved control frames. These deliberately permissive initial bounds can be tightened, or made operator-tunable within platform bounds, after production behavior is understood. |
 | Parsed raw WebSocket binary frame | 16 MiB | Close with `1002`; binary messages are relayed rather than inspected. |
@@ -101,14 +102,7 @@ Ordinary allowed traffic is streamed rather than accumulated to a
 connection-sized buffer. A parsing or transformation feature introduces a
 buffer only when it owns an explicit bound.
 
-Parsed WebSocket text assembly for an active middleware session acquires shared
-middleware work before buffering. The assembly state retains that permit with
-its buffer, compression and fragment state, and total deadline. Input progress
-resets only the idle deadline. Completion transfers the permit into middleware
-evaluation; every timeout and terminal parser error drops it. Parsed relays
-used only for native policy, credential rewriting, compression, or a disabled
-fail-open middleware session retain the per-message and time bounds above but
-do not yet share aggregate assembly admission.
+Every parsed WebSocket text message acquires network-owned assembly capacity before payload allocation or reading, including relays used only for native policy, credential rewriting, compression, or a disabled fail-open middleware session. The process-lifetime budget survives policy reloads, and the assembly retains its permit through decompression, policy and middleware evaluation, credential rewriting, and upstream forwarding. Active middleware sessions additionally acquire shared middleware work before buffering. Input progress resets only the idle deadline. Every timeout and terminal parser error releases both permits through ordinary ownership. Queue exhaustion emits a payload-free network denial event.
 
 The operator middleware `max_payload_bytes` ceiling applies to payloads exposed
 through HTTP-body and WebSocket text-message bindings. It does not replace the
@@ -160,8 +154,6 @@ resource model. Known gaps include:
   ceiling rather than narrowing it.
 - Socket read deadlines are not expressed consistently as idle plus total
   budgets across every parser.
-- Parsed WebSocket text assembly without active middleware has per-message and
-  time bounds but no process-wide aggregate admission budget.
 - There is no documented aggregate connection budget or per-destination
   fairness policy in the supervisor.
 - The policy status outbox is intentionally unbounded and can grow if policy

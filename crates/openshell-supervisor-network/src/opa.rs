@@ -123,6 +123,7 @@ pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
     generation: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
+    websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
 }
 
 /// Generation guard captured when an HTTP tunnel or request path starts.
@@ -163,6 +164,7 @@ pub struct TunnelPolicyEngine {
     engine: Mutex<regorus::Engine>,
     generation_guard: PolicyGenerationGuard,
     middleware_runner: ChainRunner,
+    websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
 }
 
 impl TunnelPolicyEngine {
@@ -190,6 +192,12 @@ impl TunnelPolicyEngine {
         &self.middleware_runner
     }
 
+    pub(crate) fn websocket_assembly_budget(
+        &self,
+    ) -> crate::l7::websocket::WebSocketAssemblyBudget {
+        self.websocket_assembly_budget.clone()
+    }
+
     /// Query the ordered middleware chain for a destination within this tunnel.
     pub fn query_middleware_chain(&self, input: &NetworkInput) -> Result<Vec<ChainEntry>> {
         let mut engine = self
@@ -201,6 +209,12 @@ impl TunnelPolicyEngine {
 }
 
 impl OpaEngine {
+    pub(crate) fn websocket_assembly_budget(
+        &self,
+    ) -> crate::l7::websocket::WebSocketAssemblyBudget {
+        self.websocket_assembly_budget.clone()
+    }
+
     /// Load policy from a `.rego` rules file and data from a YAML file.
     ///
     /// Preprocesses the YAML data to expand access presets and validate L7 config.
@@ -236,6 +250,7 @@ impl OpaEngine {
             engine: Mutex::new(engine),
             generation: Arc::new(AtomicU64::new(0)),
             middleware_runner: RwLock::new(ChainRunner::default()),
+            websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
         })
     }
 
@@ -291,6 +306,7 @@ impl OpaEngine {
             engine: Mutex::new(engine),
             generation: Arc::new(AtomicU64::new(0)),
             middleware_runner: RwLock::new(ChainRunner::default()),
+            websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
         })
     }
 
@@ -370,6 +386,7 @@ impl OpaEngine {
             engine: Mutex::new(engine),
             generation: Arc::new(AtomicU64::new(0)),
             middleware_runner: RwLock::new(ChainRunner::default()),
+            websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
         })
     }
 
@@ -763,6 +780,7 @@ impl OpaEngine {
                 current_generation: Arc::clone(&self.generation),
             },
             middleware_runner: self.middleware_runner()?,
+            websocket_assembly_budget: self.websocket_assembly_budget(),
         })
     }
 }
@@ -3046,6 +3064,7 @@ network_policies:
             engine: Mutex::new(rego),
             generation: Arc::new(AtomicU64::new(0)),
             middleware_runner: RwLock::new(ChainRunner::default()),
+            websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
         };
         let input = l7_websocket_graphql_input(
             "realtime.graphql.com",
@@ -6894,6 +6913,54 @@ network_policies:
             .expect("released capacity is reusable after reload");
         assert!(admitted.allowed);
         assert!(admitted.session.is_some());
+    }
+
+    #[tokio::test]
+    async fn websocket_assembly_budget_survives_policy_reload() {
+        use crate::l7::websocket::{
+            MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES, WebSocketAssemblyAdmissionOutcome,
+        };
+
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial policy");
+        let old_tunnel = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .expect("old tunnel");
+        let old_budget = old_tunnel.websocket_assembly_budget();
+        let mut old_admissions = Vec::new();
+        for _ in 0..MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES {
+            match old_budget.reserve().await.expect("reserve old assembly") {
+                WebSocketAssemblyAdmissionOutcome::Admitted(admission) => {
+                    old_admissions.push(admission);
+                }
+                WebSocketAssemblyAdmissionOutcome::QueueExhausted => {
+                    panic!("active assembly capacity exhausted too early")
+                }
+            }
+        }
+
+        engine
+            .reload_from_proto_with_pid(&proto, 0)
+            .expect("policy reload");
+        let new_tunnel = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .expect("new tunnel");
+        let new_budget = new_tunnel.websocket_assembly_budget();
+        let waiting = tokio::spawn(async move { new_budget.reserve().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "new generation must share old generation assembly capacity"
+        );
+
+        drop(old_admissions.pop());
+        assert!(matches!(
+            waiting
+                .await
+                .expect("join waiting assembly")
+                .expect("waiting assembly result"),
+            WebSocketAssemblyAdmissionOutcome::Admitted(_)
+        ));
     }
 
     #[tokio::test]

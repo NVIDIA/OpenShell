@@ -4264,6 +4264,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_only_attachment_allows_33_requested_subprotocols() {
+        let runner = ChainRunner::new(Arc::new(ScriptedService {
+            manifest_name: "test/http-only".into(),
+            max_body_bytes: 4096,
+            result: allow_result(),
+        }));
+        let chain = [ChainEntry {
+            name: "http-guard".into(),
+            implementation: "test/http-only".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        }];
+        let mut input = websocket_preflight_input("http-only-many-subprotocols");
+        input.requested_subprotocols = (0..33)
+            .map(|index| format!("subprotocol-{index}"))
+            .collect();
+
+        let outcome = runner
+            .preflight_websocket(&chain, input)
+            .await
+            .expect("HTTP-only attachment must not validate a WebSocket middleware envelope");
+
+        assert!(outcome.allowed);
+        assert_eq!(outcome.terminal_reason, None);
+        assert!(outcome.session.is_none());
+        assert!(outcome.invocations.is_empty());
+        assert_eq!(
+            outcome.coverage,
+            [WebSocketCoverage {
+                config_name: "http-guard".into(),
+                implementation: "test/http-only".into(),
+                state: WebSocketCoverageState::BindingNotSelected,
+                sequence: None,
+                message_type: None,
+                original_size: 0,
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn unsupported_binary_messages_advance_sequence_without_applying_on_error() {
         for on_error in [OnError::FailClosed, OnError::FailOpen] {
             let runner = builtin_runner();

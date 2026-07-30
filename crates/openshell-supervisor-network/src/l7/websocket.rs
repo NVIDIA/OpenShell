@@ -18,10 +18,14 @@ use openshell_ocsf::{
 };
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_TEXT_MESSAGE_BYTES: usize = openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES;
+pub const MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES: usize = 32;
+pub const MAX_QUEUED_WEBSOCKET_ASSEMBLIES: usize = MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES * 2;
 const MAX_RAW_FRAME_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MESSAGE_FRAGMENTS: usize = 4096;
 const TEXT_MESSAGE_ASSEMBLY_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
@@ -34,10 +38,65 @@ const OPCODE_CLOSE: u8 = 0x8;
 const OPCODE_PING: u8 = 0x9;
 const OPCODE_PONG: u8 = 0xA;
 
+#[derive(Clone, Debug)]
+pub struct WebSocketAssemblyBudget {
+    active: Arc<Semaphore>,
+    waiters: Arc<Semaphore>,
+}
+
+impl Default for WebSocketAssemblyBudget {
+    fn default() -> Self {
+        Self::new(
+            MAX_CONCURRENT_WEBSOCKET_ASSEMBLIES,
+            MAX_QUEUED_WEBSOCKET_ASSEMBLIES,
+        )
+    }
+}
+
+impl WebSocketAssemblyBudget {
+    pub fn new(active: usize, waiters: usize) -> Self {
+        Self {
+            active: Arc::new(Semaphore::new(active)),
+            waiters: Arc::new(Semaphore::new(waiters)),
+        }
+    }
+
+    pub async fn reserve(&self) -> Result<WebSocketAssemblyAdmissionOutcome> {
+        if let Ok(active) = Arc::clone(&self.active).try_acquire_owned() {
+            return Ok(WebSocketAssemblyAdmissionOutcome::Admitted(
+                WebSocketAssemblyAdmission { _active: active },
+            ));
+        }
+        let Ok(waiter) = Arc::clone(&self.waiters).try_acquire_owned() else {
+            return Ok(WebSocketAssemblyAdmissionOutcome::QueueExhausted);
+        };
+        let active = Arc::clone(&self.active)
+            .acquire_owned()
+            .await
+            .map_err(|_| miette!("websocket assembly admission semaphore closed"))?;
+        drop(waiter);
+        Ok(WebSocketAssemblyAdmissionOutcome::Admitted(
+            WebSocketAssemblyAdmission { _active: active },
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub struct WebSocketAssemblyAdmission {
+    _active: OwnedSemaphorePermit,
+}
+
+#[derive(Debug)]
+pub enum WebSocketAssemblyAdmissionOutcome {
+    Admitted(WebSocketAssemblyAdmission),
+    QueueExhausted,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebSocketTerminationCause {
     PeerDisconnect,
     PolicyReload,
+    CapacityExhausted,
     MiddlewareDenial,
     MiddlewareFailure,
     PolicyDenial,
@@ -51,6 +110,7 @@ impl WebSocketTerminationCause {
         match self {
             Self::PeerDisconnect => None,
             Self::PolicyReload => Some(1012),
+            Self::CapacityExhausted => Some(1013),
             Self::MiddlewareDenial | Self::MiddlewareFailure | Self::PolicyDenial => Some(1008),
             Self::InvalidUtf8 => Some(1007),
             Self::ProtocolError => Some(1002),
@@ -68,7 +128,7 @@ impl WebSocketTerminationCause {
                 openshell_core::proto::WebSocketSessionEndReason::MiddlewareDenial
             }
             Self::PolicyDenial => openshell_core::proto::WebSocketSessionEndReason::PolicyDenial,
-            Self::MiddlewareFailure => {
+            Self::CapacityExhausted | Self::MiddlewareFailure => {
                 openshell_core::proto::WebSocketSessionEndReason::MiddlewareFailure
             }
             Self::InvalidUtf8 | Self::ProtocolError | Self::MessageTooBig => {
@@ -279,6 +339,7 @@ struct TextMessageAssembly {
     payload: Vec<u8>,
     compressed: bool,
     fragment_count: usize,
+    assembly_admission: WebSocketAssemblyAdmission,
     admission: Option<openshell_supervisor_middleware::MiddlewareWorkAdmission>,
     total_deadline: tokio::time::Instant,
 }
@@ -286,12 +347,14 @@ struct TextMessageAssembly {
 impl TextMessageAssembly {
     fn new(
         compressed: bool,
+        assembly_admission: WebSocketAssemblyAdmission,
         admission: Option<openshell_supervisor_middleware::MiddlewareWorkAdmission>,
     ) -> Self {
         Self {
             payload: Vec::new(),
             compressed,
             fragment_count: 1,
+            assembly_admission,
             admission,
             total_deadline: tokio::time::Instant::now() + TEXT_MESSAGE_ASSEMBLY_TOTAL_TIMEOUT,
         }
@@ -387,9 +450,15 @@ impl TextMessageAssembly {
     ) -> (
         Vec<u8>,
         bool,
+        WebSocketAssemblyAdmission,
         Option<openshell_supervisor_middleware::MiddlewareWorkAdmission>,
     ) {
-        (self.payload, self.compressed, self.admission)
+        (
+            self.payload,
+            self.compressed,
+            self.assembly_admission,
+            self.admission,
+        )
     }
 }
 
@@ -410,6 +479,7 @@ pub(super) struct InspectionOptions<'a> {
 
 pub(super) struct RelayOptions<'a> {
     pub(super) policy_name: &'a str,
+    pub(super) assembly_budget: WebSocketAssemblyBudget,
     pub(super) resolver: Option<&'a SecretResolver>,
     pub(super) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(super) inspector: Option<InspectionOptions<'a>>,
@@ -537,11 +607,8 @@ where
         if matches!(
             frame.opcode,
             OPCODE_TEXT | OPCODE_BINARY | OPCODE_CONTINUATION
-        ) && let Some(guard) = options.generation_guard
-            && let Err(error) = guard.ensure_current()
-        {
-            crate::l7::relay::emit_policy_reload(guard, host, port, options.policy_name);
-            return Err(terminate(WebSocketTerminationCause::PolicyReload, error));
+        ) {
+            ensure_generation_current(host, port, options)?;
         }
 
         match frame.opcode {
@@ -552,6 +619,22 @@ where
                     ))
                     .into());
                 }
+                let assembly_outcome =
+                    options.assembly_budget.reserve().await.map_err(|error| {
+                        terminate(WebSocketTerminationCause::CapacityExhausted, error)
+                    })?;
+                let assembly_admission = match assembly_outcome {
+                    WebSocketAssemblyAdmissionOutcome::Admitted(admission) => admission,
+                    WebSocketAssemblyAdmissionOutcome::QueueExhausted => {
+                        return Err(terminate(
+                            WebSocketTerminationCause::CapacityExhausted,
+                            miette!(
+                                "websocket assembly admission queue is full; refusing additional buffered work"
+                            ),
+                        ));
+                    }
+                };
+                ensure_generation_current(host, port, options)?;
                 let admission = if let Some(session) = options.middleware_session.as_mut() {
                     let message_admission = session.admit_message().await.map_err(|error| {
                         terminate(WebSocketTerminationCause::MiddlewareFailure, error)
@@ -568,16 +651,29 @@ where
                 } else {
                     None
                 };
+                ensure_generation_current(host, port, options)?;
                 let compressed = frame.rsv == 0x40;
-                let mut assembly = TextMessageAssembly::new(compressed, admission);
+                let mut assembly =
+                    TextMessageAssembly::new(compressed, assembly_admission, admission);
                 assembly
                     .read_payload(reader, &frame)
                     .await
                     .map_err(WebSocketTermination::from)?;
+                ensure_generation_current(host, port, options)?;
                 if frame.fin {
-                    let (payload, compressed, admission) = assembly.into_parts();
+                    let (payload, compressed, assembly_admission, admission) =
+                        assembly.into_parts();
                     relay_text_payload(
-                        writer, &frame, payload, admission, false, compressed, host, port, options,
+                        writer,
+                        &frame,
+                        payload,
+                        assembly_admission,
+                        admission,
+                        false,
+                        compressed,
+                        host,
+                        port,
+                        options,
                     )
                     .await?;
                 } else {
@@ -602,17 +698,20 @@ where
                         .read_payload(reader, &frame)
                         .await
                         .map_err(WebSocketTermination::from)?;
+                    ensure_generation_current(host, port, options)?;
                     if frame.fin {
                         let FragmentState::Text(assembly) =
                             std::mem::replace(&mut fragments, FragmentState::None)
                         else {
                             unreachable!("validated text continuation state")
                         };
-                        let (complete, was_compressed, admission) = assembly.into_parts();
+                        let (complete, was_compressed, assembly_admission, admission) =
+                            assembly.into_parts();
                         relay_text_payload(
                             writer,
                             &frame,
                             complete,
+                            assembly_admission,
                             admission,
                             true,
                             was_compressed,
@@ -936,11 +1035,35 @@ fn append_text_fragment(buffer: &mut Vec<u8>, next: Vec<u8>) -> FrameResult<()> 
     Ok(())
 }
 
+fn ensure_generation_current(
+    host: &str,
+    port: u16,
+    options: &RelayOptions<'_>,
+) -> WebSocketRelayResult<()> {
+    ensure_generation_guard_current(host, port, options.policy_name, options.generation_guard)
+}
+
+fn ensure_generation_guard_current(
+    host: &str,
+    port: u16,
+    policy_name: &str,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> WebSocketRelayResult<()> {
+    let Some(guard) = generation_guard else {
+        return Ok(());
+    };
+    guard.ensure_current().map_err(|error| {
+        crate::l7::relay::emit_policy_reload(guard, host, port, policy_name);
+        terminate(WebSocketTerminationCause::PolicyReload, error)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn relay_text_payload<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &FrameHeader,
     payload: Vec<u8>,
+    _assembly_admission: WebSocketAssemblyAdmission,
     admission: Option<openshell_supervisor_middleware::MiddlewareWorkAdmission>,
     force_reframe: bool,
     compressed: bool,
@@ -948,6 +1071,7 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     port: u16,
     options: &mut RelayOptions<'_>,
 ) -> WebSocketRelayResult<()> {
+    ensure_generation_current(host, port, options)?;
     let message_payload = if compressed {
         decompress_permessage_deflate(&payload).map_err(|error| match error {
             WebSocketDecompressionError::MessageTooBig(error) => {
@@ -972,6 +1096,7 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     if let Some(inspector) = options.inspector.as_ref() {
         inspect_websocket_text_message(host, port, options.policy_name, inspector, &text)?;
     }
+    ensure_generation_current(host, port, options)?;
 
     let mut middleware_transformed = false;
     if let Some(session) = options.middleware_session.as_mut() {
@@ -984,6 +1109,7 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
         let outcome = session
             .evaluate_text_admitted(text.into_bytes(), admission)
             .await;
+        ensure_generation_current(host, port, options)?;
         if let Some(ctx) = options.middleware_context {
             crate::l7::middleware::emit_websocket_message_events(ctx, &outcome);
         }
@@ -1019,6 +1145,7 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     if middleware_transformed && let Some(inspector) = options.inspector.as_ref() {
         inspect_websocket_text_message(host, port, options.policy_name, inspector, &text)?;
     }
+    ensure_generation_current(host, port, options)?;
 
     let replacements = if let Some(resolver) = options.resolver {
         resolver
@@ -1032,6 +1159,7 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     } else {
         0
     };
+    ensure_generation_current(host, port, options)?;
 
     if replacements == 0 && !middleware_transformed && !force_reframe && !compressed {
         writer.write_all(&frame.raw_header).await.map_err(|error| {
@@ -1040,6 +1168,7 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
                 miette!("websocket upstream write failed: {error}"),
             )
         })?;
+        ensure_generation_current(host, port, options)?;
         let mut payload = text.into_bytes();
         let mask_key = frame.mask_key.ok_or_else(|| {
             WebSocketTermination::from(FrameError::protocol(
@@ -1073,13 +1202,27 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
                 error,
             ))
         })?;
-        return write_masked_frame_with_rsv(writer, OPCODE_TEXT, 0x40, &compressed_payload)
-            .await
-            .map_err(|error| terminate(WebSocketTerminationCause::PeerDisconnect, error));
+        return write_masked_text_frame_guarded(
+            writer,
+            0x40,
+            &compressed_payload,
+            host,
+            port,
+            options.policy_name,
+            options.generation_guard,
+        )
+        .await;
     }
-    write_masked_frame(writer, OPCODE_TEXT, text.as_bytes())
-        .await
-        .map_err(|error| terminate(WebSocketTerminationCause::PeerDisconnect, error))
+    write_masked_text_frame_guarded(
+        writer,
+        0,
+        text.as_bytes(),
+        host,
+        port,
+        options.policy_name,
+        options.generation_guard,
+    )
+    .await
 }
 
 fn inspect_websocket_text_message(
@@ -1438,6 +1581,45 @@ async fn write_masked_frame_with_rsv<W: AsyncWrite + Unpin>(
     rsv: u8,
     payload: &[u8],
 ) -> Result<()> {
+    let (header, masked) = masked_frame_parts(opcode, rsv, payload);
+    writer.write_all(&header).await.into_diagnostic()?;
+    writer.write_all(&masked).await.into_diagnostic()?;
+    writer.flush().await.into_diagnostic()?;
+    Ok(())
+}
+
+async fn write_masked_text_frame_guarded<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    rsv: u8,
+    payload: &[u8],
+    host: &str,
+    port: u16,
+    policy_name: &str,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> WebSocketRelayResult<()> {
+    let (header, masked) = masked_frame_parts(OPCODE_TEXT, rsv, payload);
+    writer.write_all(&header).await.map_err(|error| {
+        terminate(
+            WebSocketTerminationCause::PeerDisconnect,
+            miette!("websocket upstream write failed: {error}"),
+        )
+    })?;
+    ensure_generation_guard_current(host, port, policy_name, generation_guard)?;
+    writer.write_all(&masked).await.map_err(|error| {
+        terminate(
+            WebSocketTerminationCause::PeerDisconnect,
+            miette!("websocket upstream write failed: {error}"),
+        )
+    })?;
+    writer.flush().await.map_err(|error| {
+        terminate(
+            WebSocketTerminationCause::PeerDisconnect,
+            miette!("websocket upstream flush failed: {error}"),
+        )
+    })
+}
+
+fn masked_frame_parts(opcode: u8, rsv: u8, payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let mut header = Vec::with_capacity(14);
     header.push(0x80 | rsv | opcode);
     match payload.len() {
@@ -1460,10 +1642,7 @@ async fn write_masked_frame_with_rsv<W: AsyncWrite + Unpin>(
 
     let mut masked = payload.to_vec();
     apply_mask(&mut masked, mask_key);
-    writer.write_all(&header).await.into_diagnostic()?;
-    writer.write_all(&masked).await.into_diagnostic()?;
-    writer.flush().await.into_diagnostic()?;
-    Ok(())
+    (header, masked)
 }
 
 fn decompress_permessage_deflate(
@@ -1682,6 +1861,23 @@ fn observe_termination(
     if let Some(failure_class) = termination.failure_class {
         emit_protocol_failure(host, port, policy_name, failure_class);
     }
+    if termination.cause == WebSocketTerminationCause::CapacityExhausted {
+        ocsf_emit!(
+            NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .firewall_rule(policy_name, "l7-websocket")
+                .status_detail("assembly_capacity_exhausted")
+                .message(format!(
+                    "WebSocket text assembly capacity exhausted [host:{host} port:{port}]"
+                ))
+                .build()
+        );
+    }
 }
 
 fn emit_protocol_failure(
@@ -1734,11 +1930,25 @@ mod tests {
     use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
         SupervisorMiddleware, SupervisorMiddlewareServer,
     };
+
     use openshell_core::secrets::SecretResolver;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
     use tonic::{Request, Response, Status};
+
+    async fn test_assembly_admission() -> WebSocketAssemblyAdmission {
+        match WebSocketAssemblyBudget::new(1, 0)
+            .reserve()
+            .await
+            .expect("reserve test assembly")
+        {
+            WebSocketAssemblyAdmissionOutcome::Admitted(admission) => admission,
+            WebSocketAssemblyAdmissionOutcome::QueueExhausted => {
+                panic!("fresh test assembly budget must admit")
+            }
+        }
+    }
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
     const GRAPHQL_WS_POLICY: &str = r#"
@@ -1901,6 +2111,19 @@ network_policies:
         assert!(!task.is_finished(), "fixture task must be pending");
     }
 
+    fn relay_options_with_budget(budget: WebSocketAssemblyBudget) -> RelayOptions<'static> {
+        RelayOptions {
+            policy_name: "test-policy",
+            assembly_budget: budget,
+            resolver: None,
+            generation_guard: None,
+            inspector: None,
+            compression: WebSocketCompression::None,
+            middleware_session: None,
+            middleware_context: None,
+        }
+    }
+
     fn close_payload(code: u16, reason: &[u8]) -> Vec<u8> {
         let mut payload = Vec::with_capacity(2 + reason.len());
         payload.extend_from_slice(&code.to_be_bytes());
@@ -1918,6 +2141,7 @@ network_policies:
 
         let mut options = RelayOptions {
             policy_name: "test-policy",
+            assembly_budget: WebSocketAssemblyBudget::default(),
             resolver: Some(&resolver),
             generation_guard: None,
             inspector: None,
@@ -1940,6 +2164,116 @@ network_policies:
         result
             .map(|_| output)
             .map_err(|termination| termination.error)
+    }
+
+    #[tokio::test]
+    async fn parsed_relays_share_assembly_budget_without_middleware() {
+        let budget = WebSocketAssemblyBudget::new(1, 0);
+        let held_frame = masked_frame(true, OPCODE_TEXT, b"held");
+        let (mut first_client, mut first_reader) = tokio::io::duplex(64);
+        let (mut first_writer, _first_upstream) = tokio::io::duplex(64);
+        first_client
+            .write_all(&held_frame[..6])
+            .await
+            .expect("send frame header without payload");
+        let first_budget = budget.clone();
+        let first = tokio::spawn(async move {
+            let mut options = relay_options_with_budget(first_budget);
+            relay_client_to_server(
+                &mut first_reader,
+                &mut first_writer,
+                "gateway.example.test",
+                443,
+                &mut options,
+            )
+            .await
+        });
+        wait_for_stalled_task(&first).await;
+
+        let rejected_frame = masked_frame(true, OPCODE_TEXT, b"rejected");
+        let (mut second_client, mut second_reader) = tokio::io::duplex(64);
+        let (mut second_writer, mut second_upstream) = tokio::io::duplex(64);
+        second_client
+            .write_all(&rejected_frame)
+            .await
+            .expect("send rejected frame");
+        drop(second_client);
+        let mut second_options = relay_options_with_budget(budget.clone());
+        let rejected = relay_client_to_server(
+            &mut second_reader,
+            &mut second_writer,
+            "gateway.example.test",
+            443,
+            &mut second_options,
+        )
+        .await
+        .expect_err("full assembly budget must shed");
+        assert_eq!(rejected.cause, WebSocketTerminationCause::CapacityExhausted);
+        drop(second_writer);
+        let mut rejected_output = Vec::new();
+        second_upstream
+            .read_to_end(&mut rejected_output)
+            .await
+            .expect("read rejected upstream");
+        assert!(rejected_output.is_empty());
+
+        drop(first_client);
+        first
+            .await
+            .expect("join held relay")
+            .expect_err("incomplete message must end on disconnect");
+
+        let admitted_frame = masked_frame(true, OPCODE_TEXT, b"admitted");
+        let (mut third_client, mut third_reader) = tokio::io::duplex(64);
+        let (mut third_writer, mut third_upstream) = tokio::io::duplex(64);
+        third_client
+            .write_all(&admitted_frame)
+            .await
+            .expect("send admitted frame");
+        drop(third_client);
+        let mut third_options = relay_options_with_budget(budget);
+        relay_client_to_server(
+            &mut third_reader,
+            &mut third_writer,
+            "gateway.example.test",
+            443,
+            &mut third_options,
+        )
+        .await
+        .expect("released assembly budget must admit");
+        drop(third_writer);
+        let mut admitted_output = Vec::new();
+        third_upstream
+            .read_to_end(&mut admitted_output)
+            .await
+            .expect("read admitted upstream");
+        assert_eq!(admitted_output, admitted_frame);
+    }
+
+    #[tokio::test]
+    async fn assembly_budget_bounds_waiters_and_recovers_capacity() {
+        let budget = WebSocketAssemblyBudget::new(1, 1);
+        let first = match budget.reserve().await.expect("reserve active assembly") {
+            WebSocketAssemblyAdmissionOutcome::Admitted(admission) => admission,
+            WebSocketAssemblyAdmissionOutcome::QueueExhausted => {
+                panic!("fresh budget must admit")
+            }
+        };
+        let waiting_budget = budget.clone();
+        let waiting = tokio::spawn(async move { waiting_budget.reserve().await });
+        wait_for_stalled_task(&waiting).await;
+        assert!(matches!(
+            budget.reserve().await.expect("attempt shed admission"),
+            WebSocketAssemblyAdmissionOutcome::QueueExhausted
+        ));
+        drop(first);
+        assert!(matches!(
+            waiting
+                .await
+                .expect("join waiting admission")
+                .expect("waiting admission result"),
+            WebSocketAssemblyAdmissionOutcome::Admitted(_)
+        ));
     }
 
     async fn run_client_to_server_with_graphql_policy(
@@ -1981,6 +2315,7 @@ network_policies:
 
         let mut options = RelayOptions {
             policy_name: "graphql_ws",
+            assembly_budget: WebSocketAssemblyBudget::default(),
             resolver,
             generation_guard: Some(tunnel_engine.generation_guard()),
             inspector: Some(InspectionOptions {
@@ -2022,6 +2357,7 @@ network_policies:
 
         let mut options = RelayOptions {
             policy_name: "test-policy",
+            assembly_budget: WebSocketAssemblyBudget::default(),
             resolver: Some(&resolver),
             generation_guard: None,
             inspector: None,
@@ -2129,7 +2465,8 @@ network_policies:
         let (client, mut reader) = tokio::io::duplex(8);
         let frame = test_frame_header(true, OPCODE_TEXT, 4);
         let task = tokio::spawn(async move {
-            let mut assembly = TextMessageAssembly::new(false, Some(admission));
+            let mut assembly =
+                TextMessageAssembly::new(false, test_assembly_admission().await, Some(admission));
             assembly.read_payload(&mut reader, &frame).await
         });
 
@@ -2163,7 +2500,8 @@ network_policies:
             .expect("send partial continuation payload");
         let frame = test_frame_header(true, OPCODE_CONTINUATION, 2);
         let task = tokio::spawn(async move {
-            let mut assembly = TextMessageAssembly::new(false, Some(admission));
+            let mut assembly =
+                TextMessageAssembly::new(false, test_assembly_admission().await, Some(admission));
             assembly.payload.extend_from_slice(b"first");
             assembly.add_fragment().expect("continuation within limit");
             assembly.read_payload(&mut reader, &frame).await
@@ -2194,7 +2532,8 @@ network_policies:
             .expect("reserve middleware work");
         let (client, mut reader) = tokio::io::duplex(8);
         let task = tokio::spawn(async move {
-            let mut assembly = TextMessageAssembly::new(false, Some(admission));
+            let mut assembly =
+                TextMessageAssembly::new(false, test_assembly_admission().await, Some(admission));
             assembly.payload.extend_from_slice(b"first");
             let result = read_frame_header(&mut reader, Some(&assembly)).await;
             drop(assembly);
@@ -2227,7 +2566,8 @@ network_policies:
         let (mut client, mut reader) = tokio::io::duplex(8);
         let frame = test_frame_header(true, OPCODE_TEXT, 1_024);
         let task = tokio::spawn(async move {
-            let mut assembly = TextMessageAssembly::new(false, Some(admission));
+            let mut assembly =
+                TextMessageAssembly::new(false, test_assembly_admission().await, Some(admission));
             assembly.read_payload(&mut reader, &frame).await
         });
         wait_for_stalled_task(&task).await;
@@ -2274,7 +2614,11 @@ network_policies:
             clients.push(client);
             let frame = test_frame_header(true, OPCODE_TEXT, 4);
             stalled.push(tokio::spawn(async move {
-                let mut assembly = TextMessageAssembly::new(false, Some(admission));
+                let mut assembly = TextMessageAssembly::new(
+                    false,
+                    test_assembly_admission().await,
+                    Some(admission),
+                );
                 assembly.read_payload(&mut reader, &frame).await
             }));
         }
@@ -2452,6 +2796,7 @@ network_policies:
                 443,
                 RelayOptions {
                     policy_name: "test-policy",
+                    assembly_budget: WebSocketAssemblyBudget::default(),
                     resolver: Some(&resolver),
                     generation_guard: None,
                     inspector: None,
@@ -2493,6 +2838,8 @@ network_policies:
     struct OpenAiWebSocketRedactor {
         observed: Option<tokio::sync::mpsc::UnboundedSender<ObservedWebSocketRequest>>,
         close_on_first_message: bool,
+        message_received: Option<Arc<tokio::sync::Notify>>,
+        release_message: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[tonic::async_trait]
@@ -2555,6 +2902,8 @@ network_policies:
             let mut requests = request.into_inner();
             let observed = self.observed.clone();
             let close_on_first_message = self.close_on_first_message;
+            let message_received = self.message_received.clone();
+            let release_message = self.release_message.clone();
             let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 while let Ok(Some(request)) = requests.message().await {
@@ -2580,6 +2929,12 @@ network_policies:
                             }
                             if close_on_first_message {
                                 break;
+                            }
+                            if let Some(received) = &message_received {
+                                received.notify_one();
+                            }
+                            if let Some(release) = &release_message {
+                                release.notified().await;
                             }
                             let text =
                                 String::from_utf8(message.payload).expect("OpenAI event UTF-8");
@@ -2651,6 +3006,19 @@ network_policies:
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<std::result::Result<(), tonic::transport::Error>>,
     ) {
+        recording_middleware_session_with_controls(scheme, None, None).await
+    }
+
+    async fn recording_middleware_session_with_controls(
+        scheme: &str,
+        message_received: Option<Arc<tokio::sync::Notify>>,
+        release_message: Option<Arc<tokio::sync::Notify>>,
+    ) -> (
+        openshell_supervisor_middleware::WebSocketSession,
+        tokio::sync::mpsc::UnboundedReceiver<ObservedWebSocketRequest>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<std::result::Result<(), tonic::transport::Error>>,
+    ) {
         use openshell_core::proto::SupervisorMiddlewareService;
         use openshell_supervisor_middleware::{ChainEntry, MiddlewareRegistry, OnError};
 
@@ -2663,6 +3031,8 @@ network_policies:
         let server = tonic::transport::Server::builder()
             .add_service(SupervisorMiddlewareServer::new(OpenAiWebSocketRedactor {
                 observed: Some(observed_tx),
+                message_received,
+                release_message,
                 ..Default::default()
             }))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
@@ -2733,6 +3103,7 @@ network_policies:
                 443,
                 RelayOptions {
                     policy_name: "rest-api",
+                    assembly_budget: WebSocketAssemblyBudget::default(),
                     resolver: None,
                     generation_guard: None,
                     inspector: None,
@@ -2857,6 +3228,7 @@ network_policies:
                 443,
                 RelayOptions {
                     policy_name: "rest-api",
+                    assembly_budget: WebSocketAssemblyBudget::default(),
                     resolver: None,
                     generation_guard: None,
                     inspector: None,
@@ -2916,6 +3288,7 @@ network_policies:
             443,
             crate::l7::relay::UpgradeRelayOptions {
                 websocket_request: true,
+                assembly_budget: Some(WebSocketAssemblyBudget::default()),
                 middleware_session: Some(session),
                 selected_subprotocol: Some("x".repeat(257)),
                 ..Default::default()
@@ -2974,6 +3347,7 @@ network_policies:
                 443,
                 crate::l7::relay::UpgradeRelayOptions {
                     websocket_request: true,
+                    assembly_budget: Some(WebSocketAssemblyBudget::default()),
                     ctx: Some(&L7EvalContext {
                         host: "api.openai.com".into(),
                         port: 443,
@@ -3037,13 +3411,13 @@ network_policies:
 
         let (session, mut observed, shutdown_tx, server_task) =
             recording_middleware_session(scheme).await;
-        let engine = std::sync::Arc::new(
+        let engine = Arc::new(
             OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").expect("test policy"),
         );
         let generation_guard = engine
             .generation_guard(engine.current_generation())
             .expect("generation guard");
-        let (mut client_app, mut relay_client) = tokio::io::duplex(1);
+        let (mut client_app, mut relay_client) = tokio::io::duplex(4096);
         let (mut relay_upstream, mut upstream_app) = tokio::io::duplex(4096);
         let port = if scheme == "wss" { 443 } else { 80 };
         let relay = tokio::spawn(async move {
@@ -3055,6 +3429,7 @@ network_policies:
                 port,
                 crate::l7::relay::UpgradeRelayOptions {
                     websocket_request: true,
+                    assembly_budget: Some(WebSocketAssemblyBudget::default()),
                     generation_guard: Some(&generation_guard),
                     ctx: Some(&L7EvalContext {
                         host: "api.openai.com".into(),
@@ -3074,24 +3449,33 @@ network_policies:
             observed.recv().await,
             Some(ObservedWebSocketRequest::SessionStart)
         ));
+        let stale_frame = if fragmented {
+            masked_frame(true, OPCODE_CONTINUATION, b"message")
+        } else {
+            masked_frame(true, OPCODE_TEXT, b"stale-message")
+        };
         if fragmented {
             client_app
                 .write_all(&masked_frame(false, OPCODE_TEXT, b"stale-"))
                 .await
                 .expect("send initial fragment");
+        } else {
+            client_app
+                .write_all(&stale_frame[..7])
+                .await
+                .expect("send frame header and partial payload");
         }
 
         engine
             .replace_middleware_registry(MiddlewareRegistry::default())
             .expect("invalidate generation");
-        let mut stale_frame = if fragmented {
-            masked_frame(true, OPCODE_CONTINUATION, b"message")
+        let stale_input = if fragmented {
+            &stale_frame[..6]
         } else {
-            masked_frame(true, OPCODE_TEXT, b"stale-message")
+            &stale_frame[7..]
         };
-        stale_frame.truncate(6);
         client_app
-            .write_all(&stale_frame)
+            .write_all(stale_input)
             .await
             .expect("send stale data frame");
 
@@ -3148,6 +3532,153 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn reload_during_middleware_evaluation_blocks_credentials_and_payload() {
+        use openshell_supervisor_middleware::MiddlewareRegistry;
+
+        let message_received = Arc::new(tokio::sync::Notify::new());
+        let release_message = Arc::new(tokio::sync::Notify::new());
+        let (session, mut observed, shutdown_tx, server_task) =
+            recording_middleware_session_with_controls(
+                "wss",
+                Some(Arc::clone(&message_received)),
+                Some(Arc::clone(&release_message)),
+            )
+            .await;
+        let engine = Arc::new(
+            OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").expect("test policy"),
+        );
+        let generation_guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("generation guard");
+        let assembly_budget = engine.websocket_assembly_budget();
+        let (child_env, resolver) = resolver();
+        let placeholder = child_env
+            .get("DISCORD_BOT_TOKEN")
+            .expect("credential placeholder")
+            .clone();
+        let (mut client_app, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, mut upstream_app) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            crate::l7::relay::handle_upgrade(
+                &mut relay_client,
+                &mut relay_upstream,
+                Vec::new(),
+                "api.openai.com",
+                443,
+                crate::l7::relay::UpgradeRelayOptions {
+                    websocket_request: true,
+                    websocket: crate::l7::relay::WebSocketUpgradeBehavior {
+                        credential_rewrite: true,
+                        ..Default::default()
+                    },
+                    assembly_budget: Some(assembly_budget),
+                    secret_resolver: Some(Arc::new(resolver)),
+                    generation_guard: Some(&generation_guard),
+                    policy_name: "rest-api".into(),
+                    middleware_session: Some(session),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+
+        assert!(matches!(
+            observed.recv().await,
+            Some(ObservedWebSocketRequest::SessionStart)
+        ));
+        let payload = format!(r#"{{"authorization":"{placeholder}"}}"#);
+        client_app
+            .write_all(&masked_frame(true, OPCODE_TEXT, payload.as_bytes()))
+            .await
+            .expect("send credential-bearing message");
+        message_received.notified().await;
+
+        engine
+            .replace_middleware_registry(MiddlewareRegistry::default())
+            .expect("invalidate generation");
+        release_message.notify_one();
+
+        let upstream_close = read_one_frame(&mut upstream_app).await;
+        assert_eq!(upstream_close[0] & 0x0f, OPCODE_CLOSE);
+        assert_eq!(
+            u16::from_be_bytes(
+                decode_masked_payload(&upstream_close)[..2]
+                    .try_into()
+                    .expect("upstream close code"),
+            ),
+            1012
+        );
+        assert!(
+            !String::from_utf8_lossy(&upstream_close).contains("real-token"),
+            "resolved credential must not reach upstream"
+        );
+        let error = relay
+            .await
+            .expect("join relay")
+            .expect_err("stale generation must terminate relay");
+        assert!(error.to_string().contains("policy generation is stale"));
+
+        let mut end_reason = None;
+        while let Some(event) = observed.recv().await {
+            if let ObservedWebSocketRequest::SessionEnd(reason) = event {
+                end_reason = Some(reason);
+                break;
+            }
+        }
+        assert_eq!(
+            end_reason,
+            Some(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+        );
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware server")
+            .expect("middleware server");
+    }
+
+    #[tokio::test]
+    async fn pre_upgrade_reload_finalizes_session_as_policy_reload() {
+        use openshell_supervisor_middleware::MiddlewareRegistry;
+
+        let (session, mut observed, shutdown_tx, server_task) =
+            recording_middleware_session("wss").await;
+        let engine =
+            OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").expect("test policy");
+        let generation_guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("generation guard");
+        engine
+            .replace_middleware_registry(MiddlewareRegistry::default())
+            .expect("invalidate generation");
+        let mut session = Some(session);
+
+        crate::l7::relay::finalize_websocket_pre_upgrade(
+            &mut session,
+            &generation_guard,
+            "api.openai.com",
+            443,
+            "rest-api",
+            Ok(()),
+        )
+        .await
+        .expect_err("reload before upgrade must terminate");
+        assert!(session.is_none());
+        assert!(matches!(
+            observed.recv().await,
+            Some(ObservedWebSocketRequest::SessionEnd(
+                openshell_core::proto::WebSocketSessionEndReason::PolicyReload
+            ))
+        ));
+
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join middleware server")
+            .expect("middleware server");
+    }
+
+    #[tokio::test]
     async fn graphql_policy_denial_reports_policy_denial_to_middleware() {
         let (mut session, mut observed, shutdown_tx, server_task) =
             recording_middleware_session("wss").await;
@@ -3192,6 +3723,7 @@ network_policies:
                 443,
                 RelayOptions {
                     policy_name: "graphql_ws",
+                    assembly_budget: WebSocketAssemblyBudget::default(),
                     resolver: None,
                     generation_guard: Some(tunnel_engine.generation_guard()),
                     inspector: Some(InspectionOptions {
@@ -3329,6 +3861,7 @@ network_policies:
                 443,
                 RelayOptions {
                     policy_name: "openai",
+                    assembly_budget: WebSocketAssemblyBudget::default(),
                     resolver: None,
                     generation_guard: None,
                     inspector: None,
@@ -3413,6 +3946,7 @@ network_policies:
             .add_service(SupervisorMiddlewareServer::new(OpenAiWebSocketRedactor {
                 observed: Some(observed_tx),
                 close_on_first_message: true,
+                ..Default::default()
             }))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                 let _ = shutdown_rx.await;
@@ -3493,6 +4027,7 @@ network_policies:
                 443,
                 RelayOptions {
                     policy_name: "openai",
+                    assembly_budget: WebSocketAssemblyBudget::default(),
                     resolver: None,
                     generation_guard: None,
                     inspector: None,
@@ -3584,6 +4119,7 @@ network_policies:
                 443,
                 RelayOptions {
                     policy_name: "openai",
+                    assembly_budget: WebSocketAssemblyBudget::default(),
                     resolver: None,
                     generation_guard: None,
                     inspector: None,

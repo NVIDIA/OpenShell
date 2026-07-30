@@ -71,6 +71,7 @@ pub struct L7EvalContext {
 pub(crate) struct UpgradeRelayOptions<'a> {
     pub(crate) websocket_request: bool,
     pub(crate) websocket: WebSocketUpgradeBehavior,
+    pub(crate) assembly_budget: Option<crate::l7::websocket::WebSocketAssemblyBudget>,
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) engine: Option<&'a TunnelPolicyEngine>,
@@ -560,7 +561,7 @@ where
             } else {
                 None
             };
-            let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
+            let outcome_result = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req,
                 client,
                 upstream,
@@ -576,6 +577,15 @@ where
                     host: &ctx.host,
                     port: ctx.port,
                 },
+            )
+            .await;
+            let outcome = finalize_websocket_pre_upgrade(
+                &mut middleware_session,
+                engine.generation_guard(),
+                &ctx.host,
+                ctx.port,
+                &ctx.policy_name,
+                outcome_result,
             )
             .await?;
             match outcome {
@@ -757,6 +767,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    ensure_upgrade_generation_current(client, upstream, host, port, &mut options).await?;
     let start_terminal_reason = if let Some(session) = options.middleware_session.as_mut() {
         let start = session
             .start(options.selected_subprotocol.as_deref().unwrap_or_default())
@@ -768,6 +779,7 @@ where
     } else {
         None
     };
+    ensure_upgrade_generation_current(client, upstream, host, port, &mut options).await?;
     if let Some(reason) = start_terminal_reason {
         if let Some(session) = options.middleware_session.take() {
             session.end(reason).await;
@@ -798,6 +810,10 @@ where
             .build()
     );
     if use_websocket_relay {
+        let assembly_budget = options
+            .assembly_budget
+            .take()
+            .ok_or_else(|| miette!("websocket parsed relay missing assembly budget"))?;
         let resolver = if options.websocket.credential_rewrite {
             options.secret_resolver.as_deref()
         } else {
@@ -835,6 +851,7 @@ where
             port,
             crate::l7::websocket::RelayOptions {
                 policy_name: &options.policy_name,
+                assembly_budget,
                 resolver,
                 generation_guard: options.generation_guard,
                 inspector,
@@ -852,6 +869,33 @@ where
     tokio::io::copy_bidirectional(client, upstream)
         .await
         .into_diagnostic()?;
+    Ok(())
+}
+
+async fn ensure_upgrade_generation_current<C, U>(
+    client: &mut C,
+    upstream: &mut U,
+    host: &str,
+    port: u16,
+    options: &mut UpgradeRelayOptions<'_>,
+) -> Result<()>
+where
+    C: AsyncWrite + Unpin,
+    U: AsyncWrite + Unpin,
+{
+    let Some(guard) = options.generation_guard else {
+        return Ok(());
+    };
+    if let Err(error) = guard.ensure_current() {
+        emit_policy_reload(guard, host, port, &options.policy_name);
+        if let Some(session) = options.middleware_session.take() {
+            session
+                .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                .await;
+        }
+        send_websocket_close(client, upstream, 1012).await;
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -894,6 +938,7 @@ pub(crate) fn upgrade_options<'a>(
             message_policy: websocket_message_policy,
             permessage_deflate: false,
         },
+        assembly_budget: engine.map(TunnelPolicyEngine::websocket_assembly_budget),
         secret_resolver: if websocket_credential_rewrite {
             ctx.secret_resolver.clone()
         } else {
@@ -1195,7 +1240,7 @@ where
                 };
 
             // Forward request to upstream and relay response
-            let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
+            let outcome_result = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req_with_auth,
                 client,
                 upstream,
@@ -1211,6 +1256,15 @@ where
                     host: &ctx.host,
                     port: ctx.port,
                 },
+            )
+            .await;
+            let outcome = finalize_websocket_pre_upgrade(
+                &mut middleware_session,
+                engine.generation_guard(),
+                &ctx.host,
+                ctx.port,
+                &ctx.policy_name,
+                outcome_result,
             )
             .await?;
             match outcome {
@@ -1306,6 +1360,43 @@ pub(crate) fn emit_policy_reload(
             ))
             .build()
     );
+}
+
+pub(crate) async fn finalize_websocket_pre_upgrade<T>(
+    session: &mut Option<openshell_supervisor_middleware::WebSocketSession>,
+    guard: &PolicyGenerationGuard,
+    host: &str,
+    port: u16,
+    policy_name: &str,
+    result: Result<T>,
+) -> Result<T> {
+    match result {
+        Ok(value) => {
+            if let Err(error) = guard.ensure_current() {
+                emit_policy_reload(guard, host, port, policy_name);
+                if let Some(session) = session.take() {
+                    session
+                        .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                        .await;
+                }
+                Err(error)
+            } else {
+                Ok(value)
+            }
+        }
+        Err(error) => {
+            let reason = if guard.is_stale() {
+                emit_policy_reload(guard, host, port, policy_name);
+                openshell_core::proto::WebSocketSessionEndReason::PolicyReload
+            } else {
+                openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected
+            };
+            if let Some(session) = session.take() {
+                session.end(reason).await;
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn relay_jsonrpc<C, U>(
@@ -1749,6 +1840,9 @@ where
                     ..
                 } => {
                     let options = UpgradeRelayOptions {
+                        assembly_budget: Some(
+                            crate::l7::websocket::WebSocketAssemblyBudget::default(),
+                        ),
                         websocket: WebSocketUpgradeBehavior {
                             permessage_deflate: websocket_permessage_deflate,
                             ..Default::default()

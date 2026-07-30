@@ -3608,6 +3608,7 @@ mod tests {
                 443,
                 crate::l7::relay::UpgradeRelayOptions {
                     websocket_request: true,
+                    assembly_budget: Some(crate::l7::websocket::WebSocketAssemblyBudget::default()),
                     websocket: crate::l7::relay::WebSocketUpgradeBehavior {
                         credential_rewrite,
                         permessage_deflate: websocket_permessage_deflate,
