@@ -3129,6 +3129,44 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn effective_identity_validation_honors_landlock_denial() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let root = dir.path().canonicalize().unwrap().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut policy = policy_with_process(ProcessPolicy::default());
+        policy.filesystem = FilesystemPolicy {
+            read_only: vec![root.clone()],
+            read_write: Vec::new(),
+            include_workdir: false,
+        };
+        policy.landlock = LandlockPolicy {
+            compatibility: openshell_core::policy::LandlockCompatibility::HardRequirement,
+        };
+        let Ok(prepared) = crate::sandbox::prepare_current_user(&policy, None) else {
+            return;
+        };
+
+        match unsafe { fork() }.expect("fork should succeed") {
+            ForkResult::Child => {
+                let denied = crate::sandbox::enforce(prepared).is_ok()
+                    && validate_oci_workspace_as_effective_identity(&root).is_err();
+                unsafe { libc::_exit(i32::from(!denied)) };
+            }
+            ForkResult::Parent { child } => {
+                assert_eq!(
+                    waitpid(child, None).expect("waitpid should succeed"),
+                    WaitStatus::Exited(child, 0),
+                    "kernel-effective validation should honor an enforced LSM denial"
+                );
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn validate_oci_workspace_rejects_restrictive_parent() {
