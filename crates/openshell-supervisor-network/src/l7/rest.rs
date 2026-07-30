@@ -416,11 +416,7 @@ pub(crate) fn request_authority(
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .ok_or_else(|| miette!("HTTP request is missing a request target"))?;
-    let absolute_uri = request_target
-        .contains("://")
-        .then(|| request_target.parse::<http::Uri>())
-        .transpose()
-        .map_err(|_| miette!("HTTP absolute-form request target contains an invalid URI"))?;
+    let absolute_uri = absolute_form_uri(request_target)?;
     let (authority, default_port) = if let Some(uri) = absolute_uri {
         let authority = uri
             .authority()
@@ -464,12 +460,9 @@ fn validate_absolute_form_authority(
     target: &str,
     host_authority: Option<&http::uri::Authority>,
 ) -> Result<()> {
-    if !target.contains("://") {
+    let Some(uri) = absolute_form_uri(target)? else {
         return Ok(());
-    }
-    let uri = target
-        .parse::<http::Uri>()
-        .map_err(|_| miette!("HTTP absolute-form request target contains an invalid URI"))?;
+    };
     let request_authority = uri
         .authority()
         .ok_or_else(|| miette!("HTTP absolute-form request target is missing an authority"))?;
@@ -481,6 +474,18 @@ fn validate_absolute_form_authority(
         ));
     }
     Ok(())
+}
+
+/// Return a URI only when the request-target uses HTTP absolute form.
+///
+/// Origin-form request-targets can legitimately contain `://` in a path or
+/// query value, so a substring check would incorrectly make those requests
+/// participate in authority validation.
+fn absolute_form_uri(target: &str) -> Result<Option<http::Uri>> {
+    let uri = target
+        .parse::<http::Uri>()
+        .map_err(|_| miette!("HTTP absolute-form request target contains an invalid URI"))?;
+    Ok(uri.scheme().is_some().then_some(uri))
 }
 
 fn authorities_match(
@@ -4894,6 +4899,50 @@ mod tests {
                 .to_string()
                 .contains("request authority does not match the Host header"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn origin_form_targets_with_embedded_urls_use_host_authority() {
+        let host: http::uri::Authority = "api.example.test".parse().unwrap();
+
+        for target in ["/fetch/http://example.test", "/?next=http://example.test"] {
+            assert!(
+                absolute_form_uri(target).unwrap().is_none(),
+                "{target} must remain origin-form"
+            );
+            validate_absolute_form_authority(target, Some(&host))
+                .expect("embedded URL must not trigger absolute-form validation");
+
+            let raw = format!("GET {target} HTTP/1.1\r\nHost: api.example.test\r\n\r\n");
+            let authority = request_authority(raw.as_bytes(), Some(443))
+                .unwrap()
+                .expect("origin-form request with Host must have an authority");
+            assert_eq!(authority.authority, host);
+            assert_eq!(authority.effective_port, 443);
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_keeps_embedded_url_in_origin_form_path() {
+        let (mut client, mut peer) = tokio::io::duplex(1024);
+        peer.write_all(
+            b"GET /fetch/http://example.test?next=http://other.test HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let request = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .expect("embedded URL origin-form request must parse")
+        .expect("request must be present");
+        assert_eq!(request.target, "/fetch/http:/example.test");
+        assert_eq!(
+            request.raw_header,
+            b"GET /fetch/http:/example.test?next=http://other.test HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
         );
     }
 
