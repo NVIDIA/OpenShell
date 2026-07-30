@@ -19,6 +19,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./raw": {
+      "types": "./dist/raw.d.ts",
+      "import": "./dist/raw.js"
     }
   },
   "files": [

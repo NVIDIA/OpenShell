@@ -490,11 +490,22 @@ class Pushable<T> implements AsyncIterable<T> {
 export class SandboxClient {
   private readonly grpc: Client<typeof OpenShell>;
 
+  /**
+   * Advanced escape hatch: a generated client for every gateway RPC, including
+   * surface the curated methods do not wrap yet. Request/response types are the
+   * generated wire messages (import them from '@nvidia/openshell-sdk/raw').
+   */
+  readonly raw: Client<typeof OpenShell>;
+  /** The shared Connect transport, for building extra clients over the same connection. */
+  readonly transport: Transport;
+
   // Takes a transport rather than options so OpenShellClient can compose
   // several scoped clients over a single connection. For standalone use,
   // prefer the SandboxClient.connect() factory below.
   constructor(transport: Transport) {
+    this.transport = transport;
     this.grpc = createClient(OpenShell, transport);
+    this.raw = this.grpc;
   }
 
   static async connect(options: ConnectOptions): Promise<SandboxClient> {
@@ -1072,11 +1083,23 @@ export class OpenShellClient {
   /** Sandbox lifecycle + exec: create/get/list/delete, waitReady/waitDeleted, exec. */
   readonly sandbox: SandboxClient;
 
+  /**
+   * Advanced escape hatch: a generated client for every gateway RPC, including
+   * surface the curated sub-clients do not wrap yet (gateway config, provider
+   * CRUD, policy status, watch, logs, and the full observed Sandbox). See
+   * '@nvidia/openshell-sdk/raw' for the generated request/response types.
+   */
+  readonly raw: Client<typeof OpenShell>;
+  /** The shared Connect transport, for building extra clients over the same connection. */
+  readonly transport: Transport;
+
   private readonly grpc: Client<typeof OpenShell>;
 
   private constructor(transport: Transport) {
     // One transport (one connection) shared across every scoped client.
+    this.transport = transport;
     this.grpc = createClient(OpenShell, transport);
+    this.raw = this.grpc;
     this.sandbox = new SandboxClient(transport);
   }
 
