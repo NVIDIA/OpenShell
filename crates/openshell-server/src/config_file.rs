@@ -161,6 +161,8 @@ pub struct GatewayFileSection {
     pub mtls_auth: Option<MtlsAuthConfig>,
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
+    #[serde(default)]
+    pub otlp: Option<OtlpConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
@@ -169,6 +171,23 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
+}
+
+/// `[openshell.gateway.otlp]` section.
+///
+/// Presence of this table enables OTLP export; there is no `enabled` flag.
+/// SDK tuning knobs are deliberately absent — see [`crate::otel_tracing`] for what
+/// this table owns and what the `OTEL_*` environment variables own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OtlpConfig {
+    /// OTLP/gRPC collector endpoint, e.g.
+    /// `http://otel-collector.observability.svc:4317`.
+    pub endpoint: String,
+
+    /// `service.name` resource attribute. Defaults to `openshell-gateway`.
+    #[serde(default)]
+    pub service_name: Option<String>,
 }
 
 /// `[openshell.supervisor]` section.
@@ -434,6 +453,64 @@ grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
         assert!(gw.tls.is_some());
         assert!(gw.oidc.is_some());
         assert!(file.openshell.drivers.contains_key("kubernetes"));
+    }
+
+    #[test]
+    fn parses_gateway_otlp_config() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://otel-collector.observability.svc:4317"
+service_name = "openshell-gateway-dev"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid otlp config parses");
+        let otlp = file.openshell.gateway.otlp.expect("otlp config");
+        assert_eq!(
+            otlp.endpoint,
+            "http://otel-collector.observability.svc:4317"
+        );
+        assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
+    }
+
+    #[test]
+    fn otlp_config_requires_only_endpoint() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("minimal otlp config parses");
+        let otlp = file.openshell.gateway.otlp.expect("otlp config");
+        assert_eq!(otlp.endpoint, "http://127.0.0.1:4317");
+        assert!(otlp.service_name.is_none());
+    }
+
+    #[test]
+    fn otlp_config_rejects_unknown_fields() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+protocol = "http"
+"#;
+        let tmp = write_tmp(toml);
+        assert!(load(tmp.path()).is_err(), "unknown otlp field is rejected");
+    }
+
+    #[test]
+    fn otlp_config_rejects_sdk_tuning_keys() {
+        // Sampling, batching, and limits are the SDK's env-var surface. A
+        // `deny_unknown_fields` rejection is the signal that they do not
+        // belong in the config file.
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+sampler = "traceidratio"
+"#;
+        let tmp = write_tmp(toml);
+        assert!(
+            load(tmp.path()).is_err(),
+            "sampler is configured via OTEL_TRACES_SAMPLER, not TOML"
+        );
     }
 
     #[test]

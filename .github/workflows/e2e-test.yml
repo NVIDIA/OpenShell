@@ -302,29 +302,7 @@ jobs:
         with:
           artifact-name: ${{ inputs.vm-driver-artifact-name }}
 
-      - name: Detect KVM access
-        id: kvm
-        run: |
-          set -euo pipefail
-          if [[ ! -c /dev/kvm ]]; then
-            echo "::warning::The GitHub-hosted runner did not expose /dev/kvm; skipping VM E2E"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          sudo chmod 0666 /dev/kvm
-          ls -l /dev/kvm
-          # Shell access bits do not detect device-cgroup or LSM denials.
-          # Opening the device exercises the same boundary as libkrun.
-          if ! exec 3</dev/kvm; then
-            echo "::warning::The GitHub-hosted runner denied opening /dev/kvm; skipping VM E2E"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          exec 3<&-
-          echo "available=true" >> "$GITHUB_OUTPUT"
-
       - name: Install system dependencies
-        if: steps.kvm.outputs.available == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -339,42 +317,49 @@ jobs:
             socat \
             zstd
 
+      - name: Enable KVM access
+        run: |
+          set -euo pipefail
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::The GitHub-hosted runner did not expose /dev/kvm"
+            lscpu
+            grep -m1 -E '^(flags|Features)' /proc/cpuinfo || true
+            ls -la /dev
+            exit 1
+          fi
+
+          # Package installation can restart systemd-udevd, which reapplies
+          # the default root:kvm 0660 mode. Install a persistent rule after
+          # dependencies so later udev events preserve runner access.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --settle --name-match=kvm
+
+          ls -l /dev/kvm
+          exec 3<>/dev/kvm
+          exec 3>&-
+
       - name: Validate VM host tools
-        if: steps.kvm.outputs.available == 'true'
         run: |
           command -v mke2fs
           command -v mkfs.ext4
           command -v debugfs
 
       - name: Install mise
-        if: steps.kvm.outputs.available == 'true'
         run: |
           curl https://mise.run | MISE_VERSION=v2026.4.25 sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
 
       - name: Install tools
-        if: steps.kvm.outputs.available == 'true'
         run: mise install --locked
 
       - name: Cache Rust target and registry
-        if: steps.kvm.outputs.available == 'true'
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: e2e-vm-linux-amd64
           cache-on-failure: "true"
 
       - name: Run VM E2E
-        if: steps.kvm.outputs.available == 'true'
-        run: |
-          log="$RUNNER_TEMP/openshell-vm-e2e.log"
-          set +e
-          mise run --no-deps --skip-deps e2e:vm 2>&1 | tee "$log"
-          status=${PIPESTATUS[0]}
-          set -e
-          if [[ "$status" -ne 0 ]] &&
-            grep -Fq "cannot open /dev/kvm: Permission denied" "$log"; then
-            echo "::warning::The GitHub-hosted runner denied KVM during VM launch; skipping VM E2E"
-            exit 0
-          fi
-          exit "$status"
+        run: mise run --no-deps --skip-deps e2e:vm
