@@ -14,6 +14,7 @@ use std::{fs, io::Write};
 
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
+use serial_test::serial;
 
 const DOCKERFILE_CONTENT: &str = r#"FROM public.ecr.aws/docker/library/python:3.13-slim
 
@@ -64,6 +65,7 @@ const MARKER: &str = "custom-image-e2e-marker";
 /// A named OCI user can write through direct and SSH children when the image
 /// already grants that authority; existing content retains its ownership.
 #[tokio::test]
+#[serial(custom_image)]
 async fn sandbox_from_custom_dockerfile() {
     // Step 1: Write a temporary Dockerfile.
     let tmpdir = tempfile::tempdir().expect("create tmpdir");
@@ -182,6 +184,7 @@ async fn sandbox_from_custom_dockerfile() {
 /// A numeric OCI user/group pair works without passwd or group entries.
 /// The image intentionally has no pre-existing `/sandbox`.
 #[tokio::test]
+#[serial(custom_image)]
 async fn sandbox_from_passwd_less_numeric_oci_user() {
     let tmpdir = tempfile::tempdir().expect("create tmpdir");
     let dockerfile_path = tmpdir.path().join("Dockerfile");
@@ -214,6 +217,7 @@ async fn sandbox_from_passwd_less_numeric_oci_user() {
 }
 
 #[tokio::test]
+#[serial(custom_image)]
 async fn sandbox_rejects_image_workdir_that_would_require_new_authority() {
     let tmpdir = tempfile::tempdir().expect("create tmpdir");
     let dockerfile_path = tmpdir.path().join("Dockerfile");

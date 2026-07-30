@@ -33,7 +33,9 @@ root (`/`), or explicit `/sandbox` declaration uses `/sandbox`, which OpenShell
 creates when necessary and owns as a compatibility workspace. Any other image workdir must
 already exist without symlink components. The completed identity, including
 supplementary groups, must already be able to traverse every parent and
-write and enter the workdir. OpenShell does not change its ownership or mode.
+write and enter the workdir. Validation runs under that completed identity and
+uses the kernel's effective-access checks, so POSIX ACL grants and LSM denials
+are honored. OpenShell does not change its ownership or mode.
 Image `VOLUME` declarations must not cover the workdir or one of its parents
 because Docker would mount the volume before the supervisor could validate the
 immutable image path.

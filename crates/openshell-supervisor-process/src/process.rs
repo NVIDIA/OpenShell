@@ -1329,6 +1329,71 @@ pub fn validate_oci_workspace(
     Ok(())
 }
 
+/// Validate an image-provided workdir in a clean copy of the supervisor so the
+/// main process retains the root authority needed for subsequent setup.
+#[cfg(target_os = "linux")]
+fn validate_oci_workspace_in_subprocess(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+    workdir: &Path,
+) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let (uid, gid, supplementary_gids) = resolve_filesystem_identity(policy, resolved_identity)?;
+    let uid = uid.ok_or_else(|| miette::miette!("workspace validator UID is unresolved"))?;
+    let gid = gid.ok_or_else(|| miette::miette!("workspace validator GID is unresolved"))?;
+    let groups = supplementary_gids
+        .iter()
+        .map(|group| group.as_raw())
+        .collect::<Vec<_>>();
+    let executable = std::env::current_exe().into_diagnostic()?;
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg("validate-workspace")
+        .arg("--workdir")
+        .arg(workdir)
+        .arg("--expected-uid")
+        .arg(uid.to_string())
+        .arg("--expected-gid")
+        .arg(gid.to_string())
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    // `pre_exec` runs after fork and before exec. These direct credential
+    // syscalls are async-signal-safe and affect only the one-shot child.
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setgroups(groups.len(), groups.as_ptr()) != 0
+                || libc::setgid(gid.as_raw()) != 0
+                || libc::setuid(uid.as_raw()) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let output = command.output().into_diagnostic()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    let diagnostic = diagnostic.trim();
+    if diagnostic.is_empty() {
+        return Err(miette::miette!(
+            "image workspace validation failed with status {}",
+            output.status
+        ));
+    }
+    Err(miette::miette!(
+        "image workspace validation failed: {diagnostic}"
+    ))
+}
+
 #[cfg(unix)]
 fn validate_workspace_component(
     path: &Path,
@@ -1377,6 +1442,104 @@ fn validate_workspace_component(
         ));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn validate_oci_workspace_as_effective_identity(root: &Path) -> Result<()> {
+    use rustix::fs::{Access, AtFlags, FileType, Mode, OFlags};
+
+    let components = validated_workspace_components(root, false)?;
+    let open_flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut current_path = PathBuf::from("/");
+    let mut current_fd = rustix::fs::open("/", open_flags, Mode::empty()).into_diagnostic()?;
+    reject_special_workspace_filesystem_fd(&current_fd, &current_path)?;
+    rustix::fs::accessat(
+        &current_fd,
+        ".",
+        Access::EXEC_OK,
+        AtFlags::EACCESS | AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(|error| {
+        miette::miette!(
+            "workspace path component '{}' is not traversable by the sandbox identity in the image: {error}",
+            current_path.display()
+        )
+    })?;
+
+    let last_component = components.len().saturating_sub(1);
+    for (index, component) in components.into_iter().enumerate() {
+        current_path.push(&component);
+        let stat = rustix::fs::statat(&current_fd, &component, AtFlags::SYMLINK_NOFOLLOW).map_err(
+            |error| {
+                if error == rustix::io::Errno::NOENT {
+                    miette::miette!(
+                        "image workspace path component '{}' does not exist",
+                        current_path.display()
+                    )
+                } else {
+                    miette::miette!(
+                        "failed to inspect image workspace path component '{}': {error}",
+                        current_path.display()
+                    )
+                }
+            },
+        )?;
+        let file_type = FileType::from_raw_mode(stat.st_mode);
+        if file_type.is_symlink() {
+            return Err(miette::miette!(
+                "workspace path component '{}' is a symlink — refusing to follow it",
+                current_path.display()
+            ));
+        }
+        if !file_type.is_dir() {
+            return Err(miette::miette!(
+                "workspace path component '{}' is not a directory",
+                current_path.display()
+            ));
+        }
+
+        let is_workspace = index == last_component;
+        let access = if is_workspace {
+            Access::WRITE_OK | Access::EXEC_OK
+        } else {
+            Access::EXEC_OK
+        };
+        rustix::fs::accessat(
+            &current_fd,
+            &component,
+            access,
+            AtFlags::EACCESS | AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| {
+            let requirement = if is_workspace {
+                "writable and traversable"
+            } else {
+                "traversable"
+            };
+            miette::miette!(
+                "workspace path component '{}' is not {requirement} by the sandbox identity in the image: {error}",
+                current_path.display()
+            )
+        })?;
+
+        current_fd = rustix::fs::openat(&current_fd, &component, open_flags, Mode::empty())
+            .map_err(|error| {
+                miette::miette!(
+                    "failed to open image workspace path component '{}': {error}",
+                    current_path.display()
+                )
+            })?;
+        reject_special_workspace_filesystem_fd(&current_fd, &current_path)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reject_special_workspace_filesystem_fd(fd: &impl std::os::fd::AsFd, path: &Path) -> Result<()> {
+    let fs = rustix::fs::fstatfs(fd).into_diagnostic()?;
+    #[allow(clippy::cast_sign_loss)]
+    reject_special_workspace_filesystem_type(path, fs.f_type as u64)
 }
 
 #[cfg(target_os = "linux")]
@@ -1693,6 +1856,9 @@ pub fn prepare_filesystem_with_identity(
             prepare_oci_workspace(workspace, uid, gid, &supplementary_gids)?;
         } else {
             info!(path = %workspace.display(), ?uid, ?gid, "Validating image workspace authority");
+            #[cfg(target_os = "linux")]
+            validate_oci_workspace_in_subprocess(policy, resolved_identity, workspace)?;
+            #[cfg(not(target_os = "linux"))]
             validate_oci_workspace(workspace, uid, gid, &supplementary_gids)?;
         }
     }
@@ -2886,6 +3052,81 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("does not exist"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn effective_identity_validation_honors_named_user_acl() {
+        if !nix::unistd::geteuid().is_root() {
+            return;
+        }
+
+        const TEST_UID: u32 = 42_234;
+        const TEST_GID: u32 = 42_235;
+        const ACL_XATTR_VERSION: u32 = 2;
+        const ACL_USER_OBJ: u16 = 0x01;
+        const ACL_USER: u16 = 0x02;
+        const ACL_GROUP_OBJ: u16 = 0x04;
+        const ACL_MASK: u16 = 0x10;
+        const ACL_OTHER: u16 = 0x20;
+        const ACL_UNDEFINED_ID: u32 = u32::MAX;
+
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+        let root = dir.path().canonicalize().unwrap().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut acl = ACL_XATTR_VERSION.to_ne_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (ACL_USER_OBJ, 0o7, ACL_UNDEFINED_ID),
+            (ACL_USER, 0o7, TEST_UID),
+            (ACL_GROUP_OBJ, 0o0, ACL_UNDEFINED_ID),
+            (ACL_MASK, 0o7, ACL_UNDEFINED_ID),
+            (ACL_OTHER, 0o0, ACL_UNDEFINED_ID),
+        ] {
+            acl.extend_from_slice(&tag.to_ne_bytes());
+            acl.extend_from_slice(&permissions.to_ne_bytes());
+            acl.extend_from_slice(&id.to_ne_bytes());
+        }
+        let path = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).unwrap();
+        let name = c"system.posix_acl_access";
+        let result = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "setxattr failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        match unsafe { fork() }.expect("fork should succeed") {
+            ForkResult::Child => {
+                let credentials_dropped = unsafe {
+                    libc::setgroups(0, std::ptr::null()) == 0
+                        && libc::setgid(TEST_GID) == 0
+                        && libc::setuid(TEST_UID) == 0
+                };
+                let valid = credentials_dropped
+                    && validate_oci_workspace_as_effective_identity(&root).is_ok();
+                unsafe { libc::_exit(i32::from(!valid)) };
+            }
+            ForkResult::Parent { child } => {
+                assert_eq!(
+                    waitpid(child, None).expect("waitpid should succeed"),
+                    WaitStatus::Exited(child, 0),
+                    "named ACL user should retain workspace authority"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

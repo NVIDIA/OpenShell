@@ -441,7 +441,9 @@ OpenShell creates and owns that compatibility workspace. Any other workdir must
 already exist in the immutable image without symlink components. The completed
 UID/GID and supplementary groups must already be able to traverse every parent
 and write and enter the workdir. OpenShell does not change that directory's
-ownership or mode. It rejects kernel-managed filesystems based on filesystem
+ownership or mode. A one-shot validator drops to that identity and uses kernel
+effective-access checks, including POSIX ACL grants and LSM denials. It rejects
+kernel-managed filesystems based on filesystem
 metadata and rejects overlap with actual OpenShell control paths. Docker checks
 the original image filesystem in the final supervisor and rejects image
 `VOLUME` declarations that would mask the workdir or one of its parents before
