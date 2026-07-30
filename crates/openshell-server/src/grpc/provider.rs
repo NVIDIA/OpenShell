@@ -3121,12 +3121,11 @@ mod tests {
         GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRequest,
         ImportProviderProfilesRequest, L7Allow, L7Rule, LintProviderProfilesRequest,
         ListProviderProfilesRequest, ListProvidersRequest, NetworkBinary, NetworkEndpoint,
-        NetworkPolicyRule,
-        ProviderCredentialRefresh, ProviderCredentialRefreshMaterial, ProviderCredentialTokenGrant,
-        ProviderCredentialTokenGrantAudienceOverride, ProviderProfile, ProviderProfileCategory,
-        ProviderProfileCredential, ProviderProfileImportItem, RotateProviderCredentialRequest,
-        Sandbox, SandboxPolicy, SandboxSpec, StoredProviderProfile, UpdateProviderProfilesRequest,
-        UpdateProviderRequest,
+        NetworkPolicyRule, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
+        ProviderCredentialTokenGrant, ProviderCredentialTokenGrantAudienceOverride,
+        ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
+        ProviderProfileImportItem, RotateProviderCredentialRequest, Sandbox, SandboxPolicy,
+        SandboxSpec, StoredProviderProfile, UpdateProviderProfilesRequest, UpdateProviderRequest,
     };
     use openshell_core::{ObjectId, ObjectName};
     use tonic::{Code, Request};
