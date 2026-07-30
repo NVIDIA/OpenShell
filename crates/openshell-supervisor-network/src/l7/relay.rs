@@ -143,14 +143,16 @@ fn request_authority_matches_endpoint(
             }
             Err(_) => return false,
         };
-    let request_host = authority.authority.host().trim_end_matches('.');
-    let endpoint_host = ctx
-        .host
-        .trim()
+    let request_host = normalized_endpoint_host(authority.authority.host());
+    let endpoint_host = normalized_endpoint_host(&ctx.host);
+    request_host.eq_ignore_ascii_case(endpoint_host) && authority.effective_port == ctx.port
+}
+
+fn normalized_endpoint_host(host: &str) -> &str {
+    host.trim()
         .trim_start_matches('[')
         .trim_end_matches(']')
-        .trim_end_matches('.');
-    request_host.eq_ignore_ascii_case(endpoint_host) && authority.effective_port == ctx.port
+        .trim_end_matches('.')
 }
 
 async fn reject_request_authority_mismatch<W>(client: &mut W, ctx: &L7EvalContext) -> Result<()>
@@ -2543,6 +2545,29 @@ mod tests {
                 .resolve_placeholder("openshell:resolve:env:v42_API_TOKEN"),
             Some("secret")
         );
+    }
+
+    #[test]
+    fn bracketed_ipv6_host_matches_bracket_free_connect_endpoint() {
+        let request = crate::l7::provider::L7Request {
+            action: "GET".to_string(),
+            target: "/v1".to_string(),
+            query_params: TestHashMap::new(),
+            raw_header: b"GET /v1 HTTP/1.1\r\nHost: [2001:db8::1]:8443\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let ctx = L7EvalContext {
+            host: "2001:db8::1".to_string(),
+            port: 8443,
+            request_default_port: Some(8443),
+            ..Default::default()
+        };
+
+        let authority = crate::l7::rest::request_authority(&request.raw_header, Some(8443))
+            .expect("valid authority")
+            .expect("Host header");
+        assert_eq!(authority.authority.host(), "[2001:db8::1]");
+        assert!(request_authority_matches_endpoint(&request, &ctx));
     }
 
     async fn run_single_config_credential_mismatch(
