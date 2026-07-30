@@ -7,6 +7,7 @@ set -euo pipefail
 
 REAL_GH="${OPENSHELL_REAL_GH:-/usr/bin/gh}"
 GATOR_MARKER='> **gator-agent**'
+GATOR_PAYLOAD_VERSION="${OPENSHELL_AGENT_PAYLOAD_VERSION:-2}"
 
 if [[ $# -lt 1 || "$1" != "api" ]]; then
     exec "$REAL_GH" "$@"
@@ -135,10 +136,16 @@ guard_duplicate_gator_disposition() {
     [[ "$body" != *"## Monitoring Complete"* ]] || return 0
 
     local pull_json head_sha current_is_draft
-    pull_json="$($REAL_GH api "repos/$owner/$repo/pulls/$number" 2>/dev/null || true)"
+    if ! pull_json="$($REAL_GH api "repos/$owner/$repo/pulls/$number" 2>/dev/null)"; then
+        echo "openshell-agent: blocked gator write because current PR head lookup failed for $owner/$repo#$number" >&2
+        return 21
+    fi
     head_sha="$(printf '%s' "$pull_json" | jq -r '.head.sha // empty' 2>/dev/null || true)"
     current_is_draft="$(printf '%s' "$pull_json" | jq -r '.draft // false' 2>/dev/null || true)"
-    [[ -n "$head_sha" ]] || return 0
+    if [[ -z "$head_sha" ]]; then
+        echo "openshell-agent: blocked gator write because current PR head was missing for $owner/$repo#$number" >&2
+        return 21
+    fi
 
     if is_legacy_reviewer_failure_disposition "$body" "$head_sha"; then
         echo "openshell-agent: blocked public reviewer sub-agent failure disposition for $owner/$repo#$number ($head_sha)" >&2
@@ -147,13 +154,30 @@ guard_duplicate_gator_disposition() {
     fi
 
     local existing_comments existing_reviews
-    existing_comments="$($REAL_GH api "repos/$owner/$repo/issues/$number/comments" --paginate --jq '.[] | select(.body | contains("> **gator-agent**")) | .body | @json' 2>/dev/null || true)"
-    existing_reviews="$($REAL_GH api "repos/$owner/$repo/pulls/$number/reviews" --paginate --jq '.[] | select(.body | contains("> **gator-agent**")) | .body | @json' 2>/dev/null || true)"
+    if ! existing_comments="$($REAL_GH api "repos/$owner/$repo/issues/$number/comments" --paginate --jq '.[] | select(.body | contains("> **gator-agent**")) | .body | @json' 2>/dev/null)"; then
+        echo "openshell-agent: blocked gator write because existing comment lookup failed for $owner/$repo#$number" >&2
+        return 21
+    fi
+    if ! existing_reviews="$($REAL_GH api "repos/$owner/$repo/pulls/$number/reviews" --paginate --jq '.[] | select(.body | contains("> **gator-agent**")) | .body | @json' 2>/dev/null)"; then
+        echo "openshell-agent: blocked gator write because existing review lookup failed for $owner/$repo#$number" >&2
+        return 21
+    fi
 
     if has_blocking_same_sha_disposition "$head_sha" "$current_is_draft" "$(printf '%s\n%s\n' "$existing_comments" "$existing_reviews")"; then
         echo "openshell-agent: blocked duplicate gator same-SHA disposition for $owner/$repo#$number ($head_sha)" >&2
         echo "openshell-agent: push a new commit, remove the old disposition, or set OPENSHELL_GATOR_ALLOW_SAME_SHA_COMMENT=1 for an explicit maintainer-requested same-SHA action" >&2
         return 20
+    fi
+
+    if [[ "$body" == *"## PR Review Status"* || "$body" == *"## Re-check After"* ]]; then
+        if [[ "$body" != *"Head SHA: \`$head_sha\`"* && "$body" != *"Head SHA: $head_sha"* ]]; then
+            echo "openshell-agent: blocked gator review disposition without the exact current Head SHA for $owner/$repo#$number" >&2
+            return 22
+        fi
+        if [[ "$body" != *"Gator payload: \`$GATOR_PAYLOAD_VERSION\`"* && "$body" != *"Gator payload: $GATOR_PAYLOAD_VERSION"* ]]; then
+            echo "openshell-agent: blocked gator review disposition without Gator payload version $GATOR_PAYLOAD_VERSION" >&2
+            return 22
+        fi
     fi
 }
 

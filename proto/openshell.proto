@@ -20,152 +20,409 @@ import "sandbox.proto";
 //   resource messages before persisting or returning them to clients.
 service OpenShell {
   // Check the health of the service.
-  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Health(HealthRequest) returns (HealthResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "unauthenticated"
+    };
+  }
+
+  // Return the authenticated caller identity established by the gateway.
+  rpc GetCurrentUser(GetCurrentUserRequest) returns (GetCurrentUserResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+    };
+  }
 
   // Fetch elevated live gateway runtime metadata.
-  rpc GetGatewayInfo(GetGatewayInfoRequest) returns (GetGatewayInfoResponse);
+  rpc GetGatewayInfo(GetGatewayInfoRequest) returns (GetGatewayInfoResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:read"
+      global_role: "platform_admin"
+    };
+  }
 
   // Create a new sandbox.
-  rpc CreateSandbox(CreateSandboxRequest) returns (SandboxResponse);
+  rpc CreateSandbox(CreateSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Fetch a sandbox by name.
-  rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse);
+  rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // List sandboxes.
-  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
+  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // List provider records attached to a sandbox.
   rpc ListSandboxProviders(ListSandboxProvidersRequest)
-      returns (ListSandboxProvidersResponse);
+      returns (ListSandboxProvidersResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // Attach a provider record to an existing sandbox.
   rpc AttachSandboxProvider(AttachSandboxProviderRequest)
-      returns (AttachSandboxProviderResponse);
+      returns (AttachSandboxProviderResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Detach a provider record from an existing sandbox.
   rpc DetachSandboxProvider(DetachSandboxProviderRequest)
-      returns (DetachSandboxProviderResponse);
+      returns (DetachSandboxProviderResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Delete a sandbox by name.
-  rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
+  rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Create a short-lived SSH session for a sandbox.
-  rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse);
+  rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Create or update a sandbox HTTP service endpoint for local routing.
-  rpc ExposeService(ExposeServiceRequest) returns (ServiceEndpointResponse);
+  rpc ExposeService(ExposeServiceRequest) returns (ServiceEndpointResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Fetch one sandbox HTTP service endpoint.
-  rpc GetService(GetServiceRequest) returns (ServiceEndpointResponse);
+  rpc GetService(GetServiceRequest) returns (ServiceEndpointResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // List sandbox HTTP service endpoints.
-  rpc ListServices(ListServicesRequest) returns (ListServicesResponse);
+  rpc ListServices(ListServicesRequest) returns (ListServicesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // Delete one sandbox HTTP service endpoint.
-  rpc DeleteService(DeleteServiceRequest) returns (DeleteServiceResponse);
+  rpc DeleteService(DeleteServiceRequest) returns (DeleteServiceResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Revoke a previously issued SSH session.
-  rpc RevokeSshSession(RevokeSshSessionRequest) returns (RevokeSshSessionResponse);
+  rpc RevokeSshSession(RevokeSshSessionRequest) returns (RevokeSshSessionResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Execute a command in a ready sandbox and stream output.
-  rpc ExecSandbox(ExecSandboxRequest) returns (stream ExecSandboxEvent);
+  rpc ExecSandbox(ExecSandboxRequest) returns (stream ExecSandboxEvent) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Forward one CLI-side TCP connection to a loopback TCP target in a sandbox.
-  rpc ForwardTcp(stream TcpForwardFrame) returns (stream TcpForwardFrame);
+  rpc ForwardTcp(stream TcpForwardFrame) returns (stream TcpForwardFrame) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Execute an interactive command with bidirectional stdin/stdout streaming.
   // The first client message MUST carry an ExecSandboxInput with the start
   // variant. Subsequent messages carry stdin bytes or window resize events.
-  rpc ExecSandboxInteractive(stream ExecSandboxInput) returns (stream ExecSandboxEvent);
+  rpc ExecSandboxInteractive(stream ExecSandboxInput) returns (stream ExecSandboxEvent) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
 
   // Create a provider.
-  rpc CreateProvider(CreateProviderRequest) returns (ProviderResponse);
+  rpc CreateProvider(CreateProviderRequest) returns (ProviderResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Fetch a provider by name.
-  rpc GetProvider(GetProviderRequest) returns (ProviderResponse);
+  rpc GetProvider(GetProviderRequest) returns (ProviderResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:read"
+      workspace_role: "user"
+    };
+  }
 
   // List providers.
-  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:read"
+      workspace_role: "user"
+    };
+  }
 
   // List available provider type profiles.
   rpc ListProviderProfiles(ListProviderProfilesRequest)
-      returns (ListProviderProfilesResponse);
+      returns (ListProviderProfilesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:read"
+      workspace_role: "user"
+    };
+  }
 
   // Fetch one provider type profile by id.
   rpc GetProviderProfile(GetProviderProfileRequest)
-      returns (ProviderProfileResponse);
+      returns (ProviderProfileResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:read"
+      workspace_role: "user"
+    };
+  }
 
   // Import custom provider type profiles.
   rpc ImportProviderProfiles(ImportProviderProfilesRequest)
-      returns (ImportProviderProfilesResponse);
+      returns (ImportProviderProfilesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Update an existing custom provider type profile.
   rpc UpdateProviderProfiles(UpdateProviderProfilesRequest)
-      returns (UpdateProviderProfilesResponse);
+      returns (UpdateProviderProfilesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Validate provider type profiles without registering them.
   rpc LintProviderProfiles(LintProviderProfilesRequest)
-      returns (LintProviderProfilesResponse);
+      returns (LintProviderProfilesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:read"
+      workspace_role: "user"
+    };
+  }
 
   // Update an existing provider by name.
-  rpc UpdateProvider(UpdateProviderRequest) returns (ProviderResponse);
+  rpc UpdateProvider(UpdateProviderRequest) returns (ProviderResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Fetch refresh status for one provider or provider credential.
   rpc GetProviderRefreshStatus(GetProviderRefreshStatusRequest)
-      returns (GetProviderRefreshStatusResponse);
+      returns (GetProviderRefreshStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:read"
+      workspace_role: "user"
+    };
+  }
 
   // Configure gateway-owned refresh material for one provider credential.
   rpc ConfigureProviderRefresh(ConfigureProviderRefreshRequest)
-      returns (ConfigureProviderRefreshResponse);
+      returns (ConfigureProviderRefreshResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Record a gateway-owned refresh request for one provider credential.
   rpc RotateProviderCredential(RotateProviderCredentialRequest)
-      returns (RotateProviderCredentialResponse);
+      returns (RotateProviderCredentialResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Delete gateway-owned refresh configuration for one provider credential.
   rpc DeleteProviderRefresh(DeleteProviderRefreshRequest)
-      returns (DeleteProviderRefreshResponse);
+      returns (DeleteProviderRefreshResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Delete a provider by name.
-  rpc DeleteProvider(DeleteProviderRequest) returns (DeleteProviderResponse);
+  rpc DeleteProvider(DeleteProviderRequest) returns (DeleteProviderResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Delete a custom provider type profile by id.
   rpc DeleteProviderProfile(DeleteProviderProfileRequest)
-      returns (DeleteProviderProfileResponse);
+      returns (DeleteProviderProfileResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "provider:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Get sandbox settings by id (called by sandbox entrypoint and poll loop).
   rpc GetSandboxConfig(openshell.sandbox.v1.GetSandboxConfigRequest)
-      returns (openshell.sandbox.v1.GetSandboxConfigResponse);
+      returns (openshell.sandbox.v1.GetSandboxConfigResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "dual"
+      scope: "config:read"
+      workspace_role: "user"
+    };
+  }
 
-  // Get gateway-global settings.
+  // Get gateway-global settings (read-only feature flags; any authenticated
+  // user may read these so the CLI and TUI can discover capabilities like
+  // providers_v2_enabled without requiring Platform Admin).
+  //
+  // Scope-only (no role): scopes are granted by the IdP at token issuance,
+  // orthogonal to workspace membership. Deployments that enable scope
+  // enforcement configure the IdP to grant config:read (or openshell:all)
+  // to all sandbox users, so this does not block least-privilege flows.
   rpc GetGatewayConfig(openshell.sandbox.v1.GetGatewayConfigRequest)
-      returns (openshell.sandbox.v1.GetGatewayConfigResponse);
+      returns (openshell.sandbox.v1.GetGatewayConfigResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:read"
+    };
+  }
 
   // Update settings or policy at sandbox or global scope.
   rpc UpdateConfig(UpdateConfigRequest)
-      returns (UpdateConfigResponse);
+      returns (UpdateConfigResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "dual"
+      scope: "config:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Get the load status of a specific policy version.
   rpc GetSandboxPolicyStatus(GetSandboxPolicyStatusRequest)
-      returns (GetSandboxPolicyStatusResponse);
+      returns (GetSandboxPolicyStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // List policy history for a sandbox.
   rpc ListSandboxPolicies(ListSandboxPoliciesRequest)
-      returns (ListSandboxPoliciesResponse);
+      returns (ListSandboxPoliciesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // Report policy load result (called by sandbox after reload attempt).
   rpc ReportPolicyStatus(ReportPolicyStatusRequest)
-      returns (ReportPolicyStatusResponse);
+      returns (ReportPolicyStatusResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Get provider environment for a sandbox (called by sandbox supervisor at startup).
   rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
-      returns (GetSandboxProviderEnvironmentResponse);
+      returns (GetSandboxProviderEnvironmentResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Fetch recent sandbox logs (one-shot).
-  rpc GetSandboxLogs(GetSandboxLogsRequest) returns (GetSandboxLogsResponse);
+  rpc GetSandboxLogs(GetSandboxLogsRequest) returns (GetSandboxLogsResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // Push sandbox supervisor logs to the server (client-streaming).
-  rpc PushSandboxLogs(stream PushSandboxLogsRequest) returns (PushSandboxLogsResponse);
+  rpc PushSandboxLogs(stream PushSandboxLogsRequest) returns (PushSandboxLogsResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Persistent supervisor-to-gateway session (bidirectional streaming).
   //
@@ -174,7 +431,11 @@ service OpenShell {
   // SSH connect, ExecSandbox, and targetable sandbox services. Raw service
   // bytes flow over RelayStream calls (separate HTTP/2 streams on the same
   // connection), not over this stream.
-  rpc ConnectSupervisor(stream SupervisorMessage) returns (stream GatewayMessage);
+  rpc ConnectSupervisor(stream SupervisorMessage) returns (stream GatewayMessage) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Raw byte relay between supervisor and gateway.
   //
@@ -187,7 +448,11 @@ service OpenShell {
   //
   // This rides the same TCP+TLS+HTTP/2 connection as ConnectSupervisor —
   // no new TLS handshake, no reverse HTTP CONNECT.
-  rpc RelayStream(stream RelayFrame) returns (stream RelayFrame);
+  rpc RelayStream(stream RelayFrame) returns (stream RelayFrame) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Watch a sandbox and stream updates.
   //
@@ -195,7 +460,13 @@ service OpenShell {
   // - Sandbox status snapshots (phase/status)
   // - OpenShell server process logs correlated by sandbox_id
   // - Platform events correlated to the sandbox
-  rpc WatchSandbox(WatchSandboxRequest) returns (stream SandboxStreamEvent);
+  rpc WatchSandbox(WatchSandboxRequest) returns (stream SandboxStreamEvent) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:read"
+      workspace_role: "user"
+    };
+  }
 
   // ---------------------------------------------------------------------------
   // Draft policy recommendation RPCs
@@ -203,42 +474,98 @@ service OpenShell {
 
   // Submit denial analysis results from sandbox (summaries + proposed chunks).
   rpc SubmitPolicyAnalysis(SubmitPolicyAnalysisRequest)
-      returns (SubmitPolicyAnalysisResponse);
+      returns (SubmitPolicyAnalysisResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Get draft policy recommendations for a sandbox.
-  rpc GetDraftPolicy(GetDraftPolicyRequest) returns (GetDraftPolicyResponse);
+  rpc GetDraftPolicy(GetDraftPolicyRequest) returns (GetDraftPolicyResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "dual"
+      scope: "config:read"
+      workspace_role: "user"
+    };
+  }
 
   // Approve a single draft policy chunk (merges into active policy).
   rpc ApproveDraftChunk(ApproveDraftChunkRequest)
-      returns (ApproveDraftChunkResponse);
+      returns (ApproveDraftChunkResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Reject a single draft policy chunk.
   rpc RejectDraftChunk(RejectDraftChunkRequest)
-      returns (RejectDraftChunkResponse);
+      returns (RejectDraftChunkResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Approve all pending draft chunks (skips security-flagged unless forced).
   rpc ApproveAllDraftChunks(ApproveAllDraftChunksRequest)
-      returns (ApproveAllDraftChunksResponse);
+      returns (ApproveAllDraftChunksResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Edit a pending draft chunk in-place (e.g. narrow allowed_ips).
-  rpc EditDraftChunk(EditDraftChunkRequest) returns (EditDraftChunkResponse);
+  rpc EditDraftChunk(EditDraftChunkRequest) returns (EditDraftChunkResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Reverse an approval (remove merged rule from active policy).
-  rpc UndoDraftChunk(UndoDraftChunkRequest) returns (UndoDraftChunkResponse);
+  rpc UndoDraftChunk(UndoDraftChunkRequest) returns (UndoDraftChunkResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Clear all pending draft chunks for a sandbox.
   rpc ClearDraftChunks(ClearDraftChunksRequest)
-      returns (ClearDraftChunksResponse);
+      returns (ClearDraftChunksResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Get decision history for a sandbox's draft policy.
-  rpc GetDraftHistory(GetDraftHistoryRequest) returns (GetDraftHistoryResponse);
+  rpc GetDraftHistory(GetDraftHistoryRequest) returns (GetDraftHistoryResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "config:read"
+      workspace_role: "user"
+    };
+  }
 
   // Exchange a sandbox-bootstrap credential (e.g. a Kubernetes projected
   // ServiceAccount token) for a gateway-minted JWT bound to the calling
   // sandbox's UUID. Used by the Kubernetes driver path; singleplayer
   // drivers receive the gateway JWT directly from the create-sandbox flow
   // and never call this RPC.
-  rpc IssueSandboxToken(IssueSandboxTokenRequest) returns (IssueSandboxTokenResponse);
+  rpc IssueSandboxToken(IssueSandboxTokenRequest) returns (IssueSandboxTokenResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Renew the calling sandbox's gateway JWT. Older tokens remain valid
   // until their own expiry; deployments should keep token TTLs short to
@@ -247,32 +574,78 @@ service OpenShell {
   // memory only — the on-disk bootstrap file is intentionally not
   // rewritten.
   rpc RefreshSandboxToken(RefreshSandboxTokenRequest)
-      returns (RefreshSandboxTokenResponse);
+      returns (RefreshSandboxTokenResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // ---------------------------------------------------------------------------
   // Workspace management RPCs
   // ---------------------------------------------------------------------------
 
   // Create a workspace.
-  rpc CreateWorkspace(CreateWorkspaceRequest) returns (CreateWorkspaceResponse);
+  rpc CreateWorkspace(CreateWorkspaceRequest) returns (CreateWorkspaceResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "workspace:write"
+      global_role: "platform_admin"
+    };
+  }
 
   // Fetch a workspace by name.
-  rpc GetWorkspace(GetWorkspaceRequest) returns (GetWorkspaceResponse);
+  rpc GetWorkspace(GetWorkspaceRequest) returns (GetWorkspaceResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "workspace:read"
+      workspace_role: "user"
+    };
+  }
 
   // List workspaces.
-  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "workspace:read"
+      workspace_role: "user"
+    };
+  }
 
   // Delete a workspace by name.
-  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "workspace:write"
+      global_role: "platform_admin"
+    };
+  }
 
   // Add a member to a workspace.
-  rpc AddWorkspaceMember(AddWorkspaceMemberRequest) returns (AddWorkspaceMemberResponse);
+  rpc AddWorkspaceMember(AddWorkspaceMemberRequest) returns (AddWorkspaceMemberResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "workspace:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Remove a member from a workspace.
-  rpc RemoveWorkspaceMember(RemoveWorkspaceMemberRequest) returns (RemoveWorkspaceMemberResponse);
+  rpc RemoveWorkspaceMember(RemoveWorkspaceMemberRequest) returns (RemoveWorkspaceMemberResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "workspace:write"
+      workspace_role: "admin"
+    };
+  }
 
   // List members of a workspace.
-  rpc ListWorkspaceMembers(ListWorkspaceMembersRequest) returns (ListWorkspaceMembersResponse);
+  rpc ListWorkspaceMembers(ListWorkspaceMembersRequest) returns (ListWorkspaceMembersResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "workspace:read"
+      workspace_role: "user"
+    };
+  }
 }
 
 // IssueSandboxToken request. Empty body; identity is established by the
@@ -316,6 +689,27 @@ message HealthResponse {
 
   // Service version.
   string version = 2;
+}
+
+// Current-user request. The identity comes from the authenticated request.
+message GetCurrentUserRequest {}
+
+// Authenticated user identity as validated by the gateway.
+message GetCurrentUserResponse {
+  // Stable identity subject (for example, the OIDC `sub` claim).
+  string subject = 1;
+
+  // Human-readable identity name when supplied by the authentication provider.
+  string display_name = 2;
+
+  // Roles granted to the authenticated identity.
+  repeated string roles = 3;
+
+  // OAuth2 scopes granted to the authenticated identity.
+  repeated string scopes = 4;
+
+  // Authentication provider that established the identity.
+  string identity_provider = 5;
 }
 
 // Gateway info request.

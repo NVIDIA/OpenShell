@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 id: gator
+payload_version: 2
 display_name: Gator Gate Agent
 description: Validate and monitor OpenShell GitHub issues and pull requests through the gator state machine.
 
@@ -81,6 +82,11 @@ skills:
   - id: gator-gate
     source: agent://skills/gator-gate/SKILL.md
     destination: skills/gator-gate/SKILL.md
+
+resources:
+  - id: gator-review-findings-schema
+    source: agent://skills/gator-gate/references/review-findings-schema.md
+    destination: skills/gator-gate/references/review-findings-schema.md
 
 subagents:
   - id: principal-engineer-reviewer

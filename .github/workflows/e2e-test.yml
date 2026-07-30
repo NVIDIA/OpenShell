@@ -50,6 +50,12 @@ jobs:
           - suite: python
             cmd: "mise run --no-deps --skip-deps e2e:python"
             apt_packages: ""
+          - suite: oidc-python
+            cmd: "mise run --no-deps --skip-deps e2e:oidc-python:docker"
+            apt_packages: ""
+          - suite: oidc-pkce-docker
+            cmd: "mise run --no-deps --skip-deps e2e:oidc-pkce:docker"
+            apt_packages: "openssh-client"
           - suite: rust-docker
             cmd: "mise run --no-deps --skip-deps e2e:rust"
             apt_packages: "openssh-client"
@@ -111,7 +117,7 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Install Python dependencies and generate protobuf stubs
-        if: matrix.suite == 'python'
+        if: matrix.suite == 'python' || matrix.suite == 'oidc-python'
         run: uv sync --frozen && mise run --no-deps python:proto
 
       - name: Run tests

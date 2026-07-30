@@ -129,7 +129,10 @@ The connection flow:
 3. The CLI connects to the gateway and attaches `authorization: Bearer <token>` metadata to each gRPC request.
 4. The gateway validates the JWT signature, issuer, audience, expiration, and key ID against the issuer's JWKS.
 5. The gateway extracts roles and optional scopes from the configured claim paths.
-6. The gateway authorizes the gRPC method. Admin methods require the admin role, other authenticated methods require the user role. Admin role holders also satisfy user-role checks.
+6. The gateway authorizes the gRPC method. Platform-scoped methods require the configured admin role. Workspace-scoped methods require the configured user role and a sufficient membership in the target workspace. Admin role holders satisfy user-role checks and bypass workspace membership checks.
+
+For the Platform Admin, Workspace Admin, and Workspace User permissions, refer
+to [Manage Workspaces and Access](/sandboxes/manage-workspaces).
 
 If `OPENSHELL_OIDC_SCOPES_CLAIM` is set, the gateway also enforces scopes. It accepts space-delimited scope strings such as `scope: "openid sandbox:read"` and JSON arrays such as `scp: ["sandbox:read"]`. Standard OIDC scopes such as `openid`, `profile`, `email`, and `offline_access` are ignored for authorization. `openshell:all` grants access to all scoped methods.
 
@@ -140,6 +143,20 @@ Re-authenticate an OIDC gateway with:
 ```shell
 openshell gateway login production
 ```
+
+Inspect the identity the gateway validated:
+
+```shell
+openshell whoami
+openshell whoami --output json
+```
+
+The output includes the stable subject used for workspace membership, the
+display name when available, identity provider, roles, and scopes. The gateway
+returns its validated identity; the CLI does not infer these values from an
+unverified local token payload. Use the `subject` value when adding the user to
+a workspace. For membership commands, refer to
+[Manage Workspaces and Access](/sandboxes/manage-workspaces).
 
 ### Edge JWT (cloud gateways)
 

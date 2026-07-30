@@ -7,6 +7,12 @@
 
 e2e_cargo_target_dir() {
   local root=$1
+  shift
+  local cargo_command=(cargo)
+
+  if [ "$#" -gt 0 ]; then
+    cargo_command=("$@")
+  fi
 
   if [ -n "${CARGO_TARGET_DIR:-}" ]; then
     case "${CARGO_TARGET_DIR}" in
@@ -16,7 +22,7 @@ e2e_cargo_target_dir() {
     return 0
   fi
 
-  cargo metadata --format-version=1 --no-deps \
+  "${cargo_command[@]}" metadata --format-version=1 --no-deps \
     | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
 }
 
@@ -112,18 +118,25 @@ e2e_register_mtls_gateway() {
   local endpoint=$3
   local port=$4
   local pki_dir=$5
+  local oidc_issuer="${6:-}"
   local gateway_config_dir="${config_home}/openshell/gateways/${name}"
 
   mkdir -p "${gateway_config_dir}/mtls"
   cp "${pki_dir}/ca.crt"         "${gateway_config_dir}/mtls/ca.crt"
   cp "${pki_dir}/client/tls.crt" "${gateway_config_dir}/mtls/tls.crt"
   cp "${pki_dir}/client/tls.key" "${gateway_config_dir}/mtls/tls.key"
+
+  local oidc_line=""
+  if [ -n "${oidc_issuer}" ]; then
+    oidc_line="$(printf ',\n  "oidc_issuer": "%s"' "${oidc_issuer}")"
+  fi
+
   cat >"${gateway_config_dir}/metadata.json" <<EOF
 {
   "name": "${name}",
   "gateway_endpoint": "${endpoint}",
   "is_remote": false,
-  "gateway_port": ${port}
+  "gateway_port": ${port}${oidc_line}
 }
 EOF
   printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
@@ -165,6 +178,20 @@ e2e_write_gateway_jwt_config() {
 e2e_write_gateway_mtls_auth_config() {
   printf '[openshell.gateway.mtls_auth]\n'
   printf 'enabled = true\n\n'
+}
+
+e2e_write_gateway_oidc_config() {
+  local issuer=$1
+  local scopes_claim="${2:-scope}"
+
+  printf '[openshell.gateway.oidc]\n'
+  printf 'issuer = %s\n'         "$(e2e_toml_string "${issuer}")"
+  printf 'audience = "openshell-cli"\n'
+  printf 'jwks_ttl_secs = 60\n'
+  printf 'roles_claim = "realm_access.roles"\n'
+  printf 'admin_role = "openshell-admin"\n'
+  printf 'user_role = "openshell-user"\n'
+  printf 'scopes_claim = %s\n\n' "$(e2e_toml_string "${scopes_claim}")"
 }
 
 e2e_build_gateway_binaries() {

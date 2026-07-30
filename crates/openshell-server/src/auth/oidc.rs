@@ -29,7 +29,7 @@ use tracing::{debug, info, warn};
 ///
 /// These are structural bypasses for gRPC infrastructure that doesn't map to a
 /// single RPC method. Per-method bypasses (e.g. `Health`) are declared at the
-/// handler with `#[rpc_auth(auth = "unauthenticated")]`.
+/// handler with `auth_mode: "unauthenticated"` in the proto annotation.
 const UNAUTHENTICATED_PREFIXES: &[&str] = &["/grpc.reflection.", "/grpc.health."];
 
 /// Returns `true` if the method needs no authentication at all.

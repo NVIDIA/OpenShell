@@ -856,9 +856,10 @@ where
             } else if allow_unauthenticated_users {
                 unauthenticated_dev_user_principal()
             } else {
-                // No auth configured — pass through for dev /
-                // fronting-proxy deployments.
-                return inner.ready().await?.call(req).await;
+                // No auth configured — dev / fronting-proxy deployments.
+                // Inject a local-dev principal so downstream handlers that
+                // call extract_principal() always find one.
+                unauthenticated_dev_user_principal()
             };
 
             match principal {

@@ -53,6 +53,7 @@ let
   runtimeInputs = [
     qemu
     pkgs.python3Packages.ansible-core
+    pkgs.python3Packages.virt-firmware
     pkgs.coreutils
     pkgs.gnugrep
     pkgs.jq
@@ -71,7 +72,6 @@ let
     export OPENSHELL_TEST_GUEST_CACHE_LIB=${./cache-lib.sh}
     export OPENSHELL_TEST_GUEST_CACHE_RUNNER=${./cache.sh}
     export OPENSHELL_TEST_GUEST_CACHE_SEAL=${./cache-seal.sh}
-    export OPENSHELL_TEST_GUEST_ARTIFACT_PLAYBOOK=${./configuration/artifacts.yml}
     export OPENSHELL_TEST_GUEST_RUNNER=${./run.sh}
     export TEST_GUEST_BASH=${pkgs.bash}/bin/bash
     export TEST_GUEST_QEMU=${qemuBinary}
