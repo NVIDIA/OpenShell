@@ -1211,8 +1211,8 @@ mod tests {
                 provider_name: "github-prod".to_string(),
                 credential_key: "GITHUB_TOKEN".to_string(),
                 handle: Some(handle(&format!("v1:{logical_path}"))),
-                workspace: "default".to_string(),
-                provider_id: "prov-123".to_string(),
+                workspace: "test-workspace".to_string(),
+                provider_id: "test-provider-id".to_string(),
             }])
             .await
             .unwrap();
