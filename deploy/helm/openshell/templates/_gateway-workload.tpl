@@ -60,7 +60,7 @@ spec:
         # All gateway settings live in the ConfigMap-backed TOML file
         # mounted at /etc/openshell/gateway.toml. The only env var below
         # is a process-level setting consumed by libraries outside
-        # gateway code (currently just SSL_CERT_FILE for OIDC issuer TLS).
+        # gateway code (currently SSL_CERT_FILE for OIDC issuer TLS).
         {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
         # OIDC issuer custom-CA: rustls/reqwest read SSL_CERT_FILE for
         # outbound TLS verification. This is a process-level env var
@@ -68,6 +68,10 @@ spec:
         # cannot be represented in the gateway TOML schema.
         - name: SSL_CERT_FILE
           value: /etc/openshell-tls/oidc-ca/ca.crt
+        {{- end }}
+        {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+        - name: OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET
+          value: {{ .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
         {{- end }}
       volumeMounts:
         {{- if eq (include "openshell.workloadKind" .) "statefulset" }}
@@ -93,6 +97,11 @@ spec:
         {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
         - name: oidc-ca
           mountPath: /etc/openshell-tls/oidc-ca
+          readOnly: true
+        {{- end }}
+        {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+        - name: spiffe-workload-api
+          mountPath: {{ dir .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
           readOnly: true
         {{- end }}
       ports:
@@ -161,6 +170,12 @@ spec:
     - name: oidc-ca
       configMap:
         name: {{ .Values.server.oidc.caConfigMapName }}
+    {{- end }}
+    {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
+    - name: spiffe-workload-api
+      csi:
+        driver: csi.spiffe.io
+        readOnly: true
     {{- end }}
   {{- with .Values.nodeSelector }}
   nodeSelector:

@@ -60,6 +60,33 @@ openshell provider create --name my-api --type generic --credential API_KEY
 
 This looks up the current value of `$API_KEY` in your shell and stores it.
 
+### From the Current OIDC Login
+
+Profile-backed token-exchange providers can store the current gateway OIDC
+access token as their subject credential:
+
+```shell
+openshell provider create \
+  --name custom-api \
+  --type custom-api \
+  --from-oidc-token
+```
+
+OpenShell infers the destination credential from the provider profile when the
+profile has exactly one `token_grant.subject_token.credential`. If the profile
+has more than one, pass `--credential <key>`. Refresh the stored subject token
+later with:
+
+```shell
+openshell provider update custom-api --from-oidc-token
+```
+
+This copies the current OIDC access token and expiry from the active gateway
+login. This requires an active named gateway that was registered for OIDC. If
+the stored gateway access token is expired and a refresh token is available, the
+CLI refreshes it before storing the provider credential. It does not store the
+OIDC refresh token in the provider.
+
 Provider profile metadata is available for known provider types. Provider profile
 network policy is gateway opt-in:
 

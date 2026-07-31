@@ -26,7 +26,7 @@ url = { workspace = true }
 ipnet = "2"
 base64 = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
-reqwest = { workspace = true, features = ["blocking", "rustls-tls-webpki-roots"], optional = true }
+reqwest = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
@@ -36,7 +36,9 @@ default = ["telemetry"]
 ## Compile in anonymous telemetry emission support. On by default; disable with
 ## `--no-default-features` (plus any other features you need) for a build that
 ## contains no telemetry endpoint, no HTTP client, and no emission code at all.
-telemetry = ["dep:reqwest", "dep:chrono"]
+telemetry = ["dep:reqwest", "dep:chrono", "reqwest?/blocking", "reqwest?/rustls-tls-webpki-roots"]
+## OAuth2 token request helpers used by supervisor and gateway.
+oauth = ["dep:reqwest"]
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
