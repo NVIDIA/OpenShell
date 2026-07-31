@@ -8,8 +8,8 @@
 use crate::persistence::{ObjectType, PersistenceError, Store, WriteCondition, current_time_ms};
 use openshell_core::ObjectWorkspace;
 use openshell_core::proto::{
-    Provider, ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-    StoredProviderCredentialRefreshState,
+    CredentialHandle, Provider, ProviderCredentialRefreshStatus,
+    ProviderCredentialRefreshStrategy, StoredProviderCredentialRefreshState,
 };
 use openshell_core::{ObjectId, ObjectName};
 use prost::Message;
@@ -516,7 +516,7 @@ async fn apply_minted_credential(
     minted: &MintedCredential,
 ) -> Result<(), Status> {
     let mut updated = provider.clone();
-    let stored_handles = if let Some(credentials) = credentials
+    let staged_handles = if let Some(credentials) = credentials
         && credentials.stores_provider_credentials()
     {
         let mut creds_to_store =
@@ -524,27 +524,29 @@ async fn apply_minted_credential(
         for (key, value) in &minted.additional_credentials {
             creds_to_store.insert(key.clone(), value.clone());
         }
-        let stored = credentials
+        // Stage under new handles - don't reuse existing handles to avoid overwriting
+        // the still-committed values before validation/CAS succeeds
+        let staged = credentials
             .store_provider_credentials(
                 provider.object_name(),
                 provider.object_workspace(),
                 provider.object_id(),
                 &creds_to_store,
-                &provider.credential_handles,
+                &HashMap::new(), // Empty map forces creation of new handles
             )
             .await?;
-        if !stored.contains_key(credential_key) {
+        if !staged.contains_key(credential_key) {
             return Err(Status::internal(
                 "credential driver did not return refreshed credential handle",
             ));
         }
-        for (key, handle) in &stored {
+        for (key, handle) in &staged {
             updated.credentials.remove(key);
             updated
                 .credential_handles
                 .insert(key.clone(), handle.clone());
         }
-        Some(stored)
+        Some(staged)
     } else {
         updated
             .credentials
@@ -573,9 +575,21 @@ async fn apply_minted_credential(
         store, workspace, &updated,
     )
     .await?;
+
+    // Collect old handles that will be replaced after successful CAS
+    let old_handles_to_delete: HashMap<String, CredentialHandle> = if staged_handles.is_some() {
+        provider
+            .credential_handles
+            .iter()
+            .filter(|(key, _)| updated.credential_handles.contains_key(*key))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    } else {
+        HashMap::new()
+    };
     let cas_result = store
         .update_message_cas::<Provider, _>(provider.object_id(), 0, |current| {
-            if let Some(handles) = stored_handles.clone() {
+            if let Some(handles) = staged_handles.clone() {
                 for (key, handle) in &handles {
                     current.credentials.remove(key);
                     current
@@ -613,7 +627,7 @@ async fn apply_minted_credential(
         });
     if cas_result.is_err()
         && let Some(credentials) = credentials
-        && let Some(ref handles) = stored_handles
+        && let Some(ref handles) = staged_handles
         && let Err(cleanup_err) = credentials
             .delete_provider_credential_handles(
                 provider.object_name(),
@@ -626,9 +640,33 @@ async fn apply_minted_credential(
         warn!(
             provider_name = %provider.object_name(),
             error = %cleanup_err,
-            "failed to clean up stored provider credentials after refresh CAS failure"
+            "failed to clean up staged provider credentials after refresh CAS failure"
         );
     }
+
+    // If CAS succeeded and we have old handles to delete, clean them up
+    if cas_result.is_ok()
+        && !old_handles_to_delete.is_empty()
+        && let Some(credentials) = credentials
+    {
+        if let Err(cleanup_err) = credentials
+            .delete_provider_credential_handles(
+                provider.object_name(),
+                provider.object_workspace(),
+                provider.object_id(),
+                &old_handles_to_delete,
+            )
+            .await
+        {
+            warn!(
+                provider_name = %provider.object_name(),
+                error = %cleanup_err,
+                "failed to clean up old provider credential handles after successful refresh"
+            );
+            // Don't fail the operation - the refresh succeeded, this is just cleanup
+        }
+    }
+
     cas_result
 }
 
