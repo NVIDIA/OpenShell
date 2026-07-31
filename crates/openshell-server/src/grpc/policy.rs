@@ -4833,7 +4833,10 @@ mod tests {
             }],
             ..Default::default()
         });
-        assert!(!below.contains("ephemeral"), "49151 should not be flagged: {below}");
+        assert!(
+            !below.contains("ephemeral"),
+            "49151 should not be flagged: {below}"
+        );
 
         let at = generate_security_notes(&NetworkPolicyRule {
             endpoints: vec![NetworkEndpoint {
@@ -4843,7 +4846,10 @@ mod tests {
             }],
             ..Default::default()
         });
-        assert!(at.contains("Port 49152 is in the ephemeral range"), "49152 should be flagged: {at}");
+        assert!(
+            at.contains("Port 49152 is in the ephemeral range"),
+            "49152 should be flagged: {at}"
+        );
     }
 
     #[test]
