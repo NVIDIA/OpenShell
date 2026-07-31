@@ -12,10 +12,10 @@ use std::collections::HashMap as StdHashMap;
 /// span that merely happened to return nothing.
 #[tokio::test]
 async fn failed_store_calls_are_marked_on_the_span() {
-    use crate::otel_tracing::test_collector;
+    use crate::otel_tracing::test_exporter;
 
     let store = test_store().await;
-    let traced = test_collector::install_traced();
+    let traced = test_exporter::install_traced();
     store.close_for_test().await;
     store
         .get("sandbox", "failed-store-call")
@@ -36,26 +36,32 @@ async fn failed_store_calls_are_marked_on_the_span() {
 /// every gateway restart, exports as a failure.
 #[tokio::test]
 async fn expected_conflicts_leave_the_span_unmarked() {
-    use crate::otel_tracing::test_collector;
+    use crate::otel_tracing::test_exporter;
 
     let store = test_store().await;
-    let traced = test_collector::install_traced();
-    let put = async |id: &str| {
-        store
-            .put_if(
-                "workspace",
-                id,
-                "expected-conflict",
-                "",
-                b"payload",
-                None,
-                super::WriteCondition::MustCreate,
-            )
-            .await
-    };
+    store
+        .put(
+            "workspace",
+            "expected-conflict-first",
+            "expected-conflict",
+            "",
+            b"payload",
+            None,
+        )
+        .await
+        .expect("seed conflicting record");
 
-    put("expected-conflict-first").await.expect("first write");
-    put("expected-conflict-second")
+    let traced = test_exporter::install_traced();
+    store
+        .put_if(
+            "workspace",
+            "expected-conflict-second",
+            "expected-conflict",
+            "",
+            b"payload",
+            None,
+            super::WriteCondition::MustCreate,
+        )
         .await
         .expect_err("the name is already taken");
 
@@ -73,7 +79,7 @@ async fn expected_conflicts_leave_the_span_unmarked() {
 /// each call touched is carried as attributes.
 #[tokio::test]
 async fn store_spans_record_what_they_touched_as_attributes() {
-    use crate::otel_tracing::test_collector;
+    use crate::otel_tracing::test_exporter;
 
     let store = test_store().await;
     store
@@ -81,7 +87,7 @@ async fn store_spans_record_what_they_touched_as_attributes() {
         .await
         .unwrap();
 
-    let traced = test_collector::install_traced();
+    let traced = test_exporter::install_traced();
     store.get("sandbox", "abc").await.unwrap();
     store
         .get_by_name("sandbox", "default", "my-sandbox")
@@ -91,7 +97,7 @@ async fn store_spans_record_what_they_touched_as_attributes() {
 
     let by_name = traced.span_with("store.get_by_name", "object.name", "my-sandbox");
     assert_eq!(
-        test_collector::attribute(&by_name, "object_type").as_deref(),
+        test_exporter::attribute(&by_name, "object_type").as_deref(),
         Some("sandbox"),
         "the span records which type it queried"
     );
@@ -2179,11 +2185,11 @@ async fn membership_selector_escapes_adversarial_label_key() {
 async fn store_operations_export_spans_with_parents() {
     use tracing::Instrument as _;
 
-    use crate::otel_tracing::test_collector;
+    use crate::otel_tracing::test_exporter;
 
     let store = test_store().await;
 
-    let traced = test_collector::install_traced();
+    let traced = test_exporter::install_traced();
     async {
         store
             .list("sandbox", "default", 10, 0)
@@ -2211,9 +2217,9 @@ async fn store_operations_export_spans_with_parents() {
             )
         });
 
-    test_collector::assert_has_parent(child);
+    test_exporter::assert_has_parent(child);
     assert_eq!(
-        test_collector::attribute(child, "object_type").as_deref(),
+        test_exporter::attribute(child, "object_type").as_deref(),
         Some("sandbox"),
         "the store span records what it queried"
     );

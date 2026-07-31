@@ -2130,7 +2130,7 @@ mod tests {
             tracing_subscriber::registry().with(fmt_layer)
         };
         {
-            let _traced = crate::otel_tracing::test_collector::install_scoped(subscriber);
+            let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
 
             let req = Request::builder()
                 .uri("/test-path")
@@ -2154,9 +2154,9 @@ mod tests {
     /// correlated with the gateway's logs.
     #[tokio::test]
     async fn request_span_exports_over_otlp_with_request_id() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         let req = Request::builder()
             .uri("/openshell.v1.OpenShell/CreateSandbox")
             .header("x-request-id", "otlp-req-id-9876")
@@ -2177,11 +2177,11 @@ mod tests {
                 )
             });
         assert_eq!(
-            test_collector::attribute(span, "request_id").as_deref(),
+            test_exporter::attribute(span, "request_id").as_deref(),
             Some("otlp-req-id-9876"),
         );
         assert_eq!(
-            test_collector::attribute(span, "path").as_deref(),
+            test_exporter::attribute(span, "path").as_deref(),
             Some("/openshell.v1.OpenShell/CreateSandbox"),
         );
         assert_eq!(
@@ -2189,26 +2189,26 @@ mod tests {
             opentelemetry::trace::SpanKind::Server,
             "trace UIs lay this out as a served call, not an internal operation"
         );
-        test_collector::assert_is_root(span);
+        test_exporter::assert_is_root(span);
         assert_eq!(
-            test_collector::attribute(span, "rpc.system").as_deref(),
+            test_exporter::attribute(span, "rpc.system").as_deref(),
             Some("grpc"),
         );
         assert_eq!(
-            test_collector::attribute(span, "rpc.service").as_deref(),
+            test_exporter::attribute(span, "rpc.service").as_deref(),
             Some("openshell.v1.OpenShell"),
         );
         assert_eq!(
-            test_collector::attribute(span, "rpc.method").as_deref(),
+            test_exporter::attribute(span, "rpc.method").as_deref(),
             Some("CreateSandbox"),
         );
     }
 
     #[tokio::test]
     async fn request_span_continues_the_incoming_trace() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         let req = Request::builder()
             .uri("/openshell.v1.OpenShell/CreateSandbox")
             .header(
@@ -2241,9 +2241,9 @@ mod tests {
     /// trace UI, which keys off span status rather than a logged field.
     #[tokio::test]
     async fn request_spans_record_the_response_outcome() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         for (path, status) in [
             ("/openshell.v1.OpenShell/CreateSandbox", 500),
             ("/openshell.v1.OpenShell/ListSandboxes", 200),
@@ -2274,7 +2274,7 @@ mod tests {
             .expect("successful request span recorded");
 
         assert_eq!(
-            test_collector::attribute(failed, "http.response.status_code").as_deref(),
+            test_exporter::attribute(failed, "http.response.status_code").as_deref(),
             Some("500"),
             "the response status is an attribute, not only a log field"
         );
@@ -2292,9 +2292,9 @@ mod tests {
 
     #[tokio::test]
     async fn request_span_records_grpc_status_from_trailers() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         let req = Request::builder()
             .uri("/openshell.v1.OpenShell/CreateSandbox")
             .body(Empty::<Bytes>::new())
@@ -2311,7 +2311,7 @@ mod tests {
             "CreateSandbox",
         );
         assert_eq!(
-            test_collector::attribute(&span, "rpc.grpc.status_code").as_deref(),
+            test_exporter::attribute(&span, "rpc.grpc.status_code").as_deref(),
             Some("13")
         );
         assert!(
@@ -2324,7 +2324,7 @@ mod tests {
     /// named for its RPC or HTTP method.
     #[tokio::test]
     async fn each_entrypoint_gets_its_own_root_span() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
         let paths = [
             "/openshell.v1.OpenShell/CreateSandbox",
@@ -2334,7 +2334,7 @@ mod tests {
             "/metrics",
         ];
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         for path in paths {
             let req = Request::builder()
                 .uri(path)

@@ -1527,11 +1527,11 @@ mod tests {
     /// of its own its store reads export as anonymous single-span traces.
     #[tokio::test]
     async fn refresh_worker_ticks_are_roots_and_store_operations_have_parents() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
         let store = test_store().await;
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         run_refresh_worker_tick(&store).await.unwrap();
 
         let spans = traced.finished_spans();
@@ -1545,7 +1545,7 @@ mod tests {
                 )
             });
 
-        test_collector::assert_is_root(root);
+        test_exporter::assert_is_root(root);
         let store_span = spans
             .iter()
             .find(|span| {
@@ -1553,7 +1553,7 @@ mod tests {
                     && span.span_context.trace_id() == root.span_context.trace_id()
             })
             .expect("the tick records its store operation");
-        test_collector::assert_has_parent(store_span);
+        test_exporter::assert_has_parent(store_span);
     }
 
     #[test]

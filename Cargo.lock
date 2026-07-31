@@ -4201,7 +4201,6 @@ dependencies = [
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "opentelemetry",
- "opentelemetry-proto",
  "opentelemetry_sdk",
  "petname",
  "pin-project-lite",
