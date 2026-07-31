@@ -22,6 +22,7 @@ openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
 openshell-driver-podman = { path = "../openshell-driver-podman" }
 openshell-gateway-interceptors = { path = "../openshell-gateway-interceptors" }
 openshell-ocsf = { path = "../openshell-ocsf" }
+openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
@@ -72,7 +73,6 @@ tracing-subscriber = { workspace = true }
 # OpenTelemetry (OTLP trace export, opt-in via [openshell.gateway.otlp])
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
-opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 
 # Metrics
@@ -99,7 +99,7 @@ async-trait = "0.1"
 url = { workspace = true }
 glob = { workspace = true }
 hex = "0.4"
-russh = "0.57"
+russh = "0.61"
 rand = { workspace = true }
 petname = "2"
 ipnet = "2"
