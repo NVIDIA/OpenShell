@@ -9563,7 +9563,12 @@ mod tests {
 
     #[test]
     fn resolve_from_accepts_containerfile_and_custom_files() {
-        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let cwd = std::env::current_dir().expect("resolve current dir");
+
+        let temp = tempfile::Builder::new()
+            .prefix("openshell-relative-test-")
+            .tempdir_in(&cwd)
+            .expect("failed to create tempdir");
         let temp_canonical = temp.path().canonicalize().unwrap();
 
         // 1. Direct Containerfile test with exact path assertions
@@ -9616,11 +9621,17 @@ mod tests {
         let project_containerfile = project.join("Containerfile");
         fs::write(&project_containerfile, "FROM alpine")
             .expect("failed to write project Containerfile");
+        let relative_project = project
+            .strip_prefix(&cwd)
+            .expect("project should be under cwd");
 
-        let old_cwd = std::env::current_dir().expect("failed to get current directory");
-        std::env::set_current_dir(temp.path()).expect("failed to change current directory");
-
-        match resolve_from("project").expect("expected relative directory source") {
+        match resolve_from(
+            relative_project
+                .to_str()
+                .expect("relative project path should be UTF-8"),
+        )
+        .expect("expected relative directory source")
+        {
             super::ResolvedSource::Dockerfile {
                 dockerfile,
                 context,
@@ -9642,7 +9653,6 @@ mod tests {
                 panic!("expected Dockerfile source, got image {image}");
             }
         }
-        std::env::set_current_dir(old_cwd).expect("failed to restore current directory");
     }
 
     #[test]
