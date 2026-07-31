@@ -2386,6 +2386,8 @@ fn build_container_create_body_for_image(
                 "image-declared volume '{volume}' masks OCI WorkingDir '{workspace_root}' before workspace validation"
             ))
         })?;
+        driver_mounts::validate_mount_control_path(volume, &config.ssh_socket_path)
+            .map_err(Status::failed_precondition)?;
     }
     for mount in &driver_config.mounts {
         let target = match mount {
@@ -2395,6 +2397,8 @@ fn build_container_create_body_for_image(
             | DockerDriverMountConfig::Image { target, .. } => target,
         };
         driver_mounts::validate_workspace_mount_target(target, &workspace_root)
+            .map_err(Status::failed_precondition)?;
+        driver_mounts::validate_mount_control_path(target, &config.ssh_socket_path)
             .map_err(Status::failed_precondition)?;
     }
     let user_mounts = docker_driver_mounts(driver_config)?;

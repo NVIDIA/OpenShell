@@ -656,6 +656,29 @@ fn container_creation_rejects_image_volume_that_masks_working_dir() {
 }
 
 #[test]
+fn container_creation_rejects_image_volume_over_configured_ssh_socket() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace".to_string(),
+        volumes: vec!["/custom-runtime".to_string()],
+    };
+    let mut config = runtime_config();
+    config.ssh_socket_path = "/custom-runtime/ssh.sock".to_string();
+
+    let error = build_container_create_body_for_image(
+        &test_sandbox(),
+        &config,
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+
+    assert!(error.message().contains("OpenShell control path"));
+}
+
+#[test]
 fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts() {
     let metadata = DockerImageMetadata {
         id: "sha256:immutable".to_string(),
@@ -1273,6 +1296,36 @@ fn driver_config_rejects_reserved_mount_targets() {
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("reserved OpenShell path"));
+}
+
+#[test]
+fn driver_config_rejects_mount_over_configured_ssh_socket() {
+    let mount_config: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{
+            "type": "tmpfs",
+            "target": "/custom-runtime"
+        }]
+    }))
+    .unwrap();
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace".to_string(),
+        volumes: Vec::new(),
+    };
+    let mut config = runtime_config();
+    config.ssh_socket_path = "/custom-runtime/ssh.sock".to_string();
+
+    let error = build_container_create_body_for_image(
+        &test_sandbox(),
+        &config,
+        &mount_config,
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+
+    assert!(error.message().contains("OpenShell control path"));
 }
 
 #[test]

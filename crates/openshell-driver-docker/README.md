@@ -105,9 +105,10 @@ optional `selinux_label` of `shared` (applies `:z`) or `private` (applies
 `read_only: false` to make them writable. Mount `source`, `target`, and
 `subpath` values must not contain surrounding whitespace. Mount targets must be
 absolute container paths and must not replace or contain the resolved workspace
-root. Nested workspace mounts remain valid. Mounts also must not overlap
-OpenShell supervisor files, `/etc/openshell`, `/etc/openshell-tls`, or
-`/run/netns`.
+root. Nested workspace mounts remain valid. Mounts also must not overlap the
+configured SSH socket or the reserved `/opt/openshell`, `/etc/openshell`,
+`/etc/openshell-tls`, `/run/openshell`, `/run/openshell-sidecar`, and network
+namespace roots.
 
 Example named-volume usage:
 

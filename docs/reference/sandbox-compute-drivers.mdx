@@ -168,10 +168,10 @@ Docker mount schema:
 
 OpenShell rejects mount `source`, `target`, and Docker volume `subpath` values
 with surrounding whitespace. OpenShell also rejects mount targets that replace
-the workspace root or container root, or contain or are contained by concrete
-OpenShell control targets such as the supervisor mount, TLS and token files,
-runtime socket, or network namespace mount. These checks do not make host bind
-mounts safe.
+the workspace root or container root, or contain or are contained by the
+configured SSH socket or reserved `/opt/openshell`, `/etc/openshell`,
+`/etc/openshell-tls`, `/run/openshell`, `/run/openshell-sidecar`, and network
+namespace roots. These checks do not make host bind mounts safe.
 
 ## Podman Driver
 

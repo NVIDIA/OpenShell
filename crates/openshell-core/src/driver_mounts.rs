@@ -5,11 +5,6 @@
 
 use std::path::Path;
 
-use crate::driver_utils::{
-    SANDBOX_TOKEN_MOUNT_PATH, SUPERVISOR_CONTAINER_DIR, TLS_CA_MOUNT_PATH, TLS_CERT_MOUNT_PATH,
-    TLS_KEY_MOUNT_PATH, UPSTREAM_PROXY_AUTH_MOUNT_PATH,
-};
-
 /// `SELinux` relabelling mode for bind mounts.
 ///
 /// On hosts with `SELinux` enabled (e.g. Fedora, RHEL) a bind-mounted path
@@ -30,22 +25,20 @@ pub enum SelinuxLabel {
     Private,
 }
 
-/// Paths mounted or created by the local container supervisor.
+/// High-level namespaces mounted or created by `OpenShell` inside containers.
 ///
-/// Keep this list tied to concrete `OpenShell` control resources. Workspace
-/// safety itself is enforced from the image's ownership and mode metadata,
-/// not by guessing which distro paths are sensitive.
-const OPENSHELL_CONTROL_PATHS: &[&str] = &[
-    SUPERVISOR_CONTAINER_DIR,
-    TLS_CA_MOUNT_PATH,
-    TLS_CERT_MOUNT_PATH,
-    TLS_KEY_MOUNT_PATH,
-    SANDBOX_TOKEN_MOUNT_PATH,
-    UPSTREAM_PROXY_AUTH_MOUNT_PATH,
-    // Kubernetes mounts the sandbox client certificate secret here.
-    "/etc/openshell-tls/client",
-    "/etc/openshell-tls/proxy",
+/// Keep privileged `OpenShell` state within these roots. This is intentionally
+/// not a general Linux system-path denylist. Kernel and image-provided paths
+/// have separate trust models; see NVIDIA/OpenShell#2578.
+const OPENSHELL_CONTROL_ROOTS: &[&str] = &[
+    "/opt/openshell",
+    "/etc/openshell",
+    "/etc/openshell-tls",
+    "/run/openshell",
+    "/run/openshell-sidecar",
     "/run/netns",
+    // The supervisor currently uses the conventional iproute2 spelling.
+    "/var/run/netns",
 ];
 
 /// Compatibility workspace used when an OCI image has no usable working
@@ -104,7 +97,7 @@ pub fn validate_mount_subpath(subpath: &str) -> Result<(), String> {
 pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
     let normalized = normalize_absolute_container_path(target, "mount target")?;
     let path = Path::new(&normalized);
-    for reserved in OPENSHELL_CONTROL_PATHS {
+    for reserved in OPENSHELL_CONTROL_ROOTS {
         let reserved = Path::new(reserved);
         if paths_overlap(path, reserved) {
             return Err(format!(
@@ -128,7 +121,7 @@ pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
         return Ok(DEFAULT_WORKSPACE_ROOT.to_string());
     }
     let workspace_root = normalize_absolute_container_path(working_dir, "OCI WorkingDir")?;
-    for control_path in OPENSHELL_CONTROL_PATHS {
+    for control_path in OPENSHELL_CONTROL_ROOTS {
         validate_workspace_control_path(&workspace_root, control_path)?;
     }
 
@@ -178,6 +171,23 @@ pub fn validate_workspace_control_path(
     if paths_overlap(workspace, control) {
         return Err(format!(
             "OCI WorkingDir '{workspace_root}' conflicts with OpenShell control path '{control_path}'"
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a mount that contains or is contained by a runtime-configured
+/// `OpenShell` control path, such as the sandbox SSH socket.
+pub fn validate_mount_control_path(target: &str, control_path: &str) -> Result<(), String> {
+    let normalized_target = normalize_absolute_container_path(target, "mount target")?;
+    let normalized_control =
+        normalize_absolute_container_path(control_path, "OpenShell control path")?;
+    if paths_overlap(
+        Path::new(&normalized_target),
+        Path::new(&normalized_control),
+    ) {
+        return Err(format!(
+            "mount target '{target}' conflicts with OpenShell control path '{control_path}'"
         ));
     }
     Ok(())
@@ -274,8 +284,13 @@ mod tests {
             "/opt/openshell/bin/project",
             "/etc/openshell/tls/client",
             "/etc/openshell/auth",
+            "/etc/openshell/skills",
+            "/etc/openshell-tls",
             "/run",
+            "/run/openshell/cache",
+            "/run/openshell-sidecar/control.sock",
             "/run/netns/project",
+            "/var/run/netns/project",
         ] {
             assert!(
                 resolve_oci_workspace_root(invalid).is_err(),
@@ -307,7 +322,7 @@ mod tests {
     fn container_target_rejects_reserved_openshell_tls_legacy_path() {
         let err = validate_container_mount_target("/etc/openshell-tls/proxy/client").unwrap_err();
 
-        assert!(err.contains("/etc/openshell-tls/proxy"));
+        assert!(err.contains("/etc/openshell-tls"));
     }
 
     #[test]
@@ -320,6 +335,18 @@ mod tests {
     #[test]
     fn container_target_does_not_prefix_match_unrelated_paths() {
         validate_container_mount_target("/etc/openshell-tools").unwrap();
+        validate_container_mount_target("/run/openshell-tools").unwrap();
+    }
+
+    #[test]
+    fn mount_target_rejects_runtime_configured_control_path_overlap() {
+        for target in ["/custom", "/custom/ssh.sock", "/custom/ssh.sock/cache"] {
+            assert!(
+                validate_mount_control_path(target, "/custom/ssh.sock").is_err(),
+                "expected '{target}' to conflict with the configured control path"
+            );
+        }
+        validate_mount_control_path("/custom-other", "/custom/ssh.sock").unwrap();
     }
 
     #[test]
