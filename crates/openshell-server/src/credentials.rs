@@ -1121,7 +1121,15 @@ impl CredentialDriver for RemoteCredentialDriver {
         grpc_request.set_timeout(Duration::from_secs(
             DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS,
         ));
-        let response = client.store_credential(grpc_request).await?;
+
+        let timeout_duration = Duration::from_secs(DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS);
+        let response =
+            tokio::time::timeout(timeout_duration, client.store_credential(grpc_request))
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded("credential driver StoreCredential timed out")
+                })??;
+
         response
             .into_inner()
             .handle
@@ -1134,7 +1142,13 @@ impl CredentialDriver for RemoteCredentialDriver {
         grpc_request.set_timeout(Duration::from_secs(
             DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS,
         ));
-        client.delete_credential(grpc_request).await?;
+
+        let timeout_duration = Duration::from_secs(DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS);
+        tokio::time::timeout(timeout_duration, client.delete_credential(grpc_request))
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded("credential driver DeleteCredential timed out")
+            })??;
         Ok(())
     }
 
@@ -1149,7 +1163,14 @@ impl CredentialDriver for RemoteCredentialDriver {
         grpc_request.set_timeout(Duration::from_secs(
             DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS,
         ));
-        let response = client.resolve_credentials(grpc_request).await?;
+
+        let timeout_duration = Duration::from_secs(DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS);
+        let response =
+            tokio::time::timeout(timeout_duration, client.resolve_credentials(grpc_request))
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded("credential driver ResolveCredentials timed out")
+                })??;
         Ok(response.into_inner().credentials)
     }
 }
