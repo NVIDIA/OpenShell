@@ -1008,17 +1008,28 @@ mod tests {
         let _ = std::fs::remove_file(socket_path);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn remove_container_allows_cleanup_after_stop_timeout() {
-        let (socket_path, _request_log, handle) = spawn_podman_stub(
+        let (socket_path, request_log, handle) = spawn_podman_stub(
             "remove-container-delayed",
             vec![StubResponse::new(StatusCode::NO_CONTENT, "").with_delay(Duration::from_secs(6))],
         );
         let client = PodmanClient::new(socket_path.clone());
 
-        client
-            .remove_container("sandbox-123", 0)
+        let removal = tokio::spawn(async move { client.remove_container("sandbox-123", 0).await });
+        while request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        removal
             .await
+            .expect("removal task should finish")
             .expect("container removal should retain the API timeout for cleanup");
 
         handle.await.expect("stub task should finish");
