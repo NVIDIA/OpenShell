@@ -2609,7 +2609,7 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while traced.spans_named("disconnected_watch_request").is_empty() {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
