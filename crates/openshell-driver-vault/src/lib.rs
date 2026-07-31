@@ -147,10 +147,17 @@ impl VaultCredentialDriver {
         let logical_path = if let Some(existing_handle) = request.existing_handle.as_ref() {
             Self::logical_path_from_handle(existing_handle)?
         } else {
-            managed_secret_path(&request.provider_name, &request.credential_key)
+            managed_secret_path(
+                &request.workspace,
+                &request.provider_id,
+                &request.provider_name,
+                &request.credential_key,
+            )
         };
         validate_secret_path(&logical_path).map_err(Status::invalid_argument)?;
         validate_managed_secret_path(
+            &request.workspace,
+            &request.provider_id,
             &request.provider_name,
             &request.credential_key,
             &logical_path,
@@ -178,6 +185,8 @@ impl VaultCredentialDriver {
         let handle = Self::handle_from_request("delete", request.handle)?;
         let logical_path = Self::logical_path_from_handle(&handle)?;
         validate_managed_secret_path(
+            &request.workspace,
+            &request.provider_id,
             &request.provider_name,
             &request.credential_key,
             &logical_path,
@@ -200,6 +209,8 @@ impl VaultCredentialDriver {
             let handle = Self::handle_from_request(&request.request_id, request.handle)?;
             let logical_path = Self::logical_path_from_handle(&handle)?;
             validate_managed_secret_path(
+                &request.workspace,
+                &request.provider_id,
                 &request.provider_name,
                 &request.credential_key,
                 &logical_path,
@@ -731,8 +742,17 @@ fn delete_api_path_for_reference(mount: &str, kv_version: KvVersion, target: &st
     }
 }
 
-fn managed_secret_path(provider_name: &str, credential_key: &str) -> String {
+fn managed_secret_path(
+    workspace: &str,
+    provider_id: &str,
+    provider_name: &str,
+    credential_key: &str,
+) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(workspace.as_bytes());
+    hasher.update([0]);
+    hasher.update(provider_id.as_bytes());
+    hasher.update([0]);
     hasher.update(provider_name.as_bytes());
     hasher.update([0]);
     hasher.update(credential_key.as_bytes());
@@ -742,11 +762,13 @@ fn managed_secret_path(provider_name: &str, credential_key: &str) -> String {
 }
 
 fn validate_managed_secret_path(
+    workspace: &str,
+    provider_id: &str,
     provider_name: &str,
     credential_key: &str,
     logical_path: &str,
 ) -> Result<(), Status> {
-    let expected = managed_secret_path(provider_name, credential_key);
+    let expected = managed_secret_path(workspace, provider_id, provider_name, credential_key);
     if logical_path == expected {
         return Ok(());
     }
@@ -988,6 +1010,8 @@ mod tests {
     #[test]
     fn handle_rejects_unexpected_managed_path() {
         let err = validate_managed_secret_path(
+            "default",
+            "prov-123",
             "nvidia-prod",
             "NVIDIA_API_KEY",
             "openshell/provider-credentials/other",
@@ -1001,7 +1025,8 @@ mod tests {
     #[tokio::test]
     async fn store_and_resolve_token_file_kv2_secret() {
         let mock_server = MockServer::start().await;
-        let logical_path = managed_secret_path("nvidia-prod", "NVIDIA_API_KEY");
+        let logical_path =
+            managed_secret_path("default", "prov-123", "nvidia-prod", "NVIDIA_API_KEY");
         let api_path = format!("/v1/secret/data/{logical_path}");
         Mock::given(method("POST"))
             .and(path(api_path.as_str()))
@@ -1042,6 +1067,8 @@ mod tests {
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 value: "nvapi-test".to_string(),
                 existing_handle: None,
+                workspace: "default".to_string(),
+                provider_id: "prov-123".to_string(),
             })
             .await
             .unwrap();
@@ -1053,6 +1080,8 @@ mod tests {
                 provider_name: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 handle: Some(stored),
+                workspace: "default".to_string(),
+                provider_id: "prov-123".to_string(),
             }])
             .await
             .unwrap();
@@ -1063,7 +1092,8 @@ mod tests {
     #[tokio::test]
     async fn store_with_existing_handle_reuses_logical_path() {
         let mock_server = MockServer::start().await;
-        let logical_path = managed_secret_path("nvidia-prod", "NVIDIA_API_KEY");
+        let logical_path =
+            managed_secret_path("default", "prov-123", "nvidia-prod", "NVIDIA_API_KEY");
         Mock::given(method("POST"))
             .and(path(format!("/v1/secret/data/{logical_path}")))
             .and(header("x-vault-token", "dev-token"))
@@ -1088,6 +1118,8 @@ mod tests {
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 value: "updated-secret".to_string(),
                 existing_handle: Some(handle(&format!("v1:{logical_path}"))),
+                workspace: "default".to_string(),
+                provider_id: "prov-123".to_string(),
             })
             .await
             .unwrap();
@@ -1098,7 +1130,8 @@ mod tests {
     #[tokio::test]
     async fn delete_token_file_kv2_secret() {
         let mock_server = MockServer::start().await;
-        let logical_path = managed_secret_path("nvidia-prod", "NVIDIA_API_KEY");
+        let logical_path =
+            managed_secret_path("default", "prov-123", "nvidia-prod", "NVIDIA_API_KEY");
         Mock::given(method("DELETE"))
             .and(path(format!("/v1/secret/metadata/{logical_path}")))
             .and(header("x-vault-token", "dev-token"))
@@ -1121,6 +1154,8 @@ mod tests {
                 provider_name: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 handle: Some(handle(&format!("v1:{logical_path}"))),
+                workspace: "default".to_string(),
+                provider_id: "prov-123".to_string(),
             })
             .await
             .unwrap();
@@ -1171,6 +1206,8 @@ mod tests {
                 provider_name: "github-prod".to_string(),
                 credential_key: "GITHUB_TOKEN".to_string(),
                 handle: Some(handle(&format!("v1:{logical_path}"))),
+                workspace: "default".to_string(),
+                provider_id: "prov-123".to_string(),
             }])
             .await
             .unwrap();
@@ -1181,7 +1218,8 @@ mod tests {
     #[tokio::test]
     async fn resolve_maps_missing_key() {
         let mock_server = MockServer::start().await;
-        let logical_path = managed_secret_path("nvidia-prod", "NVIDIA_API_KEY");
+        let logical_path =
+            managed_secret_path("default", "prov-123", "nvidia-prod", "NVIDIA_API_KEY");
         Mock::given(method("GET"))
             .and(path(format!("/v1/secret/data/{logical_path}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1208,6 +1246,8 @@ mod tests {
                 provider_name: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 handle: Some(handle(&format!("v1:{logical_path}"))),
+                workspace: "default".to_string(),
+                provider_id: "prov-123".to_string(),
             }])
             .await
             .unwrap_err();
@@ -1219,7 +1259,8 @@ mod tests {
     #[tokio::test]
     async fn resolve_maps_permission_denied() {
         let mock_server = MockServer::start().await;
-        let logical_path = managed_secret_path("nvidia-prod", "NVIDIA_API_KEY");
+        let logical_path =
+            managed_secret_path("default", "prov-123", "nvidia-prod", "NVIDIA_API_KEY");
         Mock::given(method("GET"))
             .and(path(format!("/v1/secret/data/{logical_path}")))
             .respond_with(ResponseTemplate::new(403))
@@ -1242,6 +1283,8 @@ mod tests {
                 provider_name: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 handle: Some(handle(&format!("v1:{logical_path}"))),
+                workspace: "default".to_string(),
+                provider_id: "prov-123".to_string(),
             }])
             .await
             .unwrap_err();

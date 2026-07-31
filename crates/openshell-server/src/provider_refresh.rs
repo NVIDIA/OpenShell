@@ -527,6 +527,8 @@ async fn apply_minted_credential(
         let stored = credentials
             .store_provider_credentials(
                 provider.object_name(),
+                provider.object_workspace(),
+                provider.object_id(),
                 &creds_to_store,
                 &provider.credential_handles,
             )
@@ -613,7 +615,12 @@ async fn apply_minted_credential(
         && let Some(credentials) = credentials
         && let Some(ref handles) = stored_handles
         && let Err(cleanup_err) = credentials
-            .delete_provider_credential_handles(provider.object_name(), handles)
+            .delete_provider_credential_handles(
+                provider.object_name(),
+                provider.object_workspace(),
+                provider.object_id(),
+                handles,
+            )
             .await
     {
         warn!(

@@ -1845,6 +1845,8 @@ mod tests {
         let handles = credentials
             .store_provider_credentials(
                 "openai-dev",
+                "default",
+                "provider-1",
                 &HashMap::from([("OPENAI_API_KEY".to_string(), "sk-encrypted".to_string())]),
                 &HashMap::new(),
             )

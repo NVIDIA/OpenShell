@@ -200,6 +200,8 @@ impl CredentialRuntime {
     pub async fn store_provider_credentials(
         &self,
         provider_name: &str,
+        workspace: &str,
+        provider_id: &str,
         credentials: &HashMap<String, String>,
         existing_handles: &HashMap<String, CredentialHandle>,
     ) -> Result<HashMap<String, CredentialHandle>, Status> {
@@ -227,6 +229,8 @@ impl CredentialRuntime {
                         credential_key: credential_key.clone(),
                         value: value.clone(),
                         existing_handle,
+                        workspace: workspace.to_string(),
+                        provider_id: provider_id.to_string(),
                     })
                     .await?;
                 handle.driver.clone_from(&driver_name);
@@ -238,6 +242,8 @@ impl CredentialRuntime {
                 if let Some(replaced_handle) = replaced_handle {
                     self.delete_provider_credential_handle(
                         provider_name,
+                        workspace,
+                        provider_id,
                         credential_key,
                         replaced_handle,
                     )
@@ -265,7 +271,12 @@ impl CredentialRuntime {
         if let Some(err) = first_error {
             if !successes.is_empty()
                 && let Err(cleanup_err) = self
-                    .delete_provider_credential_handles(provider_name, &successes)
+                    .delete_provider_credential_handles(
+                        provider_name,
+                        workspace,
+                        provider_id,
+                        &successes,
+                    )
                     .await
             {
                 tracing::warn!(
@@ -283,10 +294,18 @@ impl CredentialRuntime {
     pub async fn delete_provider_credential_handles(
         &self,
         provider_name: &str,
+        workspace: &str,
+        provider_id: &str,
         handles: &HashMap<String, CredentialHandle>,
     ) -> Result<(), Status> {
         let futures = handles.iter().map(|(credential_key, handle)| {
-            self.delete_provider_credential_handle(provider_name, credential_key, handle.clone())
+            self.delete_provider_credential_handle(
+                provider_name,
+                workspace,
+                provider_id,
+                credential_key,
+                handle.clone(),
+            )
         });
         let results = futures::future::join_all(futures).await;
         let mut first_error: Option<Status> = None;
@@ -306,6 +325,8 @@ impl CredentialRuntime {
     async fn delete_provider_credential_handle(
         &self,
         provider_name: &str,
+        workspace: &str,
+        provider_id: &str,
         credential_key: &str,
         handle: CredentialHandle,
     ) -> Result<(), Status> {
@@ -316,6 +337,8 @@ impl CredentialRuntime {
                 provider_name: provider_name.to_string(),
                 credential_key: credential_key.to_string(),
                 handle: Some(handle),
+                workspace: workspace.to_string(),
+                provider_id: provider_id.to_string(),
             })
             .await
     }
@@ -334,6 +357,16 @@ impl CredentialRuntime {
             .metadata
             .as_ref()
             .map(|metadata| metadata.name.clone())
+            .unwrap_or_default();
+        let workspace = provider
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.workspace.clone())
+            .unwrap_or_default();
+        let provider_id = provider
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.id.clone())
             .unwrap_or_default();
         let mut request_keys = HashMap::new();
         let mut requests_by_driver: BTreeMap<String, Vec<ResolveCredentialRequest>> =
@@ -354,6 +387,8 @@ impl CredentialRuntime {
                     provider_name: provider_name.clone(),
                     credential_key: credential_key.clone(),
                     handle: Some(selected_handle),
+                    workspace: workspace.clone(),
+                    provider_id: provider_id.clone(),
                 });
         }
 

@@ -208,6 +208,8 @@ async fn create_provider_record_validating(
                 let _ = credentials
                     .delete_provider_credential_handles(
                         provider.object_name(),
+                        provider.object_workspace(),
+                        provider.object_id(),
                         &provider.credential_handles,
                     )
                     .await;
@@ -366,6 +368,8 @@ async fn update_provider_record_validating(
     let credential_update = prepare_provider_credential_update(
         credentials,
         candidate.object_name(),
+        candidate.object_workspace(),
+        candidate.object_id(),
         &removed_credential_handles,
         &updated_credential_values,
         &existing_handles,
@@ -428,6 +432,8 @@ async fn update_provider_record_validating(
             cleanup_pre_stored_provider_credentials(
                 credentials,
                 candidate.object_name(),
+                candidate.object_workspace(),
+                candidate.object_id(),
                 &credential_update.pre_stored_handles,
             )
             .await;
@@ -438,6 +444,8 @@ async fn update_provider_record_validating(
     finish_provider_credential_update(
         credentials,
         candidate.object_name(),
+        candidate.object_workspace(),
+        candidate.object_id(),
         credential_update,
         &removed_credential_handles,
         &existing_handles,
@@ -514,7 +522,12 @@ pub(super) async fn delete_provider_record_with_credentials(
     }
 
     credentials
-        .delete_provider_credential_handles(provider.object_name(), &provider.credential_handles)
+        .delete_provider_credential_handles(
+            provider.object_name(),
+            provider.object_workspace(),
+            provider.object_id(),
+            &provider.credential_handles,
+        )
         .await?;
 
     crate::provider_refresh::delete_refresh_states_for_provider(store, provider.object_id())
@@ -688,6 +701,8 @@ struct ProviderCredentialUpdate {
 async fn prepare_provider_credential_update(
     credentials: Option<&crate::credentials::CredentialRuntime>,
     provider_name: &str,
+    workspace: &str,
+    provider_id: &str,
     _removed_handles: &HashMap<String, CredentialHandle>,
     updated_values: &HashMap<String, String>,
     existing_handles: &HashMap<String, CredentialHandle>,
@@ -724,6 +739,8 @@ async fn prepare_provider_credential_update(
         update.pre_stored_handles = credentials
             .store_provider_credentials(
                 provider_name,
+                workspace,
+                provider_id,
                 &values_requiring_new_handles,
                 &HashMap::new(),
             )
@@ -736,6 +753,8 @@ async fn prepare_provider_credential_update(
 async fn finish_provider_credential_update(
     credentials: Option<&crate::credentials::CredentialRuntime>,
     provider_name: &str,
+    workspace: &str,
+    provider_id: &str,
     update: ProviderCredentialUpdate,
     removed_handles: &HashMap<String, CredentialHandle>,
     existing_handles: &HashMap<String, CredentialHandle>,
@@ -751,6 +770,8 @@ async fn finish_provider_credential_update(
         credentials
             .store_provider_credentials(
                 provider_name,
+                workspace,
+                provider_id,
                 &update.deferred_store_values,
                 existing_handles,
             )
@@ -761,7 +782,7 @@ async fn finish_provider_credential_update(
     handles_to_delete.extend(update.replaced_handles);
     if !handles_to_delete.is_empty() {
         credentials
-            .delete_provider_credential_handles(provider_name, &handles_to_delete)
+            .delete_provider_credential_handles(provider_name, workspace, provider_id, &handles_to_delete)
             .await?;
     }
 
@@ -776,6 +797,8 @@ async fn finish_provider_credential_update(
 async fn cleanup_pre_stored_provider_credentials(
     credentials: Option<&crate::credentials::CredentialRuntime>,
     provider_name: &str,
+    workspace: &str,
+    provider_id: &str,
     handles: &HashMap<String, CredentialHandle>,
 ) {
     if handles.is_empty() {
@@ -785,7 +808,7 @@ async fn cleanup_pre_stored_provider_credentials(
         return;
     };
     if let Err(err) = credentials
-        .delete_provider_credential_handles(provider_name, handles)
+        .delete_provider_credential_handles(provider_name, workspace, provider_id, handles)
         .await
     {
         warn!(
@@ -826,8 +849,16 @@ async fn store_provider_credentials_if_configured(
     }
 
     let provider_name = provider.object_name().to_string();
+    let workspace = provider.object_workspace().to_string();
+    let provider_id = provider.object_id().to_string();
     let stored_handles = credentials
-        .store_provider_credentials(&provider_name, values_to_store, existing_handles)
+        .store_provider_credentials(
+            &provider_name,
+            &workspace,
+            &provider_id,
+            values_to_store,
+            existing_handles,
+        )
         .await?;
 
     for key in stored_handles.keys() {

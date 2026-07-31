@@ -150,10 +150,17 @@ impl KubernetesSecretsCredentialDriver {
         &self,
         request: StoreCredentialRequest,
     ) -> Result<CredentialHandle, Status> {
-        let owner_id = credential_owner_id(&request.provider_name, &request.credential_key);
+        let owner_id = credential_owner_id(
+            &request.workspace,
+            &request.provider_id,
+            &request.provider_name,
+            &request.credential_key,
+        );
         let reference = if let Some(existing_handle) = request.existing_handle.as_ref() {
             let reference = self.resolve_handle(existing_handle, &request.credential_key)?;
             validate_expected_secret_name(
+                &request.workspace,
+                &request.provider_id,
                 &request.provider_name,
                 &request.credential_key,
                 &reference.secret_name,
@@ -162,7 +169,12 @@ impl KubernetesSecretsCredentialDriver {
         } else {
             KubernetesSecretReference {
                 namespace: self.settings.namespace.clone(),
-                secret_name: managed_secret_name(&request.provider_name, &request.credential_key),
+                secret_name: managed_secret_name(
+                    &request.workspace,
+                    &request.provider_id,
+                    &request.provider_name,
+                    &request.credential_key,
+                ),
                 key: required_handle_component("credential_key", &request.credential_key)?
                     .to_string(),
             }
@@ -193,11 +205,18 @@ impl KubernetesSecretsCredentialDriver {
         let handle = Self::handle_from_request("delete", request.handle)?;
         let reference = self.resolve_handle(&handle, &request.credential_key)?;
         validate_expected_secret_name(
+            &request.workspace,
+            &request.provider_id,
             &request.provider_name,
             &request.credential_key,
             &reference.secret_name,
         )?;
-        let owner_id = credential_owner_id(&request.provider_name, &request.credential_key);
+        let owner_id = credential_owner_id(
+            &request.workspace,
+            &request.provider_id,
+            &request.provider_name,
+            &request.credential_key,
+        );
         let api: Api<Secret> = Api::namespaced(self.client.clone(), &reference.namespace);
         for _attempt in 0..CONFLICT_RETRY_LIMIT {
             let secret = match api.get(&reference.secret_name).await {
@@ -251,11 +270,18 @@ impl KubernetesSecretsCredentialDriver {
             let handle = Self::handle_from_request(&request.request_id, request.handle)?;
             let reference = self.resolve_handle(&handle, &request.credential_key)?;
             validate_expected_secret_name(
+                &request.workspace,
+                &request.provider_id,
                 &request.provider_name,
                 &request.credential_key,
                 &reference.secret_name,
             )?;
-            let owner_id = credential_owner_id(&request.provider_name, &request.credential_key);
+            let owner_id = credential_owner_id(
+                &request.workspace,
+                &request.provider_id,
+                &request.provider_name,
+                &request.credential_key,
+            );
             let value = self.resolve_secret_value(&reference, &owner_id).await?;
             Ok::<_, Status>(ResolvedCredential {
                 request_id: request.request_id,
@@ -520,8 +546,17 @@ fn managed_secret(secret_name: &str, key: &str, owner_id: &str, value: &str) -> 
     }
 }
 
-fn credential_owner_id(provider_name: &str, credential_key: &str) -> String {
+fn credential_owner_id(
+    workspace: &str,
+    provider_id: &str,
+    provider_name: &str,
+    credential_key: &str,
+) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(workspace.as_bytes());
+    hasher.update([0]);
+    hasher.update(provider_id.as_bytes());
+    hasher.update([0]);
     hasher.update(provider_name.as_bytes());
     hasher.update([0]);
     hasher.update(credential_key.as_bytes());
@@ -529,17 +564,24 @@ fn credential_owner_id(provider_name: &str, credential_key: &str) -> String {
     format!("{digest:x}")
 }
 
-fn managed_secret_name(provider_name: &str, credential_key: &str) -> String {
-    let hex = credential_owner_id(provider_name, credential_key);
+fn managed_secret_name(
+    workspace: &str,
+    provider_id: &str,
+    provider_name: &str,
+    credential_key: &str,
+) -> String {
+    let hex = credential_owner_id(workspace, provider_id, provider_name, credential_key);
     format!("openshell-cred-{}", &hex[..40])
 }
 
 fn validate_expected_secret_name(
+    workspace: &str,
+    provider_id: &str,
     provider_name: &str,
     credential_key: &str,
     secret_name: &str,
 ) -> Result<(), Status> {
-    let expected = managed_secret_name(provider_name, credential_key);
+    let expected = managed_secret_name(workspace, provider_id, provider_name, credential_key);
     if secret_name != expected {
         return Err(Status::invalid_argument(format!(
             "kubernetes-secrets credential handle Secret name '{secret_name}' does not match the managed Secret for provider credential '{credential_key}'"
@@ -797,16 +839,19 @@ mod tests {
 
     #[test]
     fn managed_secret_names_are_stable_dns_subdomains() {
-        let name = managed_secret_name("openai-prod", "OPENAI_API_KEY");
+        let name = managed_secret_name("default", "prov-123", "openai-prod", "OPENAI_API_KEY");
 
         assert!(name.starts_with("openshell-cred-"));
         assert!(is_dns_subdomain(&name));
-        assert_eq!(name, managed_secret_name("openai-prod", "OPENAI_API_KEY"));
+        assert_eq!(
+            name,
+            managed_secret_name("default", "prov-123", "openai-prod", "OPENAI_API_KEY")
+        );
     }
 
     #[test]
     fn managed_secret_carries_owner_metadata() {
-        let owner_id = credential_owner_id("openai-prod", "OPENAI_API_KEY");
+        let owner_id = credential_owner_id("default", "prov-123", "openai-prod", "OPENAI_API_KEY");
         let secret = managed_secret("provider-secret", "OPENAI_API_KEY", &owner_id, "sk-test");
 
         assert_eq!(
@@ -831,9 +876,14 @@ mod tests {
 
     #[test]
     fn expected_secret_name_rejects_arbitrary_handle_names() {
-        let err =
-            validate_expected_secret_name("openai-prod", "OPENAI_API_KEY", "preexisting-secret")
-                .unwrap_err();
+        let err = validate_expected_secret_name(
+            "default",
+            "prov-123",
+            "openai-prod",
+            "OPENAI_API_KEY",
+            "preexisting-secret",
+        )
+        .unwrap_err();
 
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("does not match"));
@@ -841,8 +891,9 @@ mod tests {
 
     #[test]
     fn ownership_check_accepts_matching_managed_secret() {
-        let owner_id = credential_owner_id("openai-prod", "OPENAI_API_KEY");
-        let secret_name = managed_secret_name("openai-prod", "OPENAI_API_KEY");
+        let owner_id = credential_owner_id("default", "prov-123", "openai-prod", "OPENAI_API_KEY");
+        let secret_name =
+            managed_secret_name("default", "prov-123", "openai-prod", "OPENAI_API_KEY");
         let reference = KubernetesSecretReference {
             namespace: "openshell".to_string(),
             secret_name: secret_name.clone(),
@@ -855,7 +906,7 @@ mod tests {
 
     #[test]
     fn ownership_check_rejects_unmanaged_secret() {
-        let owner_id = credential_owner_id("openai-prod", "OPENAI_API_KEY");
+        let owner_id = credential_owner_id("default", "prov-123", "openai-prod", "OPENAI_API_KEY");
         let reference = KubernetesSecretReference {
             namespace: "openshell".to_string(),
             secret_name: "provider-secret".to_string(),
@@ -876,9 +927,15 @@ mod tests {
 
     #[test]
     fn ownership_check_rejects_different_provider_credential() {
-        let owner_id = credential_owner_id("openai-prod", "OPENAI_API_KEY");
-        let other_owner_id = credential_owner_id("other-provider", "OPENAI_API_KEY");
-        let secret_name = managed_secret_name("openai-prod", "OPENAI_API_KEY");
+        let owner_id = credential_owner_id("default", "prov-123", "openai-prod", "OPENAI_API_KEY");
+        let other_owner_id = credential_owner_id(
+            "other-workspace",
+            "prov-456",
+            "other-provider",
+            "OPENAI_API_KEY",
+        );
+        let secret_name =
+            managed_secret_name("default", "prov-123", "openai-prod", "OPENAI_API_KEY");
         let reference = KubernetesSecretReference {
             namespace: "openshell".to_string(),
             secret_name: secret_name.clone(),
