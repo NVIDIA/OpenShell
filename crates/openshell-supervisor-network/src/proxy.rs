@@ -901,7 +901,8 @@ async fn handle_tcp_connection(
         .await;
     }
 
-    let (host, port) = parse_target(target)?;
+    let (raw_host, port) = parse_target(target)?;
+    let host = normalize_host(&raw_host);
     let host_lc = host.to_ascii_lowercase();
 
     if host_lc == INFERENCE_LOCAL_HOST && port == INFERENCE_LOCAL_PORT {
@@ -1056,7 +1057,7 @@ async fn handle_tcp_connection(
     // while keeping loopback/link-local/unspecified addresses denied.
     let mut raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
     if raw_allowed_ips.is_empty() {
-        raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
+        raw_allowed_ips = implicit_allowed_ips_for_ip_host(host);
     }
     let exact_declared_endpoint_host =
         query_exact_declared_endpoint_host(&opa_engine, &decision, &host_lc, port);
@@ -1074,7 +1075,7 @@ async fn handle_tcp_connection(
         // user code runs). Bypass the normal SSRF tiers so link-local gateway
         // addresses (used by rootless Podman with pasta) are not hard-blocked.
         // Cloud metadata IPs and control-plane ports are still rejected.
-        match resolve_and_check_trusted_gateway(&host, port, gw, sandbox_entrypoint_pid).await {
+        match resolve_and_check_trusted_gateway(&raw_host, port, gw, sandbox_entrypoint_pid).await {
             Ok(addrs) => addrs,
             Err(reason) => {
                 {
@@ -1126,7 +1127,7 @@ async fn handle_tcp_connection(
         // Loopback and link-local are still always blocked.
         match parse_allowed_ips(&raw_allowed_ips) {
             Ok(nets) => {
-                match resolve_and_check_allowed_ips(&host, port, &nets, sandbox_entrypoint_pid)
+                match resolve_and_check_allowed_ips(&raw_host, port, &nets, sandbox_entrypoint_pid)
                     .await
                 {
                     Ok(addrs) => addrs,
@@ -1228,7 +1229,7 @@ async fn handle_tcp_connection(
         // host:port, so private IP resolution is permitted without duplicating
         // the resolved IP in allowed_ips. Always-blocked addresses and
         // control-plane ports remain denied.
-        match resolve_and_check_declared_endpoint(&host, port, sandbox_entrypoint_pid).await {
+        match resolve_and_check_declared_endpoint(&raw_host, port, sandbox_entrypoint_pid).await {
             Ok(addrs) => addrs,
             Err(reason) => {
                 {
@@ -1278,7 +1279,7 @@ async fn handle_tcp_connection(
         }
     } else {
         // Default: reject all internal IPs (loopback, RFC 1918, link-local).
-        match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
+        match resolve_and_reject_internal(&raw_host, port, sandbox_entrypoint_pid).await {
             Ok(addrs) => addrs,
             Err(reason) => {
                 {
@@ -2749,9 +2750,11 @@ fn implicit_allowed_ips_for_ip_host(host: &str) -> Vec<String> {
 }
 
 fn normalize_host_lookup_key(host: &str) -> &str {
-    host.strip_prefix('[')
+    let h = host
+        .strip_prefix('[')
         .and_then(|trimmed| trimmed.strip_suffix(']'))
-        .unwrap_or(host)
+        .unwrap_or(host);
+    h.strip_suffix('.').unwrap_or(h)
 }
 
 /// Returns `true` if `host` is one of the well-known driver-injected aliases
@@ -2992,15 +2995,18 @@ async fn resolve_socket_addrs(
         return Ok(addrs);
     }
 
-    let lookup_host = normalize_host_lookup_key(host);
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((lookup_host, port))
+    let dns_host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((dns_host, port))
         .await
-        .map_err(|e| format!("DNS resolution failed for {lookup_host}:{port}: {e}"))?
+        .map_err(|e| format!("DNS resolution failed for {dns_host}:{port}: {e}"))?
         .collect();
 
     if addrs.is_empty() {
         return Err(format!(
-            "DNS resolution returned no addresses for {lookup_host}:{port}"
+            "DNS resolution returned no addresses for {dns_host}:{port}"
         ));
     }
 
@@ -3832,6 +3838,9 @@ async fn handle_forward_proxy(
             return Ok(());
         }
     };
+
+    let raw_host = host;
+    let host = normalize_host(&raw_host);
     let host_lc = host.to_ascii_lowercase();
 
     if host_lc == POLICY_LOCAL_HOST {
@@ -4529,7 +4538,7 @@ async fn handle_forward_proxy(
     //    implicitly allowed — the user explicitly declared the destination.
     let mut raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
     if raw_allowed_ips.is_empty() {
-        raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
+        raw_allowed_ips = implicit_allowed_ips_for_ip_host(host);
     }
     let exact_declared_endpoint_host =
         query_exact_declared_endpoint_host(&opa_engine, &decision, &host_lc, port);
@@ -4541,7 +4550,7 @@ async fn handle_forward_proxy(
         && let Some(gw) = *trusted_host_gateway
     {
         // Trusted host-gateway path. Mirrors the CONNECT path logic.
-        match resolve_and_check_trusted_gateway(&host, port, gw, sandbox_entrypoint_pid).await {
+        match resolve_and_check_trusted_gateway(&raw_host, port, gw, sandbox_entrypoint_pid).await {
             Ok(addrs) => addrs,
             Err(reason) => {
                 {
@@ -4596,7 +4605,7 @@ async fn handle_forward_proxy(
         // allowed_ips mode: validate resolved IPs against CIDR allowlist.
         match parse_allowed_ips(&raw_allowed_ips) {
             Ok(nets) => {
-                match resolve_and_check_allowed_ips(&host, port, &nets, sandbox_entrypoint_pid)
+                match resolve_and_check_allowed_ips(&raw_host, port, &nets, sandbox_entrypoint_pid)
                     .await
                 {
                     Ok(addrs) => addrs,
@@ -4710,7 +4719,7 @@ async fn handle_forward_proxy(
         // Exact declared hostname mode mirrors CONNECT: private resolved
         // addresses are allowed for this operator-declared host:port, while
         // always-blocked addresses and control-plane ports remain denied.
-        match resolve_and_check_declared_endpoint(&host, port, sandbox_entrypoint_pid).await {
+        match resolve_and_check_declared_endpoint(&raw_host, port, sandbox_entrypoint_pid).await {
             Ok(addrs) => addrs,
             Err(reason) => {
                 {
@@ -4764,7 +4773,7 @@ async fn handle_forward_proxy(
         }
     } else {
         // No allowed_ips: reject internal IPs, allow public IPs through.
-        match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
+        match resolve_and_reject_internal(&raw_host, port, sandbox_entrypoint_pid).await {
             Ok(addrs) => addrs,
             Err(reason) => {
                 {
@@ -5139,6 +5148,10 @@ fn parse_target(target: &str) -> Result<(String, u16)> {
         .parse()
         .map_err(|_| miette::miette!("Invalid port in CONNECT target: {target}"))?;
     Ok((host.to_string(), port))
+}
+
+fn normalize_host(raw_host: &str) -> &str {
+    raw_host.strip_suffix('.').unwrap_or(raw_host)
 }
 
 async fn respond(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
@@ -8477,6 +8490,16 @@ network_policies:
     }
 
     #[test]
+    fn test_normalize_host_strips_single_trailing_dot() {
+        assert_eq!(normalize_host("api.example.com."), "api.example.com");
+    }
+
+    #[test]
+    fn test_normalize_host_remains_the_same() {
+        assert_eq!(normalize_host("api.example.com"), "api.example.com");
+    }
+
+    #[test]
     fn test_parse_target_control_char_passes_through() {
         let (host, _) = parse_target("evil\x01.com:443").unwrap();
         assert!(
@@ -8620,6 +8643,14 @@ network_policies:
             "NUL byte not stripped or rejected in forward proxy URI"
         );
         assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn test_parse_proxy_uri_trailing_dot_host() {
+        let (_, host, port, _) = parse_proxy_uri("http://api.example.com.:80/path").unwrap();
+        let host = normalize_host(&host);
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 80_u16);
     }
 
     #[test]
