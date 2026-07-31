@@ -516,6 +516,7 @@ async fn apply_minted_credential(
     minted: &MintedCredential,
 ) -> Result<(), Status> {
     let mut updated = provider.clone();
+    let staging_id = format!("{}-refresh-{}", provider.object_id(), uuid::Uuid::new_v4());
     let staged_handles = if let Some(credentials) = credentials
         && credentials.stores_provider_credentials()
     {
@@ -524,13 +525,13 @@ async fn apply_minted_credential(
         for (key, value) in &minted.additional_credentials {
             creds_to_store.insert(key.clone(), value.clone());
         }
-        // Stage under new handles - don't reuse existing handles to avoid overwriting
+        // Stage under new handles with a unique staging ID to ensure we don't overwrite
         // the still-committed values before validation/CAS succeeds
         let staged = credentials
             .store_provider_credentials(
                 provider.object_name(),
                 provider.object_workspace(),
-                provider.object_id(),
+                &staging_id, // Use unique staging ID instead of real provider ID
                 &creds_to_store,
                 &HashMap::new(), // Empty map forces creation of new handles
             )
@@ -632,7 +633,7 @@ async fn apply_minted_credential(
             .delete_provider_credential_handles(
                 provider.object_name(),
                 provider.object_workspace(),
-                provider.object_id(),
+                &staging_id, // Use staging ID for cleanup - matches how they were stored
                 handles,
             )
             .await
