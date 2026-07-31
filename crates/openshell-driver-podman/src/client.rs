@@ -489,7 +489,10 @@ impl PodmanClient {
         timeout_secs: u32,
     ) -> Result<(), PodmanApiError> {
         validate_name(name)?;
-        let http_timeout = Duration::from_secs(u64::from(timeout_secs) + 5);
+        // The delete request covers both the graceful stop and the subsequent
+        // storage, network, and anonymous-volume cleanup. Preserve the normal
+        // API timeout as cleanup headroom after the stop grace period.
+        let http_timeout = Duration::from_secs(u64::from(timeout_secs)) + API_TIMEOUT;
         let (status, bytes) = self
             .request(
                 hyper::Method::DELETE,
@@ -1002,6 +1005,23 @@ mod tests {
                 .as_slice(),
             ["DELETE /v5.0.0/libpod/containers/sandbox-123?force=true&volumes=true&timeout=10"]
         );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn remove_container_allows_cleanup_after_stop_timeout() {
+        let (socket_path, _request_log, handle) = spawn_podman_stub(
+            "remove-container-delayed",
+            vec![StubResponse::new(StatusCode::NO_CONTENT, "").with_delay(Duration::from_secs(6))],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        client
+            .remove_container("sandbox-123", 0)
+            .await
+            .expect("container removal should retain the API timeout for cleanup");
+
+        handle.await.expect("stub task should finish");
         let _ = std::fs::remove_file(socket_path);
     }
 }
