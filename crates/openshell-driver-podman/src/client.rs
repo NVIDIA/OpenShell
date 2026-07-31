@@ -479,7 +479,10 @@ impl PodmanClient {
         }
     }
 
-    /// Gracefully stop, then force-remove a container and its anonymous volumes.
+    /// Remove a container in one timed, forced Libpod delete operation.
+    ///
+    /// The Libpod endpoint uses `volumes` for anonymous-volume removal. Its
+    /// Docker-compatible counterpart uses the shorter `v` parameter.
     pub async fn remove_container(
         &self,
         name: &str,
@@ -490,7 +493,9 @@ impl PodmanClient {
         let (status, bytes) = self
             .request(
                 hyper::Method::DELETE,
-                &format!("/libpod/containers/{name}?force=true&v=true&timeout={timeout_secs}"),
+                &format!(
+                    "/libpod/containers/{name}?force=true&volumes=true&timeout={timeout_secs}"
+                ),
                 None,
                 http_timeout,
             )
@@ -977,7 +982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_container_uses_atomic_timed_libpod_removal() {
+    async fn remove_container_uses_single_timed_libpod_removal() {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "remove-container",
             vec![StubResponse::new(StatusCode::NO_CONTENT, "")],
@@ -995,7 +1000,7 @@ mod tests {
                 .lock()
                 .expect("request log lock should not be poisoned")
                 .as_slice(),
-            ["DELETE /v5.0.0/libpod/containers/sandbox-123?force=true&v=true&timeout=10"]
+            ["DELETE /v5.0.0/libpod/containers/sandbox-123?force=true&volumes=true&timeout=10"]
         );
         let _ = std::fs::remove_file(socket_path);
     }

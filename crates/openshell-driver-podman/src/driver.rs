@@ -1802,7 +1802,7 @@ mod tests {
             vec![
                 // list_containers by label
                 StubResponse::new(StatusCode::OK, list_body),
-                // atomic stop and remove_container
+                // single timed remove_container operation
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
                 // remove_volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
@@ -1827,7 +1827,7 @@ mod tests {
             format!(
                 "DELETE {}",
                 api_path(&format!(
-                    "/libpod/containers/{container_id}?force=true&v=true&timeout=10"
+                    "/libpod/containers/{container_id}?force=true&volumes=true&timeout=10"
                 ))
             )
         );
