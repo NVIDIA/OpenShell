@@ -16,6 +16,15 @@ pub const SIDECAR_RUN_ROOT: &str = "/run/openshell-sidecar";
 pub const NETNS_MOUNT_ROOT: &str = "/run/netns";
 pub const NETNS_IPROUTE2_ROOT: &str = "/var/run/netns";
 
+/// Standard Linux container namespaces that an image-selected workspace must
+/// not contain or enter.
+///
+/// These roots cover the default filesystems and devices defined by the OCI
+/// Runtime Specification: procfs, sysfs, cgroups, device nodes, devpts, shared
+/// memory, and POSIX message queues.
+/// <https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#default-filesystems>
+pub const OCI_RUNTIME_MOUNT_ROOTS: &[&str] = &["/proc", "/sys", "/dev"];
+
 /// High-level namespaces mounted or created by `OpenShell` inside sandboxes.
 ///
 /// This is intentionally not a general Linux system-path denylist. Kernel and
@@ -104,6 +113,26 @@ mod tests {
                     .iter()
                     .any(|root| Path::new(path).starts_with(root)),
                 "fixed control path {path} is outside the reserved roots"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_roots_cover_standard_oci_mount_destinations() {
+        for path in [
+            "/proc",
+            "/dev",
+            "/dev/pts",
+            "/dev/shm",
+            "/dev/mqueue",
+            "/sys",
+            "/sys/fs/cgroup",
+        ] {
+            assert!(
+                OCI_RUNTIME_MOUNT_ROOTS
+                    .iter()
+                    .any(|root| Path::new(path).starts_with(root)),
+                "OCI runtime mount {path} is outside the reserved roots"
             );
         }
     }

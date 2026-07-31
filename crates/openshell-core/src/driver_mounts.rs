@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::container_paths::CONTROL_ROOTS;
+use crate::container_paths::{CONTROL_ROOTS, OCI_RUNTIME_MOUNT_ROOTS};
 
 /// `SELinux` relabelling mode for bind mounts.
 ///
@@ -107,6 +107,9 @@ pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
         return Ok(DEFAULT_WORKSPACE_ROOT.to_string());
     }
     let workspace_root = normalize_absolute_container_path(working_dir, "OCI WorkingDir")?;
+    for runtime_path in OCI_RUNTIME_MOUNT_ROOTS {
+        validate_workspace_reserved_path(&workspace_root, runtime_path, "OCI runtime mount")?;
+    }
     for control_path in CONTROL_ROOTS {
         validate_workspace_control_path(&workspace_root, control_path)?;
     }
@@ -152,11 +155,21 @@ pub fn validate_workspace_control_path(
     workspace_root: &str,
     control_path: &str,
 ) -> Result<(), String> {
-    let workspace = Path::new(workspace_root);
-    let control = Path::new(control_path);
-    if paths_overlap(workspace, control) {
+    validate_workspace_reserved_path(workspace_root, control_path, "OpenShell control path")
+}
+
+fn validate_workspace_reserved_path(
+    workspace_root: &str,
+    reserved_path: &str,
+    description: &str,
+) -> Result<(), String> {
+    let normalized_workspace = normalize_absolute_container_path(workspace_root, "OCI WorkingDir")?;
+    let normalized_reserved = normalize_absolute_container_path(reserved_path, description)?;
+    let workspace = Path::new(&normalized_workspace);
+    let reserved = Path::new(&normalized_reserved);
+    if paths_overlap(workspace, reserved) {
         return Err(format!(
-            "OCI WorkingDir '{workspace_root}' conflicts with OpenShell control path '{control_path}'"
+            "OCI WorkingDir '{workspace_root}' conflicts with {description} '{reserved_path}'"
         ));
     }
     Ok(())
@@ -262,8 +275,14 @@ mod tests {
     }
 
     #[test]
-    fn oci_workspace_root_rejects_only_openshell_control_path_collisions() {
+    fn oci_workspace_root_rejects_runtime_and_openshell_control_path_collisions() {
         for invalid in [
+            "/proc",
+            "/proc/self",
+            "/sys",
+            "/sys/fs/cgroup",
+            "/dev",
+            "/dev/shm",
             "/etc",
             "/opt",
             "/opt/openshell",
@@ -295,6 +314,9 @@ mod tests {
             "/var/app/current",
             "/var/task",
             "/var/www/app",
+            "/processor",
+            "/system",
+            "/device",
         ] {
             assert_eq!(
                 resolve_oci_workspace_root(valid).unwrap(),
@@ -333,6 +355,21 @@ mod tests {
             );
         }
         validate_mount_control_path("/custom-other", "/custom/ssh.sock").unwrap();
+    }
+
+    #[test]
+    fn workspace_rejects_malformed_runtime_control_paths() {
+        for control_path in [
+            "workspace/ssh.sock",
+            "/workspace/../run/ssh.sock",
+            "/workspace//ssh.sock",
+            "",
+        ] {
+            assert!(
+                validate_workspace_control_path("/workspace", control_path).is_err(),
+                "expected malformed control path '{control_path}' to be rejected"
+            );
+        }
     }
 
     #[test]

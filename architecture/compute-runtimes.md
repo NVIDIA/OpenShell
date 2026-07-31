@@ -207,8 +207,9 @@ identity, including supplementary groups, must already be able to traverse
 every parent and write and enter the workdir; OpenShell does not change that
 directory's ownership or mode. A one-shot validator drops to that identity and
 uses kernel effective-access checks so POSIX ACL and LSM decisions are honored.
-Filesystem metadata identifies kernel-managed
-mounts, while collision checks are derived from actual OpenShell control paths.
+Path checks reserve the standard OCI runtime namespaces under `/proc`, `/sys`,
+and `/dev`, while separate collision checks are derived from actual OpenShell
+control paths.
 Docker performs the check in the final container before workload launch and
 rejects image `VOLUME` declarations that would mask the workdir ancestry. The
 resolved workspace is the child cwd and `HOME`; when

@@ -49,10 +49,10 @@ incomplete permission model to OpenShell.
 Image `VOLUME` declarations must not cover the workdir or one of its parents
 because Docker would mount the volume before the supervisor could validate the
 immutable image path.
-Kernel-managed filesystems are detected from filesystem metadata, and paths
-that overlap concrete OpenShell control resources are rejected. The workspace
-is the child cwd and `HOME`. The supervisor starts from `/`, then reports an
-invalid workdir as a readiness failure.
+Workdirs under the standard OCI runtime namespaces `/proc`, `/sys`, and `/dev`
+are rejected, as are paths that overlap concrete OpenShell control resources.
+The workspace is the child cwd and `HOME`. The supervisor starts from `/`, then
+reports an invalid workdir as a readiness failure.
 
 Docker containers join an OpenShell-managed bridge network. The driver injects
 `host.openshell.internal` and `host.docker.internal` so supervisors have stable
