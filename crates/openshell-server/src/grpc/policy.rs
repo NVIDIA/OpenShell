@@ -1200,10 +1200,75 @@ pub(super) async fn validate_candidate_provider_attachments(
 
 pub(super) async fn provider_policy_composition_enabled(store: &Store) -> Result<bool, Status> {
     let global_settings = load_global_settings(store).await?;
-    Ok(
-        decode_policy_from_global_settings(&global_settings)?.is_none()
-            && bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?,
-    )
+    provider_policy_composition_enabled_in(&global_settings)
+}
+
+fn provider_policy_composition_enabled_in(settings: &StoredSettings) -> Result<bool, Status> {
+    Ok(decode_policy_from_global_settings(settings)?.is_none()
+        && bool_setting_enabled(settings, settings::PROVIDERS_V2_ENABLED_KEY)?)
+}
+
+async fn validate_provider_composition_for_existing_sandboxes(
+    state: &ServerState,
+) -> Result<(), Status> {
+    let mut offset = 0;
+    let mut catalogs = HashMap::<String, EffectiveProviderProfileCatalog>::new();
+
+    loop {
+        let sandboxes = state
+            .store
+            .list_all_messages::<Sandbox>(MAX_PAGE_SIZE, offset)
+            .await
+            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+        let page_len = sandboxes.len();
+
+        for sandbox in sandboxes {
+            let provider_names = sandbox
+                .spec
+                .as_ref()
+                .map(|spec| spec.providers.as_slice())
+                .unwrap_or_default();
+            if provider_names.is_empty() {
+                continue;
+            }
+
+            let workspace = sandbox.object_workspace().to_string();
+            if !catalogs.contains_key(&workspace) {
+                let catalog = state
+                    .provider_profile_sources
+                    .snapshot_catalog(state.store.as_ref(), &workspace)
+                    .await?;
+                catalogs.insert(workspace.clone(), catalog);
+            }
+            let catalog = catalogs
+                .get(&workspace)
+                .expect("catalog was inserted for sandbox workspace");
+            let base_policy =
+                current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
+            let provider_layers = profile_provider_policy_layers_with_catalog(
+                state.store.as_ref(),
+                catalog,
+                &workspace,
+                provider_names,
+            )
+            .await?;
+            validate_candidate_effective_policy(&base_policy, &provider_layers).map_err(|error| {
+                Status::failed_precondition(format!(
+                    "cannot activate provider policy composition: sandbox '{}/{}' has an invalid effective policy: {}",
+                    workspace,
+                    sandbox.object_name(),
+                    error.message()
+                ))
+            })?;
+        }
+
+        if page_len < MAX_PAGE_SIZE as usize {
+            break;
+        }
+        offset = offset.saturating_add(MAX_PAGE_SIZE);
+    }
+
+    Ok(())
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
@@ -1983,9 +2048,30 @@ async fn handle_update_config_inner(
         }
 
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
+        let provider_composition_was_enabled =
+            provider_policy_composition_enabled_in(&global_settings)?;
         let changed = if req.delete_setting {
-            let removed = global_settings.settings.remove(key).is_some();
-            if removed
+            global_settings.settings.remove(key).is_some()
+        } else {
+            let setting = req
+                .setting_value
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
+            let stored = proto_setting_to_stored(key, setting)?;
+            upsert_setting_value(&mut global_settings.settings, key, stored)
+        };
+
+        if changed {
+            let provider_composition_is_enabled =
+                provider_policy_composition_enabled_in(&global_settings)?;
+            if !provider_composition_was_enabled && provider_composition_is_enabled {
+                validate_provider_composition_for_existing_sandboxes(state).await?;
+            }
+
+            global_settings.revision = global_settings.revision.wrapping_add(1);
+            save_global_settings(state.store.as_ref(), &global_settings).await?;
+
+            if req.delete_setting
                 && key == POLICY_SETTING_KEY
                 && let Ok(Some(latest)) = state
                     .store
@@ -1997,19 +2083,6 @@ async fn handle_update_config_inner(
                     .supersede_older_policies(GLOBAL_POLICY_SANDBOX_ID, latest.version + 1)
                     .await;
             }
-            removed
-        } else {
-            let setting = req
-                .setting_value
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
-            let stored = proto_setting_to_stored(key, setting)?;
-            upsert_setting_value(&mut global_settings.settings, key, stored)
-        };
-
-        if changed {
-            global_settings.revision = global_settings.revision.wrapping_add(1);
-            save_global_settings(state.store.as_ref(), &global_settings).await?;
         }
 
         return Ok(update_config_response(
@@ -11915,6 +11988,131 @@ mod tests {
         );
         let settings = load_global_settings(state.store.as_ref()).await.unwrap();
         assert!(!settings.settings.contains_key(POLICY_SETTING_KEY));
+    }
+
+    async fn install_ambiguous_provider_binding(state: &Arc<ServerState>, suffix: &str) {
+        use openshell_core::proto::{
+            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
+        };
+
+        let profile_name = format!("ambiguous-{suffix}");
+        let provider_name = format!("provider-{suffix}");
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("profile-{suffix}"),
+                    name: profile_name.clone(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                profile: Some(ProviderProfile {
+                    id: profile_name.clone(),
+                    display_name: "Ambiguous".to_string(),
+                    category: ProviderProfileCategory::Other as i32,
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        tls: "skip".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider(&provider_name, &profile_name))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                &format!("sandbox-{suffix}"),
+                &format!("sandbox-{suffix}"),
+                test_policy_with_rule("base", "api.example.com"),
+                vec![provider_name],
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabling_provider_composition_rejects_existing_ambiguous_binding() {
+        let state = test_server_state().await;
+        install_ambiguous_provider_binding(&state, "enable").await;
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                setting_value: Some(SettingValue {
+                    value: Some(setting_value::Value::BoolValue(true)),
+                }),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("provider composition must be validated before activation");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("sandbox-enable"));
+        assert!(error.message().contains("tls"));
+        let settings = load_global_settings(state.store.as_ref()).await.unwrap();
+        assert!(!bool_setting_enabled(&settings, settings::PROVIDERS_V2_ENABLED_KEY).unwrap());
+    }
+
+    #[tokio::test]
+    async fn deleting_global_policy_rejects_reactivated_ambiguous_provider_binding() {
+        let state = test_server_state().await;
+        install_ambiguous_provider_binding(&state, "delete-policy").await;
+
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(test_policy_with_rule("global", "global.example.com")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("global policy should suppress provider composition");
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                setting_value: Some(SettingValue {
+                    value: Some(setting_value::Value::BoolValue(true)),
+                }),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("providers may be enabled while a global policy is active");
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: POLICY_SETTING_KEY.to_string(),
+                delete_setting: true,
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("global policy deletion must validate reactivated provider composition");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("sandbox-delete-policy"));
+        let settings = load_global_settings(state.store.as_ref()).await.unwrap();
+        assert!(settings.settings.contains_key(POLICY_SETTING_KEY));
     }
 
     #[test]
