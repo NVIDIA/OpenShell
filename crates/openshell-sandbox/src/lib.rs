@@ -1,10 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `OpenShell` Sandbox library.
-//!
-//! This crate provides process sandboxing and monitoring capabilities.
-
 mod activity_aggregator;
 mod denial_aggregator;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

@@ -7009,8 +7009,6 @@ mod tests {
         refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
         service_expose_status_error, service_url_for_gateway,
     };
-    #[cfg(unix)]
-    use super::{local_upload_path_exists, local_upload_path_is_symlink};
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::progress_step_from_metadata;
     use crate::test_utils::EnvVarGuard;
