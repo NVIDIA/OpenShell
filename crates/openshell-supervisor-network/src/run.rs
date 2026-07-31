@@ -208,7 +208,7 @@ pub async fn run_networking(
         match SandboxCa::generate() {
             Ok(ca) => {
                 let tls_dir = std::env::var(openshell_core::sandbox_env::PROXY_TLS_DIR)
-                    .unwrap_or_else(|_| "/etc/openshell-tls".to_string());
+                    .unwrap_or_else(|_| openshell_core::container_paths::TLS_ROOT.to_string());
                 let tls_dir = std::path::Path::new(&tls_dir);
                 let system_ca_bundle = read_system_ca_bundle();
                 match write_ca_files(&ca, tls_dir, &system_ca_bundle) {

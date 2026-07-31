@@ -5,6 +5,8 @@
 
 use std::path::Path;
 
+use crate::container_paths::CONTROL_ROOTS;
+
 /// `SELinux` relabelling mode for bind mounts.
 ///
 /// On hosts with `SELinux` enabled (e.g. Fedora, RHEL) a bind-mounted path
@@ -24,22 +26,6 @@ pub enum SelinuxLabel {
     /// Private `SELinux` label (`:Z`).
     Private,
 }
-
-/// High-level namespaces mounted or created by `OpenShell` inside containers.
-///
-/// Keep privileged `OpenShell` state within these roots. This is intentionally
-/// not a general Linux system-path denylist. Kernel and image-provided paths
-/// have separate trust models; see NVIDIA/OpenShell#2578.
-const OPENSHELL_CONTROL_ROOTS: &[&str] = &[
-    "/opt/openshell",
-    "/etc/openshell",
-    "/etc/openshell-tls",
-    "/run/openshell",
-    "/run/openshell-sidecar",
-    "/run/netns",
-    // The supervisor currently uses the conventional iproute2 spelling.
-    "/var/run/netns",
-];
 
 /// Compatibility workspace used when an OCI image has no usable working
 /// directory and by drivers whose workspace remains fixed.
@@ -97,7 +83,7 @@ pub fn validate_mount_subpath(subpath: &str) -> Result<(), String> {
 pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
     let normalized = normalize_absolute_container_path(target, "mount target")?;
     let path = Path::new(&normalized);
-    for reserved in OPENSHELL_CONTROL_ROOTS {
+    for reserved in CONTROL_ROOTS {
         let reserved = Path::new(reserved);
         if paths_overlap(path, reserved) {
             return Err(format!(
@@ -121,7 +107,7 @@ pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
         return Ok(DEFAULT_WORKSPACE_ROOT.to_string());
     }
     let workspace_root = normalize_absolute_container_path(working_dir, "OCI WorkingDir")?;
-    for control_path in OPENSHELL_CONTROL_ROOTS {
+    for control_path in CONTROL_ROOTS {
         validate_workspace_control_path(&workspace_root, control_path)?;
     }
 

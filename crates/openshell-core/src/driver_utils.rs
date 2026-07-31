@@ -7,6 +7,11 @@ use std::path::PathBuf;
 
 use crate::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
 
+pub use crate::container_paths::{
+    SANDBOX_TOKEN_MOUNT_PATH, SUPERVISOR_CONTAINER_BINARY, SUPERVISOR_CONTAINER_DIR,
+    TLS_CA_MOUNT_PATH, TLS_CERT_MOUNT_PATH, TLS_KEY_MOUNT_PATH, UPSTREAM_PROXY_AUTH_MOUNT_PATH,
+};
+
 // ---------------------------------------------------------------------------
 // Sandbox container/pod label keys (openshell.ai/ namespace)
 // ---------------------------------------------------------------------------
@@ -45,49 +50,6 @@ pub fn openshell_sandbox_label_selector() -> String {
 /// start the sandboxed environment.  The value must be kept in sync with the
 /// path used when building the `openshell-sandbox` image layer.
 pub const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
-
-/// Directory inside sandbox containers where the supervisor binary is mounted.
-///
-/// Compute drivers that side-load the supervisor into a shared volume mount
-/// the binary here so the sandbox container can execute it from a fixed path.
-pub const SUPERVISOR_CONTAINER_DIR: &str = "/opt/openshell/bin";
-
-/// Full path to the supervisor binary inside sandbox containers.
-///
-/// Equals `SUPERVISOR_CONTAINER_DIR + "/openshell-sandbox"`. Use this when
-/// the full executable path is needed (Docker entrypoint, Podman entrypoint,
-/// VM rootfs injection). Use `SUPERVISOR_CONTAINER_DIR` when only the
-/// directory mount-point is needed (Kubernetes emptyDir volume mount).
-pub const SUPERVISOR_CONTAINER_BINARY: &str = "/opt/openshell/bin/openshell-sandbox";
-
-// ---------------------------------------------------------------------------
-// In-container mount paths for guest TLS materials and the sandbox token.
-//
-// All container-based drivers (Docker, Podman, Kubernetes) mount the gateway's
-// mTLS client credentials at these fixed paths inside every sandbox container.
-// The supervisor reads these paths on startup to establish its gRPC-over-mTLS
-// connection back to the gateway. The paths must remain stable across driver
-// versions since the supervisor binary is built and packaged separately.
-// ---------------------------------------------------------------------------
-
-/// Container-side mount path for the guest mTLS CA certificate.
-pub const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
-
-/// Container-side mount path for the guest mTLS client certificate.
-pub const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
-
-/// Container-side mount path for the guest mTLS client private key.
-pub const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
-
-/// Container-side mount path for the per-sandbox JWT token.
-pub const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
-
-/// Container-side mount path for the corporate upstream-proxy credentials.
-///
-/// The file holds the `user:pass` userinfo used to build the
-/// `Proxy-Authorization` header. It is delivered through a root-only secret
-/// mount so the credential never appears in container environment/metadata.
-pub const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str = "/etc/openshell/auth/upstream-proxy";
 
 /// A validated corporate upstream-proxy address.
 ///

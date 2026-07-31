@@ -347,7 +347,7 @@ impl Default for KubernetesComputeConfig {
             topology: SupervisorTopology::default(),
             sidecar: KubernetesSidecarConfig::default(),
             grpc_endpoint: String::new(),
-            ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
+            ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
             enable_user_namespaces: false,

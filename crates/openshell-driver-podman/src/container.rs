@@ -1133,7 +1133,7 @@ pub fn build_container_spec_for_image(
             let mut m = vec![Mount {
                 kind: "tmpfs".into(),
                 source: "tmpfs".into(),
-                destination: "/run/netns".into(),
+                destination: openshell_core::container_paths::NETNS_MOUNT_ROOT.into(),
                 options: vec!["rw".into(), "nosuid".into(), "nodev".into()],
             }];
             // Bind-mount client TLS materials into the container when mTLS

@@ -36,10 +36,10 @@ const VALIDATE_WORKSPACE_SUBCOMMAND: &str = "validate-workspace";
 
 /// Default `--mode` value: run both supervisor leaves in a single binary.
 const DEFAULT_MODE: &str = "network,process";
-const SIDECAR_STATE_DIR: &str = "/run/openshell-sidecar";
-const SIDECAR_TLS_DIR: &str = "/etc/openshell-tls/proxy";
+const SIDECAR_STATE_DIR: &str = openshell_core::container_paths::SIDECAR_RUN_ROOT;
+const SIDECAR_TLS_DIR: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
 #[cfg(target_os = "linux")]
-const CLIENT_TLS_DIR: &str = "/etc/openshell-tls/client";
+const CLIENT_TLS_DIR: &str = openshell_core::container_paths::CLIENT_TLS_DIR;
 #[cfg(target_os = "linux")]
 const SIDECAR_CLIENT_TLS_SUBDIR: &str = "client";
 #[cfg(target_os = "linux")]
