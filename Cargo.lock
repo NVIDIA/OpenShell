@@ -3957,6 +3957,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -4200,7 +4201,6 @@ dependencies = [
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "opentelemetry",
- "opentelemetry-proto",
  "opentelemetry_sdk",
  "petname",
  "pin-project-lite",
@@ -4217,6 +4217,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "socket2 0.6.3",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",

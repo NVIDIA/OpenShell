@@ -78,8 +78,6 @@ pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::n
 pub(crate) static TEST_TRACING_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 use compute::ComputeRuntime;
-#[cfg(test)]
-use gateway_listener::GatewayListenerSpec;
 use gateway_listener::{BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
@@ -449,8 +447,11 @@ pub(crate) async fn run_server(
     // snapshot on its first poll.
     ensure_default_workspace(&store).await?;
 
-    let gateway_listeners =
-        bind_gateway_listeners(config.bind_address, state.compute.gateway_bind_addresses()).await?;
+    let gateway_listeners = bind_gateway_listeners(
+        config.bind_address,
+        state.compute.gateway_listener_requirements(),
+    )
+    .await?;
 
     if let Err(err) = state.compute.resume_persisted_sandboxes().await {
         warn!(error = %err, "Failed to resume persisted sandboxes during startup");
@@ -662,8 +663,12 @@ fn allow_plaintext_service_http(
     enabled: bool,
     listen_addr: SocketAddr,
     peer_addr: SocketAddr,
+    listener_scope: GatewayListenerScope,
 ) -> bool {
-    enabled && listen_addr.ip().is_loopback() && peer_addr.ip().is_loopback()
+    enabled
+        && matches!(listener_scope, GatewayListenerScope::Primary)
+        && listen_addr.ip().is_loopback()
+        && peer_addr.ip().is_loopback()
 }
 
 fn spawn_gateway_connection(
@@ -683,6 +688,7 @@ fn spawn_gateway_connection(
                         enable_loopback_service_http,
                         listen_addr,
                         addr,
+                        listener_scope,
                     ) =>
                 {
                     if let Err(e) = service
@@ -697,7 +703,12 @@ fn spawn_gateway_connection(
                     }
                 }
                 Ok(ConnectionProtocol::PlainHttp) => {
-                    warn!(client = %addr, listen = %listen_addr, "Rejected plaintext HTTP on non-loopback gateway listener");
+                    warn!(
+                        client = %addr,
+                        listen = %listen_addr,
+                        scope = ?listener_scope,
+                        "Rejected plaintext HTTP on gateway listener"
+                    );
                 }
                 Ok(ConnectionProtocol::Tls | ConnectionProtocol::Unknown) => {
                     // acceptor.acceptor() snapshots the current TLS config;
@@ -1015,10 +1026,10 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
 mod tests {
     use super::{
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, GatewayListenerScope,
-        GatewayListenerSpec, MultiplexService, ServerState, TlsAcceptor,
-        allow_plaintext_service_http, bind_gateway_listeners, classify_initial_bytes,
-        configured_compute_driver, is_benign_tls_handshake_failure,
-        kubernetes_sandbox_jwt_expiry_disabled, serve_gateway_listener,
+        MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
+        bind_gateway_listeners, classify_initial_bytes, configured_compute_driver,
+        is_benign_tls_handshake_failure, kubernetes_sandbox_jwt_expiry_disabled,
+        serve_gateway_listener,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -1036,7 +1047,11 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::watch;
 
-    use crate::tls_test_utils::{generate_test_certs_with_ca, install_rustls_provider};
+    use crate::{
+        compute::GatewayListenerRequirement,
+        gateway_listener::GatewayListenerSpec,
+        tls_test_utils::{generate_test_certs_with_ca, install_rustls_provider},
+    };
 
     fn test_driver_startup<'a>(
         config: &'a Config,
@@ -1212,11 +1227,23 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:54000".parse().unwrap();
         let wildcard: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let remote_peer: SocketAddr = "192.0.2.10:54000".parse().unwrap();
+        let primary = GatewayListenerScope::Primary;
+        let callback = GatewayListenerScope::ComputeDriverCallback;
 
-        assert!(allow_plaintext_service_http(true, loopback, peer));
-        assert!(!allow_plaintext_service_http(false, loopback, peer));
-        assert!(!allow_plaintext_service_http(true, wildcard, peer));
-        assert!(!allow_plaintext_service_http(true, loopback, remote_peer));
+        assert!(allow_plaintext_service_http(true, loopback, peer, primary));
+        assert!(!allow_plaintext_service_http(
+            false, loopback, peer, primary
+        ));
+        assert!(!allow_plaintext_service_http(true, wildcard, peer, primary));
+        assert!(!allow_plaintext_service_http(
+            true,
+            loopback,
+            remote_peer,
+            primary
+        ));
+        assert!(!allow_plaintext_service_http(
+            true, loopback, peer, callback
+        ));
     }
 
     #[tokio::test]
@@ -1501,7 +1528,11 @@ mod tests {
         let primary_address: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let result: openshell_core::Result<()> = async {
-            let _listeners = bind_gateway_listeners(primary_address, &[occupied_address]).await?;
+            let _listeners = bind_gateway_listeners(
+                primary_address,
+                &[docker_listener_requirement(occupied_address)],
+            )
+            .await?;
             resume_attempted.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -1515,5 +1546,13 @@ mod tests {
             !resume_attempted.load(Ordering::SeqCst),
             "persisted sandbox resume must not run before every gateway listener is bound"
         );
+    }
+
+    fn docker_listener_requirement(address: SocketAddr) -> GatewayListenerRequirement {
+        GatewayListenerRequirement::Exact {
+            address,
+            driver_name: "docker".to_string(),
+            reason: "managed bridge".to_string(),
+        }
     }
 }

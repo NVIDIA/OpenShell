@@ -24,10 +24,14 @@ Package-managed gateways do not require a TOML file. Create one at the package's
 
 | Package | Optional Gateway TOML location |
 |---|---|
-| Homebrew | `$XDG_CONFIG_HOME/openshell/gateway.toml` when it exists, otherwise an existing Homebrew prefix config such as `/opt/homebrew/var/openshell/gateway.toml`. |
+| Homebrew | `$XDG_CONFIG_HOME/openshell/gateway.toml` when it exists, otherwise the Homebrew prefix config such as `/opt/homebrew/var/openshell/gateway.toml`. |
 | Debian/Ubuntu | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
 | Fedora/RHEL RPM | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
 | Snap | `$SNAP_COMMON/gateway.toml`, usually `/var/snap/openshell/common/gateway.toml`. |
+
+The Fedora/RHEL RPM template leaves `[openshell.gateway].bind_address` unset. The gateway therefore uses its built-in `127.0.0.1:17670` primary listener. The Podman driver negotiates separate, restricted listeners for sandbox callbacks, so the primary listener does not need a wildcard address. Set `bind_address` explicitly only when clients must reach the primary multiplexed API through another interface.
+
+The Homebrew formula creates its prefix config once with `bind_address = "[::1]:17670"`. Keeping the primary API on IPv6 loopback leaves IPv4 loopback available for Podman Machine's sandbox callback listener. A user config takes precedence, and upgrades do not overwrite either config.
 
 ## Layout
 

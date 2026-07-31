@@ -176,6 +176,18 @@ Common findings:
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Root and missing identities are rejected.
 - Supervisor cannot call back: check callback endpoint and gateway logs.
+- Gateway exits before becoming healthy with a callback-listener discovery
+  error: inspect `podman info --debug`, the configured Podman network, and the
+  host's IPv4 default route. Rootless pasta uses the private source address
+  selected by that route; rootful Podman uses the bridge gateway address.
+- Callback discovery reports that the requested address equals the primary
+  listener: configure a distinct primary address. For Podman Machine, keep the
+  IPv4 loopback callback separate by using an IPv6-loopback primary such as
+  `[::1]:17670`.
+- Rootless slirp4netns, another named helper, or missing helper metadata
+  requires an explicitly remote `grpc_endpoint`. An explicit `host_gateway_ip`
+  cannot bypass slirp4netns host-loopback isolation. Do not work around
+  discovery failures by broadening the primary gateway listener to `0.0.0.0`.
 
 ### Step 6: Check Kubernetes Helm Gateways
 
@@ -392,6 +404,8 @@ openshell logs <sandbox-name>
 |---|---|---|
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
+| Gateway exits while resolving compute-driver listener requirements | Callback alias topology is unsupported, the Podman network cannot be inspected, or the selected address is not private/authorized | Gateway startup error, `podman info --debug`, Podman network inspection, host IPv4 default route |
+| Admin, health, reflection, or HTTP request is denied on a Docker/Podman callback address | Negotiated callback listeners intentionally expose only sandbox-callable gRPC methods | Retry through the gateway's primary endpoint; inspect the listener-purpose startup log if the address was unexpected |
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
 | Docker GPU e2e fails before GPU sandbox comparison | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |

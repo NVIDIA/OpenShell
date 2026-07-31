@@ -797,7 +797,8 @@ version = 2
     /// `load()` path that the gateway uses at runtime, catching:
     ///   - template corruption or unknown fields (`deny_unknown_fields`)
     ///   - schema drift (version bump or field renames)
-    ///   - accidental changes to the bind address or compute driver list
+    ///   - accidental addition of a wildcard bind-address override
+    ///   - accidental changes to the compute driver list
     #[test]
     fn rpm_default_config_parses_and_has_podman_defaults() {
         let path =
@@ -806,20 +807,12 @@ version = 2
             load(&path).expect("deploy/rpm/gateway.toml.default must parse against current schema");
         let gw = &config.openshell.gateway;
 
-        let addr = gw
-            .bind_address
-            .expect("bind_address must be explicitly set in the RPM default config");
-        assert!(
-            addr.ip().is_unspecified(),
-            "RPM default bind_address must be 0.0.0.0 so Podman sandbox containers \
-             can reach the gateway over the host network bridge, got {addr}"
-        );
-        assert_eq!(
-            addr.port(),
-            openshell_core::config::DEFAULT_SERVER_PORT,
-            "RPM default port must match DEFAULT_SERVER_PORT ({})",
-            openshell_core::config::DEFAULT_SERVER_PORT
-        );
+        if let Some(addr) = gw.bind_address {
+            assert!(
+                !addr.ip().is_unspecified(),
+                "RPM default config must not expose the primary listener on every interface"
+            );
+        }
 
         let drivers = gw
             .compute_drivers

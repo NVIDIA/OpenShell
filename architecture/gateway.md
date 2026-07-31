@@ -37,6 +37,27 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
+Docker and Podman may negotiate additional listeners that make the gateway
+reachable from their local sandbox network topology. Those listeners accept
+only gRPC methods classified as sandbox-callable by the gateway's generated
+authorization metadata. They reject user and administrator APIs, health,
+reflection, non-callback inference APIs, and HTTP routes before normal request
+authentication. The operator-configured primary listener retains the full
+multiplexed API surface.
+
+The gateway rejects a callback requirement that resolves to the exact primary
+listener address because one socket cannot preserve two authorization scopes.
+A wildcard primary listener may cover a callback address because the accepted
+connection's concrete local address still selects the callback-only scope.
+
+The `rpc_auth` classification is also the source of truth for negotiated
+listener exposure: marking an RPC as `sandbox` or `dual` makes it callable on
+these listeners. Review such changes as both authorization and network-surface
+changes. Listener requirements are currently authorized only for the built-in
+Docker and Podman drivers. Operator-granted listener capabilities for external
+drivers are tracked in
+[#2539](https://github.com/NVIDIA/OpenShell/issues/2539).
+
 Operators can configure a gateway-wide gRPC request rate limit. The limit is
 applied only to gRPC API traffic after protocol multiplexing; health, metrics,
 and local sandbox-service HTTP routes are not rate limited by this control.
@@ -661,7 +682,12 @@ system entry instead of pretending to delete package-manager owned state.
 - Podman-backed macOS gateways use gvproxy's host-loopback IP for sandbox host
   aliases by default so stale Podman machine images do not need Podman's
   `host-gateway` resolver. Linux Podman keeps the resolver unless
-  `host_gateway_ip` is configured.
+  `host_gateway_ip` is configured. Rootful Podman can request its exact bridge
+  gateway listener. Rootless Podman explicitly reporting pasta requests the
+  private IPv4 source selected by the host default route rather than an
+  arbitrary private interface. Slirp4netns, other helpers, and missing helper
+  metadata fail closed for local callbacks until a rootless-network namespace
+  relay is available.
 - Gateway restarts recover persisted objects from storage, but live relay
   streams must be re-established by supervisors.
 - User-facing behavior changes must update published docs in `docs/`; this file

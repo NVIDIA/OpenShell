@@ -24,6 +24,5 @@ ttl_secs = 0
 default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy = "missing"
 network_name = "openshell-e2e"
-grpc_endpoint = "http://10.89.0.1:8080"
-host_gateway_ip = "10.89.0.1"
+grpc_endpoint = "http://host.containers.internal:8080"
 supervisor_image = "localhost/openshell/supervisor:e2e-vm"

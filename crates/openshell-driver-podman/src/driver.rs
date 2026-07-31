@@ -16,13 +16,21 @@ use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
     effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
+#[cfg(target_os = "linux")]
+use openshell_core::proto::compute::v1::GatewayDefaultRouteInterfaceRequirement;
+#[cfg(target_os = "macos")]
+use openshell_core::proto::compute::v1::GatewayLoopbackInterfaceRequirement;
 use openshell_core::proto::compute::v1::{
-    DriverSandbox, GetCapabilitiesResponse, GpuResourceRequirements,
+    DriverSandbox, GatewayListenerRequirement, GetCapabilitiesResponse, GpuResourceRequirements,
+    gateway_listener_requirement::Selector,
 };
+#[cfg(target_os = "linux")]
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+use url::Url;
 
 impl From<PodmanApiError> for ComputeDriverError {
     fn from(value: PodmanApiError) -> Self {
@@ -39,9 +47,13 @@ impl From<PodmanApiError> for ComputeDriverError {
 pub struct PodmanComputeDriver {
     client: PodmanClient,
     config: PodmanComputeConfig,
-    /// The host's IP on the bridge network. Sandbox containers use this to
-    /// reach the gateway server when no explicit gRPC endpoint is configured.
+    /// The host's IP on the bridge network, when that bridge exists in the
+    /// gateway's network namespace (notably rootful Podman).
     network_gateway_ip: Option<String>,
+    /// Whether Podman's service is running without root privileges.
+    rootless: bool,
+    /// Rootless network helper reported by Podman, such as `pasta`.
+    rootless_network_cmd: String,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
     gpu_inventory_refresh: Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>,
 }
@@ -52,6 +64,8 @@ impl std::fmt::Debug for PodmanComputeDriver {
             .field("socket_path", &self.config.socket_path)
             .field("default_image", &self.config.default_image)
             .field("network_name", &self.config.network_name)
+            .field("rootless", &self.rootless)
+            .field("rootless_network_cmd", &self.rootless_network_cmd)
             .field("gpu_inventory", &self.gpu_selector.device_ids())
             .finish()
     }
@@ -289,7 +303,7 @@ impl PodmanComputeDriver {
         }
 
         // Verify cgroups v2, detect rootless mode, and log system info.
-        match client.system_info().await {
+        let (rootless, rootless_network_cmd) = match client.system_info().await {
             Ok(info) => {
                 if info.host.cgroup_version != "v2" {
                     return Err(PodmanApiError::Connection(format!(
@@ -303,15 +317,17 @@ impl PodmanComputeDriver {
                     cgroup_version = %info.host.cgroup_version,
                     network_backend = %info.host.network_backend,
                     rootless = info.host.security.rootless,
+                    rootless_network_cmd = %info.host.rootless_network_cmd,
                     "Connected to Podman"
                 );
+                (info.host.security.rootless, info.host.rootless_network_cmd)
             }
             Err(e) => {
                 return Err(PodmanApiError::Connection(format!(
                     "failed to query Podman system info: {e}"
                 )));
             }
-        }
+        };
 
         // Rootless pre-flight: warn if subuid/subgid ranges look missing.
         // Not a hard error because some systems configure these via LDAP or
@@ -320,33 +336,8 @@ impl PodmanComputeDriver {
             check_subuid_range();
         }
 
-        // Ensure the bridge network exists.
-        client.ensure_network(&config.network_name).await?;
-        let network_gateway_ip = client
-            .network_gateway_ip(&config.network_name)
-            .await
-            .unwrap_or(None);
-        info!(
-            network = %config.network_name,
-            gateway_ip = ?network_gateway_ip,
-            "Bridge network ready"
-        );
-
-        let (gpu_inventory, allow_all_default_gpu) = local_podman_gpu_selector_state();
-        if !gpu_inventory.is_empty() {
-            info!(
-                device_count = gpu_inventory.as_slice().len(),
-                "Discovered local Podman NVIDIA CDI GPU devices"
-            );
-        }
-
-        // Auto-detect the gRPC callback endpoint when not explicitly
-        // configured. Sandbox containers use host.containers.internal
-        // (injected via hostadd with host-gateway in the container spec)
-        // to reach the gateway server on the host. The scheme is
-        // determined by whether TLS client certs are configured: when
-        // all three TLS paths are set, the endpoint uses https so the
-        // supervisor connects with mTLS.
+        // Auto-detect the gRPC callback endpoint before deciding whether this
+        // topology needs the Podman bridge gateway address.
         if config.grpc_endpoint.is_empty() {
             let scheme = if config.tls_enabled() {
                 "https"
@@ -364,10 +355,42 @@ impl PodmanComputeDriver {
             );
         }
 
+        // Ensure the bridge network exists. Inspect its gateway only when the
+        // selected Linux callback topology will bind that exact address.
+        client.ensure_network(&config.network_name).await?;
+        let uses_local_callback_alias = Url::parse(&config.grpc_endpoint)
+            .ok()
+            .as_ref()
+            .is_some_and(callback_endpoint_uses_local_alias);
+        let needs_network_gateway_ip = cfg!(target_os = "linux")
+            && uses_local_callback_alias
+            && !rootless
+            && config.host_gateway_ip.trim().is_empty();
+        let network_gateway_ip = if needs_network_gateway_ip {
+            client.network_gateway_ip(&config.network_name).await?
+        } else {
+            None
+        };
+        info!(
+            network = %config.network_name,
+            gateway_ip = ?network_gateway_ip,
+            "Bridge network ready"
+        );
+
+        let (gpu_inventory, allow_all_default_gpu) = local_podman_gpu_selector_state();
+        if !gpu_inventory.is_empty() {
+            info!(
+                device_count = gpu_inventory.as_slice().len(),
+                "Discovered local Podman NVIDIA CDI GPU devices"
+            );
+        }
+
         Ok(Self {
             client,
             config,
             network_gateway_ip,
+            rootless,
+            rootless_network_cmd,
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,
@@ -378,8 +401,8 @@ impl PodmanComputeDriver {
 
     /// The host's IP on the bridge network, if available.
     ///
-    /// Used by the server to auto-detect the gRPC callback endpoint when
-    /// no explicit `--grpc-endpoint` is configured.
+    /// Used to request the exact rootful gateway callback listener when no
+    /// explicit host-gateway override is configured.
     #[must_use]
     pub fn network_gateway_ip(&self) -> Option<&str> {
         self.network_gateway_ip.as_deref()
@@ -392,6 +415,94 @@ impl PodmanComputeDriver {
             openshell_core::VERSION,
             &self.config.default_image,
         ))
+    }
+
+    /// Report the gateway exposure needed by Podman's standard local callback aliases.
+    ///
+    /// Rootful Podman binds the exact bridge address behind the sandbox alias.
+    /// Rootless pasta follows the host's default-route interface, while Podman
+    /// Machine forwards the alias to gateway loopback. Other rootless helpers
+    /// cannot use a direct host listener.
+    pub fn gateway_listener_requirements(
+        &self,
+    ) -> Result<Vec<GatewayListenerRequirement>, ComputeDriverError> {
+        let endpoint = Url::parse(&self.config.grpc_endpoint).map_err(|err| {
+            ComputeDriverError::Precondition(format!(
+                "invalid Podman gateway callback endpoint '{}': {err}",
+                self.config.grpc_endpoint
+            ))
+        })?;
+        let uses_local_callback_alias = callback_endpoint_uses_local_alias(&endpoint);
+        if !uses_local_callback_alias {
+            return Ok(Vec::new());
+        }
+        let callback_port = endpoint.port_or_known_default().ok_or_else(|| {
+            ComputeDriverError::Precondition(format!(
+                "Podman gateway callback endpoint '{}' has no port",
+                self.config.grpc_endpoint
+            ))
+        })?;
+        if callback_port != self.config.gateway_port {
+            return Err(ComputeDriverError::Precondition(format!(
+                "Podman local callback endpoint '{}' uses port {callback_port}, but the gateway primary listener uses port {}; configure grpc_endpoint with the gateway primary listener port",
+                self.config.grpc_endpoint, self.config.gateway_port
+            )));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if self.rootless {
+                validate_rootless_local_callback_helper(&self.rootless_network_cmd)?;
+
+                if self.config.host_gateway_ip.trim().is_empty() {
+                    return Ok(vec![GatewayListenerRequirement {
+                        reason:
+                            "Podman rootless pasta callback uses the host default-route interface"
+                                .to_string(),
+                        selector: Some(Selector::DefaultRouteInterface(
+                            GatewayDefaultRouteInterfaceRequirement {},
+                        )),
+                    }]);
+                }
+            }
+
+            let gateway_ip = if self.config.host_gateway_ip.trim().is_empty() {
+                self.network_gateway_ip.as_deref().ok_or_else(|| {
+                    ComputeDriverError::Precondition(format!(
+                        "Podman network '{}' did not report a host bridge gateway address for local callback alias '{}'",
+                        self.config.network_name,
+                        endpoint.host_str().unwrap_or_default()
+                    ))
+                })?
+            } else {
+                self.config.host_gateway_ip.trim()
+            };
+            let gateway_ip = gateway_ip.parse::<IpAddr>().map_err(|err| {
+                ComputeDriverError::Precondition(format!(
+                    "Podman callback gateway address '{gateway_ip}' is invalid: {err}"
+                ))
+            })?;
+            Ok(vec![GatewayListenerRequirement {
+                reason: format!("Podman network '{}' host gateway", self.config.network_name),
+                selector: Some(Selector::ExactBindAddress(
+                    SocketAddr::new(gateway_ip, callback_port).to_string(),
+                )),
+            }])
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Ok(vec![GatewayListenerRequirement {
+                reason: "Podman machine callback forwarding terminates on gateway loopback"
+                    .to_string(),
+                selector: Some(Selector::LoopbackInterface(
+                    GatewayLoopbackInterfaceRequirement {},
+                )),
+            }])
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Ok(Vec::new())
+        }
     }
 
     #[must_use]
@@ -892,6 +1003,8 @@ impl PodmanComputeDriver {
             client,
             config,
             network_gateway_ip: None,
+            rootless: false,
+            rootless_network_cmd: String::new(),
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,
@@ -948,6 +1061,31 @@ fn check_subuid_range() {
              sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami)"
         );
     }
+}
+
+fn callback_endpoint_uses_local_alias(endpoint: &Url) -> bool {
+    endpoint
+        .host_str()
+        .is_some_and(|host| matches!(host, "host.containers.internal" | "host.openshell.internal"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_rootless_local_callback_helper(
+    rootless_network_cmd: &str,
+) -> Result<(), ComputeDriverError> {
+    let rootless_network_cmd = rootless_network_cmd.trim();
+    if rootless_network_cmd == "pasta" {
+        return Ok(());
+    }
+
+    let reported = if rootless_network_cmd.is_empty() {
+        "<missing>"
+    } else {
+        rootless_network_cmd
+    };
+    Err(ComputeDriverError::Precondition(format!(
+        "Podman rootless network helper '{reported}' does not support direct local gateway callbacks; configure pasta or use an explicitly remote grpc_endpoint"
+    )))
 }
 
 #[cfg(test)]
@@ -1166,6 +1304,272 @@ mod tests {
             cfg.grpc_endpoint = format!("{scheme}://host.containers.internal:{}", cfg.gateway_port);
         }
         assert_eq!(cfg.grpc_endpoint, "https://gateway.internal:9000");
+    }
+
+    #[test]
+    fn rootless_slirp_allows_remote_callback_endpoint() {
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "https://gateway.internal:9000".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+        driver.rootless = true;
+        driver.rootless_network_cmd = "slirp4netns".to_string();
+
+        let requirements = driver.gateway_listener_requirements().unwrap();
+
+        assert!(requirements.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rootful_local_callback_alias_requests_discovered_network_gateway() {
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+        driver.network_gateway_ip = Some("10.89.1.1".to_string());
+
+        let requirements = driver.gateway_listener_requirements().unwrap();
+
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(
+            requirements[0].selector,
+            Some(Selector::ExactBindAddress("10.89.1.1:17670".to_string()))
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn configured_host_gateway_overrides_discovered_network_gateway() {
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.containers.internal:17670".to_string(),
+            host_gateway_ip: "10.90.1.1".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+        driver.network_gateway_ip = Some("10.89.1.1".to_string());
+        driver.rootless = true;
+        driver.rootless_network_cmd = "pasta".to_string();
+
+        let requirements = driver.gateway_listener_requirements().unwrap();
+
+        assert_eq!(
+            requirements[0].selector,
+            Some(Selector::ExactBindAddress("10.90.1.1:17670".to_string()))
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rootless_pasta_requests_default_route_interface() {
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+        driver.rootless = true;
+        driver.rootless_network_cmd = "pasta".to_string();
+
+        let requirements = driver.gateway_listener_requirements().unwrap();
+
+        assert!(matches!(
+            requirements[0].selector,
+            Some(Selector::DefaultRouteInterface(_))
+        ));
+    }
+
+    #[test]
+    fn rootless_non_pasta_helpers_are_rejected() {
+        for (rootless_network_cmd, reported) in [
+            ("slirp4netns", "slirp4netns"),
+            ("", "<missing>"),
+            ("unknown-helper", "unknown-helper"),
+        ] {
+            let err = validate_rootless_local_callback_helper(rootless_network_cmd).unwrap_err();
+
+            assert!(matches!(err, ComputeDriverError::Precondition(_)));
+            assert!(err.to_string().contains(reported));
+            assert!(err.to_string().contains("configure pasta"));
+            assert!(err.to_string().contains("remote grpc_endpoint"));
+        }
+    }
+
+    #[test]
+    fn rootless_pasta_is_accepted_for_local_callbacks() {
+        validate_rootless_local_callback_helper("pasta").unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rootless_slirp_rejects_explicit_host_gateway_override() {
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
+            host_gateway_ip: "10.90.1.1".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+        driver.rootless = true;
+        driver.rootless_network_cmd = "slirp4netns".to_string();
+
+        let err = driver.gateway_listener_requirements().unwrap_err();
+
+        assert!(matches!(err, ComputeDriverError::Precondition(_)));
+        assert!(err.to_string().contains("slirp4netns"));
+    }
+
+    #[tokio::test]
+    async fn constructor_preserves_required_network_gateway_discovery_error() {
+        let (socket_path, _request_log, handle) = spawn_podman_stub(
+            "network-gateway-error",
+            vec![
+                StubResponse::new(StatusCode::OK, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{
+                        "host": {
+                            "cgroupVersion": "v2",
+                            "networkBackend": "netavark",
+                            "security": {"rootless": false},
+                            "remoteSocket": {"path": "/run/podman/podman.sock"}
+                        },
+                        "version": {"Version": "5.0.0"}
+                    }"#,
+                ),
+                StubResponse::new(StatusCode::CREATED, "{}"),
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"network gateway inspection failed"}"#,
+                ),
+            ],
+        );
+        let config = PodmanComputeConfig {
+            socket_path: Some(socket_path.clone()),
+            grpc_endpoint: "http://host.containers.internal:8080".to_string(),
+            ..PodmanComputeConfig::default()
+        };
+
+        let Err(err) = PodmanComputeDriver::new(config).await else {
+            panic!("required network gateway discovery failure should prevent startup");
+        };
+
+        assert!(
+            err.to_string()
+                .contains("network gateway inspection failed"),
+            "unexpected startup error: {err}"
+        );
+        handle.await.expect("stub task should finish");
+    }
+
+    #[tokio::test]
+    async fn constructor_skips_network_gateway_discovery_for_remote_callback() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "remote-callback-no-network-gateway",
+            vec![
+                StubResponse::new(StatusCode::OK, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{
+                        "host": {
+                            "cgroupVersion": "v2",
+                            "networkBackend": "netavark",
+                            "security": {"rootless": false}
+                        }
+                    }"#,
+                ),
+                StubResponse::new(StatusCode::CREATED, "{}"),
+            ],
+        );
+        let config = PodmanComputeConfig {
+            socket_path: Some(socket_path.clone()),
+            grpc_endpoint: "https://gateway.example.test:9443".to_string(),
+            ..PodmanComputeConfig::default()
+        };
+
+        let driver = PodmanComputeDriver::new(config)
+            .await
+            .expect("remote callbacks must not require bridge gateway inspection");
+
+        assert!(driver.network_gateway_ip().is_none());
+        assert!(driver.gateway_listener_requirements().unwrap().is_empty());
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            [
+                "GET /_ping".to_string(),
+                format!("GET {}", api_path("/libpod/info")),
+                format!("POST {}", api_path("/libpod/networks/create")),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rootful_local_callback_alias_requires_concrete_gateway_address() {
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+
+        let err = driver.gateway_listener_requirements().unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("did not report a host bridge gateway address")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn podman_machine_callback_alias_requests_loopback_listener() {
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+
+        let requirements = driver.gateway_listener_requirements().unwrap();
+
+        assert_eq!(requirements.len(), 1);
+        assert!(matches!(
+            requirements[0].selector,
+            Some(Selector::LoopbackInterface(_))
+        ));
+    }
+
+    #[test]
+    fn explicit_remote_callback_does_not_request_gateway_listener() {
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "https://gateway.example.test:9443".to_string(),
+            gateway_port: 17670,
+            ..PodmanComputeConfig::default()
+        });
+
+        assert!(driver.gateway_listener_requirements().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_callback_alias_requires_primary_listener_port() {
+        for grpc_endpoint in [
+            "http://host.openshell.internal:17671",
+            "http://host.containers.internal",
+        ] {
+            let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+                grpc_endpoint: grpc_endpoint.to_string(),
+                gateway_port: 17670,
+                ..PodmanComputeConfig::default()
+            });
+
+            let err = driver.gateway_listener_requirements().unwrap_err();
+
+            assert!(
+                matches!(err, ComputeDriverError::Precondition(_)),
+                "mismatched local callback port should fail precondition: {err}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("gateway primary listener uses port 17670"),
+                "unexpected error for {grpc_endpoint}: {err}"
+            );
+        }
     }
 
     #[test]

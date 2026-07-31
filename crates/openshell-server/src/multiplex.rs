@@ -7,7 +7,7 @@
 //! to either the gRPC service or HTTP endpoints based on the request headers.
 
 use bytes::{Bytes, BytesMut};
-use http::{Extensions, HeaderValue, Request, Response};
+use http::{Extensions, HeaderValue, Request, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited, StreamBody};
 use hyper::body::Incoming;
@@ -234,7 +234,7 @@ impl MultiplexService {
             .await
     }
 
-    /// Serve a connection and preserve its listener purpose in request
+    /// Serve a connection and preserve its listener scope in request
     /// extensions for downstream routing and policy decisions.
     pub(crate) async fn serve_on_listener<S>(
         &self,
@@ -265,7 +265,7 @@ impl MultiplexService {
         .await
     }
 
-    /// Serve a TLS connection and preserve its listener purpose in request
+    /// Serve a TLS connection and preserve its listener scope in request
     /// extensions for downstream routing and policy decisions.
     pub(crate) async fn serve_with_peer_identity_on_listener<S>(
         &self,
@@ -345,7 +345,7 @@ impl MultiplexService {
     }
 
     /// Serve a plaintext service HTTP connection and preserve its listener
-    /// purpose in request extensions.
+    /// scope in request extensions.
     pub(crate) async fn serve_service_http_on_listener<S>(
         &self,
         stream: S,
@@ -1080,6 +1080,38 @@ impl<G, H> MultiplexedService<G, H> {
     }
 }
 
+fn listener_allows_request(
+    listener_scope: Option<&GatewayListenerScope>,
+    is_grpc: bool,
+    path: &str,
+) -> bool {
+    match listener_scope {
+        Some(GatewayListenerScope::ComputeDriverCallback) => {
+            is_grpc && crate::auth::sandbox_methods::is_sandbox_callable(path)
+        }
+        Some(GatewayListenerScope::Primary) | None => true,
+    }
+}
+
+fn callback_listener_rejection(is_grpc: bool) -> Response<BoxBody> {
+    if is_grpc {
+        let response: Response<tonic::body::Body> = tonic::Status::permission_denied(
+            "compute-driver callback listeners accept sandbox callback RPCs only",
+        )
+        .into_http();
+        let (parts, body) = response.into_parts();
+        let body = body.map_err(Into::into).boxed_unsync();
+        Response::from_parts(parts, BoxBody(body))
+    } else {
+        Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(boxed_body_from_bytes(Bytes::from_static(
+                b"compute-driver callback listeners accept gRPC callbacks only",
+            )))
+            .expect("static callback listener rejection response must be valid")
+    }
+}
+
 impl<G, H, GBody, HBody> hyper::service::Service<Request<Incoming>> for MultiplexedService<G, H>
 where
     G: tower::Service<Request<BoxBody>, Response = Response<GBody>> + Clone + Send + 'static,
@@ -1102,6 +1134,15 @@ where
             .headers()
             .get("content-type")
             .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"));
+
+        if !listener_allows_request(
+            req.extensions().get::<GatewayListenerScope>(),
+            is_grpc,
+            req.uri().path(),
+        ) {
+            let response = callback_listener_rejection(is_grpc);
+            return Box::pin(async move { Ok(response) });
+        }
 
         if is_grpc {
             let method = grpc_method_from_path(req.uri().path());
@@ -1321,6 +1362,98 @@ mod tests {
         );
     }
 
+    fn callback_listener_scope() -> GatewayListenerScope {
+        GatewayListenerScope::ComputeDriverCallback
+    }
+
+    #[test]
+    fn callback_listener_allows_sandbox_callback_rpcs() {
+        let scope = callback_listener_scope();
+        let callback_paths = [
+            "/openshell.v1.OpenShell/ConnectSupervisor",
+            "/openshell.v1.OpenShell/RelayStream",
+            "/openshell.v1.OpenShell/GetSandboxConfig",
+            "/openshell.v1.OpenShell/ReportPolicyStatus",
+            "/openshell.v1.OpenShell/PushSandboxLogs",
+            "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
+            "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
+            "/openshell.v1.OpenShell/RefreshSandboxToken",
+            "/openshell.inference.v1.Inference/GetInferenceBundle",
+        ];
+
+        for path in callback_paths {
+            assert!(
+                listener_allows_request(Some(&scope), true, path),
+                "callback listener should allow {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_listener_surface_matches_rpc_auth_metadata() {
+        let scope = callback_listener_scope();
+
+        for path in crate::auth::method_authz::all_paths() {
+            assert_eq!(
+                listener_allows_request(Some(&scope), true, path),
+                crate::auth::method_authz::is_sandbox_callable(path),
+                "callback listener exposure must follow rpc_auth metadata for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_listener_rejects_non_callback_routes() {
+        let scope = callback_listener_scope();
+        let rejected_grpc_paths = [
+            "/grpc.health.v1.Health/Check",
+            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+            "/openshell.v1.OpenShell/ListSandboxes",
+            "/openshell.v1.OpenShell/DeleteSandbox",
+            "/openshell.v1.OpenShell/CreateProvider",
+            "/openshell.inference.v1.Inference/GetInferenceRoute",
+            "/openshell.inference.v1.Inference/SetInferenceRoute",
+        ];
+
+        for path in rejected_grpc_paths {
+            assert!(
+                !listener_allows_request(Some(&scope), true, path),
+                "callback listener should reject {path}"
+            );
+        }
+        assert!(!listener_allows_request(Some(&scope), false, "/health"));
+        assert!(!listener_allows_request(Some(&scope), false, "/service"));
+    }
+
+    #[test]
+    fn primary_listener_routing_is_unchanged() {
+        let primary = GatewayListenerScope::Primary;
+        let paths = [
+            "/grpc.health.v1.Health/Check",
+            "/openshell.v1.OpenShell/ListSandboxes",
+            "/openshell.inference.v1.Inference/GetInferenceRoute",
+            "/health",
+            "/service",
+        ];
+
+        for path in paths {
+            assert!(listener_allows_request(Some(&primary), true, path));
+            assert!(listener_allows_request(Some(&primary), false, path));
+            assert!(listener_allows_request(None, true, path));
+            assert!(listener_allows_request(None, false, path));
+        }
+    }
+
+    #[test]
+    fn callback_listener_rejections_use_protocol_appropriate_statuses() {
+        let grpc = callback_listener_rejection(true);
+        assert_eq!(grpc.status(), StatusCode::OK);
+        assert_eq!(grpc.headers().get("grpc-status").unwrap(), "7");
+
+        let http = callback_listener_rejection(false);
+        assert_eq!(http.status(), StatusCode::FORBIDDEN);
+    }
+
     #[derive(Clone)]
     struct PostCommitTestInterceptor;
 
@@ -1422,6 +1555,12 @@ mod tests {
     }
 
     async fn start_http_server_with_middleware() -> std::net::SocketAddr {
+        start_http_server_with_middleware_on_listener(GatewayListenerScope::Primary).await
+    }
+
+    async fn start_http_server_with_middleware_on_listener(
+        listener_scope: GatewayListenerScope,
+    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1429,6 +1568,7 @@ mod tests {
         let http_service = request_id_middleware!(http_service);
 
         let service = MultiplexedService::new(http_service.clone(), http_service);
+        let service = GatewayListenerContextService::new(service, listener_scope);
 
         tokio::spawn(async move {
             loop {
@@ -1447,8 +1587,9 @@ mod tests {
         addr
     }
 
-    async fn http1_get(
+    async fn http1_request(
         addr: std::net::SocketAddr,
+        method: &str,
         path: &str,
         headers: &[(&str, &str)],
     ) -> Response<Incoming> {
@@ -1462,13 +1603,54 @@ mod tests {
         });
 
         let mut builder = Request::builder()
-            .method("GET")
+            .method(method)
             .uri(format!("http://{addr}{path}"));
         for (k, v) in headers {
             builder = builder.header(*k, *v);
         }
         let req = builder.body(Empty::<Bytes>::new()).unwrap();
         sender.send_request(req).await.unwrap()
+    }
+
+    async fn http1_get(
+        addr: std::net::SocketAddr,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> Response<Incoming> {
+        http1_request(addr, "GET", path, headers).await
+    }
+
+    #[tokio::test]
+    async fn callback_listener_filter_is_applied_before_route_dispatch() {
+        let addr = start_http_server_with_middleware_on_listener(callback_listener_scope()).await;
+
+        let health = http1_get(addr, "/healthz", &[]).await;
+        assert_eq!(health.status(), StatusCode::FORBIDDEN);
+
+        let admin = http1_request(
+            addr,
+            "POST",
+            "/openshell.v1.OpenShell/ListSandboxes",
+            &[("content-type", "application/grpc")],
+        )
+        .await;
+        assert_eq!(admin.status(), StatusCode::OK);
+        assert_eq!(admin.headers().get("grpc-status").unwrap(), "7");
+
+        let callback = http1_request(
+            addr,
+            "POST",
+            "/openshell.v1.OpenShell/ConnectSupervisor",
+            &[("content-type", "application/grpc")],
+        )
+        .await;
+        assert_ne!(
+            callback
+                .headers()
+                .get("grpc-status")
+                .and_then(|value| value.to_str().ok()),
+            Some("7")
+        );
     }
 
     #[tokio::test]
@@ -1948,7 +2130,7 @@ mod tests {
             tracing_subscriber::registry().with(fmt_layer)
         };
         {
-            let _traced = crate::otel_tracing::test_collector::install_scoped(subscriber);
+            let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
 
             let req = Request::builder()
                 .uri("/test-path")
@@ -1972,9 +2154,9 @@ mod tests {
     /// correlated with the gateway's logs.
     #[tokio::test]
     async fn request_span_exports_over_otlp_with_request_id() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         let req = Request::builder()
             .uri("/openshell.v1.OpenShell/CreateSandbox")
             .header("x-request-id", "otlp-req-id-9876")
@@ -1995,11 +2177,11 @@ mod tests {
                 )
             });
         assert_eq!(
-            test_collector::attribute(span, "request_id").as_deref(),
+            test_exporter::attribute(span, "request_id").as_deref(),
             Some("otlp-req-id-9876"),
         );
         assert_eq!(
-            test_collector::attribute(span, "path").as_deref(),
+            test_exporter::attribute(span, "path").as_deref(),
             Some("/openshell.v1.OpenShell/CreateSandbox"),
         );
         assert_eq!(
@@ -2007,26 +2189,26 @@ mod tests {
             opentelemetry::trace::SpanKind::Server,
             "trace UIs lay this out as a served call, not an internal operation"
         );
-        test_collector::assert_is_root(span);
+        test_exporter::assert_is_root(span);
         assert_eq!(
-            test_collector::attribute(span, "rpc.system").as_deref(),
+            test_exporter::attribute(span, "rpc.system").as_deref(),
             Some("grpc"),
         );
         assert_eq!(
-            test_collector::attribute(span, "rpc.service").as_deref(),
+            test_exporter::attribute(span, "rpc.service").as_deref(),
             Some("openshell.v1.OpenShell"),
         );
         assert_eq!(
-            test_collector::attribute(span, "rpc.method").as_deref(),
+            test_exporter::attribute(span, "rpc.method").as_deref(),
             Some("CreateSandbox"),
         );
     }
 
     #[tokio::test]
     async fn request_span_continues_the_incoming_trace() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         let req = Request::builder()
             .uri("/openshell.v1.OpenShell/CreateSandbox")
             .header(
@@ -2059,9 +2241,9 @@ mod tests {
     /// trace UI, which keys off span status rather than a logged field.
     #[tokio::test]
     async fn request_spans_record_the_response_outcome() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         for (path, status) in [
             ("/openshell.v1.OpenShell/CreateSandbox", 500),
             ("/openshell.v1.OpenShell/ListSandboxes", 200),
@@ -2092,7 +2274,7 @@ mod tests {
             .expect("successful request span recorded");
 
         assert_eq!(
-            test_collector::attribute(failed, "http.response.status_code").as_deref(),
+            test_exporter::attribute(failed, "http.response.status_code").as_deref(),
             Some("500"),
             "the response status is an attribute, not only a log field"
         );
@@ -2110,9 +2292,9 @@ mod tests {
 
     #[tokio::test]
     async fn request_span_records_grpc_status_from_trailers() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         let req = Request::builder()
             .uri("/openshell.v1.OpenShell/CreateSandbox")
             .body(Empty::<Bytes>::new())
@@ -2129,7 +2311,7 @@ mod tests {
             "CreateSandbox",
         );
         assert_eq!(
-            test_collector::attribute(&span, "rpc.grpc.status_code").as_deref(),
+            test_exporter::attribute(&span, "rpc.grpc.status_code").as_deref(),
             Some("13")
         );
         assert!(
@@ -2142,7 +2324,7 @@ mod tests {
     /// named for its RPC or HTTP method.
     #[tokio::test]
     async fn each_entrypoint_gets_its_own_root_span() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
         let paths = [
             "/openshell.v1.OpenShell/CreateSandbox",
@@ -2152,7 +2334,7 @@ mod tests {
             "/metrics",
         ];
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         for path in paths {
             let req = Request::builder()
                 .uri(path)

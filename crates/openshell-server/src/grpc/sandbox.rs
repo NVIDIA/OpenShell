@@ -2570,7 +2570,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_producer_releases_request_span_when_client_disconnects() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
         use tokio_stream::StreamExt as _;
         use tracing::Instrument as _;
 
@@ -2578,7 +2578,7 @@ mod tests {
         let sandbox = test_sandbox("watched", Vec::new());
         state.store.put_message(&sandbox).await.unwrap();
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         let request_span = tracing::info_span!("disconnected_watch_request");
         let response = handle_watch_sandbox(
             &state,

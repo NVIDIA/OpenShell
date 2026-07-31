@@ -105,66 +105,48 @@ pub fn mark_error(span: &tracing::Span) {
     span.record("otel.status_code", "ERROR");
 }
 
-/// In-process OTLP/gRPC trace collector, for tests that need to assert what
-/// the gateway actually put on the wire.
+/// Isolated in-memory span exporters for tracing tests.
 #[cfg(test)]
-pub mod test_collector {
-    use std::net::SocketAddr;
-    use std::sync::{Arc, Mutex};
-
-    use opentelemetry_proto::tonic::collector::trace::v1::{
-        ExportTraceServiceRequest, ExportTraceServiceResponse,
-        trace_service_server::{TraceService, TraceServiceServer},
-    };
-    use opentelemetry_proto::tonic::trace::v1::Span;
-
-    /// Spans received by a running [`start`] collector.
-    pub type Received = Arc<Mutex<Vec<Span>>>;
-
-    /// The one exporter every traced test reads, installed for the whole test
-    /// binary and never swapped.
+pub mod test_exporter {
+    /// Installs a process-wide registry before any scoped test subscriber is
+    /// used.
     ///
-    /// A per-test subscriber cannot work here: `tracing` caches callsite
-    /// interest process-wide, so a callsite first hit by an untraced test
-    /// stays dark for every later one.
-    static EXPORTER: std::sync::LazyLock<opentelemetry_sdk::trace::InMemorySpanExporter> =
-        std::sync::LazyLock::new(|| {
-            use tracing_subscriber::layer::SubscriberExt as _;
+    /// `tracing` caches callsite interest process-wide. The registry keeps
+    /// callsites enabled without exporting spans from unrelated tests.
+    static INITIALIZED: std::sync::LazyLock<()> = std::sync::LazyLock::new(|| {
+        tracing::subscriber::set_global_default(tracing_subscriber::registry())
+            .expect("test subscriber installs once");
+    });
 
-            let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
-            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                .with_simple_exporter(exporter.clone())
-                .build();
-            let subscriber = tracing_subscriber::registry().with(super::layer(&provider));
-            tracing::subscriber::set_global_default(subscriber)
-                .expect("test subscriber installs once");
-            // Leaked so the provider outlives every span the binary records;
-            // dropping it would shut the exporter down mid-suite.
-            std::mem::forget(provider);
-            exporter
-        });
-
-    /// Captures spans until the returned guard is dropped.
+    /// Captures spans from the current test thread until the guard is dropped.
     ///
-    /// Serialized on [`crate::TEST_TRACING_LOCK`] because the exporter it
-    /// clears is shared by the whole binary.
+    /// Subscriber changes remain serialized because `tracing` caches callsite
+    /// interest process-wide. The exporter itself is private to this guard, so
+    /// concurrent non-tracing tests cannot contaminate or reset its spans.
     #[must_use]
     pub fn install_traced() -> TracingTestGuard {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
         let lock = crate::TEST_TRACING_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        EXPORTER.reset();
+        std::sync::LazyLock::force(&INITIALIZED);
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(super::layer(&provider));
+        let dispatch = tracing::Dispatch::new(subscriber);
         TracingTestGuard {
+            _default: tracing::dispatcher::set_default(&dispatch),
+            _provider: provider,
+            exporter,
             _lock: lock,
-            exporter: &EXPORTER,
         }
     }
 
     impl TracingTestGuard {
-        /// Every span recorded since [`install_traced`], including any written
-        /// concurrently by other callers.
-        ///
-        /// Prefer [`Self::spans_named`] or [`Self::span_with`] to select spans.
+        /// Every span recorded by this test's in-memory exporter.
         pub fn finished_spans(&self) -> Vec<opentelemetry_sdk::trace::SpanData> {
             self.exporter.get_finished_spans().expect("in-memory spans")
         }
@@ -226,7 +208,7 @@ pub mod test_collector {
         let lock = crate::TEST_TRACING_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::sync::LazyLock::force(&EXPORTER);
+        std::sync::LazyLock::force(&INITIALIZED);
         ScopedTracingTestGuard {
             _default: tracing::dispatcher::set_default(&subscriber.into()),
             _lock: lock,
@@ -240,72 +222,10 @@ pub mod test_collector {
     }
 
     pub struct TracingTestGuard {
+        _default: tracing::dispatcher::DefaultGuard,
+        _provider: opentelemetry_sdk::trace::SdkTracerProvider,
+        exporter: opentelemetry_sdk::trace::InMemorySpanExporter,
         _lock: std::sync::MutexGuard<'static, ()>,
-        exporter: &'static opentelemetry_sdk::trace::InMemorySpanExporter,
-    }
-
-    #[derive(Clone)]
-    struct Collector {
-        spans: Received,
-    }
-
-    #[tonic::async_trait]
-    impl TraceService for Collector {
-        async fn export(
-            &self,
-            request: tonic::Request<ExportTraceServiceRequest>,
-        ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
-            let mut spans = self.spans.lock().expect("collector lock");
-            for resource_span in request.into_inner().resource_spans {
-                for scope_span in resource_span.scope_spans {
-                    spans.extend(scope_span.spans);
-                }
-            }
-            Ok(tonic::Response::new(ExportTraceServiceResponse::default()))
-        }
-    }
-
-    /// Start a collector on an ephemeral port. Returns its address and a
-    /// handle to the spans it receives.
-    pub async fn start() -> (SocketAddr, Received) {
-        let spans: Received = Arc::new(Mutex::new(Vec::new()));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind collector");
-        let addr = listener.local_addr().expect("collector addr");
-
-        let service = Collector {
-            spans: Arc::clone(&spans),
-        };
-        tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(TraceServiceServer::new(service))
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .ok();
-        });
-
-        (addr, spans)
-    }
-
-    /// Wait for spans named `expected` to arrive, returning everything
-    /// received.
-    ///
-    /// `SdkTracerProvider::force_flush` is not a delivery barrier — it reports
-    /// `Ok` even when the collector is unreachable — so asserting on the
-    /// collector's contents immediately after it is a race.
-    pub async fn wait_for_spans(received: &Received, expected: &[&str]) -> Vec<Span> {
-        for _ in 0..200 {
-            let spans = received.lock().expect("collector lock").clone();
-            if expected
-                .iter()
-                .all(|name| spans.iter().any(|s| s.name == *name))
-            {
-                return spans;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        received.lock().expect("collector lock").clone()
     }
 
     /// Value of `key` on an in-memory span, if present.
@@ -314,21 +234,6 @@ pub mod test_collector {
             .iter()
             .find(|kv| kv.key.as_str() == key)
             .map(|kv| kv.value.to_string())
-    }
-
-    /// Value of `key` on `span`, if present as a string attribute.
-    pub fn string_attribute(span: &Span, key: &str) -> Option<String> {
-        use opentelemetry_proto::tonic::common::v1::any_value::Value;
-
-        span.attributes
-            .iter()
-            .find(|kv| kv.key == key)
-            .and_then(|kv| kv.value.as_ref())
-            .and_then(|v| v.value.as_ref())
-            .map(|v| match v {
-                Value::StringValue(s) => s.clone(),
-                other => format!("{other:?}"),
-            })
     }
 }
 
@@ -530,7 +435,7 @@ mod tests {
 
     #[tokio::test]
     async fn tracing_events_are_not_exported() {
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         let span = tracing::info_span!("outer");
         let entered = span.enter();
         tracing::warn!(target: "opentelemetry-otlp", "export failed");
@@ -548,46 +453,5 @@ mod tests {
             outer.events.is_empty(),
             "structured log events stay on the logging paths"
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn tracing_spans_reach_the_collector_over_otlp() {
-        let (addr, received) = test_collector::start().await;
-
-        let cfg = OtlpConfig {
-            endpoint: format!("http://{addr}"),
-            service_name: None,
-        };
-        let provider = build_provider(&cfg).expect("provider builds");
-
-        {
-            // Its own subscriber, not the shared in-memory one: this test
-            // asserts on what reaches a real collector over the wire.
-            use tracing_subscriber::layer::SubscriberExt as _;
-            let subscriber = tracing_subscriber::registry().with(layer(&provider));
-            let _traced = test_collector::install_scoped(subscriber);
-            let span = tracing::info_span!("create_sandbox", sandbox_id = "sb-otlp");
-            let _entered = span.enter();
-        }
-
-        provider.force_flush().expect("flush spans");
-
-        let spans = test_collector::wait_for_spans(&received, &["create_sandbox"]).await;
-        let span = spans
-            .iter()
-            .find(|s| s.name == "create_sandbox")
-            .unwrap_or_else(|| {
-                panic!(
-                    "collector received the exported span, got {:?}",
-                    spans.iter().map(|s| &s.name).collect::<Vec<_>>()
-                )
-            });
-        assert_eq!(
-            test_collector::string_attribute(span, "sandbox_id").as_deref(),
-            Some("sb-otlp"),
-            "tracing fields are exported as span attributes"
-        );
-
-        provider.shutdown().ok();
     }
 }

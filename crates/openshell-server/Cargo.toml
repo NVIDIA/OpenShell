@@ -36,6 +36,7 @@ k8s-openapi = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+socket2 = { workspace = true }
 
 # gRPC
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
@@ -127,8 +128,5 @@ wiremock = "0.6"
 # `testing` provides InMemorySpanExporter, so span assertions do not need a
 # collector, a network hop, or a flush barrier.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
-# Supports asserting that the gateway sends spans over OTLP.
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
-
 [lints]
 workspace = true
