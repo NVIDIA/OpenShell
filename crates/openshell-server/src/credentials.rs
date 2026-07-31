@@ -50,6 +50,7 @@ use tracing::warn;
 use crate::persistence::{PersistenceError, Store, WriteCondition};
 
 const DEFAULT_CREDENTIAL_DRIVER_STARTUP_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS: u64 = 30;
 const COMMON_CREDENTIAL_DRIVER_FIELDS: &[&str] = &[
     "transport",
     "socket_path",
@@ -1116,7 +1117,11 @@ impl CredentialDriver for RemoteCredentialDriver {
         request: StoreCredentialRequest,
     ) -> Result<CredentialHandle, Status> {
         let mut client = self.client();
-        let response = client.store_credential(Request::new(request)).await?;
+        let mut grpc_request = Request::new(request);
+        grpc_request.set_timeout(Duration::from_secs(
+            DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS,
+        ));
+        let response = client.store_credential(grpc_request).await?;
         response
             .into_inner()
             .handle
@@ -1125,7 +1130,11 @@ impl CredentialDriver for RemoteCredentialDriver {
 
     async fn delete_credential(&self, request: DeleteCredentialRequest) -> Result<(), Status> {
         let mut client = self.client();
-        client.delete_credential(Request::new(request)).await?;
+        let mut grpc_request = Request::new(request);
+        grpc_request.set_timeout(Duration::from_secs(
+            DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS,
+        ));
+        client.delete_credential(grpc_request).await?;
         Ok(())
     }
 
@@ -1134,11 +1143,13 @@ impl CredentialDriver for RemoteCredentialDriver {
         requests: Vec<ResolveCredentialRequest>,
     ) -> Result<Vec<ResolvedCredential>, Status> {
         let mut client = self.client();
-        let response = client
-            .resolve_credentials(Request::new(ResolveCredentialsRequest {
-                credentials: requests,
-            }))
-            .await?;
+        let mut grpc_request = Request::new(ResolveCredentialsRequest {
+            credentials: requests,
+        });
+        grpc_request.set_timeout(Duration::from_secs(
+            DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS,
+        ));
+        let response = client.resolve_credentials(grpc_request).await?;
         Ok(response.into_inner().credentials)
     }
 }
@@ -1300,7 +1311,7 @@ async fn wait_for_launched_credential_driver(
     timeout: Duration,
 ) -> CoreResult<Channel> {
     let deadline = Instant::now() + timeout;
-    let mut last_error: Option<String>;
+    let mut last_error: Option<String> = None;
 
     loop {
         let try_wait_result = child.try_wait().map_err(|err| {
@@ -1314,9 +1325,28 @@ async fn wait_for_launched_credential_driver(
             )));
         }
 
-        match connect_ready_credential_driver(driver_name, socket_path).await {
-            Ok(channel) => return Ok(channel),
-            Err(err) => last_error = Some(err.to_string()),
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::execution(format!(
+                "timed out waiting for credential driver '{driver_name}' socket '{}': {}",
+                socket_path.display(),
+                last_error.unwrap_or_else(|| "unknown error".to_string())
+            )));
+        }
+
+        match tokio::time::timeout(
+            remaining,
+            connect_ready_credential_driver(driver_name, socket_path),
+        )
+        .await
+        {
+            Ok(Ok(channel)) => return Ok(channel),
+            Ok(Err(err)) => last_error = Some(err.to_string()),
+            Err(_) => {
+                return Err(Error::execution(format!(
+                    "timed out waiting for credential driver '{driver_name}' to respond to GetCapabilities"
+                )));
+            }
         }
 
         if Instant::now() >= deadline {
@@ -1338,14 +1368,15 @@ async fn connect_ready_credential_driver(
 ) -> CoreResult<Channel> {
     let channel = connect_credential_driver_socket(driver_name, socket_path).await?;
     let mut client = CredentialDriverClient::new(channel.clone());
-    client
-        .get_capabilities(Request::new(GetCredentialDriverCapabilitiesRequest {}))
-        .await
-        .map_err(|status| {
-            Error::config(format!(
-                "credential driver '{driver_name}' GetCapabilities failed: {status}"
-            ))
-        })?;
+    let mut request = Request::new(GetCredentialDriverCapabilitiesRequest {});
+    request.set_timeout(Duration::from_secs(
+        DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS,
+    ));
+    client.get_capabilities(request).await.map_err(|status| {
+        Error::config(format!(
+            "credential driver '{driver_name}' GetCapabilities failed: {status}"
+        ))
+    })?;
     Ok(channel)
 }
 
@@ -1608,6 +1639,8 @@ mod tests {
         let stored = runtime
             .store_provider_credentials(
                 "openai-local",
+                "test-workspace",
+                "test-provider-id",
                 &HashMap::from([("OPENAI_API_KEY".to_string(), "sk-test".to_string())]),
                 &HashMap::new(),
             )
@@ -1640,6 +1673,8 @@ mod tests {
         let first = runtime
             .store_provider_credentials(
                 "openai-local",
+                "test-workspace",
+                "test-provider-id",
                 &HashMap::from([("OPENAI_API_KEY".to_string(), "sk-first".to_string())]),
                 &HashMap::new(),
             )
@@ -1648,6 +1683,8 @@ mod tests {
         let second = runtime
             .store_provider_credentials(
                 "openai-local",
+                "test-workspace",
+                "test-provider-id",
                 &HashMap::from([("OPENAI_API_KEY".to_string(), "sk-second".to_string())]),
                 &first,
             )
@@ -1685,6 +1722,8 @@ mod tests {
         let stored = runtime
             .store_provider_credentials(
                 "openai-local",
+                "test-workspace",
+                "test-provider-id",
                 &HashMap::from([("OPENAI_API_KEY".to_string(), "sk-test".to_string())]),
                 &HashMap::new(),
             )
@@ -1692,7 +1731,12 @@ mod tests {
             .unwrap();
 
         runtime
-            .delete_provider_credential_handles("openai-local", &stored)
+            .delete_provider_credential_handles(
+                "openai-local",
+                "test-workspace",
+                "test-provider-id",
+                &stored,
+            )
             .await
             .unwrap();
 
@@ -1729,6 +1773,8 @@ backend_specific = "ignored-by-gateway"
         let stored = runtime
             .store_provider_credentials(
                 "openai-local",
+                "test-workspace",
+                "test-provider-id",
                 &HashMap::from([("OPENAI_API_KEY".to_string(), "sk-test".to_string())]),
                 &HashMap::new(),
             )
@@ -1789,6 +1835,8 @@ key_encryption_key_path = "{}"
         let stored = runtime
             .store_provider_credentials(
                 "openai-local",
+                "test-workspace",
+                "test-provider-id",
                 &HashMap::from([("OPENAI_API_KEY".to_string(), "sk-test".to_string())]),
                 &HashMap::new(),
             )

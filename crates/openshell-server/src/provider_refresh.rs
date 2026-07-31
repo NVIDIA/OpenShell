@@ -8,8 +8,8 @@
 use crate::persistence::{ObjectType, PersistenceError, Store, WriteCondition, current_time_ms};
 use openshell_core::ObjectWorkspace;
 use openshell_core::proto::{
-    CredentialHandle, Provider, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, StoredProviderCredentialRefreshState,
+    CredentialHandle, Provider, ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+    StoredProviderCredentialRefreshState,
 };
 use openshell_core::{ObjectId, ObjectName};
 use prost::Message;
@@ -648,8 +648,7 @@ async fn apply_minted_credential(
     if cas_result.is_ok()
         && !old_handles_to_delete.is_empty()
         && let Some(credentials) = credentials
-    {
-        if let Err(cleanup_err) = credentials
+        && let Err(cleanup_err) = credentials
             .delete_provider_credential_handles(
                 provider.object_name(),
                 provider.object_workspace(),
@@ -657,14 +656,13 @@ async fn apply_minted_credential(
                 &old_handles_to_delete,
             )
             .await
-        {
-            warn!(
-                provider_name = %provider.object_name(),
-                error = %cleanup_err,
-                "failed to clean up old provider credential handles after successful refresh"
-            );
-            // Don't fail the operation - the refresh succeeded, this is just cleanup
-        }
+    {
+        warn!(
+            provider_name = %provider.object_name(),
+            error = %cleanup_err,
+            "failed to clean up old provider credential handles after successful refresh"
+        );
+        // Don't fail the operation - the refresh succeeded, this is just cleanup
     }
 
     cas_result
@@ -1735,7 +1733,7 @@ mod tests {
         let store = test_store().await;
 
         let traced = test_exporter::install_traced();
-        run_refresh_worker_tick(&store).await.unwrap();
+        run_refresh_worker_tick(&store, None).await.unwrap();
 
         let spans = traced.finished_spans();
         let root = spans

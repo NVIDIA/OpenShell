@@ -1164,7 +1164,12 @@ mod tests {
     #[tokio::test]
     async fn resolve_kubernetes_auth_kv2_secret() {
         let mock_server = MockServer::start().await;
-        let logical_path = managed_secret_path("github-prod", "GITHUB_TOKEN");
+        let logical_path = managed_secret_path(
+            "test-workspace",
+            "test-provider-id",
+            "github-prod",
+            "GITHUB_TOKEN",
+        );
         Mock::given(method("POST"))
             .and(path("/v1/auth/kubernetes/login"))
             .and(body_string_contains("openshell-gateway"))

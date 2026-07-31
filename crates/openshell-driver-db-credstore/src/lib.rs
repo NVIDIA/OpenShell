@@ -1033,6 +1033,8 @@ mod tests {
             credential_key: credential_key.to_string(),
             value: value.to_string(),
             existing_handle,
+            workspace: "test-workspace".to_string(),
+            provider_id: "test-provider-id".to_string(),
         }
     }
 
@@ -1047,6 +1049,8 @@ mod tests {
             provider_name: provider_name.to_string(),
             credential_key: credential_key.to_string(),
             handle: Some(handle),
+            workspace: "test-workspace".to_string(),
+            provider_id: "test-provider-id".to_string(),
         }
     }
 
@@ -1119,6 +1123,8 @@ mod tests {
                 provider_name: "openai-local".to_string(),
                 credential_key: "OPENAI_API_KEY".to_string(),
                 handle: Some(updated.clone()),
+                workspace: "test-workspace".to_string(),
+                provider_id: "test-provider-id".to_string(),
             })
             .await
             .unwrap();
