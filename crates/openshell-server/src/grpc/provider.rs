@@ -782,7 +782,12 @@ async fn finish_provider_credential_update(
     handles_to_delete.extend(update.replaced_handles);
     if !handles_to_delete.is_empty() {
         credentials
-            .delete_provider_credential_handles(provider_name, workspace, provider_id, &handles_to_delete)
+            .delete_provider_credential_handles(
+                provider_name,
+                workspace,
+                provider_id,
+                &handles_to_delete,
+            )
             .await?;
     }
 

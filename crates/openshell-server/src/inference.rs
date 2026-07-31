@@ -1168,9 +1168,27 @@ async fn resolve_provider_credentials(
         .resolve_provider_handles(&provider, current_time_ms())
         .await?;
     provider.credentials.extend(resolved.values);
-    provider
-        .credential_expires_at_ms
-        .extend(resolved.expires_at_ms);
+
+    // Merge expiration times, keeping the earliest non-zero value
+    for (key, driver_expires_at_ms) in resolved.expires_at_ms {
+        let provider_expires_at_ms = provider
+            .credential_expires_at_ms
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+
+        let effective_expires_at_ms = match (provider_expires_at_ms, driver_expires_at_ms) {
+            (0, driver) => driver,
+            (provider, 0) => provider,
+            (provider, driver) => provider.min(driver),
+        };
+
+        if effective_expires_at_ms > 0 {
+            provider
+                .credential_expires_at_ms
+                .insert(key, effective_expires_at_ms);
+        }
+    }
     Ok(provider)
 }
 

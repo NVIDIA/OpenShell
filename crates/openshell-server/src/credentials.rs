@@ -45,6 +45,7 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 #[cfg(unix)]
 use tower::service_fn;
+use tracing::warn;
 
 use crate::persistence::{PersistenceError, Store, WriteCondition};
 
@@ -426,15 +427,37 @@ impl CredentialRuntime {
                     .get(&response.request_id)
                     .expect("validated response request_id")
                     .clone();
-                if response.expires_at_ms > 0 && response.expires_at_ms <= now_ms {
-                    return Err(Status::failed_precondition(format!(
-                        "credential driver '{driver_name}' returned expired credential for provider credential '{credential_key}'"
-                    )));
+
+                // Check provider-level expiration
+                let provider_expires_at_ms = provider
+                    .credential_expires_at_ms
+                    .get(&credential_key)
+                    .copied()
+                    .unwrap_or(0);
+
+                // Compute effective expiration (earliest non-zero timestamp)
+                let effective_expires_at_ms = match (provider_expires_at_ms, response.expires_at_ms)
+                {
+                    (0, driver) => driver,
+                    (provider, 0) => provider,
+                    (provider, driver) => provider.min(driver),
+                };
+
+                if effective_expires_at_ms > 0 && effective_expires_at_ms <= now_ms {
+                    warn!(
+                        provider_name = %provider_name,
+                        credential_key = %credential_key,
+                        provider_expires_at_ms,
+                        driver_expires_at_ms = response.expires_at_ms,
+                        effective_expires_at_ms,
+                        "skipping expired handle-backed credential"
+                    );
+                    continue;
                 }
-                if response.expires_at_ms > 0 {
+                if effective_expires_at_ms > 0 {
                     resolved
                         .expires_at_ms
-                        .insert(credential_key.clone(), response.expires_at_ms);
+                        .insert(credential_key.clone(), effective_expires_at_ms);
                 }
                 resolved.values.insert(credential_key, response.value);
             }
