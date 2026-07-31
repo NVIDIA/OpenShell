@@ -1499,40 +1499,83 @@ pub fn validate_oci_workspace_as_effective_identity(root: &Path) -> Result<()> {
         }
 
         let is_workspace = index == last_component;
-        let access = if is_workspace {
-            Access::WRITE_OK | Access::EXEC_OK
-        } else {
-            Access::EXEC_OK
-        };
         rustix::fs::accessat(
             &current_fd,
             &component,
-            access,
+            Access::EXEC_OK,
             AtFlags::EACCESS | AtFlags::SYMLINK_NOFOLLOW,
         )
         .map_err(|error| {
-            let requirement = if is_workspace {
-                "writable and traversable"
-            } else {
-                "traversable"
-            };
             miette::miette!(
-                "workspace path component '{}' is not {requirement} by the sandbox identity in the image: {error}",
+                "workspace path component '{}' is not traversable by the sandbox identity in the image: {error}",
                 current_path.display()
             )
         })?;
 
-        current_fd = rustix::fs::openat(&current_fd, &component, open_flags, Mode::empty())
+        let next_fd = rustix::fs::openat(&current_fd, &component, open_flags, Mode::empty())
             .map_err(|error| {
                 miette::miette!(
                     "failed to open image workspace path component '{}': {error}",
                     current_path.display()
                 )
             })?;
-        reject_special_workspace_filesystem_fd(&current_fd, &current_path)?;
+        reject_special_workspace_filesystem_fd(&next_fd, &current_path)?;
+        if is_workspace {
+            validate_effective_workspace_write(&next_fd, &current_path)?;
+        }
+        current_fd = next_fd;
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_effective_workspace_write(fd: &impl std::os::fd::AsFd, path: &Path) -> Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+
+    let mode = Mode::RUSR | Mode::WUSR;
+    let tmpfile_flags = OFlags::TMPFILE | OFlags::WRONLY | OFlags::CLOEXEC;
+    match rustix::fs::openat(fd, ".", tmpfile_flags, mode) {
+        Ok(_probe) => return Ok(()),
+        Err(rustix::io::Errno::INVAL | rustix::io::Errno::ISDIR | rustix::io::Errno::NOTSUP) => {}
+        Err(error) => {
+            return Err(miette::miette!(
+                "workspace path component '{}' is not writable by the sandbox identity in the image: {error}",
+                path.display()
+            ));
+        }
+    }
+
+    // Some filesystems do not implement O_TMPFILE. Fall back to a short-lived,
+    // no-follow entry. A collision fails closed after bounded retries.
+    let create_flags =
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    for attempt in 0..16 {
+        let name = format!(".openshell-workdir-probe-{}-{attempt}", std::process::id());
+        match rustix::fs::openat(fd, &name, create_flags, mode) {
+            Ok(_probe) => {
+                rustix::fs::unlinkat(fd, &name, AtFlags::empty()).map_err(|error| {
+                    miette::miette!(
+                        "workspace write probe cleanup failed for '{}': {error}",
+                        path.display()
+                    )
+                })?;
+                return Ok(());
+            }
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => {
+                return Err(miette::miette!(
+                    "workspace path component '{}' is not writable by the sandbox identity in the image: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    Err(miette::miette!(
+        "workspace write probe could not allocate a unique entry in '{}'",
+        path.display()
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -3058,10 +3101,6 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn effective_identity_validation_honors_named_user_acl() {
-        if !nix::unistd::geteuid().is_root() {
-            return;
-        }
-
         const TEST_UID: u32 = 42_234;
         const TEST_GID: u32 = 42_235;
         const ACL_XATTR_VERSION: u32 = 2;
@@ -3072,6 +3111,10 @@ mod tests {
         const ACL_OTHER: u16 = 0x20;
         const ACL_UNDEFINED_ID: u32 = u32::MAX;
 
+        if !nix::unistd::geteuid().is_root() {
+            return;
+        }
+
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
         let root = dir.path().canonicalize().unwrap().join("project");
@@ -3080,17 +3123,17 @@ mod tests {
 
         let mut acl = ACL_XATTR_VERSION.to_ne_bytes().to_vec();
         for (tag, permissions, id) in [
-            (ACL_USER_OBJ, 0o7, ACL_UNDEFINED_ID),
-            (ACL_USER, 0o7, TEST_UID),
-            (ACL_GROUP_OBJ, 0o0, ACL_UNDEFINED_ID),
-            (ACL_MASK, 0o7, ACL_UNDEFINED_ID),
-            (ACL_OTHER, 0o0, ACL_UNDEFINED_ID),
+            (ACL_USER_OBJ, 0o7_u16, ACL_UNDEFINED_ID),
+            (ACL_USER, 0o7_u16, TEST_UID),
+            (ACL_GROUP_OBJ, 0o0_u16, ACL_UNDEFINED_ID),
+            (ACL_MASK, 0o7_u16, ACL_UNDEFINED_ID),
+            (ACL_OTHER, 0o0_u16, ACL_UNDEFINED_ID),
         ] {
             acl.extend_from_slice(&tag.to_ne_bytes());
             acl.extend_from_slice(&permissions.to_ne_bytes());
             acl.extend_from_slice(&id.to_ne_bytes());
         }
-        let path = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).unwrap();
+        let path = CString::new(root.as_os_str().as_encoded_bytes()).unwrap();
         let name = c"system.posix_acl_access";
         let result = unsafe {
             libc::setxattr(
@@ -3147,13 +3190,13 @@ mod tests {
         policy.landlock = LandlockPolicy {
             compatibility: openshell_core::policy::LandlockCompatibility::HardRequirement,
         };
-        let Ok(prepared) = crate::sandbox::prepare_current_user(&policy, None) else {
+        let Ok(prepared) = sandbox::linux::prepare_current_user(&policy, None) else {
             return;
         };
 
         match unsafe { fork() }.expect("fork should succeed") {
             ForkResult::Child => {
-                let denied = crate::sandbox::enforce(prepared).is_ok()
+                let denied = sandbox::linux::enforce(prepared).is_ok()
                     && validate_oci_workspace_as_effective_identity(&root).is_err();
                 unsafe { libc::_exit(i32::from(!denied)) };
             }
