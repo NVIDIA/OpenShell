@@ -2232,6 +2232,38 @@ enum GatewayRuntimeReloadError {
     MiddlewareRegistry(miette::Report),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatewayRuntimeFailureClass {
+    PolicyValidation,
+    MiddlewareRegistry,
+}
+
+impl GatewayRuntimeReloadError {
+    fn class(&self) -> GatewayRuntimeFailureClass {
+        match self {
+            Self::PolicyValidation(_) => GatewayRuntimeFailureClass::PolicyValidation,
+            Self::MiddlewareRegistry(_) => GatewayRuntimeFailureClass::MiddlewareRegistry,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FailedRuntimeRevision {
+    config_revision: u64,
+    policy_hash: String,
+    failure_class: GatewayRuntimeFailureClass,
+}
+
+impl FailedRuntimeRevision {
+    fn new(config_revision: u64, policy_hash: &str, failure: &GatewayRuntimeReloadError) -> Self {
+        Self {
+            config_revision,
+            policy_hash: policy_hash.to_string(),
+            failure_class: failure.class(),
+        }
+    }
+}
+
 async fn reload_gateway_policy_runtime(
     engine: &OpaEngine,
     policy: Option<&openshell_core::proto::SandboxPolicy>,
@@ -2875,7 +2907,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         openshell_core::proto::EffectiveSetting,
     > = std::collections::HashMap::new();
     let reloads_gateway_policy = ctx.loaded_policy_origin.allows_gateway_policy_reload();
-    let mut last_failed_runtime_revision: Option<(u64, String)> = None;
+    let mut last_failed_runtime_revision: Option<FailedRuntimeRevision> = None;
     let mut rejected_policy_generation: Option<RejectedPolicyGeneration> = None;
     let mut has_last_valid_policy = ctx.loaded_policy_origin.has_last_valid_policy();
 
@@ -3202,7 +3234,11 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                     last_failed_runtime_revision = None;
                 }
                 Err(failure) => {
-                    let failed_revision = (result.config_revision, result.policy_hash.clone());
+                    let failed_revision = FailedRuntimeRevision::new(
+                        result.config_revision,
+                        &result.policy_hash,
+                        &failure,
+                    );
                     if last_failed_runtime_revision.as_ref() != Some(&failed_revision) {
                         let failure_mode = result.policy_validation_failure_mode;
                         match apply_gateway_runtime_reload_failure(
@@ -3854,6 +3890,56 @@ filesystem_policy:
         ));
         assert_eq!(engine.current_generation(), active_generation);
         assert!(engine.fail_closed_reason().is_none());
+    }
+
+    #[test]
+    fn policy_rejection_after_middleware_outage_is_not_deduplicated() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../../openshell-supervisor-network/data/sandbox-policy.rego"),
+            "network_policies: {}\n",
+        )
+        .unwrap();
+        let middleware_failure = GatewayRuntimeReloadError::MiddlewareRegistry(miette::miette!(
+            "middleware service unavailable"
+        ));
+        let first_failure = FailedRuntimeRevision::new(42, "sha256:candidate", &middleware_failure);
+        let middleware_disposition = apply_gateway_runtime_reload_failure(
+            &engine,
+            middleware_failure,
+            PolicyValidationFailureMode::FailClosed,
+            true,
+            7,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            middleware_disposition,
+            GatewayRuntimeFailureDisposition::MiddlewareUnavailable { .. }
+        ));
+        assert!(engine.fail_closed_reason().is_none());
+
+        let policy_failure = GatewayRuntimeReloadError::PolicyValidation(miette::miette!(
+            "conflicting endpoint metadata"
+        ));
+        let second_failure = FailedRuntimeRevision::new(42, "sha256:candidate", &policy_failure);
+        assert_ne!(
+            first_failure, second_failure,
+            "a changed failure class for the same candidate must be handled"
+        );
+
+        let policy_disposition = apply_gateway_runtime_reload_failure(
+            &engine,
+            policy_failure,
+            PolicyValidationFailureMode::FailClosed,
+            true,
+            7,
+        )
+        .unwrap();
+        assert!(matches!(
+            policy_disposition,
+            GatewayRuntimeFailureDisposition::PolicyRejected { .. }
+        ));
+        assert!(engine.fail_closed_reason().is_some());
     }
 
     #[test]
