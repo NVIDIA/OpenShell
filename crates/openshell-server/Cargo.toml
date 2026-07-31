@@ -99,7 +99,7 @@ async-trait = "0.1"
 url = { workspace = true }
 glob = { workspace = true }
 hex = "0.4"
-russh = "0.57"
+russh = "0.61"
 rand = { workspace = true }
 petname = "2"
 ipnet = "2"
