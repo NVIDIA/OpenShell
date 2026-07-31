@@ -1,6 +1,6 @@
 ---
 name: fix-security-issue
-description: Implement a fix for a reviewed security issue. Takes an issue number or scans for issues labeled "topic:security" and "state:agent-ready". Reads the security review from the issue comments and implements the remediation plan. Trigger keywords - fix security issue, remediate security, implement security fix, patch vulnerability.
+description: Implement a fix for a reviewed security issue. Takes a directly requested issue number or scans for issues labeled `topic:security` and `agent:implementation-requested`. Reads the security review from the issue comments and implements the remediation plan. Trigger keywords - fix security issue, remediate security, implement security fix, patch vulnerability.
 ---
 
 # Fix Security Issue
@@ -11,7 +11,7 @@ Implement a code fix for a security issue that has already been reviewed by the 
 
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must be in a git repository with a GitHub remote
-- The issue **must** have both the `topic:security` and `state:agent-ready` labels. If either is missing, do not proceed.
+- The issue must have `topic:security`. In unattended scan mode it must also have `agent:implementation-requested`; a direct user request to fix a specific issue does not require that label.
 - The issue must have a prior security review comment (posted by `review-security-issue`) with a **Legitimate concern** determination and a remediation plan
 
 ## Agent Comment Marker
@@ -30,14 +30,14 @@ The user may provide an issue number directly, or ask the agent to find issues t
 
 ### If an issue number is provided
 
-Strip any leading `#` and proceed to Step 2 with that issue ID.
+Strip any leading `#` and proceed to Step 2 with that issue ID. The user's explicit fix request authorizes implementation; do not refuse solely because `agent:implementation-requested` is absent.
 
 ### If no issue number is provided
 
-Scan for open issues labeled `topic:security` and `state:agent-ready`:
+Scan for open issues labeled `topic:security` and `agent:implementation-requested`:
 
 ```bash
-gh issue list --label "topic:security" --label "state:agent-ready" --state open --json number,title,labels,updatedAt
+gh issue list --label "topic:security" --label "agent:implementation-requested" --state open --json number,title,labels,updatedAt
 ```
 
 - **If no issues are found**, report to the user that there are no security issues ready for fixing and stop.
@@ -52,20 +52,16 @@ Fetch the issue details:
 gh issue view <id> --json number,title,body,state,labels,author
 ```
 
-### Require both `topic:security` and `state:agent-ready` labels
+### Validate the Security Label and Invocation Mode
 
-**This is a hard gate.** Check the issue's `labels` array from the response above. Both of the following labels **must** be present:
+Check the issue's `labels` array from the response above:
 
-- `topic:security`
-- `state:agent-ready`
+- `topic:security` is required because this specialized skill handles security issues.
+- `agent:implementation-requested` is required only when an unattended agent discovered the issue by scanning the queue.
 
-If **either label is missing**, do **not** proceed. Report to the user which label(s) are missing and stop. For example:
+If `topic:security` is missing, report that this skill only handles security issues and stop. If queue mode selected an issue without `agent:implementation-requested`, report that it is not ready for unattended pickup and stop.
 
-- Missing `state:agent-ready`: "Issue #42 has the `topic:security` label but is not marked `state:agent-ready`. It may still need review or human triage before a fix can be implemented."
-- Missing `topic:security`: "Issue #42 is marked `state:agent-ready` but does not have the `topic:security` label. This skill only handles security issues."
-- Missing both: "Issue #42 is missing both the `topic:security` and `state:agent-ready` labels. Cannot proceed."
-
-**Do not offer to add the labels or bypass this check.** The labels are a deliberate human-controlled gate.
+Never apply `agent:implementation-requested` yourself. Its absence does not block a direct user request to fix a specific issue.
 
 ### Validate the security review
 
@@ -99,6 +95,12 @@ git checkout -b fix/security-<issue-id>-<short-description>
 ```
 
 Follow the project's branch naming conventions. The branch name should reference the issue ID.
+
+In queue mode, replace the human request and ready-plan labels with the agent execution state. For an unlabeled direct invocation, do not add an agent-workflow label:
+
+```bash
+gh issue edit <id> --remove-label "agent:implementation-requested" --remove-label "agent:plan-ready" --add-label "agent:in-progress"
+```
 
 ## Step 5: Implement the Fix
 
@@ -232,6 +234,12 @@ EOF
 Created PR [#<number>](https://github.com/OWNER/REPO/pull/<number>)
 ```
 
+In queue mode, replace `agent:in-progress` with `agent:pr-opened` after the PR is created. For an unlabeled direct invocation, do not add an agent-workflow label:
+
+```bash
+gh issue edit <id> --remove-label "agent:in-progress" --add-label "agent:pr-opened"
+```
+
 ## Step 9: Report to User
 
 Summarize what was done:
@@ -247,7 +255,7 @@ Summarize what was done:
 
 | Command | Description |
 | --- | --- |
-| `gh issue list --label "topic:security" --label "state:agent-ready" --state open` | Find open security issues ready for fixing |
+| `gh issue list --label "topic:security" --label "agent:implementation-requested" --state open` | Find security issues whose fixes a human requested |
 | `gh issue view <id> --json number,title,body,state,labels,author` | Fetch full issue metadata |
 | `gh issue view <id> --json comments` | Fetch all comments on an issue |
 | `gh pr create --title "..." --body "..."` | Create a pull request |
@@ -271,11 +279,11 @@ User says: "Fix security issue #42"
 8. Commit, push, and open PR with `Closes #42`
 9. Report the PR link and changes to the user
 
-### Scan and fix agent-ready issues
+### Scan and fix requested security issues
 
 User says: "Fix any ready security issues"
 
-1. Query for open issues with labels `topic:security` + `state:agent-ready`
+1. Query for open issues with labels `topic:security` + `agent:implementation-requested`
 2. Find issue #78: "SQL injection in search endpoint"
 3. Fetch the review comment -- determination is "Legitimate concern"
 4. Implement parameterized queries
@@ -292,20 +300,20 @@ User says: "Fix security issue #99"
 3. Report to the user: "Issue #99 was reviewed and determined to be not actionable. No fix is needed."
 4. Stop
 
-### Issue missing `state:agent-ready` label
+### Directly requested issue without `agent:implementation-requested`
 
 User says: "Fix security issue #55"
 
 1. Fetch issue #55 metadata
-2. Labels are `["topic:security"]` -- missing `state:agent-ready`
-3. Report to the user: "Issue #55 has the `topic:security` label but is not marked `state:agent-ready`. It may still need review or human triage before a fix can be implemented."
-4. Stop
+2. Labels are `["topic:security"]` -- missing `agent:implementation-requested`
+3. Confirm that a legitimate security review and remediation plan exist
+4. Proceed because the user's direct request authorizes implementation
 
 ### Issue without a review
 
 User says: "Fix security issue #60"
 
-1. Fetch issue #60 metadata -- labels include both `topic:security` and `state:agent-ready`
+1. Fetch issue #60 metadata -- `topic:security` is present and the user directly requested the fix
 2. Fetch comments -- no `security-review-agent` comment found
 3. Report to the user: "Issue #60 has not been reviewed yet. Run the review-security-issue skill first."
 4. Stop

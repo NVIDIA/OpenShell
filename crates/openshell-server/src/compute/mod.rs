@@ -57,11 +57,75 @@ use tokio::sync::{Mutex, watch};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
 use tower::service_fn;
-use tracing::{debug, info, warn};
+use tracing::{Instrument as _, debug, info, warn};
 
 type DriverWatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
 type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
+
+use traced_driver::TracedDriver;
+
+/// Instrumenting wrapper around the compute driver.
+mod traced_driver {
+    use std::future::Future;
+
+    use tonic::Status;
+    use tracing::Instrument as _;
+
+    use super::SharedComputeDriver;
+
+    #[derive(Clone)]
+    pub(super) struct TracedDriver {
+        inner: SharedComputeDriver,
+        name: String,
+    }
+
+    impl TracedDriver {
+        pub(super) fn new(inner: SharedComputeDriver, name: String) -> Self {
+            Self { inner, name }
+        }
+
+        /// Run one call across the driver boundary inside its span.
+        ///
+        /// Takes a closure rather than a future so the call cannot be built
+        /// without going through here.
+        pub(super) async fn call<T, Fut>(
+            &self,
+            operation: &'static str,
+            sandbox_id: Option<&str>,
+            call: impl FnOnce(SharedComputeDriver) -> Fut,
+        ) -> Result<T, Status>
+        where
+            Fut: Future<Output = Result<T, Status>>,
+        {
+            let span = tracing::info_span!(
+                "driver",
+                otel.name = operation,
+                otel.kind = "client",
+                otel.status_code = tracing::field::Empty,
+                driver.name = %self.name,
+                sandbox.id = tracing::field::Empty,
+                grpc.code = tracing::field::Empty,
+            );
+            if let Some(sandbox_id) = sandbox_id {
+                span.record("sandbox.id", sandbox_id);
+            }
+
+            let future = call(self.inner.clone());
+            async {
+                let result = future.await;
+                if let Err(status) = &result {
+                    let current = tracing::Span::current();
+                    crate::otel_tracing::mark_error(&current);
+                    current.record("grpc.code", status.code() as i32);
+                }
+                result
+            }
+            .instrument(span)
+            .await
+        }
+    }
+}
 
 const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
 
@@ -357,7 +421,7 @@ impl ComputeDriver for RemoteComputeDriver {
 
 #[derive(Clone)]
 pub struct ComputeRuntime {
-    driver: SharedComputeDriver,
+    driver: TracedDriver,
     driver_info: ComputeDriverInfoSnapshot,
     shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
     startup_resume: Option<Arc<dyn StartupResume>>,
@@ -382,6 +446,15 @@ impl fmt::Debug for ComputeRuntime {
 
 impl ComputeRuntime {
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "driver.initialize",
+        skip_all,
+        fields(
+            otel.name = "driver.initialize",
+            otel.status_code = tracing::field::Empty,
+            driver.name = %driver_name,
+        )
+    )]
     async fn from_driver(
         driver_name: String,
         driver: SharedComputeDriver,
@@ -398,7 +471,10 @@ impl ComputeRuntime {
         let capabilities = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
             .await
-            .map_err(compute_error_from_status)?
+            .map_err(|status| {
+                tracing::Span::current().record("otel.status_code", "ERROR");
+                compute_error_from_status(status)
+            })?
             .into_inner();
         let driver_kind = driver_name.parse::<ComputeDriverKind>().ok();
         info!(
@@ -408,13 +484,13 @@ impl ComputeRuntime {
             "Compute driver connected"
         );
         let driver_info = ComputeDriverInfoSnapshot {
-            name: driver_name,
+            name: driver_name.clone(),
             driver_name: capabilities.driver_name,
             driver_version: capabilities.driver_version,
         };
         let default_image = capabilities.default_image;
         Ok(Self {
-            driver,
+            driver: TracedDriver::new(driver, driver_name),
             driver_info,
             shutdown_cleanup,
             startup_resume,
@@ -596,9 +672,17 @@ impl ComputeRuntime {
         let driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
         self.driver
-            .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
-                sandbox: Some(driver_sandbox),
-            }))
+            .call(
+                "driver.validate_sandbox_create",
+                Some(sandbox.object_id()),
+                |driver| async move {
+                    driver
+                        .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
+                            sandbox: Some(driver_sandbox),
+                        }))
+                        .await
+                },
+            )
             .await
             .map(|_| ())
     }
@@ -657,9 +741,17 @@ impl ComputeRuntime {
         }
         match self
             .driver
-            .create_sandbox(Request::new(CreateSandboxRequest {
-                sandbox: Some(driver_sandbox),
-            }))
+            .call(
+                "driver.create_sandbox",
+                Some(sandbox.object_id()),
+                |driver| async move {
+                    driver
+                        .create_sandbox(Request::new(CreateSandboxRequest {
+                            sandbox: Some(driver_sandbox),
+                        }))
+                        .await
+                },
+            )
             .await
         {
             Ok(_) => {
@@ -724,11 +816,17 @@ impl ComputeRuntime {
         // the worker. From this commitment point onward, request cancellation
         // cannot stop the delete after it starts mutating durable state.
         let runtime = self.clone();
-        tokio::spawn(async move {
-            runtime
-                .delete_sandbox_inner(target, delete_guard, global_guard)
-                .await
-        })
+        // `tokio::spawn` detaches from the current span, which would orphan
+        // the driver span from the request trace. Carry the span across.
+        let request_span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                runtime
+                    .delete_sandbox_inner(target, delete_guard, global_guard)
+                    .await
+            }
+            .instrument(request_span),
+        )
         .await
         .map_err(|err| {
             Status::internal(format!(
@@ -786,10 +884,22 @@ impl ComputeRuntime {
 
         let result = self
             .driver
-            .delete_sandbox(Request::new(DeleteSandboxRequest {
-                sandbox_id: transition.deleting.object_id().to_string(),
-                sandbox_name: transition.deleting.object_name().to_string(),
-            }))
+            .call(
+                "driver.delete_sandbox",
+                Some(transition.deleting.object_id()),
+                |driver| {
+                    let sandbox_id = transition.deleting.object_id().to_string();
+                    let sandbox_name = transition.deleting.object_name().to_string();
+                    async move {
+                        driver
+                            .delete_sandbox(Request::new(DeleteSandboxRequest {
+                                sandbox_id,
+                                sandbox_name,
+                            }))
+                            .await
+                    }
+                },
+            )
             .await;
 
         match result {
@@ -1514,9 +1624,15 @@ impl ComputeRuntime {
 
     async fn watch_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
+            // Spans the stream open, not its lifetime: the future resolves
+            // once the driver accepts the watch.
             let mut stream = match self
                 .driver
-                .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
+                .call("driver.watch_sandboxes", None, |driver| async move {
+                    driver
+                        .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
+                        .await
+                })
                 .await
             {
                 Ok(response) => response.into_inner(),
@@ -1574,30 +1690,49 @@ impl ComputeRuntime {
         }
     }
 
+    #[tracing::instrument(
+        name = "reconcile",
+        skip_all,
+        fields(
+            otel.name = "reconcile.sandboxes",
+            driver.name = %self.driver_info.name,
+            backend_count = tracing::field::Empty,
+            store_count = tracing::field::Empty,
+        )
+    )]
     async fn reconcile_store_with_backend(&self, grace_period: Duration) -> Result<(), String> {
         let sweep_started_at_ms = openshell_core::time::now_ms();
         let backend_sandboxes = self
             .driver
-            .list_sandboxes(Request::new(ListSandboxesRequest {}))
+            .call("driver.list_sandboxes", None, |driver| async move {
+                driver
+                    .list_sandboxes(Request::new(ListSandboxesRequest {}))
+                    .await
+            })
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())
+            .inspect_err(|_| crate::otel_tracing::mark_error(&tracing::Span::current()))?
             .into_inner()
             .sandboxes;
         let backend_ids = backend_sandboxes
             .iter()
             .map(|sandbox| sandbox.id.clone())
             .collect::<std::collections::HashSet<_>>();
+        tracing::Span::current().record("backend_count", backend_sandboxes.len());
 
         for sandbox in backend_sandboxes {
             self.reconcile_snapshot_sandbox(sandbox, sweep_started_at_ms)
-                .await?;
+                .await
+                .inspect_err(|_| crate::otel_tracing::mark_error(&tracing::Span::current()))?;
         }
 
         let records = self
             .store
             .list_by_type(Sandbox::object_type(), 500, 0)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+            .inspect_err(|_| crate::otel_tracing::mark_error(&tracing::Span::current()))?;
+        tracing::Span::current().record("store_count", records.len());
 
         let grace_ms = grace_period.as_millis().try_into().unwrap_or(i64::MAX);
 
@@ -1615,13 +1750,50 @@ impl ComputeRuntime {
             }
 
             self.prune_missing_sandbox(record, sweep_started_at_ms, grace_ms)
-                .await?;
+                .await
+                .inspect_err(|_| crate::otel_tracing::mark_error(&tracing::Span::current()))?;
         }
 
         Ok(())
     }
 
     async fn apply_watch_event(&self, event: WatchSandboxesEvent) -> Result<(), String> {
+        let (operation, sandbox_id) = match &event.payload {
+            Some(watch_sandboxes_event::Payload::Sandbox(update)) => (
+                "driver_watch.sandbox_updated",
+                update
+                    .sandbox
+                    .as_ref()
+                    .map(|sandbox| sandbox.id.as_str())
+                    .unwrap_or_default(),
+            ),
+            Some(watch_sandboxes_event::Payload::Deleted(deleted)) => {
+                ("driver_watch.sandbox_deleted", deleted.sandbox_id.as_str())
+            }
+            Some(watch_sandboxes_event::Payload::PlatformEvent(platform_event)) => (
+                "driver_watch.platform_event",
+                platform_event.sandbox_id.as_str(),
+            ),
+            None => return Ok(()),
+        };
+        let span = tracing::info_span!(
+            "driver_watch",
+            otel.name = operation,
+            otel.status_code = tracing::field::Empty,
+            sandbox.id = %sandbox_id,
+        );
+        async {
+            let result = self.apply_watch_event_inner(event).await;
+            if result.is_err() {
+                crate::otel_tracing::mark_error(&tracing::Span::current());
+            }
+            result
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn apply_watch_event_inner(&self, event: WatchSandboxesEvent) -> Result<(), String> {
         match event.payload {
             Some(watch_sandboxes_event::Payload::Sandbox(sandbox)) => {
                 if let Some(sandbox) = sandbox.sandbox {
@@ -2068,10 +2240,18 @@ impl ComputeRuntime {
     ) -> Result<Option<DriverSandbox>, String> {
         match self
             .driver
-            .get_sandbox(Request::new(GetSandboxRequest {
-                sandbox_id: sandbox_id.to_string(),
-                sandbox_name: sandbox_name.to_string(),
-            }))
+            .call("driver.get_sandbox", Some(sandbox_id), |driver| {
+                let sandbox_id = sandbox_id.to_string();
+                let sandbox_name = sandbox_name.to_string();
+                async move {
+                    driver
+                        .get_sandbox(Request::new(GetSandboxRequest {
+                            sandbox_id,
+                            sandbox_name,
+                        }))
+                        .await
+                }
+            })
             .await
         {
             Ok(response) => {
@@ -2830,7 +3010,7 @@ pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
 #[cfg(test)]
 pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -> ComputeRuntime {
     ComputeRuntime {
-        driver: Arc::new(NoopTestDriver),
+        driver: TracedDriver::new(Arc::new(NoopTestDriver), "test".to_string()),
         driver_info: ComputeDriverInfoSnapshot {
             name: driver_name.to_string(),
             driver_name: driver_name.to_string(),
@@ -3299,7 +3479,7 @@ mod tests {
     ) -> ComputeRuntime {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
-            driver,
+            driver: TracedDriver::new(driver, "test-driver".to_string()),
             driver_info: ComputeDriverInfoSnapshot {
                 name: "test-driver".to_string(),
                 driver_name: "test-driver".to_string(),
@@ -3914,6 +4094,160 @@ mod tests {
             compute_error_from_status(Status::failed_precondition("sandbox agent pod IP is not available")),
             ComputeError::Precondition(message) if message == "sandbox agent pod IP is not available"
         ));
+    }
+
+    /// Driver calls are a remote boundary even in-process: they reach the
+    /// Docker daemon, the Kubernetes API, or a Podman socket.
+    #[tokio::test]
+    async fn driver_calls_export_spans_with_parents() {
+        use tracing::Instrument as _;
+
+        use crate::otel_tracing::test_collector;
+
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-trace", "sandbox-trace", SandboxPhase::Provisioning);
+
+        let traced = test_collector::install_traced();
+        async {
+            runtime
+                .create_sandbox(sandbox, None)
+                .await
+                .expect("create succeeds");
+        }
+        .instrument(tracing::info_span!("request"))
+        .await;
+
+        let driver_span = traced.span_with("driver.create_sandbox", "sandbox.id", "sb-trace");
+        test_collector::assert_has_parent(&driver_span);
+        assert_eq!(
+            test_collector::attribute(&driver_span, "driver.name").as_deref(),
+            Some("test-driver"),
+            "the span names which driver was called"
+        );
+        assert_eq!(
+            test_collector::attribute(&driver_span, "sandbox.id").as_deref(),
+            Some("sb-trace"),
+        );
+        assert_eq!(
+            driver_span.span_kind,
+            opentelemetry::trace::SpanKind::Client,
+            "the gateway is the caller at this boundary"
+        );
+        assert!(
+            !matches!(
+                driver_span.status,
+                opentelemetry::trace::Status::Error { .. }
+            ),
+            "a successful driver call is not marked an error, got {:?}",
+            driver_span.status
+        );
+    }
+
+    /// A failing driver call must be visible as a failure in the trace, not
+    /// just as a span that happens to be followed by nothing.
+    #[tokio::test]
+    async fn failed_driver_calls_are_marked_on_the_span() {
+        use tracing::Instrument as _;
+
+        use crate::otel_tracing::test_collector;
+
+        /// A driver that behaves normally except that creates fail, so the
+        /// test exercises only the failure attribute.
+        #[derive(Debug, Default)]
+        struct FailingDriver(TestDriver);
+
+        #[tonic::async_trait]
+        impl ComputeDriver for FailingDriver {
+            type WatchSandboxesStream = DriverWatchStream;
+
+            async fn create_sandbox(
+                &self,
+                _request: Request<CreateSandboxRequest>,
+            ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
+                Err(Status::unavailable("driver is down"))
+            }
+
+            async fn get_capabilities(
+                &self,
+                request: Request<GetCapabilitiesRequest>,
+            ) -> Result<tonic::Response<GetCapabilitiesResponse>, Status> {
+                self.0.get_capabilities(request).await
+            }
+
+            async fn validate_sandbox_create(
+                &self,
+                request: Request<ValidateSandboxCreateRequest>,
+            ) -> Result<tonic::Response<ValidateSandboxCreateResponse>, Status> {
+                self.0.validate_sandbox_create(request).await
+            }
+
+            async fn get_sandbox(
+                &self,
+                request: Request<GetSandboxRequest>,
+            ) -> Result<tonic::Response<GetSandboxResponse>, Status> {
+                self.0.get_sandbox(request).await
+            }
+
+            async fn list_sandboxes(
+                &self,
+                request: Request<ListSandboxesRequest>,
+            ) -> Result<
+                tonic::Response<openshell_core::proto::compute::v1::ListSandboxesResponse>,
+                Status,
+            > {
+                self.0.list_sandboxes(request).await
+            }
+
+            async fn stop_sandbox(
+                &self,
+                request: Request<StopSandboxRequest>,
+            ) -> Result<tonic::Response<StopSandboxResponse>, Status> {
+                self.0.stop_sandbox(request).await
+            }
+
+            async fn delete_sandbox(
+                &self,
+                request: Request<DeleteSandboxRequest>,
+            ) -> Result<tonic::Response<DeleteSandboxResponse>, Status> {
+                self.0.delete_sandbox(request).await
+            }
+
+            async fn watch_sandboxes(
+                &self,
+                request: Request<WatchSandboxesRequest>,
+            ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
+                self.0.watch_sandboxes(request).await
+            }
+        }
+
+        let runtime = test_runtime(Arc::new(FailingDriver::default())).await;
+        let sandbox = sandbox_record("sb-fail", "sandbox-fail", SandboxPhase::Provisioning);
+
+        let traced = test_collector::install_traced();
+        async {
+            runtime
+                .create_sandbox(sandbox, None)
+                .await
+                .expect_err("driver refuses the create");
+        }
+        .instrument(tracing::info_span!("request"))
+        .await;
+
+        let driver_span = traced.span_with("driver.create_sandbox", "sandbox.id", "sb-fail");
+
+        assert!(
+            matches!(
+                driver_span.status,
+                opentelemetry::trace::Status::Error { .. }
+            ),
+            "the span carries error status so trace UIs flag it, got {:?}",
+            driver_span.status
+        );
+        assert_eq!(
+            test_collector::attribute(&driver_span, "grpc.code").as_deref(),
+            Some("14"),
+            "the gRPC code names the cause without reading the message"
+        );
     }
 
     #[tokio::test]
@@ -5669,6 +6003,110 @@ mod tests {
         }));
     }
 
+    /// Driver watch events arrive on a background stream, so the store writes
+    /// they trigger land outside the request that caused them.
+    #[tokio::test]
+    async fn driver_watch_events_are_roots_and_store_operations_have_parents() {
+        use crate::otel_tracing::test_collector;
+
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime.sandbox_index.update_from_sandbox(&sandbox);
+
+        let traced = test_collector::install_traced();
+        runtime
+            .apply_watch_event(deleted_watch_event("sb-1"))
+            .await
+            .unwrap();
+
+        let spans = traced.finished_spans();
+        let root = spans
+            .iter()
+            .find(|s| s.name == "driver_watch.sandbox_deleted")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the event records a span of its own, got {:?}",
+                    spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+
+        test_collector::assert_is_root(root);
+        assert_eq!(
+            test_collector::attribute(root, "sandbox.id").as_deref(),
+            Some("sb-1"),
+            "the span names which sandbox the driver reported on"
+        );
+
+        let store_span = spans
+            .iter()
+            .find(|span| {
+                span.name.starts_with("store.")
+                    && span.span_context.trace_id() == root.span_context.trace_id()
+            })
+            .expect("the event records its store operation");
+        test_collector::assert_has_parent(store_span);
+    }
+
+    /// The reconciler runs on a timer with no inbound request, so without a
+    /// span of its own each store call becomes its own anonymous trace.
+    #[tokio::test]
+    async fn reconcile_sweeps_are_roots_and_operations_have_parents() {
+        use crate::otel_tracing::test_collector;
+
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime.sandbox_index.update_from_sandbox(&sandbox);
+
+        let traced = test_collector::install_traced();
+        runtime
+            .reconcile_store_with_backend(Duration::ZERO)
+            .await
+            .unwrap();
+
+        // Other tests drive their own reconcile loops into the shared
+        // exporter, so match on the shape of a sweep rather than assuming
+        // there is exactly one.
+        let spans = traced.finished_spans();
+        let roots = traced.spans_named("reconcile.sandboxes");
+        assert!(
+            !roots.is_empty(),
+            "the sweep records a span of its own, got {:?}",
+            spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        let root = roots
+            .iter()
+            .find(|root| {
+                spans.iter().any(|span| {
+                    span.name == "driver.list_sandboxes"
+                        && span.span_context.trace_id() == root.span_context.trace_id()
+                }) && spans.iter().any(|span| {
+                    span.name.starts_with("store.")
+                        && span.span_context.trace_id() == root.span_context.trace_id()
+                })
+            })
+            .expect("the sweep records its driver and store operations");
+        test_collector::assert_is_root(root);
+
+        let driver_span = spans
+            .iter()
+            .find(|span| {
+                span.name == "driver.list_sandboxes"
+                    && span.span_context.trace_id() == root.span_context.trace_id()
+            })
+            .expect("the sweep records its driver call");
+        test_collector::assert_has_parent(driver_span);
+        let store_span = spans
+            .iter()
+            .find(|span| {
+                span.name.starts_with("store.")
+                    && span.span_context.trace_id() == root.span_context.trace_id()
+            })
+            .expect("the sweep records its store operation");
+        test_collector::assert_has_parent(store_span);
+    }
+
     #[tokio::test]
     async fn reconcile_store_with_backend_does_not_recreate_missing_record_from_snapshot() {
         let runtime = test_runtime(Arc::new(TestDriver {
@@ -6074,6 +6512,32 @@ mod tests {
             config.is_none() || !config.as_ref().unwrap().fields.contains_key("host_users"),
             "unset user_namespaces must not produce host_users"
         );
+    }
+
+    #[tokio::test]
+    async fn compute_driver_initialization_records_an_operation_span() {
+        use crate::otel_tracing::test_collector;
+
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let traced = test_collector::install_traced();
+        ComputeRuntime::from_driver(
+            "test-driver".to_string(),
+            Arc::new(TestDriver::default()),
+            None,
+            None,
+            None,
+            store,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let initialization = traced.span_with("driver.initialize", "driver.name", "test-driver");
+        test_collector::assert_is_root(&initialization);
     }
 
     #[tokio::test]

@@ -1000,9 +1000,20 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
     });
 }
 
+#[tracing::instrument(
+    name = "refresh",
+    skip_all,
+    fields(
+        otel.name = "refresh.provider_credentials",
+        watched_count = tracing::field::Empty,
+        due_count = tracing::field::Empty,
+    )
+)]
 async fn run_refresh_worker_tick(store: &Store) -> Result<(), Status> {
     let now_ms = current_time_ms();
-    let states = list_all_refresh_states(store).await?;
+    let states = list_all_refresh_states(store).await.inspect_err(|_| {
+        crate::otel_tracing::mark_error(&tracing::Span::current());
+    })?;
     let watched_count = states.len();
     let due_count = states
         .iter()
@@ -1012,6 +1023,9 @@ async fn run_refresh_worker_tick(store: &Store) -> Result<(), Status> {
         .iter()
         .filter(|state| state.status == "rotation_requested")
         .count();
+    let span = tracing::Span::current();
+    span.record("watched_count", watched_count);
+    span.record("due_count", due_count);
     info!(
         watched_count,
         due_count, rotation_requested_count, "provider credential refresh worker sweep"
@@ -1507,6 +1521,39 @@ mod tests {
                 .credentials
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
         );
+    }
+
+    /// The worker ticks on a timer with no inbound request, so without a span
+    /// of its own its store reads export as anonymous single-span traces.
+    #[tokio::test]
+    async fn refresh_worker_ticks_are_roots_and_store_operations_have_parents() {
+        use crate::otel_tracing::test_collector;
+
+        let store = test_store().await;
+
+        let traced = test_collector::install_traced();
+        run_refresh_worker_tick(&store).await.unwrap();
+
+        let spans = traced.finished_spans();
+        let root = spans
+            .iter()
+            .find(|s| s.name == "refresh.provider_credentials")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the tick records a span of its own, got {:?}",
+                    spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+
+        test_collector::assert_is_root(root);
+        let store_span = spans
+            .iter()
+            .find(|span| {
+                span.name.starts_with("store.")
+                    && span.span_context.trace_id() == root.span_context.trace_id()
+            })
+            .expect("the tick records its store operation");
+        test_collector::assert_has_parent(store_span);
     }
 
     #[test]
