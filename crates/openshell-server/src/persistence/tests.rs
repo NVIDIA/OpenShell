@@ -40,34 +40,24 @@ async fn expected_conflicts_leave_the_span_unmarked() {
 
     let store = test_store().await;
     let traced = test_collector::install_traced();
-    let mut first = Box::pin(store.put_if(
-        "workspace",
-        "expected-conflict-first",
-        "expected-conflict",
-        "",
-        b"payload",
-        None,
-        super::WriteCondition::MustCreate,
-    ));
-    first.as_mut().await.expect("first write");
-    drop(first);
+    let put = async |id: &str| {
+        store
+            .put_if(
+                "workspace",
+                id,
+                "expected-conflict",
+                "",
+                b"payload",
+                None,
+                super::WriteCondition::MustCreate,
+            )
+            .await
+    };
 
-    let mut second = Box::pin(store.put_if(
-        "workspace",
-        "expected-conflict-second",
-        "expected-conflict",
-        "",
-        b"payload",
-        None,
-        super::WriteCondition::MustCreate,
-    ));
-    second
-        .as_mut()
+    put("expected-conflict-first").await.expect("first write");
+    put("expected-conflict-second")
         .await
         .expect_err("the name is already taken");
-    // Close the instrumented future before reading the exporter. A completed
-    // future may otherwise remain in the async state machine until test exit.
-    drop(second);
 
     let span = traced.span_with("store.put_if", "object.id", "expected-conflict-second");
 
