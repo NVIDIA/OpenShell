@@ -211,13 +211,13 @@ network_policies:
     endpoints:
       - host: host.openshell.internal
         port: {port}
-        path: /allowed/**
+        path: /**
         protocol: rest
         access: full
         enforcement: enforce
       - host: host.docker.internal
         port: {port}
-        path: /allowed/**
+        path: /**
         protocol: rest
         access: full
         enforcement: enforce
@@ -431,8 +431,8 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
     .expect("create endpoint-bound provider B");
 
     let command = format!(
-        r#"allowed=$(curl --silent --show-error --max-time 15 -H "Authorization: Bearer $BOUND_TOKEN_A" http://host.openshell.internal:{}/allowed/check); denied=$(curl --silent --show-error --max-time 15 -o /tmp/denied-body -w "%{{http_code}}" -H "Authorization: Bearer $BOUND_TOKEN_A" http://host.docker.internal:{}/allowed/check); printf 'ALLOWED=%s DENIED=%s\n' "$allowed" "$denied""#,
-        server.port, server.port
+        r#"allowed=$(curl --silent --show-error --max-time 15 -H "Authorization: Bearer $BOUND_TOKEN_A" http://host.openshell.internal:{}/allowed/check); host_denied=$(curl --silent --show-error --max-time 15 -o /tmp/host-denied-body -w "%{{http_code}}" -H "Authorization: Bearer $BOUND_TOKEN_A" http://host.docker.internal:{}/allowed/check); path_denied=$(curl --silent --show-error --max-time 15 -o /tmp/path-denied-body -w "%{{http_code}}" -H "Authorization: Bearer $BOUND_TOKEN_A" http://host.openshell.internal:{}/other/check); printf 'ALLOWED=%s HOST_DENIED=%s PATH_DENIED=%s\n' "$allowed" "$host_denied" "$path_denied""#,
+        server.port, server.port, server.port
     );
     let mut guard = SandboxGuard::create(&[
         "--policy",
@@ -464,8 +464,13 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
         guard.create_output,
     );
     assert!(
-        guard.create_output.contains("DENIED=403"),
+        guard.create_output.contains("HOST_DENIED=403"),
         "same placeholder must be denied at an unbound host:\n{}",
+        guard.create_output
+    );
+    assert!(
+        guard.create_output.contains("PATH_DENIED=403"),
+        "same placeholder must be denied at an unbound path on its bound host:\n{}",
         guard.create_output
     );
 
