@@ -699,13 +699,7 @@ where
             (false, EnforcementMode::Audit) => "audit",
             (false, EnforcementMode::Enforce) => "deny",
         };
-        let engine_type = match config.protocol {
-            L7Protocol::Graphql => "l7-graphql",
-            L7Protocol::Websocket => "l7-websocket",
-            L7Protocol::JsonRpc => "l7-jsonrpc",
-            L7Protocol::Mcp => "l7-mcp",
-            L7Protocol::Rest | L7Protocol::Sql => "l7",
-        };
+        let engine_type = engine_type_for_protocol(config.protocol);
         let protocol_summary =
             l7_protocol_log_summary(graphql_info.as_ref(), jsonrpc_info.as_ref());
         emit_l7_request_log(
@@ -876,7 +870,7 @@ fn l7_protocol_log_summary(
     jsonrpc_info: Option<&crate::l7::jsonrpc::JsonRpcRequestInfo>,
 ) -> String {
     if let Some(info) = graphql_info {
-        return format!(" {}", graphql_log_summary(info));
+        return format!(" {}", crate::l7::graphql::log_summary(info));
     }
 
     if let Some(info) = jsonrpc_info {
@@ -1684,7 +1678,7 @@ where
                     SeverityId::Informational,
                 ),
             };
-            let gql_summary = graphql_log_summary(&graphql_info);
+            let gql_summary = crate::l7::graphql::log_summary(&graphql_info);
             let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Other)
                 .action(action_id)
@@ -1801,34 +1795,6 @@ where
             return Ok(());
         }
     }
-}
-
-fn graphql_log_summary(info: &crate::l7::graphql::GraphqlRequestInfo) -> String {
-    if let Some(error) = &info.error {
-        return format!("graphql_error={error:?}");
-    }
-    let ops: Vec<String> = info
-        .operations
-        .iter()
-        .map(|op| {
-            let name = op.operation_name.as_deref().unwrap_or("-");
-            let fields = if op.fields.is_empty() {
-                "-".to_string()
-            } else {
-                op.fields.join(",")
-            };
-            let persisted = op
-                .persisted_query_hash
-                .as_deref()
-                .or(op.persisted_query_id.as_deref())
-                .unwrap_or("-");
-            format!(
-                "type={} name={} fields={} persisted={}",
-                op.operation_type, name, fields, persisted
-            )
-        })
-        .collect();
-    format!("graphql_ops={}", ops.join(";"))
 }
 
 pub(crate) fn jsonrpc_log_message(
