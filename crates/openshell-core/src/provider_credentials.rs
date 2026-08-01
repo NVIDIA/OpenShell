@@ -820,6 +820,55 @@ mod tests {
     }
 
     #[test]
+    fn multiple_credentials_resolve_only_at_their_own_endpoints() {
+        let mut binding_a = binding("a.example.com", 443, "/a/**");
+        binding_a.credential_identity = "provider-a:KEY_A".to_string();
+        let mut binding_b = binding("b.example.com", 443, "/b/**");
+        binding_b.credential_identity = "provider-b:KEY_B".to_string();
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            HashMap::from([
+                ("KEY_A".to_string(), "secret-a".to_string()),
+                ("KEY_B".to_string(), "secret-b".to_string()),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                ("KEY_A".to_string(), binding_a),
+                ("KEY_B".to_string(), binding_b),
+            ]),
+            Vec::new(),
+        )
+        .expect("valid bindings");
+
+        let resolver_a = state
+            .resolver_for_endpoint("a.example.com", 443, "/a/check")
+            .expect("endpoint A resolver");
+        assert_eq!(
+            resolver_a.resolve_placeholder("openshell:resolve:env:v7_KEY_A"),
+            Some("secret-a")
+        );
+        assert_eq!(
+            resolver_a.resolve_placeholder("openshell:resolve:env:v7_KEY_B"),
+            None,
+            "credential B must not resolve at endpoint A"
+        );
+
+        let resolver_b = state
+            .resolver_for_endpoint("b.example.com", 443, "/b/check")
+            .expect("endpoint B resolver");
+        assert_eq!(
+            resolver_b.resolve_placeholder("openshell:resolve:env:v7_KEY_B"),
+            Some("secret-b")
+        );
+        assert_eq!(
+            resolver_b.resolve_placeholder("openshell:resolve:env:v7_KEY_A"),
+            None,
+            "credential A must not resolve at endpoint B"
+        );
+    }
+
+    #[test]
     fn revisioned_path_placeholder_matches_exact_redacted_binding() {
         let state = ProviderCredentialState::from_bound_environment(
             7,
