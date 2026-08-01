@@ -80,20 +80,7 @@ pub struct L7EvalContext {
 }
 
 fn request_default_port(ctx: &L7EvalContext) -> Option<u16> {
-    ctx.request_default_port.or({
-        // Existing direct relay tests construct the request context below the
-        // production adapter that records the inspected transport. Keep those
-        // fixtures focused on their original concern; authority regressions
-        // set this field explicitly.
-        #[cfg(test)]
-        {
-            Some(ctx.port)
-        }
-        #[cfg(not(test))]
-        {
-            None
-        }
-    })
+    ctx.request_default_port
 }
 
 fn scoped_context_for_request(
@@ -2480,6 +2467,7 @@ mod tests {
         let ctx = L7EvalContext {
             host: "allowed.example.test".to_string(),
             port: 443,
+            request_default_port: Some(443),
             provider_credentials: Some(state),
             ..Default::default()
         };
@@ -2523,6 +2511,25 @@ mod tests {
             .expect("Host header");
         assert_eq!(authority.authority.host(), "[2001:db8::1]");
         assert!(request_authority_matches_endpoint(&request, &ctx));
+    }
+
+    #[test]
+    fn missing_request_default_port_does_not_infer_the_connect_port() {
+        let request = crate::l7::provider::L7Request {
+            action: "GET".to_string(),
+            target: "/v1".to_string(),
+            query_params: TestHashMap::new(),
+            raw_header: b"GET /v1 HTTP/1.1\r\nHost: api.example.test\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let ctx = L7EvalContext {
+            host: "api.example.test".to_string(),
+            port: 443,
+            request_default_port: None,
+            ..Default::default()
+        };
+
+        assert!(!request_authority_matches_endpoint(&request, &ctx));
     }
 
     async fn run_single_config_credential_mismatch(
@@ -2606,6 +2613,7 @@ mod tests {
         let ctx = L7EvalContext {
             host: "denied.example.test".to_string(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "bound".to_string(),
             secret_resolver: Some(Arc::new(resolver.clone())),
             ..Default::default()
@@ -2805,6 +2813,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 8080,
+            request_default_port: Some(8080),
             policy_name: "rest_api".into(),
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
@@ -2872,6 +2881,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 8080,
+            request_default_port: Some(8080),
             policy_name: "rest_api".into(),
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
@@ -2913,6 +2923,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 8080,
+            request_default_port: Some(8080),
             policy_name: "rest_api".into(),
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
@@ -2968,6 +2979,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "jsonrpc.example.test".into(),
             port: 8000,
+            request_default_port: Some(8000),
             policy_name: "jsonrpc_api".into(),
             binary_path: "/usr/bin/python3".into(),
             ancestors: vec![],
@@ -3012,6 +3024,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "mcp.example.test".into(),
             port: 8000,
+            request_default_port: Some(8000),
             policy_name: "mcp_api".into(),
             binary_path: "/usr/bin/python3".into(),
             ancestors: vec![],
@@ -3057,6 +3070,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "graphql.example.test".into(),
             port: 8000,
+            request_default_port: Some(8000),
             policy_name: "graphql_api".into(),
             binary_path: "/usr/bin/python3".into(),
             ancestors: vec![],
@@ -3577,6 +3591,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 8080,
+            request_default_port: Some(8080),
             policy_name: "passthrough_api".into(),
             binary_path: "/usr/bin/curl".into(),
             provider_credentials: Some(state),
@@ -3989,6 +4004,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "jsonrpc_api".into(),
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
@@ -4104,6 +4120,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "p".into(),
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
@@ -4488,6 +4505,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "jsonrpc_api".into(),
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
@@ -4650,6 +4668,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "graphql_api".into(),
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
@@ -4749,6 +4768,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "db.example.test".into(),
             port: 5432,
+            request_default_port: Some(5432),
             policy_name: "sql_db".into(),
             binary_path: "/usr/bin/psql".into(),
             ancestors: vec![],
@@ -5102,6 +5122,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 80,
+            request_default_port: Some(80),
             policy_name: "api".into(),
             binary_path: "/usr/bin/curl".into(),
             ancestors: Vec::new(),
@@ -5134,6 +5155,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "rest_api".into(),
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
@@ -5323,6 +5345,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 8080,
+            request_default_port: Some(8080),
             policy_name: "passthrough_api".into(),
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
@@ -5433,6 +5456,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "gateway.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "ws_api".into(),
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
@@ -5646,6 +5670,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "gateway.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "ws_api".into(),
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
@@ -5721,6 +5746,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "jsonrpc_api".into(),
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
@@ -5842,6 +5868,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "jsonrpc_api".into(),
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
@@ -5905,6 +5932,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "mcp_api".into(),
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
@@ -6066,6 +6094,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "gateway.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "route_api".into(),
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
@@ -6163,6 +6192,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "gateway.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "route_api".into(),
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
@@ -6256,6 +6286,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "allowed.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "route_api".into(),
             provider_credentials: Some(state),
             ..Default::default()
@@ -6364,6 +6395,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "gateway.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "route_api".into(),
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
@@ -6487,6 +6519,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "gateway.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "route_api".into(),
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
@@ -6658,6 +6691,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 8080,
+            request_default_port: Some(8080),
             policy_name: "rest_api".into(),
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
@@ -6749,6 +6783,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
             port: 8080,
+            request_default_port: Some(8080),
             policy_name: "rest_api".into(),
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
