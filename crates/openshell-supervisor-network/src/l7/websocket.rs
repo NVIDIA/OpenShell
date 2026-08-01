@@ -1100,7 +1100,10 @@ fn emit_websocket_l7_event(
             SeverityId::Informational,
         ),
     };
-    let summary = graphql.map(graphql_log_summary).unwrap_or_default();
+    let summary = graphql
+        .map(crate::l7::graphql::log_summary)
+        .map(|summary| format!(" {summary}"))
+        .unwrap_or_default();
     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Other)
         .action(action_id)
@@ -1115,34 +1118,6 @@ fn emit_websocket_l7_event(
         ))
         .build();
     ocsf_emit!(event);
-}
-
-fn graphql_log_summary(info: &crate::l7::graphql::GraphqlRequestInfo) -> String {
-    if let Some(error) = info.error.as_deref() {
-        return format!(" graphql_error={error:?}");
-    }
-    let ops: Vec<String> = info
-        .operations
-        .iter()
-        .map(|op| {
-            let name = op.operation_name.as_deref().unwrap_or("-");
-            let fields = if op.fields.is_empty() {
-                "-".to_string()
-            } else {
-                op.fields.join(",")
-            };
-            let persisted = op
-                .persisted_query_hash
-                .as_deref()
-                .or(op.persisted_query_id.as_deref())
-                .unwrap_or("-");
-            format!(
-                "type={} name={} fields={} persisted={}",
-                op.operation_type, name, fields, persisted
-            )
-        })
-        .collect();
-    format!(" graphql_ops={}", ops.join(";"))
 }
 
 fn protocol_failure_class(error: &miette::Report) -> &'static str {
@@ -1772,7 +1747,7 @@ network_policies:
                 panic!("expected operation, got {other:?}")
             }
         };
-        let summary = graphql_log_summary(&graphql);
+        let summary = crate::l7::graphql::log_summary(&graphql);
 
         assert!(summary.contains("type=query"));
         assert!(summary.contains("fields=viewer"));
