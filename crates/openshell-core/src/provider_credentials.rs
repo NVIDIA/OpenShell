@@ -704,6 +704,85 @@ mod tests {
         }
     }
 
+    fn assert_binding_validation_error(
+        env: HashMap<String, String>,
+        bindings: HashMap<String, StaticCredentialBinding>,
+        non_secret_environment_keys: Vec<String>,
+        expected: &str,
+    ) {
+        let error =
+            validate_static_credential_bindings(&env, &bindings, &non_secret_environment_keys)
+                .expect_err("malformed provider metadata must fail validation");
+        assert_eq!(error.to_string(), expected);
+    }
+
+    #[test]
+    fn rejects_each_malformed_static_credential_binding_shape() {
+        let credential_env = || HashMap::from([("API_KEY".to_string(), "secret".to_string())]);
+        let credential_binding = || {
+            HashMap::from([(
+                "API_KEY".to_string(),
+                binding("api.example.com", 443, "/**"),
+            )])
+        };
+
+        assert_binding_validation_error(
+            HashMap::from([("PROJECT_ID".to_string(), "project".to_string())]),
+            HashMap::new(),
+            vec!["PROJECT_ID".to_string(), "PROJECT_ID".to_string()],
+            "provider environment repeats a non-secret environment key",
+        );
+        assert_binding_validation_error(
+            credential_env(),
+            credential_binding(),
+            vec!["API_KEY".to_string()],
+            "provider environment classifies a key as both credential and non-secret configuration",
+        );
+        assert_binding_validation_error(
+            credential_env(),
+            HashMap::new(),
+            Vec::new(),
+            "provider environment contains an unclassified credential key",
+        );
+        assert_binding_validation_error(
+            HashMap::new(),
+            credential_binding(),
+            Vec::new(),
+            "provider environment metadata references a missing environment key",
+        );
+
+        let mut missing_identity = binding("api.example.com", 443, "/**");
+        missing_identity.credential_identity.clear();
+        assert_binding_validation_error(
+            credential_env(),
+            HashMap::from([("API_KEY".to_string(), missing_identity)]),
+            Vec::new(),
+            "static credential binding has no provider credential identity",
+        );
+
+        let mut missing_endpoints = binding("api.example.com", 443, "/**");
+        missing_endpoints.endpoints.clear();
+        assert_binding_validation_error(
+            credential_env(),
+            HashMap::from([("API_KEY".to_string(), missing_endpoints)]),
+            Vec::new(),
+            "static credential binding has no authorized endpoints",
+        );
+
+        for (host, port) in [
+            ("api.example.com", 0),
+            ("api.example.com", u32::from(u16::MAX) + 1),
+            ("invalid host", 443),
+        ] {
+            assert_binding_validation_error(
+                credential_env(),
+                HashMap::from([("API_KEY".to_string(), binding(host, port, "/**"))]),
+                Vec::new(),
+                "static credential binding contains an invalid endpoint",
+            );
+        }
+    }
+
     #[test]
     fn bound_credentials_resolve_only_at_matching_endpoint() {
         let state = ProviderCredentialState::from_bound_environment(
