@@ -5,6 +5,7 @@
 
 use crate::secrets::SecretResolver;
 use crate::{
+    endpoint_path::EndpointPathPattern,
     host_pattern::HostPattern,
     proto::{StaticCredentialBinding, StaticCredentialEndpointBinding},
 };
@@ -29,7 +30,7 @@ struct ProviderCredentialStateInner {
     combined_resolver: Option<Arc<SecretResolver>>,
     suppressed_keys: HashSet<String>,
     non_secret_environment_keys: HashSet<String>,
-    static_credential_bindings: HashMap<String, StaticCredentialBinding>,
+    static_credential_bindings: HashMap<String, CompiledStaticCredentialBinding>,
     known_static_credential_keys: HashSet<String>,
     static_credential_identity_epochs: HashMap<String, StaticCredentialIdentityEpoch>,
 }
@@ -38,6 +39,19 @@ struct ProviderCredentialStateInner {
 struct StaticCredentialIdentityEpoch {
     identity: String,
     revisions: HashSet<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledStaticCredentialBinding {
+    endpoints: Vec<CompiledStaticCredentialEndpointBinding>,
+    credential_identity: String,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledStaticCredentialEndpointBinding {
+    host: HostPattern,
+    port: u16,
+    path: EndpointPathPattern,
 }
 
 #[derive(Debug, Clone)]
@@ -103,9 +117,9 @@ impl ProviderCredentialState {
         static_credential_bindings: HashMap<String, StaticCredentialBinding>,
         non_secret_environment_keys: Vec<String>,
     ) -> Result<Self, StaticCredentialBindingError> {
-        validate_static_credential_bindings(
+        let static_credential_bindings = compile_static_credential_bindings(
             &env,
-            &static_credential_bindings,
+            static_credential_bindings,
             &non_secret_environment_keys,
         )?;
         let state =
@@ -236,13 +250,16 @@ impl ProviderCredentialState {
         port: u16,
         path: &str,
     ) -> (Option<Arc<SecretResolver>>, u64) {
+        let request_path = path.split_once('?').map_or(path, |(path, _)| path);
+        let request_path = crate::secrets::redact_target_for_policy(request_path);
+        let normalized_host = host.to_ascii_lowercase();
+        let host_labels = normalized_host.split('.').collect::<Vec<_>>();
         let inner = self
             .inner
             .read()
             .expect("provider credential state poisoned");
         let revision = inner.current.revision;
-        let request_path = path.split_once('?').map_or(path, |(path, _)| path);
-        let Ok(request_path) = crate::secrets::redact_target_for_policy(request_path) else {
+        let Ok(request_path) = request_path else {
             // Binding authorization must not depend on real credential
             // material. Malformed placeholder syntax cannot be normalized
             // safely, so expose no endpoint-scoped resolver.
@@ -253,7 +270,7 @@ impl ProviderCredentialState {
             .iter()
             .filter(|(_, binding)| {
                 binding.endpoints.iter().any(|endpoint| {
-                    static_credential_endpoint_matches(endpoint, host, port, &request_path)
+                    static_credential_endpoint_matches(endpoint, &host_labels, port, &request_path)
                 })
             })
             .map(|(key, _)| key.clone())
@@ -476,14 +493,17 @@ impl ProviderCredentialState {
         static_credential_bindings: HashMap<String, StaticCredentialBinding>,
         non_secret_environment_keys: Vec<String>,
     ) -> Result<usize, StaticCredentialBindingError> {
-        if let Err(error) = validate_static_credential_bindings(
+        let static_credential_bindings = match compile_static_credential_bindings(
             &env,
-            &static_credential_bindings,
+            static_credential_bindings,
             &non_secret_environment_keys,
         ) {
-            self.revoke_static_provider_environment_inner(revision, Some(dynamic_credentials));
-            return Err(error);
-        }
+            Ok(bindings) => bindings,
+            Err(error) => {
+                self.revoke_static_provider_environment_inner(revision, Some(dynamic_credentials));
+                return Err(error);
+            }
+        };
 
         let (mut child_env, generation_resolver, current_resolver) =
             SecretResolver::from_provider_env_for_current_revision(
@@ -568,11 +588,11 @@ impl ProviderCredentialState {
     }
 }
 
-fn validate_static_credential_bindings(
+fn compile_static_credential_bindings(
     env: &HashMap<String, String>,
-    bindings: &HashMap<String, StaticCredentialBinding>,
+    bindings: HashMap<String, StaticCredentialBinding>,
     non_secret_environment_keys: &[String],
-) -> Result<(), StaticCredentialBindingError> {
+) -> Result<HashMap<String, CompiledStaticCredentialBinding>, StaticCredentialBindingError> {
     let non_secret_keys = non_secret_environment_keys
         .iter()
         .cloned()
@@ -614,21 +634,48 @@ fn validate_static_credential_bindings(
             ));
         }
         for endpoint in &binding.endpoints {
-            if endpoint.port == 0
-                || endpoint.port > u32::from(u16::MAX)
-                || HostPattern::new(&endpoint.host).is_err()
-            {
+            if endpoint.port == 0 || endpoint.port > u32::from(u16::MAX) {
                 return Err(binding_error(
                     "static credential binding contains an invalid endpoint",
                 ));
             }
         }
     }
-    Ok(())
+
+    bindings
+        .into_iter()
+        .map(|(key, binding)| {
+            let endpoints = binding
+                .endpoints
+                .into_iter()
+                .map(compile_static_credential_endpoint)
+                .collect::<Result<_, _>>()?;
+            Ok((
+                key,
+                CompiledStaticCredentialBinding {
+                    endpoints,
+                    credential_identity: binding.credential_identity,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn compile_static_credential_endpoint(
+    endpoint: StaticCredentialEndpointBinding,
+) -> Result<CompiledStaticCredentialEndpointBinding, StaticCredentialBindingError> {
+    let host = HostPattern::new(&endpoint.host)
+        .map_err(|_| binding_error("static credential binding contains an invalid endpoint"))?;
+    Ok(CompiledStaticCredentialEndpointBinding {
+        host,
+        port: u16::try_from(endpoint.port)
+            .map_err(|_| binding_error("static credential binding contains an invalid endpoint"))?,
+        path: EndpointPathPattern::new(&endpoint.path),
+    })
 }
 
 fn static_credential_identities(
-    bindings: &HashMap<String, StaticCredentialBinding>,
+    bindings: &HashMap<String, CompiledStaticCredentialBinding>,
 ) -> HashMap<&str, &str> {
     bindings
         .iter()
@@ -639,7 +686,7 @@ fn static_credential_identities(
 fn update_static_credential_identity_epochs(
     epochs: &mut HashMap<String, StaticCredentialIdentityEpoch>,
     revision: u64,
-    bindings: &HashMap<String, StaticCredentialBinding>,
+    bindings: &HashMap<String, CompiledStaticCredentialBinding>,
 ) {
     epochs.retain(|key, _| bindings.contains_key(key));
     for (key, binding) in bindings {
@@ -671,14 +718,14 @@ fn binding_error(message: &str) -> StaticCredentialBindingError {
 }
 
 fn static_credential_endpoint_matches(
-    endpoint: &StaticCredentialEndpointBinding,
-    host: &str,
+    endpoint: &CompiledStaticCredentialEndpointBinding,
+    host_labels: &[&str],
     port: u16,
     path: &str,
 ) -> bool {
-    endpoint.port == u32::from(port)
-        && HostPattern::new(&endpoint.host).is_ok_and(|pattern| pattern.matches(host))
-        && crate::endpoint_path::matches(&endpoint.path, path)
+    endpoint.port == port
+        && endpoint.host.matches_normalized_labels(host_labels)
+        && endpoint.path.matches(path)
 }
 
 fn merge_resolvers(
@@ -717,7 +764,7 @@ mod tests {
         expected: &str,
     ) {
         let error =
-            validate_static_credential_bindings(&env, &bindings, &non_secret_environment_keys)
+            compile_static_credential_bindings(&env, bindings, &non_secret_environment_keys)
                 .expect_err("malformed provider metadata must fail validation");
         assert_eq!(error.to_string(), expected);
     }
@@ -872,6 +919,52 @@ mod tests {
             None,
             "credential A must not resolve at endpoint B"
         );
+    }
+
+    #[test]
+    fn refresh_replaces_compiled_endpoint_patterns() {
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("API_KEY".to_string(), "old".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "API_KEY".to_string(),
+                binding("old.example.com", 443, "/v1/**"),
+            )]),
+            Vec::new(),
+        )
+        .expect("initial bindings");
+
+        state
+            .install_bound_environment(
+                2,
+                HashMap::from([("API_KEY".to_string(), "new".to_string())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::from([(
+                    "API_KEY".to_string(),
+                    binding("new.example.com", 443, "/v2/**"),
+                )]),
+                Vec::new(),
+            )
+            .expect("replacement bindings");
+
+        let replacement = state
+            .resolver_for_endpoint("new.example.com", 443, "/v2/messages")
+            .expect("replacement endpoint resolver");
+        assert_eq!(
+            replacement.resolve_placeholder("openshell:resolve:env:v2_API_KEY"),
+            Some("new")
+        );
+
+        let removed = state
+            .resolver_for_endpoint("old.example.com", 443, "/v1/messages")
+            .expect("restricted resolver");
+        let error = removed
+            .rewrite_header_value("openshell:resolve:env:v2_API_KEY")
+            .expect_err("replaced endpoint binding must no longer authorize the credential");
+        assert!(error.is_endpoint_mismatch());
     }
 
     #[test]
