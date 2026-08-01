@@ -14,8 +14,8 @@ use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::secrets::{SecretResolver, contains_reserved_credential_marker};
 use openshell_ocsf::{
-    ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
-    NetworkActivityBuilder, SeverityId, StatusId, ocsf_emit,
+    ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SeverityId, StatusId,
+    ocsf_emit,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -149,26 +149,12 @@ fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
             .status_detail("credential_endpoint_mismatch")
             .build()
     );
-    ocsf_emit!(
-        DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Denied)
-            .disposition(DispositionId::Blocked)
-            .severity(SeverityId::High)
-            .is_alert(true)
-            .finding_info(FindingInfo::new(
-                "openshell.provider_credential.endpoint_mismatch",
-                "Provider credential used at an unauthorized endpoint",
-            ))
-            .evidence_pairs(&[
-                ("policy", policy_name),
-                ("host", host),
-                ("protocol", "websocket"),
-                ("disposition", "denied"),
-            ])
-            .message("Provider credential endpoint binding mismatch; WebSocket closed")
-            .build()
-    );
+    ocsf_emit!(crate::l7::build_credential_endpoint_mismatch_finding(
+        policy_name,
+        host,
+        Some("websocket"),
+        "Provider credential endpoint binding mismatch; WebSocket closed",
+    ));
 }
 
 async fn relay_client_to_server<R, W>(

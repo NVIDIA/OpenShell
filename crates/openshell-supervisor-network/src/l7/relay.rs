@@ -248,23 +248,12 @@ fn build_credential_resolution_event(
 }
 
 fn build_credential_endpoint_mismatch_finding(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
-    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Open)
-        .action(ActionId::Denied)
-        .disposition(DispositionId::Blocked)
-        .severity(SeverityId::High)
-        .is_alert(true)
-        .finding_info(FindingInfo::new(
-            "openshell.provider_credential.endpoint_mismatch",
-            "Provider credential used at an unauthorized endpoint",
-        ))
-        .evidence_pairs(&[
-            ("policy", ctx.policy_name.as_str()),
-            ("host", ctx.host.as_str()),
-            ("disposition", "denied"),
-        ])
-        .message("Provider credential endpoint binding mismatch; request denied")
-        .build()
+    crate::l7::build_credential_endpoint_mismatch_finding(
+        &ctx.policy_name,
+        &ctx.host,
+        None,
+        "Provider credential endpoint binding mismatch; request denied",
+    )
 }
 
 pub(crate) async fn reject_credential_resolution<W>(
