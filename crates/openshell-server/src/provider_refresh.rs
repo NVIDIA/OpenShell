@@ -1026,6 +1026,7 @@ async fn run_refresh_worker_tick(store: &Store) -> Result<(), Status> {
     let span = tracing::Span::current();
     span.record("watched_count", watched_count);
     span.record("due_count", due_count);
+    drop(span);
     info!(
         watched_count,
         due_count, rotation_requested_count, "provider credential refresh worker sweep"
