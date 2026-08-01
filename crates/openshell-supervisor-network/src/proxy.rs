@@ -23,9 +23,8 @@ use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
 use openshell_ocsf::{
-    ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
-    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, Process, SeverityId, StatusId,
-    Url as OcsfUrl, ocsf_emit,
+    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
+    NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -78,23 +77,12 @@ fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
         .status_detail("credential_endpoint_mismatch")
         .build();
     ocsf_emit!(event);
-    let finding = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Open)
-        .action(ActionId::Denied)
-        .disposition(DispositionId::Blocked)
-        .severity(SeverityId::High)
-        .is_alert(true)
-        .finding_info(FindingInfo::new(
-            "openshell.provider_credential.endpoint_mismatch",
-            "Provider credential used at an unauthorized endpoint",
-        ))
-        .evidence_pairs(&[
-            ("policy", policy_name),
-            ("host", host),
-            ("disposition", "denied"),
-        ])
-        .message("Provider credential endpoint binding mismatch; request denied")
-        .build();
+    let finding = crate::l7::build_credential_endpoint_mismatch_finding(
+        policy_name,
+        host,
+        None,
+        "Provider credential endpoint binding mismatch; request denied",
+    );
     ocsf_emit!(finding);
 }
 
