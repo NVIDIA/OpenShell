@@ -38,7 +38,7 @@ struct ProviderCredentialStateInner {
 #[derive(Debug)]
 struct StaticCredentialIdentityEpoch {
     identity: String,
-    revisions: HashSet<u64>,
+    revisions: Arc<HashSet<u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -692,18 +692,18 @@ fn update_static_credential_identity_epochs(
     for (key, binding) in bindings {
         match epochs.get_mut(key) {
             Some(epoch) if epoch.identity == binding.credential_identity => {
-                epoch.revisions.insert(revision);
+                Arc::make_mut(&mut epoch.revisions).insert(revision);
             }
             Some(epoch) => {
                 epoch.identity.clone_from(&binding.credential_identity);
-                epoch.revisions = HashSet::from([revision]);
+                epoch.revisions = Arc::new(HashSet::from([revision]));
             }
             None => {
                 epochs.insert(
                     key.clone(),
                     StaticCredentialIdentityEpoch {
                         identity: binding.credential_identity.clone(),
-                        revisions: HashSet::from([revision]),
+                        revisions: Arc::new(HashSet::from([revision])),
                     },
                 );
             }

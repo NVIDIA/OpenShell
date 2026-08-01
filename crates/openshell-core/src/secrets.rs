@@ -123,7 +123,7 @@ pub struct SecretResolver {
     by_placeholder: HashMap<String, SecretValue>,
     denied_env_keys: HashSet<String>,
     identity_bound_env_keys: HashSet<String>,
-    revision_fallback_allowed_revisions: HashMap<String, HashSet<u64>>,
+    revision_fallback_allowed_revisions: HashMap<String, Arc<HashSet<u64>>>,
 }
 
 #[derive(Clone)]
@@ -286,7 +286,7 @@ impl SecretResolver {
         &self,
         bound_keys: &HashSet<String>,
         allowed_bound_keys: &HashSet<String>,
-        revision_fallback_allowed_revisions: HashMap<String, HashSet<u64>>,
+        revision_fallback_allowed_revisions: HashMap<String, Arc<HashSet<u64>>>,
     ) -> Self {
         let denied_env_keys = bound_keys
             .difference(allowed_bound_keys)
