@@ -793,7 +793,10 @@ impl PodmanComputeDriver {
                 error = %e,
                 "Failed to start container; cleaning up"
             );
-            let _ = self.client.remove_container(&name).await;
+            let _ = self
+                .client
+                .remove_container(&name, self.config.stop_timeout_secs)
+                .await;
             cleanup_created().await;
             return Err(ComputeDriverError::from(e));
         }
@@ -859,13 +862,14 @@ impl PodmanComputeDriver {
         };
         info!(sandbox_id = %sandbox_id, container = %container_id, "Deleting sandbox container");
 
-        // Stop (best-effort).
-        let _ = self
+        // Keep stop, timeout, and removal in one Podman operation. Splitting
+        // stop and remove can race with another container starting an image
+        // mount when the stop reaches its timeout.
+        let container_existed = match self
             .client
-            .stop_container(&container_id, self.config.stop_timeout_secs)
-            .await;
-
-        let container_existed = match self.client.remove_container(&container_id).await {
+            .remove_container(&container_id, self.config.stop_timeout_secs)
+            .await
+        {
             Ok(()) => true,
             Err(PodmanApiError::NotFound(_)) => false,
             Err(e) => return Err(ComputeDriverError::from(e)),
@@ -2202,9 +2206,7 @@ mod tests {
             vec![
                 // list_containers by label
                 StubResponse::new(StatusCode::OK, list_body),
-                // stop_container
-                StubResponse::new(StatusCode::NO_CONTENT, ""),
-                // remove_container
+                // single timed remove_container operation
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
                 // remove_volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
@@ -2224,10 +2226,17 @@ mod tests {
             .expect("request log lock should not be poisoned")
             .clone();
         assert!(requests[0].contains("/libpod/containers/json"));
-        assert!(requests[1].contains(&format!("/libpod/containers/{container_id}/stop")));
-        assert!(requests[2].contains(&format!("/libpod/containers/{container_id}")));
         assert_eq!(
-            requests[3],
+            requests[1],
+            format!(
+                "DELETE {}",
+                api_path(&format!(
+                    "/libpod/containers/{container_id}?force=true&volumes=true&timeout=10"
+                ))
+            )
+        );
+        assert_eq!(
+            requests[2],
             format!(
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))

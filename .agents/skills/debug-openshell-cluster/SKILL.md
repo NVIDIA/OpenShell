@@ -106,6 +106,30 @@ The middleware service must start before the gateway and be reachable from both 
 
 At request time, distinguish an explicit `middleware_denied` result from `middleware_failed`. A denial is always enforced. A failure follows the policy-local `on_error`: `fail_closed` blocks the request, while `fail_open` bypasses only that stage and emits a detection finding. If a running supervisor cannot install a new registry, it preserves its last-known-good generation and emits a configuration failure event.
 
+For network policy validation failures, first distinguish a gateway mutation
+rejection from a supervisor runtime rejection. Direct policy updates,
+incremental merges and approvals, provider attachments, and provider-profile
+fanout are validated against the complete effective policy before persistence
+when the gateway knows the affected sandbox scope. A `FAILED_PRECONDITION`
+ambiguity response means no invalid revision or partial fanout was stored.
+Supervisor validation remains defense in depth for startup, races, and policy
+sources outside those mutation paths.
+
+Runtime rejection behavior is configured only in `gateway.toml`:
+
+```toml
+[openshell.gateway]
+policy_validation_failure_mode = "fail_closed"
+```
+
+The default `fail_closed` mode deactivates the previous generation, closes
+pinned relays, and quarantines new egress until a valid generation loads.
+`retain_last_valid` explicitly keeps the previous valid policy active; without
+one it still fails closed. Restart the gateway after changing this field.
+Inspect sandbox OCSF configuration and finding events for the validation
+rationale, configured and effective modes, active generation, and the explicit
+`previous_policy_active` state.
+
 ### Step 4: Check Docker-Backed Gateways
 
 ```bash
@@ -417,6 +441,8 @@ openshell logs <sandbox-name>
 | Provider profiles disappear after enabling an interceptor catalog | `provider_profile_sources` selected only an authoritative interceptor or returned invalid/duplicate IDs | Inspect source list and interceptor `Describe`/catalog logs; include `builtin` and `user` when intended |
 | Gateway fails after registering supervisor middleware | Service unavailable, invalid manifest, duplicate binding, reserved name, or invalid body/timeout limit | Middleware service and gateway logs; `[[openshell.supervisor.middleware]]`; `Describe` response |
 | Policy update rejects `network_middlewares` | Unknown middleware name, implementation-owned config invalid, duplicate order, broad/invalid host selector, or fail-closed coverage of `tls: skip` | Policy error, gateway logs, middleware `ValidateConfig`, selector and order fields |
+| Policy mutation returns `FAILED_PRECONDITION` for endpoint ambiguity | Equally specific effective endpoint selectors disagree on connection or request-processing metadata | CLI error, base and provider-composed policy, affected profile attachments; confirm no new revision was stored |
+| Supervisor enters policy quarantine | A runtime candidate failed validation while `policy_validation_failure_mode = "fail_closed"` | Sandbox OCSF config/finding events, validation rationale, active generation, `previous_policy_active` |
 | HTTP request returns `middleware_failed` or `middleware_denied` | Selected stage failed or explicitly denied the admitted request | Sandbox OCSF logs; policy-local middleware config; service availability; `on_error` |
 | Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or configured with a reserved/mismatched name | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |

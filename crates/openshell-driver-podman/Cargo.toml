@@ -39,6 +39,7 @@ url = { workspace = true }
 [dev-dependencies]
 prost-types = { workspace = true }
 temp-env = "0.3"
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

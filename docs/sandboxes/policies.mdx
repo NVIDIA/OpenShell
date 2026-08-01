@@ -61,8 +61,7 @@ network_middlewares:
 
 Static sections are locked at sandbox creation. Changing them requires destroying and recreating the sandbox.
 Dynamic sections can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
-When a hot reload changes rules on an active HTTP L7 endpoint, existing keep-alive tunnels are closed before forwarding another parsed request. Credential-injection-only HTTP passthrough tunnels use the same reload boundary. Most HTTP clients reconnect automatically, and the next request is evaluated against the current policy.
-Raw streams are connection-scoped and outside L7 live-reload guarantees. This includes `tls: skip`, non-HTTP TCP payloads, HTTP upgrades such as WebSocket, and long-lived response streams such as SSE. A reload applies to the next connection or next parsed HTTP request; it does not interrupt an already-forwarded raw stream. Use `protocol: websocket` when policy should stay attached to the RFC 6455 upgrade and client text messages after the allowed upgrade. Add `websocket_credential_rewrite: true` only when the relay should rewrite credential placeholders in client-to-server WebSocket text messages. Add `request_body_credential_rewrite: true` only on inspected REST endpoints that need OpenShell to rewrite placeholders in supported text request bodies.
+When a hot reload changes rules, the supervisor publishes a new policy generation and closes connections pinned to the previous generation. This includes HTTP keep-alive tunnels, `tls: skip`, non-HTTP payloads, HTTP upgrades such as WebSocket, and long-lived response streams such as SSE. Most clients reconnect automatically, and the next connection or request is evaluated against the current policy. Use `protocol: websocket` when policy should stay attached to the RFC 6455 upgrade and client text messages after the allowed upgrade. Add `websocket_credential_rewrite: true` only when the relay should rewrite credential placeholders in client-to-server WebSocket text messages. Add `request_body_credential_rewrite: true` only on inspected REST endpoints that need OpenShell to rewrite placeholders in supported text request bodies.
 
 | Section | Type | Description |
 |---|---|---|
@@ -202,6 +201,44 @@ The following steps outline the hot-reload policy update workflow.
    openshell policy list <name>
    ```
 
+### Validation failures
+
+OpenShell validates a complete candidate policy before activating any part of it. Endpoints may overlap when their connection and request-processing metadata agree. For example, two `api.example.com:443` REST entries can contribute different allow and deny rules when they use the same TLS, destination, credential, parser, and enforcement settings. A plain L4 endpoint may overlap an L7 endpoint because it authorizes the destination without contributing request-processing metadata. A more-specific path endpoint may override request-processing metadata from a broader endpoint, such as a `/graphql` GraphQL endpoint alongside a general REST endpoint for the same host. OpenShell rejects the candidate when overlapping exact or wildcard host selectors can both contribute equally specific endpoint configuration and disagree on those fields.
+
+When the gateway knows the affected sandbox scope, it validates the complete
+effective candidate before persistence. This covers direct policy replacement,
+incremental merges and proposal approvals, provider attachment, and
+provider-profile updates that fan out to attached sandboxes. An ambiguity
+failure returns `FAILED_PRECONDITION`; OpenShell stores no invalid policy
+revision and does not partially apply a profile update. Supervisor validation
+remains a defense-in-depth boundary for startup, concurrent changes, and policy
+sources outside those mutation paths.
+
+A gateway preflight rejection leaves the currently active policy unchanged
+regardless of failure mode because the candidate is never persisted or
+distributed. If a candidate reaches a supervisor and fails runtime validation,
+the gateway's `policy_validation_failure_mode` configuration determines the
+supervisor posture. Set it under `[openshell.gateway]` in `gateway.toml`. Its
+default is `fail_closed`:
+
+```toml
+[openshell.gateway]
+policy_validation_failure_mode = "fail_closed"
+```
+
+In `fail_closed` mode, the supervisor publishes a quarantine generation, denies new egress, and closes connections pinned to the previous generation. The previous policy is not active. A later valid policy exits quarantine automatically.
+
+Operators that explicitly prioritize availability can retain the previous generation:
+
+```toml
+[openshell.gateway]
+policy_validation_failure_mode = "retain_last_valid"
+```
+
+In `retain_last_valid` mode, the rejected candidate remains inactive and the previous valid generation remains active. If no previous valid generation exists, such as during initial startup, OpenShell still fails closed. Restart the gateway after changing `gateway.toml`; connected sandbox supervisors receive the configured posture from the restarted gateway. Individual sandboxes cannot override it.
+
+OCSF configuration and finding events identify the rejected candidate, validation rationale, configured and effective modes, active generation, and whether the previous policy is active. When `retain_last_valid` is configured without a previous valid generation, the effective mode remains `fail_closed`. Connection denials during quarantine include the validation failure as their policy denial rationale.
+
 ## Incremental Policy Updates
 
 Use `openshell policy update` when you want to merge network policy changes into the current live policy instead of replacing the whole YAML document. This command only updates the dynamic `network_policies` section.
@@ -331,13 +368,14 @@ means:
 - match the endpoint `api.github.com:443`.
 - match HTTP method `POST`.
 - match paths like `/repos/acme/issues`.
-- do not match deeper paths like `/repos/acme/project/issues/123` because `*` matches one path segment.
+- also match deeper paths when the surrounding literals align, because `*` may include `/`.
 
 Path globs follow the same semantics as YAML allow and deny rules:
 
-- `*` matches one path segment.
-- `**` matches any number of segments.
-- `/repos/*/issues` matches one repository owner or name segment in the middle.
+- `*` and `**` match zero or more characters and may cross `/` boundaries.
+- `?` matches exactly one character.
+- bracket classes such as `[0-9]` and negated classes such as `[!0]` are supported.
+- `/repos/*/issues` matches any intervening text, including multiple path segments.
 - `/repos/**` matches everything under `/repos/`.
 
 The rule-level commands only modify method and path constraints. They do not change binaries, hostnames, ports, protocol settings, or WebSocket message payload matching.

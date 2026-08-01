@@ -23,9 +23,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+use openshell_core::PolicyValidationFailureMode;
+
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfigStateChangeBuilder, DetectionFindingBuilder,
-    DispositionId, FindingInfo, SandboxContext, SeverityId, StateId, StatusId, ocsf_emit,
+    DispositionId, FindingInfo, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
+    ocsf_emit,
 };
 
 // ---------------------------------------------------------------------------
@@ -852,7 +855,10 @@ fn load_policy_from_sidecar_bootstrap(
         policy,
         opa_engine,
         Some(proto),
-        LoadedPolicyOrigin::Gateway { revision: None },
+        LoadedPolicyOrigin::Gateway {
+            revision: None,
+            has_last_valid_policy: true,
+        },
     ))
 }
 
@@ -1992,7 +1998,7 @@ async fn load_policy(
             }
         }
 
-        let loaded_policy_revision =
+        let mut loaded_policy_revision =
             policy_bound_to_snapshot.then(|| LoadedPolicyRevision::from_snapshot(&snapshot));
 
         // Build OPA engine from baked-in rules + typed proto data.
@@ -2002,12 +2008,37 @@ async fn load_policy(
         // container hasn't started yet. After the entrypoint spawns, the
         // engine is rebuilt with the real PID for symlink resolution.
         info!("Creating OPA engine from proto policy data");
+        let mut has_last_valid_policy = true;
         let engine = match OpaEngine::from_proto(&proto_policy) {
-            Ok(engine) => engine,
+            Ok(engine) => Arc::new(engine),
             Err(e) => {
                 report_initial_policy_failure(endpoint, id, loaded_policy_revision.as_ref(), &e)
                     .await;
-                return Err(e);
+                let validation_error = e.to_string();
+                let candidate_version = snapshot.version;
+                let candidate_hash = snapshot.policy_hash.clone();
+                // There is no in-memory last-known-good generation during
+                // startup, so both configured modes necessarily fail closed.
+                // Load the restrictive default atomically and keep the
+                // rejected revision unacknowledged for poll reconciliation.
+                has_last_valid_policy = false;
+                proto_policy = openshell_policy::restrictive_default_policy();
+                let engine = Arc::new(OpaEngine::from_proto(&proto_policy)?);
+                let disposition = apply_policy_validation_failure(
+                    &engine,
+                    snapshot.policy_validation_failure_mode,
+                    has_last_valid_policy,
+                    candidate_version,
+                    &validation_error,
+                )?;
+                emit_policy_validation_failure(
+                    &disposition,
+                    candidate_version,
+                    &candidate_hash,
+                    &validation_error,
+                );
+                loaded_policy_revision = None;
+                engine
             }
         };
 
@@ -2050,7 +2081,7 @@ async fn load_policy(
         } else {
             MiddlewareRegistryStatus::Synchronized
         };
-        let opa_engine = Some(Arc::new(engine));
+        let opa_engine = Some(engine);
 
         let policy = match SandboxPolicy::try_from(proto_policy.clone()) {
             Ok(policy) => policy,
@@ -2067,6 +2098,7 @@ async fn load_policy(
             middleware_registry_status,
             LoadedPolicyOrigin::Gateway {
                 revision: loaded_policy_revision,
+                has_last_valid_policy,
             },
             agent_proposals_enabled_from_settings(&snapshot.settings),
         ));
@@ -2194,6 +2226,72 @@ enum MiddlewareRegistryStatus {
     NeedsReconciliation,
 }
 
+#[derive(Debug)]
+enum GatewayRuntimeReloadError {
+    PolicyValidation(miette::Report),
+    MiddlewareRegistry(miette::Report),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatewayRuntimeFailureClass {
+    PolicyValidation,
+    MiddlewareRegistry,
+}
+
+impl GatewayRuntimeReloadError {
+    fn class(&self) -> GatewayRuntimeFailureClass {
+        match self {
+            Self::PolicyValidation(_) => GatewayRuntimeFailureClass::PolicyValidation,
+            Self::MiddlewareRegistry(_) => GatewayRuntimeFailureClass::MiddlewareRegistry,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FailedRuntimeRevision {
+    config_revision: u64,
+    policy_hash: String,
+    failure_class: GatewayRuntimeFailureClass,
+}
+
+impl FailedRuntimeRevision {
+    fn new(config_revision: u64, policy_hash: &str, failure: &GatewayRuntimeReloadError) -> Self {
+        Self {
+            config_revision,
+            policy_hash: policy_hash.to_string(),
+            failure_class: failure.class(),
+        }
+    }
+}
+
+async fn reload_gateway_policy_runtime(
+    engine: &OpaEngine,
+    policy: Option<&openshell_core::proto::SandboxPolicy>,
+    entrypoint_pid: u32,
+    desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    middleware_registry_changed: bool,
+) -> std::result::Result<(), GatewayRuntimeReloadError> {
+    match policy {
+        Some(policy) if middleware_registry_changed => {
+            let registry = connect_middleware_registry(desired_services)
+                .await
+                .map_err(GatewayRuntimeReloadError::MiddlewareRegistry)?;
+            engine
+                .reload_policy_and_middleware_from_proto_with_pid(policy, entrypoint_pid, registry)
+                .map_err(GatewayRuntimeReloadError::PolicyValidation)
+        }
+        // Policy-only change: the installed registry already matches the
+        // delivered service set, so swap the engine alone. This must not
+        // require middleware reachability.
+        Some(policy) => engine
+            .reload_from_proto_with_pid(policy, entrypoint_pid)
+            .map_err(GatewayRuntimeReloadError::PolicyValidation),
+        None => Err(GatewayRuntimeReloadError::PolicyValidation(
+            miette::miette!("runtime reload requires a policy payload but none was returned"),
+        )),
+    }
+}
+
 /// True when the installed middleware registry no longer matches the desired
 /// service set and must be rebuilt (reconnecting every delivered service).
 ///
@@ -2249,12 +2347,23 @@ enum LoadedPolicyOrigin {
     LocalOverride,
     Gateway {
         revision: Option<LoadedPolicyRevision>,
+        has_last_valid_policy: bool,
     },
 }
 
 impl LoadedPolicyOrigin {
     fn allows_gateway_policy_reload(&self) -> bool {
         matches!(self, Self::Gateway { .. })
+    }
+
+    fn has_last_valid_policy(&self) -> bool {
+        match self {
+            Self::LocalOverride => true,
+            Self::Gateway {
+                has_last_valid_policy,
+                ..
+            } => *has_last_valid_policy,
+        }
     }
 }
 
@@ -2362,7 +2471,7 @@ fn initial_poll_disposition(
 ) -> InitialPollDisposition {
     match origin {
         LoadedPolicyOrigin::LocalOverride => InitialPollDisposition::TrackOnly,
-        LoadedPolicyOrigin::Gateway { revision } => {
+        LoadedPolicyOrigin::Gateway { revision, .. } => {
             initial_policy_ack_candidate(revision.as_ref(), canonical).map_or(
                 InitialPollDisposition::Reconcile,
                 InitialPollDisposition::Acknowledge,
@@ -2594,6 +2703,187 @@ async fn reconcile_middleware_registry(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct PolicyValidationFailureDisposition {
+    configured_mode: PolicyValidationFailureMode,
+    mode: PolicyValidationFailureMode,
+    previous_policy_active: bool,
+    active_generation: u64,
+}
+
+struct RejectedPolicyGeneration {
+    version: u32,
+    policy_hash: String,
+    validation_error: String,
+    configured_mode: PolicyValidationFailureMode,
+}
+
+enum GatewayRuntimeFailureDisposition {
+    PolicyRejected {
+        error: String,
+        disposition: PolicyValidationFailureDisposition,
+    },
+    MiddlewareUnavailable {
+        error: String,
+    },
+}
+
+fn apply_gateway_runtime_reload_failure(
+    engine: &OpaEngine,
+    failure: GatewayRuntimeReloadError,
+    configured_mode: PolicyValidationFailureMode,
+    has_last_valid_policy: bool,
+    version: u32,
+) -> Result<GatewayRuntimeFailureDisposition> {
+    match failure {
+        GatewayRuntimeReloadError::PolicyValidation(error) => {
+            let error = error.to_string();
+            let disposition = apply_policy_validation_failure(
+                engine,
+                configured_mode,
+                has_last_valid_policy,
+                version,
+                &error,
+            )?;
+            Ok(GatewayRuntimeFailureDisposition::PolicyRejected { error, disposition })
+        }
+        GatewayRuntimeReloadError::MiddlewareRegistry(error) => {
+            Ok(GatewayRuntimeFailureDisposition::MiddlewareUnavailable {
+                error: error.to_string(),
+            })
+        }
+    }
+}
+
+fn apply_policy_validation_failure(
+    engine: &OpaEngine,
+    configured_mode: PolicyValidationFailureMode,
+    has_last_valid_policy: bool,
+    version: u32,
+    error: &str,
+) -> Result<PolicyValidationFailureDisposition> {
+    let mode = if has_last_valid_policy {
+        configured_mode
+    } else {
+        PolicyValidationFailureMode::FailClosed
+    };
+    match mode {
+        PolicyValidationFailureMode::FailClosed => {
+            let reason = format!(
+                "policy validation failed; fail-closed quarantine is active; candidate version {version} rejected: {error}"
+            );
+            let active_generation = engine.enter_fail_closed(reason)?;
+            Ok(PolicyValidationFailureDisposition {
+                configured_mode,
+                mode,
+                previous_policy_active: false,
+                active_generation,
+            })
+        }
+        PolicyValidationFailureMode::RetainLastValid => {
+            let active_generation = engine.exit_fail_closed()?;
+            Ok(PolicyValidationFailureDisposition {
+                configured_mode,
+                mode,
+                previous_policy_active: true,
+                active_generation,
+            })
+        }
+    }
+}
+
+fn policy_validation_failure_events(
+    disposition: &PolicyValidationFailureDisposition,
+    version: u32,
+    policy_hash: &str,
+    error: &str,
+) -> [OcsfEvent; 2] {
+    let previous_policy_state = if disposition.previous_policy_active {
+        "IS active"
+    } else {
+        "IS NOT active"
+    };
+    let state = if disposition.previous_policy_active {
+        (StateId::Enabled, "retained_last_valid")
+    } else {
+        (StateId::Disabled, "fail_closed")
+    };
+    let message = format!(
+        "Policy validation failed; configured_mode={} effective_mode={}; previous policy {previous_policy_state} [version:{version} active_generation:{} error:{error}]",
+        disposition.configured_mode.as_str(),
+        disposition.mode.as_str(),
+        disposition.active_generation,
+    );
+    let finding_uid = format!("policy-validation-failed-{version}");
+    let version_string = version.to_string();
+    let config = ConfigStateChangeBuilder::new(ocsf_ctx())
+        .severity(SeverityId::High)
+        .status(StatusId::Failure)
+        .state(state.0, state.1)
+        .unmapped("candidate_version", serde_json::json!(version))
+        .unmapped("candidate_policy_hash", serde_json::json!(policy_hash))
+        .unmapped(
+            "validation_failure_mode",
+            serde_json::json!(disposition.mode.as_str()),
+        )
+        .unmapped(
+            "configured_validation_failure_mode",
+            serde_json::json!(disposition.configured_mode.as_str()),
+        )
+        .unmapped(
+            "previous_policy_active",
+            serde_json::json!(disposition.previous_policy_active),
+        )
+        .unmapped(
+            "active_generation",
+            serde_json::json!(disposition.active_generation),
+        )
+        .unmapped("validation_error", serde_json::json!(error))
+        .message(message.clone())
+        .build();
+    let finding = DetectionFindingBuilder::new(ocsf_ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .is_alert(true)
+        .finding_info(
+            FindingInfo::new(&finding_uid, "Invalid policy generation rejected").with_desc(error),
+        )
+        .evidence_pairs(&[
+            ("candidate_version", &version_string),
+            ("candidate_policy_hash", policy_hash),
+            ("validation_failure_mode", disposition.mode.as_str()),
+            (
+                "configured_validation_failure_mode",
+                disposition.configured_mode.as_str(),
+            ),
+            (
+                "previous_policy_active",
+                if disposition.previous_policy_active {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
+        ])
+        .remediation("Submit a valid, unambiguous policy generation")
+        .message(message)
+        .build();
+    [config, finding]
+}
+
+fn emit_policy_validation_failure(
+    disposition: &PolicyValidationFailureDisposition,
+    version: u32,
+    policy_hash: &str,
+    error: &str,
+) {
+    for event in policy_validation_failure_events(disposition, version, policy_hash, error) {
+        ocsf_emit!(event);
+    }
+}
+
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::PolicySource;
@@ -2617,7 +2907,9 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         openshell_core::proto::EffectiveSetting,
     > = std::collections::HashMap::new();
     let reloads_gateway_policy = ctx.loaded_policy_origin.allows_gateway_policy_reload();
-    let mut last_failed_runtime_revision: Option<(u64, String)> = None;
+    let mut last_failed_runtime_revision: Option<FailedRuntimeRevision> = None;
+    let mut rejected_policy_generation: Option<RejectedPolicyGeneration> = None;
+    let mut has_last_valid_policy = ctx.loaded_policy_origin.has_last_valid_policy();
 
     // A first poll that does not match the policy already loaded into OPA must
     // pass through the normal reconciliation path immediately. It must never
@@ -2707,14 +2999,23 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             &current_middleware_services,
             &result.supervisor_middleware_services,
         );
-        let policy_runtime_changed = gateway_policy_runtime_needs_reconciliation(
-            reloads_gateway_policy,
-            &current_policy_hash,
-            &result.policy_hash,
-            &current_middleware_services,
-            &result.supervisor_middleware_services,
-            middleware_registry_status,
-        );
+        // A valid candidate may intentionally restore byte-for-byte policy
+        // content that was active before a rejected update. Its hash then
+        // equals `current_policy_hash`, but the runtime is still quarantined
+        // and must reload (or it would remain deny-all indefinitely).
+        let recovering_rejected_policy = reloads_gateway_policy
+            && rejected_policy_generation
+                .as_ref()
+                .is_some_and(|rejected| rejected.policy_hash != result.policy_hash);
+        let policy_runtime_changed = recovering_rejected_policy
+            || gateway_policy_runtime_needs_reconciliation(
+                reloads_gateway_policy,
+                &current_policy_hash,
+                &result.policy_hash,
+                &current_middleware_services,
+                &result.supervisor_middleware_services,
+                middleware_registry_status,
+            );
 
         // A local policy override is not coupled to the gateway policy
         // snapshot, so its service registry can still be reconciled alone.
@@ -2737,6 +3038,30 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         if config_changed || provider_env_changed {
             // Log which settings changed.
             log_setting_changes(&current_settings, &result.settings);
+
+            // A posture change after a rejected update takes effect immediately.
+            // The compiled last-known-good engine remains available beneath a
+            // fail-closed quarantine, so an explicit retain_last_valid selection
+            // can reactivate it without accepting any part of the invalid policy.
+            if !policy_changed && let Some(rejected) = rejected_policy_generation.as_mut() {
+                let mode = result.policy_validation_failure_mode;
+                if mode != rejected.configured_mode {
+                    let disposition = apply_policy_validation_failure(
+                        &ctx.opa_engine,
+                        mode,
+                        has_last_valid_policy,
+                        rejected.version,
+                        &rejected.validation_error,
+                    )?;
+                    emit_policy_validation_failure(
+                        &disposition,
+                        rejected.version,
+                        &rejected.policy_hash,
+                        &rejected.validation_error,
+                    );
+                    rejected.configured_mode = mode;
+                }
+            }
 
             ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
                 .severity(SeverityId::Informational)
@@ -2804,26 +3129,14 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 
         if policy_runtime_changed {
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
-            let runtime_result = match result.policy.as_ref() {
-                Some(policy) if middleware_registry_changed => {
-                    match connect_middleware_registry(&result.supervisor_middleware_services).await
-                    {
-                        Ok(registry) => ctx
-                            .opa_engine
-                            .reload_policy_and_middleware_from_proto_with_pid(
-                                policy, pid, registry,
-                            ),
-                        Err(error) => Err(error),
-                    }
-                }
-                // Policy-only change: the installed registry already matches
-                // the delivered service set, so swap the engine alone. This
-                // must not require middleware reachability.
-                Some(policy) => ctx.opa_engine.reload_from_proto_with_pid(policy, pid),
-                None => Err(miette::miette!(
-                    "runtime reload requires a policy payload but none was returned"
-                )),
-            };
+            let runtime_result = reload_gateway_policy_runtime(
+                &ctx.opa_engine,
+                result.policy.as_ref(),
+                pid,
+                &result.supervisor_middleware_services,
+                middleware_registry_changed,
+            )
+            .await;
 
             match runtime_result {
                 Ok(()) => {
@@ -2831,6 +3144,8 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                         .policy
                         .as_ref()
                         .expect("successful runtime reload requires a policy payload");
+                    has_last_valid_policy = true;
+                    rejected_policy_generation = None;
                     if policy_changed {
                         if let Some(policy_local_ctx) = ctx.policy_local_ctx.as_ref() {
                             policy_local_ctx.set_current_policy(policy.clone()).await;
@@ -2875,6 +3190,26 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                                 PolicyStatusUpdate::loaded(result.version),
                             );
                         }
+                    } else if recovering_rejected_policy
+                        && result.version > 0
+                        && result.policy_source == PolicySource::Sandbox
+                    {
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Enabled, "loaded")
+                                .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                                .message(format!(
+                                    "Policy reloaded successfully and fail-closed quarantine cleared [policy_hash:{}]",
+                                    result.policy_hash
+                                ))
+                                .build()
+                        );
+                        enqueue_policy_status(
+                            &status_sender,
+                            PolicyStatusUpdate::loaded(result.version),
+                        );
                     }
 
                     if middleware_registry_changed {
@@ -2898,28 +3233,61 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                     middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
                     last_failed_runtime_revision = None;
                 }
-                Err(e) => {
-                    let failed_revision = (result.config_revision, result.policy_hash.clone());
+                Err(failure) => {
+                    let failed_revision = FailedRuntimeRevision::new(
+                        result.config_revision,
+                        &result.policy_hash,
+                        &failure,
+                    );
                     if last_failed_runtime_revision.as_ref() != Some(&failed_revision) {
-                        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Medium)
-                            .status(StatusId::Failure)
-                            .state(StateId::Other, "failed")
-                            .unmapped("version", serde_json::json!(result.version))
-                            .unmapped("error", serde_json::json!(e.to_string()))
-                            .message(format!(
-                                "Policy and middleware runtime reload failed, keeping last-known-good runtime [version:{} error:{e}]",
-                                result.version
-                            ))
-                            .build());
-                        if policy_changed
-                            && result.version > 0
-                            && result.policy_source == PolicySource::Sandbox
-                        {
-                            enqueue_policy_status(
-                                &status_sender,
-                                PolicyStatusUpdate::failed(result.version, e.to_string()),
-                            );
+                        let failure_mode = result.policy_validation_failure_mode;
+                        match apply_gateway_runtime_reload_failure(
+                            &ctx.opa_engine,
+                            failure,
+                            failure_mode,
+                            has_last_valid_policy,
+                            result.version,
+                        )? {
+                            GatewayRuntimeFailureDisposition::PolicyRejected {
+                                error,
+                                disposition,
+                            } => {
+                                emit_policy_validation_failure(
+                                    &disposition,
+                                    result.version,
+                                    &result.policy_hash,
+                                    &error,
+                                );
+                                rejected_policy_generation = Some(RejectedPolicyGeneration {
+                                    version: result.version,
+                                    policy_hash: result.policy_hash.clone(),
+                                    validation_error: error.clone(),
+                                    configured_mode: failure_mode,
+                                });
+                                if policy_changed
+                                    && result.version > 0
+                                    && result.policy_source == PolicySource::Sandbox
+                                {
+                                    enqueue_policy_status(
+                                        &status_sender,
+                                        PolicyStatusUpdate::failed(result.version, error),
+                                    );
+                                }
+                            }
+                            GatewayRuntimeFailureDisposition::MiddlewareUnavailable { error } => {
+                                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                                    .severity(SeverityId::Medium)
+                                    .status(StatusId::Failure)
+                                    .state(StateId::Other, "failed")
+                                    .unmapped("version", serde_json::json!(result.version))
+                                    .unmapped("error", serde_json::json!(&error))
+                                    .unmapped("previous_policy_active", serde_json::json!(true))
+                                    .message(format!(
+                                        "Supervisor middleware registry unavailable, keeping last-known-good policy runtime active [version:{} error:{error}]",
+                                        result.version
+                                    ))
+                                    .build());
+                            }
                         }
                     }
                     last_failed_runtime_revision = Some(failed_revision);
@@ -3458,6 +3826,7 @@ filesystem_policy:
             provider_env_revision: 0,
             supervisor_middleware_services: Vec::new(),
             workspace: String::new(),
+            policy_validation_failure_mode: PolicyValidationFailureMode::default(),
         }
     }
 
@@ -3481,6 +3850,96 @@ filesystem_policy:
             .expect_err("unavailable external service must not replace built-ins");
 
         assert_eq!(engine.current_generation(), builtins_generation);
+    }
+
+    #[tokio::test]
+    async fn unavailable_middleware_reload_keeps_last_known_good_runtime_active() {
+        let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
+        install_builtin_middleware_registry(&engine)
+            .await
+            .expect("install built-in middleware registry");
+        let active_generation = engine.current_generation();
+        let unavailable_service = openshell_core::proto::SupervisorMiddlewareService {
+            name: "unavailable-guard".into(),
+            grpc_endpoint: "http://127.0.0.1:1".into(),
+            max_body_bytes: 1024,
+            ..Default::default()
+        };
+
+        let failure = reload_gateway_policy_runtime(
+            &engine,
+            Some(&proto_policy_fixture()),
+            0,
+            &[unavailable_service],
+            true,
+        )
+        .await
+        .expect_err("unavailable middleware must fail candidate preparation");
+        let disposition = apply_gateway_runtime_reload_failure(
+            &engine,
+            failure,
+            PolicyValidationFailureMode::FailClosed,
+            true,
+            2,
+        )
+        .expect("middleware failure handling must succeed");
+
+        assert!(matches!(
+            disposition,
+            GatewayRuntimeFailureDisposition::MiddlewareUnavailable { .. }
+        ));
+        assert_eq!(engine.current_generation(), active_generation);
+        assert!(engine.fail_closed_reason().is_none());
+    }
+
+    #[test]
+    fn policy_rejection_after_middleware_outage_is_not_deduplicated() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../../openshell-supervisor-network/data/sandbox-policy.rego"),
+            "network_policies: {}\n",
+        )
+        .unwrap();
+        let middleware_failure = GatewayRuntimeReloadError::MiddlewareRegistry(miette::miette!(
+            "middleware service unavailable"
+        ));
+        let first_failure = FailedRuntimeRevision::new(42, "sha256:candidate", &middleware_failure);
+        let middleware_disposition = apply_gateway_runtime_reload_failure(
+            &engine,
+            middleware_failure,
+            PolicyValidationFailureMode::FailClosed,
+            true,
+            7,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            middleware_disposition,
+            GatewayRuntimeFailureDisposition::MiddlewareUnavailable { .. }
+        ));
+        assert!(engine.fail_closed_reason().is_none());
+
+        let policy_failure = GatewayRuntimeReloadError::PolicyValidation(miette::miette!(
+            "conflicting endpoint metadata"
+        ));
+        let second_failure = FailedRuntimeRevision::new(42, "sha256:candidate", &policy_failure);
+        assert_ne!(
+            first_failure, second_failure,
+            "a changed failure class for the same candidate must be handled"
+        );
+
+        let policy_disposition = apply_gateway_runtime_reload_failure(
+            &engine,
+            policy_failure,
+            PolicyValidationFailureMode::FailClosed,
+            true,
+            7,
+        )
+        .unwrap();
+        assert!(matches!(
+            policy_disposition,
+            GatewayRuntimeFailureDisposition::PolicyRejected { .. }
+        ));
+        assert!(engine.fail_closed_reason().is_some());
     }
 
     #[test]
@@ -3684,6 +4143,7 @@ filesystem_policy:
             initial_poll_disposition(
                 &LoadedPolicyOrigin::Gateway {
                     revision: Some(loaded),
+                    has_last_valid_policy: true,
                 },
                 &canonical,
             ),
@@ -3713,7 +4173,10 @@ filesystem_policy:
             2,
             openshell_core::proto::PolicySource::Sandbox,
         );
-        let origin = LoadedPolicyOrigin::Gateway { revision: None };
+        let origin = LoadedPolicyOrigin::Gateway {
+            revision: None,
+            has_last_valid_policy: true,
+        };
 
         assert_eq!(
             initial_poll_disposition(&origin, &canonical),
@@ -3751,6 +4214,169 @@ filesystem_policy:
         assert_eq!(
             snapshot.workspace, "beta",
             "workspace must survive the snapshot so sync_policy_and_fetch_snapshot receives it"
+        );
+    }
+    #[test]
+    fn fail_closed_validation_failure_deactivates_previous_generation() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../../openshell-supervisor-network/data/sandbox-policy.rego"),
+            "network_policies: {}\n",
+        )
+        .unwrap();
+        let previous_generation = engine.current_generation();
+
+        let disposition = apply_policy_validation_failure(
+            &engine,
+            PolicyValidationFailureMode::FailClosed,
+            true,
+            7,
+            "conflicting tls metadata",
+        )
+        .unwrap();
+
+        assert!(!disposition.previous_policy_active);
+        assert!(disposition.active_generation > previous_generation);
+        assert!(
+            engine
+                .fail_closed_reason()
+                .expect("quarantine reason")
+                .contains("candidate version 7 rejected")
+        );
+    }
+
+    #[test]
+    fn retain_validation_failure_keeps_previous_generation_active() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../../openshell-supervisor-network/data/sandbox-policy.rego"),
+            "network_policies: {}\n",
+        )
+        .unwrap();
+        let previous_generation = engine.current_generation();
+
+        let quarantined = apply_policy_validation_failure(
+            &engine,
+            PolicyValidationFailureMode::FailClosed,
+            true,
+            6,
+            "conflicting tls metadata",
+        )
+        .unwrap();
+        assert!(!quarantined.previous_policy_active);
+
+        let disposition = apply_policy_validation_failure(
+            &engine,
+            PolicyValidationFailureMode::RetainLastValid,
+            true,
+            7,
+            "conflicting tls metadata",
+        )
+        .unwrap();
+
+        assert!(disposition.previous_policy_active);
+        assert!(disposition.active_generation > quarantined.active_generation);
+        assert!(disposition.active_generation > previous_generation);
+        assert!(engine.fail_closed_reason().is_none());
+    }
+
+    #[test]
+    fn retain_validation_failure_without_last_valid_policy_stays_fail_closed() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../../openshell-supervisor-network/data/sandbox-policy.rego"),
+            "network_policies: {}\n",
+        )
+        .unwrap();
+
+        let disposition = apply_policy_validation_failure(
+            &engine,
+            PolicyValidationFailureMode::RetainLastValid,
+            false,
+            1,
+            "conflicting tls metadata",
+        )
+        .unwrap();
+
+        assert_eq!(
+            disposition.configured_mode,
+            PolicyValidationFailureMode::RetainLastValid
+        );
+        assert_eq!(disposition.mode, PolicyValidationFailureMode::FailClosed);
+        assert!(!disposition.previous_policy_active);
+        assert!(engine.fail_closed_reason().is_some());
+
+        let [config, _] = policy_validation_failure_events(
+            &disposition,
+            1,
+            "sha256:test",
+            "conflicting tls metadata",
+        );
+        let config = config.to_json().unwrap();
+        assert_eq!(config["unmapped"]["validation_failure_mode"], "fail_closed");
+        assert_eq!(
+            config["unmapped"]["configured_validation_failure_mode"],
+            "retain_last_valid"
+        );
+        assert!(
+            config["message"]
+                .as_str()
+                .unwrap()
+                .contains("previous policy IS NOT active")
+        );
+    }
+
+    #[test]
+    fn validation_failure_ocsf_states_whether_previous_policy_is_active() {
+        let fail_closed = PolicyValidationFailureDisposition {
+            configured_mode: PolicyValidationFailureMode::FailClosed,
+            mode: PolicyValidationFailureMode::FailClosed,
+            previous_policy_active: false,
+            active_generation: 9,
+        };
+        let [config, finding] = policy_validation_failure_events(
+            &fail_closed,
+            8,
+            "sha256:test",
+            "conflicting tls metadata",
+        );
+        let config = config.to_json().unwrap();
+        assert_eq!(config["class_uid"], 5019);
+        assert_eq!(config["status"], "Failure");
+        assert_eq!(config["unmapped"]["validation_failure_mode"], "fail_closed");
+        assert_eq!(
+            config["unmapped"]["configured_validation_failure_mode"],
+            "fail_closed"
+        );
+        assert_eq!(config["unmapped"]["previous_policy_active"], false);
+        assert!(
+            config["message"]
+                .as_str()
+                .unwrap()
+                .contains("previous policy IS NOT active")
+        );
+
+        let finding = finding.to_json().unwrap();
+        assert_eq!(finding["class_uid"], 2004);
+        assert_eq!(finding["action"], "Denied");
+        assert_eq!(finding["disposition"], "Blocked");
+
+        let retained = PolicyValidationFailureDisposition {
+            configured_mode: PolicyValidationFailureMode::RetainLastValid,
+            mode: PolicyValidationFailureMode::RetainLastValid,
+            previous_policy_active: true,
+            active_generation: 4,
+        };
+        let [config, _] = policy_validation_failure_events(
+            &retained,
+            8,
+            "sha256:test",
+            "conflicting tls metadata",
+        );
+        let config = config.to_json().unwrap();
+        assert_eq!(config["unmapped"]["previous_policy_active"], true);
+        assert!(
+            config["message"]
+                .as_str()
+                .unwrap()
+                .contains("previous policy IS active")
         );
     }
 }

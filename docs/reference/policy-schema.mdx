@@ -223,7 +223,7 @@ REST allow rules match HTTP requests by method, path, and optional query paramet
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `method` | string | Yes | HTTP method to allow (for example, `GET`, `POST`). `*` matches any method. |
-| `path` | string | Yes | URL path pattern. Supports `*` and `**` glob syntax. |
+| `path` | string | Yes | URL path glob. `*` and `**` match zero or more characters and may cross `/`; `?` matches one character; bracket classes such as `[0-9]` and `[!0]` are supported. |
 | `query` | map | No | Query parameter matchers keyed by decoded param name. Matcher value can be a glob string (`tag: "foo-*"`) or an object with `any` (`tag: { any: ["foo-*", "bar-*"] }`). |
 
 Example REST allow rules:

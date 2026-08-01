@@ -481,15 +481,36 @@ impl PodmanClient {
         }
     }
 
-    /// Force-remove a container and its anonymous volumes.
-    pub async fn remove_container(&self, name: &str) -> Result<(), PodmanApiError> {
+    /// Remove a container in one timed, forced Libpod delete operation.
+    ///
+    /// The Libpod endpoint uses `volumes` for anonymous-volume removal. Its
+    /// Docker-compatible counterpart uses the shorter `v` parameter.
+    pub async fn remove_container(
+        &self,
+        name: &str,
+        timeout_secs: u32,
+    ) -> Result<(), PodmanApiError> {
         validate_name(name)?;
-        self.request_ok(
-            hyper::Method::DELETE,
-            &format!("/libpod/containers/{name}?force=true&v=true"),
-            None,
-        )
-        .await
+        // The delete request covers both the graceful stop and the subsequent
+        // storage, network, and anonymous-volume cleanup. Preserve the normal
+        // API timeout as cleanup headroom after the stop grace period.
+        let http_timeout = Duration::from_secs(u64::from(timeout_secs)) + API_TIMEOUT;
+        let (status, bytes) = self
+            .request(
+                hyper::Method::DELETE,
+                &format!(
+                    "/libpod/containers/{name}?force=true&volumes=true&timeout={timeout_secs}"
+                ),
+                None,
+                http_timeout,
+            )
+            .await?;
+        let code = status.as_u16();
+        if status.is_success() || code == 304 {
+            Ok(())
+        } else {
+            Err(error_from_response(code, &bytes))
+        }
     }
 
     /// Inspect a container by name or ID.
@@ -980,6 +1001,58 @@ mod tests {
                 .as_slice(),
             ["GET /v5.0.0/libpod/images/example%2Fimage%3Alatest/json"]
         );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn remove_container_uses_single_timed_libpod_removal() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "remove-container",
+            vec![StubResponse::new(StatusCode::NO_CONTENT, "")],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        client
+            .remove_container("sandbox-123", 10)
+            .await
+            .expect("container removal should succeed");
+
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            ["DELETE /v5.0.0/libpod/containers/sandbox-123?force=true&volumes=true&timeout=10"]
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remove_container_allows_cleanup_after_stop_timeout() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "remove-container-delayed",
+            vec![StubResponse::new(StatusCode::NO_CONTENT, "").with_delay(Duration::from_secs(6))],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let removal = tokio::spawn(async move { client.remove_container("sandbox-123", 0).await });
+        while request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        removal
+            .await
+            .expect("removal task should finish")
+            .expect("container removal should retain the API timeout for cleanup");
+
+        handle.await.expect("stub task should finish");
         let _ = std::fs::remove_file(socket_path);
     }
 }

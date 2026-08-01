@@ -354,6 +354,13 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 openshell policy set dev --policy current-policy.yaml --wait
 ```
 
+The gateway validates the complete effective candidate—including attached
+provider-profile policy—before it stores a direct update, incremental merge,
+approved proposal, provider attachment, or profile update that affects attached
+sandboxes. An ambiguity failure returns `FAILED_PRECONDITION`; the rejected
+candidate does not create a policy revision or partially update affected
+sandboxes. Fix the conflicting endpoint selectors and submit again.
+
 The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls every second). Exit codes:
 - **0**: Policy loaded successfully
 - **1**: Policy load failed
@@ -577,6 +584,13 @@ openshell settings set --global --key providers_v2_enabled --value true
 ```
 
 Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.
+
+`policy_validation_failure_mode` is gateway startup configuration, not a
+mutable `openshell settings` key. Set it under `[openshell.gateway]` in
+`gateway.toml` and restart the gateway. The security-first default is
+`fail_closed`; `retain_last_valid` is an explicit availability tradeoff. OCSF
+configuration events state whether the previous generation is active after a
+runtime validation failure.
 
 ## Workflow 10: Service Access
 
