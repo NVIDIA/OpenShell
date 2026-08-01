@@ -3,9 +3,7 @@
 
 pub mod config;
 
-#[cfg(not(target_os = "windows"))]
 pub mod driver;
-#[cfg(not(target_os = "windows"))]
 pub mod grpc;
 
 pub use config::{
@@ -14,7 +12,5 @@ pub use config::{
     SupervisorSideloadMethod, SupervisorTopology,
 };
 
-#[cfg(not(target_os = "windows"))]
 pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
-#[cfg(not(target_os = "windows"))]
 pub use grpc::ComputeDriverService;

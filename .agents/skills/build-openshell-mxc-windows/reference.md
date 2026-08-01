@@ -57,7 +57,7 @@ installer behavior, Linux build-environment shell helpers, and Linux
 service/RPM packaging assets skip on Windows. The Windows Clippy command
 excludes unsupported runtime packages as top-level targets and allows only
 unused imports, dead code, and unused async functions caused by cfg-gated
-Windows stubs; other warnings remain errors.
+platform code; other warnings remain errors.
 
 The wrapper limits Cargo to four jobs by default and serializes wrapper-owned
 Cargo commands with a host-local mutex. It does not set `CL` or `_CL_` because
@@ -85,8 +85,9 @@ Windows is a build target only. These runtimes remain unsupported:
 
 Rules:
 
-- Keep config/library stubs where the gateway needs them.
-- Return clear unsupported errors at runtime.
+- Keep unsupported driver crates out of the Windows gateway dependency graph.
+- Make the Windows check fail if Docker, Kubernetes, or Podman re-enters that graph.
+- Return clear unsupported errors from gateway driver selection.
 - Do not build standalone Windows driver binaries.
 - Do not add Docker Desktop, WSL, Hyper-V, Podman machine, Podman Desktop, or
   VM-backed execution as part of this skill.
@@ -94,8 +95,7 @@ Rules:
 Current focused unsupported-contract tests:
 
 ```text
-windows_compute_driver_stubs_report_unsupported
-windows_spawn_reports_unsupported
+windows_builtin_compute_drivers_report_unsupported
 ```
 
 Run them with the architecture-specific focused task on the native host.
@@ -113,10 +113,9 @@ top-level workspace targets for check/test:
 --exclude openshell-supervisor-process
 ```
 
-This does not mean all driver code disappears from the build graph. Docker,
-Kubernetes, and Podman stubs can still compile as gateway dependencies. The
-process supervisor is also excluded because its runtime is not supported on
-Windows.
+Docker, Kubernetes, and Podman are also target-specific gateway dependencies,
+so these packages do not re-enter the Windows graph transitively. The process
+supervisor remains excluded because its runtime is not supported on Windows.
 
 ## Common Errors
 

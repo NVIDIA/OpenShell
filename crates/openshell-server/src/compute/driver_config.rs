@@ -10,8 +10,11 @@
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;
 use openshell_core::{ComputeDriverKind, Error, Result};
+#[cfg(not(target_os = "windows"))]
 use openshell_driver_docker::DockerComputeConfig;
+#[cfg(not(target_os = "windows"))]
 use openshell_driver_kubernetes::KubernetesComputeConfig;
+#[cfg(not(target_os = "windows"))]
 use openshell_driver_podman::PodmanComputeConfig;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -46,6 +49,7 @@ pub struct DriverStartupContext<'a> {
 }
 
 /// Build the selected Kubernetes config from TOML plus runtime defaults.
+#[cfg(not(target_os = "windows"))]
 pub fn kubernetes_config_from_context(
     context: DriverStartupContext<'_>,
 ) -> Result<KubernetesComputeConfig> {
@@ -54,6 +58,7 @@ pub fn kubernetes_config_from_context(
     Ok(cfg)
 }
 
+#[cfg(not(target_os = "windows"))]
 pub fn kubernetes_config_for_k8s_sa_bootstrap(
     file: Option<&config_file::ConfigFile>,
 ) -> Result<KubernetesComputeConfig> {
@@ -71,6 +76,7 @@ pub fn kubernetes_config_for_k8s_sa_bootstrap(
 }
 
 /// Build the selected Podman config from TOML plus runtime defaults.
+#[cfg(not(target_os = "windows"))]
 pub fn podman_config_from_context(
     context: DriverStartupContext<'_>,
 ) -> Result<PodmanComputeConfig> {
@@ -80,6 +86,7 @@ pub fn podman_config_from_context(
 }
 
 /// Build the selected Docker config from TOML plus runtime defaults.
+#[cfg(not(target_os = "windows"))]
 pub fn docker_config_from_context(
     context: DriverStartupContext<'_>,
 ) -> Result<DockerComputeConfig> {
@@ -141,6 +148,7 @@ where
     })
 }
 
+#[cfg(not(target_os = "windows"))]
 fn apply_kubernetes_runtime_defaults(k8s: &mut KubernetesComputeConfig) {
     if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
         k8s.workspace_default_storage_size = size;
@@ -150,6 +158,7 @@ fn apply_kubernetes_runtime_defaults(k8s: &mut KubernetesComputeConfig) {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn apply_podman_runtime_defaults(
     podman: &mut PodmanComputeConfig,
     context: DriverStartupContext<'_>,
@@ -164,6 +173,7 @@ fn apply_podman_runtime_defaults(
     );
 }
 
+#[cfg(not(target_os = "windows"))]
 fn apply_docker_runtime_defaults(cfg: &mut DockerComputeConfig, context: DriverStartupContext<'_>) {
     apply_guest_tls_defaults_to_split_fields(
         &mut cfg.guest_tls_ca,
@@ -196,6 +206,7 @@ fn apply_vm_runtime_defaults(cfg: &mut VmComputeConfig, context: DriverStartupCo
     );
 }
 
+#[cfg(not(target_os = "windows"))]
 fn apply_podman_env_overrides(podman: &mut PodmanComputeConfig) {
     if let Ok(p) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
         podman.socket_path = Some(PathBuf::from(p));
@@ -266,6 +277,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn k8s_sa_bootstrap_rejects_missing_kubernetes_driver_config() {
         let err = kubernetes_config_for_k8s_sa_bootstrap(None).unwrap_err();
         assert!(err.to_string().contains("[openshell.drivers.kubernetes]"));
@@ -277,6 +289,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn k8s_sa_bootstrap_uses_configured_namespace_and_service_account() {
         let file: config_file::ConfigFile = toml::from_str(
             r#"
@@ -295,6 +308,7 @@ service_account_name = "sandbox-sa"
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn podman_config_reads_bind_mount_opt_in_from_driver_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r"
@@ -310,6 +324,7 @@ enable_bind_mounts = true
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn docker_config_reads_bind_mount_opt_in_from_driver_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r"
@@ -325,6 +340,7 @@ enable_bind_mounts = true
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn docker_config_reads_socket_path_from_driver_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r#"
@@ -401,6 +417,7 @@ socket_path = "/run/openshell/kyma.sock"
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn docker_config_reports_selected_invalid_driver_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r"

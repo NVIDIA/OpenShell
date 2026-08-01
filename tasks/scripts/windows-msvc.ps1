@@ -576,6 +576,24 @@ function Invoke-Check([string] $RustTarget) {
         -RustTarget $RustTarget `
         -CargoArgs "cargo check --workspace $UnsupportedDriverPackageExcludes --target $RustTarget $Z3WorkspaceFeatures" `
         -LogName "build-$RustTarget-check.log"
+    Assert-GatewayExcludesUnsupportedDriverCrates $RustTarget
+}
+
+function Assert-GatewayExcludesUnsupportedDriverCrates([string] $RustTarget) {
+    $logName = "build-$RustTarget-driver-tree.log"
+    Invoke-VsCargo `
+        -RustTarget $RustTarget `
+        -CargoArgs "cargo tree -p openshell-server --target $RustTarget --prefix none" `
+        -LogName $logName
+
+    $logPath = Join-Path $LogDir $logName
+    $unexpected = @(Select-String `
+        -Path $logPath `
+        -Pattern '^openshell-driver-(docker|kubernetes|podman)\s')
+    if ($unexpected.Count -gt 0) {
+        $packages = ($unexpected.Line | Sort-Object -Unique) -join ", "
+        throw "Unsupported driver crates entered the Windows gateway dependency graph: $packages"
+    }
 }
 
 function Invoke-Lint([string] $RustTarget) {
@@ -620,8 +638,7 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
     Assert-NativeTestTarget $RustTarget
 
     $tests = @(
-        "windows_compute_driver_stubs_report_unsupported",
-        "windows_spawn_reports_unsupported"
+        "windows_builtin_compute_drivers_report_unsupported"
     )
     foreach ($test in $tests) {
         Invoke-VsCargo `

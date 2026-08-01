@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//! Docker compute driver.
+
+#![allow(clippy::result_large_err)]
+
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{

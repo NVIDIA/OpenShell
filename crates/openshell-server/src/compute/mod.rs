@@ -7,8 +7,11 @@ pub mod driver_config;
 pub mod lease;
 pub mod vm;
 
+#[cfg(not(target_os = "windows"))]
 pub use openshell_driver_docker::DockerComputeConfig;
+#[cfg(not(target_os = "windows"))]
 pub use openshell_driver_kubernetes::KubernetesComputeConfig;
+#[cfg(not(target_os = "windows"))]
 pub use openshell_driver_podman::PodmanComputeConfig;
 pub use vm::VmComputeConfig;
 
@@ -318,11 +321,6 @@ const ORPHAN_GRACE_PERIOD: Duration = Duration::from_secs(300);
 
 // Re-export the shared error type under the name used by this module.
 pub use openshell_core::ComputeDriverError as ComputeError;
-
-#[cfg(target_os = "windows")]
-fn unsupported_compute_driver_error(driver: &str) -> ComputeError {
-    ComputeError::Message(format!("{driver} compute driver is unsupported on Windows"))
-}
 
 #[derive(Debug)]
 pub struct ManagedDriverProcess {
@@ -758,19 +756,6 @@ impl ComputeRuntime {
         .await
     }
 
-    #[cfg(target_os = "windows")]
-    pub async fn new_docker(
-        _config: openshell_core::Config,
-        _docker_config: DockerComputeConfig,
-        _store: Arc<Store>,
-        _sandbox_index: SandboxIndex,
-        _sandbox_watch_bus: SandboxWatchBus,
-        _tracing_log_bus: TracingLogBus,
-        _supervisor_sessions: Arc<SupervisorSessionRegistry>,
-    ) -> Result<Self, ComputeError> {
-        Err(unsupported_compute_driver_error("Docker"))
-    }
-
     #[cfg(not(target_os = "windows"))]
     pub async fn new_kubernetes(
         config: KubernetesComputeConfig,
@@ -797,18 +782,6 @@ impl ComputeRuntime {
             supervisor_sessions,
         )
         .await
-    }
-
-    #[cfg(target_os = "windows")]
-    pub async fn new_kubernetes(
-        _config: KubernetesComputeConfig,
-        _store: Arc<Store>,
-        _sandbox_index: SandboxIndex,
-        _sandbox_watch_bus: SandboxWatchBus,
-        _tracing_log_bus: TracingLogBus,
-        _supervisor_sessions: Arc<SupervisorSessionRegistry>,
-    ) -> Result<Self, ComputeError> {
-        Err(unsupported_compute_driver_error("Kubernetes"))
     }
 
     pub(crate) async fn new_remote_driver(
@@ -861,18 +834,6 @@ impl ComputeRuntime {
             supervisor_sessions,
         )
         .await
-    }
-
-    #[cfg(target_os = "windows")]
-    pub async fn new_podman(
-        _config: PodmanComputeConfig,
-        _store: Arc<Store>,
-        _sandbox_index: SandboxIndex,
-        _sandbox_watch_bus: SandboxWatchBus,
-        _tracing_log_bus: TracingLogBus,
-        _supervisor_sessions: Arc<SupervisorSessionRegistry>,
-    ) -> Result<Self, ComputeError> {
-        Err(unsupported_compute_driver_error("Podman"))
     }
 
     #[must_use]
@@ -7300,17 +7261,5 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.object_workspace(), "alpha");
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_compute_driver_stubs_report_unsupported() {
-        for driver in ["Docker", "Kubernetes", "Podman"] {
-            let message = unsupported_compute_driver_error(driver).to_string();
-            assert!(
-                message.contains("unsupported on Windows"),
-                "{driver} stub message should be explicit, got: {message}"
-            );
-        }
     }
 }
