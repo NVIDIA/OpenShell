@@ -6193,9 +6193,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Other tests drive their own reconcile loops into the shared
-        // exporter, so match on the shape of a sweep rather than assuming
-        // there is exactly one.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while traced.spans_named("reconcile.sandboxes").is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the sweep records a span of its own");
+
         let spans = traced.finished_spans();
         let roots = traced.spans_named("reconcile.sandboxes");
         assert!(
