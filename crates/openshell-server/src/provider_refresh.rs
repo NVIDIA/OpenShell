@@ -1534,6 +1534,17 @@ mod tests {
         let traced = test_exporter::install_traced();
         run_refresh_worker_tick(&store).await.unwrap();
 
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while traced
+                .spans_named("refresh.provider_credentials")
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the tick records a span of its own");
+
         let spans = traced.finished_spans();
         let root = spans
             .iter()

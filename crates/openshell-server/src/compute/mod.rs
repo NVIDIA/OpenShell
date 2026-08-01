@@ -6148,6 +6148,17 @@ mod tests {
             .await
             .unwrap();
 
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while traced
+                .spans_named("driver_watch.sandbox_deleted")
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the event records a span of its own");
+
         let spans = traced.finished_spans();
         let root = spans
             .iter()
