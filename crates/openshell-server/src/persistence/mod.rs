@@ -358,7 +358,7 @@ impl Store {
         name = "store",
         skip_all,
         fields(
-            otel.name = "store.get_by_name", otel.status_code = tracing::field::Empty, 
+            otel.name = "store.get_by_name", otel.status_code = tracing::field::Empty,
             object_type = %object_type,
             workspace = %workspace,
             object.name = %name
@@ -492,7 +492,7 @@ impl Store {
         name = "store",
         skip_all,
         fields(
-            otel.name = "store.list_with_selector", otel.status_code = tracing::field::Empty, 
+            otel.name = "store.list_with_selector", otel.status_code = tracing::field::Empty,
             object_type = %object_type,
             workspace = %workspace,
             label_selector = %label_selector

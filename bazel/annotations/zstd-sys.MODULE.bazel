@@ -1,0 +1,8 @@
+bazel_dep(name = "zstd", version = "1.5.7.bcr.1")
+
+crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
+crate.annotation(
+    crate = "zstd-sys",
+    gen_build_script = "off",
+    deps = ["@zstd"],
+)

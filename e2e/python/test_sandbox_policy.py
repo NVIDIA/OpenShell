@@ -1950,15 +1950,14 @@ def test_host_wildcard_rejects_deep_subdomain(
 # =============================================================================
 
 
-def test_overlapping_policies_do_not_crash_opa(
+def test_overlapping_policies_with_conflicting_destination_metadata_are_rejected(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """OVL-1: Two policies covering the same host:port must not crash OPA.
+    """OVL-1: Conflicting metadata on the same host:port fails closed.
 
-    After a draft rule approval, the merged policy can contain two entries
-    for the same (host, port).  The OPA engine must handle this without
-    a 'duplicated definition of local variable' error.  This test creates
-    the overlap directly to simulate the post-approval state.
+    One endpoint permits any resolved address while the other constrains
+    ``allowed_ips``. The complete candidate is ambiguous and must not activate
+    either entry.
     """
     policy = _base_policy(
         network_policies={
@@ -1992,8 +1991,9 @@ def test_overlapping_policies_do_not_crash_opa(
             args=(_PROXY_HOST, _PROXY_PORT, _SANDBOX_IP, _FORWARD_PROXY_PORT),
         )
         assert result.exit_code == 0, result.stderr
-        assert "200" in result.stdout, (
-            f"Overlapping policies should not crash; expected 200, got: {result.stdout}"
+        assert "403" in result.stdout, (
+            "Conflicting overlapping policies should fail closed; "
+            f"expected 403, got: {result.stdout}"
         )
 
 

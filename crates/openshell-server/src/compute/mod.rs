@@ -27,11 +27,14 @@ use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
-    DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest,
+    DriverSandboxTemplate, GatewayListenerRequirement as ProtoGatewayListenerRequirement,
+    GetCapabilitiesRequest, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest,
     GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
     ResourceRequirements as DriverSandboxResourceRequirements, ValidateSandboxCreateRequest,
     WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
-    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -128,6 +131,41 @@ mod traced_driver {
 }
 
 const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GatewayListenerRequirement {
+    Exact {
+        address: SocketAddr,
+        driver_name: String,
+        reason: String,
+    },
+    DefaultRouteInterface {
+        driver_name: String,
+        reason: String,
+    },
+    LoopbackInterface {
+        driver_name: String,
+        reason: String,
+    },
+}
+
+impl GatewayListenerRequirement {
+    pub fn driver_name(&self) -> &str {
+        match self {
+            Self::Exact { driver_name, .. }
+            | Self::DefaultRouteInterface { driver_name, .. }
+            | Self::LoopbackInterface { driver_name, .. } => driver_name,
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Exact { reason, .. }
+            | Self::DefaultRouteInterface { reason, .. }
+            | Self::LoopbackInterface { reason, .. } => reason,
+        }
+    }
+}
 
 /// Serializes request-side deletes for the same stable sandbox ID.
 ///
@@ -352,6 +390,14 @@ impl ComputeDriver for RemoteComputeDriver {
         client.get_capabilities(request).await
     }
 
+    async fn get_gateway_listener_requirements(
+        &self,
+        request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<tonic::Response<GetGatewayListenerRequirementsResponse>, Status> {
+        let mut client = self.client();
+        client.get_gateway_listener_requirements(request).await
+    }
+
     async fn validate_sandbox_create(
         &self,
         request: Request<ValidateSandboxCreateRequest>,
@@ -434,7 +480,7 @@ pub struct ComputeRuntime {
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
     sync_lock: Arc<Mutex<()>>,
     delete_gates: Arc<DeleteGateRegistry>,
-    gateway_bind_addresses: Vec<SocketAddr>,
+    gateway_listener_requirements: Vec<GatewayListenerRequirement>,
     replica_id: String,
 }
 
@@ -466,7 +512,6 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
-        gateway_bind_addresses: Vec<SocketAddr>,
     ) -> Result<Self, ComputeError> {
         let capabilities = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
@@ -489,6 +534,59 @@ impl ComputeRuntime {
             driver_version: capabilities.driver_version,
         };
         let default_image = capabilities.default_image;
+        let gateway_listener_requirements = match driver
+            .get_gateway_listener_requirements(Request::new(
+                GetGatewayListenerRequirementsRequest {},
+            ))
+            .await
+        {
+            Ok(response) => response
+                .into_inner()
+                .requirements
+                .into_iter()
+                .map(|requirement: ProtoGatewayListenerRequirement| {
+                    let Some(selector) = requirement.selector else {
+                        return Err(ComputeError::Message(format!(
+                            "compute driver '{driver_name}' returned a gateway listener requirement without a selector"
+                        )));
+                    };
+                    match selector {
+                        Selector::ExactBindAddress(bind_address) => {
+                            let address = bind_address.parse::<SocketAddr>().map_err(|err| {
+                                ComputeError::Message(format!(
+                                    "compute driver '{driver_name}' returned invalid gateway listener address '{bind_address}': {err}"
+                                ))
+                            })?;
+                            Ok(GatewayListenerRequirement::Exact {
+                                address,
+                                driver_name: driver_name.clone(),
+                                reason: requirement.reason,
+                            })
+                        }
+                        Selector::DefaultRouteInterface(_) => {
+                            Ok(GatewayListenerRequirement::DefaultRouteInterface {
+                                driver_name: driver_name.clone(),
+                                reason: requirement.reason,
+                            })
+                        }
+                        Selector::LoopbackInterface(_) => {
+                            Ok(GatewayListenerRequirement::LoopbackInterface {
+                                driver_name: driver_name.clone(),
+                                reason: requirement.reason,
+                            })
+                        }
+                    }
+                })
+                .collect::<Result<Vec<_>, ComputeError>>()?,
+            Err(status) if status.code() == Code::Unimplemented => {
+                debug!(
+                    driver = %driver_name,
+                    "Compute driver does not implement gateway listener requirements"
+                );
+                Vec::new()
+            }
+            Err(status) => return Err(compute_error_from_status(status)),
+        };
         Ok(Self {
             driver: TracedDriver::new(driver, driver_name),
             driver_info,
@@ -503,7 +601,7 @@ impl ComputeRuntime {
             supervisor_sessions,
             sync_lock: Arc::new(Mutex::new(())),
             delete_gates: Arc::new(DeleteGateRegistry::default()),
-            gateway_bind_addresses,
+            gateway_listener_requirements,
             replica_id: lease::replica_id(),
         })
     }
@@ -547,7 +645,6 @@ impl ComputeRuntime {
                 .await
                 .map_err(|err| ComputeError::Message(err.to_string()))?,
         );
-        let gateway_bind_addresses = driver.gateway_bind_addresses();
         let shutdown_cleanup: Arc<dyn ShutdownCleanup> = driver.clone();
         let startup_resume: Arc<dyn StartupResume> = driver.clone();
         let driver: SharedComputeDriver = driver;
@@ -562,7 +659,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            gateway_bind_addresses,
         )
         .await
     }
@@ -590,7 +686,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            Vec::new(),
         )
         .await
     }
@@ -615,7 +710,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            Vec::new(),
         )
         .await
     }
@@ -643,7 +737,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            Vec::new(),
         )
         .await
     }
@@ -664,8 +757,8 @@ impl ComputeRuntime {
     }
 
     #[must_use]
-    pub fn gateway_bind_addresses(&self) -> &[SocketAddr] {
-        &self.gateway_bind_addresses
+    pub(crate) fn gateway_listener_requirements(&self) -> &[GatewayListenerRequirement] {
+        &self.gateway_listener_requirements
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
@@ -2932,6 +3025,15 @@ impl ComputeDriver for NoopTestDriver {
         ))
     }
 
+    async fn get_gateway_listener_requirements(
+        &self,
+        _request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<tonic::Response<GetGatewayListenerRequirementsResponse>, Status> {
+        Ok(tonic::Response::new(
+            GetGatewayListenerRequirementsResponse::default(),
+        ))
+    }
+
     async fn validate_sandbox_create(
         &self,
         _request: Request<ValidateSandboxCreateRequest>,
@@ -3027,7 +3129,7 @@ pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
         sync_lock: Arc::new(Mutex::new(())),
         delete_gates: Arc::new(DeleteGateRegistry::default()),
-        gateway_bind_addresses: Vec::new(),
+        gateway_listener_requirements: Vec::new(),
         replica_id: "test-replica".to_string(),
     }
 }
@@ -3179,6 +3281,15 @@ mod tests {
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
             }))
+        }
+
+        async fn get_gateway_listener_requirements(
+            &self,
+            _request: Request<GetGatewayListenerRequirementsRequest>,
+        ) -> Result<tonic::Response<GetGatewayListenerRequirementsResponse>, Status> {
+            Ok(tonic::Response::new(
+                GetGatewayListenerRequirementsResponse::default(),
+            ))
         }
 
         async fn validate_sandbox_create(
@@ -3363,6 +3474,15 @@ mod tests {
             }))
         }
 
+        async fn get_gateway_listener_requirements(
+            &self,
+            _request: Request<GetGatewayListenerRequirementsRequest>,
+        ) -> Result<tonic::Response<GetGatewayListenerRequirementsResponse>, Status> {
+            Ok(tonic::Response::new(
+                GetGatewayListenerRequirementsResponse::default(),
+            ))
+        }
+
         async fn validate_sandbox_create(
             &self,
             _request: Request<ValidateSandboxCreateRequest>,
@@ -3496,7 +3616,7 @@ mod tests {
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
             sync_lock: Arc::new(Mutex::new(())),
             delete_gates: Arc::new(DeleteGateRegistry::default()),
-            gateway_bind_addresses: Vec::new(),
+            gateway_listener_requirements: Vec::new(),
             replica_id: "test-replica".to_string(),
         }
     }
@@ -4102,12 +4222,12 @@ mod tests {
     async fn driver_calls_export_spans_with_parents() {
         use tracing::Instrument as _;
 
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-trace", "sandbox-trace", SandboxPhase::Provisioning);
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         async {
             runtime
                 .create_sandbox(sandbox, None)
@@ -4118,14 +4238,14 @@ mod tests {
         .await;
 
         let driver_span = traced.span_with("driver.create_sandbox", "sandbox.id", "sb-trace");
-        test_collector::assert_has_parent(&driver_span);
+        test_exporter::assert_has_parent(&driver_span);
         assert_eq!(
-            test_collector::attribute(&driver_span, "driver.name").as_deref(),
+            test_exporter::attribute(&driver_span, "driver.name").as_deref(),
             Some("test-driver"),
             "the span names which driver was called"
         );
         assert_eq!(
-            test_collector::attribute(&driver_span, "sandbox.id").as_deref(),
+            test_exporter::attribute(&driver_span, "sandbox.id").as_deref(),
             Some("sb-trace"),
         );
         assert_eq!(
@@ -4149,7 +4269,7 @@ mod tests {
     async fn failed_driver_calls_are_marked_on_the_span() {
         use tracing::Instrument as _;
 
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
         /// A driver that behaves normally except that creates fail, so the
         /// test exercises only the failure attribute.
@@ -4172,6 +4292,14 @@ mod tests {
                 request: Request<GetCapabilitiesRequest>,
             ) -> Result<tonic::Response<GetCapabilitiesResponse>, Status> {
                 self.0.get_capabilities(request).await
+            }
+
+            async fn get_gateway_listener_requirements(
+                &self,
+                request: Request<GetGatewayListenerRequirementsRequest>,
+            ) -> Result<tonic::Response<GetGatewayListenerRequirementsResponse>, Status>
+            {
+                self.0.get_gateway_listener_requirements(request).await
             }
 
             async fn validate_sandbox_create(
@@ -4223,7 +4351,7 @@ mod tests {
         let runtime = test_runtime(Arc::new(FailingDriver::default())).await;
         let sandbox = sandbox_record("sb-fail", "sandbox-fail", SandboxPhase::Provisioning);
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         async {
             runtime
                 .create_sandbox(sandbox, None)
@@ -4244,7 +4372,7 @@ mod tests {
             driver_span.status
         );
         assert_eq!(
-            test_collector::attribute(&driver_span, "grpc.code").as_deref(),
+            test_exporter::attribute(&driver_span, "grpc.code").as_deref(),
             Some("14"),
             "the gRPC code names the cause without reading the message"
         );
@@ -6007,14 +6135,14 @@ mod tests {
     /// they trigger land outside the request that caused them.
     #[tokio::test]
     async fn driver_watch_events_are_roots_and_store_operations_have_parents() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime.sandbox_index.update_from_sandbox(&sandbox);
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         runtime
             .apply_watch_event(deleted_watch_event("sb-1"))
             .await
@@ -6031,9 +6159,9 @@ mod tests {
                 )
             });
 
-        test_collector::assert_is_root(root);
+        test_exporter::assert_is_root(root);
         assert_eq!(
-            test_collector::attribute(root, "sandbox.id").as_deref(),
+            test_exporter::attribute(root, "sandbox.id").as_deref(),
             Some("sb-1"),
             "the span names which sandbox the driver reported on"
         );
@@ -6045,21 +6173,21 @@ mod tests {
                     && span.span_context.trace_id() == root.span_context.trace_id()
             })
             .expect("the event records its store operation");
-        test_collector::assert_has_parent(store_span);
+        test_exporter::assert_has_parent(store_span);
     }
 
     /// The reconciler runs on a timer with no inbound request, so without a
     /// span of its own each store call becomes its own anonymous trace.
     #[tokio::test]
     async fn reconcile_sweeps_are_roots_and_operations_have_parents() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime.sandbox_index.update_from_sandbox(&sandbox);
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         runtime
             .reconcile_store_with_backend(Duration::ZERO)
             .await
@@ -6087,7 +6215,7 @@ mod tests {
                 })
             })
             .expect("the sweep records its driver and store operations");
-        test_collector::assert_is_root(root);
+        test_exporter::assert_is_root(root);
 
         let driver_span = spans
             .iter()
@@ -6096,7 +6224,7 @@ mod tests {
                     && span.span_context.trace_id() == root.span_context.trace_id()
             })
             .expect("the sweep records its driver call");
-        test_collector::assert_has_parent(driver_span);
+        test_exporter::assert_has_parent(driver_span);
         let store_span = spans
             .iter()
             .find(|span| {
@@ -6104,7 +6232,7 @@ mod tests {
                     && span.span_context.trace_id() == root.span_context.trace_id()
             })
             .expect("the sweep records its store operation");
-        test_collector::assert_has_parent(store_span);
+        test_exporter::assert_has_parent(store_span);
     }
 
     #[tokio::test]
@@ -6516,10 +6644,10 @@ mod tests {
 
     #[tokio::test]
     async fn compute_driver_initialization_records_an_operation_span() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
 
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         ComputeRuntime::from_driver(
             "test-driver".to_string(),
             Arc::new(TestDriver::default()),
@@ -6531,13 +6659,12 @@ mod tests {
             SandboxWatchBus::new(),
             TracingLogBus::new(),
             Arc::new(SupervisorSessionRegistry::new()),
-            Vec::new(),
         )
         .await
         .unwrap();
 
         let initialization = traced.span_with("driver.initialize", "driver.name", "test-driver");
-        test_collector::assert_is_root(&initialization);
+        test_exporter::assert_is_root(&initialization);
     }
 
     #[tokio::test]
@@ -6549,7 +6676,11 @@ mod tests {
         let socket_path = dir.path().join("compute-driver.sock");
         let driver = FakeComputeDriver::new()
             .with_driver_name("fake-remote-driver")
-            .with_default_image("openshell/sandbox:remote");
+            .with_default_image("openshell/sandbox:remote")
+            .with_gateway_listener_requirement(
+                "172.19.0.1:17670",
+                "external driver managed bridge",
+            );
         let _server = driver.serve_uds(&socket_path).unwrap();
 
         let endpoint = connect_remote_compute_driver("external-test", &socket_path)
@@ -6566,6 +6697,14 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            runtime.gateway_listener_requirements(),
+            &[GatewayListenerRequirement::Exact {
+                address: "172.19.0.1:17670".parse().unwrap(),
+                driver_name: "external-test".to_string(),
+                reason: "external driver managed bridge".to_string(),
+            }]
+        );
 
         let mut sandbox = sandbox_record("sb-uds", "uds-sandbox", SandboxPhase::Provisioning);
         sandbox.spec = Some(SandboxSpec {
@@ -6602,10 +6741,14 @@ mod tests {
         );
 
         let calls = driver.calls();
-        assert_eq!(calls.len(), 4, "unexpected calls: {calls:?}");
+        assert_eq!(calls.len(), 5, "unexpected calls: {calls:?}");
         assert!(matches!(calls[0], FakeComputeDriverCall::GetCapabilities));
+        assert!(matches!(
+            calls[1],
+            FakeComputeDriverCall::GetGatewayListenerRequirements
+        ));
 
-        let validated = match &calls[1] {
+        let validated = match &calls[2] {
             FakeComputeDriverCall::ValidateSandboxCreate {
                 sandbox: Some(sandbox),
             } => sandbox,
@@ -6622,7 +6765,7 @@ mod tests {
         assert!(driver_config.fields.contains_key("pool"));
         assert!(!driver_config.fields.contains_key("network_mode"));
 
-        let created = match &calls[2] {
+        let created = match &calls[3] {
             FakeComputeDriverCall::CreateSandbox {
                 sandbox: Some(sandbox),
             } => sandbox,
@@ -6631,7 +6774,7 @@ mod tests {
         assert_eq!(created.id, "sb-uds");
         assert_eq!(created.name, "uds-sandbox");
 
-        match &calls[3] {
+        match &calls[4] {
             FakeComputeDriverCall::DeleteSandbox {
                 sandbox_id,
                 sandbox_name,
@@ -6641,6 +6784,43 @@ mod tests {
             }
             other => panic!("expected DeleteSandbox call, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn remote_compute_driver_accepts_unimplemented_listener_requirements_api() {
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("compute-driver.sock");
+        let driver = FakeComputeDriver::new()
+            .with_driver_name("legacy-remote-driver")
+            .without_gateway_listener_requirements_api();
+        let _server = driver.serve_uds(&socket_path).unwrap();
+
+        let endpoint = connect_remote_compute_driver("external-test", &socket_path)
+            .await
+            .unwrap();
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let runtime = ComputeRuntime::new_remote_driver(
+            endpoint,
+            store,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap();
+
+        assert!(runtime.gateway_listener_requirements().is_empty());
+        assert_eq!(
+            driver.calls(),
+            vec![
+                FakeComputeDriverCall::GetCapabilities,
+                FakeComputeDriverCall::GetGatewayListenerRequirements,
+            ]
+        );
     }
 
     #[tokio::test]

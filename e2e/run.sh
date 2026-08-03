@@ -31,7 +31,8 @@ Options:
   -h, --help           Show this help
 
 Omit --vm and --with to run the gateway on the host. Supplying --with without
---vm selects the Ubuntu test guest. Set OPENSHELL_E2E_KEEP=1 to retain state.
+--vm selects Fedora for the Podman driver and Ubuntu otherwise. Set
+OPENSHELL_E2E_KEEP=1 to retain state.
 EOF
 }
 
@@ -154,7 +155,11 @@ mode=host
 if [ -n "${vm}" ] || [ "${#with_configurations[@]}" -gt 0 ]; then
 	mode=vm
 	if [ -z "${vm}" ]; then
-		vm=ubuntu
+		if [ "${gateway_driver}" = podman ]; then
+			vm=fedora
+		else
+			vm=ubuntu
+		fi
 	fi
 fi
 if [ "${mode}" = vm ]; then
@@ -166,6 +171,9 @@ if [ "${mode}" = vm ]; then
 			die "invalid VM configuration name: ${configuration}"
 		fi
 	done
+	if [ "${gateway_driver}" = podman ] && [ "${vm}" = ubuntu ]; then
+		die "the Ubuntu 24.04 guest lacks the Podman 5 pasta helper required for sandbox callbacks; use --vm fedora --with podman"
+	fi
 	if ! command -v nix >/dev/null 2>&1; then
 		die "Nix is required for VM mode"
 	fi
@@ -466,33 +474,6 @@ podman)
 	;;
 esac
 report_timing "${gateway_driver} supervisor import" "\${phase_started_at}"
-if [ '${gateway_driver}' = podman ]; then
-	phase_started_at=\${SECONDS}
-	# Keep the primary gateway listener on loopback and bridge the rootless
-	# container callback path temporarily. Remove this relay when #2492 lands.
-	relay_socket=\${state_root}/podman-gateway.sock
-	rm -f "\${relay_socket}"
-	socat "UNIX-LISTEN:\${relay_socket},fork" TCP:127.0.0.1:8080 &
-	host_relay_pid=\$!
-	for _ in \$(seq 1 50); do
-		[ -S "\${relay_socket}" ] && break
-		sleep 0.1
-	done
-	if [ ! -S "\${relay_socket}" ] || ! kill -0 "\${host_relay_pid}" 2>/dev/null; then
-		echo "ERROR: failed to start the host-side Podman gateway relay" >&2
-		exit 1
-	fi
-	env -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_STATE_HOME \
-		podman unshare --rootless-netns \
-		socat TCP-LISTEN:8080,bind=0.0.0.0,reuseaddr,fork "UNIX-CONNECT:\${relay_socket}" &
-	network_relay_pid=\$!
-	sleep 1
-	if ! kill -0 "\${network_relay_pid}" 2>/dev/null; then
-		echo "ERROR: failed to start the rootless-network Podman gateway relay" >&2
-		exit 1
-	fi
-	report_timing "Podman network relays" "\${phase_started_at}"
-fi
 cd /home/openshell
 exec /usr/local/bin/openshell-gateway \
 	--config "\${config_path}" \

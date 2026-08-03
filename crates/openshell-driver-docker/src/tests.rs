@@ -13,8 +13,9 @@ use openshell_core::progress::{
     PROGRESS_STEP_STARTING_SANDBOX,
 };
 use openshell_core::proto::compute::v1::{
-    DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate, GpuResourceRequirements,
-    ResourceRequirements,
+    DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+    GetGatewayListenerRequirementsRequest, GpuResourceRequirements, ResourceRequirements,
+    gateway_listener_requirement::Selector,
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -156,6 +157,43 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
             allow_all_default_gpu,
         )),
     }
+}
+
+#[tokio::test]
+async fn gateway_listener_requirements_report_managed_bridge_address() {
+    let config = runtime_config();
+    let expected_address = match config.gateway_route {
+        DockerGatewayRoute::Bridge { bind_address, .. } => bind_address,
+        DockerGatewayRoute::HostGateway => panic!("test config must use a managed bridge"),
+    };
+    let driver = test_driver_with_config(config);
+
+    let response = driver
+        .get_gateway_listener_requirements(Request::new(GetGatewayListenerRequirementsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.requirements.len(), 1);
+    assert_eq!(
+        response.requirements[0].selector,
+        Some(Selector::ExactBindAddress(expected_address.to_string()))
+    );
+}
+
+#[tokio::test]
+async fn gateway_listener_requirements_are_empty_for_host_gateway_route() {
+    let mut config = runtime_config();
+    config.gateway_route = DockerGatewayRoute::HostGateway;
+    let driver = test_driver_with_config(config);
+
+    let response = driver
+        .get_gateway_listener_requirements(Request::new(GetGatewayListenerRequirementsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(response.requirements.is_empty());
 }
 
 #[test]

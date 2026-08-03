@@ -18,6 +18,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 
+mod ambiguity;
+
+pub use ambiguity::{EndpointAmbiguity, find_endpoint_ambiguities};
+
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,

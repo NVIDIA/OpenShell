@@ -19,8 +19,7 @@
 # surface small. The default digest currently carries Debian glibc
 # 2.41-12+deb13u3.
 
-ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:e1fd250ce83d94603e9887ec991156a6c26905a6b0001039b7a43699018c0733
-
+ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
 FROM ${GATEWAY_BASE_IMAGE} AS gateway
 
 ARG TARGETARCH

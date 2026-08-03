@@ -20,6 +20,7 @@ use openshell_core::proto::{
 use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
 };
+use openshell_policy::ProviderPolicyLayer;
 use prost::Message;
 use std::collections::HashMap;
 use tonic::Status;
@@ -2193,12 +2194,12 @@ async fn profile_attached_sandbox_diagnostics(
     profiles: &[(String, ProviderTypeProfile)],
     operation: &str,
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
-    let mut candidate_profiles = HashMap::<String, (String, ProviderProfile)>::new();
+    let mut candidate_profiles = HashMap::<String, (String, ProviderTypeProfile)>::new();
     for (source, profile) in profiles {
         let Some(id) = normalize_profile_id(&profile.id) else {
             continue;
         };
-        candidate_profiles.insert(id, (source.clone(), profile.to_proto()));
+        candidate_profiles.insert(id, (source.clone(), profile.clone()));
     }
     if candidate_profiles.is_empty() {
         return Ok(Vec::new());
@@ -2226,11 +2227,14 @@ async fn profile_attached_sandbox_diagnostics(
         .await?
     };
     let mut diagnostics = Vec::new();
+    let validate_policy_composition =
+        super::policy::provider_policy_composition_enabled(store).await?;
     for sandbox in sandboxes {
         let sandbox_name = sandbox.object_name().to_string();
         let sandbox_workspace = sandbox.object_workspace().to_string();
         let spec = sandbox.spec.as_ref().expect("filtered by scan_sandboxes");
         let mut bindings = Vec::new();
+        let mut provider_layers = Vec::new();
         let mut imported_profiles_used = Vec::<(String, String)>::new();
 
         for provider_name in &spec.providers {
@@ -2246,21 +2250,41 @@ async fn profile_attached_sandbox_diagnostics(
             else {
                 continue;
             };
+            let profile_id =
+                normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
             let scope_mismatch = (is_platform_scope && !provider.profile_workspace.is_empty())
                 || (!is_platform_scope && provider.profile_workspace.is_empty());
             if scope_mismatch {
                 bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
                     catalog, &provider,
                 ));
+                if validate_policy_composition
+                    && let Some(profile) = get_provider_type_profile_for_scope(
+                        catalog,
+                        profile_id,
+                        &provider.profile_workspace,
+                    )
+                {
+                    let rule_name = openshell_policy::provider_rule_name(provider.object_name());
+                    provider_layers.push(ProviderPolicyLayer {
+                        rule: profile.network_policy_rule(&rule_name),
+                        rule_name,
+                    });
+                }
                 continue;
             }
-            let profile_id =
-                normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
             if let Some((source, profile)) = candidate_profiles.get(profile_id) {
                 bindings.extend(dynamic_token_grant_bindings_for_profile(
                     provider.object_name(),
-                    profile,
+                    &profile.to_proto(),
                 ));
+                if validate_policy_composition {
+                    let rule_name = openshell_policy::provider_rule_name(provider.object_name());
+                    provider_layers.push(ProviderPolicyLayer {
+                        rule: profile.network_policy_rule(&rule_name),
+                        rule_name,
+                    });
+                }
                 let used = (source.clone(), profile_id.to_string());
                 if !imported_profiles_used.contains(&used) {
                     imported_profiles_used.push(used);
@@ -2269,6 +2293,19 @@ async fn profile_attached_sandbox_diagnostics(
                 bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
                     catalog, &provider,
                 ));
+                if validate_policy_composition
+                    && let Some(profile) = get_provider_type_profile_for_scope(
+                        catalog,
+                        profile_id,
+                        &provider.profile_workspace,
+                    )
+                {
+                    let rule_name = openshell_policy::provider_rule_name(provider.object_name());
+                    provider_layers.push(ProviderPolicyLayer {
+                        rule: profile.network_policy_rule(&rule_name),
+                        rule_name,
+                    });
+                }
             }
         }
 
@@ -2287,6 +2324,27 @@ async fn profile_attached_sandbox_diagnostics(
                     ),
                     severity: "error".to_string(),
                 });
+            }
+        }
+        if validate_policy_composition {
+            let base_policy =
+                super::policy::current_base_policy_for_sandbox(store, &sandbox).await?;
+            if let Err(error) =
+                super::policy::validate_candidate_effective_policy(&base_policy, &provider_layers)
+            {
+                for (source, profile_id) in &imported_profiles_used {
+                    diagnostics.push(ProfileValidationDiagnostic {
+                        source: source.clone(),
+                        profile_id: profile_id.clone(),
+                        field: "endpoints".to_string(),
+                        message: format!(
+                            "{operation} would create ambiguous network endpoints on sandbox \
+                             '{sandbox_name}': {}",
+                            error.message()
+                        ),
+                        severity: "error".to_string(),
+                    });
+                }
             }
         }
     }
@@ -3063,11 +3121,11 @@ mod tests {
         GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRequest,
         ImportProviderProfilesRequest, L7Allow, L7Rule, LintProviderProfilesRequest,
         ListProviderProfilesRequest, ListProvidersRequest, NetworkBinary, NetworkEndpoint,
-        ProviderCredentialRefresh, ProviderCredentialRefreshMaterial, ProviderCredentialTokenGrant,
-        ProviderCredentialTokenGrantAudienceOverride, ProviderProfile, ProviderProfileCategory,
-        ProviderProfileCredential, ProviderProfileImportItem, RotateProviderCredentialRequest,
-        Sandbox, SandboxSpec, StoredProviderProfile, UpdateProviderProfilesRequest,
-        UpdateProviderRequest,
+        NetworkPolicyRule, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
+        ProviderCredentialTokenGrant, ProviderCredentialTokenGrantAudienceOverride,
+        ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
+        ProviderProfileImportItem, RotateProviderCredentialRequest, Sandbox, SandboxPolicy,
+        SandboxSpec, StoredProviderProfile, UpdateProviderProfilesRequest, UpdateProviderRequest,
     };
     use openshell_core::{ObjectId, ObjectName};
     use tonic::{Code, Request};
@@ -4013,6 +4071,135 @@ mod tests {
         .profile
         .unwrap();
         assert_eq!(fetched.id, "custom-api");
+    }
+
+    #[tokio::test]
+    async fn profile_update_rejects_fanout_endpoint_ambiguity_without_persisting() {
+        let state = test_server_state().await;
+        crate::grpc::policy::save_global_settings(
+            state.store.as_ref(),
+            &crate::grpc::StoredSettings {
+                revision: 1,
+                settings: std::iter::once((
+                    openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                    crate::grpc::StoredSettingValue::Bool(true),
+                ))
+                .collect(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut initial_profile = custom_profile("fanout-ambiguity");
+        initial_profile.endpoints.push(NetworkEndpoint {
+            host: "other.example.com".to_string(),
+            port: 443,
+            ..Default::default()
+        });
+        let imported = handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(initial_profile),
+                    source: "fanout.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(imported.imported);
+        let resource_version = imported.profiles[0].resource_version;
+
+        create_provider_record(
+            state.store.as_ref(),
+            "default",
+            provider_with_values("fanout-provider", "fanout-ambiguity"),
+        )
+        .await
+        .unwrap();
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "fanout-sandbox-id".to_string(),
+                    name: "fanout-sandbox".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["fanout-provider".to_string()],
+                    policy: Some(SandboxPolicy {
+                        network_policies: HashMap::from([(
+                            "base".to_string(),
+                            NetworkPolicyRule {
+                                name: "base".to_string(),
+                                endpoints: vec![NetworkEndpoint {
+                                    host: "api.example.com".to_string(),
+                                    port: 443,
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            },
+                        )]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut conflicting_profile = custom_profile("fanout-ambiguity");
+        conflicting_profile.resource_version = resource_version;
+        conflicting_profile.endpoints.push(NetworkEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            tls: "skip".to_string(),
+            ..Default::default()
+        });
+        let response = handle_update_provider_profiles(
+            &state,
+            authed_request(UpdateProviderProfilesRequest {
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(conflicting_profile),
+                    source: "fanout.yaml".to_string(),
+                }),
+                expected_resource_version: resource_version,
+                id: "fanout-ambiguity".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.updated);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "endpoints"
+                && diagnostic.message.contains("fanout-sandbox")
+                && diagnostic.message.contains("tls")
+        }));
+        let stored = handle_get_provider_profile(
+            &state,
+            authed_request(GetProviderProfileRequest {
+                id: "fanout-ambiguity".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profile
+        .unwrap();
+        assert_eq!(stored.endpoints[0].host, "other.example.com");
     }
 
     #[tokio::test]

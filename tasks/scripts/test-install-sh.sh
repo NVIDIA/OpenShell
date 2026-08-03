@@ -100,4 +100,14 @@ assert_glibc_preflight_fails \
   "OpenShell Linux packages require glibc >= 2.28; detected musl or unsupported libc." \
   setup_ldd_musl
 
-echo "install.sh libc preflight tests passed"
+if [ "$(PLATFORM=darwin local_gateway_endpoint)" != "https://[::1]:17670" ]; then
+  echo "FAIL: macOS local gateway endpoint must use IPv6 loopback" >&2
+  exit 1
+fi
+
+if [ "$(PLATFORM=linux local_gateway_endpoint)" != "https://127.0.0.1:17670" ]; then
+  echo "FAIL: Linux local gateway endpoint must use IPv4 loopback" >&2
+  exit 1
+fi
+
+echo "install.sh focused tests passed"

@@ -105,6 +105,9 @@ pub struct GatewayFileSection {
     pub grpc_rate_limit_requests: Option<u64>,
     #[serde(default)]
     pub grpc_rate_limit_window_seconds: Option<u64>,
+    /// Security posture when a sandbox rejects a candidate policy generation.
+    #[serde(default)]
+    pub policy_validation_failure_mode: Option<openshell_core::PolicyValidationFailureMode>,
 
     // ── Service routing ──────────────────────────────────────────────────
     /// Subject Alternative Names configured on the gateway server certificate.
@@ -422,6 +425,7 @@ compute_drivers = ["kubernetes"]
 sandbox_namespace = "agents"
 grpc_rate_limit_requests = 120
 grpc_rate_limit_window_seconds = 60
+policy_validation_failure_mode = "retain_last_valid"
 default_image = "ghcr.io/nvidia/openshell/sandbox:latest"
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
 client_tls_secret_name = "openshell-sandbox-tls"
@@ -450,6 +454,10 @@ grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
         );
         assert_eq!(gw.grpc_rate_limit_requests, Some(120));
         assert_eq!(gw.grpc_rate_limit_window_seconds, Some(60));
+        assert_eq!(
+            gw.policy_validation_failure_mode,
+            Some(openshell_core::PolicyValidationFailureMode::RetainLastValid)
+        );
         assert!(gw.tls.is_some());
         assert!(gw.oidc.is_some());
         assert!(file.openshell.drivers.contains_key("kubernetes"));
@@ -511,6 +519,18 @@ sampler = "traceidratio"
             load(tmp.path()).is_err(),
             "sampler is configured via OTEL_TRACES_SAMPLER, not TOML"
         );
+    }
+
+    #[test]
+    fn rejects_unknown_policy_validation_failure_mode() {
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway]
+policy_validation_failure_mode = "keep_old"
+"#,
+        );
+        let error = load(tmp.path()).expect_err("unknown posture must fail TOML validation");
+        assert!(error.to_string().contains("policy_validation_failure_mode"));
     }
 
     #[test]
@@ -797,7 +817,8 @@ version = 2
     /// `load()` path that the gateway uses at runtime, catching:
     ///   - template corruption or unknown fields (`deny_unknown_fields`)
     ///   - schema drift (version bump or field renames)
-    ///   - accidental changes to the bind address or compute driver list
+    ///   - accidental addition of a wildcard bind-address override
+    ///   - accidental changes to the compute driver list
     #[test]
     fn rpm_default_config_parses_and_has_podman_defaults() {
         let path =
@@ -806,20 +827,12 @@ version = 2
             load(&path).expect("deploy/rpm/gateway.toml.default must parse against current schema");
         let gw = &config.openshell.gateway;
 
-        let addr = gw
-            .bind_address
-            .expect("bind_address must be explicitly set in the RPM default config");
-        assert!(
-            addr.ip().is_unspecified(),
-            "RPM default bind_address must be 0.0.0.0 so Podman sandbox containers \
-             can reach the gateway over the host network bridge, got {addr}"
-        );
-        assert_eq!(
-            addr.port(),
-            openshell_core::config::DEFAULT_SERVER_PORT,
-            "RPM default port must match DEFAULT_SERVER_PORT ({})",
-            openshell_core::config::DEFAULT_SERVER_PORT
-        );
+        if let Some(addr) = gw.bind_address {
+            assert!(
+                !addr.ip().is_unspecified(),
+                "RPM default config must not expose the primary listener on every interface"
+            );
+        }
 
         let drivers = gw
             .compute_drivers

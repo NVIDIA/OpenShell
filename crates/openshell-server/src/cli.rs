@@ -404,6 +404,13 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
         config = config.with_ssh_session_ttl_secs(ttl);
     }
 
+    if let Some(mode) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.policy_validation_failure_mode)
+    {
+        config.policy_validation_failure_mode = mode;
+    }
+
     if let Some(issuer) = args.oidc_issuer.clone() {
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,
@@ -1765,6 +1772,9 @@ enable_loopback_service_http = false
         std::fs::write(
             &config_path,
             r#"
+[openshell.gateway]
+policy_validation_failure_mode = "retain_last_valid"
+
 [openshell.drivers.docker]
 unknown_docker_key = true
 
@@ -1789,6 +1799,10 @@ mem_mib = "not-a-number"
             super::prepare_server_config(&mut args, &matches).expect("server config is prepared");
 
         assert_eq!(prepared.config.compute_drivers, vec!["podman".to_string()]);
+        assert_eq!(
+            prepared.config.policy_validation_failure_mode,
+            openshell_core::PolicyValidationFailureMode::RetainLastValid
+        );
         let file = prepared.config_file.expect("config file is preserved");
         assert!(file.openshell.drivers.contains_key("docker"));
         assert!(file.openshell.drivers.contains_key("vm"));

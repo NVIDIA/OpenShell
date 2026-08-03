@@ -229,6 +229,22 @@ tests:
           path: data["gateway.toml"]
           pattern: 'grpc_rate_limit_window_seconds\s*='
 
+  - it: renders fail-closed policy validation posture by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?policy_validation_failure_mode\s*=\s*"fail_closed"'
+
+  - it: renders retain-last-valid policy validation posture
+    template: templates/gateway-config.yaml
+    set:
+      server.policyValidationFailureMode: retain_last_valid
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?policy_validation_failure_mode\s*=\s*"retain_last_valid"'
+
   - it: renders the gRPC rate limit under [openshell.gateway] when both values are positive
     template: templates/gateway-config.yaml
     set:

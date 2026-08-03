@@ -24,9 +24,7 @@
 
     - name: Install Podman dependencies
       ansible.builtin.package:
-        name:
-          - podman
-          - socat
+        name: podman
         state: present
 
     - name: Enable the rootless Podman API socket

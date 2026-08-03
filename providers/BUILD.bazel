@@ -1,0 +1,5 @@
+filegroup(
+    name = "profiles",
+    srcs = glob(["*.yaml"]),
+    visibility = ["//crates/openshell-providers:__pkg__"],
+)

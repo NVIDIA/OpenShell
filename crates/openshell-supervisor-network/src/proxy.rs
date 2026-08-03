@@ -3,6 +3,10 @@
 
 //! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
 
+mod destination;
+mod egress;
+mod relay;
+
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
@@ -30,6 +34,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
+
+use self::destination::{
+    DestinationDenial, DestinationDenialKind, DestinationRequest, build_validation_plan,
+    validate_destination,
+};
+use self::egress::{
+    EgressDecision, EgressIntent, EndpointDecision, IdentityUnavailableReason, L7ConfigSnapshot,
+    L7RouteSnapshot, ProcessIdentityEvidence,
+};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const TUNNEL_PROTOCOL_PEEK_BYTES: usize = crate::l7::rest::HTTP2_PRIOR_KNOWLEDGE_PREFACE.len();
@@ -81,21 +94,6 @@ const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 // Exercise idle-timeout truncation without slowing the full package test suite.
 #[cfg(test)]
 const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Result of a proxy CONNECT policy decision.
-struct ConnectDecision {
-    action: NetworkAction,
-    /// Policy generation used for the L4 network decision.
-    generation: u64,
-    /// Resolved binary path.
-    binary: Option<PathBuf>,
-    /// PID owning the socket.
-    binary_pid: Option<u32>,
-    /// Ancestor binary paths from process tree walk.
-    ancestors: Vec<PathBuf>,
-    /// Cmdline-derived absolute paths (for script detection).
-    cmdline_paths: Vec<PathBuf>,
-}
 
 /// Outcome of an inference interception attempt.
 ///
@@ -758,7 +756,7 @@ fn emit_denial(
     host: &str,
     port: u16,
     binary: &str,
-    decision: &ConnectDecision,
+    decision: &EgressDecision,
     reason: &str,
     stage: &str,
 ) {
@@ -787,7 +785,7 @@ fn emit_denial_simple(
     host: &str,
     port: u16,
     binary: &str,
-    decision: &ConnectDecision,
+    decision: &EgressDecision,
     reason: &str,
     stage: &str,
 ) {
@@ -807,6 +805,278 @@ fn emit_denial_simple(
             l7_path: None,
         });
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_connect_allow_ocsf_event(
+    peer_addr: SocketAddr,
+    host: &str,
+    port: u16,
+    binary: &str,
+    pid: &str,
+    ancestors: &str,
+    cmdline: &str,
+    policy: &str,
+    l7_inspection: bool,
+) -> openshell_ocsf::OcsfEvent {
+    let connect_msg = if l7_inspection {
+        "CONNECT_L7"
+    } else {
+        "CONNECT"
+    };
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .firewall_rule(policy, "opa")
+        .message(format!("{connect_msg} allowed {host}:{port}"))
+        .build()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_forward_allow_ocsf_event(
+    peer_addr: SocketAddr,
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    binary: &str,
+    pid: &str,
+    ancestors: &str,
+    cmdline: &str,
+    policy: &str,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Other)
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .http_request(HttpRequest::new(
+            method,
+            OcsfUrl::new("http", host, path, port),
+        ))
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .firewall_rule(policy, "opa")
+        .message(format!("FORWARD allowed {method} {host}:{port}{path}"))
+        .build()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_forward_policy_deny_ocsf_event(
+    peer_addr: SocketAddr,
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    binary: &str,
+    pid: &str,
+    ancestors: &str,
+    cmdline: &str,
+    reason: &str,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Other)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .http_request(HttpRequest::new(
+            method,
+            OcsfUrl::new("http", host, path, port),
+        ))
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .firewall_rule("-", "opa")
+        .message(format!("FORWARD denied {method} {host}:{port}{path}"))
+        .status_detail(reason)
+        .build()
+}
+
+fn destination_denial_detail(kind: DestinationDenialKind) -> &'static str {
+    match kind {
+        DestinationDenialKind::TrustedGateway => "trusted-gateway check failed",
+        DestinationDenialKind::InvalidAllowedIps => "invalid allowed_ips in policy",
+        DestinationDenialKind::AllowedIps => "allowed_ips check failed",
+        DestinationDenialKind::DeclaredEndpoint => "declared endpoint check failed",
+        DestinationDenialKind::InternalAddress => "internal address",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_connect_destination_deny_ocsf_event(
+    denial: &DestinationDenial,
+    peer_addr: SocketAddr,
+    host: &str,
+    port: u16,
+    binary: &str,
+    pid: &str,
+    ancestors: &str,
+    cmdline: &str,
+) -> openshell_ocsf::OcsfEvent {
+    let detail = destination_denial_detail(denial.kind);
+    let message = if denial.kind == DestinationDenialKind::InternalAddress {
+        format!("CONNECT blocked: internal address {host}:{port}")
+    } else {
+        format!("CONNECT blocked: {detail} for {host}:{port}")
+    };
+
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .firewall_rule("-", "ssrf")
+        .message(message)
+        .status_detail(&denial.reason)
+        .build()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_forward_destination_deny_ocsf_event(
+    denial: &DestinationDenial,
+    peer_addr: SocketAddr,
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    binary: &str,
+    pid: &str,
+    ancestors: &str,
+    cmdline: &str,
+    policy: &str,
+) -> openshell_ocsf::OcsfEvent {
+    let detail = destination_denial_detail(denial.kind);
+    let log_detail = if denial.kind == DestinationDenialKind::InternalAddress {
+        "internal IP without allowed_ips"
+    } else {
+        detail
+    };
+
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Other)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .http_request(HttpRequest::new(
+            method,
+            OcsfUrl::new("http", host, path, port),
+        ))
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .firewall_rule(policy, "ssrf")
+        .message(format!("FORWARD blocked: {log_detail} for {host}:{port}"))
+        .status_detail(&denial.reason)
+        .build()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deny_connect_destination(
+    client: &mut TcpStream,
+    denial: &DestinationDenial,
+    peer_addr: SocketAddr,
+    host: &str,
+    port: u16,
+    binary: &str,
+    pid: &str,
+    ancestors: &str,
+    cmdline: &str,
+    decision: &EgressDecision,
+    denial_tx: &Option<mpsc::UnboundedSender<DenialEvent>>,
+    activity_tx: &Option<ActivitySender>,
+) -> Result<()> {
+    let detail = destination_denial_detail(denial.kind);
+    ocsf_emit!(build_connect_destination_deny_ocsf_event(
+        denial, peer_addr, host, port, binary, pid, ancestors, cmdline,
+    ));
+
+    emit_denial(
+        denial_tx,
+        host,
+        port,
+        binary,
+        decision,
+        &denial.reason,
+        "ssrf",
+    );
+    // Preserve the current activity contract. The declared-endpoint branch
+    // historically emits the denial without a separate SSRF activity count.
+    if denial.kind != DestinationDenialKind::DeclaredEndpoint {
+        emit_activity(activity_tx, true, "ssrf");
+    }
+    respond(
+        client,
+        &build_json_error_response(
+            403,
+            "Forbidden",
+            "ssrf_denied",
+            &format!("CONNECT {host}:{port} blocked: {detail}"),
+        ),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deny_forward_destination(
+    client: &mut TcpStream,
+    denial: &DestinationDenial,
+    peer_addr: SocketAddr,
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    binary: &str,
+    pid: &str,
+    ancestors: &str,
+    cmdline: &str,
+    policy: &str,
+    decision: &EgressDecision,
+    denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
+    activity_tx: Option<&ActivitySender>,
+) -> Result<()> {
+    let detail = destination_denial_detail(denial.kind);
+    ocsf_emit!(build_forward_destination_deny_ocsf_event(
+        denial, peer_addr, method, host, port, path, binary, pid, ancestors, cmdline, policy,
+    ));
+
+    emit_denial_simple(
+        denial_tx,
+        host,
+        port,
+        binary,
+        decision,
+        &denial.reason,
+        "ssrf",
+    );
+    // Preserve the current activity contract. The declared-endpoint branch
+    // historically emits the denial without a separate SSRF activity count.
+    if denial.kind != DestinationDenialKind::DeclaredEndpoint {
+        emit_activity_simple(activity_tx, true, "ssrf");
+    }
+    respond(
+        client,
+        &build_json_error_response(
+            403,
+            "Forbidden",
+            "ssrf_denied",
+            &format!("{method} {host}:{port} blocked: {detail}"),
+        ),
+    )
+    .await
 }
 
 // Many distinct, non-related context parameters are required for a CONNECT
@@ -941,19 +1211,18 @@ async fn handle_tcp_connection(
     let opa_clone = opa_engine.clone();
     let cache_clone = identity_cache.clone();
     let pid_clone = entrypoint_pid.clone();
-    let host_clone = host_lc.clone();
-    let decision = tokio::task::spawn_blocking(move || {
-        evaluate_opa_tcp(
-            connection,
-            &opa_clone,
-            &cache_clone,
-            &pid_clone,
-            &host_clone,
-            port,
-        )
+    let intent = EgressIntent::connect(host_lc.clone(), port);
+    let mut decision = tokio::task::spawn_blocking(move || {
+        authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
     })
     .await
     .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
+
+    debug!(
+        transport = ?decision.intent.transport,
+        identity = ?decision.identity,
+        "Authorized explicit proxy egress intent"
+    );
 
     // Extract action string and matched policy for logging
     let (matched_policy, deny_reason) = match &decision.action {
@@ -1036,294 +1305,88 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
+    let connect_generation_guard =
+        match relay::pin_policy_generation(&opa_engine, decision.l4_policy_generation) {
+            Ok(guard) => guard,
+            Err(error) => {
+                reject_stale_connect_policy(
+                    &mut client,
+                    &host_lc,
+                    port,
+                    activity_tx.as_ref(),
+                    error,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
     // Resolve the route's TLS treatment up front. `query_tls_mode` reads only
     // the policy decision + host/port (no peeked bytes), so it is valid before
     // the `200`. The fail-closed refusal that consumes it runs after the SSRF/
     // allowed_ips validation below — so an internal-address CONNECT still gets
     // the SSRF 403 and telemetry in degraded state — but before the upstream
     // connect and before `200 Connection Established`.
-    let effective_tls_skip =
-        query_tls_mode(&opa_engine, &decision, &host_lc, port) == crate::l7::TlsMode::Skip;
+    hydrate_tls_mode(&opa_engine, &mut decision);
+    let effective_tls_skip = decision.endpoint.tls_mode == crate::l7::TlsMode::Skip;
 
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
-    // Query allowed_ips from the matched endpoint config (if any).
-    // When present, the SSRF check validates resolved IPs against this
-    // allowlist instead of blanket-blocking all private IPs.
-    // When the policy host is already a literal IP address, treat it as
-    // implicitly allowed — the user explicitly declared the destination.
-    // Exact declared hostnames also skip the private-IP blanket block below,
-    // while keeping loopback/link-local/unspecified addresses denied.
-    let mut raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
-    if raw_allowed_ips.is_empty() {
-        raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
+    match hydrate_destination_plan(&opa_engine, &mut decision, *trusted_host_gateway) {
+        Ok(()) => {}
+        Err(denial) => {
+            deny_connect_destination(
+                &mut client,
+                &denial,
+                workload_addr,
+                &host_lc,
+                port,
+                &binary_str,
+                &pid_str,
+                &ancestors_str,
+                &cmdline_str,
+                &decision,
+                &denial_tx,
+                &activity_tx,
+            )
+            .await?;
+            return Ok(());
+        }
     }
-    let exact_declared_endpoint_host =
-        query_exact_declared_endpoint_host(&opa_engine, &decision, &host_lc, port);
+    let destination_plan = decision
+        .endpoint
+        .destination
+        .as_ref()
+        .expect("destination plan hydrated");
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
     let dns_connect_start = std::time::Instant::now();
-    // The "non-empty" branch is the explicit-allowlist path; reading it first
-    // matches the policy decision narrative.
-    #[allow(clippy::if_not_else)]
-    let validated_addrs = if is_host_gateway_alias(&host_lc)
-        && let Some(gw) = *trusted_host_gateway
+    let connector = match validate_destination(DestinationRequest {
+        host: &host,
+        port,
+        sandbox_entrypoint_pid,
+        plan: destination_plan,
+    })
+    .await
     {
-        // Trusted host-gateway path. The compute driver injected this hostname
-        // into /etc/hosts pointing at a known IP (read at proxy startup before
-        // user code runs). Bypass the normal SSRF tiers so link-local gateway
-        // addresses (used by rootless Podman with pasta) are not hard-blocked.
-        // Cloud metadata IPs and control-plane ports are still rejected.
-        match resolve_and_check_trusted_gateway(&host, port, gw, sandbox_entrypoint_pid).await {
-            Ok(addrs) => addrs,
-            Err(reason) => {
-                {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Open)
-                        .action(ActionId::Denied)
-                        .disposition(DispositionId::Blocked)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
-                        .firewall_rule("-", "ssrf")
-                        .message(format!(
-                            "CONNECT blocked: trusted-gateway check failed for {host_lc}:{port}"
-                        ))
-                        .status_detail(&reason)
-                        .build();
-                    ocsf_emit!(event);
-                }
-                emit_denial(
-                    &denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
-                emit_activity(&activity_tx, true, "ssrf");
-                respond(
-                    &mut client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "ssrf_denied",
-                        &format!("CONNECT {host_lc}:{port} blocked: trusted-gateway check failed"),
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-    } else if !raw_allowed_ips.is_empty() {
-        // allowed_ips mode: validate resolved IPs against CIDR allowlist.
-        // Loopback and link-local are still always blocked.
-        match parse_allowed_ips(&raw_allowed_ips) {
-            Ok(nets) => {
-                match resolve_and_check_allowed_ips(&host, port, &nets, sandbox_entrypoint_pid)
-                    .await
-                {
-                    Ok(addrs) => addrs,
-                    Err(reason) => {
-                        {
-                            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                .activity(ActivityId::Open)
-                                .action(ActionId::Denied)
-                                .disposition(DispositionId::Blocked)
-                                .severity(SeverityId::Medium)
-                                .status(StatusId::Failure)
-                                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                                .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-                                .actor_process(
-                                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                        .with_cmd_line(&cmdline_str),
-                                )
-                                .firewall_rule("-", "ssrf")
-                                .message(format!(
-                                    "CONNECT blocked: allowed_ips check failed for {host_lc}:{port}"
-                                ))
-                                .status_detail(&reason)
-                                .build();
-                            ocsf_emit!(event);
-                        }
-                        emit_denial(
-                            &denial_tx,
-                            &host_lc,
-                            port,
-                            &binary_str,
-                            &decision,
-                            &reason,
-                            "ssrf",
-                        );
-                        emit_activity(&activity_tx, true, "ssrf");
-                        respond(
-                            &mut client,
-                            &build_json_error_response(
-                                403,
-                                "Forbidden",
-                                "ssrf_denied",
-                                &format!(
-                                    "CONNECT {host_lc}:{port} blocked: allowed_ips check failed"
-                                ),
-                            ),
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                }
-            }
-            Err(reason) => {
-                {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Open)
-                        .action(ActionId::Denied)
-                        .disposition(DispositionId::Blocked)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
-                        .firewall_rule("-", "ssrf")
-                        .message(format!(
-                            "CONNECT blocked: invalid allowed_ips in policy for {host_lc}:{port}"
-                        ))
-                        .status_detail(&reason)
-                        .build();
-                    ocsf_emit!(event);
-                }
-                emit_denial(
-                    &denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
-                emit_activity(&activity_tx, true, "ssrf");
-                respond(
-                    &mut client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "ssrf_denied",
-                        &format!("CONNECT {host_lc}:{port} blocked: invalid allowed_ips in policy"),
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-    } else if exact_declared_endpoint_host {
-        // Exact declared hostname mode: the operator explicitly allowed this
-        // host:port, so private IP resolution is permitted without duplicating
-        // the resolved IP in allowed_ips. Always-blocked addresses and
-        // control-plane ports remain denied.
-        match resolve_and_check_declared_endpoint(&host, port, sandbox_entrypoint_pid).await {
-            Ok(addrs) => addrs,
-            Err(reason) => {
-                {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Open)
-                        .action(ActionId::Denied)
-                        .disposition(DispositionId::Blocked)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
-                        .firewall_rule("-", "ssrf")
-                        .message(format!(
-                            "CONNECT blocked: declared endpoint check failed for {host_lc}:{port}"
-                        ))
-                        .status_detail(&reason)
-                        .build();
-                    ocsf_emit!(event);
-                }
-                emit_denial(
-                    &denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
-                respond(
-                    &mut client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "ssrf_denied",
-                        &format!(
-                            "CONNECT {host_lc}:{port} blocked: declared endpoint check failed"
-                        ),
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-    } else {
-        // Default: reject all internal IPs (loopback, RFC 1918, link-local).
-        match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
-            Ok(addrs) => addrs,
-            Err(reason) => {
-                {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Open)
-                        .action(ActionId::Denied)
-                        .disposition(DispositionId::Blocked)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
-                        .firewall_rule("-", "ssrf")
-                        .message(format!(
-                            "CONNECT blocked: internal address {host_lc}:{port}"
-                        ))
-                        .status_detail(&reason)
-                        .build();
-                    ocsf_emit!(event);
-                }
-                emit_denial(
-                    &denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
-                emit_activity(&activity_tx, true, "ssrf");
-                respond(
-                    &mut client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "ssrf_denied",
-                        &format!("CONNECT {host_lc}:{port} blocked: internal address"),
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
+        Ok(connector) => connector,
+        Err(denial) => {
+            deny_connect_destination(
+                &mut client,
+                &denial,
+                workload_addr,
+                &host_lc,
+                port,
+                &binary_str,
+                &pid_str,
+                &ancestors_str,
+                &cmdline_str,
+                &decision,
+                &denial_tx,
+                &activity_tx,
+            )
+            .await?;
+            return Ok(());
         }
     };
 
@@ -1369,9 +1432,45 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
-    let mut upstream = dial_upstream(&upstream_proxy, &host_lc, port, &validated_addrs)
-        .await
-        .into_diagnostic()?;
+    // CONNECT must use one policy generation from authorization through route
+    // hydration and relay startup. A later L7 lookup must never make a stale
+    // L4 allow appear current.
+    hydrate_l7_route(&opa_engine, &mut decision);
+    let l7_route = decision.endpoint.l7_route.as_ref();
+    if let Err(error) =
+        relay::validate_route_generation(l7_route, connect_generation_guard.captured_generation())
+    {
+        reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
+            .await?;
+        return Ok(());
+    }
+
+    let upstream_result = tokio::select! {
+        result = dial_upstream(&upstream_proxy, &host_lc, port, connector.addrs()) => Some(result),
+        () = connect_generation_guard.wait_until_stale() => None,
+    };
+    let Some(upstream_result) = upstream_result else {
+        reject_stale_connect_policy(
+            &mut client,
+            &host_lc,
+            port,
+            activity_tx.as_ref(),
+            miette::miette!(
+                "policy changed while CONNECT was dialing upstream \
+                 [captured_generation:{} current_generation:{}]",
+                connect_generation_guard.captured_generation(),
+                connect_generation_guard.current_generation(),
+            ),
+        )
+        .await?;
+        return Ok(());
+    };
+    let mut upstream = upstream_result.into_diagnostic()?;
+    if let Err(error) = connect_generation_guard.ensure_current() {
+        reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
+            .await?;
+        return Ok(());
+    }
 
     debug!(
         "handle_tcp_connection dns_resolve_and_tcp_connect: {}ms host={host_lc}",
@@ -1380,69 +1479,34 @@ async fn handle_tcp_connection(
 
     respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
-    // Check if endpoint has L7 config for protocol-aware inspection, and
-    // retain the generation for HTTP passthrough keep-alive tunnels.
-    let l7_route = query_l7_route_snapshot(&opa_engine, &decision, &host_lc, port);
-    let should_inspect_l7 = l7_inspection_active(l7_route.as_ref());
+    let should_inspect_l7 = l7_inspection_active(l7_route);
 
     // Log the allowed CONNECT — use CONNECT_L7 when L7 inspection follows,
     // so log consumers can distinguish L4-only decisions from tunnel lifecycle events.
-    let connect_msg = if should_inspect_l7 {
-        "CONNECT_L7"
-    } else {
-        "CONNECT"
-    };
-    {
-        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Allowed)
-            .disposition(DispositionId::Allowed)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
-            .firewall_rule(policy_str, "opa")
-            .message(format!("{connect_msg} allowed {host_lc}:{port}"))
-            .build();
-        ocsf_emit!(event);
-    }
-    emit_connect_activity_if_l4_only(&activity_tx, l7_route.as_ref());
+    ocsf_emit!(build_connect_allow_ocsf_event(
+        workload_addr,
+        &host_lc,
+        port,
+        &binary_str,
+        &pid_str,
+        &ancestors_str,
+        &cmdline_str,
+        policy_str,
+        should_inspect_l7,
+    ));
+    emit_connect_activity_if_l4_only(&activity_tx, l7_route);
 
     // `effective_tls_skip` was resolved before the `200` above (the fail-closed
     // gate needs it) and drives the raw-tunnel branch below.
 
-    // Build L7 eval context (shared by TLS-terminated and plaintext paths).
-    let ctx = crate::l7::relay::L7EvalContext {
-        host: host_lc.clone(),
-        port,
-        policy_name: matched_policy.clone().unwrap_or_default(),
-        binary_path: decision
-            .binary
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        ancestors: decision
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-        cmdline_paths: decision
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-        secret_resolver: secret_resolver.clone(),
-        activity_tx: activity_tx.clone(),
-        dynamic_credentials: dynamic_credentials.clone(),
-        token_grant_resolver: dynamic_credentials
-            .as_ref()
-            .map(|_| crate::l7::token_grant_injection::default_resolver()),
+    // Build request-processing context shared by CONNECT and forward HTTP.
+    let ctx = relay::http_context(
+        &decision,
+        secret_resolver.clone(),
+        activity_tx.clone(),
+        dynamic_credentials.clone(),
         agent_proposals,
-    };
+    );
 
     if effective_tls_skip {
         // Policy validation rejects fail-closed middleware overlapping
@@ -1477,9 +1541,11 @@ async fn handle_tcp_connection(
             port = port,
             "tls: skip — bypassing TLS auto-detection, raw tunnel"
         );
-        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
-            .await
-            .into_diagnostic()?;
+        let Some(generation_guard) = relay::prepare_raw_relay(l7_route, &opa_engine, &decision)
+        else {
+            return Ok(());
+        };
+        relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await?;
         return Ok(());
     }
 
@@ -1499,61 +1565,13 @@ async fn handle_tcp_connection(
                 let mut tls_upstream =
                     crate::l7::tls::tls_connect_upstream(upstream, &host_lc, tls.upstream_config())
                         .await?;
+                let Some(relay_context) =
+                    relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
+                else {
+                    return Ok(());
+                };
 
-                if let Some(route) = l7_route.as_ref().filter(|route| !route.configs.is_empty()) {
-                    // L7 inspection on terminated TLS traffic.
-                    let tunnel_engine = match opa_engine.clone_engine_for_tunnel(route.generation) {
-                        Ok(engine) => engine,
-                        Err(e) => {
-                            emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
-                            return Ok(());
-                        }
-                    };
-                    if route.configs.len() == 1 {
-                        crate::l7::relay::relay_with_inspection(
-                            &route.configs[0].config,
-                            tunnel_engine,
-                            &mut tls_client,
-                            &mut tls_upstream,
-                            &ctx,
-                        )
-                        .await
-                    } else {
-                        let configs: Vec<crate::l7::L7EndpointConfig> = route
-                            .configs
-                            .iter()
-                            .map(|snapshot| snapshot.config.clone())
-                            .collect();
-                        crate::l7::relay::relay_with_route_selection(
-                            &configs,
-                            tunnel_engine,
-                            &mut tls_client,
-                            &mut tls_upstream,
-                            &ctx,
-                        )
-                        .await
-                    }
-                } else {
-                    // No L7 config — relay with credential injection only.
-                    let generation = l7_route
-                        .as_ref()
-                        .map_or(decision.generation, |route| route.generation);
-                    let generation_guard = match opa_engine.generation_guard(generation) {
-                        Ok(guard) => guard,
-                        Err(e) => {
-                            emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
-                            return Ok(());
-                        }
-                    };
-                    crate::l7::relay::relay_passthrough_with_credentials(
-                        &mut tls_client,
-                        &mut tls_upstream,
-                        &ctx,
-                        &generation_guard,
-                        Some(&opa_engine),
-                    )
-                    .await
-                }
+                relay::relay_http_stream(&mut tls_client, &mut tls_upstream, relay_context).await
             };
             if let Err(e) = tls_result.await {
                 if is_benign_relay_error(&e) {
@@ -1620,85 +1638,32 @@ async fn handle_tcp_connection(
         }
     } else if tunnel_protocol == TunnelProtocol::Http1 {
         // Plaintext HTTP detected.
-        if let Some(route) = l7_route.as_ref().filter(|route| !route.configs.is_empty()) {
-            let tunnel_engine = match opa_engine.clone_engine_for_tunnel(route.generation) {
-                Ok(engine) => engine,
-                Err(e) => {
-                    emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
-                    return Ok(());
-                }
-            };
-            let relay_result = if route.configs.len() == 1 {
-                crate::l7::relay::relay_with_inspection(
-                    &route.configs[0].config,
-                    tunnel_engine,
-                    &mut client,
-                    &mut upstream,
-                    &ctx,
-                )
-                .await
-            } else {
-                let configs: Vec<crate::l7::L7EndpointConfig> = route
-                    .configs
-                    .iter()
-                    .map(|snapshot| snapshot.config.clone())
-                    .collect();
-                crate::l7::relay::relay_with_route_selection(
-                    &configs,
-                    tunnel_engine,
-                    &mut client,
-                    &mut upstream,
-                    &ctx,
-                )
-                .await
-            };
-            if let Err(e) = relay_result {
-                if is_benign_relay_error(&e) {
+        let is_l7_relay = l7_route.is_some_and(|route| !route.configs.is_empty());
+        let Some(relay_context) = relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
+        else {
+            return Ok(());
+        };
+        if let Err(e) = relay::relay_http_stream(&mut client, &mut upstream, relay_context).await {
+            if is_benign_relay_error(&e) {
+                if is_l7_relay {
                     debug!(host = %host_lc, port = port, error = %e, "L7 connection closed");
                 } else {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Low)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .message(format!("L7 relay error: {e}"))
-                        .build();
-                    ocsf_emit!(event);
-                }
-            }
-        } else {
-            // Plaintext HTTP, no L7 config — relay with credential injection.
-            let generation = l7_route
-                .as_ref()
-                .map_or(decision.generation, |route| route.generation);
-            let generation_guard = match opa_engine.generation_guard(generation) {
-                Ok(guard) => guard,
-                Err(e) => {
-                    emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
-                    return Ok(());
-                }
-            };
-            if let Err(e) = crate::l7::relay::relay_passthrough_with_credentials(
-                &mut client,
-                &mut upstream,
-                &ctx,
-                &generation_guard,
-                Some(&opa_engine),
-            )
-            .await
-            {
-                if is_benign_relay_error(&e) {
                     debug!(host = %host_lc, port = port, error = %e, "HTTP relay closed");
-                } else {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Low)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .message(format!("HTTP relay error: {e}"))
-                        .build();
-                    ocsf_emit!(event);
                 }
+            } else {
+                let message = if is_l7_relay {
+                    format!("L7 relay error: {e}")
+                } else {
+                    format!("HTTP relay error: {e}")
+                };
+                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Fail)
+                    .severity(SeverityId::Low)
+                    .status(StatusId::Failure)
+                    .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                    .message(message)
+                    .build();
+                ocsf_emit!(event);
             }
         }
     } else {
@@ -1761,9 +1726,11 @@ async fn handle_tcp_connection(
             port = port,
             "Non-TLS non-HTTP traffic detected, raw tunnel"
         );
-        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
-            .await
-            .into_diagnostic()?;
+        let Some(generation_guard) = relay::prepare_raw_relay(l7_route, &opa_engine, &decision)
+        else {
+            return Ok(());
+        };
+        relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await?;
     }
 
     Ok(())
@@ -1772,7 +1739,7 @@ async fn handle_tcp_connection(
 /// Resolved process identity for a TCP peer: binary path, PID, ancestor chain,
 /// cmdline paths, and the TOFU-verified binary hash.
 ///
-/// Produced by [`resolve_process_identity`]; consumed by [`evaluate_opa_tcp`]
+/// Produced by [`resolve_process_identity`]; consumed by [`authorize_egress_intent`]
 /// and by the identity-chain regression tests.
 #[cfg(target_os = "linux")]
 struct ResolvedIdentity {
@@ -1806,7 +1773,7 @@ impl ResolvedIdentity {
 
 /// Error from [`resolve_process_identity`]. Carries the deny reason and
 /// whatever partial identity data was resolved before the failure so the
-/// caller can include it in the [`ConnectDecision`] and OCSF event.
+/// caller can include it in the [`EgressDecision`] and OCSF event.
 #[cfg(target_os = "linux")]
 struct IdentityError {
     reason: String,
@@ -1909,7 +1876,7 @@ fn collect_ancestor_identities(start_pid: u32, stop_pid: u32) -> Vec<(u32, PathB
 /// walks each ancestor chain verifying every ancestor, and collects
 /// cmdline-derived absolute paths for script detection.
 ///
-/// This is the identity-resolution block of [`evaluate_opa_tcp`] extracted
+/// This is the identity-resolution block of [`authorize_egress_intent`] extracted
 /// into a standalone helper so it can be exercised by Linux-only regression
 /// tests without a full OPA engine. The key hot-swap invariant under test is
 /// that display paths are stripped for policy/logging, while integrity hashing
@@ -1985,26 +1952,29 @@ fn resolve_process_identity(
 
 /// Evaluate OPA policy for a TCP connection with identity binding via /proc/net/tcp.
 #[cfg(target_os = "linux")]
-fn evaluate_opa_tcp(
+fn authorize_egress_intent(
     connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
     identity_cache: &BinaryIdentityCache,
     entrypoint_pid: &AtomicU32,
-    host: &str,
-    port: u16,
-) -> ConnectDecision {
+    intent: EgressIntent,
+) -> EgressDecision {
     use crate::opa::NetworkInput;
     use std::sync::atomic::Ordering;
 
     let deny = |reason: String,
+                identity: ProcessIdentityEvidence,
                 binary: Option<PathBuf>,
                 binary_pid: Option<u32>,
                 ancestors: Vec<PathBuf>,
                 cmdline_paths: Vec<PathBuf>|
-     -> ConnectDecision {
-        ConnectDecision {
+     -> EgressDecision {
+        EgressDecision {
+            intent: intent.clone(),
             action: NetworkAction::Deny { reason },
-            generation: engine.current_generation(),
+            l4_policy_generation: engine.current_generation(),
+            identity,
+            endpoint: EndpointDecision::default(),
             binary,
             binary_pid,
             ancestors,
@@ -2013,9 +1983,12 @@ fn evaluate_opa_tcp(
     };
 
     if !crate::opa::network_binary_identity_required() {
-        let result = evaluate_endpoint_only_opa(engine, host, port);
+        let result = evaluate_endpoint_only_opa(engine, intent);
         debug!(
-            "evaluate_opa_tcp endpoint-only: host={host} port={port} action={:?}",
+            "authorize_egress_intent endpoint-only: host={} port={} transport={:?} action={:?}",
+            result.intent.destination.host,
+            result.intent.destination.port,
+            result.intent.transport,
             result.action
         );
         return result;
@@ -2025,6 +1998,7 @@ fn evaluate_opa_tcp(
     let Some(proc_net_anchor_pid) = proc_net_anchor_pid(entrypoint_pid) else {
         return deny(
             "entrypoint process not yet spawned".into(),
+            ProcessIdentityEvidence::Unavailable(IdentityUnavailableReason::LookupFailed),
             None,
             None,
             vec![],
@@ -2038,6 +2012,7 @@ fn evaluate_opa_tcp(
         Err(err) => {
             return deny(
                 err.reason,
+                ProcessIdentityEvidence::Unavailable(IdentityUnavailableReason::LookupFailed),
                 err.binary,
                 err.binary_pid,
                 err.ancestors,
@@ -2055,8 +2030,8 @@ fn evaluate_opa_tcp(
     } = identity;
 
     let input = NetworkInput {
-        host: host.to_string(),
-        port,
+        host: intent.destination.host.clone(),
+        port: intent.destination.port,
         binary_path: bin_path.clone(),
         binary_sha256: bin_hash,
         ancestors: ancestors.clone(),
@@ -2064,9 +2039,12 @@ fn evaluate_opa_tcp(
     };
 
     let result = match engine.evaluate_network_action_with_generation(&input) {
-        Ok((action, generation)) => ConnectDecision {
+        Ok((action, generation)) => EgressDecision {
+            intent: intent.clone(),
             action,
-            generation,
+            l4_policy_generation: generation,
+            identity: ProcessIdentityEvidence::Available,
+            endpoint: EndpointDecision::default(),
             binary: Some(bin_path),
             binary_pid: Some(binary_pid),
             ancestors,
@@ -2074,6 +2052,7 @@ fn evaluate_opa_tcp(
         },
         Err(e) => deny(
             format!("policy evaluation error: {e}"),
+            ProcessIdentityEvidence::Available,
             Some(bin_path),
             Some(binary_pid),
             ancestors,
@@ -2081,8 +2060,11 @@ fn evaluate_opa_tcp(
         ),
     };
     debug!(
-        "evaluate_opa_tcp TOTAL: {}ms host={host} port={port}",
-        total_start.elapsed().as_millis()
+        "authorize_egress_intent TOTAL: {}ms host={} port={} transport={:?}",
+        total_start.elapsed().as_millis(),
+        intent.destination.host,
+        intent.destination.port,
+        intent.transport,
     );
     result
 }
@@ -2101,10 +2083,10 @@ fn sidecar_topology_enabled() -> bool {
         .is_ok_and(|value| value == SIDECAR_SUPERVISOR_TOPOLOGY)
 }
 
-fn evaluate_endpoint_only_opa(engine: &OpaEngine, host: &str, port: u16) -> ConnectDecision {
+fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> EgressDecision {
     let input = crate::opa::NetworkInput {
-        host: host.to_string(),
-        port,
+        host: intent.destination.host.clone(),
+        port: intent.destination.port,
         binary_path: PathBuf::new(),
         binary_sha256: String::new(),
         ancestors: vec![],
@@ -2112,19 +2094,29 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, host: &str, port: u16) -> Conn
     };
 
     match engine.evaluate_network_action_with_generation(&input) {
-        Ok((action, generation)) => ConnectDecision {
+        Ok((action, generation)) => EgressDecision {
+            intent,
             action,
-            generation,
+            l4_policy_generation: generation,
+            identity: ProcessIdentityEvidence::Unavailable(
+                IdentityUnavailableReason::EndpointOnlyMode,
+            ),
+            endpoint: EndpointDecision::default(),
             binary: None,
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
         },
-        Err(e) => ConnectDecision {
+        Err(e) => EgressDecision {
+            intent,
             action: NetworkAction::Deny {
                 reason: format!("policy evaluation error: {e}"),
             },
-            generation: engine.current_generation(),
+            l4_policy_generation: engine.current_generation(),
+            identity: ProcessIdentityEvidence::Unavailable(
+                IdentityUnavailableReason::EndpointOnlyMode,
+            ),
+            endpoint: EndpointDecision::default(),
             binary: None,
             binary_pid: None,
             ancestors: vec![],
@@ -2135,23 +2127,27 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, host: &str, port: u16) -> Conn
 
 /// Non-Linux stub: OPA identity binding requires /proc.
 #[cfg(not(target_os = "linux"))]
-fn evaluate_opa_tcp(
+fn authorize_egress_intent(
     _connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
     _identity_cache: &BinaryIdentityCache,
     _entrypoint_pid: &AtomicU32,
-    host: &str,
-    port: u16,
-) -> ConnectDecision {
+    intent: EgressIntent,
+) -> EgressDecision {
     if !crate::opa::network_binary_identity_required() {
-        return evaluate_endpoint_only_opa(engine, host, port);
+        return evaluate_endpoint_only_opa(engine, intent);
     }
 
-    ConnectDecision {
+    EgressDecision {
+        intent,
         action: NetworkAction::Deny {
             reason: "identity binding unavailable on this platform".into(),
         },
-        generation: engine.current_generation(),
+        l4_policy_generation: engine.current_generation(),
+        identity: ProcessIdentityEvidence::Unavailable(
+            IdentityUnavailableReason::UnsupportedPlatform,
+        ),
+        endpoint: EndpointDecision::default(),
         binary: None,
         binary_pid: None,
         ancestors: vec![],
@@ -2593,17 +2589,6 @@ async fn write_all(writer: &mut (impl tokio::io::AsyncWrite + Unpin), data: &[u8
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct L7ConfigSnapshot {
-    config: crate::l7::L7EndpointConfig,
-}
-
-#[derive(Debug, Clone)]
-struct L7RouteSnapshot {
-    configs: Vec<L7ConfigSnapshot>,
-    generation: u64,
-}
-
 fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette::Report) {
     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
@@ -2619,13 +2604,72 @@ fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette
     ocsf_emit!(event);
 }
 
-/// Query L7 endpoint config from the OPA engine for a matched CONNECT decision.
+async fn reject_stale_connect_policy(
+    client: &mut TcpStream,
+    host: &str,
+    port: u16,
+    activity_tx: Option<&ActivitySender>,
+    error: miette::Report,
+) -> Result<()> {
+    warn!(
+        host,
+        port,
+        error = %error,
+        "CONNECT rejected because policy changed after L4 authorization"
+    );
+    emit_l7_tunnel_close_after_policy_change(host, port, error);
+    emit_activity_simple(activity_tx, true, "policy_stale");
+    respond(
+        client,
+        &build_json_error_response(
+            403,
+            "Forbidden",
+            "policy_denied",
+            &format!("CONNECT {host}:{port} not permitted because policy changed"),
+        ),
+    )
+    .await
+}
+
+/// Query L7 endpoint config from the OPA engine for an allowed egress decision.
 ///
 /// Returns `Some(L7EndpointConfig)` if the matched endpoint has L7 config (protocol field),
 /// `None` for L4-only endpoints.
+fn hydrate_l7_route(engine: &OpaEngine, decision: &mut EgressDecision) {
+    let host = decision.intent.destination.host.clone();
+    let port = decision.intent.destination.port;
+    decision.endpoint.l7_route = query_l7_route_snapshot(engine, decision, &host, port);
+}
+
+fn hydrate_tls_mode(engine: &OpaEngine, decision: &mut EgressDecision) {
+    let host = decision.intent.destination.host.clone();
+    let port = decision.intent.destination.port;
+    decision.endpoint.tls_mode = query_tls_mode(engine, decision, &host, port);
+}
+
+fn hydrate_destination_plan(
+    engine: &OpaEngine,
+    decision: &mut EgressDecision,
+    trusted_host_gateway: Option<IpAddr>,
+) -> std::result::Result<(), DestinationDenial> {
+    let host = decision.intent.destination.host.clone();
+    let port = decision.intent.destination.port;
+    let raw_allowed_ips = query_allowed_ips(engine, decision, &host, port);
+    let exact_declared_host = query_exact_declared_endpoint_host(engine, decision, &host, port);
+    let plan = build_validation_plan(
+        &host,
+        &host.to_ascii_lowercase(),
+        trusted_host_gateway,
+        &raw_allowed_ips,
+        exact_declared_host,
+    )?;
+    decision.endpoint.destination = Some(plan);
+    Ok(())
+}
+
 fn query_l7_route_snapshot(
     engine: &OpaEngine,
-    decision: &ConnectDecision,
+    decision: &EgressDecision,
     host: &str,
     port: u16,
 ) -> Option<L7RouteSnapshot> {
@@ -2663,7 +2707,7 @@ fn query_l7_route_snapshot(
             );
             Some(L7RouteSnapshot {
                 configs,
-                generation,
+                l7_policy_generation: generation,
             })
         }
         Err(e) => {
@@ -2695,7 +2739,7 @@ fn select_l7_config_for_path<'a>(
 /// This extracts `tls: skip` from the endpoint even when no `protocol` is set.
 fn query_tls_mode(
     engine: &OpaEngine,
-    decision: &ConnectDecision,
+    decision: &EgressDecision,
     host: &str,
     port: u16,
 ) -> crate::l7::TlsMode {
@@ -3296,7 +3340,7 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
 /// Query `allowed_ips` from the matched endpoint config for a CONNECT decision.
 fn query_allowed_ips(
     engine: &OpaEngine,
-    decision: &ConnectDecision,
+    decision: &EgressDecision,
     host: &str,
     port: u16,
 ) -> Vec<String> {
@@ -3339,7 +3383,7 @@ fn query_allowed_ips(
 /// Query whether the matched endpoint was declared as this exact hostname.
 fn query_exact_declared_endpoint_host(
     engine: &OpaEngine,
-    decision: &ConnectDecision,
+    decision: &EgressDecision,
     host: &str,
     port: u16,
 ) -> bool {
@@ -3679,9 +3723,13 @@ fn rewrite_forward_request(
     output.extend_from_slice(b"\r\n");
     let rewritten_header_end = output.len();
 
-    // Append any overflow body bytes from the original buffer
+    // Append only bytes that belong to the first request body. The initial
+    // proxy read can also contain a pipelined follow-on request; forwarding
+    // that as body overflow would bypass its own policy evaluation.
     if header_end < used {
-        output.extend_from_slice(&raw[header_end..used]);
+        let overflow = &raw[header_end..used];
+        let body_prefix_len = initial_forward_body_prefix_len(&header_str, overflow);
+        output.extend_from_slice(&overflow[..body_prefix_len]);
     }
 
     // Fail-closed: scan for any remaining unresolved placeholders
@@ -3700,6 +3748,66 @@ fn rewrite_forward_request(
     }
 
     Ok(output)
+}
+
+fn initial_forward_body_prefix_len(header_str: &str, overflow: &[u8]) -> usize {
+    match crate::l7::rest::parse_body_length(header_str) {
+        Ok(crate::l7::provider::BodyLength::None) => 0,
+        Ok(crate::l7::provider::BodyLength::ContentLength(len)) => usize::try_from(len)
+            .unwrap_or(usize::MAX)
+            .min(overflow.len()),
+        Ok(crate::l7::provider::BodyLength::Chunked) => {
+            complete_chunked_body_prefix_len(overflow).unwrap_or(overflow.len())
+        }
+        // Invalid framing is rejected by the guarded relay before an upstream
+        // body write. Keep the bytes available so that parser sees the same
+        // malformed request instead of blocking while trying to re-read them.
+        Err(_) => overflow.len(),
+    }
+}
+
+/// Return the complete chunked body length when its terminator is already in
+/// the initial read. `None` means more body bytes are required.
+fn complete_chunked_body_prefix_len(bytes: &[u8]) -> Option<usize> {
+    let mut pos = 0usize;
+    loop {
+        let line_end = bytes[pos..]
+            .windows(2)
+            .position(|window| window == b"\r\n")?
+            + pos;
+        let size_line = std::str::from_utf8(&bytes[pos..line_end]).ok()?;
+        let size = usize::from_str_radix(
+            size_line
+                .split(';')
+                .next()
+                .map(str::trim)
+                .unwrap_or_default(),
+            16,
+        )
+        .ok()?;
+        pos = line_end.checked_add(2)?;
+
+        if size == 0 {
+            loop {
+                let trailer_end = bytes[pos..]
+                    .windows(2)
+                    .position(|window| window == b"\r\n")?
+                    + pos;
+                let empty = trailer_end == pos;
+                pos = trailer_end.checked_add(2)?;
+                if empty {
+                    return Some(pos);
+                }
+            }
+        }
+
+        let chunk_end = pos.checked_add(size)?;
+        let framed_end = chunk_end.checked_add(2)?;
+        if framed_end > bytes.len() || &bytes[chunk_end..framed_end] != b"\r\n" {
+            return None;
+        }
+        pos = framed_end;
+    }
 }
 
 struct ForwardRelayOptions<'a> {
@@ -3912,19 +4020,18 @@ async fn handle_forward_proxy(
     let opa_clone = opa_engine.clone();
     let cache_clone = identity_cache.clone();
     let pid_clone = entrypoint_pid.clone();
-    let host_clone = host_lc.clone();
-    let decision = tokio::task::spawn_blocking(move || {
-        evaluate_opa_tcp(
-            connection,
-            &opa_clone,
-            &cache_clone,
-            &pid_clone,
-            &host_clone,
-            port,
-        )
+    let intent = EgressIntent::forward_http(host_lc.clone(), port);
+    let mut decision = tokio::task::spawn_blocking(move || {
+        authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
     })
     .await
     .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
+
+    debug!(
+        transport = ?decision.intent.transport,
+        identity = ?decision.identity,
+        "Authorized explicit proxy egress intent"
+    );
 
     // Build log context
     let binary_str = decision
@@ -3959,28 +4066,18 @@ async fn handle_forward_proxy(
     let matched_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone(),
         NetworkAction::Deny { reason } => {
-            {
-                let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                    .activity(ActivityId::Other)
-                    .action(ActionId::Denied)
-                    .disposition(DispositionId::Blocked)
-                    .severity(SeverityId::Medium)
-                    .status(StatusId::Failure)
-                    .http_request(HttpRequest::new(
-                        method,
-                        OcsfUrl::new("http", &host_lc, &path, port),
-                    ))
-                    .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                    .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-                    .actor_process(
-                        Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                            .with_cmd_line(&cmdline_str),
-                    )
-                    .firewall_rule("-", "opa")
-                    .message(format!("FORWARD denied {method} {host_lc}:{port}{path}"))
-                    .build();
-                ocsf_emit!(event);
-            }
+            ocsf_emit!(build_forward_policy_deny_ocsf_event(
+                workload_addr,
+                method,
+                &host_lc,
+                port,
+                &path,
+                &binary_str,
+                &pid_str,
+                &ancestors_str,
+                &cmdline_str,
+                reason,
+            ));
             emit_denial_simple(
                 denial_tx,
                 &host_lc,
@@ -4011,19 +4108,22 @@ async fn handle_forward_proxy(
         binary = %binary_str,
         binary_pid = %pid_str,
         matched_policy = %policy_str,
-        decision_generation = decision.generation,
+        l4_policy_generation = decision.l4_policy_generation,
         current_generation = opa_engine.current_generation(),
         action = ?decision.action,
         "Forward proxy L4 policy decision"
     );
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
-    let forward_generation_guard = match opa_engine.generation_guard(decision.generation) {
+    let forward_generation_guard = match relay::pin_policy_generation(
+        &opa_engine,
+        decision.l4_policy_generation,
+    ) {
         Ok(guard) => guard,
         Err(e) => {
             warn!(
                 host = %host_lc,
                 port,
-                decision_generation = decision.generation,
+                l4_policy_generation = decision.l4_policy_generation,
                 current_generation = opa_engine.current_generation(),
                 error = %e,
                 "Forward proxy rejected request because policy generation changed after L4 decision"
@@ -4057,48 +4157,34 @@ async fn handle_forward_proxy(
     let mut forward_websocket_request =
         crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
     let mut request_body_credential_rewrite = false;
-    let l7_ctx = crate::l7::relay::L7EvalContext {
-        host: host_lc.clone(),
-        port,
-        policy_name: matched_policy.clone().unwrap_or_default(),
-        binary_path: decision
-            .binary
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        ancestors: decision
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-        cmdline_paths: decision
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-        secret_resolver: secret_resolver.clone(),
-        activity_tx: activity_tx.cloned(),
-        dynamic_credentials: dynamic_credentials.clone(),
-        token_grant_resolver: dynamic_credentials
-            .as_ref()
-            .map(|_| crate::l7::token_grant_injection::default_resolver()),
+    let l7_ctx = relay::http_context(
+        &decision,
+        secret_resolver.clone(),
+        activity_tx.cloned(),
+        dynamic_credentials.clone(),
         agent_proposals,
-    };
+    );
     let mut l7_activity_pending = false;
 
     // 4b. If the endpoint has L7 config, evaluate the request against
-    //     L7 policy.  The forward proxy handles exactly one request per
-    //     connection (Connection: close), so a single evaluation suffices.
-    if let Some(route) = query_l7_route_snapshot(&opa_engine, &decision, &host_lc, port)
-        && !route.configs.is_empty()
+    //     L7 policy. The forward proxy handles exactly one request per
+    //     connection, so a single evaluation suffices. The shared HTTP relay
+    //     strips hop-by-hop `Connection` headers and drops the upstream after
+    //     the response instead of asking the upstream to close it.
+    hydrate_l7_route(&opa_engine, &mut decision);
+    if let Some(route) = decision
+        .endpoint
+        .l7_route
+        .as_ref()
+        .filter(|route| !route.configs.is_empty())
     {
-        if route.generation != forward_generation_guard.captured_generation() {
+        if route.l7_policy_generation != forward_generation_guard.captured_generation() {
             warn!(
                 host = %host_lc,
                 port,
-                decision_generation = decision.generation,
-                guard_generation = forward_generation_guard.captured_generation(),
-                route_generation = route.generation,
+                l4_policy_generation = decision.l4_policy_generation,
+                l4_guard_generation = forward_generation_guard.captured_generation(),
+                l7_policy_generation = route.l7_policy_generation,
                 current_generation = opa_engine.current_generation(),
                 "Forward proxy rejected request because L7 route lookup used a different policy generation"
             );
@@ -4108,7 +4194,7 @@ async fn handle_forward_proxy(
                 miette::miette!(
                     "policy changed before forward L7 evaluation [expected_generation:{} current_generation:{}]",
                     forward_generation_guard.captured_generation(),
-                    route.generation,
+                    route.l7_policy_generation,
                 ),
             );
             emit_activity_simple(activity_tx, true, "policy_stale");
@@ -4124,13 +4210,13 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         }
-        let tunnel_engine = match opa_engine.clone_engine_for_tunnel(route.generation) {
+        let tunnel_engine = match relay::pin_l7_evaluator(&opa_engine, route.l7_policy_generation) {
             Ok(engine) => engine,
             Err(e) => {
                 warn!(
                     host = %host_lc,
                     port,
-                    route_generation = route.generation,
+                    l7_policy_generation = route.l7_policy_generation,
                     current_generation = opa_engine.current_generation(),
                     error = %e,
                     "Forward proxy rejected request because L7 tunnel engine could not be cloned"
@@ -4527,293 +4613,65 @@ async fn handle_forward_proxy(
     //    - Otherwise: reject internal IPs, allow public IPs through.
     //    When the policy host is already a literal IP address, treat it as
     //    implicitly allowed — the user explicitly declared the destination.
-    let mut raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
-    if raw_allowed_ips.is_empty() {
-        raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
+    match hydrate_destination_plan(&opa_engine, &mut decision, *trusted_host_gateway) {
+        Ok(()) => {}
+        Err(denial) => {
+            deny_forward_destination(
+                client,
+                &denial,
+                workload_addr,
+                method,
+                &host_lc,
+                port,
+                &path,
+                &binary_str,
+                &pid_str,
+                &ancestors_str,
+                &cmdline_str,
+                policy_str,
+                &decision,
+                denial_tx,
+                activity_tx,
+            )
+            .await?;
+            return Ok(());
+        }
     }
-    let exact_declared_endpoint_host =
-        query_exact_declared_endpoint_host(&opa_engine, &decision, &host_lc, port);
+    let destination_plan = decision
+        .endpoint
+        .destination
+        .as_ref()
+        .expect("destination plan hydrated");
 
-    // The trusted-gateway branch is the first path; reading it before the
-    // allowed_ips and default branches matches the policy decision narrative.
-    #[allow(clippy::if_not_else)]
-    let addrs = if is_host_gateway_alias(&host_lc)
-        && let Some(gw) = *trusted_host_gateway
+    let connector = match validate_destination(DestinationRequest {
+        host: &host,
+        port,
+        sandbox_entrypoint_pid,
+        plan: destination_plan,
+    })
+    .await
     {
-        // Trusted host-gateway path. Mirrors the CONNECT path logic.
-        match resolve_and_check_trusted_gateway(&host, port, gw, sandbox_entrypoint_pid).await {
-            Ok(addrs) => addrs,
-            Err(reason) => {
-                {
-                    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Other)
-                        .action(ActionId::Denied)
-                        .disposition(DispositionId::Blocked)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .http_request(HttpRequest::new(
-                            method,
-                            OcsfUrl::new("http", &host_lc, &path, port),
-                        ))
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
-                        .firewall_rule(policy_str, "ssrf")
-                        .message(format!(
-                            "FORWARD blocked: trusted-gateway check failed for {host_lc}:{port}"
-                        ))
-                        .status_detail(&reason)
-                        .build();
-                    ocsf_emit!(event);
-                }
-                emit_denial_simple(
-                    denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
-                emit_activity_simple(activity_tx, true, "ssrf");
-                respond(
-                    client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "ssrf_denied",
-                        &format!("{method} {host_lc}:{port} blocked: trusted-gateway check failed"),
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-    } else if !raw_allowed_ips.is_empty() {
-        // allowed_ips mode: validate resolved IPs against CIDR allowlist.
-        match parse_allowed_ips(&raw_allowed_ips) {
-            Ok(nets) => {
-                match resolve_and_check_allowed_ips(&host, port, &nets, sandbox_entrypoint_pid)
-                    .await
-                {
-                    Ok(addrs) => addrs,
-                    Err(reason) => {
-                        {
-                            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                .activity(ActivityId::Other)
-                                .action(ActionId::Denied)
-                                .disposition(DispositionId::Blocked)
-                                .severity(SeverityId::Medium)
-                                .status(StatusId::Failure)
-                                .http_request(HttpRequest::new(
-                                    method,
-                                    OcsfUrl::new("http", &host_lc, &path, port),
-                                ))
-                                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                                .src_endpoint(Endpoint::from_ip(
-                                    workload_addr.ip(),
-                                    workload_addr.port(),
-                                ))
-                                .actor_process(
-                                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                        .with_cmd_line(&cmdline_str),
-                                )
-                                .firewall_rule(policy_str, "ssrf")
-                                .message(format!(
-                                    "FORWARD blocked: allowed_ips check failed for {host_lc}:{port}"
-                                ))
-                                .status_detail(&reason)
-                                .build();
-                            ocsf_emit!(event);
-                        }
-                        emit_denial_simple(
-                            denial_tx,
-                            &host_lc,
-                            port,
-                            &binary_str,
-                            &decision,
-                            &reason,
-                            "ssrf",
-                        );
-                        emit_activity_simple(activity_tx, true, "ssrf");
-                        respond(
-                            client,
-                            &build_json_error_response(
-                                403,
-                                "Forbidden",
-                                "ssrf_denied",
-                                &format!(
-                                    "{method} {host_lc}:{port} blocked: allowed_ips check failed"
-                                ),
-                            ),
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                }
-            }
-            Err(reason) => {
-                {
-                    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Other)
-                        .action(ActionId::Denied)
-                        .disposition(DispositionId::Blocked)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .http_request(HttpRequest::new(
-                            method,
-                            OcsfUrl::new("http", &host_lc, &path, port),
-                        ))
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
-                        .firewall_rule(policy_str, "ssrf")
-                        .message(format!(
-                            "FORWARD blocked: invalid allowed_ips in policy for {host_lc}:{port}"
-                        ))
-                        .status_detail(&reason)
-                        .build();
-                    ocsf_emit!(event);
-                }
-                emit_denial_simple(
-                    denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
-                emit_activity_simple(activity_tx, true, "ssrf");
-                respond(
-                    client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "ssrf_denied",
-                        &format!(
-                            "{method} {host_lc}:{port} blocked: invalid allowed_ips in policy"
-                        ),
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-    } else if exact_declared_endpoint_host {
-        // Exact declared hostname mode mirrors CONNECT: private resolved
-        // addresses are allowed for this operator-declared host:port, while
-        // always-blocked addresses and control-plane ports remain denied.
-        match resolve_and_check_declared_endpoint(&host, port, sandbox_entrypoint_pid).await {
-            Ok(addrs) => addrs,
-            Err(reason) => {
-                {
-                    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Other)
-                        .action(ActionId::Denied)
-                        .disposition(DispositionId::Blocked)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .http_request(HttpRequest::new(
-                            method,
-                            OcsfUrl::new("http", &host_lc, &path, port),
-                        ))
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
-                        .firewall_rule(policy_str, "ssrf")
-                        .message(format!(
-                            "FORWARD blocked: declared endpoint check failed for {host_lc}:{port}"
-                        ))
-                        .status_detail(&reason)
-                        .build();
-                    ocsf_emit!(event);
-                }
-                emit_denial_simple(
-                    denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
-                respond(
-                    client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "ssrf_denied",
-                        &format!(
-                            "{method} {host_lc}:{port} blocked: declared endpoint check failed"
-                        ),
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-    } else {
-        // No allowed_ips: reject internal IPs, allow public IPs through.
-        match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
-            Ok(addrs) => addrs,
-            Err(reason) => {
-                {
-                    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Other)
-                        .action(ActionId::Denied)
-                        .disposition(DispositionId::Blocked)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .http_request(HttpRequest::new(
-                            method,
-                            OcsfUrl::new("http", &host_lc, &path, port),
-                        ))
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
-                        .firewall_rule(policy_str, "ssrf")
-                        .message(format!(
-                            "FORWARD blocked: internal IP without allowed_ips for {host_lc}:{port}"
-                        ))
-                        .status_detail(&reason)
-                        .build();
-                    ocsf_emit!(event);
-                }
-                emit_denial_simple(
-                    denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
-                emit_activity_simple(activity_tx, true, "ssrf");
-                respond(
-                    client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "ssrf_denied",
-                        &format!("{method} {host_lc}:{port} blocked: internal address"),
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
+        Ok(connector) => connector,
+        Err(denial) => {
+            deny_forward_destination(
+                client,
+                &denial,
+                workload_addr,
+                method,
+                &host_lc,
+                port,
+                &path,
+                &binary_str,
+                &pid_str,
+                &ancestors_str,
+                &cmdline_str,
+                policy_str,
+                &decision,
+                denial_tx,
+                activity_tx,
+            )
+            .await?;
+            return Ok(());
         }
     };
 
@@ -4845,8 +4703,7 @@ async fn handle_forward_proxy(
     //    directly: only TLS (CONNECT) tunnels chain through the corporate
     //    proxy, since plain-HTTP forwarding would need absolute-form requests
     //    rather than a CONNECT tunnel.
-    let dial_result = TcpStream::connect(addrs.as_slice()).await;
-    let mut upstream = match dial_result {
+    let mut upstream = match connector.connect().await {
         Ok(s) => s,
         Err(e) => {
             let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -4951,7 +4808,6 @@ async fn handle_forward_proxy(
             }
         };
     }
-
     forward_request_bytes = match inject_token_grant_for_forward_request(
         method,
         &upstream_target,
@@ -5053,28 +4909,18 @@ async fn handle_forward_proxy(
     // The request has now survived middleware, token grant, credential
     // rewriting, generation checks, and the HTTP relay. Only now record the
     // final allowed outcome.
-    {
-        let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Other)
-            .action(ActionId::Allowed)
-            .disposition(DispositionId::Allowed)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .http_request(HttpRequest::new(
-                method,
-                OcsfUrl::new("http", &host_lc, &path, port),
-            ))
-            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
-            .firewall_rule(policy_str, "opa")
-            .message(format!("FORWARD allowed {method} {host_lc}:{port}{path}"))
-            .build();
-        ocsf_emit!(event);
-    }
+    ocsf_emit!(build_forward_allow_ocsf_event(
+        workload_addr,
+        method,
+        &host_lc,
+        port,
+        &path,
+        &binary_str,
+        &pid_str,
+        &ancestors_str,
+        &cmdline_str,
+        policy_str,
+    ));
     emit_forward_success_activity(activity_tx, l7_activity_pending);
 
     if let crate::l7::provider::RelayOutcome::Upgraded {
@@ -5493,6 +5339,28 @@ network_policies: {}
     }
 
     #[test]
+    fn forward_policy_denial_ocsf_includes_validation_rationale() {
+        let reason = "policy validation failed; fail-closed quarantine is active; candidate version 7 rejected: conflicting tls metadata";
+        let event = build_forward_policy_deny_ocsf_event(
+            "127.0.0.1:45123".parse().unwrap(),
+            "GET",
+            "api.example.com",
+            80,
+            "/v1/models",
+            "/usr/bin/curl",
+            "42",
+            "/usr/bin/bash",
+            "curl http://api.example.com/v1/models",
+            reason,
+        );
+        let json = event.to_json().unwrap();
+
+        assert_eq!(json["status_detail"], reason);
+        assert_eq!(json["action"], "Denied");
+        assert_eq!(json["disposition"], "Blocked");
+    }
+
+    #[test]
     fn endpoint_only_opa_allows_declared_endpoint_without_process_identity() {
         let policy = include_str!("../data/sandbox-policy.rego");
         let data = r#"
@@ -5515,7 +5383,10 @@ network_policies:
         let engine = OpaEngine::from_strings_with_binary_identity_required(policy, data, false)
             .expect("relaxed engine");
 
-        let decision = evaluate_endpoint_only_opa(&engine, "host.k3d.internal", 56123);
+        let decision = evaluate_endpoint_only_opa(
+            &engine,
+            EgressIntent::connect("host.k3d.internal".to_string(), 56123),
+        );
         assert_eq!(
             decision.action,
             NetworkAction::Allow {
@@ -5525,7 +5396,10 @@ network_policies:
         assert!(decision.binary.is_none());
         assert!(decision.ancestors.is_empty());
 
-        let denied = evaluate_endpoint_only_opa(&engine, "api.example.com", 443);
+        let denied = evaluate_endpoint_only_opa(
+            &engine,
+            EgressIntent::connect("api.example.com".to_string(), 443),
+        );
         assert!(
             matches!(denied.action, NetworkAction::Deny { .. }),
             "endpoint-only mode must still deny undeclared endpoints"
@@ -5715,11 +5589,11 @@ network_policies:
             configs: vec![L7ConfigSnapshot {
                 config: websocket_l7_config(crate::l7::L7Protocol::Rest, false),
             }],
-            generation: 1,
+            l7_policy_generation: 1,
         };
         let l4_route = L7RouteSnapshot {
             configs: Vec::new(),
-            generation: 1,
+            l7_policy_generation: 1,
         };
 
         emit_connect_activity_if_l4_only(&activity_tx, Some(&l7_route));
@@ -6125,11 +5999,14 @@ network_policies:
     ) {
         let policy = include_str!("../data/sandbox-policy.rego");
         let engine = OpaEngine::from_strings(policy, data).unwrap();
-        let decision = ConnectDecision {
+        let decision = EgressDecision {
+            intent: EgressIntent::forward_http(host.to_string(), port),
             action: NetworkAction::Allow {
                 matched_policy: Some(policy_name.to_string()),
             },
-            generation: engine.current_generation(),
+            l4_policy_generation: engine.current_generation(),
+            identity: ProcessIdentityEvidence::Available,
+            endpoint: EndpointDecision::default(),
             binary: Some(PathBuf::from("/usr/bin/node")),
             binary_pid: None,
             ancestors: vec![],
@@ -6142,7 +6019,7 @@ network_policies:
             .config
             .clone();
         let tunnel_engine = engine
-            .clone_engine_for_tunnel(route.generation)
+            .clone_engine_for_tunnel(route.l7_policy_generation)
             .expect("tunnel engine");
         let ctx = crate::l7::relay::L7EvalContext {
             host: host.to_string(),
@@ -9641,7 +9518,7 @@ network_policies:
     /// itself), binds to `current_exe()`, and never falls through to the
     /// whole-`/proc` scan — the environment-sensitive path that made a forked
     /// child flaky under a busy CI `/proc`. Callers gate on Linux;
-    /// `evaluate_opa_tcp` denies unconditionally without `/proc`.
+    /// `authorize_egress_intent` denies unconditionally without `/proc`.
     async fn drive_connect_through_handler(
         endpoint_yaml: &str,
         connect_target: &str,
@@ -9719,6 +9596,68 @@ network_policies:
         (completed, stdout, denial_stages)
     }
 
+    /// Drives an absolute-form request through the same explicit-proxy entry
+    /// point used by CONNECT and returns the response and denial stages.
+    async fn drive_forward_through_handler(
+        endpoint_yaml: &str,
+        target: &str,
+    ) -> (Vec<u8>, Vec<String>) {
+        const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let data = format!(
+            r#"network_policies:
+  test_allow:
+    name: test_allow
+    endpoints:
+{endpoint_yaml}    binaries:
+      - {{ path: "{exe}" }}
+"#,
+            exe = exe.display(),
+        );
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let target = target.to_string();
+        let client = tokio::spawn(async move {
+            let mut socket = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+            let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            socket.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).await.unwrap();
+            response
+        });
+
+        let (server, _) = listener.accept().await.unwrap();
+        let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
+        Box::pin(handle_tcp_connection(
+            server,
+            engine,
+            Arc::new(BinaryIdentityCache::new()),
+            Arc::new(AtomicU32::new(std::process::id())),
+            None,
+            None,
+            None,
+            AgentProposals::default(),
+            Arc::new(None),
+            Arc::new(None),
+            None,
+            None,
+            Some(denial_tx),
+            None,
+        ))
+        .await
+        .expect("forward handler should complete");
+
+        let response = client.await.expect("client task");
+        let mut denial_stages = Vec::new();
+        while let Ok(event) = denial_rx.try_recv() {
+            denial_stages.push(event.denial_stage);
+        }
+        (response, denial_stages)
+    }
+
     /// End-to-end regression for the gator finding on PR #2162: with no TLS
     /// termination state, a terminating `CONNECT` must have its 503 written as
     /// the FIRST bytes on the socket — never after a `200 Connection
@@ -9788,6 +9727,32 @@ network_policies:
             !resp.contains("503"),
             "SSRF runs before the fail-closed gate, so the 503 must not appear; got: {resp:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn forward_handler_preserves_ssrf_response_and_denial_stage() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+
+        let (response, denial_stages) = Box::pin(drive_forward_through_handler(
+            "      - { host: \"127.0.0.1\", port: 80 }\n",
+            "http://127.0.0.1/private",
+        ))
+        .await;
+
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "internal forward destination must get the SSRF 403; got: {response:?}"
+        );
+        assert!(response.contains("ssrf_denied"));
+        assert!(
+            response.contains("GET 127.0.0.1:80 blocked: declared endpoint check failed"),
+            "an explicit loopback endpoint must fail declared-endpoint validation; got: {response:?}"
+        );
+        assert_eq!(denial_stages, ["ssrf"]);
     }
 
     /// A real `tls: skip` policy path through the handler is exempt from the
@@ -9868,9 +9833,12 @@ network_policies:
                     panic!("glob binary must be allowed, got deny: {reason}")
                 }
             }
-            let decision = ConnectDecision {
+            let decision = EgressDecision {
+                intent: EgressIntent::connect("203.0.113.10".to_string(), 443),
                 action,
-                generation,
+                l4_policy_generation: generation,
+                identity: ProcessIdentityEvidence::Available,
+                endpoint: EndpointDecision::default(),
                 binary: Some(input.binary_path),
                 binary_pid: Some(1),
                 ancestors: vec![],
@@ -10536,4 +10504,6 @@ network_policies:
         assert_eq!(res, 3);
         assert_eq!(unk, 2);
     }
+    #[path = "compatibility.rs"]
+    mod compatibility;
 }

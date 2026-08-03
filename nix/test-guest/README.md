@@ -57,6 +57,11 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 | Fedora 44 | No | Yes | Yes | `.rpm` |
 | Rocky Linux 9 | Yes | Yes | Yes | `.rpm` |
 
+The Ubuntu 24.04 Podman configuration is available for runtime and packaging
+checks, but its Podman 4 release does not provide the `pasta` rootless network
+helper required by OpenShell sandbox callbacks. OpenShell Podman E2E runs use
+the Fedora guest, which provides Podman 5 and `pasta`.
+
 List the available distros and configurations:
 
 ```shell

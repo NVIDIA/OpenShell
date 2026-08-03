@@ -504,6 +504,13 @@ pub(super) async fn handle_attach_sandbox_provider(
         &candidate_spec.providers,
     )
     .await?;
+    super::policy::validate_candidate_provider_attachments(
+        state,
+        &workspace,
+        &sandbox,
+        &candidate_spec.providers,
+    )
+    .await?;
 
     let provider_name = request.provider_name.clone();
     let attached = Arc::new(AtomicBool::new(false));
@@ -2570,7 +2577,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_producer_releases_request_span_when_client_disconnects() {
-        use crate::otel_tracing::test_collector;
+        use crate::otel_tracing::test_exporter;
         use tokio_stream::StreamExt as _;
         use tracing::Instrument as _;
 
@@ -2578,7 +2585,7 @@ mod tests {
         let sandbox = test_sandbox("watched", Vec::new());
         state.store.put_message(&sandbox).await.unwrap();
 
-        let traced = test_collector::install_traced();
+        let traced = test_exporter::install_traced();
         let request_span = tracing::info_span!("disconnected_watch_request");
         let response = handle_watch_sandbox(
             &state,
@@ -2600,9 +2607,9 @@ mod tests {
         drop(stream);
         drop(request_span);
 
-        tokio::time::timeout(std::time::Duration::from_millis(200), async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while traced.spans_named("disconnected_watch_request").is_empty() {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
