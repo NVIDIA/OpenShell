@@ -50,6 +50,14 @@ tests:
       - notExists:
           path: spec.host
 
+  - it: fails when passthrough Route is enabled with TLS disabled
+    set:
+      openshiftRoute.enabled: true
+      server.disableTls: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "openshiftRoute.enabled=true requires TLS (server.disableTls must be false) \u2014 a passthrough Route forwards encrypted traffic by SNI, so the gateway must terminate its own TLS."
+
   - it: renders custom annotations
     set:
       openshiftRoute.enabled: true

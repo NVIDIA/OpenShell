@@ -43,6 +43,9 @@ spec:
     secretName: {{ .Values.certManager.caSecretName | quote }}
 ---
 {{- $externalServerIssuer := .Values.certManager.serverIssuerRef.name }}
+{{- if and $externalServerIssuer .Values.certManager.clientCaFromServerTlsSecret }}
+{{- fail "certManager.serverIssuerRef.name is set but certManager.clientCaFromServerTlsSecret is still true \u2014 the server cert Secret's ca.crt comes from the external issuer, not the CA that signs the client (mTLS) certificate. Set certManager.clientCaFromServerTlsSecret=false and set server.tls.clientCaSecretName to the secret containing the client CA (e.g. the value of certManager.caSecretName, which defaults to openshell-ca-tls)." }}
+{{- end }}
 {{- if $externalServerIssuer }}
 {{- range .Values.certManager.serverDnsNames }}
 {{- /* Single-label names (e.g. "openshell") are also rejected by ACME CAs but are intentionally not checked here — the guard targets recognisable internal-network patterns. */ -}}
@@ -108,7 +111,7 @@ spec:
   issuerRef:
     {{- if .Values.certManager.serverIssuerRef.name }}
     name: {{ .Values.certManager.serverIssuerRef.name }}
-    kind: {{ .Values.certManager.serverIssuerRef.kind | default "ClusterIssuer" }}
+    kind: {{ .Values.certManager.serverIssuerRef.kind | default "Issuer" }}
     group: {{ .Values.certManager.serverIssuerRef.group | default "cert-manager.io" }}
     {{- else }}
     name: {{ include "openshell.fullname" . }}-ca-issuer
@@ -136,13 +139,7 @@ spec:
     - digital signature
     - key encipherment
   issuerRef:
-    {{- if .Values.certManager.clientIssuerRef.name }}
-    name: {{ .Values.certManager.clientIssuerRef.name }}
-    kind: {{ .Values.certManager.clientIssuerRef.kind | default "ClusterIssuer" }}
-    group: {{ .Values.certManager.clientIssuerRef.group | default "cert-manager.io" }}
-    {{- else }}
     name: {{ include "openshell.fullname" . }}-ca-issuer
     kind: Issuer
     group: cert-manager.io
-    {{- end }}
 {{- end }}

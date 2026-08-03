@@ -360,13 +360,6 @@ certManager:
     name: ""
     kind: ""
     group: ""
-  # -- Override the issuerRef for the client (mTLS) Certificate. Client certs
-  # don't need public trust; leave empty to use the chart's own CA issuer
-  # unless an internal PKI issuer is preferred.
-  clientIssuerRef:
-    name: ""
-    kind: ""
-    group: ""
   # -- Mount gateway client CA from the server TLS secret's ca.crt (populated by
   # cert-manager for certs issued by a CA Issuer). Set to false when
   # serverIssuerRef points at an external issuer (its secret's ca.crt would be

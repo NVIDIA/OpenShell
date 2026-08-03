@@ -289,7 +289,9 @@ exactly this reason.
 If sandbox supervisors fail their TLS handshake to the gateway with
 `UnknownCA` after configuring `serverIssuerRef`, the client (mTLS) certificate
 and the server certificate now come from different CAs, and the gateway's
-client-verification CA is misconfigured. Set
+client-verification CA is misconfigured. The chart now fails at render time if
+`clientCaFromServerTlsSecret` is still true when `serverIssuerRef` is set, but
+this can still occur with pre-existing releases or manual overrides. Set
 `certManager.clientCaFromServerTlsSecret=false` and
 `server.tls.clientCaSecretName` to a secret that actually contains the CA that
 signs the client certificate (`certManager.caSecretName`'s value by default):

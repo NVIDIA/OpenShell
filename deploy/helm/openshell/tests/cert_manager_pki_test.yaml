@@ -59,6 +59,7 @@ tests:
       certManager.enabled: true
       certManager.serverIssuerRef.name: letsencrypt-prod
       certManager.serverIssuerRef.kind: ClusterIssuer
+      certManager.clientCaFromServerTlsSecret: false
       certManager.serverDnsNames:
         - openshell.example.com
     asserts:
@@ -81,6 +82,7 @@ tests:
       certManager.enabled: true
       certManager.serverIssuerRef.name: letsencrypt-prod
       certManager.serverIssuerRef.kind: ClusterIssuer
+      certManager.clientCaFromServerTlsSecret: false
       certManager.serverDnsNames:
         - openshell.example.com
     asserts:
@@ -105,27 +107,25 @@ tests:
           content: openshell.my-namespace.svc.cluster.local
         documentIndex: 3
 
-  - it: overrides the client Certificate issuerRef when clientIssuerRef is set
+  - it: fails when serverIssuerRef is set but clientCaFromServerTlsSecret is true
     template: templates/cert-manager-pki.yaml
     set:
       certManager.enabled: true
-      certManager.clientIssuerRef.name: internal-pki-issuer
-      certManager.clientIssuerRef.kind: ClusterIssuer
+      certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.serverIssuerRef.kind: ClusterIssuer
+      certManager.clientCaFromServerTlsSecret: true
+      certManager.serverDnsNames:
+        - openshell.example.com
     asserts:
-      - equal:
-          path: spec.issuerRef.name
-          value: internal-pki-issuer
-        documentIndex: 4
-      - equal:
-          path: spec.issuerRef.kind
-          value: ClusterIssuer
-        documentIndex: 4
+      - failedTemplate:
+          errorMessage: "certManager.serverIssuerRef.name is set but certManager.clientCaFromServerTlsSecret is still true \u2014 the server cert Secret's ca.crt comes from the external issuer, not the CA that signs the client (mTLS) certificate. Set certManager.clientCaFromServerTlsSecret=false and set server.tls.clientCaSecretName to the secret containing the client CA (e.g. the value of certManager.caSecretName, which defaults to openshell-ca-tls)."
 
   - it: fails when serverIssuerRef is set but serverDnsNames contains internal-only names
     template: templates/cert-manager-pki.yaml
     set:
       certManager.enabled: true
       certManager.serverIssuerRef.name: letsencrypt-prod
+      certManager.clientCaFromServerTlsSecret: false
       # serverDnsNames is left at the default which contains "openshell.openshell.svc", "localhost", etc.
     asserts:
       - failedTemplate:
@@ -137,6 +137,7 @@ tests:
       certManager.enabled: true
       certManager.serverIssuerRef.name: letsencrypt-prod
       certManager.serverIssuerRef.kind: ClusterIssuer
+      certManager.clientCaFromServerTlsSecret: false
       certManager.serverDnsNames:
         - openshell.example.com
     asserts:
