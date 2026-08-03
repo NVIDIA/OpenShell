@@ -183,13 +183,13 @@ openshell sandbox create \
 ```
 
 Key flags:
-- `--provider`: Attach one or more providers (repeatable)
+- `--provider`: Attach configured credential providers for API keys, tokens, and other secrets (repeatable)
 - `--policy`: Custom policy YAML (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var)
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
 - `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
-- `--env KEY=VALUE`: Inject sandbox environment variables (repeatable)
+- `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
@@ -242,6 +242,8 @@ openshell sandbox exec --name my-sandbox --env MODE=test -- cargo test
 ```
 
 `sandbox exec` streams output and exits with the remote command's exit code. Use `sandbox connect` for an interactive shell.
+Use `--env` only for non-secret values. Attach credentials to the sandbox with a
+provider instead of passing API keys, tokens, or other secrets to `sandbox exec`.
 
 ### Change attached providers
 
