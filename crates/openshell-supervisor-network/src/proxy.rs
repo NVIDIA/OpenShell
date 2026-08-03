@@ -9533,15 +9533,16 @@ network_policies:
         // Allow the current test binary — the in-process client's
         // `/proc/<pid>/exe` — to reach the endpoint. Matching is by path.
         let exe = std::env::current_exe().expect("current_exe");
+        let exe_yaml = serde_json::to_string(&exe.display().to_string())
+            .expect("serialize current executable path");
         let data = format!(
             r#"network_policies:
   test_allow:
     name: test_allow
     endpoints:
 {endpoint_yaml}    binaries:
-      - {{ path: "{exe}" }}
+      - {{ path: {exe_yaml} }}
 "#,
-            exe = exe.display(),
         );
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy"));
 
@@ -9609,15 +9610,16 @@ network_policies:
         const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
 
         let exe = std::env::current_exe().expect("current_exe");
+        let exe_yaml = serde_json::to_string(&exe.display().to_string())
+            .expect("serialize current executable path");
         let data = format!(
             r#"network_policies:
   test_allow:
     name: test_allow
     endpoints:
 {endpoint_yaml}    binaries:
-      - {{ path: "{exe}" }}
+      - {{ path: {exe_yaml} }}
 "#,
-            exe = exe.display(),
         );
         let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy"));
 

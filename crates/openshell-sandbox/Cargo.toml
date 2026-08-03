@@ -44,8 +44,6 @@ anyhow = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }
 hex = "0.4"
-russh = { version = "0.57", default-features = false, features = ["flate2", "ring", "rsa"] }
-rand_core = "0.6"
 
 # Unix ownership for Kubernetes sidecar init setup
 nix = { workspace = true }
