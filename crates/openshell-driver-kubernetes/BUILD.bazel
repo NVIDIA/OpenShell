@@ -2,6 +2,7 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rustfmt_test")
 
 rust_library(
     name = "openshell-driver-kubernetes",
@@ -21,6 +22,11 @@ rust_binary(
     binary_name = "openshell-driver-kubernetes",
     visibility = ["//visibility:public"],
     deps = all_crate_deps(normal = True) + [":openshell-driver-kubernetes"],
+)
+
+rustfmt_test(
+    name = "openshell-driver-kubernetes_bin_rustfmt_test",
+    targets = [":openshell-driver-kubernetes_bin"],
 )
 
 rust_test(

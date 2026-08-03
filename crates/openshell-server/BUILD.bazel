@@ -2,6 +2,7 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rustfmt_test")
 
 rust_library(
     name = "openshell-server",
@@ -25,6 +26,11 @@ rust_binary(
     aliases = aliases(),
     visibility = ["//visibility:public"],
     deps = all_crate_deps(normal = True) + [":openshell-server"],
+)
+
+rustfmt_test(
+    name = "openshell-gateway_rustfmt_test",
+    targets = [":openshell-gateway"],
 )
 
 rust_test(

@@ -2,6 +2,7 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rustfmt_test")
 load("@workspace_version//:version.bzl", "WORKSPACE_VERSION")
 
 rust_library(
@@ -24,11 +25,21 @@ rust_binary(
     deps = all_crate_deps(normal = True) + [":openshell-cli"],
 )
 
+rustfmt_test(
+    name = "openshell_rustfmt_test",
+    targets = [":openshell"],
+)
+
 rust_binary(
     name = "fake-forward-process",
     testonly = True,
     srcs = ["tests/fixtures/fake_forward.rs"],
     crate_root = "tests/fixtures/fake_forward.rs",
+)
+
+rustfmt_test(
+    name = "fake-forward-process_rustfmt_test",
+    targets = [":fake-forward-process"],
 )
 
 rust_test(
