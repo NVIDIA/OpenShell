@@ -95,9 +95,12 @@ from a real Issuer or ClusterIssuer (for example, an ACME issuer), and an
 OpenShift Route with TLS passthrough exposes it externally while the gateway
 keeps terminating its own TLS and mTLS.
 
-Install cert-manager and configure a working `ClusterIssuer` first, then see
+Install cert-manager and configure a working `ClusterIssuer` first — see
 [Managing Certificates](/kubernetes/managing-certificates) for the
-`certManager.serverIssuerRef` details. Install the chart with:
+`certManager.serverIssuerRef` details. Configure an OIDC provider as described
+in [Access Control](/kubernetes/access-control) — remote gateways authenticate
+CLI users via OIDC, not mTLS, so the gateway must know the OIDC issuer URL.
+Install the chart with:
 
 ```shell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
@@ -114,7 +117,9 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --set certManager.serverIssuerRef.kind=ClusterIssuer \
   --set certManager.serverDnsNames[0]=<external-hostname> \
   --set openshiftRoute.enabled=true \
-  --set openshiftRoute.host=<external-hostname>
+  --set openshiftRoute.host=<external-hostname> \
+  --set server.oidc.issuer=<oidc-issuer-url> \
+  --set server.oidc.audience=<oidc-audience>
 ```
 
 | Override | Reason |
@@ -123,6 +128,7 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
 | `certManager.clientCaFromServerTlsSecret=false` + `server.tls.clientCaSecretName` | The server cert's issuer no longer shares a CA with the client (mTLS) cert, so this points the gateway's client-verification CA at `certManager.caSecretName` (the chart's own CA secret, `openshell-ca-tls` by default) instead of the server secret. |
 | `certManager.serverIssuerRef` | Points the server certificate at your real Issuer or ClusterIssuer instead of the chart's built-in self-signed CA. |
 | `openshiftRoute.enabled` / `openshiftRoute.host` | Creates an OpenShift Route with TLS passthrough — the router forwards the encrypted connection by SNI without decrypting, so the gateway keeps terminating its own TLS and mTLS. |
+| `server.oidc.issuer` / `server.oidc.audience` | Configures server-side OIDC validation. Without these, the gateway expects mTLS client certificates and rejects OIDC-only CLI connections. See [Access Control](/kubernetes/access-control). |
 
 Register the gateway with the CLI over OIDC. Remote gateways authenticate CLI
 users via OIDC, not mTLS — see [Access Control](/kubernetes/access-control):

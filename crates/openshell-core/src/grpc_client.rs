@@ -168,14 +168,21 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
             .wrap_err_with(|| format!("failed to read client key from {key_path}"))?;
 
         // Trust the configured CA (self-signed deployments sign the gateway's
-        // cert with it) *in addition to* the public root stores, rather than
-        // instead of them — tonic's root store is a union of all configured
-        // sources, so this also covers deployments where the gateway's server
-        // cert comes from a public CA (e.g. an ACME issuer) instead of the
-        // same private CA that signs this client's identity.
+        // cert with it) *in addition to* the compiled-in WebPKI roots — this
+        // covers deployments where the gateway's server cert comes from a
+        // public CA (e.g. an ACME issuer) instead of the same private CA that
+        // signs this client's identity.
+        //
+        // Do NOT add `.with_native_roots()` here: the supervisor runs inside
+        // the user-selected sandbox image (Docker/Podman drivers), so the
+        // image's CA bundle is not operator-controlled.  An attacker who can
+        // influence the image and DNS/routing could install their own CA and
+        // intercept the supervisor→gateway TLS connection.  Additionally,
+        // tonic returns NativeCertsNotFound when the native store is empty,
+        // which would break minimal BYOC images even though OPENSHELL_TLS_CA
+        // is valid.
         let mut tls_config = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(ca_pem))
-            .with_native_roots()
             .with_webpki_roots()
             .identity(Identity::from_pem(cert_pem, key_pem));
         if let Ok(server_name) = std::env::var(sandbox_env::GATEWAY_TLS_SERVER_NAME)
