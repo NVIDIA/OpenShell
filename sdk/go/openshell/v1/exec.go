@@ -34,7 +34,7 @@ type InteractiveSession interface {
 // ExecInterface defines command execution operations on sandboxes.
 // Methods accept a sandbox name and resolve it to an ID internally.
 type ExecInterface interface {
-	Run(ctx context.Context, sandboxName string, command []string, opts ...ExecOptions) (*ExecResult, error)
-	Stream(ctx context.Context, sandboxName string, command []string, opts ...ExecOptions) (ExecStream, error)
-	Interactive(ctx context.Context, sandboxName string, command []string, cols, rows uint32, opts ...ExecOptions) (InteractiveSession, error)
+	Run(ctx context.Context, workspace, sandboxName string, command []string, opts ...ExecOptions) (*ExecResult, error)
+	Stream(ctx context.Context, workspace, sandboxName string, command []string, opts ...ExecOptions) (ExecStream, error)
+	Interactive(ctx context.Context, workspace, sandboxName string, command []string, cols, rows uint32, opts ...ExecOptions) (InteractiveSession, error)
 }

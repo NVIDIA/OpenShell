@@ -39,11 +39,11 @@ type SSHInterface interface {
 	// For name-based access with automatic session lifecycle management,
 	// prefer [SSHInterface.Tunnel] which resolves sandbox names internally
 	// and revokes the session on Close.
-	CreateSession(ctx context.Context, sandboxID string) (*SSHSession, error)
+	CreateSession(ctx context.Context, workspace, sandboxID string) (*SSHSession, error)
 	// RevokeSession revokes an existing SSH session by its token.
 	// Returns true if the session was actively revoked, false if it was
 	// already expired or not found.
-	RevokeSession(ctx context.Context, token string) (bool, error)
+	RevokeSession(ctx context.Context, workspace, token string) (bool, error)
 	// Tunnel opens a bidirectional SSH tunnel to the given port inside a
 	// sandbox. It combines CreateSession and ForwardTcp(SshRelayTarget)
 	// into a single call with automatic session cleanup on Close.
@@ -54,5 +54,5 @@ type SSHInterface interface {
 	// Errors: InvalidArgument if port is out of range or sandboxName is
 	// empty; NotFound if the sandbox does not exist; Unimplemented by
 	// the fake client; Unavailable if the client is closed.
-	Tunnel(ctx context.Context, sandboxName string, port uint32, opts ...TunnelOption) (io.ReadWriteCloser, error)
+	Tunnel(ctx context.Context, workspace, sandboxName string, port uint32, opts ...TunnelOption) (io.ReadWriteCloser, error)
 }

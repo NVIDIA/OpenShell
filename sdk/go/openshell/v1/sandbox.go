@@ -53,15 +53,15 @@ var WithLogMinLevel = types.WithLogMinLevel
 
 // SandboxInterface defines lifecycle operations on sandboxes.
 type SandboxInterface interface {
-	Create(ctx context.Context, name string, spec *SandboxSpec, labels map[string]string) (*Sandbox, error)
-	Get(ctx context.Context, name string) (*Sandbox, error)
-	List(ctx context.Context, opts ...ListOptions) ([]*Sandbox, error)
-	Delete(ctx context.Context, name string) error
-	AttachProvider(ctx context.Context, sandboxName, providerName string, expectedResourceVersion uint64) (*AttachProviderResult, error)
-	DetachProvider(ctx context.Context, sandboxName, providerName string, expectedResourceVersion uint64) (*DetachProviderResult, error)
-	ListProviders(ctx context.Context, sandboxName string) ([]*Provider, error)
-	WaitReady(ctx context.Context, name string, opts ...WaitOptions) (*Sandbox, error)
-	Watch(ctx context.Context, name string, opts ...WatchOptions) (WatchInterface[*Sandbox], error)
+	Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string) (*Sandbox, error)
+	Get(ctx context.Context, workspace, name string) (*Sandbox, error)
+	List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error)
+	Delete(ctx context.Context, workspace, name string) error
+	AttachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*AttachProviderResult, error)
+	DetachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*DetachProviderResult, error)
+	ListProviders(ctx context.Context, workspace, sandboxName string) ([]*Provider, error)
+	WaitReady(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
+	Watch(ctx context.Context, workspace, name string, opts ...WatchOptions) (WatchInterface[*Sandbox], error)
 	// GetLogs retrieves log entries for a sandbox. The sandbox is resolved
 	// by name (an internal Get call translates name to ID). Use
 	// WithLogLines, WithLogSince, WithLogSources, and WithLogMinLevel to
@@ -69,5 +69,5 @@ type SandboxInterface interface {
 	//
 	// Errors: NotFound if the sandbox does not exist; InvalidArgument if
 	// the sandbox name is empty; Unimplemented by the fake client.
-	GetLogs(ctx context.Context, sandboxName string, opts ...LogOption) (*LogResult, error)
+	GetLogs(ctx context.Context, workspace, sandboxName string, opts ...LogOption) (*LogResult, error)
 }

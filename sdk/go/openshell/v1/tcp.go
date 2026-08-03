@@ -72,7 +72,7 @@ type TCPInterface interface {
 	//
 	// The connection respects context cancellation: if ctx is cancelled,
 	// the stream is closed and pending Read/Write calls return a context error.
-	Forward(ctx context.Context, sandboxName string, port uint32, opts ...ForwardOption) (io.ReadWriteCloser, error)
+	Forward(ctx context.Context, workspace, sandboxName string, port uint32, opts ...ForwardOption) (io.ReadWriteCloser, error)
 
 	// Listen binds a local TCP port and tunnels every accepted connection to
 	// the given port inside a sandbox, returning a standard [net.Listener].
@@ -93,5 +93,5 @@ type TCPInterface interface {
 	//     or localPort is > 65535
 	//   - Unimplemented: returned by the fake client
 	//   - Unavailable: client is closed
-	Listen(ctx context.Context, sandboxName string, remotePort uint32, localPort uint32, opts ...ListenOption) (net.Listener, error)
+	Listen(ctx context.Context, workspace, sandboxName string, remotePort uint32, localPort uint32, opts ...ListenOption) (net.Listener, error)
 }

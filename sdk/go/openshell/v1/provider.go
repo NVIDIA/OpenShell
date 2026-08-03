@@ -18,12 +18,12 @@ type ProviderSpec = types.ProviderSpec
 // ProviderInterface defines CRUD and Ensure operations on providers,
 // plus sub-client accessors for profiles and credential refresh.
 type ProviderInterface interface {
-	Create(ctx context.Context, provider *Provider) (*Provider, error)
-	Get(ctx context.Context, name string) (*Provider, error)
-	List(ctx context.Context, opts ...ListOptions) ([]*Provider, error)
-	Update(ctx context.Context, provider *Provider) (*Provider, error)
-	Delete(ctx context.Context, name string) error
-	Ensure(ctx context.Context, provider *Provider) (*Provider, error)
+	Create(ctx context.Context, workspace string, provider *Provider) (*Provider, error)
+	Get(ctx context.Context, workspace, name string) (*Provider, error)
+	List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Provider, error)
+	Update(ctx context.Context, workspace string, provider *Provider) (*Provider, error)
+	Delete(ctx context.Context, workspace, name string) error
+	Ensure(ctx context.Context, workspace string, provider *Provider) (*Provider, error)
 	Profiles() ProfileInterface
 	Refresh() RefreshInterface
 }

@@ -16,6 +16,7 @@ type ListOptions struct {
 	Limit         int
 	Offset        int
 	LabelSelector string
+	AllWorkspaces bool
 }
 
 // DeleteOptions configures resource deletion.

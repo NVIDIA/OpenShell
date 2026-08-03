@@ -31,11 +31,11 @@ const (
 type RefreshInterface interface {
 	// GetStatus returns the refresh status for a provider's credential.
 	// If credentialKey is empty, statuses for all credentials are returned.
-	GetStatus(ctx context.Context, provider, credentialKey string) ([]*RefreshStatus, error)
+	GetStatus(ctx context.Context, workspace, provider, credentialKey string) ([]*RefreshStatus, error)
 	// Configure sets up credential refresh for a provider credential.
-	Configure(ctx context.Context, config *RefreshConfig) (*RefreshStatus, error)
+	Configure(ctx context.Context, workspace string, config *RefreshConfig) (*RefreshStatus, error)
 	// Rotate triggers an immediate credential rotation.
-	Rotate(ctx context.Context, provider, credentialKey string) (*RefreshStatus, error)
+	Rotate(ctx context.Context, workspace, provider, credentialKey string) (*RefreshStatus, error)
 	// Delete removes credential refresh configuration. Returns true if deleted.
-	Delete(ctx context.Context, provider, credentialKey string) (bool, error)
+	Delete(ctx context.Context, workspace, provider, credentialKey string) (bool, error)
 }

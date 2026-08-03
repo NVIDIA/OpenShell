@@ -56,15 +56,15 @@ const (
 // ProfileInterface defines operations for managing provider profiles.
 type ProfileInterface interface {
 	// List returns all provider profiles.
-	List(ctx context.Context, opts ...ListOptions) ([]*ProviderProfile, error)
+	List(ctx context.Context, workspace string, opts ...ListOptions) ([]*ProviderProfile, error)
 	// Get retrieves a provider profile by ID.
-	Get(ctx context.Context, id string) (*ProviderProfile, error)
+	Get(ctx context.Context, workspace, id string) (*ProviderProfile, error)
 	// Import submits profiles for import and returns the result with diagnostics.
-	Import(ctx context.Context, items []ProfileImportItem) (*ImportResult, error)
+	Import(ctx context.Context, workspace string, items []ProfileImportItem) (*ImportResult, error)
 	// Update replaces an existing profile identified by ID and expected resource version.
-	Update(ctx context.Context, id string, expectedResourceVersion uint64, item ProfileImportItem) (*UpdateResult, error)
+	Update(ctx context.Context, workspace, id string, expectedResourceVersion uint64, item ProfileImportItem) (*UpdateResult, error)
 	// Lint validates profiles without persisting them and returns diagnostics.
-	Lint(ctx context.Context, items []ProfileImportItem) (*LintResult, error)
+	Lint(ctx context.Context, workspace string, items []ProfileImportItem) (*LintResult, error)
 	// Delete removes a provider profile by ID. Returns true if deleted.
-	Delete(ctx context.Context, id string) (bool, error)
+	Delete(ctx context.Context, workspace, id string) (bool, error)
 }
