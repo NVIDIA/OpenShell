@@ -4407,7 +4407,7 @@ fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
             ..
         }
         | openshell_policy::PolicyMergeError::UndeclaredPortWouldChange { .. }
-        | openshell_policy::PolicyMergeError::ConflictingMcpContractsForEndpoint { .. }
+        | openshell_policy::PolicyMergeError::ConflictingInspectionContracts { .. }
         | openshell_policy::PolicyMergeError::AmbiguousEndpointRule { .. }
         | openshell_policy::PolicyMergeError::CannotRemoveBinaryFromAnyBinaryScope { .. }
         | openshell_policy::PolicyMergeError::EndpointNotFound { .. }
@@ -5407,7 +5407,7 @@ mod tests {
         assert!(undeclared_port.message().contains("8443"));
 
         let mcp_conflict = map_policy_merge_error(
-            openshell_policy::PolicyMergeError::ConflictingMcpContractsForEndpoint {
+            openshell_policy::PolicyMergeError::ConflictingInspectionContracts {
                 host: "mcp.example.com".to_string(),
                 port: 443,
                 contracts: vec![

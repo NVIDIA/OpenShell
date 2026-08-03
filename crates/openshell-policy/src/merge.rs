@@ -219,9 +219,9 @@ pub enum PolicyMergeError {
         host: String,
         ports: Vec<u32>,
     },
-    /// One host and port would carry more than one effective MCP inspection
+    /// One host and port would carry more than one effective L7 inspection
     /// contract, which the supervisor resolves by match order rather than policy.
-    ConflictingMcpContractsForEndpoint {
+    ConflictingInspectionContracts {
         host: String,
         port: u32,
         /// Rendered effective contracts found at this host and port, sorted.
@@ -322,13 +322,13 @@ impl std::fmt::Display for PolicyMergeError {
                 f,
                 "merge operation {operation_index} add-rule '{rule_name}' would change authorization for {host} on undeclared ports {ports:?}; declare every port of the endpoint it modifies"
             ),
-            Self::ConflictingMcpContractsForEndpoint {
+            Self::ConflictingInspectionContracts {
                 host,
                 port,
                 contracts,
             } => write!(
                 f,
-                "{host}:{port} would carry more than one MCP inspection contract ({}); the sandbox resolves one contract per host and port, so these cannot coexist even in different rules or under different paths",
+                "{host}:{port} would carry more than one L7 inspection contract ({}); the sandbox resolves one contract per host and port, so these cannot coexist even in different rules or under different paths",
                 contracts.join(", ")
             ),
             Self::AmbiguousEndpointRule {
@@ -691,12 +691,12 @@ pub fn merge_policy(
     // Validate and apply in request order. `merged` is private until every
     // operation succeeds, so failures remain atomic without allowing a later
     // malformed operation to replace the error from an earlier operation.
-    let conflicts_before = conflicting_mcp_host_ports(&policy);
+    let conflicts_before = conflicting_inspection_contracts(&policy);
     for (operation_index, operation) in operations.iter().enumerate() {
         validate_operation(operation_index, operation)?;
         apply_operation(&mut merged, operation_index, operation, &mut warnings)?;
     }
-    ensure_no_new_mcp_contract_conflicts(&merged, &conflicts_before)?;
+    ensure_no_new_inspection_conflicts(&merged, &conflicts_before)?;
 
     let changed = merged != policy;
     Ok(PolicyMergeResult {
@@ -706,32 +706,48 @@ pub fn merge_policy(
     })
 }
 
-/// Host and port pairs whose MCP endpoints do not agree on one inspection
-/// contract, mapped to the rendered contracts in play.
+/// The L7 inspection contract an endpoint establishes for its host and port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveInspection {
+    protocol: String,
+    mcp: Option<EffectiveMcpContract>,
+}
+
+/// Host and port pairs whose endpoints do not agree on one inspection contract,
+/// mapped to the rendered contracts in play.
 ///
 /// The supervisor selects an endpoint's extended configuration by host and port
 /// alone: `endpoint_matches_request` never consults `path`, and the first match
-/// wins. Two MCP endpoints on one host and port therefore make the effective
-/// strict-tool-name, method-profile, and body-limit contract depend on
-/// evaluation order rather than on policy. `merge_endpoint` cannot catch this on
-/// its own, because it only compares endpoints that fold together, and a
-/// differing path or a separate rule keeps them apart.
-fn conflicting_mcp_host_ports(policy: &SandboxPolicy) -> BTreeMap<(String, u32), Vec<String>> {
-    let mut contracts: BTreeMap<(String, u32), Vec<(EffectiveMcpContract, String)>> =
+/// wins. Two inspected endpoints on one host and port therefore make the
+/// effective protocol, strict-tool-name, method-profile, and body-limit contract
+/// depend on evaluation order rather than on policy. `merge_endpoint` cannot
+/// catch this on its own, because it only compares endpoints that fold together,
+/// and a differing path or a separate rule keeps them apart.
+///
+/// Endpoints with no protocol are skipped: they carry no L7 configuration, so
+/// they never compete to supply one.
+fn conflicting_inspection_contracts(
+    policy: &SandboxPolicy,
+) -> BTreeMap<(String, u32), Vec<String>> {
+    let mut contracts: BTreeMap<(String, u32), Vec<(EffectiveInspection, String)>> =
         BTreeMap::new();
     for rule in policy.network_policies.values() {
         for endpoint in &rule.endpoints {
             // Provider-composed rules are deliberately included: the supervisor
             // resolves one contract per host and port regardless of which rule
             // contributed the endpoint.
-            let Some(contract) = effective_mcp_contract(endpoint) else {
+            if endpoint.protocol.is_empty() {
                 continue;
+            }
+            let inspection = EffectiveInspection {
+                protocol: endpoint.protocol.to_ascii_lowercase(),
+                mcp: effective_mcp_contract(endpoint),
             };
             for port in canonical_ports(endpoint) {
                 contracts
                     .entry((endpoint.host.to_ascii_lowercase(), port))
                     .or_default()
-                    .push((contract, describe_mcp_contract(endpoint)));
+                    .push((inspection.clone(), describe_mcp_contract(endpoint)));
             }
         }
     }
@@ -739,8 +755,8 @@ fn conflicting_mcp_host_ports(policy: &SandboxPolicy) -> BTreeMap<(String, u32),
     contracts
         .into_iter()
         .filter_map(|(key, found)| {
-            let first = found.first()?.0;
-            if found.iter().all(|(contract, _)| *contract == first) {
+            let first = &found.first()?.0;
+            if found.iter().all(|(inspection, _)| inspection == first) {
                 return None;
             }
             let mut rendered: Vec<String> =
@@ -752,21 +768,21 @@ fn conflicting_mcp_host_ports(policy: &SandboxPolicy) -> BTreeMap<(String, u32),
         .collect()
 }
 
-/// Rejects an operation that introduces an MCP contract conflict.
+/// Rejects an operation that introduces an L7 inspection-contract conflict.
 ///
 /// Only conflicts absent from `before` are rejected. A policy that already
 /// carries one, for instance through a provider profile composed outside this
 /// merge, would otherwise make every later update fail with an error the
 /// operation did nothing to cause.
-fn ensure_no_new_mcp_contract_conflicts(
+fn ensure_no_new_inspection_conflicts(
     merged: &SandboxPolicy,
     before: &BTreeMap<(String, u32), Vec<String>>,
 ) -> Result<(), PolicyMergeError> {
-    for ((host, port), contracts) in conflicting_mcp_host_ports(merged) {
+    for ((host, port), contracts) in conflicting_inspection_contracts(merged) {
         if before.contains_key(&(host.clone(), port)) {
             continue;
         }
-        return Err(PolicyMergeError::ConflictingMcpContractsForEndpoint {
+        return Err(PolicyMergeError::ConflictingInspectionContracts {
             host,
             port,
             contracts,
@@ -1012,16 +1028,60 @@ fn add_rule(
 /// True for the merge errors that exist only because two authorizations share
 /// one rule, so moving the incoming authorization to its own rule resolves them.
 ///
+/// `UndeclaredPortWouldChange` belongs here for the same reason as the two
+/// inheritance variants. The undeclared port exists only on the endpoint the
+/// fold would merge into; an operation kept on its own rule carries exactly the
+/// ports it declared, so nothing reaches a port it did not name. Leaving it out
+/// makes a narrow update against a multi-port endpoint fail outright instead of
+/// landing on its own rule.
+///
 /// An MCP contract conflict is deliberately excluded. The supervisor establishes
 /// one inspection contract per host and port rather than per rule, so two
 /// contracts for the same endpoint stay ambiguous in separate rules and the
 /// operation has to be rejected wherever it lands.
+///
+/// The match is exhaustive on purpose. A catch-all would let a new variant
+/// default to "not fold-only" and silently withdraw the separate-rule remedy
+/// for whichever updates start hitting it first, so adding a variant has to be
+/// an explicit decision here.
+// The three groups returning `false` are kept apart on purpose: each declines
+// for a different reason, and merging them into one arm would leave a future
+// variant with no guidance on which group it belongs to.
+#[allow(clippy::match_same_arms)]
 fn is_authorization_inheritance_conflict(error: &PolicyMergeError) -> bool {
-    matches!(
-        error,
+    match error {
+        // Scope conflicts that exist only because the fold puts two
+        // authorizations in one rule. Kept on its own rule, the incoming
+        // authorization grants exactly the binaries, endpoints, and ports it
+        // declared, and the conflict disappears.
         PolicyMergeError::NewBinaryWouldInheritAuthorization { .. }
-            | PolicyMergeError::ExistingBinariesWouldInheritAuthorization { .. }
-    )
+        | PolicyMergeError::ExistingBinariesWouldInheritAuthorization { .. }
+        | PolicyMergeError::UndeclaredPortWouldChange { .. } => true,
+
+        // Separating the rules does not help. The supervisor establishes one MCP
+        // inspection contract per host and port rather than per rule, so two
+        // contracts stay ambiguous however they are split.
+        PolicyMergeError::McpContractConflict { .. }
+        | PolicyMergeError::ConflictingInspectionContracts { .. } => false,
+
+        // Reports an unsupported or missing state in the policy the fold
+        // targeted rather than a scope conflict. Routing around it would leave
+        // the operator with a rule they did not ask for and an existing endpoint
+        // still needing attention.
+        PolicyMergeError::UnsupportedAccessPreset { .. }
+        | PolicyMergeError::UnsupportedEndpointProtocol { .. }
+        | PolicyMergeError::EndpointHasNoL7Inspection { .. }
+        | PolicyMergeError::EndpointHasNoAllowBase { .. }
+        | PolicyMergeError::EndpointNotFound { .. }
+        | PolicyMergeError::InvalidEndpointReference { .. }
+        | PolicyMergeError::AmbiguousEndpointRule { .. } => false,
+
+        // Malformed operations, and operations `merge_rules` never produces.
+        // Neither is answered by choosing a different rule to write to.
+        PolicyMergeError::MissingRuleNameForAddRule
+        | PolicyMergeError::EmptyAddRuleEndpoints { .. }
+        | PolicyMergeError::CannotRemoveBinaryFromAnyBinaryScope { .. } => false,
+    }
 }
 
 fn merge_rules(
@@ -1913,7 +1973,7 @@ mod tests {
 
     use super::{
         ANY_BINARY_SCOPE, DEFAULT_JSON_RPC_MAX_BODY_BYTES, PolicyMergeError, PolicyMergeOp,
-        PolicyMergeWarning, generated_rule_name, merge_policy, policy_covers_rule,
+        PolicyMergeWarning, canonical_ports, generated_rule_name, merge_policy, policy_covers_rule,
     };
     use crate::restrictive_default_policy;
     use openshell_core::proto::{
@@ -4638,7 +4698,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                PolicyMergeError::ConflictingMcpContractsForEndpoint { host, port, contracts }
+                PolicyMergeError::ConflictingInspectionContracts { host, port, contracts }
                     if host == "mcp.example.com" && *port == 443 && contracts.len() == 2
             ),
             "got {error:?}"
@@ -4690,7 +4750,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            PolicyMergeError::ConflictingMcpContractsForEndpoint { .. }
+            PolicyMergeError::ConflictingInspectionContracts { .. }
         ));
     }
 
@@ -4827,5 +4887,200 @@ mod tests {
             policy_covers_rule(&result.policy, &incoming),
             "an any-binary rule covers the named binary, so coverage must converge"
         );
+    }
+
+    /// A narrow update under its own rule name must survive an undeclared-port
+    /// conflict the fold would create. The undeclared port belongs to the
+    /// endpoint the fold merges into; a separate rule carries only the ports it
+    /// declared, so nothing reaches a port the operation did not name.
+    #[test]
+    fn undeclared_port_conflict_keeps_a_differently_named_rule_separate() {
+        let broad = rule_with_authorizations(
+            "broad",
+            vec![NetworkEndpoint {
+                protocol: "rest".to_string(),
+                rules: vec![rest_rule("GET", "/x")],
+                ..endpoint_with_ports("api.example.com", &[443, 8443])
+            }],
+            &["/usr/bin/a", "/usr/bin/b"],
+        );
+
+        let result = merge_policy(
+            policy_with_rule("broad", broad),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "narrow".to_string(),
+                rule: rule_with_authorizations(
+                    "narrow",
+                    vec![NetworkEndpoint {
+                        protocol: "rest".to_string(),
+                        rules: vec![rest_rule("POST", "/y")],
+                        ..endpoint_with_ports("api.example.com", &[443])
+                    }],
+                    &["/usr/bin/a"],
+                ),
+            }],
+        )
+        .expect("a differently named narrow rule must land rather than be rejected");
+
+        let narrow = result
+            .policy
+            .network_policies
+            .get("narrow")
+            .expect("the requested key must be preserved when folding would widen");
+        assert_eq!(narrow.binaries.len(), 1);
+        assert_eq!(canonical_ports(&narrow.endpoints[0]), vec![443]);
+
+        // The broad rule keeps its own product: neither binary gains POST, and
+        // port 8443 is untouched.
+        let broad_after = &result.policy.network_policies["broad"];
+        assert_eq!(broad_after.endpoints[0].rules.len(), 1);
+        assert_eq!(canonical_ports(&broad_after.endpoints[0]), vec![443, 8443]);
+    }
+
+    /// The same conflict against the rule's own name is still an error: there
+    /// the operation chose the target, so the undeclared port is real.
+    #[test]
+    fn undeclared_port_conflict_still_fails_on_a_same_key_update() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                protocol: "rest".to_string(),
+                rules: vec![rest_rule("GET", "/x")],
+                ..endpoint_with_ports("api.example.com", &[443, 8443])
+            }],
+            &["/usr/bin/a"],
+        );
+
+        let error = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: rule_with_authorizations(
+                    "existing",
+                    vec![NetworkEndpoint {
+                        protocol: "rest".to_string(),
+                        rules: vec![rest_rule("POST", "/y")],
+                        ..endpoint_with_ports("api.example.com", &[443])
+                    }],
+                    &["/usr/bin/a"],
+                ),
+            }],
+        )
+        .expect_err("the operation named this rule, so the undeclared port stands");
+
+        assert!(matches!(
+            error,
+            PolicyMergeError::UndeclaredPortWouldChange { ports, .. } if ports == vec![8443]
+        ));
+    }
+
+    /// The supervisor resolves one L7 contract per host and port, so endpoints
+    /// there must agree on protocol as well as on MCP options. Mixing them would
+    /// let MCP traffic be inspected as REST, or the reverse, by match order.
+    #[test]
+    fn mixed_inspection_protocols_on_one_host_and_port_are_rejected() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![mcp_endpoint(
+                "svc.example.com",
+                &[443],
+                None,
+                None,
+                65536,
+                vec![mcp_tool_rule("tool")],
+            )],
+            &["/usr/bin/only"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                path: "/rest".to_string(),
+                protocol: "rest".to_string(),
+                rules: vec![rest_rule("GET", "/x")],
+                ..endpoint("svc.example.com", 443)
+            }],
+            &["/usr/bin/only"],
+        );
+
+        let error = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect_err("one host and port cannot be inspected as both MCP and REST");
+
+        assert!(matches!(
+            error,
+            PolicyMergeError::ConflictingInspectionContracts { .. }
+        ));
+    }
+
+    /// Endpoints agreeing on protocol are fine, so splitting one REST surface
+    /// across paths stays supported.
+    #[test]
+    fn same_protocol_on_one_host_and_port_across_paths_is_accepted() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                path: "/v1".to_string(),
+                protocol: "rest".to_string(),
+                rules: vec![rest_rule("GET", "/x")],
+                ..endpoint("api.example.com", 443)
+            }],
+            &["/usr/bin/only"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                path: "/v2".to_string(),
+                protocol: "rest".to_string(),
+                rules: vec![rest_rule("GET", "/y")],
+                ..endpoint("api.example.com", 443)
+            }],
+            &["/usr/bin/only"],
+        );
+
+        merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("two REST endpoints resolve to the same inspection contract");
+    }
+
+    /// An uninspected L4 endpoint supplies no L7 configuration, so it never
+    /// competes with an inspected endpoint on the same host and port.
+    #[test]
+    fn an_l4_endpoint_does_not_conflict_with_an_inspected_one() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                protocol: "rest".to_string(),
+                rules: vec![rest_rule("GET", "/x")],
+                ..endpoint("api.example.com", 443)
+            }],
+            &["/usr/bin/only"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                path: "/raw".to_string(),
+                ..endpoint("api.example.com", 443)
+            }],
+            &["/usr/bin/only"],
+        );
+
+        merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("an endpoint with no protocol carries no inspection contract");
     }
 }
