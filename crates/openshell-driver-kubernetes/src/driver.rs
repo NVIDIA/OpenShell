@@ -2800,6 +2800,22 @@ fn supervisor_sidecar_container(
                 .into_iter()
                 .map(serde_json::Value::String),
         );
+    // In the CNI-sidecar topology there is no network-init container to copy the
+    // gateway client mTLS bundle into the shared TLS emptyDir, because CNI-sidecar
+    // omits network-init (the node CNI plugin programs egress redirection instead).
+    // Mount the client TLS secret directly at the client subdir so the network
+    // supervisor can authenticate to the gateway (policy fetch, callbacks). The
+    // secret volume is provisioned by the base template with fsGroup-readable mode.
+    if topology == SupervisorTopology::CniSidecar && !params.client_tls_secret_name.is_empty() {
+        container["volumeMounts"]
+            .as_array_mut()
+            .expect("volumeMounts is an array")
+            .push(serde_json::json!({
+                "name": CLIENT_TLS_VOLUME_NAME,
+                "mountPath": SIDECAR_CLIENT_TLS_MOUNT_PATH,
+                "readOnly": true
+            }));
+    }
     if !params.supervisor_image_pull_policy.is_empty() {
         container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
     }
@@ -3501,9 +3517,15 @@ fn sandbox_template_to_k8s_with_validated_config(
                 serde_json::Value::String(params.sandbox_id.to_string()),
             );
         }
+        // Annotate the UID the sidecar proxy actually runs as so the node CNI
+        // plugin exempts the right identity from egress redirection. In
+        // binary-aware mode the sidecar runs as UID 0 (see
+        // effective_sidecar_proxy_uid); annotating the raw params.proxy_uid
+        // (e.g. 1337) would make the CNI redirect the sidecar's own egress and
+        // block it from reaching the gateway.
         pod_annotations.insert(
             OPENSHELL_CNI_PROXY_UID_ANNOTATION.to_string(),
-            serde_json::Value::String(params.proxy_uid.to_string()),
+            serde_json::Value::String(effective_sidecar_proxy_uid(params).to_string()),
         );
         pod_annotations.insert(
             OPENSHELL_CNI_PROXY_PORT_ANNOTATION.to_string(),
@@ -6132,6 +6154,9 @@ mod tests {
             proxy_uid: 2200,
             sandbox_uid: 1500,
             sandbox_gid: 1500,
+            // Non-binary-aware: the sidecar runs as proxy_uid, so the CNI
+            // proxy-uid annotation should reflect that raw UID.
+            process_binary_aware_network_policy: false,
             ..SandboxPodParams::default()
         };
         let pod_template = sandbox_template_to_k8s(
@@ -6199,6 +6224,131 @@ mod tests {
         assert_eq!(
             rendered_env(sidecar, openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY),
             Some("cni-sidecar")
+        );
+    }
+
+    /// Regression test for the cni-sidecar proxy-uid annotation.
+    ///
+    /// In binary-aware mode the network sidecar runs as UID 0 (see
+    /// `effective_sidecar_proxy_uid`), not `params.proxy_uid`. The CNI proxy-uid
+    /// annotation tells the node plugin which UID to exempt from egress
+    /// redirection; annotating the raw `params.proxy_uid` would make the CNI
+    /// redirect the sidecar's own egress and block it from reaching the gateway.
+    /// The annotation must reflect the effective (runAsUser) UID.
+    #[test]
+    fn cni_sidecar_binary_aware_annotates_effective_proxy_uid() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::CniSidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::ImageVolume,
+            supervisor_image: "supervisor-image:latest",
+            grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
+            sandbox_id: "sb-cni-ba",
+            proxy_uid: 1337,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            process_binary_aware_network_policy: true,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        // The sidecar runs as UID 0 in binary-aware mode; the annotation must
+        // match so the node CNI exempts the sidecar's own egress.
+        let annotations = pod_template["metadata"]["annotations"].as_object().unwrap();
+        assert_eq!(
+            annotations[OPENSHELL_CNI_PROXY_UID_ANNOTATION],
+            serde_json::json!(BINARY_AWARE_SIDECAR_PROXY_UID.to_string())
+        );
+
+        let sidecar = pod_template["spec"]["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert_eq!(
+            sidecar["securityContext"]["runAsUser"],
+            serde_json::json!(BINARY_AWARE_SIDECAR_PROXY_UID)
+        );
+    }
+
+    /// Regression test for the cni-sidecar gateway client mTLS bundle.
+    ///
+    /// The cni-sidecar topology omits the network-init container (the node CNI
+    /// plugin programs egress redirection instead). In the standard sidecar
+    /// topology, network-init also copies the gateway client mTLS bundle into
+    /// the shared TLS emptyDir at `<proxy>/client`; dropping network-init would
+    /// otherwise leave that path empty, so the network supervisor cannot read
+    /// its client cert and crash-loops on policy fetch. cni-sidecar must instead
+    /// mount the client TLS secret directly onto the network sidecar so the
+    /// bundle is present at the path the sidecar env points at.
+    #[test]
+    fn cni_sidecar_topology_mounts_client_tls_on_network_sidecar() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::CniSidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::ImageVolume,
+            supervisor_image: "supervisor-image:latest",
+            grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
+            sandbox_id: "sb-cni-tls",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            client_tls_secret_name: "openshell-client-tls",
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        // The client TLS secret volume must be present in the pod spec.
+        let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
+        let client_tls_volume = volumes
+            .iter()
+            .find(|volume| volume["name"] == CLIENT_TLS_VOLUME_NAME)
+            .expect("client TLS secret volume must be provisioned");
+        assert_eq!(
+            client_tls_volume["secret"]["secretName"],
+            serde_json::json!("openshell-client-tls")
+        );
+
+        // The network sidecar must mount that secret at the client subdir the
+        // sidecar env points OPENSHELL_TLS_CA/CERT/KEY at, read-only.
+        let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        let sidecar = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        let mounts = sidecar["volumeMounts"].as_array().unwrap();
+        let client_tls_mount = mounts
+            .iter()
+            .find(|mount| mount["name"] == CLIENT_TLS_VOLUME_NAME)
+            .expect("network sidecar must mount the client TLS secret");
+        assert_eq!(
+            client_tls_mount["mountPath"],
+            serde_json::json!(SIDECAR_CLIENT_TLS_MOUNT_PATH)
+        );
+        assert_eq!(client_tls_mount["readOnly"], serde_json::json!(true));
+
+        // The sidecar env must reference that same mount path so the mount and
+        // the consuming paths stay in lockstep.
+        assert_eq!(
+            rendered_env(sidecar, "OPENSHELL_TLS_CA"),
+            Some(format!("{SIDECAR_CLIENT_TLS_MOUNT_PATH}/ca.crt").as_str())
         );
     }
 

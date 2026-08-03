@@ -122,11 +122,14 @@ a repository-only override uses the effective gateway image tag.
 
 {{/*
 CNI installer image reference. Defaults to the supervisor image because the
-supervisor image carries both openshell-sandbox and openshell-cni.
+supervisor image carries both openshell-sandbox and openshell-cni. The
+repository and tag fallbacks mirror openshell.supervisorImage so a
+gateway-only tag override (image.tag) keeps the CNI image in lockstep with
+the supervisor instead of silently pinning to the chart AppVersion.
 */}}
 {{- define "openshell.cniImage" -}}
-{{- $repository := .Values.cni.image.repository | default .Values.supervisor.image.repository -}}
-{{- $tag := .Values.cni.image.tag | default .Values.supervisor.image.tag | default .Chart.AppVersion -}}
+{{- $repository := .Values.cni.image.repository | default .Values.supervisor.image.repository | default (include "openshell.defaultSupervisorRepository" .) -}}
+{{- $tag := .Values.cni.image.tag | default .Values.supervisor.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
 {{- printf "%s:%s" $repository $tag }}
 {{- end }}
 
