@@ -242,12 +242,18 @@ network sidecar can resolve workload process and binary identity through
 `/proc/<entrypoint-pid>`.
 
 The cni-sidecar topology keeps the sidecar runtime model and its shared-state
-boundary, but removes the privileged `openshell-network-init` init container.
-Instead, the privileged OpenShell CNI DaemonSet installs the pod-network
-bypass-prevention rules during CNI `ADD` using nftables or iptables. The driver
-annotates sandbox pods so the chained CNI plugin can read the proxy UID and
-enforcement mode, and both the agent container and long-running network sidecar
-stay non-root with no added Linux capabilities.
+boundary, but removes the privileged `openshell-network-init` init container and
+its `NET_ADMIN`. Instead, the privileged OpenShell CNI DaemonSet installs the
+pod-network bypass-prevention rules during CNI `ADD` using nftables or iptables.
+The driver annotates sandbox pods so the chained CNI plugin can read the proxy
+UID and enforcement mode. The network sidecar keeps the same privilege profile
+as the other sidecar topologies: in the default binary-aware mode it runs as UID
+0 with `SYS_PTRACE` and `DAC_READ_SEARCH` (but no `NET_ADMIN`) to resolve
+cross-UID `/proc`, and only stays non-root with no added capabilities when
+`process_binary_aware_network_policy` is disabled. The agent container stays
+non-root with no added Linux capabilities in either mode. Because the node CNI —
+not an in-pod container — programs the firewall, no container in the sandbox pod
+holds `NET_ADMIN`.
 
 The CNI installer supports two modes. `conflist` (default) appends the
 `openshell-cni` plugin to an existing CNI `.conflist` (k3s / vanilla). On
@@ -255,6 +261,18 @@ OpenShift (Multus / OVN-Kubernetes) there is no appendable `.conflist`, so
 `multus-chain` writes a standalone plugin `.conf` into the Multus
 `vendor-cni-chain` auxiliary-chain directory and stores plugin credentials in a
 persistent `stateDir`. Neither mode modifies a CNO-managed file.
+
+The installer patches the chained plugin at startup and then re-verifies it on a
+reconcile tick, re-patching when the plugin is missing. This keeps enforcement in
+place across CNI config rewrites (for example a CNO reconcile) and DaemonSet
+restarts, bounding any such gap to one reconcile interval. It does not cover the
+cold-start scheduling race: a sandbox pod scheduled on a node before that node's
+CNI DaemonSet pod has completed its first patch is admitted with unrestricted
+egress, because the cni-sidecar topology deliberately omits the in-pod
+fail-closed network-init backstop. Closing that window requires gating sandbox
+scheduling on verified per-node CNI readiness (tracked as a follow-up); until
+then, operators should ensure the CNI DaemonSet is Ready on every node that can
+schedule sandbox pods before enabling the topology in production.
 
 On OpenShift, binary-aware network policy also requires a purpose-built
 SecurityContextConstraints for sandbox pods: the network sidecar runs as UID 0

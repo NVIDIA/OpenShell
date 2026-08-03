@@ -25,8 +25,12 @@ tests:
       - equal:
           path: kind
           value: StatefulSet
-      - equal:
+      # The component label must stay out of the immutable selector so existing
+      # releases can upgrade; it lives on the pod template instead.
+      - notExists:
           path: spec.selector.matchLabels["app.kubernetes.io/component"]
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/component"]
           value: gateway
 
   - it: treats a null workload map as the default StatefulSet
@@ -386,8 +390,12 @@ tests:
       - equal:
           path: spec.replicas
           value: 2
-      - equal:
+      # The component label must stay out of the immutable selector so existing
+      # releases can upgrade; it lives on the pod template instead.
+      - notExists:
           path: spec.selector.matchLabels["app.kubernetes.io/component"]
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/component"]
           value: gateway
       - equal:
           path: spec.template.spec.containers[0].name
