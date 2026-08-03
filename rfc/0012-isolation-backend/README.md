@@ -368,4 +368,4 @@ None.
 The claims this RFC makes about the current system, and the current-system
 context behind its design, are verified with file:line references in the
 supporting file [codebase-grounding.md](./codebase-grounding.md)
-(against `origin/main` at commit `a5161d0`, the RFC's parent).
+(against `origin/main` at commit `8eacb477`, post sidecar topology landing).
