@@ -5,7 +5,8 @@
 #   1. Find the latest upstream-style tag (vX.Y.Z, no -rhaiv suffix)
 #   2. If no vX.Y.Z-rhaiv.0 exists, create it
 #   3. If vX.Y.Z-rhaiv.N exists, create vX.Y.Z-rhaiv.(N+1)
-#   4. Skip if no new commits since the last -rhaiv.N tag
+#   4. Always create -rhaiv.0 for a new upstream tag (no diff check)
+#   5. Skip -rhaiv.N+1 only if no new commits since -rhaiv.N
 #
 # When upstream syncs a new vX.Y.Z, the next run creates -rhaiv.0 for it.
 
@@ -56,29 +57,28 @@ jobs:
 
           if [ -z "$latest_rhaiv" ]; then
             next="${latest_upstream}-rhaiv.0"
-            compare_ref="$latest_upstream"
-            echo "No existing rhaiv tags for $latest_upstream"
+            echo "No existing rhaiv tags for $latest_upstream -- creating initial -rhaiv.0"
           else
             current_n=$(echo "$latest_rhaiv" | grep -oP -- '-rhaiv\.\K[0-9]+')
             next_n=$((current_n + 1))
             next="${latest_upstream}-rhaiv.${next_n}"
-            compare_ref="$latest_rhaiv"
             echo "Latest rhaiv tag: $latest_rhaiv (N=$current_n)"
+
+            # Only skip on zero commits when bumping between rhaiv tags.
+            # The initial -rhaiv.0 is always created for a new upstream tag.
+            commit_count=$(git rev-list "${latest_rhaiv}..HEAD" --count)
+            echo "Commits since $latest_rhaiv: $commit_count"
+            if [ "$commit_count" -eq 0 ]; then
+              echo "No new commits since $latest_rhaiv -- skipping"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
 
           # Validate generated tag format
           if ! echo "$next" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+-rhaiv\.[0-9]+$'; then
             echo "::error::Generated tag '$next' has unexpected format"
             exit 1
-          fi
-
-          # Skip if no new commits since the last tag
-          commit_count=$(git rev-list "${compare_ref}..HEAD" --count)
-          echo "Commits since $compare_ref: $commit_count"
-          if [ "$commit_count" -eq 0 ]; then
-            echo "No new commits since $compare_ref -- skipping"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
           fi
 
           if git tag -l "$next" | grep -q .; then
