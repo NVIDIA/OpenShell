@@ -79,11 +79,6 @@ layer aligns the privilege boundary with how clusters are actually governed.
   default and the only topology that provides the full supervisor contract
   (filesystem policy, privilege drop, mount isolation).
 - **Non-Kubernetes drivers.** Docker, Podman, and VM drivers are unaffected.
-- **New CNI plugin behavior.** The `openshell-cni` plugin binary itself is
-  reused as-is; this RFC is about how it is installed and permitted, not what it
-  does during `ADD`.
-- **gVisor/Kata certification.** `cni-sidecar` is proposed as experimental with
-  those runtime classes as validation targets, not as a supported guarantee.
 
 ## Proposal
 

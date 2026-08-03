@@ -100,23 +100,41 @@ spec:
               EOF
               {{- if eq $mode "conflist" }}
               conf_dir="/host{{ .Values.cni.confDir }}"
+              resolve_conflist_target() {
               {{- if .Values.cni.configFile }}
-              target="${conf_dir}/{{ .Values.cni.configFile }}"
+                printf '%s' "${conf_dir}/{{ .Values.cni.configFile }}"
               {{- else }}
-              target="$(find "${conf_dir}" -maxdepth 1 -type f -name '*.conflist' ! -name '*openshell*' | sort | head -n 1)"
+                find "${conf_dir}" -maxdepth 1 -type f -name '*.conflist' ! -name '*openshell*' | sort | head -n 1
               {{- end }}
-              if [ -z "${target}" ] || [ ! -f "${target}" ]; then
-                echo "OpenShell CNI requires an existing CNI .conflist in ${conf_dir}" >&2
-                exit 1
-              fi
-              if [ ! -f "${target}.openshell-backup" ]; then
-                cp "${target}" "${target}.openshell-backup"
-              fi
-              tmp="$(mktemp "${conf_dir}/openshell-cni.XXXXXX")"
-              jq --slurpfile openshell "${plugin_config}" '
-                .plugins = ((.plugins // []) | map(select(.type != "openshell-cni")) + [$openshell[0]])
-              ' "${target}" > "${tmp}"
-              mv "${tmp}" "${target}"
+              }
+              patch_conflist() {
+                target="$(resolve_conflist_target)"
+                if [ -z "${target}" ] || [ ! -f "${target}" ]; then
+                  echo "OpenShell CNI requires an existing CNI .conflist in ${conf_dir}" >&2
+                  return 1
+                fi
+                if [ ! -f "${target}.openshell-backup" ]; then
+                  cp "${target}" "${target}.openshell-backup"
+                fi
+                tmp="$(mktemp "${conf_dir}/openshell-cni.XXXXXX")"
+                jq --slurpfile openshell "${plugin_config}" '
+                  .plugins = ((.plugins // []) | map(select(.type != "openshell-cni")) + [$openshell[0]])
+                ' "${target}" > "${tmp}"
+                mv "${tmp}" "${target}"
+              }
+              # Re-patch only when the chained plugin is absent, so a CNI config
+              # rewrite (CNO reconcile, node reimage) or a jq no-op cannot leave the
+              # node forwarding sandbox traffic without OpenShell egress enforcement.
+              ensure_conflist() {
+                target="$(resolve_conflist_target)"
+                if [ -n "${target}" ] && [ -f "${target}" ] \
+                  && jq -e 'any((.plugins // [])[]; .type == "openshell-cni")' "${target}" >/dev/null 2>&1; then
+                  return 0
+                fi
+                echo "OpenShell CNI re-patching ${target:-<none>}; chained plugin missing (CNI config rewrite or restart)" >&2
+                patch_conflist
+              }
+              patch_conflist || exit 1
               echo "OpenShell CNI installed (conflist mode); plugin log ${log_file}; firewall backend selected during CNI ADD"
               {{- else }}
               chain_dir="/host{{ .Values.cni.chainDir }}"
@@ -138,7 +156,9 @@ spec:
               while true; do
                 cp /var/run/secrets/kubernetes.io/serviceaccount/token "${token_file}"
                 chmod 0600 "${token_file}"
-                {{- if eq $mode "multus-chain" }}
+                {{- if eq $mode "conflist" }}
+                ensure_conflist || true
+                {{- else }}
                 [ -f "${chain_conf}" ] || write_chain_conf
                 {{- end }}
                 sleep 300

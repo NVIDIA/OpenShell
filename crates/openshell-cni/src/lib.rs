@@ -158,24 +158,58 @@ struct InstallReport {
     backend: &'static str,
 }
 
+/// CNI spec reserves error codes >= 100 for plugin-specific failures.
+const CNI_PLUGIN_ERROR_CODE: u32 = 100;
+
 pub fn run() -> Result<()> {
-    let mut input = String::new();
-    std::io::stdin()
-        .read_to_string(&mut input)
-        .into_diagnostic()?;
     let env = CniEnv::from_process();
-    let runtime = Runtime;
-    let output = match handle_command(&input, &env, &runtime, &runtime) {
-        Ok(output) => output,
+    let mut input = String::new();
+    let result = (|| -> Result<Option<Value>> {
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .into_diagnostic()
+            .wrap_err("failed to read CNI config from stdin")?;
+        let runtime = Runtime;
+        handle_command(&input, &env, &runtime, &runtime)
+    })();
+
+    match result {
+        Ok(output) => {
+            if let Some(output) = output {
+                println!("{}", serde_json::to_string(&output).into_diagnostic()?);
+            }
+            Ok(())
+        }
         Err(error) => {
             log_cni_error(&input, &env, &error);
-            return Err(error);
+            // Per the CNI spec a failing plugin must print a structured error object
+            // on stdout and exit non-zero; the runtime parses this to surface the
+            // failure instead of treating stderr text as an opaque crash.
+            emit_cni_error(&input, &error);
+            Err(error)
         }
-    };
-    if let Some(output) = output {
-        println!("{}", serde_json::to_string(&output).into_diagnostic()?);
     }
-    Ok(())
+}
+
+/// Builds the CNI-spec error object (`cniVersion`, `code`, `msg`, `details`). The
+/// version echoes the request when parseable so the runtime accepts the reply.
+fn cni_error_payload(input: &str, error: &miette::Report) -> Value {
+    let cni_version = serde_json::from_str::<CniConfig>(input)
+        .ok()
+        .and_then(|config| config.cni_version)
+        .unwrap_or_else(|| DEFAULT_CNI_VERSION.to_string());
+    serde_json::json!({
+        "cniVersion": cni_version,
+        "code": CNI_PLUGIN_ERROR_CODE,
+        "msg": "OpenShell CNI plugin error",
+        "details": one_line_error(error),
+    })
+}
+
+fn emit_cni_error(input: &str, error: &miette::Report) {
+    if let Ok(serialized) = serde_json::to_string(&cni_error_payload(input, error)) {
+        println!("{serialized}");
+    }
 }
 
 fn log_cni_error(input: &str, env: &CniEnv, error: &miette::Report) {
@@ -672,13 +706,22 @@ struct IptablesBackend {
 
 #[cfg(target_os = "linux")]
 fn install_iptables_rules(netns: &Path, proxy_uid: u32, backend: &IptablesBackend) -> Result<()> {
+    // Fail closed on IPv6 first: without ip6tables we cannot prove IPv6 egress is
+    // blocked, so a dual-stack sandbox could bypass policy over IPv6. Refuse before
+    // installing any rules rather than leaving IPv4-only enforcement in place. The
+    // preferred nft backend always programs both families in one ruleset; this path
+    // only runs when nft is unavailable.
+    let ipv6 = backend.ipv6.as_deref().ok_or_else(|| {
+        miette::miette!(
+            "ip6tables not found on node; OpenShell CNI requires it to enforce IPv6 egress in the iptables fallback (install ip6tables or nft)"
+        )
+    })?;
+
     cleanup_iptables_family(netns, &backend.ipv4);
     install_iptables_family(netns, &backend.ipv4, proxy_uid, "icmp-port-unreachable")?;
 
-    if let Some(ipv6) = backend.ipv6.as_deref() {
-        cleanup_iptables_family(netns, ipv6);
-        install_iptables_family(netns, ipv6, proxy_uid, "icmp6-port-unreachable")?;
-    }
+    cleanup_iptables_family(netns, ipv6);
+    install_iptables_family(netns, ipv6, proxy_uid, "icmp6-port-unreachable")?;
 
     Ok(())
 }
@@ -1084,5 +1127,27 @@ mod tests {
     #[test]
     fn nft_search_path_includes_k3s_aux_path() {
         assert!(NFT_SEARCH_PATHS.contains(&"/bin/aux/nft"));
+    }
+
+    #[test]
+    fn cni_error_payload_is_spec_compliant() {
+        let error = miette::miette!("boom failure");
+        let payload = cni_error_payload(&cni_input(), &error);
+        assert_eq!(payload["cniVersion"], "1.0.0");
+        assert_eq!(payload["code"], serde_json::json!(CNI_PLUGIN_ERROR_CODE));
+        assert_eq!(payload["msg"], "OpenShell CNI plugin error");
+        assert!(
+            payload["details"]
+                .as_str()
+                .unwrap()
+                .contains("boom failure")
+        );
+    }
+
+    #[test]
+    fn cni_error_payload_defaults_cni_version_on_unparseable_input() {
+        let error = miette::miette!("boom");
+        let payload = cni_error_payload("not valid json", &error);
+        assert_eq!(payload["cniVersion"], DEFAULT_CNI_VERSION);
     }
 }
