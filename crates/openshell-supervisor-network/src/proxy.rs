@@ -316,12 +316,12 @@ impl ProxyHandle {
                 }
             }
 
-            let mut consecutive_fd_errors: u32 = 0;
+            let mut consecutive_resource_errors: u32 = 0;
             let mut consecutive_unknown_errors: u32 = 0;
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
-                        consecutive_fd_errors = 0;
+                        consecutive_resource_errors = 0;
                         consecutive_unknown_errors = 0;
                         set_tcp_nodelay_best_effort(&stream);
                         let opa = opa_engine.clone();
@@ -376,7 +376,7 @@ impl ProxyHandle {
                     Err(err) => {
                         match classify_accept_error(
                             &err,
-                            &mut consecutive_fd_errors,
+                            &mut consecutive_resource_errors,
                             &mut consecutive_unknown_errors,
                         ) {
                             AcceptAction::Terminal => {
@@ -446,12 +446,9 @@ enum AcceptAction {
 
 fn classify_accept_error(
     err: &std::io::Error,
-    consecutive_fd_errors: &mut u32,
+    consecutive_resource_errors: &mut u32,
     consecutive_unknown_errors: &mut u32,
 ) -> AcceptAction {
-    // Terminal: the listener socket is permanently unusable; retrying will
-    // never succeed. EINVAL from accept() means the socket is no longer
-    // listening (shut down or corrupted).
     #[cfg(unix)]
     if matches!(
         err.raw_os_error(),
@@ -460,17 +457,66 @@ fn classify_accept_error(
         return AcceptAction::Terminal;
     }
 
-    // FD exhaustion: process or system FD table is full.
     #[cfg(unix)]
-    if matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
+    if matches!(
+        err.raw_os_error(),
+        Some(
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::ECONNABORTED
+                | libc::ECONNRESET
+                | libc::EINTR
+                | libc::ENETDOWN
+                | libc::EPROTO
+                | libc::ENOPROTOOPT
+                | libc::EHOSTDOWN
+                | libc::EHOSTUNREACH
+                | libc::EOPNOTSUPP
+                | libc::ENETUNREACH
+                | libc::ENOSR
+                | libc::ESOCKTNOSUPPORT
+                | libc::EPROTONOSUPPORT
+                | libc::ETIMEDOUT
+        )
+    ) {
         *consecutive_unknown_errors = 0;
-        *consecutive_fd_errors = consecutive_fd_errors.saturating_add(1);
-        let backoff_ms = 100u64
-            .saturating_mul(1u64 << (*consecutive_fd_errors).min(7).saturating_sub(1))
-            .min(5_000);
+
+        #[cfg(unix)]
+        let is_resource_pressure = matches!(
+            err.raw_os_error(),
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::ENOSR)
+        );
+        #[cfg(not(unix))]
+        let is_resource_pressure = false;
+
+        if is_resource_pressure {
+            *consecutive_resource_errors = consecutive_resource_errors.saturating_add(1);
+            let backoff_ms = 100u64
+                .saturating_mul(1u64 << (*consecutive_resource_errors).min(7).saturating_sub(1))
+                .min(5_000);
+            return AcceptAction::Retry {
+                backoff: std::time::Duration::from_millis(backoff_ms),
+                severity: SeverityId::Medium,
+            };
+        }
+
+        *consecutive_resource_errors = 0;
         return AcceptAction::Retry {
-            backoff: std::time::Duration::from_millis(backoff_ms),
-            severity: SeverityId::Medium,
+            backoff: std::time::Duration::from_millis(100),
+            severity: SeverityId::Low,
+        };
+    }
+
+    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    if matches!(err.raw_os_error(), Some(libc::ENONET)) {
+        *consecutive_unknown_errors = 0;
+        *consecutive_resource_errors = 0;
+        return AcceptAction::Retry {
+            backoff: std::time::Duration::from_millis(100),
+            severity: SeverityId::Low,
         };
     }
 
@@ -10373,29 +10419,60 @@ network_policies:
 
     #[cfg(unix)]
     #[test]
-    fn test_classify_fd_exhaustion_and_terminal_are_disjoint() {
-        let mut fd = 0;
+    fn test_classify_transient_and_terminal_are_disjoint() {
+        let mut res = 0;
         let mut unk = 0;
 
-        for errno in [libc::EMFILE, libc::ENFILE] {
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::ECONNABORTED,
+            libc::ECONNRESET,
+            libc::EINTR,
+            libc::ENETDOWN,
+            libc::EHOSTDOWN,
+            libc::EHOSTUNREACH,
+            libc::EOPNOTSUPP,
+            libc::ENETUNREACH,
+            libc::ENOSR,
+            libc::ETIMEDOUT,
+        ] {
             let err = std::io::Error::from_raw_os_error(errno);
             assert!(
                 matches!(
-                    classify_accept_error(&err, &mut fd, &mut unk),
+                    classify_accept_error(&err, &mut res, &mut unk),
                     AcceptAction::Retry { .. }
                 ),
                 "errno {errno} should be Retry",
             );
-            fd = 0;
+            res = 0;
             unk = 0;
         }
 
         for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
             let err = std::io::Error::from_raw_os_error(errno);
             assert_eq!(
-                classify_accept_error(&err, &mut fd, &mut unk),
+                classify_accept_error(&err, &mut res, &mut unk),
                 AcceptAction::Terminal,
                 "errno {errno} should be Terminal",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_transient_errors_never_hit_unknown_budget() {
+        let mut res = 0;
+        let mut unk = 0;
+        let err = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
+
+        for i in 0..(MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS + 5) {
+            let action = classify_accept_error(&err, &mut res, &mut unk);
+            assert!(
+                matches!(action, AcceptAction::Retry { .. }),
+                "transient error on call {i} should always Retry, got {action:?}",
             );
         }
     }
