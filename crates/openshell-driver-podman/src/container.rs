@@ -54,6 +54,9 @@ const VOLUME_PREFIX: &str = "openshell-sandbox-";
 /// Secret name prefix for per-sandbox gateway JWTs.
 const TOKEN_SECRET_PREFIX: &str = "openshell-token-";
 const PROXY_AUTH_SECRET_PREFIX: &str = "openshell-proxy-auth-";
+const TLS_CA_SECRET_PREFIX: &str = "openshell-tls-ca-";
+const TLS_CERT_SECRET_PREFIX: &str = "openshell-tls-cert-";
+const TLS_KEY_SECRET_PREFIX: &str = "openshell-tls-key-";
 
 /// Container-side mount paths for client TLS materials and the sandbox token.
 const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
@@ -171,6 +174,16 @@ pub fn proxy_auth_secret_name(sandbox_id: &str) -> String {
     format!("{PROXY_AUTH_SECRET_PREFIX}{sandbox_id}")
 }
 
+/// Build per-sandbox Podman secret names for TLS CA, cert, and key.
+#[must_use]
+pub fn tls_secret_names(sandbox_id: &str) -> [String; 3] {
+    [
+        format!("{TLS_CA_SECRET_PREFIX}{sandbox_id}"),
+        format!("{TLS_CERT_SECRET_PREFIX}{sandbox_id}"),
+        format!("{TLS_KEY_SECRET_PREFIX}{sandbox_id}"),
+    ]
+}
+
 /// Truncate a container ID to 12 characters (standard short form).
 #[must_use]
 pub fn short_id(id: &str) -> String {
@@ -229,6 +242,13 @@ struct ContainerSpec {
     /// Port mappings from host to container. Using `host_port=0` requests an
     /// ephemeral port, readable back from the inspect response.
     portmappings: Vec<PortMapping>,
+    /// User namespace mode override (e.g. `auto`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    userns: Option<UserNS>,
+    /// UID/GID mapping options. Required for `userns = "auto"` — the Podman
+    /// API needs `AutoUserNs: true` alongside the namespace mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idmappings: Option<IDMappings>,
 }
 
 /// A port mapping entry for the libpod `SpecGenerator`.
@@ -326,6 +346,49 @@ struct MemoryLimits {
 #[derive(Serialize)]
 struct NetNS {
     nsmode: String,
+}
+
+#[derive(Serialize)]
+struct UserNS {
+    nsmode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+}
+
+#[derive(Serialize)]
+struct IDMap {
+    container_id: u32,
+    host_id: u32,
+    size: u32,
+}
+
+#[derive(Serialize)]
+struct IDMappings {
+    #[serde(rename = "HostUIDMapping")]
+    host_uid_mapping: bool,
+    #[serde(rename = "HostGIDMapping")]
+    host_gid_mapping: bool,
+    #[serde(rename = "AutoUserNs")]
+    auto_user_ns: bool,
+    #[serde(rename = "UIDMap", skip_serializing_if = "Vec::is_empty")]
+    uid_map: Vec<IDMap>,
+    #[serde(rename = "GIDMap", skip_serializing_if = "Vec::is_empty")]
+    gid_map: Vec<IDMap>,
+}
+
+fn parse_id_maps(entries: &[String]) -> Result<Vec<IDMap>, ComputeDriverError> {
+    entries
+        .iter()
+        .map(|entry| {
+            let (cid, hid, size) = crate::config::parse_id_map_entry("idmap", entry)
+                .map_err(|err| ComputeDriverError::Precondition(err.to_string()))?;
+            Ok(IDMap {
+                container_id: cid,
+                host_id: hid,
+                size,
+            })
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -910,9 +973,12 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         image,
         image,
         "",
+        None,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_container_spec_for_image(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
@@ -921,6 +987,8 @@ pub fn build_container_spec_for_image(
     requested_image: &str,
     image_id: &str,
     oci_user: &str,
+    supervisor_bin_path: Option<&Path>,
+    tls_secret_names: Option<&[String; 3]>,
 ) -> Result<Value, ComputeDriverError> {
     let name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     let vol = volume_name(&sandbox.id);
@@ -962,11 +1030,15 @@ pub fn build_container_spec_for_image(
     }];
     volumes.extend(user_mounts.volumes);
 
-    let mut image_volumes = vec![ImageVolume {
-        source: config.supervisor_image.clone(),
-        destination: SUPERVISOR_MOUNT_DIR.into(),
-        rw: false,
-    }];
+    let mut image_volumes = if supervisor_bin_path.is_some() {
+        Vec::new()
+    } else {
+        vec![ImageVolume {
+            source: config.supervisor_image.clone(),
+            destination: SUPERVISOR_MOUNT_DIR.into(),
+            rw: false,
+        }]
+    };
     image_volumes.extend(user_mounts.image_volumes);
     let mut command = vec![
         "--workdir".to_string(),
@@ -1116,6 +1188,29 @@ pub fn build_container_spec_for_image(
                     mode: 0o400,
                 });
             }
+            if let Some([ca, cert, key]) = tls_secret_names {
+                secrets.push(SecretMount {
+                    source: ca.clone(),
+                    target: TLS_CA_MOUNT_PATH.into(),
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o400,
+                });
+                secrets.push(SecretMount {
+                    source: cert.clone(),
+                    target: TLS_CERT_MOUNT_PATH.into(),
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o400,
+                });
+                secrets.push(SecretMount {
+                    source: key.clone(),
+                    target: TLS_KEY_MOUNT_PATH.into(),
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o400,
+                });
+            }
             secrets
         },
         stop_timeout: config.stop_timeout_secs,
@@ -1141,20 +1236,20 @@ pub fn build_container_spec_for_image(
                 destination: openshell_core::container_paths::NETNS_MOUNT_ROOT.into(),
                 options: vec!["rw".into(), "nosuid".into(), "nodev".into()],
             }];
-            // Bind-mount client TLS materials into the container when mTLS
-            // is enabled. The supervisor reads these via OPENSHELL_TLS_CA,
-            // OPENSHELL_TLS_CERT, and OPENSHELL_TLS_KEY env vars (set in
-            // build_env above) to establish an mTLS connection back to the
-            // gateway.
-            if let (Some(ca), Some(cert), Some(key)) = (
-                &config.guest_tls_ca,
-                &config.guest_tls_cert,
-                &config.guest_tls_key,
-            ) {
+            // Deliver client TLS materials into the container when mTLS is
+            // enabled. When userns remaps UIDs (auto, no-map), bind-mounted
+            // host files are unreadable because the container root maps to a
+            // different host UID. In that case TLS materials are delivered as
+            // Podman secrets (handled in the `secrets` block above); otherwise
+            // use bind mounts.
+            if tls_secret_names.is_none()
+                && let (Some(ca), Some(cert), Some(key)) = (
+                    &config.guest_tls_ca,
+                    &config.guest_tls_cert,
+                    &config.guest_tls_key,
+                )
+            {
                 let mut ro = vec!["ro".into(), "rbind".into()];
-                // On SELinux-enabled systems (Fedora, RHEL), bind-mounted
-                // files need the shared relabel option so the container
-                // process can read them through the SELinux MAC policy.
                 if is_selinux_enabled() {
                     ro.push("z".into());
                 }
@@ -1177,6 +1272,18 @@ pub fn build_container_spec_for_image(
                     options: ro,
                 });
             }
+            if let Some(bin_path) = supervisor_bin_path {
+                let mut opts = vec!["ro".into(), "rbind".into()];
+                if is_selinux_enabled() {
+                    opts.push("z".into());
+                }
+                m.push(Mount {
+                    kind: "bind".into(),
+                    source: bin_path.display().to_string(),
+                    destination: SUPERVISOR_BINARY_PATH.into(),
+                    options: opts,
+                });
+            }
             m.extend(user_mounts.mounts);
             m
         },
@@ -1188,6 +1295,36 @@ pub fn build_container_spec_for_image(
             container_port: openshell_core::config::DEFAULT_SSH_PORT,
             protocol: "tcp".into(),
         }],
+        userns: config.userns.as_deref().map(|raw| {
+            let (base, params) = raw
+                .split_once(':')
+                .map_or((raw, None), |(b, p)| (b, Some(p)));
+            UserNS {
+                nsmode: base.to_string(),
+                value: params.map(ToString::to_string),
+            }
+        }),
+        idmappings: match config
+            .userns
+            .as_deref()
+            .map(|m| m.split(':').next().unwrap_or(m))
+        {
+            Some("auto") => Some(IDMappings {
+                host_uid_mapping: false,
+                host_gid_mapping: false,
+                auto_user_ns: true,
+                uid_map: Vec::new(),
+                gid_map: Vec::new(),
+            }),
+            Some("private") => Some(IDMappings {
+                host_uid_mapping: false,
+                host_gid_mapping: false,
+                auto_user_ns: false,
+                uid_map: parse_id_maps(&config.uidmap)?,
+                gid_map: parse_id_maps(&config.gidmap)?,
+            }),
+            _ => None,
+        },
     };
 
     Ok(serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail"))
@@ -1390,6 +1527,8 @@ mod tests {
             "registry.example/app:latest",
             "sha256:immutable",
             "app:staff",
+            None,
+            None,
         )
         .unwrap();
 
@@ -2809,5 +2948,206 @@ mod tests {
             .filter(|m| m["type"].as_str() == Some("bind"))
             .count();
         assert_eq!(bind_count, 0, "no bind mounts without TLS config");
+    }
+
+    #[test]
+    fn container_spec_includes_userns_when_configured() {
+        let sandbox = test_sandbox("userns-id", "userns-name");
+        let mut config = test_config();
+        config.userns = Some("auto".to_string());
+        let spec = build_container_spec(&sandbox, &config);
+
+        let userns = &spec["userns"];
+        assert_eq!(userns["nsmode"].as_str(), Some("auto"));
+        assert!(userns.get("value").is_none(), "bare auto should omit value");
+
+        let idmappings = &spec["idmappings"];
+        assert_eq!(
+            idmappings["AutoUserNs"].as_bool(),
+            Some(true),
+            "idmappings.AutoUserNs must be true for userns=auto"
+        );
+    }
+
+    #[test]
+    fn container_spec_auto_with_params() {
+        let sandbox = test_sandbox("userns-auto-params-id", "userns-auto-params-name");
+        let mut config = test_config();
+        config.userns = Some("auto:size=65536".to_string());
+        let spec = build_container_spec(&sandbox, &config);
+
+        let userns = &spec["userns"];
+        assert_eq!(userns["nsmode"].as_str(), Some("auto"));
+        assert_eq!(userns["value"].as_str(), Some("size=65536"));
+
+        assert_eq!(
+            spec["idmappings"]["AutoUserNs"].as_bool(),
+            Some(true),
+            "idmappings.AutoUserNs must be true for auto:size=65536"
+        );
+    }
+
+    #[test]
+    fn container_spec_keep_id_with_params() {
+        let sandbox = test_sandbox("userns-keepid-id", "userns-keepid-name");
+        let mut config = test_config();
+        config.userns = Some("keep-id:uid=1000,gid=1000".to_string());
+        let spec = build_container_spec(&sandbox, &config);
+
+        let userns = &spec["userns"];
+        assert_eq!(userns["nsmode"].as_str(), Some("keep-id"));
+        assert_eq!(userns["value"].as_str(), Some("uid=1000,gid=1000"));
+
+        assert!(
+            spec.get("idmappings").is_none(),
+            "idmappings should not be set for keep-id"
+        );
+    }
+
+    #[test]
+    fn container_spec_nomap_mode() {
+        let sandbox = test_sandbox("userns-nomap-id", "userns-nomap-name");
+        let mut config = test_config();
+        config.userns = Some("no-map".to_string());
+        let spec = build_container_spec(&sandbox, &config);
+
+        let userns = &spec["userns"];
+        assert_eq!(userns["nsmode"].as_str(), Some("no-map"));
+        assert!(userns.get("value").is_none(), "no-map should omit value");
+
+        assert!(
+            spec.get("idmappings").is_none(),
+            "idmappings should not be set for no-map"
+        );
+    }
+
+    #[test]
+    fn container_spec_private_with_mappings() {
+        let sandbox = test_sandbox("userns-private-id", "userns-private-name");
+        let mut config = test_config();
+        config.userns = Some("private".to_string());
+        config.uidmap = vec!["0:1000:1".to_string(), "1:100000:65536".to_string()];
+        config.gidmap = vec!["0:1000:1".to_string(), "1:100000:65536".to_string()];
+        let spec = build_container_spec(&sandbox, &config);
+
+        let userns = &spec["userns"];
+        assert_eq!(userns["nsmode"].as_str(), Some("private"));
+        assert!(userns.get("value").is_none(), "private should omit value");
+
+        let idmappings = &spec["idmappings"];
+        assert_eq!(
+            idmappings["AutoUserNs"].as_bool(),
+            Some(false),
+            "AutoUserNs must be false for private mode"
+        );
+
+        let uid_map = idmappings["UIDMap"]
+            .as_array()
+            .expect("UIDMap should be an array");
+        assert_eq!(uid_map.len(), 2);
+        assert_eq!(uid_map[0]["container_id"].as_u64(), Some(0));
+        assert_eq!(uid_map[0]["host_id"].as_u64(), Some(1000));
+        assert_eq!(uid_map[0]["size"].as_u64(), Some(1));
+        assert_eq!(uid_map[1]["container_id"].as_u64(), Some(1));
+        assert_eq!(uid_map[1]["host_id"].as_u64(), Some(100_000));
+        assert_eq!(uid_map[1]["size"].as_u64(), Some(65536));
+
+        let gid_map = idmappings["GIDMap"]
+            .as_array()
+            .expect("GIDMap should be an array");
+        assert_eq!(gid_map.len(), 2);
+        assert_eq!(gid_map[0]["container_id"].as_u64(), Some(0));
+        assert_eq!(gid_map[0]["host_id"].as_u64(), Some(1000));
+        assert_eq!(gid_map[0]["size"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn container_spec_omits_userns_when_unset() {
+        let sandbox = test_sandbox("no-userns-id", "no-userns-name");
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert!(
+            spec.get("userns").is_none(),
+            "userns should not be set when unconfigured"
+        );
+        assert!(
+            spec.get("idmappings").is_none(),
+            "idmappings should not be set when userns is unconfigured"
+        );
+    }
+
+    #[test]
+    fn container_spec_uses_bind_mount_for_supervisor_when_path_provided() {
+        let sandbox = test_sandbox("bind-sv-id", "bind-sv-name");
+        let config = test_config();
+        let image = resolve_image(&sandbox, &config);
+        let spec = build_container_spec_for_image(
+            &sandbox,
+            &config,
+            None,
+            None,
+            image,
+            image,
+            "",
+            Some(Path::new("/host/cache/openshell-sandbox")),
+            None,
+        )
+        .unwrap();
+
+        let image_volumes = spec["image_volumes"]
+            .as_array()
+            .expect("image_volumes should be an array");
+        assert!(
+            !image_volumes
+                .iter()
+                .any(|v| v["destination"].as_str() == Some(SUPERVISOR_MOUNT_DIR)),
+            "supervisor image volume should not be present when bind path is provided"
+        );
+
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        let sv_bind = mounts
+            .iter()
+            .find(|m| m["destination"].as_str() == Some(SUPERVISOR_BINARY_PATH));
+        assert!(
+            sv_bind.is_some(),
+            "supervisor bind mount should be present at {SUPERVISOR_BINARY_PATH}"
+        );
+        let sv_bind = sv_bind.unwrap();
+        assert_eq!(
+            sv_bind["source"].as_str(),
+            Some("/host/cache/openshell-sandbox")
+        );
+        assert_eq!(sv_bind["type"].as_str(), Some("bind"));
+    }
+
+    #[test]
+    fn container_spec_uses_image_volume_when_no_bind_path() {
+        let sandbox = test_sandbox("imgvol-id", "imgvol-name");
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let image_volumes = spec["image_volumes"]
+            .as_array()
+            .expect("image_volumes should be an array");
+        assert!(
+            image_volumes
+                .iter()
+                .any(|v| v["destination"].as_str() == Some(SUPERVISOR_MOUNT_DIR)),
+            "supervisor image volume should be present by default"
+        );
+
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        assert!(
+            !mounts.iter().any(
+                |m| m["destination"].as_str() == Some(SUPERVISOR_BINARY_PATH)
+                    && m["type"].as_str() == Some("bind")
+            ),
+            "supervisor bind mount should not be present by default"
+        );
     }
 }

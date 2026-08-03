@@ -369,6 +369,7 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_SANDBOX_PROXY_AUTH_FILE` | `--sandbox-proxy-auth-file` | unset | Path to a file containing the proxy credentials as `user:pass`. Staged as a root-only Podman secret so credentials never appear in config or container metadata. Requires the insecure-auth acknowledgement below. |
 | `OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE` | `--sandbox-proxy-auth-allow-insecure` | unset | Explicit acknowledgement (`true`) that the credential is sent as cleartext Basic auth over the plain-TCP connection to the `http://` proxy. Required when the auth file is set; rejected when it is not. |
 | `OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME` | `--sandbox-proxy-connect-by-hostname` | unset | Send the destination hostname in CONNECT requests instead of a validated IP. Last resort for proxies whose ACLs filter on hostnames: the proxy then resolves the name itself, so sandbox SSRF/`allowed_ips` validation no longer binds the connection. |
+| `OPENSHELL_PODMAN_USERNS` | `--userns` | unset | User namespace mode for sandbox containers (e.g. `auto`). When unset, containers use the default user namespace. |
 
 Through the gateway, the same settings are the `https_proxy`, `no_proxy`,
 `proxy_auth_file`, `proxy_auth_allow_insecure`, and
