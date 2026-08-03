@@ -33,6 +33,12 @@ export interface ConnectOptions {
   edgeToken?: string;
   /** Disable TLS verification (dev/debug only). */
   insecureSkipVerify?: boolean;
+  /**
+   * Permit sending an auth token (oidcToken/edgeToken) over plaintext `http://`
+   * to a non-loopback host. Off by default: tokens over cleartext to a remote
+   * host leak credentials on the wire. Loopback hosts are always allowed.
+   */
+  allowInsecureAuth?: boolean;
 }
 
 // OIDC bearer takes precedence; otherwise attach the Cloudflare Access header +
@@ -61,8 +67,46 @@ function assertMtlsPair(opts: ConnectOptions): void {
   }
 }
 
+// oidcToken and edgeToken are documented as mutually exclusive; the interceptor
+// silently prefers OIDC when both are set. Reject that ambiguity up front so a
+// caller does not think an edge token is in effect when it is being ignored.
+function assertTokenExclusivity(opts: ConnectOptions): void {
+  if (opts.oidcToken !== undefined && opts.edgeToken !== undefined) {
+    throw new SdkError('invalid_config', 'oidcToken and edgeToken are mutually exclusive');
+  }
+}
+
+function isLoopbackHost(host: string): boolean {
+  // URL.hostname keeps the brackets on IPv6 literals (e.g. `[::1]`); strip them.
+  const h = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+  if (h === 'localhost' || h === '::1') return true;
+  return /^127(?:\.\d{1,3}){3}$/.test(h);
+}
+
+// Attaching a bearer/CF token to a plaintext `http://` request to a non-loopback
+// host puts the credential on the wire in the clear. Refuse it unless the caller
+// explicitly opts in. Loopback (local-dev / edge-sidecar) is always fine.
+function assertTokenTransportSecurity(opts: ConnectOptions): void {
+  const hasToken = opts.oidcToken !== undefined || opts.edgeToken !== undefined;
+  if (!hasToken || opts.allowInsecureAuth || opts.gateway.startsWith('https://')) return;
+  let host: string;
+  try {
+    host = new URL(opts.gateway).hostname;
+  } catch {
+    return; // A malformed gateway URL surfaces from the transport itself.
+  }
+  if (!isLoopbackHost(host)) {
+    throw new SdkError(
+      'invalid_config',
+      `refusing to send an auth token over plaintext http:// to non-loopback host '${host}'; use https:// or set allowInsecureAuth`,
+    );
+  }
+}
+
 export function buildTransport(opts: ConnectOptions): Transport {
   assertMtlsPair(opts);
+  assertTokenExclusivity(opts);
+  assertTokenTransportSecurity(opts);
   const isTls = opts.gateway.startsWith('https://');
   return createGrpcTransport({
     baseUrl: opts.gateway,

@@ -364,7 +364,19 @@ function updateConfigResult(resp: UpdateConfigResponse): UpdateConfigResult {
 // current version, backward-compatible). A mismatch surfaces as Aborted →
 // SdkError code 'aborted'.
 function versionPin(value: string | undefined): bigint {
-  return value ? BigInt(value) : 0n;
+  if (!value) return 0n;
+  let pin: bigint;
+  try {
+    pin = BigInt(value);
+  } catch {
+    // BigInt() throws a raw SyntaxError on non-integer input; keep the SdkError
+    // taxonomy intact so callers' errorCode() checks still match.
+    throw new SdkError('invalid_config', `expectedResourceVersion is not a u64: '${value}'`);
+  }
+  if (pin < 0n) {
+    throw new SdkError('invalid_config', `expectedResourceVersion is not a u64: '${value}'`);
+  }
+  return pin;
 }
 
 const FORWARD_CHUNK = 64 * 1024;
@@ -729,6 +741,23 @@ export class SandboxClient {
       resolveDone = resolve;
       rejectDone = reject;
     });
+    // `done` may settle before (or without) anyone awaiting it. A lone handler
+    // keeps an unobserved rejection from surfacing as an unhandledRejection;
+    // real awaiters still receive it through their own handler.
+    void done.catch(() => {});
+    // Settle exactly once. The exit code wins; error/abandonment only apply
+    // when no exit was observed.
+    let settled = false;
+    const settleExit = (code: number): void => {
+      if (settled) return;
+      settled = true;
+      resolveDone(code);
+    };
+    const settleError = (err: unknown): void => {
+      if (settled) return;
+      settled = true;
+      rejectDone(err);
+    };
 
     async function* output(): AsyncGenerator<ExecStreamEvent, void, void> {
       let sawExit = false;
@@ -749,8 +778,11 @@ export class SandboxClient {
               break;
             case 'exit':
               sawExit = true;
+              // Settle `done` before yielding: a consumer that breaks on the
+              // exit event abandons the generator at the yield, so anything
+              // after it would never run.
+              settleExit(event.payload.value.exitCode);
               yield { type: 'exit', exitCode: event.payload.value.exitCode };
-              resolveDone(event.payload.value.exitCode);
               break;
           }
         }
@@ -759,10 +791,13 @@ export class SandboxClient {
         }
       } catch (e) {
         const err = e instanceof SdkError ? e : fromConnect(e);
-        rejectDone(err);
+        settleError(err);
         throw err;
       } finally {
         input.end();
+        // Consumer abandoned the stream before an exit event (early break or
+        // return): settle `done` so it can never hang.
+        settleError(new SdkError('rpc', 'exec output abandoned before exit'));
       }
     }
 
@@ -807,6 +842,11 @@ export class SandboxClient {
     const server = net.createServer((socket) => {
       sockets.add(socket);
       socket.on('close', () => sockets.delete(socket));
+      // Guard the window before forwardConnection attaches its own handlers
+      // (it first awaits createSshSession). Without a synchronous 'error'
+      // listener a peer reset here emits an unhandled 'error' and crashes the
+      // process; forwardConnection's catch still tears the socket down.
+      socket.on('error', () => {});
       void this.forwardConnection(socket, sandboxId, name, targetHost, targetPort);
     });
 

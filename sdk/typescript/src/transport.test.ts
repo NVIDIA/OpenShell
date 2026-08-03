@@ -51,3 +51,45 @@ describe('buildTransport mTLS pairing', () => {
     expect(transport).toBeTruthy();
   });
 });
+
+describe('buildTransport token exclusivity', () => {
+  it('throws when both oidcToken and edgeToken are set', () => {
+    const fn = () => buildTransport({ gateway: 'https://gw.local', oidcToken: 'a', edgeToken: 'b' });
+    expect(fn).toThrow(/mutually exclusive/);
+    try {
+      fn();
+    } catch (e) {
+      expect(errorCode(e)).toBe('invalid_config');
+    }
+  });
+});
+
+describe('buildTransport plaintext auth guard', () => {
+  it('rejects a token over http:// to a non-loopback host', () => {
+    const fn = () => buildTransport({ gateway: 'http://gw.remote:8080', oidcToken: 'a' });
+    expect(fn).toThrow(/non-loopback/);
+    try {
+      fn();
+    } catch (e) {
+      expect(errorCode(e)).toBe('invalid_config');
+    }
+  });
+
+  it('allows a token over http:// to loopback hosts', () => {
+    expect(buildTransport({ gateway: 'http://127.0.0.1:8080', oidcToken: 'a' })).toBeTruthy();
+    expect(buildTransport({ gateway: 'http://[::1]:8080', edgeToken: 'a' })).toBeTruthy();
+    expect(buildTransport({ gateway: 'http://localhost:8080', oidcToken: 'a' })).toBeTruthy();
+  });
+
+  it('allows a token over http:// to a remote host when allowInsecureAuth is set', () => {
+    expect(buildTransport({ gateway: 'http://gw.remote:8080', oidcToken: 'a', allowInsecureAuth: true })).toBeTruthy();
+  });
+
+  it('allows a token over https:// to any host', () => {
+    expect(buildTransport({ gateway: 'https://gw.remote', oidcToken: 'a' })).toBeTruthy();
+  });
+
+  it('allows a tokenless http:// gateway to any host', () => {
+    expect(buildTransport({ gateway: 'http://gw.remote:8080' })).toBeTruthy();
+  });
+});
