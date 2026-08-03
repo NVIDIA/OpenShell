@@ -1418,6 +1418,7 @@ mod tests {
         assert!(err.to_string().contains("slirp4netns"));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn constructor_preserves_required_network_gateway_discovery_error() {
         let (socket_path, _request_log, handle) = spawn_podman_stub(
