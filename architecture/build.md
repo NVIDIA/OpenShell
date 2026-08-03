@@ -154,15 +154,16 @@ for explicit publication.
 
 ## Python Wheel Packaging
 
-The generated protobuf/gRPC stubs under `python/openshell/_proto/` are gitignored
-build outputs of `mise run python:proto`. The task uses `uv run --frozen` to
-synchronize the current worktree's `.venv` from `uv.lock` before generation.
-maturin honors `.gitignore` when collecting `python-source` files, so native
-builds (Linux CI, local `pip install .`) would drop them and ship an unimportable
-wheel. `pyproject.toml`
-pins them back in with `[tool.maturin].include` globs. The release workflows
-install each Linux wheel in a clean image and import `openshell.sandbox` as a
-smoke check.
+The generated protobuf/gRPC stubs under `python/openshell/_proto/` are committed
+to the repository so that standard PEP 517 build frontends (pip, build, fromager)
+can produce working wheels from the source tarball without replicating the mise
+task graph. After modifying any `.proto` file under `proto/`, regenerate the stubs
+with `mise run python:proto` and commit the result. The task uses
+`uv run --frozen` to pin `grpcio-tools` via `uv.lock`, so the output is
+deterministic regardless of the contributor's Python version. CI enforces
+freshness: `mise run python:proto:check` regenerates the stubs and fails if the
+working tree differs. The release workflows install each Linux wheel in a clean
+image and import `openshell.sandbox` as a smoke check.
 
 ## CI and E2E
 

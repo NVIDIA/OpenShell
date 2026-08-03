@@ -390,6 +390,22 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run helm:docs` | Regenerate the Helm chart README                        |
 | `mise run clean`     | Clean build artifacts                                   |
 
+### Protobuf Stubs
+
+The Python SDK depends on generated protobuf/gRPC stubs committed under
+`python/openshell/_proto/`. After changing any `.proto` file in `proto/`,
+regenerate the stubs and commit the result:
+
+```shell
+mise run python:proto
+git add python/openshell/_proto/
+```
+
+The generation output is deterministic across Python versions because
+`grpcio-tools` is pinned via `uv.lock`. CI runs `mise run python:proto:check`
+to reject PRs with stale stubs. The local `mise run pre-commit` also catches
+this.
+
 ## Project Structure
 
 | Path            | Purpose                                       |
