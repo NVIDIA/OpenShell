@@ -1,0 +1,28 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+rust_library(
+    name = "openshell-sdk",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "openshell-sdk_test",
+    crate = ":openshell-sdk",
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test(
+    name = "client_mock_integration_test",
+    srcs = ["tests/client_mock.rs"],
+    aliases = aliases(),
+    crate_root = "tests/client_mock.rs",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + [":openshell-sdk"],
+)

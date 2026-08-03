@@ -15,14 +15,15 @@
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
   };
 
   outputs =
     {
       flake-utils,
       nixpkgs,
-      rust-overlay,
       treefmt-nix,
+      rust-overlay,
       ...
     }:
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (
@@ -32,11 +33,11 @@
           inherit system;
           overlays = [ (import rust-overlay) ];
         };
-        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";
           programs.nixfmt.enable = true;
         };
+        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         testGuest = import ./nix/test-guest { inherit pkgs; };
       in
       {
@@ -54,6 +55,11 @@
             llvmPackages.libclang
             # system dependency for openshell-prover
             z3
+            # Bazel 
+            bazel_9
+            buildifier
+            # Coverage
+            lcov
           ];
 
           env = {

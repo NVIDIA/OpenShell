@@ -1,0 +1,95 @@
+load("@bazel_lib//lib:transitions.bzl", "platform_transition_binary")
+
+platform(
+    name = "linux_x86_64_gnu_2_28",
+    constraint_values = [
+        "@llvm//constraints/cxxstdlib:libcxx",
+        "@llvm//constraints/libc:gnu.2.28",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+        "@rules_rs//rs/platforms/constraints:glibc",
+    ],
+)
+
+platform(
+    name = "linux_aarch64_gnu_2_28",
+    constraint_values = [
+        "@llvm//constraints/cxxstdlib:libcxx",
+        "@llvm//constraints/libc:gnu.2.28",
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+        "@rules_rs//rs/platforms/constraints:glibc",
+    ],
+)
+
+platform_transition_binary(
+    name = "openshell_linux_x86_64",
+    basename = "openshell",
+    binary = "//crates/openshell-cli:openshell",
+    tags = ["manual"],
+    target_platform = "@rules_rs//rs/platforms:x86_64-unknown-linux-musl",
+)
+
+platform_transition_binary(
+    name = "openshell_linux_aarch64",
+    basename = "openshell",
+    binary = "//crates/openshell-cli:openshell",
+    tags = ["manual"],
+    target_platform = "@rules_rs//rs/platforms:aarch64-unknown-linux-musl",
+)
+
+platform_transition_binary(
+    name = "openshell_sandbox_linux_x86_64",
+    basename = "openshell-sandbox",
+    binary = "//crates/openshell-sandbox:openshell-sandbox-bin",
+    tags = ["manual"],
+    target_platform = "@rules_rs//rs/platforms:x86_64-unknown-linux-musl",
+)
+
+platform_transition_binary(
+    name = "openshell_sandbox_linux_aarch64",
+    basename = "openshell-sandbox",
+    binary = "//crates/openshell-sandbox:openshell-sandbox-bin",
+    tags = ["manual"],
+    target_platform = "@rules_rs//rs/platforms:aarch64-unknown-linux-musl",
+)
+
+platform_transition_binary(
+    name = "openshell_gateway_linux_x86_64",
+    basename = "openshell-gateway",
+    binary = "//crates/openshell-server:openshell-gateway",
+    tags = ["manual"],
+    target_platform = ":linux_x86_64_gnu_2_28",
+)
+
+platform_transition_binary(
+    name = "openshell_gateway_linux_aarch64",
+    basename = "openshell-gateway",
+    binary = "//crates/openshell-server:openshell-gateway",
+    tags = ["manual"],
+    target_platform = ":linux_aarch64_gnu_2_28",
+)
+
+platform_transition_binary(
+    name = "openshell_macos_aarch64",
+    basename = "openshell",
+    binary = "//crates/openshell-cli:openshell",
+    tags = ["manual"],
+    target_platform = "@rules_rs//rs/platforms:aarch64-apple-darwin",
+)
+
+platform_transition_binary(
+    name = "openshell_sandbox_macos_aarch64",
+    basename = "openshell-sandbox",
+    binary = "//crates/openshell-sandbox:openshell-sandbox-bin",
+    tags = ["manual"],
+    target_platform = "@rules_rs//rs/platforms:aarch64-apple-darwin",
+)
+
+platform_transition_binary(
+    name = "openshell_gateway_macos_aarch64",
+    basename = "openshell-gateway",
+    binary = "//crates/openshell-server:openshell-gateway",
+    tags = ["manual"],
+    target_platform = "@rules_rs//rs/platforms:aarch64-apple-darwin",
+)

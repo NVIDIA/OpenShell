@@ -1,0 +1,59 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@workspace_version//:version.bzl", "WORKSPACE_VERSION")
+
+rust_library(
+    name = "openshell-sandbox",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    aliases = aliases(),
+    crate_features = ["telemetry"],
+    version = WORKSPACE_VERSION,
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "openshell-sandbox-bin",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    binary_name = "openshell-sandbox",
+    crate_name = "openshell_sandbox",
+    version = WORKSPACE_VERSION,
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True) + [":openshell-sandbox"],
+)
+
+rust_test(
+    name = "openshell-sandbox_lib_test",
+    crate = ":openshell-sandbox",
+    crate_features = ["telemetry"],
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test(
+    name = "openshell-sandbox_bin_test",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    version = WORKSPACE_VERSION,
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + [":openshell-sandbox"],
+)
+
+rust_test(
+    name = "stdout_logging_integration_test",
+    srcs = ["tests/stdout_logging.rs"],
+    aliases = aliases(),
+    crate_root = "tests/stdout_logging.rs",
+    data = [":openshell-sandbox-bin"],
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + [":openshell-sandbox"],
+)
