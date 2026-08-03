@@ -214,6 +214,41 @@ impl GuestInitDropin {
     }
 }
 
+/// A host PCI device to pass through to the guest via VFIO.
+///
+/// Generic and vendor-neutral: any lifecycle extension can add devices (a VF
+/// NIC, an accelerator, ...). The VM driver renders each as its own
+/// `pcie-root-port` + `vfio-pci` and forwards it to the launcher, so a sandbox
+/// can carry several passthrough devices at once (e.g. a GPU in
+/// [`LaunchPlan::gpu_bdf`] plus a VF NIC here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PciPassthroughDevice {
+    /// Host PCI address in `DDDD:BB:DD.F` form.
+    pub host_bdf: String,
+}
+
+impl PciPassthroughDevice {
+    #[must_use]
+    pub fn new(host_bdf: impl Into<String>) -> Self {
+        Self {
+            host_bdf: host_bdf.into(),
+        }
+    }
+}
+
+/// A host resource attached to the guest by a lifecycle extension.
+///
+/// Stored as an open, additive set in [`LaunchPlan::resources`] so new resource
+/// kinds (e.g. volume mounts) can be introduced as new variants without
+/// changing the [`LaunchPlan`] shape that other crates construct. Downstream
+/// consumers (backend resolution, QEMU rendering, cleanup) match on the kind,
+/// so adding a variant forces those sites to handle it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestResource {
+    /// A host PCI device passed through to the guest via VFIO.
+    PciPassthrough(PciPassthroughDevice),
+}
+
 #[derive(Debug, Clone)]
 pub struct LaunchPlan {
     pub backend: VmBackend,
@@ -232,9 +267,18 @@ pub struct LaunchPlan {
     pub gateway_port: Option<u16>,
     pub guest_init_dropins: Vec<GuestInitDropin>,
     pub env: Vec<String>,
+    pub resources: Vec<GuestResource>,
 }
 
 impl LaunchPlan {
+    /// Add a guest resource, de-duplicating identical entries so repeated
+    /// extension calls (configure + `before_launch`) stay idempotent.
+    pub fn add_resource(&mut self, resource: GuestResource) {
+        if !self.resources.contains(&resource) {
+            self.resources.push(resource);
+        }
+    }
+
     pub fn require_backend(&mut self, backend: VmBackend) {
         if !self.required_backends.contains(&backend) {
             self.required_backends.push(backend);
@@ -939,6 +983,7 @@ mod tests {
             gateway_port: None,
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
+            resources: Vec::new(),
         }
     }
 
