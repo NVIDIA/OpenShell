@@ -707,7 +707,7 @@ pub async fn run_sandbox(
     let proxy_exited: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(rx) = networking
         .as_mut()
         .and_then(|n| n.proxy.as_mut())
-        .map(|p| p.take_exit_receiver())
+        .and_then(|p| p.take_exit_receiver())
     {
         Box::pin(async {
             let _ = rx.await;
