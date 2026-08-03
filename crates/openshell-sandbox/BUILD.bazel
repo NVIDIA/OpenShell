@@ -30,6 +30,7 @@ rust_binary(
 
 rust_test(
     name = "openshell-sandbox_lib_test",
+    compile_data = ["//crates/openshell-supervisor-network:sandbox-policy-rego"],
     crate = ":openshell-sandbox",
     crate_features = ["telemetry"],
     deps = all_crate_deps(normal_dev = True),

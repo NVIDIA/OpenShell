@@ -2,6 +2,12 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
 
+filegroup(
+    name = "sandbox-policy-rego",
+    srcs = ["data/sandbox-policy.rego"],
+    visibility = ["//crates/openshell-sandbox:__pkg__"],
+)
+
 rust_library(
     name = "openshell-supervisor-network",
     srcs = glob(["src/**/*.rs"]),
