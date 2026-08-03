@@ -1406,10 +1406,11 @@ impl ComputeRuntime {
         let sandbox_id = transition.object_id().to_string();
         let expected_resource_version = sandbox_resource_version(transition);
         let session_connected = self.supervisor_sessions.has_session(&sandbox_id);
+        let has_supervisor = self.driver_kind() != Some(ComputeDriverKind::Mxc);
         match self
             .store
             .update_message_cas::<Sandbox, _>(&sandbox_id, expected_resource_version, |sandbox| {
-                apply_driver_snapshot(sandbox, snapshot, session_connected);
+                apply_driver_snapshot(sandbox, snapshot, session_connected, has_supervisor);
             })
             .await
         {
@@ -1853,11 +1854,14 @@ impl ComputeRuntime {
         match observed {
             Ok(Some(snapshot)) if snapshot.id == sandbox_id && snapshot.status.is_some() => {
                 let session_connected = self.supervisor_sessions.has_session(sandbox_id);
+                let has_supervisor = self.driver_kind() != Some(ComputeDriverKind::Mxc);
                 self.write_delete_recovery_with_retry(
                     sandbox_id,
                     deleting_resource_version,
                     "reconcile observed backend snapshot",
-                    |sandbox| apply_driver_snapshot(sandbox, &snapshot, session_connected),
+                    |sandbox| {
+                        apply_driver_snapshot(sandbox, &snapshot, session_connected, has_supervisor)
+                    },
                 )
                 .await;
             }
@@ -2823,12 +2827,13 @@ impl ComputeRuntime {
         existing_phase: SandboxPhase,
     ) -> Result<(), String> {
         let session_connected = self.supervisor_sessions.has_session(&incoming.id);
+        let has_supervisor = self.driver_kind() != Some(ComputeDriverKind::Mxc);
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(
                 &incoming.id,
                 expected_resource_version,
-                |sandbox| apply_driver_snapshot(sandbox, &incoming, session_connected),
+                |sandbox| apply_driver_snapshot(sandbox, &incoming, session_connected, has_supervisor),
             )
             .await
             .map_err(|e| match e {
@@ -3762,7 +3767,12 @@ fn public_status_from_driver(
     }
 }
 
-fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, session_connected: bool) {
+fn apply_driver_snapshot(
+    sandbox: &mut Sandbox,
+    incoming: &DriverSandbox,
+    session_connected: bool,
+    has_supervisor: bool,
+) {
     let old_phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
     let sandbox_name = &incoming.name;
 
@@ -3794,7 +3804,7 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
             (phase, status)
         },
         |incoming_status| {
-            let composed = ComposedPhase::new(incoming_status, session_connected);
+            let composed = ComposedPhase::new(incoming_status, session_connected, has_supervisor);
             let mut status = Some(public_status_from_driver(
                 incoming_status,
                 composed.phase,
@@ -3926,21 +3936,30 @@ struct ComposedPhase {
 }
 
 impl ComposedPhase {
-    fn new(incoming_status: &DriverSandboxStatus, session_connected: bool) -> Self {
+    fn new(
+        incoming_status: &DriverSandboxStatus,
+        session_connected: bool,
+        has_supervisor: bool,
+    ) -> Self {
         let backend_phase = derive_phase(Some(incoming_status));
         // A live supervisor session is a stronger readiness signal than the backend phase.
         // set_supervisor_session_state may have already promoted the store record to Ready
         // before this driver snapshot arrived. Keep Ready rather than letting a lagging
         // backend phase overwrite it.
+        //
+        // Backends without a supervisor (e.g. MXC) have no session to wait for; treat the
+        // backend phase as authoritative so they can reach Ready without a supervisor.
         let phase = match backend_phase {
             SandboxPhase::Error | SandboxPhase::Deleting | SandboxPhase::Stopped => backend_phase,
             _ if session_connected => SandboxPhase::Ready,
+            SandboxPhase::Ready if !has_supervisor => SandboxPhase::Ready,
             _ => SandboxPhase::Provisioning,
         };
         Self {
             phase,
             session_connected,
-            backend_ready_without_session: backend_phase == SandboxPhase::Ready
+            backend_ready_without_session: has_supervisor
+                && backend_phase == SandboxPhase::Ready
                 && !session_connected,
         }
     }
