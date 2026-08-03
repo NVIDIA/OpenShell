@@ -2636,16 +2636,21 @@ mod tests {
 
         let traced = test_exporter::install_traced();
         let request_span = tracing::info_span!("disconnected_watch_request");
-        let response = handle_watch_sandbox(
-            &state,
-            authed_request(WatchSandboxRequest {
-                id: sandbox.object_id().to_string(),
-                ..Default::default()
-            }),
-        )
-        .instrument(request_span.clone())
-        .await
-        .unwrap();
+        let mut handler = Box::pin(
+            handle_watch_sandbox(
+                &state,
+                authed_request(WatchSandboxRequest {
+                    id: sandbox.object_id().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .instrument(request_span.clone()),
+        );
+        let response = handler.as_mut().await.unwrap();
+        // A completed instrumented future can retain its span until the future
+        // itself is dropped. Release the handler's clone so this test isolates
+        // whether the spawned watch producer retains the request span.
+        drop(handler);
         let mut stream = response.into_inner();
         stream
             .next()
