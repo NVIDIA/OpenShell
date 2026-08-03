@@ -3,7 +3,9 @@ authors:
   - "@russellb"
 state: draft
 links:
-  - (originating GitHub issue — RFC number to be assigned by maintainers)
+  - https://github.com/NVIDIA/OpenShell/pull/2074 - kubernetes combined topology
+  - https://github.com/NVIDIA/OpenShell/pull/2076 - kubernetes sidecar topology
+  - https://github.com/NVIDIA/OpenShell/pull/2078 - original cni-sidecar topology PR from TaylorMutch
 ---
 
 # RFC NNNN - CNI-Sidecar Supervisor Topology (and OpenShift/Multus Enablement)
