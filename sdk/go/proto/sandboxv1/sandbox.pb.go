@@ -1737,9 +1737,13 @@ type GetSandboxConfigResponse struct {
 	SupervisorMiddlewareServices []*SupervisorMiddlewareService `protobuf:"bytes,9,rep,name=supervisor_middleware_services,json=supervisorMiddlewareServices,proto3" json:"supervisor_middleware_services,omitempty"`
 	// Workspace the sandbox belongs to. Allows the supervisor to learn its
 	// workspace context for subsequent workspace-scoped RPCs.
-	Workspace     string `protobuf:"bytes,10,opt,name=workspace,proto3" json:"workspace,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Workspace string `protobuf:"bytes,10,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	// Gateway-configured posture for rejected policy generations. Valid values
+	// are "fail_closed" and "retain_last_valid". Unknown or empty values must
+	// be treated as fail_closed by the supervisor.
+	PolicyValidationFailureMode string `protobuf:"bytes,11,opt,name=policy_validation_failure_mode,json=policyValidationFailureMode,proto3" json:"policy_validation_failure_mode,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *GetSandboxConfigResponse) Reset() {
@@ -1838,6 +1842,13 @@ func (x *GetSandboxConfigResponse) GetSupervisorMiddlewareServices() []*Supervis
 func (x *GetSandboxConfigResponse) GetWorkspace() string {
 	if x != nil {
 		return x.Workspace
+	}
+	return ""
+}
+
+func (x *GetSandboxConfigResponse) GetPolicyValidationFailureMode() string {
+	if x != nil {
+		return x.PolicyValidationFailureMode
 	}
 	return ""
 }
@@ -2066,7 +2077,7 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x05value\"\x86\x01\n" +
 	"\x10EffectiveSetting\x128\n" +
 	"\x05value\x18\x01 \x01(\v2\".openshell.sandbox.v1.SettingValueR\x05value\x128\n" +
-	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\xc2\x05\n" +
+	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\x87\x06\n" +
 	"\x18GetSandboxConfigResponse\x12;\n" +
 	"\x06policy\x18\x01 \x01(\v2#.openshell.sandbox.v1.SandboxPolicyR\x06policy\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1f\n" +
@@ -2079,7 +2090,8 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x15provider_env_revision\x18\b \x01(\x04R\x13providerEnvRevision\x12w\n" +
 	"\x1esupervisor_middleware_services\x18\t \x03(\v21.openshell.sandbox.v1.SupervisorMiddlewareServiceR\x1csupervisorMiddlewareServices\x12\x1c\n" +
 	"\tworkspace\x18\n" +
-	" \x01(\tR\tworkspace\x1ac\n" +
+	" \x01(\tR\tworkspace\x12C\n" +
+	"\x1epolicy_validation_failure_mode\x18\v \x01(\tR\x1bpolicyValidationFailureMode\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
 	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\x96\x01\n" +

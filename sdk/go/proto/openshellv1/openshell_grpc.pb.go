@@ -24,6 +24,7 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	OpenShell_Health_FullMethodName                        = "/openshell.v1.OpenShell/Health"
+	OpenShell_GetCurrentUser_FullMethodName                = "/openshell.v1.OpenShell/GetCurrentUser"
 	OpenShell_GetGatewayInfo_FullMethodName                = "/openshell.v1.OpenShell/GetGatewayInfo"
 	OpenShell_CreateSandbox_FullMethodName                 = "/openshell.v1.OpenShell/CreateSandbox"
 	OpenShell_GetSandbox_FullMethodName                    = "/openshell.v1.OpenShell/GetSandbox"
@@ -103,6 +104,8 @@ const (
 type OpenShellClient interface {
 	// Check the health of the service.
 	Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*HealthResponse, error)
+	// Return the authenticated caller identity established by the gateway.
+	GetCurrentUser(ctx context.Context, in *GetCurrentUserRequest, opts ...grpc.CallOption) (*GetCurrentUserResponse, error)
 	// Fetch elevated live gateway runtime metadata.
 	GetGatewayInfo(ctx context.Context, in *GetGatewayInfoRequest, opts ...grpc.CallOption) (*GetGatewayInfoResponse, error)
 	// Create a new sandbox.
@@ -171,7 +174,14 @@ type OpenShellClient interface {
 	DeleteProviderProfile(ctx context.Context, in *DeleteProviderProfileRequest, opts ...grpc.CallOption) (*DeleteProviderProfileResponse, error)
 	// Get sandbox settings by id (called by sandbox entrypoint and poll loop).
 	GetSandboxConfig(ctx context.Context, in *sandboxv1.GetSandboxConfigRequest, opts ...grpc.CallOption) (*sandboxv1.GetSandboxConfigResponse, error)
-	// Get gateway-global settings.
+	// Get gateway-global settings (read-only feature flags; any authenticated
+	// user may read these so the CLI and TUI can discover capabilities like
+	// providers_v2_enabled without requiring Platform Admin).
+	//
+	// Scope-only (no role): scopes are granted by the IdP at token issuance,
+	// orthogonal to workspace membership. Deployments that enable scope
+	// enforcement configure the IdP to grant config:read (or openshell:all)
+	// to all sandbox users, so this does not block least-privilege flows.
 	GetGatewayConfig(ctx context.Context, in *sandboxv1.GetGatewayConfigRequest, opts ...grpc.CallOption) (*sandboxv1.GetGatewayConfigResponse, error)
 	// Update settings or policy at sandbox or global scope.
 	UpdateConfig(ctx context.Context, in *UpdateConfigRequest, opts ...grpc.CallOption) (*UpdateConfigResponse, error)
@@ -273,6 +283,16 @@ func (c *openShellClient) Health(ctx context.Context, in *HealthRequest, opts ..
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(HealthResponse)
 	err := c.cc.Invoke(ctx, OpenShell_Health_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) GetCurrentUser(ctx context.Context, in *GetCurrentUserRequest, opts ...grpc.CallOption) (*GetCurrentUserResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetCurrentUserResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetCurrentUser_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -947,6 +967,8 @@ func (c *openShellClient) ListWorkspaceMembers(ctx context.Context, in *ListWork
 type OpenShellServer interface {
 	// Check the health of the service.
 	Health(context.Context, *HealthRequest) (*HealthResponse, error)
+	// Return the authenticated caller identity established by the gateway.
+	GetCurrentUser(context.Context, *GetCurrentUserRequest) (*GetCurrentUserResponse, error)
 	// Fetch elevated live gateway runtime metadata.
 	GetGatewayInfo(context.Context, *GetGatewayInfoRequest) (*GetGatewayInfoResponse, error)
 	// Create a new sandbox.
@@ -1015,7 +1037,14 @@ type OpenShellServer interface {
 	DeleteProviderProfile(context.Context, *DeleteProviderProfileRequest) (*DeleteProviderProfileResponse, error)
 	// Get sandbox settings by id (called by sandbox entrypoint and poll loop).
 	GetSandboxConfig(context.Context, *sandboxv1.GetSandboxConfigRequest) (*sandboxv1.GetSandboxConfigResponse, error)
-	// Get gateway-global settings.
+	// Get gateway-global settings (read-only feature flags; any authenticated
+	// user may read these so the CLI and TUI can discover capabilities like
+	// providers_v2_enabled without requiring Platform Admin).
+	//
+	// Scope-only (no role): scopes are granted by the IdP at token issuance,
+	// orthogonal to workspace membership. Deployments that enable scope
+	// enforcement configure the IdP to grant config:read (or openshell:all)
+	// to all sandbox users, so this does not block least-privilege flows.
 	GetGatewayConfig(context.Context, *sandboxv1.GetGatewayConfigRequest) (*sandboxv1.GetGatewayConfigResponse, error)
 	// Update settings or policy at sandbox or global scope.
 	UpdateConfig(context.Context, *UpdateConfigRequest) (*UpdateConfigResponse, error)
@@ -1115,6 +1144,9 @@ type UnimplementedOpenShellServer struct{}
 
 func (UnimplementedOpenShellServer) Health(context.Context, *HealthRequest) (*HealthResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Health not implemented")
+}
+func (UnimplementedOpenShellServer) GetCurrentUser(context.Context, *GetCurrentUserRequest) (*GetCurrentUserResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetCurrentUser not implemented")
 }
 func (UnimplementedOpenShellServer) GetGatewayInfo(context.Context, *GetGatewayInfoRequest) (*GetGatewayInfoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetGatewayInfo not implemented")
@@ -1337,6 +1369,24 @@ func _OpenShell_Health_Handler(srv interface{}, ctx context.Context, dec func(in
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).Health(ctx, req.(*HealthRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_GetCurrentUser_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetCurrentUserRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetCurrentUser(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetCurrentUser_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetCurrentUser(ctx, req.(*GetCurrentUserRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2398,6 +2448,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Health",
 			Handler:    _OpenShell_Health_Handler,
+		},
+		{
+			MethodName: "GetCurrentUser",
+			Handler:    _OpenShell_GetCurrentUser_Handler,
 		},
 		{
 			MethodName: "GetGatewayInfo",
