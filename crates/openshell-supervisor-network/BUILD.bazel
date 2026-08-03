@@ -1,6 +1,7 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rustfmt_test")
 
 filegroup(
     name = "sandbox-policy-rego",
@@ -44,6 +45,19 @@ rust_test(
         normal = True,
         normal_dev = True,
     ) + [":openshell-supervisor-network"],
+)
+
+rustfmt_test(
+    name = "rustfmt_test",
+    targets = [
+        ":accept_fd_exhaustion_integration_test",
+        ":openshell-supervisor-network",
+        ":openshell-supervisor-network_test",
+        ":sigv4_localstack_integration_test",
+        ":system_inference_integration_test",
+        ":websocket_upgrade_integration_test",
+    ],
+    visibility = ["//crates:__pkg__"],
 )
 
 rust_test(
