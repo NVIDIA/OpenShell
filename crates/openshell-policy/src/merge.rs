@@ -706,11 +706,10 @@ pub fn merge_policy(
     })
 }
 
-/// The L7 inspection contract an endpoint establishes for its host and port.
+/// The MCP inspection contract an endpoint establishes for its host and port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EffectiveInspection {
-    protocol: String,
-    mcp: Option<EffectiveMcpContract>,
+    mcp: EffectiveMcpContract,
 }
 
 /// Host and port pairs whose endpoints do not agree on one inspection contract,
@@ -724,8 +723,9 @@ struct EffectiveInspection {
 /// catch this on its own, because it only compares endpoints that fold together,
 /// and a differing path or a separate rule keeps them apart.
 ///
-/// Endpoints with no protocol are skipped: they carry no L7 configuration, so
-/// they never compete to supply one.
+/// Endpoints that are not MCP are skipped. The supervisor selects among
+/// matching configs by most-specific path, so protocols that differ across
+/// distinct path selectors are disambiguated at request time.
 fn conflicting_inspection_contracts(
     policy: &SandboxPolicy,
 ) -> BTreeMap<(String, u32), Vec<String>> {
@@ -736,13 +736,15 @@ fn conflicting_inspection_contracts(
             // Provider-composed rules are deliberately included: the supervisor
             // resolves one contract per host and port regardless of which rule
             // contributed the endpoint.
-            if endpoint.protocol.is_empty() {
+            // Only MCP contracts are compared. Protocols are selected per
+            // request by most-specific path, so a broader REST endpoint and a
+            // narrower GraphQL endpoint on one host and port are unambiguous
+            // and supported. MCP options are not path-selected, so two MCP
+            // endpoints on one host and port stay ambiguous.
+            let Some(mcp) = effective_mcp_contract(endpoint) else {
                 continue;
-            }
-            let inspection = EffectiveInspection {
-                protocol: endpoint.protocol.to_ascii_lowercase(),
-                mcp: effective_mcp_contract(endpoint),
             };
+            let inspection = EffectiveInspection { mcp };
             for port in canonical_ports(endpoint) {
                 contracts
                     .entry((endpoint.host.to_ascii_lowercase(), port))
@@ -4974,49 +4976,6 @@ mod tests {
         ));
     }
 
-    /// The supervisor resolves one L7 contract per host and port, so endpoints
-    /// there must agree on protocol as well as on MCP options. Mixing them would
-    /// let MCP traffic be inspected as REST, or the reverse, by match order.
-    #[test]
-    fn mixed_inspection_protocols_on_one_host_and_port_are_rejected() {
-        let existing = rule_with_authorizations(
-            "existing",
-            vec![mcp_endpoint(
-                "svc.example.com",
-                &[443],
-                None,
-                None,
-                65536,
-                vec![mcp_tool_rule("tool")],
-            )],
-            &["/usr/bin/only"],
-        );
-        let incoming = rule_with_authorizations(
-            "existing",
-            vec![NetworkEndpoint {
-                path: "/rest".to_string(),
-                protocol: "rest".to_string(),
-                rules: vec![rest_rule("GET", "/x")],
-                ..endpoint("svc.example.com", 443)
-            }],
-            &["/usr/bin/only"],
-        );
-
-        let error = merge_policy(
-            policy_with_rule("existing", existing),
-            &[PolicyMergeOp::AddRule {
-                rule_name: "existing".to_string(),
-                rule: incoming,
-            }],
-        )
-        .expect_err("one host and port cannot be inspected as both MCP and REST");
-
-        assert!(matches!(
-            error,
-            PolicyMergeError::ConflictingInspectionContracts { .. }
-        ));
-    }
-
     /// Endpoints agreeing on protocol are fine, so splitting one REST surface
     /// across paths stays supported.
     #[test]
@@ -5082,5 +5041,41 @@ mod tests {
             }],
         )
         .expect("an endpoint with no protocol carries no inspection contract");
+    }
+
+    /// The supervisor picks among matching configs by most-specific path, so a
+    /// broad REST endpoint and a narrow GraphQL endpoint on one host and port
+    /// are unambiguous. Rejecting them would refuse an update whose equivalent
+    /// full policy the runtime supports.
+    #[test]
+    fn path_disambiguated_protocols_on_one_host_and_port_are_accepted() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                path: "/**".to_string(),
+                protocol: "rest".to_string(),
+                rules: vec![rest_rule("GET", "/repos/**")],
+                ..endpoint("api.github.com", 443)
+            }],
+            &["/usr/bin/only"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![NetworkEndpoint {
+                path: "/graphql".to_string(),
+                protocol: "graphql".to_string(),
+                ..endpoint("api.github.com", 443)
+            }],
+            &["/usr/bin/only"],
+        );
+
+        merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("path selectors disambiguate these protocols at request time");
     }
 }
