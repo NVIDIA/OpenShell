@@ -46,6 +46,8 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
 | `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
+| `crates/openshell-nft-ruleset/` | nftables rulesets | Shared per-sandbox NAT + default-deny nftables ruleset generation used by compute drivers |
+| `crates/openshell-rootfs/` | Rootfs providers | Rootfs provider boundary for compute drivers; containerd-backed provider for image pull/unpack and snapshots |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
 | `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
 | `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |

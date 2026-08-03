@@ -124,6 +124,7 @@ pub enum ComputeDriverKind {
     Vm,
     Docker,
     Podman,
+    Oci,
 }
 
 impl ComputeDriverKind {
@@ -134,6 +135,7 @@ impl ComputeDriverKind {
             Self::Vm => "vm",
             Self::Docker => "docker",
             Self::Podman => "podman",
+            Self::Oci => "oci",
         }
     }
 }
@@ -174,8 +176,9 @@ impl FromStr for ComputeDriverKind {
             "vm" => Ok(Self::Vm),
             "docker" => Ok(Self::Docker),
             "podman" => Ok(Self::Podman),
+            "oci" => Ok(Self::Oci),
             other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
+                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman, oci"
             )),
         }
     }
@@ -1052,6 +1055,10 @@ mod tests {
         assert_eq!(
             "docker".parse::<ComputeDriverKind>().unwrap(),
             ComputeDriverKind::Docker
+        );
+        assert_eq!(
+            "oci".parse::<ComputeDriverKind>().unwrap(),
+            ComputeDriverKind::Oci
         );
     }
 

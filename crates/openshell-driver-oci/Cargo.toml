@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-driver-oci"
+description = "OCI/runc-based compute driver for OpenShell, backed by a system-provided containerd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "openshell_driver_oci"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openshell-driver-oci"
+path = "src/main.rs"
+
+[dependencies]
+openshell-core = { path = "../openshell-core", default-features = false }
+openshell-nft-ruleset = { path = "../openshell-nft-ruleset" }
+openshell-policy = { path = "../openshell-policy" }
+# Rootfs provider boundary. The containerd-backed provider lives there:
+# this driver never talks to containerd directly (no containerd-client
+# dependency here) and consumes only provider-neutral PreparedRootfs
+# mounts. The driver itself, not containerd, spawns the configured
+# low-level OCI runtime (runc/crun/etc.) directly (see src/runtime.rs).
+openshell-rootfs = { path = "../openshell-rootfs" }
+
+# OCI runtime-spec types (namespaces, cgroups v2 resources, seccomp).
+oci-spec = { version = "0.10", default-features = false, features = [
+  "runtime",
+] }
+
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true, features = ["transport"] }
+prost = { workspace = true }
+prost-types = { workspace = true }
+futures = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+miette = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+nix = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1218,6 +1218,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
+name = "containerd-client"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "814eedf2860b6df6e8002f917a0fbabf53bace3d3d9d2c2022661ae55a6ab6e4"
+dependencies = [
+ "hyper-util",
+ "prost",
+ "prost-types",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower 0.5.3",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3730,7 +3746,7 @@ dependencies = [
  "http-auth",
  "jsonwebtoken 10.3.0",
  "lazy_static",
- "oci-spec",
+ "oci-spec 0.9.0",
  "olpc-cjson",
  "regex",
  "reqwest 0.13.2",
@@ -3748,6 +3764,23 @@ name = "oci-spec"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8445a2631507cec628a15fdd6154b54a3ab3f20ed4fe9d73a3b8b7a4e1ba03a"
+dependencies = [
+ "const_format",
+ "derive_builder",
+ "getset",
+ "regex",
+ "serde",
+ "serde_json",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "oci-spec"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3df6f876ad774d6a676f7e968f5c3edacc32f90e65fe680a8b686235396556fb"
 dependencies = [
  "const_format",
  "derive_builder",
@@ -3935,6 +3968,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-oci"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "miette",
+ "nix",
+ "oci-spec 0.10.0",
+ "openshell-core",
+ "openshell-nft-ruleset",
+ "openshell-policy",
+ "openshell-rootfs",
+ "prost",
+ "prost-types",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "openshell-driver-podman"
 version = "0.0.0"
 dependencies = [
@@ -3974,6 +4035,7 @@ dependencies = [
  "nix 0.29.0",
  "oci-client",
  "openshell-core",
+ "openshell-nft-ruleset",
  "openshell-policy",
  "openshell-vfio",
  "polling",
@@ -4014,6 +4076,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "openshell-nft-ruleset"
+version = "0.0.0"
 
 [[package]]
 name = "openshell-ocsf"
@@ -4079,6 +4145,18 @@ dependencies = [
  "serde_yml",
  "thiserror 2.0.18",
  "url",
+]
+
+[[package]]
+name = "openshell-rootfs"
+version = "0.0.0"
+dependencies = [
+ "containerd-client",
+ "futures",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tonic",
 ]
 
 [[package]]
@@ -4190,6 +4268,7 @@ dependencies = [
  "openshell-core",
  "openshell-driver-docker",
  "openshell-driver-kubernetes",
+ "openshell-driver-oci",
  "openshell-driver-podman",
  "openshell-gateway-interceptors",
  "openshell-ocsf",

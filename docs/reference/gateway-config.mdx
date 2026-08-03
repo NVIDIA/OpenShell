@@ -551,13 +551,52 @@ guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
 # sandbox_uid = 20001
 ```
 
+### OCI
+
+Each sandbox runs as a container built from Linux kernel primitives (namespaces, cgroups v2). The gateway process itself — not containerd — spawns the sandbox's process directly through the configured low-level runtime (`runc` by default); it talks to a **system-provided `containerd`** in-process only for image pull/unpack and snapshot management, and does not spawn a separate driver subprocess the way the VM driver does. This driver never bundles or installs containerd or the low-level OCI runtime; both must already be present on the host. It is opt-in and never auto-detected. See [OCI Driver](./sandbox-compute-drivers#oci-driver) for its current scope and known gaps (rootless mode is not yet functional and defaults off; GPU support covers kernel device nodes only).
+
+```toml
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address    = "127.0.0.1:17670"
+log_level       = "info"
+# OCI is never auto-detected; an explicit entry here is required.
+compute_drivers = ["oci"]
+
+[openshell.drivers.oci]
+# Path to the system containerd gRPC Unix socket.
+containerd_socket_path = "/run/containerd/containerd.sock"
+# containerd namespace this driver operates in, distinct from other
+# tenants (Docker's "moby", the CRI plugin's "k8s.io", etc.) on the same host.
+containerd_namespace   = "openshell"
+# Low-level OCI runtime the gateway execs directly (never through
+# containerd). Never bundled by this driver: must already be installed
+# and on PATH (or an absolute path) on the gateway host.
+runtime_binary         = "runc"
+snapshotter            = "overlayfs"
+default_image          = "ghcr.io/nvidia/openshell/sandbox:latest"
+state_dir              = "/var/lib/openshell/driver-oci"
+grpc_endpoint          = "https://host.containers.internal:17670"
+# Host path to a prebuilt openshell-sandbox binary, bind-mounted read-only
+# into sandboxes. See the OCI Driver reference for why this differs
+# from the image-based supervisor mount the other drivers use.
+supervisor_binary_path = "/usr/local/libexec/openshell/openshell-sandbox"
+veth_subnet_base       = "10.0.132.0"
+# Off by default: see the OCI Driver reference for the known gap that
+# currently makes container start fail when this is enabled.
+rootless               = false
+```
+
 ### Extension Driver
 
 Extension drivers run outside the gateway and expose the
 `compute_driver.proto` gRPC service on a Unix socket. Use a non-reserved driver
-name; built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot
-be selected through unmanaged socket endpoints. The selected driver name is the
-key used for driver-owned sandbox config such as `template.driver_config.<name>`.
+name; built-in names such as `vm`, `docker`, `podman`, `kubernetes`, and
+`oci` cannot be selected through unmanaged socket endpoints. The selected
+driver name is the key used for driver-owned sandbox config such as
+`template.driver_config.<name>`.
 
 ```toml
 [openshell]

@@ -1,63 +1,27 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::fmt::Write;
+//! Thin VM-driver-specific wrapper over the shared `openshell-nft-ruleset`
+//! generator. The generic ruleset shape (NAT + default-deny forward/input
+//! scoped to the gateway port) lives in `openshell-nft-ruleset` so the
+//! oci driver can reuse it for veth-based networking without pulling in
+//! the VM driver's `bollard`/`oci-client`/libkrun dependencies.
+//!
+//! The table prefix `openshell_vm` is preserved so existing deployments see
+//! no change in the nftables tables this driver creates, and so the VM and
+//! oci drivers can never collide on a table name if both manage
+//! interfaces on the same host.
 
-/// Sanitize a TAP device name for use as an nftables table name suffix.
-/// Assumes device names match `vmtap-[a-f0-9]+` (driver-controlled).
-fn sanitize_table_name(device: &str) -> String {
-    device.replace('-', "_")
-}
+const TABLE_PREFIX: &str = "openshell_vm";
 
 /// Return the nftables table name for a TAP device.
 pub fn teardown_table_name(device: &str) -> String {
-    format!("openshell_vm_{}", sanitize_table_name(device))
+    openshell_nft_ruleset::teardown_table_name(TABLE_PREFIX, device)
 }
 
 /// Generate the nftables ruleset for VM TAP networking.
 pub fn generate_tap_ruleset(tap_device: &str, subnet: &str, gateway_port: u16) -> String {
-    let table_name = teardown_table_name(tap_device);
-    let mut ruleset = String::with_capacity(512);
-
-    writeln!(ruleset, "table ip {table_name} {{").unwrap();
-    writeln!(ruleset, "    chain postrouting {{").unwrap();
-    writeln!(
-        ruleset,
-        "        type nat hook postrouting priority 100; policy accept;"
-    )
-    .unwrap();
-    writeln!(ruleset, "        ip saddr {subnet} masquerade").unwrap();
-    writeln!(ruleset, "    }}").unwrap();
-    writeln!(ruleset, "    chain forward {{").unwrap();
-    writeln!(
-        ruleset,
-        "        type filter hook forward priority 0; policy accept;"
-    )
-    .unwrap();
-    writeln!(ruleset, "        iifname \"{tap_device}\" accept").unwrap();
-    writeln!(
-        ruleset,
-        "        oifname \"{tap_device}\" ct state related,established accept"
-    )
-    .unwrap();
-    writeln!(ruleset, "        oifname \"{tap_device}\" drop").unwrap();
-    writeln!(ruleset, "    }}").unwrap();
-    writeln!(ruleset, "    chain input {{").unwrap();
-    writeln!(
-        ruleset,
-        "        type filter hook input priority 0; policy accept;"
-    )
-    .unwrap();
-    writeln!(
-        ruleset,
-        "        iifname \"{tap_device}\" tcp dport {gateway_port} accept"
-    )
-    .unwrap();
-    writeln!(ruleset, "        iifname \"{tap_device}\" drop").unwrap();
-    writeln!(ruleset, "    }}").unwrap();
-    writeln!(ruleset, "}}").unwrap();
-
-    ruleset
+    openshell_nft_ruleset::generate_ruleset(TABLE_PREFIX, tap_device, subnet, gateway_port)
 }
 
 #[cfg(test)]

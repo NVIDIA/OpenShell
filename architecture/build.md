@@ -29,8 +29,8 @@ collect telemetry: `openshell-server` (gateway), `openshell-sandbox`
 (supervisor), and `openshell-driver-vm`. Every crate depends on
 `openshell-core` with `default-features = false`, so the binary crate's feature
 is the single switch that enables `openshell-core/telemetry` for its build
-graph. In-process drivers (`docker`, `kubernetes`, `podman`) inherit the
-gateway's setting through feature unification and carry no passthrough.
+graph. In-process drivers (`docker`, `kubernetes`, `podman`, `oci`) inherit
+the gateway's setting through feature unification and carry no passthrough.
 
 Building a binary with `--no-default-features` compiles out telemetry entirely:
 no endpoint, no telemetry HTTP client, and no emission code. With telemetry

@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-rootfs"
+description = "Rootfs provider boundary for OpenShell compute drivers, with a containerd-backed provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "openshell_rootfs"
+path = "src/lib.rs"
+
+[dependencies]
+# containerd's own generated gRPC client. This is the "system-provided
+# containerd" integration point behind `ContainerdRootfsProvider`, used
+# only for image pull/unpack and snapshot management -- never bundled,
+# installed, or managed by OpenShell. containerd's container/task
+# services and shim are never used; consumers of a prepared rootfs (the
+# OCI compute driver) spawn the low-level OCI runtime themselves.
+containerd-client = "0.9"
+
+futures = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+tonic = { workspace = true, features = ["transport"] }
+
+[lints]
+workspace = true

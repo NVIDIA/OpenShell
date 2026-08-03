@@ -12,6 +12,7 @@ use crate::defaults::LocalTlsPaths;
 use openshell_core::{ComputeDriverKind, Error, Result};
 use openshell_driver_docker::DockerComputeConfig;
 use openshell_driver_kubernetes::KubernetesComputeConfig;
+use openshell_driver_oci::OciComputeConfig;
 use openshell_driver_podman::PodmanComputeConfig;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -92,6 +93,14 @@ pub fn docker_config_from_context(
 pub fn vm_config_from_context(context: DriverStartupContext<'_>) -> Result<VmComputeConfig> {
     let mut cfg = driver_config_from_context(context, ComputeDriverKind::Vm.as_str())?;
     apply_vm_runtime_defaults(&mut cfg, context);
+    Ok(cfg)
+}
+
+/// Build the selected OCI (containerd-backed) config from TOML plus
+/// runtime defaults.
+pub fn oci_config_from_context(context: DriverStartupContext<'_>) -> Result<OciComputeConfig> {
+    let mut cfg = driver_config_from_context(context, ComputeDriverKind::Oci.as_str())?;
+    apply_oci_runtime_defaults(&mut cfg, context);
     Ok(cfg)
 }
 
@@ -194,6 +203,23 @@ fn apply_vm_runtime_defaults(cfg: &mut VmComputeConfig, context: DriverStartupCo
         &mut cfg.guest_tls_key,
         context.guest_tls,
     );
+}
+
+fn apply_oci_runtime_defaults(cfg: &mut OciComputeConfig, context: DriverStartupContext<'_>) {
+    cfg.gateway_port = context.gateway_port;
+    if cfg.state_dir.as_os_str().is_empty() {
+        cfg.state_dir = OciComputeConfig::default_state_dir();
+    }
+    if cfg.grpc_endpoint.trim().is_empty()
+        && (!context.gateway_tls_enabled || context.guest_tls.is_some())
+    {
+        let scheme = if context.gateway_tls_enabled {
+            "https"
+        } else {
+            "http"
+        };
+        cfg.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", context.gateway_port);
+    }
 }
 
 fn apply_podman_env_overrides(podman: &mut PodmanComputeConfig) {
