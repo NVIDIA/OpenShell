@@ -180,7 +180,7 @@ pub struct ProxyHandle {
     #[allow(dead_code)]
     http_addr: Option<SocketAddr>,
     join: JoinHandle<()>,
-    exited_rx: tokio::sync::oneshot::Receiver<()>,
+    exited_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl ProxyHandle {
@@ -413,7 +413,7 @@ impl ProxyHandle {
         Ok(Self {
             http_addr: Some(local_addr),
             join,
-            exited_rx,
+            exited_rx: Some(exited_rx),
         })
     }
 
@@ -422,11 +422,8 @@ impl ProxyHandle {
         self.http_addr
     }
 
-    /// Take the exit notification receiver for health monitoring.
-    /// Resolves when the proxy accept loop task exits for any reason.
-    pub fn take_exit_receiver(&mut self) -> tokio::sync::oneshot::Receiver<()> {
-        let (_tx, dummy_rx) = tokio::sync::oneshot::channel();
-        std::mem::replace(&mut self.exited_rx, dummy_rx)
+    pub fn take_exit_receiver(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        self.exited_rx.take()
     }
 }
 
@@ -452,16 +449,20 @@ fn classify_accept_error(
     consecutive_fd_errors: &mut u32,
     consecutive_unknown_errors: &mut u32,
 ) -> AcceptAction {
-    // EBADF (9) / EINVAL (22) / ENOTSOCK (88) — the listener socket is
-    // permanently unusable; retrying will never succeed. EINVAL from
-    // accept() means the socket is no longer listening (shut down or
-    // corrupted), not a generic invalid-argument condition.
-    if matches!(err.raw_os_error(), Some(9 | 22 | 88)) {
+    // Terminal: the listener socket is permanently unusable; retrying will
+    // never succeed. EINVAL from accept() means the socket is no longer
+    // listening (shut down or corrupted).
+    #[cfg(unix)]
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK)
+    ) {
         return AcceptAction::Terminal;
     }
 
-    // EMFILE (24) / ENFILE (23) — process or system FD table is full.
-    if matches!(err.raw_os_error(), Some(24 | 23)) {
+    // FD exhaustion: process or system FD table is full.
+    #[cfg(unix)]
+    if matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
         *consecutive_unknown_errors = 0;
         *consecutive_fd_errors = consecutive_fd_errors.saturating_add(1);
         let backoff_ms = 100u64
@@ -10151,38 +10152,50 @@ network_policies:
         let mut handle = ProxyHandle {
             http_addr: None,
             join,
-            exited_rx: rx,
+            exited_rx: Some(rx),
         };
-        let mut taken = handle.take_exit_receiver();
-        // Sender still alive — receiver should not be ready yet.
+        let mut taken = handle.take_exit_receiver().expect("first take should return Some");
         assert!(taken.try_recv().is_err());
-        // Drop the original sender — the taken receiver should resolve.
         drop(tx);
         assert!(taken.await.is_err());
     }
 
     #[tokio::test]
-    async fn test_take_exit_receiver_second_call_returns_instantly() {
+    async fn test_take_exit_receiver_second_call_returns_none() {
         let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
         let join = tokio::spawn(std::future::pending::<()>());
         let mut handle = ProxyHandle {
             http_addr: None,
             join,
-            exited_rx: rx,
+            exited_rx: Some(rx),
         };
         let _first = handle.take_exit_receiver();
-        let second = handle.take_exit_receiver();
-        // The dummy's sender was dropped inside take_exit_receiver, so
-        // the second receiver resolves immediately — this demonstrates
-        // the double-call hazard.
-        assert!(second.await.is_err());
+        assert!(handle.take_exit_receiver().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_handle_drop_fires_exit_receiver() {
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(async move {
+            let _guard = exited_tx;
+            std::future::pending::<()>().await;
+        });
+        let mut handle = ProxyHandle {
+            http_addr: None,
+            join,
+            exited_rx: Some(exited_rx),
+        };
+        let rx = handle.take_exit_receiver().expect("should return Some");
+        drop(handle);
+        assert!(rx.await.is_err());
     }
 
     // --- classify_accept_error tests ---
 
+    #[cfg(unix)]
     #[test]
     fn test_classify_terminal_error_ebadf() {
-        let err = std::io::Error::from_raw_os_error(9); // EBADF
+        let err = std::io::Error::from_raw_os_error(libc::EBADF);
         let mut fd = 0;
         let mut unk = 0;
         assert_eq!(
@@ -10191,9 +10204,10 @@ network_policies:
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_classify_terminal_error_einval() {
-        let err = std::io::Error::from_raw_os_error(22); // EINVAL
+        let err = std::io::Error::from_raw_os_error(libc::EINVAL);
         let mut fd = 0;
         let mut unk = 0;
         assert_eq!(
@@ -10202,10 +10216,10 @@ network_policies:
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn test_classify_terminal_error_enotsock() {
-        let err = std::io::Error::from_raw_os_error(88); // ENOTSOCK (Linux)
+        let err = std::io::Error::from_raw_os_error(libc::ENOTSOCK);
         let mut fd = 0;
         let mut unk = 0;
         assert_eq!(
@@ -10214,9 +10228,10 @@ network_policies:
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_classify_fd_exhaustion_returns_retry_medium() {
-        let err = std::io::Error::from_raw_os_error(24); // EMFILE
+        let err = std::io::Error::from_raw_os_error(libc::EMFILE);
         let mut fd = 0;
         let mut unk = 0;
         let action = classify_accept_error(&err, &mut fd, &mut unk);
@@ -10232,9 +10247,10 @@ network_policies:
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_classify_unknown_error_returns_retry_low() {
-        let err = std::io::Error::from_raw_os_error(111); // ECONNREFUSED
+        let err = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
         let mut fd = 0;
         let mut unk = 0;
         let action = classify_accept_error(&err, &mut fd, &mut unk);
@@ -10250,11 +10266,12 @@ network_policies:
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_classify_fd_exhaustion_backoff_increases_and_caps() {
         let mut fd = 0;
         let mut unk = 0;
-        let err = std::io::Error::from_raw_os_error(24); // EMFILE
+        let err = std::io::Error::from_raw_os_error(libc::EMFILE);
 
         let mut prev_backoff = std::time::Duration::ZERO;
         for _ in 0..6 {
@@ -10286,11 +10303,12 @@ network_policies:
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_classify_unknown_errors_exit_after_threshold() {
         let mut fd = 0;
         let mut unk = 0;
-        let err = std::io::Error::from_raw_os_error(111); // ECONNREFUSED
+        let err = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
 
         for i in 1..MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS {
             let action = classify_accept_error(&err, &mut fd, &mut unk);
@@ -10307,22 +10325,20 @@ network_policies:
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_classify_success_resets_counters() {
         let mut fd = 0;
         let mut unk = 0;
-        let err = std::io::Error::from_raw_os_error(111); // ECONNREFUSED
+        let err = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
 
-        // Accumulate 9 unknown errors (one below threshold).
         for _ in 1..MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS {
             classify_accept_error(&err, &mut fd, &mut unk);
         }
 
-        // Simulate a successful accept — production loop resets both counters.
         fd = 0;
         unk = 0;
 
-        // Another 9 unknowns should NOT trigger Terminal.
         for i in 1..MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS {
             let action = classify_accept_error(&err, &mut fd, &mut unk);
             assert!(
@@ -10332,22 +10348,20 @@ network_policies:
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_classify_fd_error_resets_unknown_counter() {
         let mut fd = 0;
         let mut unk = 0;
-        let unknown_err = std::io::Error::from_raw_os_error(111); // ECONNREFUSED
-        let fd_err = std::io::Error::from_raw_os_error(24); // EMFILE
+        let unknown_err = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
+        let fd_err = std::io::Error::from_raw_os_error(libc::EMFILE);
 
-        // Accumulate 5 unknown errors.
         for _ in 0..5 {
             classify_accept_error(&unknown_err, &mut fd, &mut unk);
         }
 
-        // One FD error resets the unknown counter.
         classify_accept_error(&fd_err, &mut fd, &mut unk);
 
-        // Another 9 unknowns should NOT trigger Terminal (counter was reset).
         for i in 1..MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS {
             let action = classify_accept_error(&unknown_err, &mut fd, &mut unk);
             assert!(
@@ -10357,13 +10371,13 @@ network_policies:
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_classify_fd_exhaustion_and_terminal_are_disjoint() {
         let mut fd = 0;
         let mut unk = 0;
 
-        for errno in [24, 23] {
-            // EMFILE, ENFILE
+        for errno in [libc::EMFILE, libc::ENFILE] {
             let err = std::io::Error::from_raw_os_error(errno);
             assert!(
                 matches!(
@@ -10376,8 +10390,7 @@ network_policies:
             unk = 0;
         }
 
-        for errno in [9, 22] {
-            // EBADF, EINVAL (portable values)
+        for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
             let err = std::io::Error::from_raw_os_error(errno);
             assert_eq!(
                 classify_accept_error(&err, &mut fd, &mut unk),
