@@ -6,12 +6,12 @@ kernel; it does not select a deployment or establish conformance.
 
 ## Representative placements
 
-| Pattern | Supervisor placement | Backend and network-mediation placement | Workload-kernel relationship |
-|---|---|---|---|
-| **Co-located/in-pod** | With the workload | Backend runs in the supervisor process; network mediation is co-located | Trusted components share the workload's host, guest, or application kernel, depending on the runtime |
-| **Same-pod composite** | With the workload | Backend runs with the supervisor; network mediation may run in a sidecar | Components share the workload's kernel |
-| **Delegated backend components** | With the workload | A node or remote helper establishes some controls; network mediation may be co-located or delegated | Depends on which trusted components remain with the workload |
-| **Driver-hosted/shared service** | With the compute driver or another trusted service | Backend and network mediation may be co-located with the supervisor; one host may operate many isolated boundaries | Depends on the workload runtime |
+| Pattern | Supervisor placement | Backend and network-mediation placement | Workload-kernel relationship | Implementation |
+|---|---|---|---|---|
+| **Co-located/in-pod** | With the workload | Backend runs in the supervisor process; network mediation is co-located | Trusted components share the workload's host, guest, or application kernel, depending on the runtime | Implemented (original topology) |
+| **Same-pod composite** | With the workload | Backend runs with the supervisor; network mediation may run in a sidecar | Components share the workload's kernel | Implemented (#2076) |
+| **Delegated backend components** | With the workload | A node or remote helper establishes some controls; network mediation may be co-located or delegated | Depends on which trusted components remain with the workload | Proposed |
+| **Driver-hosted/shared service** | With the compute driver or another trusted service | Backend and network mediation may be co-located with the supervisor; one host may operate many isolated boundaries | Depends on the workload runtime | Proposed |
 
 ## Durable rules
 
