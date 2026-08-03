@@ -2,6 +2,7 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rustfmt_test")
 load("@workspace_version//:version.bzl", "WORKSPACE_VERSION")
 
 rust_library(
@@ -140,4 +141,22 @@ rust_test(
         normal = True,
         normal_dev = True,
     ) + [":openshell-cli"],
+)
+
+rustfmt_test(
+    name = "rustfmt_test",
+    targets = [
+        ":ensure_providers_integration_test",
+        ":fake-forward-process",
+        ":mtls_integration_test",
+        ":openshell",
+        ":openshell-cli",
+        ":openshell-cli_bin_test",
+        ":openshell-cli_lib_test",
+        ":provider_commands_integration_test",
+        ":sandbox_create_lifecycle_integration_test",
+        ":sandbox_name_fallback_integration_test",
+        ":sandbox_upload_integration_test",
+    ],
+    visibility = ["//crates:__pkg__"],
 )
