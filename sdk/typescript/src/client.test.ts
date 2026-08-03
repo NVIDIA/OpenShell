@@ -315,6 +315,61 @@ describe('execInteractive', () => {
   });
 });
 
+describe('exec done settlement', () => {
+  it('resolves done even when the consumer breaks right after the exit event', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      // eslint-disable-next-line require-yield
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'stdout', value: { data: enc('hi') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 3 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    for await (const event of session.output) {
+      if ('type' in event) break; // break on exit: the generator never resumes
+    }
+    // Without settling `done` before the exit yield, this would hang forever.
+    expect(await session.done).toBe(3);
+  });
+
+  it('rejects done and throws from output when the stream errors before exit', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'stdout', value: { data: enc('partial') } } };
+        throw new ConnectError('boom', Code.Internal);
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    await expect(
+      (async () => {
+        for await (const _event of session.output) {
+          // drain until the stream error surfaces
+        }
+      })(),
+    ).rejects.toMatchObject({ code: 'rpc' });
+    await expect(session.done).rejects.toMatchObject({ code: 'rpc' });
+  });
+
+  it('rejects done when the consumer abandons output before an exit event', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      // eslint-disable-next-line require-yield
+      execSandboxInteractive: async function* () {
+        yield { payload: { case: 'stdout', value: { data: enc('one') } } };
+        yield { payload: { case: 'stdout', value: { data: enc('two') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const session = await sandbox.execInteractive('sb', ['bash']);
+    for await (const event of session.output) {
+      if (!('type' in event)) break; // abandon on the first chunk, before exit
+    }
+    await expect(session.done).rejects.toMatchObject({ code: 'rpc' });
+  });
+});
+
 describe('providers', () => {
   it('attach/detach assemble the request and map the changed flag + sandbox ref', async () => {
     let attachReq: {
@@ -515,6 +570,14 @@ describe('config / policy', () => {
       value: { case: 'boolValue', value: true },
     });
     expect(result.settingsRevision).toBe('11');
+  });
+
+  it('rejects a non-u64 expectedResourceVersion with invalid_config (no raw SyntaxError)', async () => {
+    // versionPin runs during request assembly, before any RPC is issued.
+    const sandbox = client({});
+    await expect(
+      sandbox.setPolicy('sb', { version: 1, networkPolicies: {} }, { expectedResourceVersion: 'not-a-number' }),
+    ).rejects.toMatchObject({ code: 'invalid_config' });
   });
 });
 
@@ -728,6 +791,53 @@ describe('forward', () => {
       expect(received[i * CHUNK + CHUNK - 1]).toBe(i & 0xff);
     }
 
+    await handle.close();
+    await handle.closed;
+  });
+
+  // Fix #7: the accepted socket must have an 'error' handler before
+  // forwardConnection awaits createSshSession, or a peer reset in that window
+  // emits an unhandled 'error' and crashes the process.
+  it('survives a forwarded socket that resets during the session-mint window', async () => {
+    let releaseSession: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseSession = resolve;
+    });
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-reset'),
+      createSshSession: async () => {
+        // Hold the RPC open so the accepted socket sits in the pre-handler window.
+        await gate;
+        return {
+          sandboxId: 'sb-id-reset',
+          token: 'reset-tok',
+          gatewayHost: 'gw',
+          gatewayPort: 443,
+          gatewayScheme: 'https',
+          hostKeyFingerprint: '',
+          expiresAtMs: 0n,
+        };
+      },
+      // biome-ignore lint/correctness/useYield: the socket is reset before any frame is relayed
+      forwardTcp: async function* () {
+        return;
+      },
+      revokeSshSession: () => ({ revoked: true }),
+    });
+
+    const handle = await sandbox.forward('sb', { targetPort: 9000 });
+    await new Promise<void>((resolve) => {
+      const socket = net.connect(handle.localPort, handle.localHost, () => {
+        // Abort mid-mint; the server-side accepted socket may see an
+        // ECONNRESET 'error' before forwardConnection attaches its handlers.
+        socket.destroy(new Error('peer reset'));
+        setTimeout(resolve, 30);
+      });
+      socket.on('error', () => {}); // ignore the client-side reset
+    });
+
+    releaseSession?.();
+    // The listener still shuts down cleanly after the aborted connection.
     await handle.close();
     await handle.closed;
   });
