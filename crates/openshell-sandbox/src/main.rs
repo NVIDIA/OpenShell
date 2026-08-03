@@ -229,6 +229,12 @@ struct Args {
     /// (for proxies whose ACLs filter on hostnames).
     #[arg(long)]
     upstream_proxy_connect_by_hostname: bool,
+
+    /// Path to a PEM CA bundle trusted for the corporate proxy: the TLS
+    /// handshake with an `https://` proxy and, for TLS-intercepting proxies,
+    /// re-signed upstream certificates and the sandbox trust bundle.
+    #[arg(long)]
+    upstream_proxy_ca_bundle: Option<String>,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -616,6 +622,7 @@ fn main() -> Result<()> {
             proxy_auth_file: args.upstream_proxy_auth_file,
             proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure,
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname,
+            proxy_ca_bundle: args.upstream_proxy_ca_bundle,
         };
 
         run_sandbox(

@@ -44,7 +44,8 @@ Environment:
 Corporate proxy (Podman driver only):
   OPENSHELL_SANDBOX_HTTPS_PROXY
                           Corporate forward proxy URL for sandbox TLS
-                          egress, in explicit http://host:port form.
+                          egress, in explicit http://host:port or
+                          https://host:port form.
   OPENSHELL_SANDBOX_NO_PROXY
                           Comma-separated NO_PROXY list (hostnames, domain
                           suffixes, IPs, CIDRs, optional :port qualifiers)
@@ -62,6 +63,11 @@ Corporate proxy (Podman driver only):
                           Set to true to send the destination hostname in
                           CONNECT instead of a validated IP. Last resort
                           for hostname-filtering proxy ACLs.
+  OPENSHELL_SANDBOX_PROXY_CA_BUNDLE
+                          Path to a PEM CA bundle trusted for the corporate
+                          proxy: the TLS handshake with an https:// proxy
+                          and, for TLS-intercepting proxies, the re-signed
+                          upstream certificates. Requires a proxy URL.
 
 Docker and VM runs delegate to gateway:docker and gateway:vm setup scripts.
 EOF
@@ -417,6 +423,9 @@ EOF
           printf 'proxy_connect_by_hostname = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME}")" >>"${CONFIG_PATH}"
           ;;
       esac
+    fi
+    if [[ -n "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE+x}" ]]; then
+      printf 'proxy_ca_bundle = "%s"\n' "$(toml_escape "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE}")" >>"${CONFIG_PATH}"
     fi
     ;;
 esac

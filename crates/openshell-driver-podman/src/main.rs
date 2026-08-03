@@ -133,6 +133,13 @@ struct Args {
     /// SSRF/`allowed_ips` validation no longer binds the connection.
     #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME")]
     sandbox_proxy_connect_by_hostname: Option<bool>,
+
+    /// Path (on the gateway host) to a PEM CA bundle trusted for the corporate
+    /// proxy: the TLS handshake with an `https://` proxy and, for
+    /// TLS-intercepting proxies, re-signed upstream certificates. Bind-mounted
+    /// read-only into the sandbox. Only meaningful with `--sandbox-https-proxy`.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CA_BUNDLE")]
+    sandbox_proxy_ca_bundle: Option<String>,
 }
 
 #[tokio::main]
@@ -168,6 +175,7 @@ async fn main() -> Result<()> {
         proxy_auth_file: args.sandbox_proxy_auth_file,
         proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
         proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
+        proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
         ..PodmanComputeConfig::default()
     })
     .await
