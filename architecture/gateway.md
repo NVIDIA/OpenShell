@@ -37,6 +37,27 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
+Docker and Podman may negotiate additional listeners that make the gateway
+reachable from their local sandbox network topology. Those listeners accept
+only gRPC methods classified as sandbox-callable by the gateway's generated
+authorization metadata. They reject user and administrator APIs, health,
+reflection, non-callback inference APIs, and HTTP routes before normal request
+authentication. The operator-configured primary listener retains the full
+multiplexed API surface.
+
+The gateway rejects a callback requirement that resolves to the exact primary
+listener address because one socket cannot preserve two authorization scopes.
+A wildcard primary listener may cover a callback address because the accepted
+connection's concrete local address still selects the callback-only scope.
+
+The `rpc_auth` classification is also the source of truth for negotiated
+listener exposure: marking an RPC as `sandbox` or `dual` makes it callable on
+these listeners. Review such changes as both authorization and network-surface
+changes. Listener requirements are currently authorized only for the built-in
+Docker and Podman drivers. Operator-granted listener capabilities for external
+drivers are tracked in
+[#2539](https://github.com/NVIDIA/OpenShell/issues/2539).
+
 Operators can configure a gateway-wide gRPC request rate limit. The limit is
 applied only to gRPC API traffic after protocol multiplexing; health, metrics,
 and local sandbox-service HTTP routes are not rate limited by this control.
@@ -157,8 +178,15 @@ does not grant sandbox identity. Kubernetes deployments use the
 gateway-minted JWT bootstrap path: the supervisor starts with a projected
 ServiceAccount token, exchanges it for a gateway-minted sandbox JWT, and uses
 that JWT on subsequent gateway RPCs.
-User-facing mutations are authorized by role policy when OIDC or edge identity
-is enabled.
+User-facing RPCs are authorized by descriptor-declared role and scope policy
+when OIDC or edge identity is enabled. The OIDC admin role grants platform-wide
+access and bypasses workspace membership checks. Workspace Admin and Workspace
+User roles are durable membership records keyed by workspace and authenticated
+subject. Handlers resolve the resource workspace and require sufficient
+membership after the middleware validates the global role and optional scope.
+The authenticated `GetCurrentUser` endpoint exposes the gateway's validated
+user subject, display name, roles, scopes, and identity provider for CLI
+identity inspection without client-side token decoding.
 
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only
@@ -596,6 +624,37 @@ Driver-specific values that are not part of the inheritance allowlist
 (e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
 table.
 
+### OTLP export
+
+The gateway already uses Rust's `tracing` framework for structured log events
+and request-span context consumed by stdout and the sandbox log bus. OTLP export
+adds an OpenTelemetry layer to the same subscriber. That layer turns selected
+`tracing` spans into distributed traces; it does not export log events or
+replace the existing logging paths.
+
+`[openshell.gateway.otlp]` is the only enablement path for OpenTelemetry
+export: the table's presence is the on-switch, and `OTEL_EXPORTER_OTLP_ENDPOINT`
+is ignored so enablement has a single source. TOML decides whether and where
+to export; the SDK's `OTEL_*` variables tune how. Transport is OTLP over gRPC
+only. Shared provider, resource, and tracing-layer construction lives in
+`openshell-otel`.
+
+Span emission requires no per-handler instrumentation. The `tower_http`
+`TraceLayer` in `multiplex.rs` opens a span per inbound request, and that span
+continues incoming W3C trace context when present or starts a new trace
+otherwise. It is named for the RPC and carries the request ID that also appears
+in the gateway's logs — the identifier that lets an operator pivot between a
+trace and its log lines. Store and compute-driver spans become children of the
+request span. Reconciliation, provider refresh, and driver-watch loops create
+their own operation spans because they have no inbound request to provide a
+parent. gRPC status is recorded when response trailers arrive.
+
+Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
+failure stops the gateway from serving: a malformed endpoint is logged at
+startup and disables export. Export is best-effort — the SDK logs runtime
+failures, and a failed batch is dropped rather than retried. Buffered spans
+flush after the server loop exits so `SIGTERM` does not drop in-flight traces.
+
 ### Package-managed gateway registry
 
 The CLI reads its active-gateway and per-gateway metadata from
@@ -623,7 +682,12 @@ system entry instead of pretending to delete package-manager owned state.
 - Podman-backed macOS gateways use gvproxy's host-loopback IP for sandbox host
   aliases by default so stale Podman machine images do not need Podman's
   `host-gateway` resolver. Linux Podman keeps the resolver unless
-  `host_gateway_ip` is configured.
+  `host_gateway_ip` is configured. Rootful Podman can request its exact bridge
+  gateway listener. Rootless Podman explicitly reporting pasta requests the
+  private IPv4 source selected by the host default route rather than an
+  arbitrary private interface. Slirp4netns, other helpers, and missing helper
+  metadata fail closed for local callbacks until a rootless-network namespace
+  relay is available.
 - Gateway restarts recover persisted objects from storage, but live relay
   streams must be re-established by supervisors.
 - User-facing behavior changes must update published docs in `docs/`; this file

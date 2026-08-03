@@ -33,6 +33,13 @@ struct TestOpenShell;
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn get_current_user(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
+    ) -> Result<Response<openshell_core::proto::GetCurrentUserResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn health(
         &self,
         _request: tonic::Request<HealthRequest>,

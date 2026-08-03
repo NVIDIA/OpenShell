@@ -727,7 +727,9 @@ An exact IP is treated as `/32` — only that specific address is permitted.
 **Agent workflow**:
 
 1. Read `sandbox-policy.yaml`
-2. Check that no existing policy already covers `api.github.com:443` — if one does, warn about overlap
+2. Check existing selectors for `api.github.com:443`. Compatible overlaps may
+   aggregate request rules; revise equally specific overlaps that disagree on
+   TLS, destination, protocol/parser, enforcement, or credential behavior.
 3. Check that the key `github_readonly` doesn't already exist
 4. Insert the new policy under `network_policies`:
 

@@ -47,19 +47,65 @@ cmd_start() {
 
     echo "Starting Keycloak ($KEYCLOAK_IMAGE) on port $KEYCLOAK_PORT..."
 
+    local port_args=(-p "${KEYCLOAK_PORT}:8080")
+    local network_args=()
+    local keycloak_args=(start-dev --import-realm)
+    local mount_args=(-v "${REALM_FILE}:/opt/keycloak/data/import/realm.json:ro,z")
+
+    # In containerized CI (GitHub Actions with a job container), the Docker
+    # CLI talks to the host daemon via a mounted socket. Port publishing
+    # lands on the host, not inside this container. Share the job
+    # container's network namespace so Keycloak is reachable on localhost.
+    if [ "${GITHUB_ACTIONS:-}" = "true" ] &&
+       [ -f /.dockerenv ] &&
+       [ "$CTR" = "docker" ] &&
+       $CTR inspect "$(hostname)" >/dev/null 2>&1; then
+        port_args=()
+        network_args=(--network "container:$(hostname)" --cap-drop ALL --security-opt no-new-privileges)
+        keycloak_args=(start-dev --http-host=127.0.0.1 --http-port="${KEYCLOAK_PORT}" --import-realm)
+
+        # The Docker daemon runs on the runner host. /__w exists only
+        # inside the job container; /home/runner/_work is mounted at the
+        # same path in both namespaces.
+        case "$REALM_FILE" in
+            /__w/*)
+                local host_realm_file="/home/runner/_work/${REALM_FILE#/__w/}"
+                ;;
+            *)
+                echo "Error: unexpected GitHub workspace path: $REALM_FILE" >&2
+                exit 1
+                ;;
+        esac
+
+        if [ ! -f "$host_realm_file" ]; then
+            echo "Error: host-visible realm file not found: $host_realm_file" >&2
+            exit 1
+        fi
+
+        # --mount fails when the source is absent; -v would silently create
+        # a directory and let Keycloak start without importing the realm.
+        mount_args=(
+            --mount
+            "type=bind,src=${host_realm_file},dst=/opt/keycloak/data/import/realm.json,readonly"
+        )
+    fi
+
     $CTR run -d \
         --name "$CONTAINER_NAME" \
-        -p "${KEYCLOAK_PORT}:8080" \
+        "${network_args[@]}" \
+        "${port_args[@]}" \
         -e KEYCLOAK_ADMIN=admin \
         -e KEYCLOAK_ADMIN_PASSWORD=admin \
-        -v "${REALM_FILE}:/opt/keycloak/data/import/realm.json:ro,z" \
+        "${mount_args[@]}" \
         "$KEYCLOAK_IMAGE" \
-        start-dev --import-realm
+        "${keycloak_args[@]}"
 
     echo "Waiting for Keycloak to become healthy (up to ${HEALTH_TIMEOUT}s)..."
     local elapsed=0
     while [ $elapsed -lt $HEALTH_TIMEOUT ]; do
-        if curl -sf "http://localhost:${KEYCLOAK_PORT}/realms/master" >/dev/null 2>&1; then
+        if curl -sf \
+            "http://localhost:${KEYCLOAK_PORT}/realms/openshell/.well-known/openid-configuration" \
+            >/dev/null 2>&1; then
             echo "Keycloak is ready."
             print_info
             return 0
@@ -109,6 +155,7 @@ print_info() {
     echo "  Test users:"
     echo "    admin@test / admin  (role: openshell-admin)"
     echo "    user@test  / user   (role: openshell-user)"
+    echo "    user-b@test / user-b (role: openshell-user)"
     echo ""
     echo "  Get a token:"
     echo "    curl -s -X POST ${issuer}/protocol/openid-connect/token \\"

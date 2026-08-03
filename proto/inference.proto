@@ -12,23 +12,44 @@ import "options.proto";
 service Inference {
   // Return the resolved inference route bundle for sandbox-local execution.
   rpc GetInferenceBundle(GetInferenceBundleRequest)
-      returns (GetInferenceBundleResponse);
+      returns (GetInferenceBundleResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
 
   // Set the inference route for a workspace.
   //
   // This controls how requests sent to `inference.local` are routed
   // for sandboxes in the specified workspace.
   rpc SetInferenceRoute(SetInferenceRouteRequest)
-      returns (SetInferenceRouteResponse);
+      returns (SetInferenceRouteResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "inference:write"
+      workspace_role: "admin"
+    };
+  }
 
   // Get the inference route for a workspace.
   rpc GetInferenceRoute(GetInferenceRouteRequest)
-      returns (GetInferenceRouteResponse);
+      returns (GetInferenceRouteResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "inference:read"
+      workspace_role: "user"
+    };
+  }
 
   // Delete an inference route from a workspace.
   rpc DeleteInferenceRoute(DeleteInferenceRouteRequest)
-      returns (DeleteInferenceRouteResponse);
-
+      returns (DeleteInferenceRouteResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "inference:write"
+      workspace_role: "admin"
+    };
+  }
 }
 
 // Persisted inference route configuration.

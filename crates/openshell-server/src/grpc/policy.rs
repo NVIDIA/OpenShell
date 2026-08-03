@@ -12,6 +12,9 @@
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
+use crate::auth::workspace_authz::{
+    MinWorkspaceRole, authorize_sandbox_workspace, authorize_workspace, require_platform_admin,
+};
 use crate::persistence::{
     DraftChunkRecord, ObjectId, ObjectName, ObjectType, ObjectWorkspace, PolicyRecord, Store,
 };
@@ -984,9 +987,27 @@ async fn auto_approve_chunk(
         return Ok(());
     }
 
-    let (version, hash) =
-        merge_chunk_into_policy(state.store.as_ref(), sandbox_id, context.workspace, &chunk)
-            .await?;
+    let provider_names = context
+        .sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.as_slice())
+        .unwrap_or_default();
+    let provider_layers = provider_policy_layers_for_sandbox(
+        state,
+        context.workspace,
+        context.sandbox,
+        provider_names,
+    )
+    .await?;
+    let (version, hash) = merge_chunk_into_policy(
+        state.store.as_ref(),
+        sandbox_id,
+        context.workspace,
+        &chunk,
+        &provider_layers,
+    )
+    .await?;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
@@ -1086,6 +1107,168 @@ async fn current_effective_policy_for_sandbox(
     }
 
     Ok(policy)
+}
+
+fn validate_endpoint_ambiguities(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
+    let ambiguities = openshell_policy::find_endpoint_ambiguities(policy);
+    if ambiguities.is_empty() {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(format!(
+        "network endpoint ambiguity validation failed:\n{}",
+        ambiguities
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    )))
+}
+
+pub(super) fn validate_candidate_effective_policy(
+    base_policy: &ProtoSandboxPolicy,
+    provider_layers: &[ProviderPolicyLayer],
+) -> Result<(), Status> {
+    let effective_policy = if provider_layers.is_empty() {
+        base_policy.clone()
+    } else {
+        compose_effective_policy(base_policy, provider_layers)
+    };
+    validate_endpoint_ambiguities(&effective_policy)
+}
+
+async fn provider_policy_layers_for_sandbox(
+    state: &ServerState,
+    workspace: &str,
+    sandbox: &Sandbox,
+    provider_names: &[String],
+) -> Result<Vec<ProviderPolicyLayer>, Status> {
+    let global_settings = load_global_settings(state.store.as_ref()).await?;
+    if decode_policy_from_global_settings(&global_settings)?.is_some()
+        || !bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?
+    {
+        return Ok(Vec::new());
+    }
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    let layers = profile_provider_policy_layers_with_catalog(
+        state.store.as_ref(),
+        &catalog,
+        workspace,
+        provider_names,
+    )
+    .await?;
+    debug!(
+        sandbox_id = %sandbox.object_id(),
+        provider_layer_count = layers.len(),
+        "Composed candidate provider policy layers for ambiguity validation"
+    );
+    Ok(layers)
+}
+
+pub(super) async fn current_base_policy_for_sandbox(
+    store: &Store,
+    sandbox: &Sandbox,
+) -> Result<ProtoSandboxPolicy, Status> {
+    if let Some(record) = store
+        .get_latest_policy(sandbox.object_id())
+        .await
+        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
+    {
+        return ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")));
+    }
+    Ok(sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.policy.clone())
+        .unwrap_or_default())
+}
+
+pub(super) async fn validate_candidate_provider_attachments(
+    state: &ServerState,
+    workspace: &str,
+    sandbox: &Sandbox,
+    provider_names: &[String],
+) -> Result<(), Status> {
+    let base_policy = current_base_policy_for_sandbox(state.store.as_ref(), sandbox).await?;
+    let provider_layers =
+        provider_policy_layers_for_sandbox(state, workspace, sandbox, provider_names).await?;
+    validate_candidate_effective_policy(&base_policy, &provider_layers)
+}
+
+pub(super) async fn provider_policy_composition_enabled(store: &Store) -> Result<bool, Status> {
+    let global_settings = load_global_settings(store).await?;
+    provider_policy_composition_enabled_in(&global_settings)
+}
+
+fn provider_policy_composition_enabled_in(settings: &StoredSettings) -> Result<bool, Status> {
+    Ok(decode_policy_from_global_settings(settings)?.is_none()
+        && bool_setting_enabled(settings, settings::PROVIDERS_V2_ENABLED_KEY)?)
+}
+
+async fn validate_provider_composition_for_existing_sandboxes(
+    state: &ServerState,
+) -> Result<(), Status> {
+    let mut offset = 0;
+    let mut catalogs = HashMap::<String, EffectiveProviderProfileCatalog>::new();
+
+    loop {
+        let sandboxes = state
+            .store
+            .list_all_messages::<Sandbox>(MAX_PAGE_SIZE, offset)
+            .await
+            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+        let page_len = sandboxes.len();
+
+        for sandbox in sandboxes {
+            let provider_names = sandbox
+                .spec
+                .as_ref()
+                .map(|spec| spec.providers.as_slice())
+                .unwrap_or_default();
+            if provider_names.is_empty() {
+                continue;
+            }
+
+            let workspace = sandbox.object_workspace().to_string();
+            if !catalogs.contains_key(&workspace) {
+                let catalog = state
+                    .provider_profile_sources
+                    .snapshot_catalog(state.store.as_ref(), &workspace)
+                    .await?;
+                catalogs.insert(workspace.clone(), catalog);
+            }
+            let catalog = catalogs
+                .get(&workspace)
+                .expect("catalog was inserted for sandbox workspace");
+            let base_policy =
+                current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
+            let provider_layers = profile_provider_policy_layers_with_catalog(
+                state.store.as_ref(),
+                catalog,
+                &workspace,
+                provider_names,
+            )
+            .await?;
+            validate_candidate_effective_policy(&base_policy, &provider_layers).map_err(|error| {
+                Status::failed_precondition(format!(
+                    "cannot activate provider policy composition: sandbox '{}/{}' has an invalid effective policy: {}",
+                    workspace,
+                    sandbox.object_name(),
+                    error.message()
+                ))
+            })?;
+        }
+
+        if page_len < MAX_PAGE_SIZE as usize {
+            break;
+        }
+        offset = offset.saturating_add(MAX_PAGE_SIZE);
+    }
+
+    Ok(())
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
@@ -1267,16 +1450,13 @@ pub(super) async fn handle_get_sandbox_config(
     state: &Arc<ServerState>,
     request: Request<GetSandboxConfigRequest>,
 ) -> Result<Response<GetSandboxConfigResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let sandbox_id = request.get_ref().sandbox_id.clone();
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     drop(request);
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox =
+        super::sandbox::fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
     let workspace = sandbox.object_workspace().to_string();
     let sandbox_provider_names = sandbox
         .spec
@@ -1423,11 +1603,12 @@ pub(super) async fn handle_get_sandbox_config(
     let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
     let supervisor_middleware_services =
         state.middleware_registry.required_services(policy.as_ref());
-    let config_revision = compute_config_revision(
+    let config_revision = compute_config_revision_with_validation_mode(
         policy.as_ref(),
         &settings,
         policy_source,
         &supervisor_middleware_services,
+        state.config.policy_validation_failure_mode,
     );
     let provider_env_revision = compute_provider_env_revision_with_catalog(
         state.store.as_ref(),
@@ -1448,6 +1629,11 @@ pub(super) async fn handle_get_sandbox_config(
         provider_env_revision,
         supervisor_middleware_services,
         workspace,
+        policy_validation_failure_mode: state
+            .config
+            .policy_validation_failure_mode
+            .as_str()
+            .to_string(),
     }))
 }
 
@@ -1661,12 +1847,12 @@ pub(super) async fn handle_update_config(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
-    let principal = request.extensions().get::<Principal>().cloned();
-    let sandbox_caller = matches!(principal, Some(Principal::Sandbox(_)));
+    let principal = super::extract_principal(&request)?;
+    let sandbox_caller = matches!(&principal, Principal::Sandbox(_));
     let update = request.get_ref();
     let should_emit_policy_failure = should_emit_config_update_policy_telemetry(sandbox_caller)
         && (update.policy.is_some() || !update.merge_operations.is_empty());
-    let result = handle_update_config_inner(state, request, principal, sandbox_caller).await;
+    let result = handle_update_config_inner(state, request, &principal, sandbox_caller).await;
     if result.is_err() && should_emit_policy_failure {
         emit_sandbox_policy_update_failure();
     }
@@ -1676,22 +1862,38 @@ pub(super) async fn handle_update_config(
 async fn handle_update_config_inner(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
-    principal: Option<Principal>,
+    principal: &Principal,
     sandbox_caller: bool,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     let req = request.into_inner();
     validate_annotations(&req.annotations, "annotations")?;
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
+    let workspace = if req.global {
+        require_platform_admin(&state.admin_role, principal)?;
+        String::new()
+    } else {
+        let min_role = if sandbox_caller {
+            MinWorkspaceRole::User
+        } else {
+            MinWorkspaceRole::Admin
+        };
+        authorize_sandbox_workspace(
+            &state.store,
+            &state.admin_role,
+            principal,
+            &req.workspace,
+            min_role,
+        )
+        .await?;
+        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+            .await?
+            .name
+    };
     if sandbox_caller {
         validate_sandbox_caller_update(&req)?;
         resolve_sandbox_by_name_for_principal(
             state.store.as_ref(),
             &workspace,
-            principal
-                .as_ref()
-                .expect("sandbox_caller implies principal"),
+            principal,
             &req.name,
         )
         .await?;
@@ -1715,7 +1917,6 @@ async fn handle_update_config_inner(
             "one of policy, setting_key, or merge_operations must be provided",
         ));
     }
-
     if req.global {
         if !req.annotations.is_empty() {
             return Err(Status::invalid_argument(
@@ -1744,6 +1945,7 @@ async fn handle_update_config_inner(
             validate_policy_safety(&new_policy)?;
             crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy)
                 .await?;
+            validate_candidate_effective_policy(&new_policy, &[])?;
 
             let payload = new_policy.encode_to_vec();
             let hash = deterministic_policy_hash(&new_policy);
@@ -1846,9 +2048,30 @@ async fn handle_update_config_inner(
         }
 
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
+        let provider_composition_was_enabled =
+            provider_policy_composition_enabled_in(&global_settings)?;
         let changed = if req.delete_setting {
-            let removed = global_settings.settings.remove(key).is_some();
-            if removed
+            global_settings.settings.remove(key).is_some()
+        } else {
+            let setting = req
+                .setting_value
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
+            let stored = proto_setting_to_stored(key, setting)?;
+            upsert_setting_value(&mut global_settings.settings, key, stored)
+        };
+
+        if changed {
+            let provider_composition_is_enabled =
+                provider_policy_composition_enabled_in(&global_settings)?;
+            if !provider_composition_was_enabled && provider_composition_is_enabled {
+                validate_provider_composition_for_existing_sandboxes(state).await?;
+            }
+
+            global_settings.revision = global_settings.revision.wrapping_add(1);
+            save_global_settings(state.store.as_ref(), &global_settings).await?;
+
+            if req.delete_setting
                 && key == POLICY_SETTING_KEY
                 && let Ok(Some(latest)) = state
                     .store
@@ -1860,19 +2083,6 @@ async fn handle_update_config_inner(
                     .supersede_older_policies(GLOBAL_POLICY_SANDBOX_ID, latest.version + 1)
                     .await;
             }
-            removed
-        } else {
-            let setting = req
-                .setting_value
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
-            let stored = proto_setting_to_stored(key, setting)?;
-            upsert_setting_value(&mut global_settings.settings, key, stored)
-        };
-
-        if changed {
-            global_settings.revision = global_settings.revision.wrapping_add(1);
-            save_global_settings(state.store.as_ref(), &global_settings).await?;
         }
 
         return Ok(update_config_response(
@@ -2010,6 +2220,9 @@ async fn handle_update_config_inner(
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
         let merge_ops = parse_merge_operations(&req.merge_operations)?;
         validate_merge_operations_for_server(&merge_ops)?;
+        let provider_layers =
+            provider_policy_layers_for_sandbox(state, &workspace, &sandbox, &spec.providers)
+                .await?;
         let atomic_context = AtomicPolicyWriteContext {
             expected_resource_version: req.expected_resource_version,
             provenance: &req.annotations,
@@ -2025,6 +2238,7 @@ async fn handle_update_config_inner(
             &workspace,
             baseline_policy.as_ref(),
             &merge_ops,
+            &provider_layers,
             Some(&atomic_context),
         )
         .await?;
@@ -2128,6 +2342,9 @@ async fn handle_update_config_inner(
 
     validate_policy_safety(&new_policy)?;
     crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy).await?;
+    let provider_layers =
+        provider_policy_layers_for_sandbox(state, &workspace, &sandbox, &spec.providers).await?;
+    validate_candidate_effective_policy(&new_policy, &provider_layers)?;
 
     let _sandbox_sync_guard = if backfill_policy.is_some() {
         Some(state.compute.sandbox_sync_guard().await)
@@ -2218,6 +2435,7 @@ async fn handle_update_config_inner(
         })?
     };
     response_annotations = committed_annotations;
+    state.sandbox_watch_bus.notify(&sandbox_id);
 
     if backfill_policy.is_some() {
         info!(
@@ -2295,11 +2513,21 @@ pub(super) async fn handle_get_sandbox_policy_status(
     state: &Arc<ServerState>,
     request: Request<GetSandboxPolicyStatusRequest>,
 ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = if req.global {
+        require_platform_admin(&state.admin_role, &principal)?;
         String::new()
     } else {
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        let authz = authorize_workspace(
+            &state.store,
+            &state.admin_role,
+            &principal,
+            &req.workspace,
+            MinWorkspaceRole::User,
+        )
+        .await?;
+        super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
             .await?
             .name
     };
@@ -2353,11 +2581,21 @@ pub(super) async fn handle_list_sandbox_policies(
     state: &Arc<ServerState>,
     request: Request<ListSandboxPoliciesRequest>,
 ) -> Result<Response<ListSandboxPoliciesResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = if req.global {
+        require_platform_admin(&state.admin_role, &principal)?;
         String::new()
     } else {
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        let authz = authorize_workspace(
+            &state.store,
+            &state.admin_role,
+            &principal,
+            &req.workspace,
+            MinWorkspaceRole::User,
+        )
+        .await?;
+        super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
             .await?
             .name
     };
@@ -2476,20 +2714,17 @@ pub(super) async fn handle_report_policy_status(
 // Sandbox logs handlers
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::unused_async)] // Must be async to match the trait signature
 pub(super) async fn handle_get_sandbox_logs(
     state: &Arc<ServerState>,
     request: Request<GetSandboxLogsRequest>,
 ) -> Result<Response<GetSandboxLogsResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    // TODO(phase2): workspace is resolved but not used for authorization.
-    // Verify the sandbox belongs to this workspace before returning logs.
-    let _workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
-        .await?
-        .name;
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
+    let _sandbox =
+        super::sandbox::fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
     let lines = if req.lines == 0 { 2000 } else { req.lines };
     let tail = state.tracing_log_bus.tail(&req.sandbox_id, lines as usize);
@@ -2894,6 +3129,14 @@ pub(super) async fn handle_get_draft_policy(
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let req = request.into_inner();
+    authorize_sandbox_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
         .await?
         .name;
@@ -2965,8 +3208,17 @@ async fn handle_approve_draft_chunk_inner(
     state: &Arc<ServerState>,
     request: Request<ApproveDraftChunkRequest>,
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
     if req.name.is_empty() {
@@ -3012,8 +3264,21 @@ async fn handle_approve_draft_chunk_inner(
         "ApproveDraftChunk: merging rule into active policy"
     );
 
-    let (version, hash) =
-        merge_chunk_into_policy(state.store.as_ref(), &sandbox_id, &workspace, &chunk).await?;
+    let provider_names = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.as_slice())
+        .unwrap_or_default();
+    let provider_layers =
+        provider_policy_layers_for_sandbox(state, &workspace, &sandbox, provider_names).await?;
+    let (version, hash) = merge_chunk_into_policy(
+        state.store.as_ref(),
+        &sandbox_id,
+        &workspace,
+        &chunk,
+        &provider_layers,
+    )
+    .await?;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
@@ -3068,8 +3333,17 @@ async fn handle_reject_draft_chunk_inner(
     state: &Arc<ServerState>,
     request: Request<RejectDraftChunkRequest>,
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
     if req.name.is_empty() {
@@ -3169,8 +3443,17 @@ async fn handle_approve_all_draft_chunks_inner(
     state: &Arc<ServerState>,
     request: Request<ApproveAllDraftChunksRequest>,
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
     if req.name.is_empty() {
@@ -3208,6 +3491,33 @@ async fn handle_approve_all_draft_chunks_inner(
     let mut chunks_skipped: u32 = 0;
     let mut last_version: i64 = 0;
     let mut last_hash = String::new();
+    let provider_names = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.as_slice())
+        .unwrap_or_default();
+    let provider_layers =
+        provider_policy_layers_for_sandbox(state, &workspace, &sandbox, provider_names).await?;
+    let mut bulk_candidate =
+        current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
+    for chunk in &pending_chunks {
+        let security_notes = current_draft_chunk_security_notes(chunk)?;
+        if !req.include_security_flagged && !security_notes.is_empty() {
+            continue;
+        }
+        let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
+            .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
+        let operations = [PolicyMergeOp::AddRule {
+            rule_name: chunk.rule_name.clone(),
+            rule,
+        }];
+        validate_merge_operations_for_server(&operations)?;
+        bulk_candidate = merge_policy(bulk_candidate, &operations)
+            .map_err(map_policy_merge_error)?
+            .policy;
+    }
+    validate_policy_safety(&bulk_candidate)?;
+    validate_candidate_effective_policy(&bulk_candidate, &provider_layers)?;
 
     for chunk in &pending_chunks {
         let security_notes = current_draft_chunk_security_notes(chunk)?;
@@ -3232,8 +3542,14 @@ async fn handle_approve_all_draft_chunks_inner(
             "ApproveAllDraftChunks: merging chunk"
         );
 
-        let (version, hash) =
-            merge_chunk_into_policy(state.store.as_ref(), &sandbox_id, &workspace, chunk).await?;
+        let (version, hash) = merge_chunk_into_policy(
+            state.store.as_ref(),
+            &sandbox_id,
+            &workspace,
+            chunk,
+            &provider_layers,
+        )
+        .await?;
         last_version = version;
         last_hash = hash;
         let chunk_summary = summarize_draft_chunk_rule(chunk)?;
@@ -3294,8 +3610,17 @@ pub(super) async fn handle_edit_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<EditDraftChunkRequest>,
 ) -> Result<Response<EditDraftChunkResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
     if req.name.is_empty() {
@@ -3361,8 +3686,17 @@ async fn handle_undo_draft_chunk_inner(
     state: &Arc<ServerState>,
     request: Request<UndoDraftChunkRequest>,
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
     if req.name.is_empty() {
@@ -3449,8 +3783,17 @@ pub(super) async fn handle_clear_draft_chunks(
     state: &Arc<ServerState>,
     request: Request<ClearDraftChunksRequest>,
 ) -> Result<Response<ClearDraftChunksResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
     if req.name.is_empty() {
@@ -3488,8 +3831,17 @@ pub(super) async fn handle_get_draft_history(
     state: &Arc<ServerState>,
     request: Request<GetDraftHistoryRequest>,
 ) -> Result<Response<GetDraftHistoryResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
     if req.name.is_empty() {
@@ -3587,14 +3939,16 @@ fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
 }
 
 /// Compute a fingerprint for the effective sandbox configuration.
-fn compute_config_revision(
+fn compute_config_revision_with_validation_mode(
     policy: Option<&ProtoSandboxPolicy>,
     settings: &HashMap<String, EffectiveSetting>,
     policy_source: PolicySource,
     supervisor_middleware_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    policy_validation_failure_mode: openshell_core::PolicyValidationFailureMode,
 ) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update((policy_source as i32).to_le_bytes());
+    hasher.update(policy_validation_failure_mode.as_str().as_bytes());
     if let Some(policy) = policy {
         hasher.update(deterministic_policy_hash(policy).as_bytes());
     }
@@ -3634,6 +3988,22 @@ fn compute_config_revision(
     let mut bytes = [0_u8; 8];
     bytes.copy_from_slice(&digest[..8]);
     u64::from_le_bytes(bytes)
+}
+
+#[cfg(test)]
+fn compute_config_revision(
+    policy: Option<&ProtoSandboxPolicy>,
+    settings: &HashMap<String, EffectiveSetting>,
+    policy_source: PolicySource,
+    supervisor_middleware_services: &[openshell_core::proto::SupervisorMiddlewareService],
+) -> u64 {
+    compute_config_revision_with_validation_mode(
+        policy,
+        settings,
+        policy_source,
+        supervisor_middleware_services,
+        openshell_core::PolicyValidationFailureMode::default(),
+    )
 }
 
 fn decode_draft_chunk_rule(record: &DraftChunkRecord) -> Result<Option<NetworkPolicyRule>, Status> {
@@ -4051,6 +4421,7 @@ async fn apply_merge_operations_with_retry(
     workspace: &str,
     baseline_policy: Option<&ProtoSandboxPolicy>,
     operations: &[PolicyMergeOp],
+    provider_layers: &[ProviderPolicyLayer],
     atomic_context: Option<&AtomicPolicyWriteContext<'_>>,
 ) -> Result<(i64, String, Option<Sandbox>), Status> {
     for attempt in 1..=MERGE_RETRY_LIMIT {
@@ -4074,6 +4445,7 @@ async fn apply_merge_operations_with_retry(
             validate_static_fields_unchanged(baseline_policy, &new_policy)?;
         }
         validate_policy_safety(&new_policy)?;
+        validate_candidate_effective_policy(&new_policy, provider_layers)?;
 
         if let Some(ref current) = latest
             && current.policy_hash == hash
@@ -4169,6 +4541,7 @@ pub(super) async fn merge_chunk_into_policy(
     sandbox_id: &str,
     workspace: &str,
     chunk: &DraftChunkRecord,
+    provider_layers: &[ProviderPolicyLayer],
 ) -> Result<(i64, String), Status> {
     let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
         .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
@@ -4177,9 +4550,17 @@ pub(super) async fn merge_chunk_into_policy(
         rule,
     }];
     validate_merge_operations_for_server(&operations)?;
-    apply_merge_operations_with_retry(store, sandbox_id, workspace, None, &operations, None)
-        .await
-        .map(|(version, hash, _)| (version, hash))
+    apply_merge_operations_with_retry(
+        store,
+        sandbox_id,
+        workspace,
+        None,
+        &operations,
+        provider_layers,
+        None,
+    )
+    .await
+    .map(|(version, hash, _)| (version, hash))
 }
 
 async fn remove_chunk_from_policy(
@@ -4197,6 +4578,7 @@ async fn remove_chunk_from_policy(
             rule_name: chunk.rule_name.clone(),
             binary_path: chunk.binary.clone(),
         }],
+        &[],
         None,
     )
     .await
@@ -4521,7 +4903,7 @@ mod tests {
     use crate::auth::principal::{
         Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
     };
-    use crate::grpc::test_support::test_server_state;
+    use crate::grpc::test_support::{authed_request, test_server_state};
     use crate::persistence::test_store;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -4780,6 +5162,154 @@ mod tests {
             },
         }));
         assert!(!is_sandbox_caller(&req));
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_logs_authorizes_persisted_sandbox_workspace() {
+        use openshell_core::proto::datamodel::v1::ObjectMeta;
+        use openshell_core::proto::{WorkspaceMember, WorkspaceRole};
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sandbox-b-id".to_string(),
+                name: "sandbox-b".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "workspace-b".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            ..Sandbox::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let member = WorkspaceMember {
+            metadata: Some(ObjectMeta {
+                id: "member-a-id".to_string(),
+                name: "test-user".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            principal_subject: "test-user".to_string(),
+            role: WorkspaceRole::User.into(),
+        };
+        state.store.put_message(&member).await.unwrap();
+
+        let error = handle_get_sandbox_logs(
+            &state,
+            with_user(Request::new(GetSandboxLogsRequest {
+                sandbox_id: "sandbox-b-id".to_string(),
+                workspace: "default".to_string(),
+                ..GetSandboxLogsRequest::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            Code::NotFound,
+            "cross-workspace sandbox access must return NotFound to prevent CWE-203 oracle"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_global_requires_platform_admin() {
+        use openshell_core::proto::datamodel::v1::ObjectMeta;
+        use openshell_core::proto::{WorkspaceMember, WorkspaceRole};
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        let member = WorkspaceMember {
+            metadata: Some(ObjectMeta {
+                id: "default-admin-member-id".to_string(),
+                name: "test-user".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            principal_subject: "test-user".to_string(),
+            role: WorkspaceRole::Admin.into(),
+        };
+        state.store.put_message(&member).await.unwrap();
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: "log_level".to_string(),
+                delete_setting: true,
+                ..UpdateConfigRequest::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn global_policy_reads_require_platform_admin() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        let get_error = handle_get_sandbox_policy_status(
+            &state,
+            with_user(Request::new(GetSandboxPolicyStatusRequest {
+                global: true,
+                ..GetSandboxPolicyStatusRequest::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(get_error.code(), Code::PermissionDenied);
+        assert!(get_error.message().contains("platform admin role required"));
+
+        let list_error = handle_list_sandbox_policies(
+            &state,
+            with_user(Request::new(ListSandboxPoliciesRequest {
+                global: true,
+                ..ListSandboxPoliciesRequest::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(list_error.code(), Code::PermissionDenied);
+        assert!(
+            list_error
+                .message()
+                .contains("platform admin role required")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_missing_principal() {
+        let state = test_server_state().await;
+
+        let error = handle_update_config(
+            &state,
+            Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: "log_level".to_string(),
+                delete_setting: true,
+                ..UpdateConfigRequest::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::Internal);
+        assert_eq!(error.message(), "missing principal");
     }
 
     #[test]
@@ -5154,6 +5684,14 @@ mod tests {
             .collect(),
             ..Default::default()
         }
+    }
+
+    fn test_ambiguous_policy() -> ProtoSandboxPolicy {
+        let mut left = test_policy_with_rule("left", "api.example.com");
+        left.network_policies.get_mut("left").unwrap().endpoints[0].tls = "skip".to_string();
+        let right = test_policy_with_rule("right", "api.example.com");
+        left.network_policies.extend(right.network_policies);
+        left
     }
 
     fn test_sandbox(
@@ -5858,6 +6396,171 @@ mod tests {
         );
     }
 
+    #[test]
+    fn candidate_effective_policy_rejects_provider_endpoint_ambiguity() {
+        let base = test_policy_with_rule("base", "api.example.com");
+        let mut provider_rule = test_policy_with_rule("provider", "api.example.com")
+            .network_policies
+            .remove("provider")
+            .unwrap();
+        provider_rule.endpoints[0].tls = "skip".to_string();
+        let layers = [ProviderPolicyLayer {
+            rule_name: "_provider_test".to_string(),
+            rule: provider_rule,
+        }];
+
+        let error = validate_candidate_effective_policy(&base, &layers)
+            .expect_err("provider composition must reject endpoint ambiguity");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("api.example.com"));
+        assert!(error.message().contains("tls"));
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_ambiguous_policy_before_persisting_revision() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox(
+            "sb-ambiguous-update",
+            "ambiguous-update",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "ambiguous-update".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(test_ambiguous_policy()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("ambiguous policy must fail before persistence");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("ambiguity validation failed"));
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-ambiguous-update")
+                .await
+                .unwrap()
+                .is_none(),
+            "invalid policy must not leave a revision in history"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_operations_reject_ambiguity_before_persisting_revision() {
+        let state = test_server_state().await;
+        let mut policy = test_ambiguous_policy();
+        policy.network_policies.get_mut("left").unwrap().endpoints[0].path = "/v1/*".to_string();
+        policy.network_policies.get_mut("right").unwrap().endpoints[0].path =
+            "/v1/users".to_string();
+        let operations = policy
+            .network_policies
+            .into_iter()
+            .map(|(rule_name, rule)| PolicyMergeOp::AddRule { rule_name, rule })
+            .collect::<Vec<_>>();
+
+        let error = apply_merge_operations_with_retry(
+            state.store.as_ref(),
+            "sb-ambiguous-merge",
+            "default",
+            None,
+            &operations,
+            &[],
+            None,
+        )
+        .await
+        .expect_err("ambiguous merge must fail before persistence");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-ambiguous-merge")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attachment_preflight_rejects_composed_ambiguity() {
+        use openshell_core::proto::{
+            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
+        };
+
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-ambiguous".to_string(),
+                    name: "ambiguous".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                profile: Some(ProviderProfile {
+                    id: "ambiguous".to_string(),
+                    display_name: "Ambiguous".to_string(),
+                    category: ProviderProfileCategory::Other as i32,
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        tls: "skip".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider("candidate-provider", "ambiguous"))
+            .await
+            .unwrap();
+        let sandbox = test_sandbox(
+            "sb-provider-ambiguity",
+            "provider-ambiguity",
+            test_policy_with_rule("base", "api.example.com"),
+            Vec::new(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = super::super::sandbox::handle_attach_sandbox_provider(
+            &state,
+            authed_request(openshell_core::proto::AttachSandboxProviderRequest {
+                sandbox_name: "provider-ambiguity".to_string(),
+                provider_name: "candidate-provider".to_string(),
+                expected_resource_version: 0,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("provider attachment must validate the composed policy");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("tls"));
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "provider-ambiguity")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.spec.unwrap().providers.is_empty());
+    }
+
     #[tokio::test]
     async fn sandbox_config_rejects_invalid_provider_composed_policy() {
         use openshell_core::proto::{
@@ -6510,7 +7213,7 @@ mod tests {
 
         handle_detach_sandbox_provider(
             &state,
-            Request::new(DetachSandboxProviderRequest {
+            authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
@@ -6561,7 +7264,7 @@ mod tests {
         enable_providers_v2(&state).await;
         handle_import_provider_profiles(
             &state,
-            Request::new(ImportProviderProfilesRequest {
+            authed_request(ImportProviderProfilesRequest {
                 profiles: vec![ProviderProfileImportItem {
                     source: "custom-api.yaml".to_string(),
                     profile: Some(ProviderProfile {
@@ -6681,7 +7384,7 @@ mod tests {
 
         handle_detach_sandbox_provider(
             &state,
-            Request::new(DetachSandboxProviderRequest {
+            authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-custom".to_string(),
                 expected_resource_version: 0,
@@ -7515,7 +8218,7 @@ mod tests {
 
         let approve = handle_approve_draft_chunk(
             &state,
-            Request::new(ApproveDraftChunkRequest {
+            authed_request(ApproveDraftChunkRequest {
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace: "default".to_string(),
@@ -7529,7 +8232,7 @@ mod tests {
 
         let history_after_approve = handle_get_draft_history(
             &state,
-            Request::new(GetDraftHistoryRequest {
+            authed_request(GetDraftHistoryRequest {
                 name: sandbox_name.clone(),
                 workspace: "default".to_string(),
             }),
@@ -7544,7 +8247,7 @@ mod tests {
 
         let policies_after_approve = handle_list_sandbox_policies(
             &state,
-            Request::new(ListSandboxPoliciesRequest {
+            authed_request(ListSandboxPoliciesRequest {
                 name: sandbox_name.clone(),
                 limit: 10,
                 offset: 0,
@@ -7560,7 +8263,7 @@ mod tests {
 
         let undo = handle_undo_draft_chunk(
             &state,
-            Request::new(UndoDraftChunkRequest {
+            authed_request(UndoDraftChunkRequest {
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace: "default".to_string(),
@@ -7588,7 +8291,7 @@ mod tests {
 
         let history_after_undo = handle_get_draft_history(
             &state,
-            Request::new(GetDraftHistoryRequest {
+            authed_request(GetDraftHistoryRequest {
                 name: sandbox_name.clone(),
                 workspace: "default".to_string(),
             }),
@@ -7601,7 +8304,7 @@ mod tests {
 
         let policies_after_undo = handle_list_sandbox_policies(
             &state,
-            Request::new(ListSandboxPoliciesRequest {
+            authed_request(ListSandboxPoliciesRequest {
                 name: sandbox_name.clone(),
                 limit: 10,
                 offset: 0,
@@ -7618,7 +8321,7 @@ mod tests {
 
         let cleared = handle_clear_draft_chunks(
             &state,
-            Request::new(ClearDraftChunksRequest {
+            authed_request(ClearDraftChunksRequest {
                 name: sandbox_name.clone(),
                 workspace: "default".to_string(),
             }),
@@ -7643,7 +8346,7 @@ mod tests {
 
         let history_after_clear = handle_get_draft_history(
             &state,
-            Request::new(GetDraftHistoryRequest {
+            authed_request(GetDraftHistoryRequest {
                 name: sandbox_name,
                 workspace: "default".to_string(),
             }),
@@ -7718,7 +8421,7 @@ mod tests {
         let guidance = "scope to docs/ paths only, not all repo contents";
         handle_reject_draft_chunk(
             &state,
-            Request::new(RejectDraftChunkRequest {
+            authed_request(RejectDraftChunkRequest {
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 reason: guidance.to_string(),
@@ -9688,7 +10391,7 @@ mod tests {
         // exact path the smoke test exercises end-to-end.
         handle_reject_draft_chunk(
             &state,
-            Request::new(RejectDraftChunkRequest {
+            authed_request(RejectDraftChunkRequest {
                 name: sandbox_name,
                 chunk_id: second.accepted_chunk_ids[0].clone(),
                 reason: "redraft test".to_string(),
@@ -10144,7 +10847,7 @@ mod tests {
 
         handle_reject_draft_chunk(
             &state,
-            Request::new(RejectDraftChunkRequest {
+            authed_request(RejectDraftChunkRequest {
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 reason: "scope too broad".to_string(),
@@ -10156,7 +10859,7 @@ mod tests {
 
         handle_approve_draft_chunk(
             &state,
-            Request::new(ApproveDraftChunkRequest {
+            authed_request(ApproveDraftChunkRequest {
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace: "default".to_string(),
@@ -10167,7 +10870,7 @@ mod tests {
 
         handle_undo_draft_chunk(
             &state,
-            Request::new(UndoDraftChunkRequest {
+            authed_request(UndoDraftChunkRequest {
                 name: sandbox_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace: "default".to_string(),
@@ -10303,7 +11006,7 @@ mod tests {
 
         let approve_err = handle_approve_draft_chunk(
             &state,
-            Request::new(ApproveDraftChunkRequest {
+            authed_request(ApproveDraftChunkRequest {
                 name: other_name.clone(),
                 chunk_id: chunk_id.clone(),
                 workspace: "default".to_string(),
@@ -10315,7 +11018,7 @@ mod tests {
 
         let reject_err = handle_reject_draft_chunk(
             &state,
-            Request::new(RejectDraftChunkRequest {
+            authed_request(RejectDraftChunkRequest {
                 name: other_name.clone(),
                 chunk_id: chunk_id.clone(),
                 reason: "wrong sandbox".to_string(),
@@ -10328,7 +11031,7 @@ mod tests {
 
         let edit_err = handle_edit_draft_chunk(
             &state,
-            Request::new(EditDraftChunkRequest {
+            authed_request(EditDraftChunkRequest {
                 name: other_name.clone(),
                 chunk_id: chunk_id.clone(),
                 proposed_rule: Some(proposed_rule.clone()),
@@ -10341,7 +11044,7 @@ mod tests {
 
         handle_approve_draft_chunk(
             &state,
-            Request::new(ApproveDraftChunkRequest {
+            authed_request(ApproveDraftChunkRequest {
                 name: sandbox_a.object_name().to_string(),
                 chunk_id: chunk_id.clone(),
                 workspace: "default".to_string(),
@@ -10352,7 +11055,7 @@ mod tests {
 
         let undo_err = handle_undo_draft_chunk(
             &state,
-            Request::new(UndoDraftChunkRequest {
+            authed_request(UndoDraftChunkRequest {
                 name: other_name,
                 chunk_id,
                 workspace: "default".to_string(),
@@ -10574,9 +11277,10 @@ mod tests {
             rejection_reason: String::new(),
         };
 
-        let (version, _) = merge_chunk_into_policy(&store, &chunk.sandbox_id, "default", &chunk)
-            .await
-            .unwrap();
+        let (version, _) =
+            merge_chunk_into_policy(&store, &chunk.sandbox_id, "default", &chunk, &[])
+                .await
+                .unwrap();
 
         assert_eq!(version, 1);
 
@@ -10671,7 +11375,7 @@ mod tests {
             rejection_reason: String::new(),
         };
 
-        let (version, _) = merge_chunk_into_policy(&store, sandbox_id, "default", &chunk)
+        let (version, _) = merge_chunk_into_policy(&store, sandbox_id, "default", &chunk, &[])
             .await
             .unwrap();
         assert_eq!(version, 2);
@@ -10773,7 +11477,7 @@ mod tests {
             rejection_reason: String::new(),
         };
 
-        let (version, _) = merge_chunk_into_policy(&store, sandbox_id, "default", &chunk)
+        let (version, _) = merge_chunk_into_policy(&store, sandbox_id, "default", &chunk, &[])
             .await
             .unwrap();
         assert_eq!(version, 2);
@@ -10855,9 +11559,23 @@ mod tests {
 
         let (left, right) = tokio::join!(
             apply_merge_operations_with_retry(
-                &store, sandbox_id, "default", None, &add_allow, None
+                &store,
+                sandbox_id,
+                "default",
+                None,
+                &add_allow,
+                &[],
+                None
             ),
-            apply_merge_operations_with_retry(&store, sandbox_id, "default", None, &add_deny, None),
+            apply_merge_operations_with_retry(
+                &store,
+                sandbox_id,
+                "default",
+                None,
+                &add_deny,
+                &[],
+                None
+            ),
         );
 
         let mut versions = vec![left.unwrap().0, right.unwrap().0];
@@ -11244,6 +11962,159 @@ mod tests {
         assert!(err.message().contains("reserved '_provider_' prefix"));
     }
 
+    #[tokio::test]
+    async fn update_config_global_policy_rejects_ambiguity_before_persisting() {
+        let state = test_server_state().await;
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(test_ambiguous_policy()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("ambiguous global policy must fail before persistence");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            state
+                .store
+                .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let settings = load_global_settings(state.store.as_ref()).await.unwrap();
+        assert!(!settings.settings.contains_key(POLICY_SETTING_KEY));
+    }
+
+    async fn install_ambiguous_provider_binding(state: &Arc<ServerState>, suffix: &str) {
+        use openshell_core::proto::{
+            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
+        };
+
+        let profile_name = format!("ambiguous-{suffix}");
+        let provider_name = format!("provider-{suffix}");
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("profile-{suffix}"),
+                    name: profile_name.clone(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                profile: Some(ProviderProfile {
+                    id: profile_name.clone(),
+                    display_name: "Ambiguous".to_string(),
+                    category: ProviderProfileCategory::Other as i32,
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        tls: "skip".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider(&provider_name, &profile_name))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                &format!("sandbox-{suffix}"),
+                &format!("sandbox-{suffix}"),
+                test_policy_with_rule("base", "api.example.com"),
+                vec![provider_name],
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabling_provider_composition_rejects_existing_ambiguous_binding() {
+        let state = test_server_state().await;
+        install_ambiguous_provider_binding(&state, "enable").await;
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                setting_value: Some(SettingValue {
+                    value: Some(setting_value::Value::BoolValue(true)),
+                }),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("provider composition must be validated before activation");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("sandbox-enable"));
+        assert!(error.message().contains("tls"));
+        let settings = load_global_settings(state.store.as_ref()).await.unwrap();
+        assert!(!bool_setting_enabled(&settings, settings::PROVIDERS_V2_ENABLED_KEY).unwrap());
+    }
+
+    #[tokio::test]
+    async fn deleting_global_policy_rejects_reactivated_ambiguous_provider_binding() {
+        let state = test_server_state().await;
+        install_ambiguous_provider_binding(&state, "delete-policy").await;
+
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(test_policy_with_rule("global", "global.example.com")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("global policy should suppress provider composition");
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                setting_value: Some(SettingValue {
+                    value: Some(setting_value::Value::BoolValue(true)),
+                }),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("providers may be enabled while a global policy is active");
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: POLICY_SETTING_KEY.to_string(),
+                delete_setting: true,
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("global policy deletion must validate reactivated provider composition");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("sandbox-delete-policy"));
+        let settings = load_global_settings(state.store.as_ref()).await.unwrap();
+        assert!(settings.settings.contains_key(POLICY_SETTING_KEY));
+    }
+
     #[test]
     fn merge_effective_settings_global_overrides_sandbox_key() {
         let global = StoredSettings {
@@ -11489,6 +12360,28 @@ mod tests {
         let rev_a = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
         let rev_b = compute_config_revision(Some(&policy), &settings, PolicySource::Global, &[]);
         assert_ne!(rev_a, rev_b);
+    }
+
+    #[test]
+    fn config_revision_changes_when_validation_failure_mode_changes() {
+        let policy = ProtoSandboxPolicy::default();
+        let settings = HashMap::new();
+
+        let fail_closed = compute_config_revision_with_validation_mode(
+            Some(&policy),
+            &settings,
+            PolicySource::Sandbox,
+            &[],
+            openshell_core::PolicyValidationFailureMode::FailClosed,
+        );
+        let retain_last_valid = compute_config_revision_with_validation_mode(
+            Some(&policy),
+            &settings,
+            PolicySource::Sandbox,
+            &[],
+            openshell_core::PolicyValidationFailureMode::RetainLastValid,
+        );
+        assert_ne!(fail_closed, retain_last_valid);
     }
 
     #[test]
@@ -12098,7 +12991,7 @@ mod tests {
 
         let response = handle_update_config(
             &state,
-            Request::new(UpdateConfigRequest {
+            authed_request(UpdateConfigRequest {
                 name: "test-sandbox".to_string(),
                 policy: Some(new_policy),
                 setting_key: String::new(),
@@ -12193,7 +13086,7 @@ mod tests {
 
         let response = handle_update_config(
             &state,
-            Request::new(UpdateConfigRequest {
+            authed_request(UpdateConfigRequest {
                 name: "annotated-backfill".to_string(),
                 policy: Some(ProtoSandboxPolicy::default()),
                 setting_key: String::new(),
@@ -12265,10 +13158,11 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut watch_rx = state.sandbox_watch_bus.subscribe("sb-same-hash");
 
         let response = handle_update_config(
             &state,
-            Request::new(UpdateConfigRequest {
+            authed_request(UpdateConfigRequest {
                 name: "same-hash".to_string(),
                 policy: Some(policy),
                 annotations: HashMap::from([(
@@ -12283,6 +13177,16 @@ mod tests {
         .into_inner();
 
         assert_eq!(response.version, 2);
+        watch_rx
+            .try_recv()
+            .expect("new provenance revision must notify the sandbox watcher");
+        assert!(
+            matches!(
+                watch_rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "one committed revision must wake the sandbox watcher exactly once"
+        );
         assert_eq!(
             response
                 .annotations
@@ -12605,7 +13509,7 @@ mod tests {
 
         let response = handle_update_config(
             &state,
-            Request::new(UpdateConfigRequest {
+            authed_request(UpdateConfigRequest {
                 name: "preserve-backfill".to_string(),
                 policy: Some(ProtoSandboxPolicy::default()),
                 expected_resource_version: current_version,
@@ -12879,7 +13783,7 @@ mod tests {
 
         let err = handle_update_config(
             &state,
-            Request::new(UpdateConfigRequest {
+            authed_request(UpdateConfigRequest {
                 name: "test-sandbox".to_string(),
                 policy: Some(new_policy),
                 setting_key: String::new(),
@@ -12978,7 +13882,7 @@ mod tests {
             let handle = tokio::spawn(async move {
                 handle_update_config(
                     &state_clone,
-                    Request::new(UpdateConfigRequest {
+                    authed_request(UpdateConfigRequest {
                         name: "test-sandbox".to_string(),
                         policy: Some(new_policy),
                         setting_key: String::new(),
@@ -13042,6 +13946,292 @@ mod tests {
                 .len(),
             1,
             "concurrent backfills must create exactly one revision"
+        );
+    }
+
+    /// Non-member callers must receive `PERMISSION_DENIED` — not `NOT_FOUND` —
+    /// when targeting a workspace that does not exist. Returning `NOT_FOUND`
+    /// would create a CWE-203 workspace-name oracle.
+    #[tokio::test]
+    async fn non_member_gets_permission_denied_not_workspace_oracle() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        fn non_member_request<T>(inner: T) -> Request<T> {
+            let mut req = Request::new(inner);
+            req.extensions_mut().insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "non-member".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+            req
+        }
+
+        let err = handle_get_sandbox_policy_status(
+            &state,
+            non_member_request(GetSandboxPolicyStatusRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_get_sandbox_policy_status should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_list_sandbox_policies(
+            &state,
+            non_member_request(ListSandboxPoliciesRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_list_sandbox_policies should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_update_config(
+            &state,
+            non_member_request(UpdateConfigRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_update_config should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_get_draft_policy(
+            &state,
+            non_member_request(GetDraftPolicyRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_get_draft_policy should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_approve_draft_chunk(
+            &state,
+            non_member_request(ApproveDraftChunkRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_approve_draft_chunk should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_reject_draft_chunk(
+            &state,
+            non_member_request(RejectDraftChunkRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_reject_draft_chunk should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_approve_all_draft_chunks(
+            &state,
+            non_member_request(ApproveAllDraftChunksRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_approve_all_draft_chunks should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_edit_draft_chunk(
+            &state,
+            non_member_request(EditDraftChunkRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_edit_draft_chunk should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_undo_draft_chunk(
+            &state,
+            non_member_request(UndoDraftChunkRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_undo_draft_chunk should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_clear_draft_chunks(
+            &state,
+            non_member_request(ClearDraftChunksRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_clear_draft_chunks should return PermissionDenied, got {:?}",
+            err.code()
+        );
+
+        let err = handle_get_draft_history(
+            &state,
+            non_member_request(GetDraftHistoryRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_get_draft_history should return PermissionDenied, got {:?}",
+            err.code()
+        );
+    }
+
+    /// ID-based policy handlers must return `NOT_FOUND` — never
+    /// `PERMISSION_DENIED` — when the caller lacks workspace access, so that
+    /// cross-workspace sandbox existence cannot be inferred (CWE-203).
+    #[tokio::test]
+    async fn id_based_policy_handlers_hide_cross_workspace_sandboxes() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        fn non_member_request<T>(inner: T) -> Request<T> {
+            let mut req = Request::new(inner);
+            req.extensions_mut().insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "non-member".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+            req
+        }
+
+        let mut sandbox = test_sandbox(
+            "sandbox-other",
+            "other",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        sandbox.metadata.as_mut().unwrap().workspace = "other-workspace".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // --- handle_get_sandbox_config ---
+        let err = handle_get_sandbox_config(
+            &state,
+            non_member_request(GetSandboxConfigRequest {
+                sandbox_id: "sandbox-other".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::NotFound,
+            "handle_get_sandbox_config must return NotFound, not PermissionDenied"
+        );
+
+        // --- handle_get_sandbox_logs ---
+        let err = handle_get_sandbox_logs(
+            &state,
+            non_member_request(GetSandboxLogsRequest {
+                sandbox_id: "sandbox-other".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::NotFound,
+            "handle_get_sandbox_logs must return NotFound, not PermissionDenied"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_gateway_config_accessible_without_platform_admin() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        let mut req = Request::new(GetGatewayConfigRequest {});
+        req.extensions_mut().insert(Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: "workspace-user".to_string(),
+                display_name: None,
+                roles: vec![],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        }));
+
+        let response = handle_get_gateway_config(&state, req).await;
+        assert!(
+            response.is_ok(),
+            "GetGatewayConfig must not require Platform Admin; got {:?}",
+            response.unwrap_err()
         );
     }
 }

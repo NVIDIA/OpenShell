@@ -3,7 +3,8 @@
 
 //! Authentication-related RPC handlers.
 //!
-//! Hosts the two sandbox-identity RPCs:
+//! Hosts authenticated identity RPCs:
+//! - `GetCurrentUser` — report the gateway-validated caller identity
 //! - `IssueSandboxToken` — bootstrap exchange (K8s SA token → gateway JWT)
 //! - `RefreshSandboxToken` — renew a still-valid gateway JWT
 //!
@@ -12,14 +13,42 @@
 //! until their own `exp` and are bounded by the configured short TTL.
 
 use crate::ServerState;
+use crate::auth::identity::IdentityProvider;
 use crate::auth::principal::{Principal, SandboxIdentitySource};
 use openshell_core::proto::{
-    IssueSandboxTokenRequest, IssueSandboxTokenResponse, RefreshSandboxTokenRequest,
-    RefreshSandboxTokenResponse, Sandbox,
+    GetCurrentUserRequest, GetCurrentUserResponse, IssueSandboxTokenRequest,
+    IssueSandboxTokenResponse, RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, Sandbox,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
+
+#[allow(clippy::result_large_err, clippy::unused_async)]
+pub async fn handle_get_current_user(
+    request: Request<GetCurrentUserRequest>,
+) -> Result<Response<GetCurrentUserResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let Principal::User(user) = principal else {
+        return Err(Status::permission_denied(
+            "GetCurrentUser requires a user principal",
+        ));
+    };
+
+    let identity = user.identity;
+    Ok(Response::new(GetCurrentUserResponse {
+        subject: identity.subject,
+        display_name: identity.display_name.unwrap_or_default(),
+        roles: identity.roles,
+        scopes: identity.scopes,
+        identity_provider: match identity.provider {
+            IdentityProvider::Oidc => "oidc",
+            IdentityProvider::Mtls => "mtls",
+            IdentityProvider::CloudflareAccess => "cloudflare_access",
+            IdentityProvider::LocalDev => "local_dev",
+        }
+        .to_string(),
+    }))
+}
 
 #[allow(clippy::result_large_err, clippy::unused_async)]
 pub async fn handle_issue_sandbox_token(
@@ -145,6 +174,7 @@ async fn ensure_sandbox_exists(state: &Arc<ServerState>, sandbox_id: &str) -> Re
 mod tests {
     use super::*;
     use crate::ServerState;
+    use crate::auth::identity::Identity;
     use crate::auth::principal::{Principal, SandboxPrincipal, UserPrincipal};
     use crate::auth::sandbox_jwt::SandboxJwtIssuer;
     use crate::compute::new_test_runtime;
@@ -223,6 +253,30 @@ mod tests {
             },
             trust_domain: Some("openshell".to_string()),
         })
+    }
+
+    #[tokio::test]
+    async fn current_user_returns_gateway_validated_identity() {
+        let mut req = Request::new(GetCurrentUserRequest {});
+        req.extensions_mut().insert(Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: "oidc-subject-123".to_string(),
+                display_name: Some("Alice".to_string()),
+                roles: vec!["openshell-user".to_string()],
+                scopes: vec!["sandbox:read".to_string()],
+                provider: IdentityProvider::Oidc,
+            },
+        }));
+
+        let response = handle_get_current_user(req)
+            .await
+            .expect("current user")
+            .into_inner();
+        assert_eq!(response.subject, "oidc-subject-123");
+        assert_eq!(response.display_name, "Alice");
+        assert_eq!(response.roles, ["openshell-user"]);
+        assert_eq!(response.scopes, ["sandbox:read"]);
+        assert_eq!(response.identity_provider, "oidc");
     }
 
     #[tokio::test]

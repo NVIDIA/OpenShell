@@ -23,8 +23,10 @@ make_mock_gh() {
     local dir="$1"
     local existing_body="$2"
     local current_is_draft="${3:-false}"
+    local lookup_failure="${4:-}"
     export MOCK_EXISTING_BODY="$existing_body"
     export MOCK_CURRENT_IS_DRAFT="$current_is_draft"
+    export MOCK_LOOKUP_FAILURE="$lookup_failure"
 
     cat > "$dir/mock-gh" <<'MOCK'
 #!/usr/bin/env bash
@@ -33,11 +35,13 @@ set -euo pipefail
 printf '%s\n' "$*" >> "$MOCK_GH_LOG"
 
 if [[ "$1" == "api" && "$2" == "repos/NVIDIA/OpenShell/pulls/1865" ]]; then
+    [[ "$MOCK_LOOKUP_FAILURE" != "pull" ]] || exit 1
     jq -n --arg sha '0e4d7af7722fbedce2307d571b0c937a1eb3250f' --argjson draft "$MOCK_CURRENT_IS_DRAFT" '{head:{sha:$sha},draft:$draft}'
     exit 0
 fi
 
 if [[ "$1" == "api" && "$2" == "repos/NVIDIA/OpenShell/issues/1865/comments" ]]; then
+    [[ "$MOCK_LOOKUP_FAILURE" != "comments" ]] || exit 1
     if [[ -n "$MOCK_EXISTING_BODY" ]]; then
         jq -Rn --arg body "$MOCK_EXISTING_BODY" '$body'
     fi
@@ -45,6 +49,7 @@ if [[ "$1" == "api" && "$2" == "repos/NVIDIA/OpenShell/issues/1865/comments" ]];
 fi
 
 if [[ "$1" == "api" && "$2" == "repos/NVIDIA/OpenShell/pulls/1865/reviews" ]]; then
+    [[ "$MOCK_LOOKUP_FAILURE" != "reviews" ]] || exit 1
     exit 0
 fi
 
@@ -70,12 +75,13 @@ run_case() {
     local post_body="$3"
     local expected_status="$4"
     local current_is_draft="${5:-false}"
+    local lookup_failure="${6:-}"
 
     local tmp
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' RETURN
     export MOCK_GH_LOG="$tmp/gh.log"
-    make_mock_gh "$tmp" "$existing_body" "$current_is_draft"
+    make_mock_gh "$tmp" "$existing_body" "$current_is_draft" "$lookup_failure"
 
     printf '{"body":%s}\n' "$(jq -Rn --arg body "$post_body" '$body')" > "$tmp/body.json"
 
@@ -106,12 +112,13 @@ run_review_case() {
 ## PR Review Status
 
 Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`' \
+        --arg payload 'Gator payload: `2`' \
         --arg inline_body '> **gator-agent**
 
 **Warning:** Keep this validation bound to the accepted value.' \
         '{
             event: "COMMENT",
-            body: $body,
+            body: ($body + "\n" + $payload),
             comments: [{
                 path: "crates/example/src/lib.rs",
                 line: 42,
@@ -134,7 +141,8 @@ same_sha_body='> **gator-agent**
 
 ## PR Review Status
 
-Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`'
+Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`
+Gator payload: `2`'
 
 run_case "blocks duplicate marked comment" \
     "$same_sha_body" \
@@ -151,7 +159,17 @@ run_case "allows first marked comment" \
 Head SHA: `different-sha`' \
     '> **gator-agent**
 
-## PR Review Status' \
+## Follow-Up Needed' \
+    0
+
+run_case "allows first versioned review disposition" \
+    '' \
+    '> **gator-agent**
+
+## PR Review Status
+
+Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`
+Gator payload: `2`' \
     0
 
 run_case "allows unmarked comment" \
@@ -185,7 +203,8 @@ Gator is blocked from completing the required independent re-review for current 
 
 ## PR Review Status
 
-Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`' \
+Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`
+Gator payload: `2`' \
     0
 
 draft_blocked_body='> **gator-agent**
@@ -204,7 +223,8 @@ run_case "ignores draft blocker after PR is ready" \
 
 ## PR Review Status
 
-Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`' \
+Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`
+Gator payload: `2`' \
     0 \
     false
 
@@ -225,5 +245,26 @@ run_review_case "allows first batched inline review as one disposition" \
 run_review_case "blocks a later batched inline review for the same SHA" \
     "$same_sha_body" \
     20
+
+run_case "rejects an unversioned review disposition" \
+    '' \
+    '> **gator-agent**
+
+## PR Review Status
+
+Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`' \
+    22
+
+run_case "fails closed when comment history lookup fails" \
+    '' \
+    '> **gator-agent**
+
+## PR Review Status
+
+Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`
+Gator payload: `2`' \
+    21 \
+    false \
+    comments
 
 printf 'PASS: gh same-SHA guard tests\n'

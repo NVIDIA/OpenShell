@@ -47,6 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        .include_file("openshell.rs")
         // Emit a binary FileDescriptorSet so the server can enumerate every
         // RPC at runtime (used by the per-handler auth exhaustiveness test).
         .file_descriptor_set_path(&descriptor_path)

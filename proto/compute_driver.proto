@@ -20,6 +20,13 @@ service ComputeDriver {
   // Report driver capabilities and defaults.
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
 
+  // Report additional gateway listeners required by this driver instance.
+  //
+  // A requirement is not authorization to expose the gateway. The gateway
+  // owns validation, authorization, and the authoritative bind.
+  rpc GetGatewayListenerRequirements(GetGatewayListenerRequirementsRequest)
+      returns (GetGatewayListenerRequirementsResponse);
+
   // Validate a sandbox before create-time provisioning.
   rpc ValidateSandboxCreate(ValidateSandboxCreateRequest)
       returns (ValidateSandboxCreateResponse);
@@ -55,6 +62,32 @@ message GetCapabilitiesResponse {
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
+}
+
+message GetGatewayListenerRequirementsRequest {}
+
+message GatewayListenerRequirement {
+  // Untrusted human-readable driver rationale for diagnostics.
+  string reason = 1;
+
+  oneof selector {
+    // Concrete IP:port address requested by the driver. The port must match
+    // the gateway's configured primary listener port.
+    string exact_bind_address = 2;
+    // Ask the gateway to bind the IPv4 address selected by its default route.
+    // This matches rootless pasta's default upstream-interface selection.
+    GatewayDefaultRouteInterfaceRequirement default_route_interface = 3;
+    // Ask the gateway to ensure an IPv4 loopback listener is present. This
+    // covers runtimes whose host forwarder terminates on gateway loopback.
+    GatewayLoopbackInterfaceRequirement loopback_interface = 4;
+  }
+}
+
+message GatewayDefaultRouteInterfaceRequirement {}
+message GatewayLoopbackInterfaceRequirement {}
+
+message GetGatewayListenerRequirementsResponse {
+  repeated GatewayListenerRequirement requirements = 1;
 }
 
 // Driver-owned sandbox model used for create requests and platform observations.

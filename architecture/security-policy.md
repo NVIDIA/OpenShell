@@ -82,9 +82,9 @@ metadata before forwarding. The proxy also supports credential injection on
 terminated HTTP streams when policy allows the endpoint.
 
 Raw streams and long-lived response bodies are connection scoped. Policy
-reloads affect the next connection or the next parsed HTTP request; they do not
-rewrite bytes already being relayed. HTTP upgrades switch to raw relay by
-default. A `protocol: rest` endpoint can opt in to
+generation changes close relays pinned to the previous generation instead of
+allowing them to continue under stale authorization. HTTP upgrades switch to
+raw relay by default. A `protocol: rest` endpoint can opt in to
 `websocket_credential_rewrite` for client-to-server WebSocket text messages
 after an allowed `101` upgrade; server-to-client traffic and all other upgraded
 protocols remain raw passthrough.
@@ -98,10 +98,37 @@ supervisor polls for config revisions and attempts to load new dynamic policy
 into the in-process OPA engine; CLI reads of the latest sandbox policy use the
 same effective configuration path.
 
-If a new policy fails validation or loading, the supervisor reports the failure
-and keeps the last-known-good policy. Static controls, such as filesystem
-allowlists and process identity, require a new sandbox because they are applied
-before the child process starts.
+The supervisor validates complete effective policy generations before
+activation. Overlapping endpoint selectors may contribute request allow and
+deny rules only when their connection and request-processing metadata agree;
+conflicting TLS, destination, credential, parser, or enforcement metadata
+rejects the complete generation. Plain L4 endpoints do not contribute
+request-processing metadata, so they may overlap an L7 endpoint when their
+connection metadata agrees. When request paths overlap, a path endpoint with a
+higher specificity rank deterministically overrides broader request-processing
+metadata. Equally specific overlapping endpoints must agree.
+
+Gateway mutation paths validate the complete effective candidate before
+persistence when the affected sandbox scope is known. Direct replacements,
+incremental merges and approvals, provider attachment, and profile fanout reject
+ambiguity atomically, without creating an invalid revision or partially
+activating an update. Supervisor validation remains the defense-in-depth
+boundary for startup, concurrent changes, and sources outside those mutations.
+
+The `[openshell.gateway] policy_validation_failure_mode` configuration controls
+candidates rejected by supervisor runtime validation. Gateway preflight
+rejections never become generations and leave the active policy unchanged. The
+runtime mode defaults to `fail_closed`, which publishes a quarantine generation,
+denies new egress, invalidates existing relays, and leaves the previous policy
+inactive. Operators may explicitly select
+`retain_last_valid`, which keeps the previous generation active. With no
+previous valid generation, the effective mode remains `fail_closed` regardless
+of the configured mode. The gateway distributes this startup configuration to
+sandbox supervisors with each effective policy snapshot. OCSF configuration and finding events state the
+candidate version, validation rationale, configured and effective modes, active
+generation, and whether the previous policy is active. Static controls,
+such as filesystem allowlists and process identity, require a new sandbox
+because they are applied before the child process starts.
 
 Gateway-global policy can override sandbox-scoped policy. Use it sparingly
 because it changes the effective access model for every sandbox on the gateway.

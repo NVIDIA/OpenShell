@@ -50,6 +50,12 @@ jobs:
           - suite: python
             cmd: "mise run --no-deps --skip-deps e2e:python"
             apt_packages: ""
+          - suite: oidc-python
+            cmd: "mise run --no-deps --skip-deps e2e:oidc-python:docker"
+            apt_packages: ""
+          - suite: oidc-pkce-docker
+            cmd: "mise run --no-deps --skip-deps e2e:oidc-pkce:docker"
+            apt_packages: "openssh-client"
           - suite: rust-docker
             cmd: "mise run --no-deps --skip-deps e2e:rust"
             apt_packages: "openssh-client"
@@ -111,7 +117,7 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Install Python dependencies and generate protobuf stubs
-        if: matrix.suite == 'python'
+        if: matrix.suite == 'python' || matrix.suite == 'oidc-python'
         run: uv sync --frozen && mise run --no-deps python:proto
 
       - name: Run tests
@@ -125,20 +131,21 @@ jobs:
     # Run directly on the Ubuntu host so the test observes the host's AppArmor
     # and unprivileged-user-namespace policy. A privileged job container masks
     # the restrictions that production rootless Podman installations enforce.
+    # Ubuntu 26.04 provides the supported Podman 5.x and pasta combination.
+    # Re-add older/slirp4netns environments when direct callbacks through a
+    # rootless-network namespace relay are supported.
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Ubuntu 24.04 matches the environment reported in #2069 and ships
-          # Podman 4.x. The probe records whether AppArmor blocks the drop.
-          - runner: ubuntu-24.04
-            podman_major: "4"
-          # Ubuntu 26.04 provides the supported Podman 5.x coverage for
-          # comparison with the Ubuntu 24.04 environment.
+          # Keep package versions explicit so hosted-runner tool overrides
+          # cannot silently change the supported test environment.
           - runner: ubuntu-26.04
             podman_major: "5"
+            podman_package_version: "5.7.0+ds2-3build1"
+            conmon_package_version: "2.1.13+ds1-2"
     env:
       IMAGE_TAG: ${{ inputs.image-tag }}
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -187,9 +194,19 @@ jobs:
             openssh-client \
             passt \
             pkg-config \
-            podman \
-            slirp4netns \
+            "conmon=${{ matrix.conmon_package_version }}" \
+            "podman=${{ matrix.podman_package_version }}" \
             uidmap
+          # Hosted runners can place newer Podman and conmon binaries under
+          # /usr/local ahead of Ubuntu's packages. Select the distro CLI and
+          # use Podman's supported final config override for its conmon path.
+          podman_config="${RUNNER_TEMP}/openshell-containers.conf"
+          printf '%s\n' \
+            '[engine]' \
+            'conmon_path = ["/usr/bin/conmon"]' \
+            > "${podman_config}"
+          echo "/usr/bin" >> "${GITHUB_PATH}"
+          echo "CONTAINERS_CONF_OVERRIDE=${podman_config}" >> "${GITHUB_ENV}"
 
       - name: Configure rootless Podman
         run: |
@@ -212,7 +229,12 @@ jobs:
             "${{ matrix.podman_major }}".*) ;;
             *) echo "ERROR: expected Podman ${{ matrix.podman_major }}.x, found $podman_version" >&2; exit 1 ;;
           esac
+          test "$(dpkg-query -W -f='${Version}' podman)" = "${{ matrix.podman_package_version }}"
+          test "$(dpkg-query -W -f='${Version}' conmon)" = "${{ matrix.conmon_package_version }}"
+          test "$(command -v podman)" = "/usr/bin/podman"
+          test "$(podman info --format '{{.Host.Conmon.Path}}')" = "/usr/bin/conmon"
           test "$(podman info --format '{{.Host.Security.Rootless}}')" = "true"
+          test "$(podman info --format '{{.Host.RootlessNetworkCmd}}')" = "pasta"
           test "$(sudo sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "1"
           echo "=== host ==="
           uname -a
@@ -280,21 +302,6 @@ jobs:
         with:
           artifact-name: ${{ inputs.vm-driver-artifact-name }}
 
-      - name: Enable KVM access
-        run: |
-          set -euo pipefail
-          if [[ ! -c /dev/kvm ]]; then
-            echo "::error::The GitHub-hosted runner did not expose /dev/kvm"
-            lscpu
-            grep -m1 -E '^(flags|Features)' /proc/cpuinfo || true
-            ls -la /dev
-            exit 1
-          fi
-          sudo chmod 0666 /dev/kvm
-          ls -l /dev/kvm
-          test -r /dev/kvm
-          test -w /dev/kvm
-
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -309,6 +316,29 @@ jobs:
             pkg-config \
             socat \
             zstd
+
+      - name: Enable KVM access
+        run: |
+          set -euo pipefail
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::The GitHub-hosted runner did not expose /dev/kvm"
+            lscpu
+            grep -m1 -E '^(flags|Features)' /proc/cpuinfo || true
+            ls -la /dev
+            exit 1
+          fi
+
+          # Package installation can restart systemd-udevd, which reapplies
+          # the default root:kvm 0660 mode. Install a persistent rule after
+          # dependencies so later udev events preserve runner access.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --settle --name-match=kvm
+
+          ls -l /dev/kvm
+          exec 3<>/dev/kvm
+          exec 3>&-
 
       - name: Validate VM host tools
         run: |

@@ -1,0 +1,46 @@
+load("@rules_proto//proto:defs.bzl", "proto_descriptor_set", "proto_library")
+load("@rules_rust//extensions/prost:defs.bzl", "rust_prost_library")
+
+package(default_visibility = ["//visibility:public"])
+
+proto_library(
+    name = "openshell_proto",
+    srcs = glob(["*.proto"]),
+    strip_import_prefix = "/proto",
+    deps = [
+        "@protobuf//:descriptor_proto",
+        "@protobuf//:empty_proto",
+        "@protobuf//:struct_proto",
+    ],
+)
+
+rust_prost_library(
+    name = "openshell_rust_proto",
+    proto = ":openshell_proto",
+)
+
+filegroup(
+    name = "openshell_rust_proto_src",
+    srcs = [":openshell_rust_proto"],
+    output_group = "rust_generated_srcs",
+)
+
+proto_descriptor_set(
+    name = "openshell_proto_descriptor_set",
+    deps = [":openshell_proto"],
+)
+
+rust_prost_library(
+    name = "descriptor_rust_proto",
+    proto = "@protobuf//:descriptor_proto",
+)
+
+rust_prost_library(
+    name = "empty_rust_proto",
+    proto = "@protobuf//:empty_proto",
+)
+
+rust_prost_library(
+    name = "struct_rust_proto",
+    proto = "@protobuf//:struct_proto",
+)

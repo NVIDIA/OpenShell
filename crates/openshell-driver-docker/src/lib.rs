@@ -39,12 +39,14 @@ use openshell_core::progress::{
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxStatus,
-    DriverSandboxTemplate, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
-    GetSandboxResponse, GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
-    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    DriverSandboxTemplate, GatewayListenerRequirement, GetCapabilitiesRequest,
+    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
+    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
+    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
+    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
+    WatchSandboxesRequest, WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
+    gateway_listener_requirement::Selector, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -397,14 +399,6 @@ impl DockerComputeDriver {
         });
 
         Ok(driver)
-    }
-
-    #[must_use]
-    pub fn gateway_bind_addresses(&self) -> Vec<SocketAddr> {
-        match self.config.gateway_route {
-            DockerGatewayRoute::Bridge { bind_address, .. } => vec![bind_address],
-            DockerGatewayRoute::HostGateway => Vec::new(),
-        }
     }
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
@@ -1384,6 +1378,24 @@ impl ComputeDriver for DockerComputeDriver {
         _request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         Ok(Response::new(self.capabilities()))
+    }
+
+    async fn get_gateway_listener_requirements(
+        &self,
+        _request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        let requirements = match self.config.gateway_route {
+            DockerGatewayRoute::Bridge { bind_address, .. } => {
+                vec![GatewayListenerRequirement {
+                    reason: "docker managed bridge gateway".to_string(),
+                    selector: Some(Selector::ExactBindAddress(bind_address.to_string())),
+                }]
+            }
+            DockerGatewayRoute::HostGateway => Vec::new(),
+        };
+        Ok(Response::new(GetGatewayListenerRequirementsResponse {
+            requirements,
+        }))
     }
 
     async fn validate_sandbox_create(

@@ -1,0 +1,75 @@
+bazel_dep(name = "rules_rs", version = "0.0.96")
+bazel_dep(name = "bazel_lib", version = "3.2.2")
+bazel_dep(name = "llvm", version = "0.8.11")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_cc", version = "0.2.20")
+bazel_dep(name = "rules_proto", version = "7.1.0")
+bazel_dep(name = "protobuf", version = "34.0.bcr.1")
+
+include("//bazel/annotations:aws-lc-sys.MODULE.bazel")
+include("//bazel/annotations:z3-sys.MODULE.bazel")
+include("//bazel/annotations:zstd-sys.MODULE.bazel")
+
+z3_repository = use_repo_rule("//third_party/z3:repositories.bzl", "z3_repository")
+
+z3_repository(
+    name = "z3",
+    build_file = "//third_party/z3:BUILD.z3.bazel",
+    integrity = "sha256-YGAaZ0II/2EDgM8NVhIayGeMRcXE6sOtFNv+kZmOzIo=",
+    strip_prefix = "z3-z3-4.15.2",
+    urls = ["https://github.com/Z3Prover/z3/archive/refs/tags/z3-4.15.2.zip"],
+)
+
+osx = use_extension("@llvm//extensions:osx.bzl", "osx")
+osx.frameworks(
+    names = [
+        "CFNetwork",
+        "CoreFoundation",
+        "CoreServices",
+        "DiskArbitration",
+        "Foundation",
+        "IOKit",
+        "Kernel",
+        "OSLog",
+        "Security",
+        "SystemConfiguration",
+    ],
+)
+
+workspace_version_repository = use_repo_rule("//bazel:cargo_version.bzl", "workspace_version_repository")
+
+workspace_version_repository(
+    name = "workspace_version",
+    manifest = "//:Cargo.toml",
+)
+
+toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
+toolchains.toolchain(
+    edition = "2024",
+    version = "1.95.0",
+)
+use_repo(toolchains, "default_rust_toolchains")
+
+rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
+use_repo(rules_rust, "rules_rust")
+
+register_toolchains(
+    "@default_rust_toolchains//:all",
+    "@llvm//toolchain:all",
+    "@rules_rust//extensions/prost:default_prost_toolchain",
+)
+
+crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lock = "//:Cargo.lock",
+    cargo_toml = "//:Cargo.toml",
+    platform_triples = [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-unknown-linux-musl",
+        "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
+    ],
+)
+use_repo(crate, "crates")

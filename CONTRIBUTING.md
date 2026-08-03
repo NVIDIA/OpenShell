@@ -34,7 +34,7 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 
 Issues labeled [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
-All open issues are actionable — if it's in the issue tracker, it's ready to be worked on.
+An open issue is not necessarily accepted or ready to be worked on. Human contributors should look for `state:accepted`, `good first issue`, or `help wanted`, or ask a maintainer before starting. Unattended agents additionally require the appropriate human-applied `agent:*` request label; an agent directly asked to work on a specific issue does not. Roadmap placement describes sequencing and does not authorize work.
 
 ## Before You Open an Issue
 
@@ -92,14 +92,171 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 
 Skills connect into pipelines. Individual skill files don't describe these relationships.
 
-- **Community inflow:** `triage-issue` → `create-spike` → `build-from-issue`
-- **Internal development:** `create-spike` → `build-from-issue`
+- **Community inflow:** `triage-issue` → human disposition and roadmap placement → `create-spike` when needed → `build-from-issue`
+- **Internal development:** `create-spike` → human disposition and roadmap placement → `build-from-issue`
 - **Security:** `review-security-issue` → `fix-security-issue`
 - **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
 
-Workflow state labels use the `state:*` prefix, and security work uses `topic:security`. GitHub issue templates assign built-in issue types where applicable, and agent-created issues should use issue types or manual follow-up rather than type labels.
-New issues opened by users without `write`, `maintain`, or `admin` repository permission are automatically labeled `state:triage-needed` by the issue triage workflow.
-Inactive issues and pull requests are automatically labeled `state:stale` after 14 days without activity and may be closed after 7 more days without activity. Comment on the item or remove `state:stale` to keep it open. Issues labeled `state:triage-needed` or `roadmap` are exempt from stale handling.
+### Issue Lifecycle, Roadmap, and Agent Work
+
+OpenShell separates technical assessment, roadmap decisions, sequencing, and agent delegation.
+
+An open issue is not automatically accepted or ready for implementation. Check its `state:*` label before starting work, and ask a maintainer when its status is unclear.
+
+#### The Four Decisions
+
+Each issue can require four independent decisions:
+
+| Decision | Question | Recorded by |
+|---|---|---|
+| Assessment | Is the report technically valid, and is there enough evidence to act on it? | `state:*` |
+| Disposition | Should OpenShell pursue the work? | `state:accepted` or closure as not planned |
+| Sequencing | Where does accepted work sit relative to everything else? | Placement on the [OpenShell Roadmap](https://github.com/orgs/NVIDIA/projects/233) |
+| Ownership | Will a human implement the issue, will a user directly instruct an agent, or will a maintainer queue it for an unattended agent? | Direct instruction or optional `agent:*` workflow |
+
+Completing one decision does not imply the others. `state:validated` confirms that the factual assessment is complete, but it does not mean the project has accepted the work. Roadmap placement communicates sequencing, but it does not authorize an agent to begin.
+
+#### Who Controls Each Decision
+
+Agents investigate issues, collect evidence, and report technical findings. Humans retain the product and investment decisions.
+
+| Action | Who performs it |
+|---|---|
+| Assess technical validity and impact | Triage agent or human triager |
+| Request missing evidence | Triage agent or human triager |
+| Mark the assessment complete with `state:validated` | Triage agent or human triager |
+| Accept or decline the work | Maintainer |
+| Place the issue on the roadmap or move it | Maintainer |
+| Directly request an agent plan | User |
+| Queue an agent plan with `agent:plan-requested` | Maintainer |
+| Produce a plan, implement it, and open a pull request | Agent |
+| Directly request agent implementation | User |
+| Queue approved implementation with `agent:implementation-requested` | Maintainer |
+
+Agents do not apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`.
+
+#### Issue State
+
+The `state:*` namespace records the issue's disposition for all contributors, regardless of who might implement it.
+
+| State | Meaning | Normal next action |
+|---|---|---|
+| `state:triage-needed` | The issue has not been assessed. New issues from users without repository write access receive this automatically. | Investigate the report and record the result. |
+| `state:needs-info` | The assessment needs specific evidence or reproduction details. | The reporter or another contributor supplies the requested information. |
+| `state:validated` | The factual assessment is complete. | A maintainer accepts the issue, declines it, or asks for more evidence. |
+| `state:accepted` | A maintainer decided that OpenShell should pursue the issue. | A human may implement it, or a maintainer may delegate work to an agent. |
+
+Keep one of these states on an open issue. When new evidence resolves a `state:needs-info` request, reassess the issue and move it to `state:validated` if the evidence is sufficient.
+
+`state:stale` is an inactivity marker, not a lifecycle decision. Accepted issues and issues awaiting human disposition are exempt from stale handling. An issue in `state:needs-info` can become stale if no new evidence arrives.
+
+#### Assessing an Incoming Issue
+
+Triage checks the report, its diagnostic evidence, related issues, current releases, and the relevant code paths. The assessment ends in one of these outcomes:
+
+| Outcome | State or resolution |
+|---|---|
+| A bug is confirmed. | Replace the intake state with `state:validated`. |
+| A feature proposal is technically coherent and feasible. | Replace the intake state with `state:validated`. |
+| The report is credible but needs a deeper investigation or spike. | Add the `spike` label when available and use `state:validated` so a human can decide whether to invest in the investigation. |
+| Critical evidence is missing, or a faithful attempt cannot reproduce the problem. | Use `state:needs-info` and request the exact evidence needed. |
+| A released change already fixes the behavior. | Explain the fix and version. Close the issue only when the causal link is clear; otherwise request a retest. |
+| Another issue is the canonical report. | Link the canonical issue and close the duplicate. |
+| The behavior is expected or caused by unsupported configuration. | Explain the finding and close the issue with the appropriate GitHub reason. |
+| The report describes a security vulnerability. | Stop public triage and follow the private process in `SECURITY.md`. |
+
+Triage establishes facts and impact. It does not decide whether the project should spend time on the work.
+
+#### Human Disposition
+
+When an issue reaches `state:validated`, a maintainer chooses one of three paths:
+
+- **Accept:** replace `state:validated` with `state:accepted` and place it on the roadmap.
+- **Decline:** close it as not planned and record the rationale.
+- **Await more evidence:** replace `state:validated` with `state:needs-info` and leave it off the roadmap.
+
+Do not use `state:accepted` as shorthand for technical validity, roadmap sequencing, or agent authorization. It records only the human decision that OpenShell should pursue the work.
+
+#### Roadmap
+
+OpenShell does not use priority labels. Sequencing comes from the [OpenShell Roadmap](https://github.com/orgs/NVIDIA/projects/233): a maintainer associates an accepted issue with a roadmap item, and the roadmap item's own timing carries the urgency. Issues tracked on the roadmap carry the `roadmap` label.
+
+An accepted issue with no roadmap association is real work the project intends to do, but it is not scheduled. Ask a maintainer before starting on one.
+
+Roadmap placement does not assign an owner. A roadmap issue still needs a human contributor, a direct user instruction to an agent, or an unattended-agent queue label.
+
+`good first issue` and `help wanted` describe contributor suitability, not sequencing.
+
+#### Human or Agent Ownership
+
+A human contributor may implement an accepted issue without any `agent:*` label. Before starting, check for an assignee, linked pull request, active branch, or comment that shows someone else is already working on it.
+
+Maintainers use the `agent:*` workflow to queue work for always-on or unattended agents that scan issues. Keep exactly one agent-workflow label on the issue at a time. When a user directly asks an agent to plan or implement a specific issue, that instruction authorizes the requested phase and the corresponding request label is not required.
+
+| Agent workflow | Applied by | Meaning |
+|---|---|---|
+| `agent:plan-requested` | Maintainer | Ask an agent to produce an implementation plan. |
+| `agent:plan-ready` | Agent | The plan is ready for human review. |
+| `agent:implementation-requested` | Maintainer | The plan is approved and an agent may implement it. |
+| `agent:in-progress` | Agent | Authorized implementation is underway. |
+| `agent:pr-opened` | Agent | The implementation produced a pull request. |
+
+The normal delegated workflow is:
+
+```text
+state:accepted
+  |
+  +-- agent:plan-requested
+        |
+        +-- agent:plan-ready
+              |
+              +-- agent:implementation-requested
+                    |
+                    +-- agent:in-progress
+                          |
+                          +-- agent:pr-opened
+```
+
+`agent:plan-requested` authorizes an unattended agent to pick up planning, not implementation. `agent:implementation-requested` confirms that a human reviewed the plan and authorizes an unattended agent to pick up implementation. Agents never apply either request label. Planning authority does not imply implementation authority.
+
+#### Spikes
+
+Use a spike when the report is credible but technical uncertainty prevents a buildable plan. The triage assessment should identify the unknowns and the evidence the spike needs to produce.
+
+A maintainer first decides whether OpenShell should invest in the investigation. If accepted, the maintainer places it on the roadmap and may request agent work. The spike records its findings in an issue and uses:
+
+- `state:validated` when the evidence supports a human accept or decline decision.
+- `state:needs-info` when material evidence or an external decision is still missing.
+
+A completed spike does not automatically authorize implementation. The resulting issue follows the same human disposition process.
+
+#### Security Issues
+
+Do not file or discuss suspected vulnerabilities in a public GitHub issue. Follow the disclosure instructions in `SECURITY.md`.
+
+Maintainers use the specialized security review and remediation workflow for an authorized security issue. For unattended processing, it uses the same queue controls:
+
+1. A maintainer applies `agent:plan-requested` to request a security review and remediation plan.
+2. The review agent replaces it with `agent:plan-ready`.
+3. A maintainer reviews the plan and applies `agent:implementation-requested`.
+4. The remediation agent implements the approved plan.
+
+A user may instead directly request review or remediation from the specialized skill. The direct request replaces the corresponding queue label, but a request for review still does not authorize remediation. General implementation agents do not process issues labeled `topic:security`.
+
+#### When an Issue Is Ready for Work
+
+| You are | Ready when |
+|---|---|
+| A human contributor | The issue has `state:accepted`, invites contribution or has maintainer confirmation, and has no conflicting owner or implementation. |
+| An unattended agent scanning for planning work | The issue has `state:accepted` and the human-applied `agent:plan-requested` label. |
+| An unattended agent scanning for implementation work | The issue has `state:accepted`, an approved plan, and the human-applied `agent:implementation-requested` label. |
+| An agent directly instructed by a user | The issue has `state:accepted`, no conflicting owner or implementation, and the instruction explicitly requests the phase the agent will perform. |
+
+Issues with `state:triage-needed`, `state:needs-info`, or `state:validated` are not ready for implementation. Roadmap placement alone never makes an issue ready.
+
+#### Stale Issues
+
+Inactive issues and pull requests are automatically labeled `state:stale` after 14 days without activity. Automated closing is currently disabled. Comment on the item or remove `state:stale` to keep it active. Issues awaiting triage or human disposition, accepted issues, active agent workflows, and roadmap issues are exempt. `state:needs-info` may become stale when no new evidence arrives.
 
 ## Prerequisites
 
@@ -285,6 +442,10 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 2. Make your changes with tests.
 3. Run `mise run ci` to verify.
 4. Open a PR using the `create-github-pr` skill or manually following the [PR template](.github/PULL_REQUEST_TEMPLATE.md).
+
+PRs for new features, user-visible behavior changes, public API changes, architecture changes, or multi-PR efforts must link an accepted issue. Small documentation fixes, mechanical maintenance, and obvious localized bug fixes may omit a separate issue when the PR contains enough context to review the decision and implementation together.
+
+In the PR's **Related Issue** section, use `Fixes #NNN` or `Closes #NNN` when an issue is required. For an exempt change, write `No issue required:` followed by a brief reason. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
 
 ### Commit Messages
 

@@ -20,10 +20,9 @@ use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, SeverityId, SshActivityBuilder, StatusId, ocsf_emit,
 };
-use rand_core::OsRng;
+use russh::ChannelId;
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, Handle, Session};
-use russh::{ChannelId, CryptoVec};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -49,7 +48,7 @@ fn ssh_server_init(
     enforcement_mode: ProcessEnforcementMode,
     shared_socket: bool,
 ) -> Result<SshServerInit> {
-    let mut rng = OsRng;
+    let mut rng = rand::rng();
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
 
     let mut config = russh::server::Config {
@@ -904,7 +903,7 @@ fn spawn_pty_shell(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let data = CryptoVec::from_slice(&buf[..n]);
+                    let data = buf[..n].to_vec();
                     let handle_clone = handle_clone.clone();
                     let _ = runtime_reader
                         .block_on(async move { handle_clone.data(channel, data).await });
@@ -1069,7 +1068,7 @@ fn spawn_pipe_exec(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let data = CryptoVec::from_slice(&buf[..n]);
+                    let data = buf[..n].to_vec();
                     let h = stdout_handle.clone();
                     let _ = stdout_runtime.block_on(async move { h.data(channel, data).await });
                 }
@@ -1088,7 +1087,7 @@ fn spawn_pipe_exec(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let data = CryptoVec::from_slice(&buf[..n]);
+                    let data = buf[..n].to_vec();
                     let h = stderr_handle.clone();
                     let _ = stderr_runtime
                         .block_on(async move { h.extended_data(channel, 1, data).await });

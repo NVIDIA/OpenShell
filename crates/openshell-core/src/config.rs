@@ -36,6 +36,43 @@ pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
+/// Gateway posture when a sandbox rejects a candidate policy generation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyValidationFailureMode {
+    /// Deactivate the previous policy and deny new egress until a valid
+    /// generation is loaded.
+    #[default]
+    FailClosed,
+    /// Keep the last valid generation active when a newer candidate fails
+    /// validation. Startup still fails closed when no valid generation exists.
+    RetainLastValid,
+}
+
+impl PolicyValidationFailureMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FailClosed => "fail_closed",
+            Self::RetainLastValid => "retain_last_valid",
+        }
+    }
+}
+
+impl FromStr for PolicyValidationFailureMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "fail_closed" => Ok(Self::FailClosed),
+            "retain_last_valid" => Ok(Self::RetainLastValid),
+            _ => Err(format!(
+                "invalid policy validation failure mode '{value}'; expected fail_closed or retain_last_valid"
+            )),
+        }
+    }
+}
+
 /// Default OCI repository for the supervisor image (no tag).
 pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
 
@@ -396,6 +433,9 @@ pub struct Config {
     /// Log level (trace, debug, info, warn, error).
     pub log_level: String,
 
+    /// Security posture for rejected sandbox policy generations.
+    pub policy_validation_failure_mode: PolicyValidationFailureMode,
+
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
     pub tls: Option<TlsConfig>,
 
@@ -737,6 +777,7 @@ impl Config {
             health_bind_address: None,
             metrics_bind_address: None,
             log_level: default_log_level(),
+            policy_validation_failure_mode: PolicyValidationFailureMode::default(),
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
@@ -981,10 +1022,10 @@ mod tests {
     use super::{
         ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
         GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
-        GatewayProviderProfileSourceConfig, detect_docker_socket_from_candidates, detect_driver,
-        detect_podman_socket_from_candidates, docker_host_unix_socket_path, docker_socket_responds,
-        is_unix_socket, normalize_compute_driver_name, podman_socket_candidates_from_env,
-        podman_socket_responds,
+        GatewayProviderProfileSourceConfig, PolicyValidationFailureMode,
+        detect_docker_socket_from_candidates, detect_driver, detect_podman_socket_from_candidates,
+        docker_host_unix_socket_path, docker_socket_responds, is_unix_socket,
+        normalize_compute_driver_name, podman_socket_candidates_from_env, podman_socket_responds,
     };
     #[cfg(unix)]
     use std::io::{Read as _, Write as _};
@@ -1018,6 +1059,21 @@ mod tests {
     fn compute_driver_kind_rejects_unknown_values() {
         let err = "firecracker".parse::<ComputeDriverKind>().unwrap_err();
         assert!(err.contains("unsupported compute driver 'firecracker'"));
+    }
+
+    #[test]
+    fn policy_validation_failure_mode_is_secure_by_default() {
+        assert_eq!(
+            Config::new(None).policy_validation_failure_mode,
+            PolicyValidationFailureMode::FailClosed
+        );
+        assert_eq!(
+            "retain_last_valid"
+                .parse::<PolicyValidationFailureMode>()
+                .unwrap(),
+            PolicyValidationFailureMode::RetainLastValid
+        );
+        assert!("keep_old".parse::<PolicyValidationFailureMode>().is_err());
     }
 
     #[test]

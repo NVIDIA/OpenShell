@@ -45,7 +45,7 @@ pub use config::{
     ComputeDriverKind, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,
     GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
     GatewayInterceptorPhaseConfig, GatewayJwtConfig, GatewayProviderProfileSourceConfig,
-    MtlsAuthConfig, OidcConfig, TlsConfig,
+    MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TlsConfig,
 };
 pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{
