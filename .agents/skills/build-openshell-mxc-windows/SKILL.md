@@ -40,7 +40,7 @@ did not request.
 
 In scope:
 
-- Refreshing a local checkout to the latest GitLab `main`.
+- Refreshing a local checkout to the latest upstream GitHub `main`.
 - Maintaining `tasks/windows.toml` and `tasks/scripts/windows-msvc.ps1`.
 - Running x64 and ARM64 MSVC checks.
 - Building x64 and ARM64 release binaries for `openshell-gateway` and
@@ -85,26 +85,22 @@ Out of scope:
 
 ## Recommended Checkout Flow
 
-From the OpenShell checkout root, use:
+From a fork checkout where `upstream` points to the official
+`NVIDIA/OpenShell` GitHub repository, use:
 
 ```powershell
-git fetch gitlab main
+git fetch upstream main
 git switch main
-git merge --ff-only gitlab/main
-git branch --set-upstream-to=gitlab/main main
+git merge --ff-only upstream/main
+git branch --set-upstream-to=upstream/main main
 git status --short --branch
 ```
 
+For a direct checkout of the official repository, use `origin` instead of
+`upstream`. Confirm the remote URLs with `git remote -v` before refreshing.
+
 If there are local changes, preserve or resolve them before refreshing. Do not
 discard user work unless the user explicitly asks to clean the checkout.
-
-For automated GitHub-to-GitLab sync work, use a dedicated sync checkout outside
-the user's active working repo. Accept the checkout path from the user or an
-environment variable instead of hardcoding a local machine path, for example:
-
-```text
-<sync-checkout>
-```
 
 ## Prerequisites
 
@@ -327,7 +323,7 @@ Every substantial Windows build run should report:
 
 | Item | Required detail |
 |---|---|
-| Git state | Branch, latest GitLab commit, and whether local changes existed. |
+| Git state | Branch, upstream GitHub base commit, and whether local changes existed. |
 | Host preconditions | OS, Rust, MSVC discovery, and notable warnings. |
 | Commands run | Exact `mise run --skip-tools windows:*` commands. |
 | x64 check/build | Pass/fail and log path. |
