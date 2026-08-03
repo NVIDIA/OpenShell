@@ -101,6 +101,7 @@ impl ReconcilerLease {
                 LEASE_OBJECT_TYPE,
                 LEASE_SINGLETON_ID,
                 LEASE_SINGLETON_NAME,
+                "",
                 &payload_bytes,
                 None,
                 WriteCondition::MustCreate,
@@ -120,9 +121,9 @@ impl ReconcilerLease {
     pub async fn try_steal_expired(&self) -> Result<LeaseGuard, LeaseError> {
         let record = self.read().await?.ok_or(LeaseError::NotFound)?;
 
-        let age_ms = now_ms() - record.updated_at_ms;
+        let current_ms = now_ms();
         let ttl_ms = i64::try_from(self.ttl.as_millis()).unwrap_or(i64::MAX);
-        if age_ms < ttl_ms {
+        if !lease_is_expired(current_ms, record.updated_at_ms, ttl_ms) {
             return Err(LeaseError::AlreadyHeld);
         }
 
@@ -140,6 +141,7 @@ impl ReconcilerLease {
                 LEASE_OBJECT_TYPE,
                 LEASE_SINGLETON_ID,
                 LEASE_SINGLETON_NAME,
+                "",
                 &payload_bytes,
                 None,
                 WriteCondition::MatchResourceVersion(record.resource_version),
@@ -181,6 +183,7 @@ impl ReconcilerLease {
                 LEASE_OBJECT_TYPE,
                 LEASE_SINGLETON_ID,
                 LEASE_SINGLETON_NAME,
+                "",
                 &payload_bytes,
                 None,
                 WriteCondition::MatchResourceVersion(guard.resource_version),
@@ -247,6 +250,17 @@ pub fn replica_id() -> String {
     std::env::var("OPENSHELL_REPLICA_ID")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
+}
+
+/// True if a lease record's age exceeds its TTL.
+///
+/// Clamps at zero so a stored `updated_at_ms` in the future (clock skew)
+/// is treated as age zero and the lease is considered fresh. Note that
+/// `i64::saturating_sub` alone is not sufficient here: it saturates at
+/// `i64::MIN`, not zero.
+fn lease_is_expired(now_ms: i64, updated_at_ms: i64, ttl_ms: i64) -> bool {
+    let age_ms = now_ms.saturating_sub(updated_at_ms).max(0);
+    age_ms >= ttl_ms
 }
 
 #[cfg(test)]
@@ -346,6 +360,28 @@ mod tests {
         let record = l2.read().await.unwrap().unwrap();
         assert_eq!(record.holder, "replica-2");
         assert_eq!(record.resource_version, guard.resource_version);
+    }
+
+    #[test]
+    fn future_updated_at_is_treated_as_age_zero() {
+        let now = 1_000_000;
+        let future_updated = now + 86_400_000; // 1 day in the future
+        assert!(
+            !lease_is_expired(now, future_updated, 1_000),
+            "future updated_at_ms should not be stealable with positive TTL"
+        );
+        assert!(
+            lease_is_expired(now, future_updated, 0),
+            "TTL zero always expires regardless of timestamp"
+        );
+        assert!(
+            !lease_is_expired(now, now, 1_000),
+            "fresh lease with positive TTL should not be expired"
+        );
+        assert!(
+            lease_is_expired(now, now, 0),
+            "present timestamp with TTL zero should be expired"
+        );
     }
 
     #[tokio::test]

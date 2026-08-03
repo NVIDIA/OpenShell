@@ -6,7 +6,8 @@
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
     ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
     WatchSandboxesRequest, compute_driver_server::ComputeDriver,
@@ -40,6 +41,15 @@ impl ComputeDriver for ComputeDriverService {
             .map_err(Status::internal)
     }
 
+    async fn get_gateway_listener_requirements(
+        &self,
+        _request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        Ok(Response::new(GetGatewayListenerRequirementsResponse {
+            requirements: Vec::new(),
+        }))
+    }
+
     async fn validate_sandbox_create(
         &self,
         request: Request<ValidateSandboxCreateRequest>,
@@ -57,22 +67,16 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
         let request = request.into_inner();
-        if request.sandbox_name.is_empty() {
-            return Err(Status::invalid_argument("sandbox_name is required"));
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
         }
 
         let sandbox = self
             .driver
-            .get_sandbox(&request.sandbox_name)
+            .get_sandbox(&request.sandbox_id)
             .await
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
-
-        if !request.sandbox_id.is_empty() && request.sandbox_id != sandbox.id {
-            return Err(Status::failed_precondition(
-                "sandbox_id did not match the fetched sandbox",
-            ));
-        }
 
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
@@ -120,9 +124,12 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let request = request.into_inner();
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
         let deleted = self
             .driver
-            .delete_sandbox(&request.sandbox_name)
+            .delete_sandbox(&request.sandbox_id)
             .await
             .map_err(Status::internal)?;
         Ok(Response::new(DeleteSandboxResponse { deleted }))

@@ -48,6 +48,13 @@ struct RelayGateway {
 
 #[tonic::async_trait]
 impl OpenShell for RelayGateway {
+    async fn get_current_user(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
+    ) -> Result<Response<openshell_core::proto::GetCurrentUserResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     type RelayStreamStream = std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>,
     >;
@@ -417,6 +424,51 @@ impl OpenShell for RelayGateway {
         &self,
         _: tonic::Request<openshell_core::proto::RefreshSandboxTokenRequest>,
     ) -> Result<Response<openshell_core::proto::RefreshSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn create_workspace(
+        &self,
+        _: tonic::Request<openshell_core::proto::CreateWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::CreateWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn get_workspace(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::GetWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn list_workspaces(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListWorkspacesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspacesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn delete_workspace(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn add_workspace_member(
+        &self,
+        _: tonic::Request<openshell_core::proto::AddWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::AddWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn remove_workspace_member(
+        &self,
+        _: tonic::Request<openshell_core::proto::RemoveWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::RemoveWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_workspace_members(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListWorkspaceMembersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspaceMembersResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
 }

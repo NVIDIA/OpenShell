@@ -16,13 +16,21 @@ use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
     effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
+#[cfg(target_os = "linux")]
+use openshell_core::proto::compute::v1::GatewayDefaultRouteInterfaceRequirement;
+#[cfg(target_os = "macos")]
+use openshell_core::proto::compute::v1::GatewayLoopbackInterfaceRequirement;
 use openshell_core::proto::compute::v1::{
-    DriverSandbox, GetCapabilitiesResponse, GpuResourceRequirements,
+    DriverSandbox, GatewayListenerRequirement, GetCapabilitiesResponse, GpuResourceRequirements,
+    gateway_listener_requirement::Selector,
 };
-use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+use url::Url;
 
 impl From<PodmanApiError> for ComputeDriverError {
     fn from(value: PodmanApiError) -> Self {
@@ -39,9 +47,13 @@ impl From<PodmanApiError> for ComputeDriverError {
 pub struct PodmanComputeDriver {
     client: PodmanClient,
     config: PodmanComputeConfig,
-    /// The host's IP on the bridge network. Sandbox containers use this to
-    /// reach the gateway server when no explicit gRPC endpoint is configured.
+    /// The host's IP on the bridge network, when that bridge exists in the
+    /// gateway's network namespace (notably rootful Podman).
     network_gateway_ip: Option<String>,
+    /// Whether Podman's service is running without root privileges.
+    rootless: bool,
+    /// Rootless network helper reported by Podman, such as `pasta`.
+    rootless_network_cmd: String,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
     gpu_inventory_refresh: Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>,
 }
@@ -52,6 +64,8 @@ impl std::fmt::Debug for PodmanComputeDriver {
             .field("socket_path", &self.config.socket_path)
             .field("default_image", &self.config.default_image)
             .field("network_name", &self.config.network_name)
+            .field("rootless", &self.rootless)
+            .field("rootless_network_cmd", &self.rootless_network_cmd)
             .field("gpu_inventory", &self.gpu_selector.device_ids())
             .finish()
     }
@@ -62,12 +76,12 @@ struct ValidatedPodmanSandbox<'a> {
     gpu_requirements: Option<&'a GpuResourceRequirements>,
 }
 
-/// Construct and validate a container name from a sandbox name.
+/// Construct and validate a container name from a sandbox.
 ///
-/// Combines the prefix with the sandbox name and validates the result
-/// against Podman's naming rules before any resources are created.
-fn validated_container_name(sandbox_name: &str) -> Result<String, ComputeDriverError> {
-    let name = container::container_name(sandbox_name);
+/// Combines the prefix with workspace, name, and ID, then validates the
+/// result against Podman's naming rules before any resources are created.
+fn validated_container_name(sandbox: &DriverSandbox) -> Result<String, ComputeDriverError> {
+    let name = container::container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     crate::client::validate_name(&name)
         .map_err(|e| ComputeDriverError::Precondition(e.to_string()))?;
     Ok(name)
@@ -110,6 +124,57 @@ async fn cleanup_sandbox_token_secret(client: &PodmanClient, secret_name: &str) 
             secret = %secret_name,
             error = %err,
             "Failed to remove Podman sandbox token secret"
+        );
+    }
+}
+
+/// Read the operator's proxy credentials file and stage it as a per-sandbox
+/// Podman secret, so the credentials reach the supervisor through a root-only
+/// mount rather than the container environment.
+///
+/// Fails closed: when `proxy_auth_file` is configured but cannot be read or
+/// does not hold a valid `user:pass` credential, the sandbox is not created.
+/// Credential validation is shared with the in-container supervisor through
+/// [`openshell_core::driver_utils::parse_upstream_proxy_credential`], so a
+/// credential staged here can never be rejected at supervisor startup.
+async fn create_sandbox_proxy_auth_secret(
+    client: &PodmanClient,
+    config: &PodmanComputeConfig,
+    sandbox: &DriverSandbox,
+) -> Result<Option<String>, ComputeDriverError> {
+    let Some(path) = config.proxy_auth_file.as_deref() else {
+        return Ok(None);
+    };
+
+    // Bounded, blocking read shared with the supervisor: rejects non-regular
+    // files (e.g. /dev/zero) and caps the size so a hostile path cannot
+    // exhaust gateway memory.
+    let path_owned = path.to_string();
+    let raw = tokio::task::spawn_blocking(move || {
+        openshell_core::driver_utils::read_upstream_proxy_credential_file(&path_owned)
+    })
+    .await
+    .map_err(|e| ComputeDriverError::Message(format!("proxy_auth_file read task failed: {e}")))?
+    .map_err(ComputeDriverError::Message)?;
+    let credential =
+        openshell_core::driver_utils::parse_upstream_proxy_credential(&raw).map_err(|err| {
+            ComputeDriverError::InvalidArgument(format!("proxy_auth_file '{path}': {err}"))
+        })?;
+
+    let secret_name = container::proxy_auth_secret_name(&sandbox.id);
+    client
+        .create_secret(&secret_name, format!("{credential}\n").as_bytes())
+        .await
+        .map_err(ComputeDriverError::from)?;
+    Ok(Some(secret_name))
+}
+
+async fn cleanup_sandbox_proxy_auth_secret(client: &PodmanClient, secret_name: &str) {
+    if let Err(err) = client.remove_secret(secret_name).await {
+        warn!(
+            secret = %secret_name,
+            error = %err,
+            "Failed to remove Podman sandbox proxy-auth secret"
         );
     }
 }
@@ -157,22 +222,48 @@ fn podman_gpu_selection_error(err: CdiGpuSelectionError) -> ComputeDriverError {
     ComputeDriverError::Precondition(err.to_string())
 }
 
+/// Resolve the socket to connect to: explicit configuration wins, otherwise
+/// fall back to `detect`. Returns an error if neither resolves.
+///
+/// Takes `detect` as a parameter (rather than calling
+/// [`openshell_core::config::detect_podman_socket`] directly) so tests can
+/// exercise the precedence deterministically, without touching real
+/// environment variables or the filesystem.
+fn resolve_socket_path(
+    configured: Option<PathBuf>,
+    detect: impl FnOnce() -> Option<PathBuf>,
+) -> Result<PathBuf, PodmanApiError> {
+    configured.or_else(detect).ok_or_else(|| {
+        PodmanApiError::InvalidInput(
+            "no responsive Podman API socket found; set OPENSHELL_PODMAN_SOCKET \
+             or configure socket_path"
+                .to_string(),
+        )
+    })
+}
+
 impl PodmanComputeDriver {
     /// Create a new driver, verifying the Podman socket is reachable.
     pub async fn new(mut config: PodmanComputeConfig) -> Result<Self, PodmanApiError> {
         const MAX_PING_RETRIES: u32 = 5;
         const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-        if !config.socket_path.exists() {
+        let socket_path = resolve_socket_path(
+            config.socket_path.clone(),
+            openshell_core::config::detect_podman_socket,
+        )?;
+        config.socket_path = Some(socket_path.clone());
+
+        if !socket_path.exists() {
             if cfg!(target_os = "macos") {
                 warn!(
-                    path = %config.socket_path.display(),
+                    path = %socket_path.display(),
                     "Podman socket not found; is podman machine running? \
                      Try `podman machine start` or set OPENSHELL_PODMAN_SOCKET to override."
                 );
             } else {
                 warn!(
-                    path = %config.socket_path.display(),
+                    path = %socket_path.display(),
                     "Podman socket not found; is the Podman service running? \
                      Set OPENSHELL_PODMAN_SOCKET or XDG_RUNTIME_DIR to override."
                 );
@@ -185,8 +276,9 @@ impl PodmanComputeDriver {
         config.validate_tls_config()?;
         config.validate_runtime_limits()?;
         config.validate_host_gateway_ip()?;
+        config.validate_proxy_config()?;
 
-        let client = PodmanClient::new(config.socket_path.clone());
+        let client = PodmanClient::new(socket_path);
 
         // Verify connectivity, retrying briefly to tolerate transient socket
         // unavailability (e.g. podman.socket restarting after a package
@@ -211,7 +303,7 @@ impl PodmanComputeDriver {
         }
 
         // Verify cgroups v2, detect rootless mode, and log system info.
-        match client.system_info().await {
+        let (rootless, rootless_network_cmd) = match client.system_info().await {
             Ok(info) => {
                 if info.host.cgroup_version != "v2" {
                     return Err(PodmanApiError::Connection(format!(
@@ -225,15 +317,17 @@ impl PodmanComputeDriver {
                     cgroup_version = %info.host.cgroup_version,
                     network_backend = %info.host.network_backend,
                     rootless = info.host.security.rootless,
+                    rootless_network_cmd = %info.host.rootless_network_cmd,
                     "Connected to Podman"
                 );
+                (info.host.security.rootless, info.host.rootless_network_cmd)
             }
             Err(e) => {
                 return Err(PodmanApiError::Connection(format!(
                     "failed to query Podman system info: {e}"
                 )));
             }
-        }
+        };
 
         // Rootless pre-flight: warn if subuid/subgid ranges look missing.
         // Not a hard error because some systems configure these via LDAP or
@@ -242,33 +336,8 @@ impl PodmanComputeDriver {
             check_subuid_range();
         }
 
-        // Ensure the bridge network exists.
-        client.ensure_network(&config.network_name).await?;
-        let network_gateway_ip = client
-            .network_gateway_ip(&config.network_name)
-            .await
-            .unwrap_or(None);
-        info!(
-            network = %config.network_name,
-            gateway_ip = ?network_gateway_ip,
-            "Bridge network ready"
-        );
-
-        let (gpu_inventory, allow_all_default_gpu) = local_podman_gpu_selector_state();
-        if !gpu_inventory.is_empty() {
-            info!(
-                device_count = gpu_inventory.as_slice().len(),
-                "Discovered local Podman NVIDIA CDI GPU devices"
-            );
-        }
-
-        // Auto-detect the gRPC callback endpoint when not explicitly
-        // configured. Sandbox containers use host.containers.internal
-        // (injected via hostadd with host-gateway in the container spec)
-        // to reach the gateway server on the host. The scheme is
-        // determined by whether TLS client certs are configured: when
-        // all three TLS paths are set, the endpoint uses https so the
-        // supervisor connects with mTLS.
+        // Auto-detect the gRPC callback endpoint before deciding whether this
+        // topology needs the Podman bridge gateway address.
         if config.grpc_endpoint.is_empty() {
             let scheme = if config.tls_enabled() {
                 "https"
@@ -286,10 +355,42 @@ impl PodmanComputeDriver {
             );
         }
 
+        // Ensure the bridge network exists. Inspect its gateway only when the
+        // selected Linux callback topology will bind that exact address.
+        client.ensure_network(&config.network_name).await?;
+        let uses_local_callback_alias = Url::parse(&config.grpc_endpoint)
+            .ok()
+            .as_ref()
+            .is_some_and(callback_endpoint_uses_local_alias);
+        let needs_network_gateway_ip = cfg!(target_os = "linux")
+            && uses_local_callback_alias
+            && !rootless
+            && config.host_gateway_ip.trim().is_empty();
+        let network_gateway_ip = if needs_network_gateway_ip {
+            client.network_gateway_ip(&config.network_name).await?
+        } else {
+            None
+        };
+        info!(
+            network = %config.network_name,
+            gateway_ip = ?network_gateway_ip,
+            "Bridge network ready"
+        );
+
+        let (gpu_inventory, allow_all_default_gpu) = local_podman_gpu_selector_state();
+        if !gpu_inventory.is_empty() {
+            info!(
+                device_count = gpu_inventory.as_slice().len(),
+                "Discovered local Podman NVIDIA CDI GPU devices"
+            );
+        }
+
         Ok(Self {
             client,
             config,
             network_gateway_ip,
+            rootless,
+            rootless_network_cmd,
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,
@@ -300,8 +401,8 @@ impl PodmanComputeDriver {
 
     /// The host's IP on the bridge network, if available.
     ///
-    /// Used by the server to auto-detect the gRPC callback endpoint when
-    /// no explicit `--grpc-endpoint` is configured.
+    /// Used to request the exact rootful gateway callback listener when no
+    /// explicit host-gateway override is configured.
     #[must_use]
     pub fn network_gateway_ip(&self) -> Option<&str> {
         self.network_gateway_ip.as_deref()
@@ -314,6 +415,94 @@ impl PodmanComputeDriver {
             openshell_core::VERSION,
             &self.config.default_image,
         ))
+    }
+
+    /// Report the gateway exposure needed by Podman's standard local callback aliases.
+    ///
+    /// Rootful Podman binds the exact bridge address behind the sandbox alias.
+    /// Rootless pasta follows the host's default-route interface, while Podman
+    /// Machine forwards the alias to gateway loopback. Other rootless helpers
+    /// cannot use a direct host listener.
+    pub fn gateway_listener_requirements(
+        &self,
+    ) -> Result<Vec<GatewayListenerRequirement>, ComputeDriverError> {
+        let endpoint = Url::parse(&self.config.grpc_endpoint).map_err(|err| {
+            ComputeDriverError::Precondition(format!(
+                "invalid Podman gateway callback endpoint '{}': {err}",
+                self.config.grpc_endpoint
+            ))
+        })?;
+        let uses_local_callback_alias = callback_endpoint_uses_local_alias(&endpoint);
+        if !uses_local_callback_alias {
+            return Ok(Vec::new());
+        }
+        let callback_port = endpoint.port_or_known_default().ok_or_else(|| {
+            ComputeDriverError::Precondition(format!(
+                "Podman gateway callback endpoint '{}' has no port",
+                self.config.grpc_endpoint
+            ))
+        })?;
+        if callback_port != self.config.gateway_port {
+            return Err(ComputeDriverError::Precondition(format!(
+                "Podman local callback endpoint '{}' uses port {callback_port}, but the gateway primary listener uses port {}; configure grpc_endpoint with the gateway primary listener port",
+                self.config.grpc_endpoint, self.config.gateway_port
+            )));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if self.rootless {
+                validate_rootless_local_callback_helper(&self.rootless_network_cmd)?;
+
+                if self.config.host_gateway_ip.trim().is_empty() {
+                    return Ok(vec![GatewayListenerRequirement {
+                        reason:
+                            "Podman rootless pasta callback uses the host default-route interface"
+                                .to_string(),
+                        selector: Some(Selector::DefaultRouteInterface(
+                            GatewayDefaultRouteInterfaceRequirement {},
+                        )),
+                    }]);
+                }
+            }
+
+            let gateway_ip = if self.config.host_gateway_ip.trim().is_empty() {
+                self.network_gateway_ip.as_deref().ok_or_else(|| {
+                    ComputeDriverError::Precondition(format!(
+                        "Podman network '{}' did not report a host bridge gateway address for local callback alias '{}'",
+                        self.config.network_name,
+                        endpoint.host_str().unwrap_or_default()
+                    ))
+                })?
+            } else {
+                self.config.host_gateway_ip.trim()
+            };
+            let gateway_ip = gateway_ip.parse::<IpAddr>().map_err(|err| {
+                ComputeDriverError::Precondition(format!(
+                    "Podman callback gateway address '{gateway_ip}' is invalid: {err}"
+                ))
+            })?;
+            Ok(vec![GatewayListenerRequirement {
+                reason: format!("Podman network '{}' host gateway", self.config.network_name),
+                selector: Some(Selector::ExactBindAddress(
+                    SocketAddr::new(gateway_ip, callback_port).to_string(),
+                )),
+            }])
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Ok(vec![GatewayListenerRequirement {
+                reason: "Podman machine callback forwarding terminates on gateway loopback"
+                    .to_string(),
+                selector: Some(Selector::LoopbackInterface(
+                    GatewayLoopbackInterfaceRequirement {},
+                )),
+            }])
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Ok(Vec::new())
+        }
     }
 
     #[must_use]
@@ -451,7 +640,7 @@ impl PodmanComputeDriver {
         // Validate the composed container name early, before creating any
         // resources (volume), so we don't leave orphans when the name is
         // invalid.
-        let name = validated_container_name(&sandbox.name)?;
+        let name = validated_container_name(sandbox)?;
         let validated = self.validated_sandbox_create(sandbox).await?;
 
         let vol_name = container::volume_name(&sandbox.id);
@@ -493,6 +682,20 @@ impl PodmanComputeDriver {
             .pull_image(image, pull_policy)
             .await
             .map_err(ComputeDriverError::from)?;
+        let inspected_image = self
+            .client
+            .inspect_image(image)
+            .await
+            .map_err(ComputeDriverError::from)?;
+        if inspected_image.id.is_empty() {
+            return Err(ComputeDriverError::Precondition(format!(
+                "podman image '{image}' inspection did not return an immutable image ID"
+            )));
+        }
+        let image_user = inspected_image
+            .config
+            .as_ref()
+            .map_or("", |config| config.user.as_str());
 
         for image in
             container::podman_driver_image_mount_sources(sandbox, self.config.enable_bind_mounts)
@@ -516,6 +719,29 @@ impl PodmanComputeDriver {
                 return Err(e);
             }
         };
+        let proxy_auth_secret_name =
+            match create_sandbox_proxy_auth_secret(&self.client, &self.config, sandbox).await {
+                Ok(name) => name,
+                Err(e) => {
+                    let _ = self.client.remove_volume(&vol_name).await;
+                    if let Some(secret) = token_secret_name.as_deref() {
+                        cleanup_sandbox_token_secret(&self.client, secret).await;
+                    }
+                    return Err(e);
+                }
+            };
+
+        // Clean up the volume and both per-sandbox secrets on any failure past
+        // this point.
+        let cleanup_created = || async {
+            let _ = self.client.remove_volume(&vol_name).await;
+            if let Some(secret) = token_secret_name.as_deref() {
+                cleanup_sandbox_token_secret(&self.client, secret).await;
+            }
+            if let Some(secret) = proxy_auth_secret_name.as_deref() {
+                cleanup_sandbox_proxy_auth_secret(&self.client, secret).await;
+            }
+        };
 
         // 3. Create container.
         let gpu_devices = match self.resolve_gpu_cdi_devices(
@@ -525,25 +751,22 @@ impl PodmanComputeDriver {
         ) {
             Ok(devices) => devices,
             Err(e) => {
-                let _ = self.client.remove_volume(&vol_name).await;
-                if let Some(secret) = token_secret_name.as_deref() {
-                    cleanup_sandbox_token_secret(&self.client, secret).await;
-                }
+                cleanup_created().await;
                 return Err(e);
             }
         };
-        let spec = match container::build_container_spec_with_token_and_gpu_devices(
+        let spec = match container::build_container_spec_for_image(
             sandbox,
             &self.config,
             token_secret_name.as_deref(),
             gpu_devices.as_deref(),
+            image,
+            &inspected_image.id,
+            image_user,
         ) {
             Ok(spec) => spec,
             Err(e) => {
-                let _ = self.client.remove_volume(&vol_name).await;
-                if let Some(secret) = token_secret_name.as_deref() {
-                    cleanup_sandbox_token_secret(&self.client, secret).await;
-                }
+                cleanup_created().await;
                 return Err(e);
             }
         };
@@ -554,17 +777,11 @@ impl PodmanComputeDriver {
                 // sandbox's ID, not the conflicting container's ID (which
                 // has the same name but a different ID), so it would be
                 // orphaned otherwise.
-                let _ = self.client.remove_volume(&vol_name).await;
-                if let Some(secret) = token_secret_name.as_deref() {
-                    cleanup_sandbox_token_secret(&self.client, secret).await;
-                }
+                cleanup_created().await;
                 return Err(ComputeDriverError::AlreadyExists);
             }
             Err(e) => {
-                let _ = self.client.remove_volume(&vol_name).await;
-                if let Some(secret) = token_secret_name.as_deref() {
-                    cleanup_sandbox_token_secret(&self.client, secret).await;
-                }
+                cleanup_created().await;
                 return Err(ComputeDriverError::from(e));
             }
         }
@@ -576,11 +793,11 @@ impl PodmanComputeDriver {
                 error = %e,
                 "Failed to start container; cleaning up"
             );
-            let _ = self.client.remove_container(&name).await;
-            let _ = self.client.remove_volume(&vol_name).await;
-            if let Some(secret) = token_secret_name.as_deref() {
-                cleanup_sandbox_token_secret(&self.client, secret).await;
-            }
+            let _ = self
+                .client
+                .remove_container(&name, self.config.stop_timeout_secs)
+                .await;
+            cleanup_created().await;
             return Err(ComputeDriverError::from(e));
         }
 
@@ -593,75 +810,66 @@ impl PodmanComputeDriver {
         Ok(())
     }
 
+    /// Find the Podman container ID for a sandbox by its sandbox ID using label lookup.
+    async fn find_container_id(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<String>, ComputeDriverError> {
+        let id_filter = format!("{LABEL_SANDBOX_ID}={sandbox_id}");
+        let entries = self
+            .client
+            .list_containers(&[LABEL_MANAGED_FILTER, &id_filter])
+            .await
+            .map_err(ComputeDriverError::from)?;
+        Ok(entries.first().map(|e| e.id.clone()))
+    }
+
     /// Stop a sandbox container without deleting it.
-    pub async fn stop_sandbox(&self, sandbox_name: &str) -> Result<(), ComputeDriverError> {
-        let name = validated_container_name(sandbox_name)?;
-        info!(sandbox_name = %sandbox_name, container = %name, "Stopping sandbox container");
+    pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
+        let container_id = self.find_container_id(sandbox_id).await?.ok_or_else(|| {
+            ComputeDriverError::Precondition("sandbox container not found".into())
+        })?;
+        info!(sandbox_id = %sandbox_id, container = %container_id, "Stopping sandbox container");
 
         self.client
-            .stop_container(&name, self.config.stop_timeout_secs)
+            .stop_container(&container_id, self.config.stop_timeout_secs)
             .await
             .map_err(ComputeDriverError::from)
     }
 
     /// Delete a sandbox container and its workspace volume.
-    pub async fn delete_sandbox(
-        &self,
-        sandbox_id: &str,
-        sandbox_name: &str,
-    ) -> Result<bool, ComputeDriverError> {
+    pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, ComputeDriverError> {
         if sandbox_id.is_empty() {
             return Err(ComputeDriverError::Precondition(
                 "sandbox id is required".into(),
             ));
         }
-        let name = validated_container_name(sandbox_name)?;
-        info!(
-            sandbox_id = %sandbox_id,
-            sandbox_name = %sandbox_name,
-            container = %name,
-            "Deleting sandbox container"
-        );
 
-        // Use the request's stable sandbox ID as the source of truth for
-        // cleanup. Inspect is only used as a best-effort cross-check so
-        // cleanup still works if the container is already gone or mislabeled.
-        match self.client.inspect_container(&name).await {
-            Ok(inspect) => match inspect.config.labels.get(LABEL_SANDBOX_ID) {
-                Some(label_id) if label_id != sandbox_id => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        sandbox_name = %sandbox_name,
-                        container = %name,
-                        label_sandbox_id = %label_id,
-                        "Container label sandbox ID did not match delete request; cleaning up using request sandbox_id"
-                    );
-                }
-                None => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        sandbox_name = %sandbox_name,
-                        container = %name,
-                        "Container missing '{}' label; cleaning up using request sandbox_id",
-                        LABEL_SANDBOX_ID,
-                    );
-                }
-                Some(_) => {}
-            },
-            Err(PodmanApiError::NotFound(_)) => {}
-            Err(e) => return Err(ComputeDriverError::from(e)),
-        }
-
-        // Stop (best-effort).
-        let _ = self
-            .client
-            .stop_container(&name, self.config.stop_timeout_secs)
+        let Some(container_id) = self.find_container_id(sandbox_id).await? else {
+            debug!(sandbox_id = %sandbox_id, "Sandbox container not found (already deleted)");
+            let vol = container::volume_name(sandbox_id);
+            if let Err(e) = self.client.remove_volume(&vol).await {
+                warn!(sandbox_id = %sandbox_id, volume = %vol, error = %e, "Failed to remove workspace volume");
+            }
+            cleanup_sandbox_token_secret(&self.client, &container::token_secret_name(sandbox_id))
+                .await;
+            cleanup_sandbox_proxy_auth_secret(
+                &self.client,
+                &container::proxy_auth_secret_name(sandbox_id),
+            )
             .await;
+            return Ok(false);
+        };
+        info!(sandbox_id = %sandbox_id, container = %container_id, "Deleting sandbox container");
 
-        // Remove container. If NotFound, the container was removed between
-        // inspect and here (TOCTOU race); proceed with volume cleanup
-        // since the workspace volume is idempotent to remove.
-        let container_existed = match self.client.remove_container(&name).await {
+        // Keep stop, timeout, and removal in one Podman operation. Splitting
+        // stop and remove can race with another container starting an image
+        // mount when the stop reaches its timeout.
+        let container_existed = match self
+            .client
+            .remove_container(&container_id, self.config.stop_timeout_secs)
+            .await
+        {
             Ok(()) => true,
             Err(PodmanApiError::NotFound(_)) => false,
             Err(e) => return Err(ComputeDriverError::from(e)),
@@ -672,37 +880,56 @@ impl PodmanComputeDriver {
         if let Err(e) = self.client.remove_volume(&vol).await {
             warn!(
                 sandbox_id = %sandbox_id,
-                sandbox_name = %sandbox_name,
                 volume = %vol,
                 error = %e,
                 "Failed to remove workspace volume"
             );
         }
         cleanup_sandbox_token_secret(&self.client, &container::token_secret_name(sandbox_id)).await;
+        cleanup_sandbox_proxy_auth_secret(
+            &self.client,
+            &container::proxy_auth_secret_name(sandbox_id),
+        )
+        .await;
 
         Ok(container_existed)
     }
 
     /// Check whether a sandbox container exists.
-    pub async fn sandbox_exists(&self, sandbox_name: &str) -> Result<bool, ComputeDriverError> {
-        let name = container::container_name(sandbox_name);
-        match self.client.inspect_container(&name).await {
-            Ok(_) => Ok(true),
-            Err(PodmanApiError::NotFound(_)) => Ok(false),
-            Err(e) => Err(ComputeDriverError::from(e)),
-        }
+    pub async fn sandbox_exists(&self, sandbox_id: &str) -> Result<bool, ComputeDriverError> {
+        let id_filter = format!("{LABEL_SANDBOX_ID}={sandbox_id}");
+        let entries = self
+            .client
+            .list_containers(&[LABEL_MANAGED_FILTER, &id_filter])
+            .await
+            .map_err(ComputeDriverError::from)?;
+        Ok(!entries.is_empty())
     }
 
-    /// Fetch a single sandbox by name.
+    /// Fetch a single sandbox by ID.
     pub async fn get_sandbox(
         &self,
-        sandbox_name: &str,
+        sandbox_id: &str,
     ) -> Result<Option<DriverSandbox>, ComputeDriverError> {
-        let name = container::container_name(sandbox_name);
-        match self.client.inspect_container(&name).await {
-            Ok(inspect) => Ok(driver_sandbox_from_inspect(&inspect)),
-            Err(PodmanApiError::NotFound(_)) => Ok(None),
-            Err(e) => Err(ComputeDriverError::from(e)),
+        let id_filter = format!("{LABEL_SANDBOX_ID}={sandbox_id}");
+        let entries = self
+            .client
+            .list_containers(&[LABEL_MANAGED_FILTER, &id_filter])
+            .await
+            .map_err(ComputeDriverError::from)?;
+        let Some(entry) = entries.first() else {
+            return Ok(None);
+        };
+        if entry.state == "running" {
+            Ok(self
+                .client
+                .inspect_container(&entry.id)
+                .await
+                .ok()
+                .and_then(|inspect| driver_sandbox_from_inspect(&inspect))
+                .or_else(|| driver_sandbox_from_list_entry(entry)))
+        } else {
+            Ok(driver_sandbox_from_list_entry(entry))
         }
     }
 
@@ -713,7 +940,7 @@ impl PodmanComputeDriver {
     pub async fn list_sandboxes(&self) -> Result<Vec<DriverSandbox>, ComputeDriverError> {
         let entries = self
             .client
-            .list_containers(LABEL_MANAGED_FILTER)
+            .list_containers(&[LABEL_MANAGED_FILTER])
             .await
             .map_err(ComputeDriverError::from)?;
 
@@ -774,12 +1001,14 @@ impl PodmanComputeDriver {
         gpu_inventory: CdiGpuInventory,
         allow_all_default_gpu: bool,
     ) -> Self {
-        let client = PodmanClient::new(config.socket_path.clone());
+        let client = PodmanClient::new(config.socket_path.clone().unwrap_or_default());
         let refresh_inventory = gpu_inventory.clone();
         Self {
             client,
             config,
             network_gateway_ip: None,
+            rootless: false,
+            rootless_network_cmd: String::new(),
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,
@@ -838,6 +1067,31 @@ fn check_subuid_range() {
     }
 }
 
+fn callback_endpoint_uses_local_alias(endpoint: &Url) -> bool {
+    endpoint
+        .host_str()
+        .is_some_and(|host| matches!(host, "host.containers.internal" | "host.openshell.internal"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_rootless_local_callback_helper(
+    rootless_network_cmd: &str,
+) -> Result<(), ComputeDriverError> {
+    let rootless_network_cmd = rootless_network_cmd.trim();
+    if rootless_network_cmd == "pasta" {
+        return Ok(());
+    }
+
+    let reported = if rootless_network_cmd.is_empty() {
+        "<missing>"
+    } else {
+        rootless_network_cmd
+    };
+    Err(ComputeDriverError::Precondition(format!(
+        "Podman rootless network helper '{reported}' does not support direct local gateway callbacks; configure pasta or use an explicitly remote grpc_endpoint"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,7 +1102,37 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    // ── socket resolution ───────────────────────────────────────────────
+    //
+    // These test resolve_socket_path directly with an injected detector, so
+    // they are deterministic regardless of the host's real environment
+    // variables or whether a Podman socket happens to be running.
+
+    #[test]
+    fn resolve_socket_path_prefers_explicit_configuration() {
+        let path = resolve_socket_path(Some(PathBuf::from("/explicit.sock")), || {
+            Some(PathBuf::from("/detected.sock"))
+        })
+        .unwrap();
+
+        assert_eq!(path, PathBuf::from("/explicit.sock"));
+    }
+
+    #[test]
+    fn resolve_socket_path_uses_detected_socket_when_unconfigured() {
+        let path = resolve_socket_path(None, || Some(PathBuf::from("/detected.sock"))).unwrap();
+
+        assert_eq!(path, PathBuf::from("/detected.sock"));
+    }
+
+    #[test]
+    fn resolve_socket_path_errors_when_neither_source_resolves() {
+        let err = resolve_socket_path(None, || None).unwrap_err();
+
+        assert!(err.to_string().contains("no responsive Podman API socket"));
+    }
 
     fn cdi_devices_config(device_ids: &[&str]) -> prost_types::Struct {
         prost_types::Struct {
@@ -1024,6 +1308,272 @@ mod tests {
             cfg.grpc_endpoint = format!("{scheme}://host.containers.internal:{}", cfg.gateway_port);
         }
         assert_eq!(cfg.grpc_endpoint, "https://gateway.internal:9000");
+    }
+
+    #[test]
+    fn rootless_slirp_allows_remote_callback_endpoint() {
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "https://gateway.internal:9000".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+        driver.rootless = true;
+        driver.rootless_network_cmd = "slirp4netns".to_string();
+
+        let requirements = driver.gateway_listener_requirements().unwrap();
+
+        assert!(requirements.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rootful_local_callback_alias_requests_discovered_network_gateway() {
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+        driver.network_gateway_ip = Some("10.89.1.1".to_string());
+
+        let requirements = driver.gateway_listener_requirements().unwrap();
+
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(
+            requirements[0].selector,
+            Some(Selector::ExactBindAddress("10.89.1.1:17670".to_string()))
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn configured_host_gateway_overrides_discovered_network_gateway() {
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.containers.internal:17670".to_string(),
+            host_gateway_ip: "10.90.1.1".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+        driver.network_gateway_ip = Some("10.89.1.1".to_string());
+        driver.rootless = true;
+        driver.rootless_network_cmd = "pasta".to_string();
+
+        let requirements = driver.gateway_listener_requirements().unwrap();
+
+        assert_eq!(
+            requirements[0].selector,
+            Some(Selector::ExactBindAddress("10.90.1.1:17670".to_string()))
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rootless_pasta_requests_default_route_interface() {
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+        driver.rootless = true;
+        driver.rootless_network_cmd = "pasta".to_string();
+
+        let requirements = driver.gateway_listener_requirements().unwrap();
+
+        assert!(matches!(
+            requirements[0].selector,
+            Some(Selector::DefaultRouteInterface(_))
+        ));
+    }
+
+    #[test]
+    fn rootless_non_pasta_helpers_are_rejected() {
+        for (rootless_network_cmd, reported) in [
+            ("slirp4netns", "slirp4netns"),
+            ("", "<missing>"),
+            ("unknown-helper", "unknown-helper"),
+        ] {
+            let err = validate_rootless_local_callback_helper(rootless_network_cmd).unwrap_err();
+
+            assert!(matches!(err, ComputeDriverError::Precondition(_)));
+            assert!(err.to_string().contains(reported));
+            assert!(err.to_string().contains("configure pasta"));
+            assert!(err.to_string().contains("remote grpc_endpoint"));
+        }
+    }
+
+    #[test]
+    fn rootless_pasta_is_accepted_for_local_callbacks() {
+        validate_rootless_local_callback_helper("pasta").unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rootless_slirp_rejects_explicit_host_gateway_override() {
+        let mut driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
+            host_gateway_ip: "10.90.1.1".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+        driver.rootless = true;
+        driver.rootless_network_cmd = "slirp4netns".to_string();
+
+        let err = driver.gateway_listener_requirements().unwrap_err();
+
+        assert!(matches!(err, ComputeDriverError::Precondition(_)));
+        assert!(err.to_string().contains("slirp4netns"));
+    }
+
+    #[tokio::test]
+    async fn constructor_preserves_required_network_gateway_discovery_error() {
+        let (socket_path, _request_log, handle) = spawn_podman_stub(
+            "network-gateway-error",
+            vec![
+                StubResponse::new(StatusCode::OK, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{
+                        "host": {
+                            "cgroupVersion": "v2",
+                            "networkBackend": "netavark",
+                            "security": {"rootless": false},
+                            "remoteSocket": {"path": "/run/podman/podman.sock"}
+                        },
+                        "version": {"Version": "5.0.0"}
+                    }"#,
+                ),
+                StubResponse::new(StatusCode::CREATED, "{}"),
+                StubResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"message":"network gateway inspection failed"}"#,
+                ),
+            ],
+        );
+        let config = PodmanComputeConfig {
+            socket_path: Some(socket_path.clone()),
+            grpc_endpoint: "http://host.containers.internal:8080".to_string(),
+            ..PodmanComputeConfig::default()
+        };
+
+        let Err(err) = PodmanComputeDriver::new(config).await else {
+            panic!("required network gateway discovery failure should prevent startup");
+        };
+
+        assert!(
+            err.to_string()
+                .contains("network gateway inspection failed"),
+            "unexpected startup error: {err}"
+        );
+        handle.await.expect("stub task should finish");
+    }
+
+    #[tokio::test]
+    async fn constructor_skips_network_gateway_discovery_for_remote_callback() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "remote-callback-no-network-gateway",
+            vec![
+                StubResponse::new(StatusCode::OK, ""),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{
+                        "host": {
+                            "cgroupVersion": "v2",
+                            "networkBackend": "netavark",
+                            "security": {"rootless": false}
+                        }
+                    }"#,
+                ),
+                StubResponse::new(StatusCode::CREATED, "{}"),
+            ],
+        );
+        let config = PodmanComputeConfig {
+            socket_path: Some(socket_path.clone()),
+            grpc_endpoint: "https://gateway.example.test:9443".to_string(),
+            ..PodmanComputeConfig::default()
+        };
+
+        let driver = PodmanComputeDriver::new(config)
+            .await
+            .expect("remote callbacks must not require bridge gateway inspection");
+
+        assert!(driver.network_gateway_ip().is_none());
+        assert!(driver.gateway_listener_requirements().unwrap().is_empty());
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            [
+                "GET /_ping".to_string(),
+                format!("GET {}", api_path("/libpod/info")),
+                format!("POST {}", api_path("/libpod/networks/create")),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rootful_local_callback_alias_requires_concrete_gateway_address() {
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+
+        let err = driver.gateway_listener_requirements().unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("did not report a host bridge gateway address")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn podman_machine_callback_alias_requests_loopback_listener() {
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "http://host.openshell.internal:17670".to_string(),
+            ..PodmanComputeConfig::default()
+        });
+
+        let requirements = driver.gateway_listener_requirements().unwrap();
+
+        assert_eq!(requirements.len(), 1);
+        assert!(matches!(
+            requirements[0].selector,
+            Some(Selector::LoopbackInterface(_))
+        ));
+    }
+
+    #[test]
+    fn explicit_remote_callback_does_not_request_gateway_listener() {
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+            grpc_endpoint: "https://gateway.example.test:9443".to_string(),
+            gateway_port: 17670,
+            ..PodmanComputeConfig::default()
+        });
+
+        assert!(driver.gateway_listener_requirements().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_callback_alias_requires_primary_listener_port() {
+        for grpc_endpoint in [
+            "http://host.openshell.internal:17671",
+            "http://host.containers.internal",
+        ] {
+            let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig {
+                grpc_endpoint: grpc_endpoint.to_string(),
+                gateway_port: 17670,
+                ..PodmanComputeConfig::default()
+            });
+
+            let err = driver.gateway_listener_requirements().unwrap_err();
+
+            assert!(
+                matches!(err, ComputeDriverError::Precondition(_)),
+                "mismatched local callback port should fail precondition: {err}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("gateway primary listener uses port 17670"),
+                "unexpected error for {grpc_endpoint}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1245,7 +1795,7 @@ mod tests {
 
     fn test_driver(socket_path: PathBuf) -> PodmanComputeDriver {
         let config = PodmanComputeConfig {
-            socket_path,
+            socket_path: Some(socket_path),
             stop_timeout_secs: 10,
             ..PodmanComputeConfig::default()
         };
@@ -1283,6 +1833,7 @@ mod tests {
                 ..Default::default()
             }),
             status: None,
+            workspace: String::new(),
         }
     }
 
@@ -1424,7 +1975,7 @@ mod tests {
             )],
         );
         let config = PodmanComputeConfig {
-            socket_path: socket_path.clone(),
+            socket_path: Some(socket_path.clone()),
             enable_bind_mounts: true,
             ..PodmanComputeConfig::default()
         };
@@ -1441,24 +1992,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_sandbox_cleans_up_with_request_id_when_container_is_already_gone() {
+    async fn delete_sandbox_cleans_up_volume_when_container_is_already_gone() {
         let sandbox_id = "sandbox-123";
-        let sandbox_name = "demo";
-        let container_name = container::container_name(sandbox_name);
         let volume_name = container::volume_name(sandbox_id);
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-not-found",
             vec![
-                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
-                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
-                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
+                // list_containers returns empty (container already gone)
+                StubResponse::new(StatusCode::OK, "[]"),
+                // remove_volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
         let driver = test_driver(socket_path.clone());
 
         let deleted = driver
-            .delete_sandbox(sandbox_id, sandbox_name)
+            .delete_sandbox(sandbox_id)
             .await
             .expect("delete should succeed");
 
@@ -1468,67 +2017,205 @@ mod tests {
             .lock()
             .expect("request log lock should not be poisoned")
             .clone();
+        assert!(requests[0].contains("/libpod/containers/json"));
         assert_eq!(
-            requests,
+            requests[1],
+            format!(
+                "DELETE {}",
+                api_path(&format!("/libpod/volumes/{volume_name}"))
+            )
+        );
+        let _ = fs::remove_file(socket_path);
+    }
+
+    /// Write a valid `user:pass` credential to a unique path for proxy-auth
+    /// secret tests. Caller removes it.
+    fn write_proxy_auth_file(test_name: &str) -> PathBuf {
+        let path = crate::test_utils::unique_socket_path(test_name).with_extension("auth");
+        fs::write(&path, "user:pass\n").expect("write proxy auth file");
+        path
+    }
+
+    fn proxy_auth_config(socket_path: PathBuf, auth_file: &Path) -> PodmanComputeConfig {
+        PodmanComputeConfig {
+            socket_path: Some(socket_path),
+            stop_timeout_secs: 10,
+            proxy_auth_file: Some(auth_file.to_string_lossy().into_owned()),
+            proxy_auth_allow_insecure: Some(true),
+            ..PodmanComputeConfig::default()
+        }
+    }
+
+    fn plain_sandbox(id: &str, name: &str) -> DriverSandbox {
+        DriverSandbox {
+            id: id.to_string(),
+            name: name.to_string(),
+            namespace: String::new(),
+            workspace: String::new(),
+            spec: None,
+            status: None,
+        }
+    }
+
+    fn secret_delete_request(sandbox_id: &str) -> String {
+        format!(
+            "DELETE {}",
+            api_path(&format!(
+                "/libpod/secrets/{}",
+                container::proxy_auth_secret_name(sandbox_id)
+            ))
+        )
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_removes_proxy_auth_secret_on_container_create_failure() {
+        // A credential secret is staged before the container is created, so a
+        // container-create failure must remove it — no credential residue.
+        let sandbox_id = "sandbox-cc";
+        let auth_file = write_proxy_auth_file("create-fail");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "create-container-fail",
             vec![
-                format!(
-                    "GET {}",
-                    api_path(&format!("/libpod/containers/{container_name}/json"))
-                ),
-                format!(
-                    "POST {}",
-                    api_path(&format!(
-                        "/libpod/containers/{container_name}/stop?timeout=10"
-                    ))
-                ),
-                format!(
-                    "DELETE {}",
-                    api_path(&format!(
-                        "/libpod/containers/{container_name}?force=true&v=true"
-                    ))
-                ),
-                format!(
-                    "DELETE {}",
-                    api_path(&format!("/libpod/volumes/{volume_name}"))
-                ),
-            ]
+                StubResponse::new(StatusCode::OK, "{}"), // pull supervisor image
+                StubResponse::new(StatusCode::OK, "{}"), // pull sandbox image
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":"1234:1235"}}"#,
+                ), // inspect sandbox image
+                StubResponse::new(StatusCode::CREATED, "{}"), // create volume
+                StubResponse::new(StatusCode::CREATED, "{}"), // create proxy-auth secret
+                StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"message":"boom"}"#), // create container
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove volume
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove proxy-auth secret
+            ],
+        );
+        let driver = test_driver_with_config(proxy_auth_config(socket_path.clone(), &auth_file));
+
+        driver
+            .create_sandbox(&plain_sandbox(sandbox_id, "demo"))
+            .await
+            .expect_err("container create should fail");
+
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert!(
+            requests.contains(&secret_delete_request(sandbox_id)),
+            "proxy-auth secret must be removed on container-create failure: {requests:?}"
+        );
+        let _ = fs::remove_file(&auth_file);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_removes_proxy_auth_secret_on_start_failure() {
+        // The container is created but fails to start; the staged credential
+        // secret must still be removed.
+        let sandbox_id = "sandbox-sf";
+        let auth_file = write_proxy_auth_file("start-fail");
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "create-start-fail",
+            vec![
+                StubResponse::new(StatusCode::OK, "{}"), // pull supervisor image
+                StubResponse::new(StatusCode::OK, "{}"), // pull sandbox image
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:sandbox","Config":{"User":"1234:1235"}}"#,
+                ), // inspect sandbox image
+                StubResponse::new(StatusCode::CREATED, "{}"), // create volume
+                StubResponse::new(StatusCode::CREATED, "{}"), // create proxy-auth secret
+                StubResponse::new(StatusCode::CREATED, "{}"), // create container
+                StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"message":"boom"}"#), // start container
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove container
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove volume
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // cleanup: remove proxy-auth secret
+            ],
+        );
+        let driver = test_driver_with_config(proxy_auth_config(socket_path.clone(), &auth_file));
+
+        driver
+            .create_sandbox(&plain_sandbox(sandbox_id, "demo"))
+            .await
+            .expect_err("container start should fail");
+
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert!(
+            requests.contains(&secret_delete_request(sandbox_id)),
+            "proxy-auth secret must be removed on start failure: {requests:?}"
+        );
+        let _ = fs::remove_file(&auth_file);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_removes_proxy_auth_secret() {
+        // Deleting a sandbox (here already gone out of band) must remove the
+        // per-sandbox proxy-auth secret so credentials never outlive it.
+        let sandbox_id = "sandbox-del";
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "delete-proxy-auth",
+            vec![
+                StubResponse::new(StatusCode::OK, "[]"), // list_containers (not found)
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove volume
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove token secret
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove proxy-auth secret
+            ],
+        );
+        let driver = test_driver(socket_path.clone());
+
+        driver
+            .delete_sandbox(sandbox_id)
+            .await
+            .expect("delete should succeed");
+
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert!(
+            requests.contains(&secret_delete_request(sandbox_id)),
+            "proxy-auth secret must be removed on delete: {requests:?}"
         );
         let _ = fs::remove_file(socket_path);
     }
 
     #[tokio::test]
-    async fn delete_sandbox_uses_request_id_when_container_label_disagrees() {
+    async fn delete_sandbox_finds_container_by_label_and_removes() {
         let sandbox_id = "sandbox-request-id";
-        let sandbox_name = "demo";
-        let container_name = container::container_name(sandbox_name);
+        let container_id = "abc123def456";
+        let container_name = "openshell-default--demo-sandbox-request-id";
         let volume_name = container::volume_name(sandbox_id);
-        let inspect_body = serde_json::json!({
-            "Id": "container-id",
-            "Name": format!("/{container_name}"),
-            "State": {
-                "Status": "running",
-                "Running": true
-            },
-            "Config": {
-                "Labels": {
-                    LABEL_SANDBOX_ID: "sandbox-label-id"
-                }
+        let list_body = serde_json::json!([{
+            "Id": container_id,
+            "Names": [container_name],
+            "State": "running",
+            "Labels": {
+                LABEL_SANDBOX_ID: sandbox_id
             }
-        })
+        }])
         .to_string();
         let (socket_path, request_log, handle) = spawn_podman_stub(
-            "delete-mismatch",
+            "delete-label-lookup",
             vec![
-                StubResponse::new(StatusCode::OK, inspect_body),
+                // list_containers by label
+                StubResponse::new(StatusCode::OK, list_body),
+                // single timed remove_container operation
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
-                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                // remove_volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
         let driver = test_driver(socket_path.clone());
 
         let deleted = driver
-            .delete_sandbox(sandbox_id, sandbox_name)
+            .delete_sandbox(sandbox_id)
             .await
             .expect("delete should succeed");
 
@@ -1538,12 +2225,22 @@ mod tests {
             .lock()
             .expect("request log lock should not be poisoned")
             .clone();
+        assert!(requests[0].contains("/libpod/containers/json"));
         assert_eq!(
-            requests[3..],
-            [format!(
+            requests[1],
+            format!(
+                "DELETE {}",
+                api_path(&format!(
+                    "/libpod/containers/{container_id}?force=true&volumes=true&timeout=10"
+                ))
+            )
+        );
+        assert_eq!(
+            requests[2],
+            format!(
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))
-            )]
+            )
         );
         let _ = fs::remove_file(socket_path);
     }

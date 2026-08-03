@@ -63,7 +63,6 @@ telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
-openshell-core = { path = "../openshell-core", features = ["test-helpers"] }
 tempfile = "3"
 temp-env = "0.3"
 tokio-tungstenite = { workspace = true }

@@ -1,0 +1,10 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_proc_macro.bzl", "rust_proc_macro")
+
+rust_proc_macro(
+    name = "openshell-server-macros",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)

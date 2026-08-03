@@ -6,7 +6,8 @@
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
     ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
     WatchSandboxesRequest, compute_driver_server::ComputeDriver,
@@ -40,6 +41,18 @@ impl ComputeDriver for ComputeDriverService {
             .map_err(Status::from)
     }
 
+    async fn get_gateway_listener_requirements(
+        &self,
+        _request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        Ok(Response::new(GetGatewayListenerRequirementsResponse {
+            requirements: self
+                .driver
+                .gateway_listener_requirements()
+                .map_err(Status::from)?,
+        }))
+    }
+
     async fn validate_sandbox_create(
         &self,
         request: Request<ValidateSandboxCreateRequest>,
@@ -60,22 +73,16 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
         let request = request.into_inner();
-        if request.sandbox_name.is_empty() {
-            return Err(Status::invalid_argument("sandbox_name is required"));
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
         }
 
         let sandbox = self
             .driver
-            .get_sandbox(&request.sandbox_name)
+            .get_sandbox(&request.sandbox_id)
             .await
             .map_err(Status::from)?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
-
-        if !request.sandbox_id.is_empty() && request.sandbox_id != sandbox.id {
-            return Err(Status::failed_precondition(
-                "sandbox_id did not match the fetched sandbox",
-            ));
-        }
 
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
@@ -110,11 +117,11 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
         let request = request.into_inner();
-        if request.sandbox_name.is_empty() {
-            return Err(Status::invalid_argument("sandbox_name is required"));
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
         }
         self.driver
-            .stop_sandbox(&request.sandbox_name)
+            .stop_sandbox(&request.sandbox_id)
             .await
             .map_err(Status::from)?;
         Ok(Response::new(StopSandboxResponse {}))
@@ -128,12 +135,9 @@ impl ComputeDriver for ComputeDriverService {
         if request.sandbox_id.is_empty() {
             return Err(Status::invalid_argument("sandbox_id is required"));
         }
-        if request.sandbox_name.is_empty() {
-            return Err(Status::invalid_argument("sandbox_name is required"));
-        }
         let deleted = self
             .driver
-            .delete_sandbox(&request.sandbox_id, &request.sandbox_name)
+            .delete_sandbox(&request.sandbox_id)
             .await
             .map_err(Status::from)?;
         Ok(Response::new(DeleteSandboxResponse { deleted }))
@@ -179,7 +183,7 @@ mod tests {
 
     fn test_service(socket_path: PathBuf) -> ComputeDriverService {
         let config = PodmanComputeConfig {
-            socket_path,
+            socket_path: Some(socket_path),
             stop_timeout_secs: 10,
             ..PodmanComputeConfig::default()
         };
@@ -188,24 +192,6 @@ mod tests {
 
     fn api_path(path: &str) -> String {
         format!("/v5.0.0{path}")
-    }
-
-    #[tokio::test]
-    async fn delete_sandbox_rejects_missing_sandbox_name() {
-        let service = test_service(unique_socket_path("missing-name"));
-
-        let err = ComputeDriver::delete_sandbox(
-            &service,
-            Request::new(DeleteSandboxRequest {
-                sandbox_id: "sandbox-123".to_string(),
-                sandbox_name: String::new(),
-            }),
-        )
-        .await
-        .expect_err("missing sandbox_name should fail");
-
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert_eq!(err.message(), "sandbox_name is required");
     }
 
     #[tokio::test]
@@ -229,15 +215,13 @@ mod tests {
     #[tokio::test]
     async fn delete_sandbox_forwards_request_sandbox_id_to_driver_cleanup() {
         let sandbox_id = "sandbox-abc";
-        let sandbox_name = "demo";
-        let container_name = container::container_name(sandbox_name);
         let volume_name = container::volume_name(sandbox_id);
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "forward-id",
             vec![
-                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
-                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
-                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
+                // list_containers returns empty (container already gone)
+                StubResponse::new(StatusCode::OK, "[]"),
+                // remove_volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
@@ -247,7 +231,7 @@ mod tests {
             &service,
             Request::new(DeleteSandboxRequest {
                 sandbox_id: sandbox_id.to_string(),
-                sandbox_name: sandbox_name.to_string(),
+                sandbox_name: "demo".to_string(),
             }),
         )
         .await
@@ -263,30 +247,13 @@ mod tests {
             .lock()
             .expect("request log lock should not be poisoned")
             .clone();
+        assert!(requests[0].contains("/libpod/containers/json"));
         assert_eq!(
-            requests,
-            vec![
-                format!(
-                    "GET {}",
-                    api_path(&format!("/libpod/containers/{container_name}/json"))
-                ),
-                format!(
-                    "POST {}",
-                    api_path(&format!(
-                        "/libpod/containers/{container_name}/stop?timeout=10"
-                    ))
-                ),
-                format!(
-                    "DELETE {}",
-                    api_path(&format!(
-                        "/libpod/containers/{container_name}?force=true&v=true"
-                    ))
-                ),
-                format!(
-                    "DELETE {}",
-                    api_path(&format!("/libpod/volumes/{volume_name}"))
-                ),
-            ]
+            requests[1],
+            format!(
+                "DELETE {}",
+                api_path(&format!("/libpod/volumes/{volume_name}"))
+            )
         );
         let _ = std::fs::remove_file(socket_path);
     }

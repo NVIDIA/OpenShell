@@ -10,7 +10,10 @@
 #![allow(clippy::cast_possible_wrap)] // Intentional u32->i32 conversions for proto compat
 
 use crate::ServerState;
-use crate::persistence::{ObjectType, WriteCondition, generate_name};
+use crate::auth::workspace_authz::{
+    MinWorkspaceRole, authorize_sandbox_workspace, authorize_workspace, require_platform_admin,
+};
+use crate::persistence::{ObjectLabels, ObjectType, WriteCondition, generate_name};
 use futures::future;
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateSandboxRequest,
@@ -27,8 +30,9 @@ use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryComputeDriver,
     TelemetryOutcome,
 };
-use openshell_core::{ObjectId, ObjectName};
+use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -46,13 +50,53 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique,
 };
 use super::validation::{
-    level_matches, source_matches, validate_exec_request_fields,
-    validate_no_reserved_provider_policy_keys, validate_policy_safety, validate_sandbox_spec,
+    level_matches, normalize_process_identity_for_driver, source_matches,
+    validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
+    validate_policy_safety, validate_sandbox_spec,
 };
-use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, clamp_limit};
+use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Fetch a sandbox by ID and authorize the caller in one step, returning
+/// `NOT_FOUND` for both missing and unauthorized sandboxes so that callers
+/// cannot distinguish the two cases (CWE-203).
+pub(super) async fn fetch_and_authorize_sandbox(
+    state: &Arc<ServerState>,
+    principal: &crate::auth::principal::Principal,
+    sandbox_id: &str,
+) -> Result<Sandbox, Status> {
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    authorize_sandbox_workspace(
+        &state.store,
+        &state.admin_role,
+        principal,
+        sandbox.object_workspace(),
+        MinWorkspaceRole::User,
+    )
+    .await
+    .map_err(|e| {
+        if e.code() == tonic::Code::PermissionDenied {
+            Status::not_found("sandbox not found")
+        } else {
+            e
+        }
+    })?;
+    Ok(sandbox)
+}
+
+fn generate_routable_name() -> String {
+    let name = petname::petname(2, "-").unwrap_or_else(generate_name);
+    let mut truncated = &name[..name.len().min(MAX_ROUTABLE_NAME_LEN)];
+    truncated = truncated.trim_end_matches('-');
+    truncated.to_string()
+}
 
 // ---------------------------------------------------------------------------
 // Sandbox lifecycle handlers
@@ -120,6 +164,7 @@ async fn handle_create_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
     let spec = request
         .spec
@@ -135,6 +180,18 @@ async fn handle_create_sandbox_inner(
     }
     crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
 
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &request.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .ensure_active()?;
+
     let _sandbox_sync_guard = if spec.providers.is_empty() {
         None
     } else {
@@ -145,12 +202,13 @@ async fn handle_create_sandbox_inner(
     for name in &spec.providers {
         state
             .store
-            .get_message_by_name::<Provider>(name)
+            .get_message_by_name::<Provider>(&workspace, name)
             .await
             .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
     }
-    validate_provider_environment_keys_unique(state.store.as_ref(), &spec.providers).await?;
+    validate_provider_environment_keys_unique(state.store.as_ref(), &workspace, &spec.providers)
+        .await?;
 
     // Ensure the template always carries the resolved image.
     let mut spec = spec;
@@ -159,10 +217,10 @@ async fn handle_create_sandbox_inner(
         template.image = state.compute.default_image().to_string();
     }
 
-    // Ensure process identity defaults to "sandbox" when missing or
-    // empty, then validate policy safety before persisting.
+    // Docker and Podman preserve omitted identity fields for OCI USER
+    // fallback. Other drivers retain the legacy persisted sandbox defaults.
     if let Some(ref mut policy) = spec.policy {
-        openshell_policy::ensure_sandbox_process_identity(policy);
+        normalize_process_identity_for_driver(policy, state.compute.driver_kind());
         validate_no_reserved_provider_policy_keys(policy)?;
         validate_policy_safety(policy)?;
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
@@ -170,7 +228,7 @@ async fn handle_create_sandbox_inner(
 
     let id = uuid::Uuid::new_v4().to_string();
     let name = if request.name.is_empty() {
-        petname::petname(2, "-").unwrap_or_else(generate_name)
+        generate_routable_name()
     } else {
         request.name.clone()
     };
@@ -185,6 +243,8 @@ async fn handle_create_sandbox_inner(
             labels: request.labels.clone(),
             resource_version: 0,
             annotations: request.annotations.clone(),
+            workspace,
+            deletion_timestamp_ms: 0,
         }),
         spec: Some(spec),
         status: None,
@@ -239,14 +299,26 @@ pub(super) async fn handle_get_sandbox(
     state: &Arc<ServerState>,
     request: Request<GetSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
-    let name = request.into_inner().name;
-    if name.is_empty() {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
 
     let sandbox = state
         .store
-        .get_message_by_name::<Sandbox>(&name)
+        .get_message_by_name::<Sandbox>(&workspace, &req.name)
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
 
@@ -260,22 +332,64 @@ pub(super) async fn handle_list_sandboxes(
     state: &Arc<ServerState>,
     request: Request<ListSandboxesRequest>,
 ) -> Result<Response<ListSandboxesResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
+    if request.all_workspaces && !request.workspace.is_empty() {
+        return Err(Status::invalid_argument(
+            "all_workspaces and workspace are mutually exclusive",
+        ));
+    }
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
 
-    let sandboxes: Vec<Sandbox> = if request.label_selector.is_empty() {
-        state
-            .store
-            .list_messages(limit, request.offset)
-            .await
-            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
+    let sandboxes: Vec<Sandbox> = if request.all_workspaces {
+        require_platform_admin(&state.admin_role, &principal)?;
+        if request.label_selector.is_empty() {
+            state
+                .store
+                .list_all_messages(limit, request.offset)
+                .await
+                .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
+        } else {
+            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
+            state
+                .store
+                .list_all_messages_with_selector(&request.label_selector, limit, request.offset)
+                .await
+                .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
+        }
     } else {
-        crate::grpc::validation::validate_label_selector(&request.label_selector)?;
-        state
-            .store
-            .list_messages_with_selector(&request.label_selector, limit, request.offset)
-            .await
-            .map_err(|e| Status::internal(format!("list sandboxes with selector failed: {e}")))?
+        let authz = authorize_workspace(
+            &state.store,
+            &state.admin_role,
+            &principal,
+            &request.workspace,
+            MinWorkspaceRole::User,
+        )
+        .await?;
+        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+            .await?
+            .name;
+        if request.label_selector.is_empty() {
+            state
+                .store
+                .list_messages(&workspace, limit, request.offset)
+                .await
+                .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
+        } else {
+            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
+            state
+                .store
+                .list_messages_with_selector(
+                    &workspace,
+                    &request.label_selector,
+                    limit,
+                    request.offset,
+                )
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("list sandboxes with selector failed: {e}"))
+                })?
+        }
     };
 
     Ok(Response::new(ListSandboxesResponse { sandboxes }))
@@ -285,8 +399,21 @@ pub(super) async fn handle_list_sandbox_providers(
     state: &Arc<ServerState>,
     request: Request<ListSandboxProvidersRequest>,
 ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
-    let sandbox = sandbox_by_name(state, &request.into_inner().sandbox_name).await?;
-    let providers = providers_for_sandbox(state, &sandbox).await?;
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
+    let sandbox = sandbox_by_name(state, &workspace, &req.sandbox_name).await?;
+    let providers = providers_for_sandbox(state, &sandbox, &workspace).await?;
     Ok(Response::new(ListSandboxProvidersResponse { providers }))
 }
 
@@ -294,7 +421,19 @@ pub(super) async fn handle_attach_sandbox_provider(
     state: &Arc<ServerState>,
     request: Request<AttachSandboxProviderRequest>,
 ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &request.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .ensure_active()?;
     if request.provider_name.is_empty() {
         return Err(Status::invalid_argument("provider_name is required"));
     }
@@ -309,7 +448,7 @@ pub(super) async fn handle_attach_sandbox_provider(
         )));
     }
 
-    get_provider_record(state.store.as_ref(), &request.provider_name)
+    get_provider_record(state.store.as_ref(), &workspace, &request.provider_name)
         .await
         .map_err(|err| {
             if err.code() == tonic::Code::NotFound {
@@ -323,7 +462,7 @@ pub(super) async fn handle_attach_sandbox_provider(
         })?;
 
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-    let sandbox = sandbox_by_name(state, &request.sandbox_name).await?;
+    let sandbox = sandbox_by_name(state, &workspace, &request.sandbox_name).await?;
     let sandbox_id = sandbox
         .metadata
         .as_ref()
@@ -359,8 +498,19 @@ pub(super) async fn handle_attach_sandbox_provider(
         candidate_spec.providers.push(request.provider_name.clone());
     }
     validate_sandbox_spec(&request.sandbox_name, &candidate_spec)?;
-    validate_provider_environment_keys_unique(state.store.as_ref(), &candidate_spec.providers)
-        .await?;
+    validate_provider_environment_keys_unique(
+        state.store.as_ref(),
+        &workspace,
+        &candidate_spec.providers,
+    )
+    .await?;
+    super::policy::validate_candidate_provider_attachments(
+        state,
+        &workspace,
+        &sandbox,
+        &candidate_spec.providers,
+    )
+    .await?;
 
     let provider_name = request.provider_name.clone();
     let attached = Arc::new(AtomicBool::new(false));
@@ -408,7 +558,19 @@ pub(super) async fn handle_detach_sandbox_provider(
     state: &Arc<ServerState>,
     request: Request<DetachSandboxProviderRequest>,
 ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &request.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
     if request.provider_name.is_empty() {
         return Err(Status::invalid_argument("provider_name is required"));
     }
@@ -423,7 +585,7 @@ pub(super) async fn handle_detach_sandbox_provider(
     }
 
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-    let sandbox = sandbox_by_name(state, &request.sandbox_name).await?;
+    let sandbox = sandbox_by_name(state, &workspace, &request.sandbox_name).await?;
     let sandbox_id = sandbox
         .metadata
         .as_ref()
@@ -500,34 +662,46 @@ async fn handle_delete_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<DeleteSandboxRequest>,
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
-    let name = request.into_inner().name;
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    let name = req.name;
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
+    let authz = authorize_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        &req.workspace,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
+        .await?
+        .name;
 
-    let sandbox_id = state
-        .store
-        .get_message_by_name::<Sandbox>(&name)
-        .await
-        .ok()
-        .flatten()
-        .map(|sandbox| sandbox.object_id().to_string());
-    let deleted = state.compute.delete_sandbox(&name).await?;
-    if deleted && let Some(sandbox_id) = sandbox_id {
-        state.telemetry.end_sandbox_session(&sandbox_id);
+    let result = state.compute.delete_sandbox(&workspace, &name).await?;
+    if result.deleted {
+        state.telemetry.end_sandbox_session(&result.sandbox_id);
     }
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
-    Ok(Response::new(DeleteSandboxResponse { deleted }))
+    Ok(Response::new(DeleteSandboxResponse {
+        deleted: result.deleted,
+    }))
 }
 
-async fn sandbox_by_name(state: &Arc<ServerState>, name: &str) -> Result<Sandbox, Status> {
+async fn sandbox_by_name(
+    state: &Arc<ServerState>,
+    workspace: &str,
+    name: &str,
+) -> Result<Sandbox, Status> {
     if name.is_empty() {
         return Err(Status::invalid_argument("sandbox_name is required"));
     }
 
     state
         .store
-        .get_message_by_name::<Sandbox>(name)
+        .get_message_by_name::<Sandbox>(workspace, name)
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))
@@ -536,6 +710,7 @@ async fn sandbox_by_name(state: &Arc<ServerState>, name: &str) -> Result<Sandbox
 async fn providers_for_sandbox(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
+    workspace: &str,
 ) -> Result<Vec<Provider>, Status> {
     let provider_names = sandbox
         .spec
@@ -545,7 +720,7 @@ async fn providers_for_sandbox(
 
     let mut providers = Vec::with_capacity(provider_names.len());
     for name in provider_names {
-        let provider = get_provider_record(state.store.as_ref(), name)
+        let provider = get_provider_record(state.store.as_ref(), workspace, name)
             .await
             .map_err(|err| {
                 if err.code() == tonic::Code::NotFound {
@@ -574,16 +749,18 @@ fn dedupe_provider_names(provider_names: &mut Vec<String>) {
 // Watch handler
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::unused_async)] // Must be async to match the trait signature
 pub(super) async fn handle_watch_sandbox(
     state: &Arc<ServerState>,
     request: Request<WatchSandboxRequest>,
 ) -> Result<Response<ReceiverStream<Result<SandboxStreamEvent, Status>>>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     if req.id.is_empty() {
         return Err(Status::invalid_argument("id is required"));
     }
     let sandbox_id = req.id.clone();
+
+    let _sandbox = fetch_and_authorize_sandbox(state, &principal, &sandbox_id).await?;
 
     let follow_status = req.follow_status;
     let follow_logs = req.follow_logs;
@@ -602,199 +779,208 @@ pub(super) async fn handle_watch_sandbox(
     let (tx, rx) = mpsc::channel::<Result<SandboxStreamEvent, Status>>(256);
     let state = state.clone();
 
-    // Spawn producer task.
-    tokio::spawn(async move {
-        // Validate that the sandbox exists BEFORE subscribing to any buses.
-        match state.store.get_message::<Sandbox>(&sandbox_id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                let _ = tx.send(Err(Status::not_found("sandbox not found"))).await;
-                return;
+    // Spawn producer task. `tokio::spawn` detaches from the current span, so
+    // carry it across to keep the producer's store reads in the request trace.
+    let request_span = tracing::Span::current();
+    tokio::spawn(tracing::Instrument::instrument(
+        async move {
+            // Validate that the sandbox exists BEFORE subscribing to any buses.
+            match state.store.get_message::<Sandbox>(&sandbox_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let _ = tx.send(Err(Status::not_found("sandbox not found"))).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!("fetch sandbox failed: {e}"))))
+                        .await;
+                    return;
+                }
             }
-            Err(e) => {
-                let _ = tx
-                    .send(Err(Status::internal(format!("fetch sandbox failed: {e}"))))
-                    .await;
-                return;
-            }
-        }
 
-        // Subscribe to all buses BEFORE reading the snapshot.
-        let mut status_rx = if follow_status {
-            Some(state.sandbox_watch_bus.subscribe(&sandbox_id))
-        } else {
-            None
-        };
-        let mut log_rx = if follow_logs {
-            Some(state.tracing_log_bus.subscribe(&sandbox_id))
-        } else {
-            None
-        };
-        let mut platform_rx = if follow_events {
-            Some(
-                state
-                    .tracing_log_bus
-                    .platform_event_bus
-                    .subscribe(&sandbox_id),
-            )
-        } else {
-            None
-        };
+            // Subscribe to all buses BEFORE reading the snapshot.
+            let mut status_rx = if follow_status {
+                Some(state.sandbox_watch_bus.subscribe(&sandbox_id))
+            } else {
+                None
+            };
+            let mut log_rx = if follow_logs {
+                Some(state.tracing_log_bus.subscribe(&sandbox_id))
+            } else {
+                None
+            };
+            let mut platform_rx = if follow_events {
+                Some(
+                    state
+                        .tracing_log_bus
+                        .platform_event_bus
+                        .subscribe(&sandbox_id),
+                )
+            } else {
+                None
+            };
 
-        // Re-read the snapshot now that we have subscriptions active.
-        match state.store.get_message::<Sandbox>(&sandbox_id).await {
-            Ok(Some(sandbox)) => {
-                state.sandbox_index.update_from_sandbox(&sandbox);
-                let _ = tx
-                    .send(Ok(SandboxStreamEvent {
-                        payload: Some(
-                            openshell_core::proto::sandbox_stream_event::Payload::Sandbox(
-                                sandbox.clone(),
+            // Re-read the snapshot now that we have subscriptions active.
+            match state.store.get_message::<Sandbox>(&sandbox_id).await {
+                Ok(Some(sandbox)) => {
+                    state.sandbox_index.update_from_sandbox(&sandbox);
+                    let _ = tx
+                        .send(Ok(SandboxStreamEvent {
+                            payload: Some(
+                                openshell_core::proto::sandbox_stream_event::Payload::Sandbox(
+                                    sandbox.clone(),
+                                ),
                             ),
-                        ),
-                    }))
-                    .await;
+                        }))
+                        .await;
 
-                if stop_on_terminal {
-                    let phase =
-                        SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-                    if phase == SandboxPhase::Ready {
+                    if stop_on_terminal {
+                        let phase = SandboxPhase::try_from(sandbox.phase())
+                            .unwrap_or(SandboxPhase::Unknown);
+                        if phase == SandboxPhase::Ready {
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let _ = tx.send(Err(Status::not_found("sandbox not found"))).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!("fetch sandbox failed: {e}"))))
+                        .await;
+                    return;
+                }
+            }
+
+            // Replay tail logs (best-effort), filtered by log_since_ms and log_sources.
+            if follow_logs {
+                for evt in state.tracing_log_bus.tail(&sandbox_id, log_tail as usize) {
+                    if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
+                        ref log,
+                    )) = evt.payload
+                    {
+                        if log_since_ms > 0 && log.timestamp_ms < log_since_ms {
+                            continue;
+                        }
+                        if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
+                            continue;
+                        }
+                        if !level_matches(&log.level, &log_min_level) {
+                            continue;
+                        }
+                    }
+                    if tx.send(Ok(evt)).await.is_err() {
                         return;
                     }
                 }
             }
-            Ok(None) => {
-                let _ = tx.send(Err(Status::not_found("sandbox not found"))).await;
-                return;
-            }
-            Err(e) => {
-                let _ = tx
-                    .send(Err(Status::internal(format!("fetch sandbox failed: {e}"))))
-                    .await;
-                return;
-            }
-        }
 
-        // Replay tail logs (best-effort), filtered by log_since_ms and log_sources.
-        if follow_logs {
-            for evt in state.tracing_log_bus.tail(&sandbox_id, log_tail as usize) {
-                if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(ref log)) =
-                    evt.payload
+            // Replay buffered platform events.
+            if follow_events {
+                for evt in state
+                    .tracing_log_bus
+                    .platform_event_bus
+                    .tail(&sandbox_id, event_tail as usize)
                 {
-                    if log_since_ms > 0 && log.timestamp_ms < log_since_ms {
-                        continue;
+                    if tx.send(Ok(evt)).await.is_err() {
+                        return;
                     }
-                    if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
-                        continue;
-                    }
-                    if !level_matches(&log.level, &log_min_level) {
-                        continue;
-                    }
-                }
-                if tx.send(Ok(evt)).await.is_err() {
-                    return;
                 }
             }
-        }
 
-        // Replay buffered platform events.
-        if follow_events {
-            for evt in state
-                .tracing_log_bus
-                .platform_event_bus
-                .tail(&sandbox_id, event_tail as usize)
-            {
-                if tx.send(Ok(evt)).await.is_err() {
-                    return;
-                }
-            }
-        }
-
-        loop {
-            tokio::select! {
-                res = async {
-                    match status_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => future::pending().await,
+            loop {
+                tokio::select! {
+                    () = tx.closed() => {
+                        return;
                     }
-                } => {
-                    match res {
-                        Ok(()) => {
-                            match state.store.get_message::<Sandbox>(&sandbox_id).await {
-                                Ok(Some(sandbox)) => {
-                                    state.sandbox_index.update_from_sandbox(&sandbox);
-                                    if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
-                                        return;
-                                    }
-                                    if stop_on_terminal {
-                                        let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-                                        if phase == SandboxPhase::Ready {
+                    res = async {
+                        match status_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => future::pending().await,
+                        }
+                    } => {
+                        match res {
+                            Ok(()) => {
+                                match state.store.get_message::<Sandbox>(&sandbox_id).await {
+                                    Ok(Some(sandbox)) => {
+                                        state.sandbox_index.update_from_sandbox(&sandbox);
+                                        if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
                                             return;
                                         }
+                                        if stop_on_terminal {
+                                            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+                                            if phase == SandboxPhase::Ready {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(Status::internal(format!("fetch sandbox failed: {e}")))).await;
+                                        return;
                                     }
                                 }
-                                Ok(None) => {
-                                    return;
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(Err(Status::internal(format!("fetch sandbox failed: {e}")))).await;
-                                    return;
-                                }
                             }
-                        }
-                        Err(err) => {
-                            let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
-                            return;
-                        }
-                    }
-                }
-                res = async {
-                    match log_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => future::pending().await,
-                    }
-                } => {
-                    match res {
-                        Ok(evt) => {
-                            if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(ref log)) = evt.payload {
-                                if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
-                                    continue;
-                                }
-                                if !level_matches(&log.level, &log_min_level) {
-                                    continue;
-                                }
-                            }
-                            if tx.send(Ok(evt)).await.is_err() {
+                            Err(err) => {
+                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
                                 return;
                             }
                         }
-                        Err(err) => {
-                            let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
-                            return;
+                    }
+                    res = async {
+                        match log_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => future::pending().await,
                         }
-                    }
-                }
-                res = async {
-                    match platform_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => future::pending().await,
-                    }
-                } => {
-                    match res {
-                        Ok(evt) => {
-                            if tx.send(Ok(evt)).await.is_err() {
+                    } => {
+                        match res {
+                            Ok(evt) => {
+                                if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(ref log)) = evt.payload {
+                                    if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
+                                        continue;
+                                    }
+                                    if !level_matches(&log.level, &log_min_level) {
+                                        continue;
+                                    }
+                                }
+                                if tx.send(Ok(evt)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
                                 return;
                             }
                         }
-                        Err(err) => {
-                            let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
-                            return;
+                    }
+                    res = async {
+                        match platform_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => future::pending().await,
+                        }
+                    } => {
+                        match res {
+                            Ok(evt) => {
+                                if tx.send(Ok(evt)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
+                                return;
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+        },
+        request_span,
+    ));
 
     Ok(Response::new(ReceiverStream::new(rx)))
 }
@@ -809,6 +995,7 @@ pub(super) async fn handle_exec_sandbox(
 ) -> Result<Response<ReceiverStream<Result<ExecSandboxEvent, Status>>>, Status> {
     use openshell_core::ObjectId;
 
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
@@ -823,12 +1010,7 @@ pub(super) async fn handle_exec_sandbox(
     }
     validate_exec_request_fields(&req)?;
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&req.sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
     if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
@@ -924,6 +1106,7 @@ pub(super) async fn handle_forward_tcp(
     >,
     Status,
 > {
+    let principal = super::extract_principal(&request)?;
     let mut inbound = request.into_inner();
     let first = inbound
         .message()
@@ -937,12 +1120,7 @@ pub(super) async fn handle_forward_tcp(
 
     let target = validate_tcp_forward_init(&init)?;
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&init.sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox = fetch_and_authorize_sandbox(state, &principal, &init.sandbox_id).await?;
 
     if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
@@ -1052,8 +1230,8 @@ async fn validate_ssh_forward_token(
 }
 
 fn acquire_ssh_connection_slots(
-    token_counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
-    sandbox_counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    token_counts: &std::sync::Mutex<HashMap<String, u32>>,
+    sandbox_counts: &std::sync::Mutex<HashMap<String, u32>>,
     token: &str,
     sandbox_id: &str,
 ) -> Result<(), Status> {
@@ -1086,10 +1264,7 @@ fn acquire_ssh_connection_slots(
     Ok(())
 }
 
-fn decrement_ssh_connection_count(
-    counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
-    key: &str,
-) {
+fn decrement_ssh_connection_count(counts: &std::sync::Mutex<HashMap<String, u32>>, key: &str) {
     let mut counts = counts.lock().unwrap();
     if let Some(count) = counts.get_mut(key) {
         *count = count.saturating_sub(1);
@@ -1257,6 +1432,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
 ) -> Result<Response<ReceiverStream<Result<ExecSandboxEvent, Status>>>, Status> {
     use openshell_core::ObjectId;
 
+    let principal = super::extract_principal(&request)?;
     let mut input_stream = request.into_inner();
 
     let first_msg = input_stream
@@ -1266,12 +1442,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
 
     let req = validate_interactive_exec_start(first_msg)?;
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&req.sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
     if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
@@ -1285,6 +1456,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
+    let request_tty = req.tty;
     let timeout_seconds = req.timeout_seconds;
     let cols = if req.cols == 0 { 80 } else { req.cols };
     let rows = if req.rows == 0 { 24 } else { req.rows };
@@ -1312,6 +1484,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
             relay_stream,
             &command_str,
             input_stream,
+            request_tty,
             timeout_seconds,
             cols,
             rows,
@@ -1334,17 +1507,13 @@ pub(super) async fn handle_create_ssh_session(
     state: &Arc<ServerState>,
     request: Request<CreateSshSessionRequest>,
 ) -> Result<Response<CreateSshSessionResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&req.sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox = fetch_and_authorize_sandbox(state, &principal, &req.sandbox_id).await?;
 
     if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
@@ -1362,9 +1531,11 @@ pub(super) async fn handle_create_ssh_session(
             id: token.clone(),
             name: generate_name(),
             created_at_ms: now_ms,
-            labels: std::collections::HashMap::new(),
+            labels: HashMap::new(),
             resource_version: 0,
-            annotations: std::collections::HashMap::new(),
+            annotations: HashMap::new(),
+            workspace: sandbox.object_workspace().to_string(),
+            deletion_timestamp_ms: 0,
         }),
         sandbox_id: req.sandbox_id.clone(),
         token: token.clone(),
@@ -1376,14 +1547,24 @@ pub(super) async fn handle_create_ssh_session(
     super::validation::validate_object_metadata(session.metadata.as_ref(), "ssh_session")?;
 
     // Use MustCreate to atomically ensure the session token is unique
+    let session_labels = session.object_labels();
+    let session_labels_json = if session_labels.as_ref().is_none_or(HashMap::is_empty) {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&session_labels)
+                .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
+        )
+    };
     state
         .store
         .put_if(
             SshSession::object_type(),
             &token,
             session.object_name(),
+            session.object_workspace(),
             &session.encode_to_vec(),
-            None,
+            session_labels_json.as_deref(),
             WriteCondition::MustCreate,
         )
         .await
@@ -1411,6 +1592,7 @@ pub(super) async fn handle_revoke_ssh_session(
     state: &Arc<ServerState>,
     request: Request<RevokeSshSessionRequest>,
 ) -> Result<Response<RevokeSshSessionResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
     let token = request.into_inner().token;
     if token.is_empty() {
         return Err(Status::invalid_argument("token is required"));
@@ -1425,6 +1607,21 @@ pub(super) async fn handle_revoke_ssh_session(
     let Some(mut session) = session else {
         return Ok(Response::new(RevokeSshSessionResponse { revoked: false }));
     };
+    authorize_sandbox_workspace(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        session.object_workspace(),
+        MinWorkspaceRole::User,
+    )
+    .await
+    .map_err(|e| {
+        if e.code() == tonic::Code::PermissionDenied {
+            Status::not_found("sandbox not found")
+        } else {
+            e
+        }
+    })?;
 
     let resource_version = session
         .metadata
@@ -1434,14 +1631,24 @@ pub(super) async fn handle_revoke_ssh_session(
     session.revoked = true;
 
     // Use CAS to prevent lost updates from concurrent revocations
+    let session_labels = session.object_labels();
+    let session_labels_json = if session_labels.as_ref().is_none_or(HashMap::is_empty) {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&session_labels)
+                .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
+        )
+    };
     state
         .store
         .put_if(
             SshSession::object_type(),
             session.object_id(),
             session.object_name(),
+            session.object_workspace(),
             &session.encode_to_vec(),
-            None,
+            session_labels_json.as_deref(),
             WriteCondition::MatchResourceVersion(resource_version),
         )
         .await
@@ -1632,6 +1839,7 @@ async fn stream_interactive_exec_over_relay(
     relay_stream: tokio::io::DuplexStream,
     command: &str,
     input_stream: tonic::Streaming<ExecSandboxInput>,
+    request_tty: bool,
     timeout_seconds: u32,
     cols: u32,
     rows: u32,
@@ -1657,6 +1865,7 @@ async fn stream_interactive_exec_over_relay(
         local_proxy_port,
         command,
         input_stream,
+        request_tty,
         cols,
         rows,
         tx.clone(),
@@ -1708,6 +1917,7 @@ async fn run_interactive_exec_with_russh(
     local_proxy_port: u16,
     command: &str,
     mut input_stream: tonic::Streaming<ExecSandboxInput>,
+    request_tty: bool,
     cols: u32,
     rows: u32,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
@@ -1753,10 +1963,12 @@ async fn run_interactive_exec_with_russh(
         .await
         .map_err(|e| Status::internal(format!("failed to open ssh channel: {e}")))?;
 
-    channel
-        .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
-        .await
-        .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
+    if request_tty {
+        channel
+            .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
+            .await
+            .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
+    }
 
     channel
         .exec(true, command.as_bytes())
@@ -1774,9 +1986,11 @@ async fn run_interactive_exec_with_russh(
                     }
                 }
                 Some(Payload::Resize(resize)) => {
-                    let _ = write_half
-                        .window_change(resize.cols, resize.rows, 0, 0)
-                        .await;
+                    if request_tty {
+                        let _ = write_half
+                            .window_change(resize.cols, resize.rows, 0, 0)
+                            .await;
+                    }
                 }
                 Some(Payload::Start(_)) | None => {}
             }
@@ -2009,9 +2223,10 @@ async fn run_exec_with_russh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grpc::test_support::test_server_state;
+    use crate::grpc::test_support::{
+        authed_request, test_server_state, test_server_state_with_driver,
+    };
     use openshell_core::proto::datamodel::v1::ObjectMeta;
-    use std::collections::HashMap;
 
     // ---- shell_escape ----
 
@@ -2283,6 +2498,18 @@ mod tests {
     }
 
     #[test]
+    fn generate_routable_name_respects_length_limit() {
+        for _ in 0..200 {
+            let name = generate_routable_name();
+            assert!(
+                name.len() <= MAX_ROUTABLE_NAME_LEN,
+                "generated name '{name}' exceeds {MAX_ROUTABLE_NAME_LEN} chars"
+            );
+            assert!(!name.is_empty(), "generated name should not be empty");
+        }
+    }
+
+    #[test]
     fn generate_name_fallback_is_valid() {
         for _ in 0..50 {
             let name = generate_name();
@@ -2311,12 +2538,15 @@ mod tests {
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once((credential_key.to_string(), "secret".to_string()))
                 .collect(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
+            profile_workspace: "default".to_string(),
         }
     }
 
@@ -2329,6 +2559,8 @@ mod tests {
                 labels: std::iter::once(("team".to_string(), "agents".to_string())).collect(),
                 resource_version: 0,
                 annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
             }),
             spec: Some(openshell_core::proto::SandboxSpec {
                 log_level: "debug".to_string(),
@@ -2341,6 +2573,102 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         sandbox.set_current_policy_version(7);
         sandbox
+    }
+
+    #[tokio::test]
+    async fn watch_producer_releases_request_span_when_client_disconnects() {
+        use crate::otel_tracing::test_exporter;
+        use tokio_stream::StreamExt as _;
+        use tracing::Instrument as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("watched", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let traced = test_exporter::install_traced();
+        let request_span = tracing::info_span!("disconnected_watch_request");
+        let response = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                id: sandbox.object_id().to_string(),
+                ..Default::default()
+            }),
+        )
+        .instrument(request_span.clone())
+        .await
+        .unwrap();
+        let mut stream = response.into_inner();
+        stream
+            .next()
+            .await
+            .expect("watch producer should send the initial snapshot")
+            .unwrap();
+
+        drop(stream);
+        drop(request_span);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while traced.spans_named("disconnected_watch_request").is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("watch producer should release the request span after client disconnect");
+    }
+
+    #[tokio::test]
+    async fn delete_handler_ends_telemetry_for_the_resolved_sandbox_id() {
+        let state = test_server_state().await;
+        let mut original = test_sandbox("reused-name", Vec::new());
+        original.metadata.as_mut().unwrap().id = "sandbox-original".to_string();
+        state.store.put_message(&original).await.unwrap();
+
+        // Hold the global guard so the handler can resolve the original ID and
+        // acquire its delete gate, but cannot yet revalidate or mutate it.
+        let global_guard = state.compute.sandbox_sync_guard().await;
+        let delete_state = state.clone();
+        let delete = tokio::spawn(async move {
+            handle_delete_sandbox_inner(
+                &delete_state,
+                authed_request(DeleteSandboxRequest {
+                    name: "reused-name".to_string(),
+                    workspace: "default".to_string(),
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.compute.delete_gate_entry_count() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("delete did not resolve and acquire the original sandbox gate");
+
+        state
+            .store
+            .delete(Sandbox::object_type(), original.object_id())
+            .await
+            .unwrap();
+        let mut replacement = test_sandbox("reused-name", Vec::new());
+        replacement.metadata.as_mut().unwrap().id = "sandbox-replacement".to_string();
+        state.store.put_message(&replacement).await.unwrap();
+        drop(global_guard);
+
+        let response = delete.await.unwrap().unwrap().into_inner();
+        assert!(response.deleted);
+        assert!(
+            state
+                .store
+                .get_message::<Sandbox>(replacement.object_id())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            state.telemetry.ended_sandbox_sessions(),
+            [original.object_id().to_string()]
+        );
     }
 
     #[tokio::test]
@@ -2359,10 +2687,11 @@ mod tests {
 
         let response = handle_attach_sandbox_provider(
             &state,
-            Request::new(AttachSandboxProviderRequest {
+            authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
+                workspace: String::new(),
             }),
         )
         .await
@@ -2372,7 +2701,7 @@ mod tests {
         assert!(response.attached);
         let sandbox = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap();
@@ -2402,10 +2731,11 @@ mod tests {
 
         let response = handle_attach_sandbox_provider(
             &state,
-            Request::new(AttachSandboxProviderRequest {
+            authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
+                workspace: String::new(),
             }),
         )
         .await
@@ -2415,7 +2745,7 @@ mod tests {
         assert!(!response.attached);
         let providers = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap()
@@ -2443,10 +2773,11 @@ mod tests {
 
         let response = handle_detach_sandbox_provider(
             &state,
-            Request::new(DetachSandboxProviderRequest {
+            authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
+                workspace: String::new(),
             }),
         )
         .await
@@ -2456,7 +2787,7 @@ mod tests {
         assert!(response.detached);
         let providers = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap()
@@ -2467,10 +2798,11 @@ mod tests {
 
         let response = handle_detach_sandbox_provider(
             &state,
-            Request::new(DetachSandboxProviderRequest {
+            authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
+                workspace: String::new(),
             }),
         )
         .await
@@ -2495,8 +2827,9 @@ mod tests {
 
         let response = handle_list_sandbox_providers(
             &state,
-            Request::new(ListSandboxProvidersRequest {
+            authed_request(ListSandboxProvidersRequest {
                 sandbox_name: "work".to_string(),
+                workspace: String::new(),
             }),
         )
         .await
@@ -2522,10 +2855,11 @@ mod tests {
 
         let err = handle_attach_sandbox_provider(
             &state,
-            Request::new(AttachSandboxProviderRequest {
+            authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "missing".to_string(),
                 expected_resource_version: 0,
+                workspace: String::new(),
             }),
         )
         .await
@@ -2692,7 +3026,7 @@ mod tests {
 
         let err = handle_create_sandbox(
             &state,
-            Request::new(CreateSandboxRequest {
+            authed_request(CreateSandboxRequest {
                 name: "collision".to_string(),
                 spec: Some(openshell_core::proto::SandboxSpec {
                     providers: vec!["provider-a".to_string(), "provider-b".to_string()],
@@ -2700,6 +3034,7 @@ mod tests {
                 }),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
+                workspace: String::new(),
             }),
         )
         .await
@@ -2725,7 +3060,7 @@ mod tests {
 
         let err = handle_create_sandbox(
             &state,
-            Request::new(CreateSandboxRequest {
+            authed_request(CreateSandboxRequest {
                 name: "reserved-policy-key".to_string(),
                 spec: Some(openshell_core::proto::SandboxSpec {
                     policy: Some(policy),
@@ -2733,6 +3068,7 @@ mod tests {
                 }),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
+                workspace: String::new(),
             }),
         )
         .await
@@ -2751,11 +3087,12 @@ mod tests {
 
         let response = handle_create_sandbox(
             &state,
-            Request::new(CreateSandboxRequest {
+            authed_request(CreateSandboxRequest {
                 name: "annotated".to_string(),
                 spec: Some(openshell_core::proto::SandboxSpec::default()),
                 labels: HashMap::new(),
                 annotations: HashMap::from([(annotation_key.clone(), annotation_value.clone())]),
+                workspace: String::new(),
             }),
         )
         .await
@@ -2773,8 +3110,9 @@ mod tests {
 
         let fetched = handle_get_sandbox(
             &state,
-            Request::new(GetSandboxRequest {
+            authed_request(GetSandboxRequest {
                 name: "annotated".to_string(),
+                workspace: String::new(),
             }),
         )
         .await
@@ -2792,15 +3130,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_and_get_preserve_partial_process_identity() {
+        let state =
+            test_server_state_with_driver(openshell_core::ComputeDriverKind::Docker.as_str()).await;
+        let policy = openshell_core::proto::SandboxPolicy {
+            version: 1,
+            process: Some(openshell_core::proto::ProcessPolicy {
+                run_as_user: String::new(),
+                run_as_group: "1234".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let response = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "partial-id".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec {
+                    policy: Some(policy),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .expect("partial process identity should be accepted")
+        .into_inner();
+
+        let created_process = response
+            .sandbox
+            .unwrap()
+            .spec
+            .unwrap()
+            .policy
+            .unwrap()
+            .process
+            .unwrap();
+        assert!(created_process.run_as_user.is_empty());
+        assert_eq!(created_process.run_as_group, "1234");
+
+        let fetched_process = handle_get_sandbox(
+            &state,
+            authed_request(GetSandboxRequest {
+                name: "partial-id".to_string(),
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap()
+        .spec
+        .unwrap()
+        .policy
+        .unwrap()
+        .process
+        .unwrap();
+        assert!(fetched_process.run_as_user.is_empty());
+        assert_eq!(fetched_process.run_as_group, "1234");
+    }
+
+    #[tokio::test]
+    async fn create_and_get_restore_legacy_identity_defaults_for_non_local_driver() {
+        let state =
+            test_server_state_with_driver(openshell_core::ComputeDriverKind::Kubernetes.as_str())
+                .await;
+        let policy = openshell_core::proto::SandboxPolicy {
+            version: 1,
+            process: Some(openshell_core::proto::ProcessPolicy {
+                run_as_user: String::new(),
+                run_as_group: "1234".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let response = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "kube-partial-id".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec {
+                    policy: Some(policy),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .expect("Kubernetes identity defaults should be accepted")
+        .into_inner();
+
+        let process = response
+            .sandbox
+            .unwrap()
+            .spec
+            .unwrap()
+            .policy
+            .unwrap()
+            .process
+            .unwrap();
+        assert_eq!(process.run_as_user, "sandbox");
+        assert_eq!(process.run_as_group, "1234");
+    }
+
+    #[tokio::test]
     async fn create_sandbox_still_rejects_long_label_values() {
         let state = test_server_state().await;
         let err = handle_create_sandbox(
             &state,
-            Request::new(CreateSandboxRequest {
+            authed_request(CreateSandboxRequest {
                 name: "bad-label".to_string(),
                 spec: Some(openshell_core::proto::SandboxSpec::default()),
                 labels: HashMap::from([("team".to_string(), "x".repeat(512))]),
                 annotations: HashMap::new(),
+                workspace: String::new(),
             }),
         )
         .await
@@ -2824,7 +3271,7 @@ mod tests {
         let task = tokio::spawn(async move {
             handle_create_sandbox(
                 &task_state,
-                Request::new(CreateSandboxRequest {
+                authed_request(CreateSandboxRequest {
                     name: "guarded-create".to_string(),
                     spec: Some(openshell_core::proto::SandboxSpec {
                         providers: vec!["work-github".to_string()],
@@ -2832,6 +3279,7 @@ mod tests {
                     }),
                     labels: HashMap::new(),
                     annotations: HashMap::new(),
+                    workspace: String::new(),
                 }),
             )
             .await
@@ -2877,10 +3325,11 @@ mod tests {
 
         let err = handle_attach_sandbox_provider(
             &state,
-            Request::new(AttachSandboxProviderRequest {
+            authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "provider-b".to_string(),
                 expected_resource_version: 0,
+                workspace: String::new(),
             }),
         )
         .await
@@ -2923,10 +3372,11 @@ mod tests {
         // Attaching the 32nd provider should succeed
         let response = handle_attach_sandbox_provider(
             &state,
-            Request::new(AttachSandboxProviderRequest {
+            authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "provider-31".to_string(),
                 expected_resource_version: 0,
+                workspace: String::new(),
             }),
         )
         .await
@@ -2936,7 +3386,7 @@ mod tests {
         assert!(response.attached);
         let providers = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap()
@@ -2977,10 +3427,11 @@ mod tests {
         // Attempting to attach the 33rd provider should fail
         let err = handle_attach_sandbox_provider(
             &state,
-            Request::new(AttachSandboxProviderRequest {
+            authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "provider-32".to_string(),
                 expected_resource_version: 0,
+                workspace: String::new(),
             }),
         )
         .await
@@ -2992,7 +3443,7 @@ mod tests {
         // Verify sandbox was not modified
         let providers = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap()
@@ -3023,10 +3474,11 @@ mod tests {
         // Should fail validation before attempting CAS
         let err = handle_attach_sandbox_provider(
             &state,
-            Request::new(AttachSandboxProviderRequest {
+            authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: long_name,
                 expected_resource_version: 0,
+                workspace: String::new(),
             }),
         )
         .await
@@ -3049,10 +3501,11 @@ mod tests {
 
         let err = handle_detach_sandbox_provider(
             &state,
-            Request::new(DetachSandboxProviderRequest {
+            authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: long_name,
                 expected_resource_version: 0,
+                workspace: String::new(),
             }),
         )
         .await
@@ -3077,7 +3530,7 @@ mod tests {
         let handle1 = tokio::spawn(async move {
             handle_create_ssh_session(
                 &state1,
-                Request::new(CreateSshSessionRequest {
+                authed_request(CreateSshSessionRequest {
                     sandbox_id: "sandbox-work".to_string(),
                 }),
             )
@@ -3088,7 +3541,7 @@ mod tests {
         let handle2 = tokio::spawn(async move {
             handle_create_ssh_session(
                 &state2,
-                Request::new(CreateSshSessionRequest {
+                authed_request(CreateSshSessionRequest {
                     sandbox_id: "sandbox-work".to_string(),
                 }),
             )
@@ -3135,7 +3588,7 @@ mod tests {
         // Create a session first
         let response = handle_create_ssh_session(
             &state,
-            Request::new(CreateSshSessionRequest {
+            authed_request(CreateSshSessionRequest {
                 sandbox_id: "sandbox-work".to_string(),
             }),
         )
@@ -3149,7 +3602,7 @@ mod tests {
         let handle1 = tokio::spawn(async move {
             handle_revoke_ssh_session(
                 &state1,
-                Request::new(RevokeSshSessionRequest { token: token1 }),
+                authed_request(RevokeSshSessionRequest { token: token1 }),
             )
             .await
         });
@@ -3159,7 +3612,7 @@ mod tests {
         let handle2 = tokio::spawn(async move {
             handle_revoke_ssh_session(
                 &state2,
-                Request::new(RevokeSshSessionRequest { token: token2 }),
+                authed_request(RevokeSshSessionRequest { token: token2 }),
             )
             .await
         });
@@ -3204,7 +3657,7 @@ mod tests {
         // Fetch the sandbox to get its current resource_version
         let sandbox = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap();
@@ -3213,10 +3666,11 @@ mod tests {
         // Attach with correct expected_resource_version
         let response = handle_attach_sandbox_provider(
             &state,
-            Request::new(AttachSandboxProviderRequest {
+            authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: current_version,
+                workspace: String::new(),
             }),
         )
         .await
@@ -3228,7 +3682,7 @@ mod tests {
         // Verify the resource_version incremented
         let updated_sandbox = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap();
@@ -3255,7 +3709,7 @@ mod tests {
         // Get current version
         let sandbox = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap();
@@ -3264,10 +3718,11 @@ mod tests {
         // Try to attach with a stale version (current_version - 1 would be 0, use 99 instead)
         let err = handle_attach_sandbox_provider(
             &state,
-            Request::new(AttachSandboxProviderRequest {
+            authed_request(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: 99,
+                workspace: String::new(),
             }),
         )
         .await
@@ -3285,7 +3740,7 @@ mod tests {
         // Verify the sandbox was not modified
         let unchanged_sandbox = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap();
@@ -3317,7 +3772,7 @@ mod tests {
         // Fetch the sandbox to get its current resource_version
         let sandbox = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap();
@@ -3326,10 +3781,11 @@ mod tests {
         // Detach with correct expected_resource_version
         let response = handle_detach_sandbox_provider(
             &state,
-            Request::new(DetachSandboxProviderRequest {
+            authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: current_version,
+                workspace: String::new(),
             }),
         )
         .await
@@ -3341,7 +3797,7 @@ mod tests {
         // Verify the resource_version incremented
         let updated_sandbox = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap();
@@ -3368,7 +3824,7 @@ mod tests {
         // Get current version
         let sandbox = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap();
@@ -3377,10 +3833,11 @@ mod tests {
         // Try to detach with a stale version
         let err = handle_detach_sandbox_provider(
             &state,
-            Request::new(DetachSandboxProviderRequest {
+            authed_request(DetachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: 99,
+                workspace: String::new(),
             }),
         )
         .await
@@ -3398,7 +3855,7 @@ mod tests {
         // Verify the sandbox was not modified
         let unchanged_sandbox = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap();
@@ -3441,7 +3898,7 @@ mod tests {
         // All three clients fetch the sandbox and see version 1
         let initial_version = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap()
@@ -3457,10 +3914,11 @@ mod tests {
             let handle = tokio::spawn(async move {
                 handle_attach_sandbox_provider(
                     &state_clone,
-                    Request::new(AttachSandboxProviderRequest {
+                    authed_request(AttachSandboxProviderRequest {
                         sandbox_name: "work".to_string(),
                         provider_name: format!("provider-{i}"),
                         expected_resource_version: initial_version,
+                        workspace: String::new(),
                     }),
                 )
                 .await
@@ -3497,7 +3955,7 @@ mod tests {
         // Final sandbox should have exactly 1 provider and resource_version = initial_version + 1
         let final_sandbox = state
             .store
-            .get_message_by_name::<Sandbox>("work")
+            .get_message_by_name::<Sandbox>("default", "work")
             .await
             .unwrap()
             .unwrap();
@@ -3506,5 +3964,422 @@ mod tests {
             final_sandbox.metadata.as_ref().unwrap().resource_version,
             initial_version + 1
         );
+    }
+
+    #[tokio::test]
+    async fn sandbox_crud_is_workspace_isolated() {
+        use crate::persistence::ObjectType;
+        use openshell_core::proto::{
+            CreateWorkspaceRequest, GetSandboxRequest, ListSandboxesRequest,
+        };
+
+        let state = test_server_state().await;
+
+        // Create a second workspace "beta".
+        crate::grpc::workspace::handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                name: "beta".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Seed a sandbox named "shared-name" in each workspace.
+        let mut sbx_default = test_sandbox("shared-name", Vec::new());
+        sbx_default.metadata.as_mut().unwrap().id = "sbx-default-id".to_string();
+        sbx_default.metadata.as_mut().unwrap().workspace = "default".to_string();
+        state.store.put_message(&sbx_default).await.unwrap();
+
+        let mut sbx_beta = test_sandbox("shared-name", Vec::new());
+        sbx_beta.metadata.as_mut().unwrap().id = "sbx-beta-id".to_string();
+        sbx_beta.metadata.as_mut().unwrap().workspace = "beta".to_string();
+        state.store.put_message(&sbx_beta).await.unwrap();
+
+        // Get in "default" returns the default sandbox.
+        let got = handle_get_sandbox(
+            &state,
+            authed_request(GetSandboxRequest {
+                name: "shared-name".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(got.sandbox.as_ref().unwrap().object_id(), "sbx-default-id");
+
+        // Get in "beta" returns the beta sandbox.
+        let got = handle_get_sandbox(
+            &state,
+            authed_request(GetSandboxRequest {
+                name: "shared-name".to_string(),
+                workspace: "beta".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(got.sandbox.as_ref().unwrap().object_id(), "sbx-beta-id");
+
+        // List in "default" returns 1 sandbox.
+        let listed = handle_list_sandboxes(
+            &state,
+            authed_request(ListSandboxesRequest {
+                limit: 100,
+                offset: 0,
+                label_selector: String::new(),
+                workspace: "default".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed.sandboxes.len(), 1);
+        assert_eq!(listed.sandboxes[0].object_id(), "sbx-default-id",);
+
+        // List in "beta" returns 1 sandbox.
+        let listed = handle_list_sandboxes(
+            &state,
+            authed_request(ListSandboxesRequest {
+                limit: 100,
+                offset: 0,
+                label_selector: String::new(),
+                workspace: "beta".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed.sandboxes.len(), 1);
+        assert_eq!(listed.sandboxes[0].object_id(), "sbx-beta-id");
+
+        // Delete in "default" (via store) does not affect "beta".
+        state
+            .store
+            .delete_by_name(Sandbox::object_type(), "default", "shared-name")
+            .await
+            .unwrap();
+
+        // "default" now has 0 sandboxes.
+        let listed = handle_list_sandboxes(
+            &state,
+            authed_request(ListSandboxesRequest {
+                limit: 100,
+                offset: 0,
+                label_selector: String::new(),
+                workspace: "default".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(listed.sandboxes.is_empty());
+
+        // "beta" still has its sandbox.
+        let got = handle_get_sandbox(
+            &state,
+            authed_request(GetSandboxRequest {
+                name: "shared-name".to_string(),
+                workspace: "beta".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(got.sandbox.as_ref().unwrap().object_id(), "sbx-beta-id");
+
+        // all_workspaces returns sandboxes from all workspaces.
+        // Re-create the "default" sandbox so both workspaces have one.
+        state
+            .store
+            .put(
+                Sandbox::object_type(),
+                "sbx-default-2",
+                "sandbox-d",
+                "default",
+                &Sandbox::default().encode_to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+        let listed = handle_list_sandboxes(
+            &state,
+            authed_request(ListSandboxesRequest {
+                limit: 100,
+                offset: 0,
+                label_selector: String::new(),
+                workspace: String::new(),
+                all_workspaces: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed.sandboxes.len(), 2);
+
+        // all_workspaces with non-empty workspace is rejected.
+        let err = handle_list_sandboxes(
+            &state,
+            authed_request(ListSandboxesRequest {
+                limit: 100,
+                offset: 0,
+                label_selector: String::new(),
+                workspace: "default".to_string(),
+                all_workspaces: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// Non-members must receive `PERMISSION_DENIED` — never `NOT_FOUND` — when
+    /// calling workspace-scoped sandbox RPCs with a workspace they do not belong
+    /// to.  If `authorize_workspace` ran *after* a store lookup the error code
+    /// would leak whether the workspace name exists (CWE-203 oracle).
+    #[tokio::test]
+    async fn non_member_gets_permission_denied_not_workspace_oracle() {
+        use crate::auth::identity::{Identity, IdentityProvider};
+        use crate::auth::principal::{Principal, UserPrincipal};
+        use tonic::Code;
+
+        fn non_member_request<T>(inner: T) -> Request<T> {
+            let mut req = Request::new(inner);
+            req.extensions_mut().insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "non-member".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+            req
+        }
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        // --- handle_create_sandbox ---
+        // Provide a spec so the handler passes the "spec is required" check
+        // before reaching authorize_workspace.
+        let err = handle_create_sandbox(
+            &state,
+            non_member_request(CreateSandboxRequest {
+                workspace: "no-such-ws".into(),
+                spec: Some(openshell_core::proto::SandboxSpec::default()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_create_sandbox should reject non-members with PermissionDenied"
+        );
+
+        // --- handle_get_sandbox ---
+        // Provide a name so the handler passes the "name is required" check.
+        let err = handle_get_sandbox(
+            &state,
+            non_member_request(GetSandboxRequest {
+                workspace: "no-such-ws".into(),
+                name: "any".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_get_sandbox should reject non-members with PermissionDenied"
+        );
+
+        // --- handle_list_sandboxes ---
+        let err = handle_list_sandboxes(
+            &state,
+            non_member_request(ListSandboxesRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_list_sandboxes should reject non-members with PermissionDenied"
+        );
+
+        // --- handle_list_sandbox_providers ---
+        let err = handle_list_sandbox_providers(
+            &state,
+            non_member_request(ListSandboxProvidersRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_list_sandbox_providers should reject non-members with PermissionDenied"
+        );
+
+        // --- handle_attach_sandbox_provider ---
+        let err = handle_attach_sandbox_provider(
+            &state,
+            non_member_request(AttachSandboxProviderRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_attach_sandbox_provider should reject non-members with PermissionDenied"
+        );
+
+        // --- handle_detach_sandbox_provider ---
+        let err = handle_detach_sandbox_provider(
+            &state,
+            non_member_request(DetachSandboxProviderRequest {
+                workspace: "no-such-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_detach_sandbox_provider should reject non-members with PermissionDenied"
+        );
+
+        // --- handle_delete_sandbox ---
+        // Provide a name so the handler passes the "name is required" check.
+        let err = handle_delete_sandbox(
+            &state,
+            non_member_request(DeleteSandboxRequest {
+                workspace: "no-such-ws".into(),
+                name: "any".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::PermissionDenied,
+            "handle_delete_sandbox should reject non-members with PermissionDenied"
+        );
+    }
+
+    /// ID-based data-plane handlers must return `NOT_FOUND` — never
+    /// `PERMISSION_DENIED` — when the caller lacks workspace access, so that
+    /// cross-workspace sandbox existence cannot be inferred (CWE-203).
+    #[tokio::test]
+    async fn id_based_handlers_hide_cross_workspace_sandboxes() {
+        use crate::auth::identity::{Identity, IdentityProvider};
+        use crate::auth::principal::{Principal, UserPrincipal};
+        use tonic::Code;
+
+        fn non_member_request<T>(inner: T) -> Request<T> {
+            let mut req = Request::new(inner);
+            req.extensions_mut().insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "non-member".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+            req
+        }
+
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+
+        let mut sandbox = test_sandbox("cross-ws", Vec::new());
+        sandbox.metadata.as_mut().unwrap().workspace = "other-workspace".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // --- handle_watch_sandbox ---
+        let err = handle_watch_sandbox(
+            &state,
+            non_member_request(WatchSandboxRequest {
+                id: "sandbox-cross-ws".into(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::NotFound,
+            "handle_watch_sandbox must return NotFound, not PermissionDenied"
+        );
+
+        // --- handle_create_ssh_session ---
+        let err = handle_create_ssh_session(
+            &state,
+            non_member_request(CreateSshSessionRequest {
+                sandbox_id: "sandbox-cross-ws".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::NotFound,
+            "handle_create_ssh_session must return NotFound, not PermissionDenied"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_ssh_session_preserves_workspace() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox("ws-test", Vec::new()))
+            .await
+            .unwrap();
+
+        let response = handle_create_ssh_session(
+            &state,
+            authed_request(CreateSshSessionRequest {
+                sandbox_id: "sandbox-ws-test".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let token = response.into_inner().token;
+
+        handle_revoke_ssh_session(
+            &state,
+            authed_request(RevokeSshSessionRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let session: SshSession = state
+            .store
+            .get_message::<SshSession>(&token)
+            .await
+            .unwrap()
+            .expect("session should still exist after revocation");
+        assert!(session.revoked);
+        assert_eq!(session.object_workspace(), "default");
     }
 }

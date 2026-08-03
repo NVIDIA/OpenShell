@@ -25,6 +25,7 @@ pub struct BootstrapData {
     pub policy_proto: openshell_core::proto::SandboxPolicy,
     pub provider_env_revision: u64,
     pub provider_child_env: HashMap<String, String>,
+    pub agent_proposals_enabled: bool,
     pub proxy_ca_cert_path: Option<PathBuf>,
     pub proxy_ca_bundle_path: Option<PathBuf>,
 }
@@ -44,13 +45,17 @@ pub struct ExpectedPeer {
 
 #[derive(Debug, Clone)]
 pub enum ControlUpdate {
-    ProviderEnvUpdated {
+    ProviderEnv {
         revision: u64,
         provider_child_env: HashMap<String, String>,
     },
-    PolicyUpdated {
+    Policy {
         policy_proto: Box<openshell_core::proto::SandboxPolicy>,
         policy_hash: String,
+        config_revision: u64,
+    },
+    AgentProposals {
+        enabled: bool,
         config_revision: u64,
     },
 }
@@ -92,6 +97,21 @@ impl Publisher {
         let _ = self.updates.send(WireServerMessage::PolicyUpdated {
             policy_proto: policy_proto.encode_to_vec(),
             policy_hash,
+            config_revision,
+        });
+    }
+
+    pub fn publish_agent_proposals(&self, enabled: bool, config_revision: u64) {
+        {
+            let mut state = self.state.write().expect("sidecar control state poisoned");
+            if state.agent_proposals_enabled == enabled {
+                return;
+            }
+            state.agent_proposals_enabled = enabled;
+        }
+
+        let _ = self.updates.send(WireServerMessage::AgentProposalsUpdated {
+            enabled,
             config_revision,
         });
     }
@@ -145,6 +165,7 @@ enum WireServerMessage {
         policy_proto: Vec<u8>,
         provider_env_revision: u64,
         provider_child_env: HashMap<String, String>,
+        agent_proposals_enabled: bool,
         proxy_ca_cert_path: Option<String>,
         proxy_ca_bundle_path: Option<String>,
     },
@@ -157,6 +178,10 @@ enum WireServerMessage {
         policy_hash: String,
         config_revision: u64,
     },
+    AgentProposalsUpdated {
+        enabled: bool,
+        config_revision: u64,
+    },
 }
 
 impl BootstrapData {
@@ -166,6 +191,7 @@ impl BootstrapData {
             policy_proto: self.policy_proto.encode_to_vec(),
             provider_env_revision: self.provider_env_revision,
             provider_child_env: self.provider_child_env.clone(),
+            agent_proposals_enabled: self.agent_proposals_enabled,
             proxy_ca_cert_path: self
                 .proxy_ca_cert_path
                 .as_ref()
@@ -186,6 +212,7 @@ impl TryFrom<WireServerMessage> for BootstrapData {
             policy_proto,
             provider_env_revision,
             provider_child_env,
+            agent_proposals_enabled,
             proxy_ca_cert_path,
             proxy_ca_bundle_path,
         } = message
@@ -203,6 +230,7 @@ impl TryFrom<WireServerMessage> for BootstrapData {
             policy_proto,
             provider_env_revision,
             provider_child_env,
+            agent_proposals_enabled,
             proxy_ca_cert_path: proxy_ca_cert_path.map(PathBuf::from),
             proxy_ca_bundle_path: proxy_ca_bundle_path.map(PathBuf::from),
         })
@@ -217,7 +245,7 @@ impl TryFrom<WireServerMessage> for ControlUpdate {
             WireServerMessage::ProviderEnvUpdated {
                 revision,
                 provider_child_env,
-            } => Ok(Self::ProviderEnvUpdated {
+            } => Ok(Self::ProviderEnv {
                 revision,
                 provider_child_env,
             }),
@@ -230,12 +258,19 @@ impl TryFrom<WireServerMessage> for ControlUpdate {
                     openshell_core::proto::SandboxPolicy::decode(policy_proto.as_slice())
                         .into_diagnostic()
                         .wrap_err("failed to decode sidecar policy update")?;
-                Ok(Self::PolicyUpdated {
+                Ok(Self::Policy {
                     policy_proto: Box::new(policy_proto),
                     policy_hash,
                     config_revision,
                 })
             }
+            WireServerMessage::AgentProposalsUpdated {
+                enabled,
+                config_revision,
+            } => Ok(Self::AgentProposals {
+                enabled,
+                config_revision,
+            }),
             WireServerMessage::BootstrapResponse { .. } => Err(miette::miette!(
                 "unexpected sidecar bootstrap response after initial handshake"
             )),
@@ -407,13 +442,16 @@ async fn handle_connection(
         }
     }
 
+    // Subscribe before taking the bootstrap snapshot so an update can neither
+    // be missed between the snapshot and the live update stream nor omitted
+    // from the snapshot itself.
+    let mut update_rx = updates.subscribe();
     let bootstrap = {
         let state = state.read().expect("sidecar control state poisoned");
         state.to_wire()
     };
     write_json_line(&mut writer, &bootstrap).await?;
 
-    let mut update_rx = updates.subscribe();
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -583,6 +621,7 @@ mod tests {
             },
             provider_env_revision: 3,
             provider_child_env: env.clone(),
+            agent_proposals_enabled: true,
             proxy_ca_cert_path: Some(PathBuf::from("/tmp/ca.pem")),
             proxy_ca_bundle_path: Some(PathBuf::from("/tmp/bundle.pem")),
         };
@@ -595,6 +634,7 @@ mod tests {
         assert_eq!(received.policy_proto.version, 7);
         assert_eq!(received.provider_env_revision, 3);
         assert_eq!(received.provider_child_env, env);
+        assert!(received.agent_proposals_enabled);
         assert_eq!(
             received.proxy_ca_cert_path,
             Some(PathBuf::from("/tmp/ca.pem"))
@@ -603,6 +643,46 @@ mod tests {
             received.proxy_ca_bundle_path,
             Some(PathBuf::from("/tmp/bundle.pem"))
         );
+    }
+
+    #[tokio::test]
+    async fn agent_proposals_update_is_delivered_to_process_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let server = spawn_server(
+            &socket,
+            BootstrapData {
+                policy_proto: SandboxPolicy::default(),
+                provider_env_revision: 0,
+                provider_child_env: HashMap::new(),
+                agent_proposals_enabled: false,
+                proxy_ca_cert_path: None,
+                proxy_ca_bundle_path: None,
+            },
+            current_peer(),
+        )
+        .unwrap();
+        let publisher = server.publisher();
+        let (_bootstrap, mut connection) = connect_process_client(&socket, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        publisher.publish_agent_proposals(true, 9);
+
+        let update = tokio::time::timeout(Duration::from_secs(1), connection.updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match update {
+            ControlUpdate::AgentProposals {
+                enabled,
+                config_revision,
+            } => {
+                assert!(enabled);
+                assert_eq!(config_revision, 9);
+            }
+            other => panic!("unexpected sidecar update: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -615,6 +695,7 @@ mod tests {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
                 provider_child_env: HashMap::new(),
+                agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
                 proxy_ca_bundle_path: None,
             },
@@ -655,6 +736,7 @@ mod tests {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
                 provider_child_env: HashMap::new(),
+                agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
                 proxy_ca_bundle_path: None,
             },
@@ -688,6 +770,7 @@ mod tests {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
                 provider_child_env: HashMap::new(),
+                agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
                 proxy_ca_bundle_path: None,
             },
@@ -716,6 +799,7 @@ mod tests {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
                 provider_child_env: HashMap::new(),
+                agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
                 proxy_ca_bundle_path: None,
             },
@@ -745,6 +829,7 @@ mod tests {
                 policy_proto: SandboxPolicy::default(),
                 provider_env_revision: 0,
                 provider_child_env: HashMap::new(),
+                agent_proposals_enabled: false,
                 proxy_ca_cert_path: None,
                 proxy_ca_bundle_path: None,
             },

@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+if [[ "$#" -ne 1 || ! -r "$1" ]]; then
+    echo "Usage: validate-review-findings REVIEW_FINDINGS.json" >&2
+    exit 2
+fi
+
+jq -e '
+    def nonempty:
+        type == "string" and length > 0;
+    def evidence_errors:
+        [
+            (if (.invariant | nonempty) then empty else "invariant" end),
+            (if (.attacker_or_operator_prerequisite | nonempty) then empty else "attacker_or_operator_prerequisite" end),
+            (if (.supported_entry_point | nonempty) then empty else "supported_entry_point" end),
+            (if (.sink | nonempty) then empty else "sink" end),
+            (if (
+                (.changed_location | type == "object") and
+                (.changed_location.path | nonempty) and
+                (.changed_location.line | type == "number" and . > 0)
+            ) then empty else "changed_location" end),
+            (if (.base_behavior | nonempty) then empty else "base_behavior" end),
+            (if (.head_behavior | nonempty) then empty else "head_behavior" end),
+            (if (.observable_impact | nonempty) then empty else "observable_impact" end),
+            (if (.reproducer | nonempty) then empty else "reproducer" end),
+            (if (.pr_ownership | nonempty) then empty else "pr_ownership" end),
+            (if (.requested_change | nonempty) then empty else "requested_change" end),
+            (if (
+                .scope == "latest_delta" or
+                .scope == "carried" or
+                .scope == "unchanged_critical"
+            ) then empty else "scope" end),
+            (if (
+                .scope != "unchanged_critical" or .severity == "Critical"
+            ) then empty else "unchanged_critical_requires_critical_severity" end)
+        ];
+
+    if (
+        .schema_version != 1 or
+        (.reviewed_head_sha | test("^[0-9A-Fa-f]{40}$") | not) or
+        (.review_mode | IN("initial", "follow_up", "human_checkpoint") | not) or
+        (.findings | type != "array")
+    ) then
+        error("invalid review findings envelope")
+    else
+        .findings |= map(
+            . as $finding
+            | (evidence_errors) as $errors
+            | .validation_errors = $errors
+            | .blocking = (
+                (.severity == "Critical" or .severity == "Warning") and
+                (.id | type == "string" and test("^GATOR-[0-9A-Fa-f]{8}-[0-9]{2}$")) and
+                ($errors | length) == 0
+            )
+            | .classification = (
+                if .blocking then "blocker"
+                elif .severity == "Suggestion" then "suggestion"
+                else "hypothesis"
+                end
+            )
+        )
+        | .findings as $normalized
+        | .findings = [
+            $normalized
+            | to_entries[]
+            | . as $entry
+            | ($entry.value.invariant // "") as $invariant
+            | $entry.value
+            | if (
+                $invariant != "" and
+                any(range(0; $entry.key); $normalized[.].invariant == $invariant)
+              ) then
+                .validation_errors += ["duplicate_invariant"]
+                | .blocking = false
+                | .classification = "hypothesis"
+              else
+                .
+              end
+        ]
+        | .telemetry = {
+            proposed_findings: (.findings | length),
+            blockers: ([.findings[] | select(.blocking)] | length),
+            hypotheses: ([.findings[] | select(.classification == "hypothesis")] | length),
+            suggestions: ([.findings[] | select(.classification == "suggestion")] | length),
+            unchanged_code_proposals: (
+                [.findings[] | select(.scope == "unchanged_critical")] | length
+            ),
+            duplicate_invariant_proposals: (
+                [.findings[]
+                 | select((.validation_errors | index("duplicate_invariant")) != null)]
+                | length
+            ),
+            blockers_lacking_reproducer: (
+                [.findings[]
+                 | select(
+                    (.severity == "Critical" or .severity == "Warning") and
+                    ((.validation_errors | index("reproducer")) != null)
+                 )]
+                | length
+            )
+        }
+    end
+' "$1"

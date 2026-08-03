@@ -20,14 +20,13 @@ The defaults are tuned for rootless Podman use:
 version = 1
 
 [openshell.gateway]
-bind_address = "0.0.0.0:17670"
 compute_drivers = ["podman"]
 ```
 
-`bind_address = "0.0.0.0:17670"` is required because Podman sandbox
-containers reach the gateway over the host network bridge and cannot
-connect to `127.0.0.1` inside the gateway's network namespace. mTLS is
-enabled by default and protects all connections.
+The RPM does not override `bind_address`. The primary listener uses the
+built-in `127.0.0.1:17670` default. The Podman driver reports the callback
+interface it needs, and the gateway adds a separate listener scoped to that
+interface. This keeps the general API off unrelated host interfaces.
 
 `compute_drivers = ["podman"]` pins the compute driver to Podman. Without
 this, the gateway auto-detects in order: Kubernetes, Podman, Docker. Pinning
@@ -43,8 +42,8 @@ To apply environment variable overrides that persist across upgrades without
 editing the TOML file, add them to `~/.config/openshell/gateway.env`:
 
 ```shell
-# Example: restrict to loopback only
-OPENSHELL_BIND_ADDRESS=127.0.0.1
+# Example: explicitly expose the primary listener on one host interface
+OPENSHELL_BIND_ADDRESS=192.168.1.10
 ```
 
 To override the path to the TOML config file entirely:
@@ -63,8 +62,9 @@ systemctl --user edit openshell-gateway
 ## TLS (mTLS)
 
 The RPM enables mutual TLS by default. The gateway requires a valid
-client certificate for all API connections and listens on
-`0.0.0.0:17670` by default (see "Default configuration" above).
+client certificate for all API connections. Its primary listener uses
+`127.0.0.1:17670`; Podman callback traffic uses the additional listener
+described in "Default configuration" above.
 
 ### Auto-generated certificates
 
@@ -214,7 +214,7 @@ overrides that persist across package upgrades.
 
 | TOML option | Default | Description |
 |-------------|---------|-------------|
-| `bind_address` | `0.0.0.0:17670` (RPM default) | Address for the gRPC/HTTP API. |
+| `bind_address` | `127.0.0.1:17670` (gateway default) | Address for the primary gRPC/HTTP API listener. |
 | `compute_drivers` | `["podman"]` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman. |
 | `default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
 | `supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor image mounted into Podman sandboxes. |
@@ -235,7 +235,6 @@ settings:
 version = 1
 
 [openshell.gateway]
-bind_address = "0.0.0.0:17670"
 compute_drivers = ["podman"]
 default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 

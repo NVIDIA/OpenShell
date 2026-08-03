@@ -36,6 +36,16 @@ This is a stopgap persistence model. It preserves user files across pod
 rescheduling but duplicates the base workspace and does not automatically apply
 image updates to existing PVCs. Future snapshotting should replace it.
 
+The workspace PVC size defaults to `workspace_default_storage_size`. Set
+`workspace_storage_class` to pin the PVC to a specific `StorageClass`; an empty
+value omits `storageClassName` so the cluster's default `StorageClass` applies.
+Clusters with no default `StorageClass` must set this, otherwise the PVC stays
+`Pending` and the sandbox never starts. Both fields can also be supplied at
+runtime via `OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE` and
+`OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS`. Both apply only to the workspace PVC
+that OpenShell provisions automatically; they have no effect when a `driver_config`
+mount attaches an existing PVC under `/sandbox`, which skips the default PVC.
+
 ## Credentials, TLS, and Relay
 
 The driver injects gateway callback configuration, sandbox identity, TLS client

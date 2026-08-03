@@ -24,10 +24,14 @@ Package-managed gateways do not require a TOML file. Create one at the package's
 
 | Package | Optional Gateway TOML location |
 |---|---|
-| Homebrew | `$XDG_CONFIG_HOME/openshell/gateway.toml` when it exists, otherwise an existing Homebrew prefix config such as `/opt/homebrew/var/openshell/gateway.toml`. |
+| Homebrew | `$XDG_CONFIG_HOME/openshell/gateway.toml` when it exists, otherwise the Homebrew prefix config such as `/opt/homebrew/var/openshell/gateway.toml`. |
 | Debian/Ubuntu | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
 | Fedora/RHEL RPM | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
 | Snap | `$SNAP_COMMON/gateway.toml`, usually `/var/snap/openshell/common/gateway.toml`. |
+
+The Fedora/RHEL RPM template leaves `[openshell.gateway].bind_address` unset. The gateway therefore uses its built-in `127.0.0.1:17670` primary listener. The Podman driver negotiates separate, restricted listeners for sandbox callbacks, so the primary listener does not need a wildcard address. Set `bind_address` explicitly only when clients must reach the primary multiplexed API through another interface.
+
+The Homebrew formula creates its prefix config once with `bind_address = "[::1]:17670"`. Keeping the primary API on IPv6 loopback leaves IPv4 loopback available for Podman Machine's sandbox callback listener. A user config takes precedence, and upgrades do not overwrite either config.
 
 ## Layout
 
@@ -74,6 +78,10 @@ compute_drivers       = ["kubernetes"]
 
 sandbox_namespace     = "openshell"
 ssh_session_ttl_secs  = 3600
+
+# Reject invalid policy generations securely by default. Set
+# "retain_last_valid" only when availability takes priority.
+policy_validation_failure_mode = "fail_closed"
 
 # Subject Alternative Names baked into the gateway server certificate.
 # Wildcard DNS SANs (e.g. "*.dev.openshell.localhost") also enable sandbox
@@ -140,6 +148,11 @@ allow_unauthenticated_users = false
 [openshell.gateway.mtls_auth]
 enabled = false
 
+# OTLP export. Omit this table entirely to disable it.
+[openshell.gateway.otlp]
+endpoint     = "http://otel-collector.observability.svc:4317"
+service_name = "openshell-gateway"
+
 [openshell.gateway.oidc]
 issuer        = "https://idp.example.com/realms/openshell"
 audience      = "openshell-cli"
@@ -171,9 +184,56 @@ phases = ["validate"]
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
 
+`[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup always fails closed when no previous valid generation exists. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
+
 `[openshell.gateway.gateway_jwt] ttl_secs` controls gateway-minted sandbox JWT lifetime. When omitted, it defaults to `0`: the token `exp` claim and `expires_at_ms` response field become `0`, and the sandbox JWT does not expire. Use that default only for local single-player Docker, Podman, or VM gateways. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway uses `0`.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
+
+## OTLP Export
+
+`[openshell.gateway.otlp]` enables OpenTelemetry export over OTLP/gRPC. Omit the table to disable export; there is no separate `enabled` flag.
+
+The gateway already uses the Rust `tracing` framework for structured logs sent to stdout and the sandbox log stream. Enabling this section adds an OpenTelemetry layer to the same tracing subscriber. It exports span trees to an OTLP collector without exporting, replacing, or redirecting the existing log events.
+
+```toml
+[openshell.gateway.otlp]
+endpoint     = "http://otel-collector.observability.svc:4317"
+service_name = "openshell-gateway"
+```
+
+`endpoint` is required and must be a valid URI. If it is malformed, the gateway logs the configuration error and continues with export disabled. It does not connect at startup: an unreachable collector produces export failures, never a failure to serve.
+
+The transport is **OTLP over gRPC only**. HTTP/protobuf and HTTP/JSON are not supported, and `OTEL_EXPORTER_OTLP_PROTOCOL` has no effect. Point `endpoint` at a collector's gRPC receiver, conventionally port `4317`, not the HTTP receiver on `4318`. A URI alone cannot distinguish the two, so an HTTP endpoint is accepted at startup and then fails on export.
+
+The OpenTelemetry SDK logs export failures after startup. Spans in a failed batch are dropped rather than retried.
+
+`service_name` sets the `service.name` resource attribute and defaults to `openshell-gateway`. The gateway also reports `service.version`.
+
+Only OpenTelemetry traces are exported. Inbound gRPC and HTTP requests produce server spans named for the RPC or HTTP method. Store and compute-driver operations appear as child spans. Internal reconciliation, credential-refresh, and driver-watch loops create operation roots for their store work because no inbound request supplies a parent. The gateway continues valid W3C `traceparent` context and starts a new trace when none is supplied. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. Health endpoint spans use DEBUG level and are not exported by the default INFO filter.
+
+### Tuning
+
+This table decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys:
+
+| Variable | Effect |
+|---|---|
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | Sampling strategy and ratio. Defaults to `parentbased_always_on`. |
+| `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_EXPORT_TIMEOUT` | Batch span processor tuning. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Additional resource attributes, such as `deployment.environment=prod`. |
+| `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, `OTEL_SPAN_EVENT_COUNT_LIMIT`, `OTEL_SPAN_LINK_COUNT_LIMIT` | Per-span limits. |
+| `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_COMPRESSION`, `OTEL_EXPORTER_OTLP_TIMEOUT` | Exporter transport tuning. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | No effect. The gateway is built with the gRPC exporter only. |
+
+To sample 10% of traces:
+
+```shell
+OTEL_TRACES_SAMPLER=parentbased_traceidratio OTEL_TRACES_SAMPLER_ARG=0.1
+```
+
+`OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` are deliberately ignored. Enablement has one source, so an environment variable cannot silently turn export on or redirect it. `OTEL_RESOURCE_ATTRIBUTES` does apply and adds attributes, but a `service_name` set here wins over `OTEL_SERVICE_NAME`.
+
+The gateway flushes buffered spans during shutdown, so spans from in-flight requests survive a `SIGTERM`.
 
 ## Supervisor Middleware Services
 
@@ -277,6 +337,10 @@ host_gateway_ip                = "10.0.0.1"
 enable_user_namespaces         = false
 app_armor_profile              = "Unconfined"
 workspace_default_storage_size = "10Gi"
+# Kubernetes StorageClass for the workspace PVC. Empty (default) omits the
+# field, using the cluster's default StorageClass. Set this on clusters with no
+# default StorageClass, otherwise the workspace PVC stays Pending.
+# workspace_storage_class      = "fast-ssd"
 # Kubernetes RuntimeClass applied to sandbox pods when the API request does
 # not specify one. Empty (default) = omit the field, using the cluster default.
 # default_runtime_class_name   = "kata-containers"
@@ -362,6 +426,8 @@ compute_drivers = ["podman"]
 
 [openshell.drivers.podman]
 # Rootless socket path. For root Podman use /run/podman/podman.sock.
+# Omit to auto-detect: the driver probes for a responsive Podman socket and
+# fails to start if none respond.
 socket_path             = "/run/user/1000/podman/podman.sock"
 default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy       = "missing"   # always | missing | never | newer
@@ -373,7 +439,7 @@ network_name            = "openshell"
 # Set "" to force Podman's host-gateway resolver.
 # host_gateway_ip       = "192.168.127.254"
 sandbox_ssh_socket_path = "/run/openshell/ssh.sock"
-stop_timeout_secs       = 10
+stop_timeout_secs       = 45
 # Defaults to the gateway version; override to pin a specific build.
 # supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 guest_tls_ca            = "/etc/openshell/certs/ca.pem"
@@ -389,6 +455,66 @@ sandbox_pids_limit      = 2048
 # but increase process churn (each check spawns a conmon subprocess).
 # Set to 0 to disable health checks entirely. Default: 10.
 health_check_interval_secs = 10
+# Corporate forward proxy for sandbox egress. When set, the in-container
+# supervisor chains policy-approved TLS tunnels through this proxy with HTTP
+# CONNECT instead of dialing destinations directly. Plain-HTTP requests are
+# not proxied and always dial the destination directly. Only http:// proxy
+# URLs in explicit http://host:port form are supported: the scheme and port
+# are both required, and a URL carrying a path, query, or fragment is
+# rejected rather than silently truncated.
+# NO_PROXY entries (hostnames, domain suffixes, IPs, CIDRs, each with an
+# optional :port qualifier) are dialed directly. A port-qualified entry only
+# bypasses that destination port. IP and CIDR entries also match hostnames
+# through their validated DNS resolution; such a match dials directly only
+# the resolved addresses inside the entry. This is an operator-owned egress
+# boundary:
+# sandbox and template environment cannot override it, and the conventional
+# HTTPS_PROXY/HTTP_PROXY/NO_PROXY variables a sandbox sets do not affect it.
+#
+# The CONNECT request sent to the proxy targets a validated resolved IP,
+# not the hostname, so the proxy performs no DNS resolution of its own and
+# the tunnel stays bound to the address that passed the sandbox's SSRF and
+# allowed_ips validation. The hostname still travels inside the tunnel (TLS
+# SNI, application Host), so destination servers behave normally. In
+# split-horizon networks, point the gateway host at the corporate resolver
+# so internal names validate to their internal addresses. If the proxy's
+# ACLs filter on hostnames and reject IP CONNECT targets, set
+# proxy_connect_by_hostname = true as a last resort: the proxy then
+# resolves the name itself, so a name that resolves differently at the
+# proxy (split-horizon DNS, rebinding) can reach destinations the sandbox
+# policy never approved, and the proxy's own ACLs become the effective
+# egress control for proxied TLS.
+#
+# Configuration is fail-closed: an invalid proxy URL is rejected at gateway
+# startup, setting no_proxy, proxy_auth_file, or proxy_connect_by_hostname
+# without a proxy URL is rejected as well, and a set-but-invalid value
+# reaching a sandbox (for example an unreadable or malformed auth file) is
+# fatal to that sandbox's supervisor instead of silently falling back to
+# direct or unauthenticated egress.
+#
+# Credentials must NOT be embedded in the URL (an inline user:pass@ is
+# rejected at startup, since it would be stored here and exposed in container
+# metadata). Instead point proxy_auth_file at a file containing "user:pass";
+# the gateway delivers it to the supervisor through a root-only secret mount.
+# The credential must use the user:pass form (non-empty user, no control
+# characters); the same validation runs at sandbox-create time and in the
+# supervisor, so a credential accepted here is never rejected in-container.
+# Keep gateway.toml and the auth file owner-readable only (mode 0600).
+#
+# WARNING: the supervisor sends the credential as a Proxy-Authorization:
+# Basic header over the plain-TCP connection to the http:// proxy. Basic
+# auth is base64, not encryption: anyone on the network path between the
+# sandbox host and the proxy can recover the credential. Because of that,
+# proxy_auth_file requires the explicit acknowledgement
+# proxy_auth_allow_insecure = true; without it the configuration is
+# rejected at gateway startup. Only opt in when the path to the proxy is a
+# trusted network segment.
+# https_proxy               = "http://proxy.corp.com:8080"
+# no_proxy                  = "*.svc.cluster.local,10.0.0.0/8"
+# proxy_auth_file           = "/etc/openshell/secrets/proxy-auth"
+# proxy_auth_allow_insecure = true
+# Last resort for hostname-filtering proxy ACLs; see the warning above.
+# proxy_connect_by_hostname = true
 ```
 
 ### MicroVM

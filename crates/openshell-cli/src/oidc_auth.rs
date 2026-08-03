@@ -17,9 +17,10 @@ use miette::{IntoDiagnostic, Result};
 use oauth2::basic::BasicClient;
 use oauth2::{
     AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
-    RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
+    RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
 use openshell_bootstrap::oidc_token::OidcTokenBundle;
+use openshell_sdk::oidc::RefreshTokenInput;
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
@@ -227,10 +228,14 @@ pub async fn oidc_client_credentials_flow(
 
 /// Refresh an OIDC token using the `refresh_token` grant.
 ///
+/// Reuses the configured login scopes when supplied so providers can select
+/// the same API resource for the refreshed access token.
+///
 /// Preserves the existing refresh token if the server does not return a new
 /// one (per OAuth 2.0 spec, the refresh response may omit `refresh_token`).
 pub async fn oidc_refresh_token(
     bundle: &OidcTokenBundle,
+    scopes: Option<&str>,
     insecure: bool,
 ) -> Result<OidcTokenBundle> {
     let refresh_token = bundle.refresh_token.as_deref().ok_or_else(|| {
@@ -239,24 +244,37 @@ pub async fn oidc_refresh_token(
         )
     })?;
 
-    let discovery = discover(&bundle.issuer, insecure).await?;
-
-    let client = BasicClient::new(ClientId::new(bundle.client_id.clone()))
-        .set_token_uri(TokenUrl::new(discovery.token_endpoint).into_diagnostic()?);
-
-    let http = http_client(insecure);
-    let token_response = client
-        .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
-        .request_async(&http)
+    let scopes = scopes.map_or_else(Vec::new, |scopes| {
+        scopes.split_whitespace().map(str::to_owned).collect()
+    });
+    let input = RefreshTokenInput::new(refresh_token, &bundle.issuer, &bundle.client_id)
+        .with_scopes(scopes)
+        .with_insecure(insecure);
+    let refreshed = openshell_sdk::oidc::refresh_token(&input)
         .await
-        .map_err(|e| miette::miette!("token refresh failed: {e}"))?;
+        .map_err(miette::Report::new)?;
 
-    let mut refreshed =
-        bundle_from_oauth2_response(&token_response, &bundle.issuer, &bundle.client_id);
-    if refreshed.refresh_token.is_none() {
-        refreshed.refresh_token.clone_from(&bundle.refresh_token);
+    Ok(bundle_from_refresh_output(
+        bundle,
+        refreshed.access_token,
+        refreshed.refresh_token,
+        refreshed.expires_at,
+    ))
+}
+
+fn bundle_from_refresh_output(
+    previous: &OidcTokenBundle,
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: Option<u64>,
+) -> OidcTokenBundle {
+    OidcTokenBundle {
+        access_token,
+        refresh_token: refresh_token.or_else(|| previous.refresh_token.clone()),
+        expires_at,
+        issuer: previous.issuer.clone(),
+        client_id: previous.client_id.clone(),
     }
-    Ok(refreshed)
 }
 
 /// Ensure we have a valid OIDC token for the given gateway, refreshing if needed.
@@ -279,7 +297,10 @@ pub async fn ensure_valid_oidc_token(gateway_name: &str, insecure: bool) -> Resu
         gateway = gateway_name,
         "OIDC token expired, attempting refresh"
     );
-    let refreshed = oidc_refresh_token(&bundle, insecure).await?;
+    let scopes = openshell_bootstrap::load_gateway_metadata(gateway_name)
+        .ok()
+        .and_then(|metadata| metadata.oidc_scopes);
+    let refreshed = oidc_refresh_token(&bundle, scopes.as_deref(), insecure).await?;
     openshell_bootstrap::oidc_token::store_oidc_token(gateway_name, &refreshed)?;
     Ok(refreshed.access_token)
 }
@@ -530,5 +551,25 @@ mod tests {
         assert_eq!(bundle.issuer, "https://issuer");
         assert_eq!(bundle.client_id, "my-client");
         assert!(bundle.expires_at.is_some());
+    }
+
+    #[test]
+    fn refresh_output_preserves_omitted_refresh_token() {
+        let previous = OidcTokenBundle {
+            access_token: "expired-access".to_string(),
+            refresh_token: Some("refresh-secret".to_string()),
+            expires_at: Some(0),
+            issuer: "https://issuer.example".to_string(),
+            client_id: "client-id".to_string(),
+        };
+
+        let refreshed =
+            bundle_from_refresh_output(&previous, "refreshed-access".to_string(), None, Some(300));
+
+        assert_eq!(refreshed.access_token, "refreshed-access");
+        assert_eq!(refreshed.refresh_token, previous.refresh_token);
+        assert_eq!(refreshed.issuer, previous.issuer);
+        assert_eq!(refreshed.client_id, previous.client_id);
+        assert_eq!(refreshed.expires_at, Some(300));
     }
 }

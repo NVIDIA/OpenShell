@@ -22,11 +22,11 @@ openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
 openshell-driver-podman = { path = "../openshell-driver-podman" }
 openshell-gateway-interceptors = { path = "../openshell-gateway-interceptors" }
 openshell-ocsf = { path = "../openshell-ocsf" }
+openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-router = { path = "../openshell-router" }
-openshell-server-macros = { path = "../openshell-server-macros" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 
@@ -36,10 +36,12 @@ k8s-openapi = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+socket2 = { workspace = true }
 
 # gRPC
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 prost = { workspace = true }
+prost-reflect = { workspace = true }
 prost-types = { workspace = true }
 
 # HTTP server
@@ -69,6 +71,11 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# OpenTelemetry (OTLP trace export, opt-in via [openshell.gateway.otlp])
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
 # Metrics
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
@@ -93,7 +100,7 @@ async-trait = "0.1"
 url = { workspace = true }
 glob = { workspace = true }
 hex = "0.4"
-russh = "0.57"
+russh = "0.61"
 rand = { workspace = true }
 petname = "2"
 ipnet = "2"
@@ -118,6 +125,8 @@ rcgen = { version = "0.13", features = ["crypto", "pem"] }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 wiremock = "0.6"
-
+# `testing` provides InMemorySpanExporter, so span assertions do not need a
+# collector, a network hop, or a flush barrier.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 [lints]
 workspace = true

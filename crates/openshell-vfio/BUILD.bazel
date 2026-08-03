@@ -1,0 +1,19 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+rust_library(
+    name = "openshell-vfio",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "openshell-vfio_test",
+    crate = ":openshell-vfio",
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = all_crate_deps(normal_dev = True),
+)

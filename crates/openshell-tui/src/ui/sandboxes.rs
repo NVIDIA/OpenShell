@@ -10,7 +10,13 @@ use crate::app::App;
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
     let t = &app.theme;
-    let header = Row::new(vec![
+    let show_ws = app.all_workspaces;
+
+    let mut header_cells = Vec::new();
+    if show_ws {
+        header_cells.push(Cell::from(Span::styled("WORKSPACE", t.muted)));
+    }
+    header_cells.extend([
         Cell::from(Span::styled("  NAME", t.muted)),
         Cell::from(Span::styled("STATUS", t.muted)),
         Cell::from(Span::styled("CREATED", t.muted)),
@@ -18,11 +24,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
         Cell::from(Span::styled("IMAGE", t.muted)),
         Cell::from(Span::styled("LABELS", t.muted)),
         Cell::from(Span::styled("NOTES", t.muted)),
-    ])
-    .bottom_margin(1);
+    ]);
+    let header = Row::new(header_cells).bottom_margin(1);
 
     let rows: Vec<Row<'_>> = (0..app.sandbox_count)
         .map(|i| {
+            let workspace = app.sandbox_workspaces.get(i).map_or("", String::as_str);
             let name = app.sandbox_names.get(i).map_or("", String::as_str);
             let phase = app.sandbox_phases.get(i).map_or("", String::as_str);
             let created = app.sandbox_created.get(i).map_or("", String::as_str);
@@ -60,7 +67,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
 
             let name_cell = Cell::from(Line::from(name_spans));
 
-            Row::new(vec![
+            let mut cells: Vec<Cell<'_>> = Vec::new();
+            if show_ws {
+                cells.push(Cell::from(Span::styled(workspace, t.muted)));
+            }
+            cells.extend([
                 name_cell,
                 Cell::from(Span::styled(phase, phase_style)),
                 Cell::from(Span::styled(created, t.muted)),
@@ -68,19 +79,34 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
                 Cell::from(Span::styled(image, t.muted)),
                 Cell::from(Span::styled(labels, t.muted)),
                 Cell::from(Span::styled(notes, t.muted)),
-            ])
+            ]);
+
+            Row::new(cells)
         })
         .collect();
 
-    let widths = [
-        Constraint::Percentage(20),
-        Constraint::Percentage(10),
-        Constraint::Percentage(15),
-        Constraint::Percentage(8),
-        Constraint::Percentage(20),
-        Constraint::Percentage(15),
-        Constraint::Percentage(12),
-    ];
+    let widths: Vec<Constraint> = if show_ws {
+        vec![
+            Constraint::Percentage(10),
+            Constraint::Percentage(16),
+            Constraint::Percentage(9),
+            Constraint::Percentage(13),
+            Constraint::Percentage(7),
+            Constraint::Percentage(18),
+            Constraint::Percentage(15),
+            Constraint::Percentage(12),
+        ]
+    } else {
+        vec![
+            Constraint::Percentage(20),
+            Constraint::Percentage(10),
+            Constraint::Percentage(15),
+            Constraint::Percentage(8),
+            Constraint::Percentage(20),
+            Constraint::Percentage(15),
+            Constraint::Percentage(12),
+        ]
+    };
 
     let border_style = if focused { t.border_focused } else { t.border };
 

@@ -16,6 +16,7 @@ use crate::refresh::{RefreshedToken, TokenSource};
 use crate::transport;
 use crate::types::{
     ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxSpec,
+    WorkspaceRef,
 };
 use futures::StreamExt;
 use openshell_core::proto;
@@ -168,6 +169,7 @@ impl OpenShellClient {
             .unary(|mut grpc| {
                 let request = proto::GetSandboxRequest {
                     name: name.to_string(),
+                    workspace: String::new(),
                 };
                 async move { grpc.get_sandbox(request).await }
             })
@@ -183,6 +185,8 @@ impl OpenShellClient {
                     limit: opts.limit,
                     offset: opts.offset,
                     label_selector: opts.label_selector.clone().unwrap_or_default(),
+                    workspace: String::new(),
+                    all_workspaces: false,
                 };
                 async move { grpc.list_sandboxes(request).await }
             })
@@ -205,6 +209,7 @@ impl OpenShellClient {
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
                     name: name.to_string(),
+                    workspace: String::new(),
                 };
                 async move { grpc.delete_sandbox(request).await }
             })
@@ -250,6 +255,110 @@ impl OpenShellClient {
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(Duration::from_secs(2));
         }
+    }
+
+    /// Return a workspace-scoped handle for sandbox operations.
+    ///
+    /// Analogous to `kube::Api::namespaced` — captures the workspace once and
+    /// injects it into every request.
+    pub fn workspace(&self, workspace: &str) -> WorkspaceScopedClient {
+        WorkspaceScopedClient {
+            client: self.clone(),
+            workspace: workspace.to_string(),
+        }
+    }
+
+    /// List sandboxes across all workspaces.
+    pub async fn list_sandboxes_all_workspaces(
+        &self,
+        opts: ListOptions,
+    ) -> Result<Vec<SandboxRef>> {
+        let response = self
+            .unary(|mut grpc| {
+                let request = proto::ListSandboxesRequest {
+                    limit: opts.limit,
+                    offset: opts.offset,
+                    label_selector: opts.label_selector.clone().unwrap_or_default(),
+                    workspace: String::new(),
+                    all_workspaces: true,
+                };
+                async move { grpc.list_sandboxes(request).await }
+            })
+            .await?;
+        Ok(response
+            .sandboxes
+            .into_iter()
+            .map(SandboxRef::from_proto)
+            .collect())
+    }
+
+    /// Create a new workspace.
+    pub async fn create_workspace(
+        &self,
+        name: &str,
+        labels: HashMap<String, String>,
+    ) -> Result<WorkspaceRef> {
+        let response = self
+            .unary(|mut grpc| {
+                let request = proto::CreateWorkspaceRequest {
+                    name: name.to_string(),
+                    labels: labels.clone(),
+                };
+                async move { grpc.create_workspace(request).await }
+            })
+            .await?;
+        response
+            .workspace
+            .map(WorkspaceRef::from_proto)
+            .ok_or_else(|| SdkError::invalid_config("workspace missing from gateway response"))
+    }
+
+    /// Fetch a workspace by name.
+    pub async fn get_workspace(&self, name: &str) -> Result<WorkspaceRef> {
+        let response = self
+            .unary(|mut grpc| {
+                let request = proto::GetWorkspaceRequest {
+                    name: name.to_string(),
+                };
+                async move { grpc.get_workspace(request).await }
+            })
+            .await?;
+        response
+            .workspace
+            .map(WorkspaceRef::from_proto)
+            .ok_or_else(|| SdkError::invalid_config("workspace missing from gateway response"))
+    }
+
+    /// List workspaces.
+    pub async fn list_workspaces(&self, opts: ListOptions) -> Result<Vec<WorkspaceRef>> {
+        let response = self
+            .unary(|mut grpc| {
+                let request = proto::ListWorkspacesRequest {
+                    limit: opts.limit,
+                    offset: opts.offset,
+                    label_selector: opts.label_selector.clone().unwrap_or_default(),
+                };
+                async move { grpc.list_workspaces(request).await }
+            })
+            .await?;
+        Ok(response
+            .workspaces
+            .into_iter()
+            .map(WorkspaceRef::from_proto)
+            .collect())
+    }
+
+    /// Delete a workspace by name.
+    pub async fn delete_workspace(&self, name: &str) -> Result<bool> {
+        let response = self
+            .unary(|mut grpc| {
+                let request = proto::DeleteWorkspaceRequest {
+                    name: name.to_string(),
+                };
+                async move { grpc.delete_workspace(request).await }
+            })
+            .await?;
+        Ok(response.deleted)
     }
 
     /// Run a command inside a sandbox and buffer stdout/stderr to the end.
@@ -395,6 +504,187 @@ impl OpenShellClient {
     }
 }
 
+/// Workspace-scoped sandbox operations, analogous to `kube::Api::namespaced`.
+///
+/// Constructed via [`OpenShellClient::workspace`]. Captures the workspace
+/// once and injects it into every request.
+#[derive(Clone)]
+pub struct WorkspaceScopedClient {
+    client: OpenShellClient,
+    workspace: String,
+}
+
+impl WorkspaceScopedClient {
+    /// The workspace this client targets.
+    pub fn workspace_name(&self) -> &str {
+        &self.workspace
+    }
+
+    /// Create a new sandbox in this workspace.
+    pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
+        let mut request = create_sandbox_request(spec);
+        request.workspace = self.workspace.clone();
+        let response = self
+            .client
+            .unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.create_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
+    /// Fetch a sandbox by name in this workspace.
+    pub async fn get_sandbox(&self, name: &str) -> Result<SandboxRef> {
+        let response = self
+            .client
+            .unary(|mut grpc| {
+                let request = proto::GetSandboxRequest {
+                    name: name.to_string(),
+                    workspace: self.workspace.clone(),
+                };
+                async move { grpc.get_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
+    /// List sandboxes in this workspace.
+    pub async fn list_sandboxes(&self, opts: ListOptions) -> Result<Vec<SandboxRef>> {
+        let response = self
+            .client
+            .unary(|mut grpc| {
+                let request = proto::ListSandboxesRequest {
+                    limit: opts.limit,
+                    offset: opts.offset,
+                    label_selector: opts.label_selector.clone().unwrap_or_default(),
+                    workspace: self.workspace.clone(),
+                    all_workspaces: false,
+                };
+                async move { grpc.list_sandboxes(request).await }
+            })
+            .await?;
+        Ok(response
+            .sandboxes
+            .into_iter()
+            .map(SandboxRef::from_proto)
+            .collect())
+    }
+
+    /// Delete a sandbox by name in this workspace.
+    pub async fn delete_sandbox(&self, name: &str) -> Result<bool> {
+        let response = self
+            .client
+            .unary(|mut grpc| {
+                let request = proto::DeleteSandboxRequest {
+                    name: name.to_string(),
+                    workspace: self.workspace.clone(),
+                };
+                async move { grpc.delete_sandbox(request).await }
+            })
+            .await?;
+        Ok(response.deleted)
+    }
+
+    /// Poll until the sandbox reaches [`SandboxPhase::Ready`] or the timeout
+    /// elapses.
+    pub async fn wait_ready(&self, name: &str, timeout: Duration) -> Result<SandboxRef> {
+        let deadline = Instant::now() + timeout;
+        let mut delay = Duration::from_millis(250);
+        loop {
+            let snapshot = self.get_sandbox(name).await?;
+            match snapshot.phase {
+                SandboxPhase::Ready => return Ok(snapshot),
+                SandboxPhase::Error => {
+                    return Err(SdkError::connect(format!(
+                        "sandbox '{name}' entered error phase"
+                    )));
+                }
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(SdkError::connect(format!(
+                    "timed out waiting for sandbox '{name}'"
+                )));
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(2));
+        }
+    }
+
+    /// Poll until the sandbox is gone (`NotFound`) or the timeout elapses.
+    pub async fn wait_deleted(&self, name: &str, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut delay = Duration::from_millis(250);
+        loop {
+            match self.get_sandbox(name).await {
+                Err(SdkError::NotFound { .. }) => return Ok(()),
+                Err(other) => return Err(other),
+                Ok(_) => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(SdkError::connect(format!(
+                    "timed out waiting for sandbox '{name}' to delete"
+                )));
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(2));
+        }
+    }
+
+    /// Run a command inside a sandbox and buffer stdout/stderr.
+    pub async fn exec(&self, name: &str, cmd: &[String], opts: ExecOptions) -> Result<ExecResult> {
+        let sandbox = self.get_sandbox(name).await?;
+        let request = proto::ExecSandboxRequest {
+            sandbox_id: sandbox.id,
+            command: cmd.to_vec(),
+            workdir: opts.workdir.unwrap_or_default(),
+            environment: opts.environment,
+            timeout_seconds: opts
+                .timeout
+                .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX)),
+            stdin: opts.stdin.unwrap_or_default(),
+            tty: false,
+            cols: 0,
+            rows: 0,
+        };
+
+        let mut stream = self
+            .client
+            .unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.exec_sandbox(request).await }
+            })
+            .await?;
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_code: Option<i32> = None;
+
+        while let Some(event) = stream.next().await {
+            let event = event.map_err(map_status)?;
+            match event.payload {
+                Some(proto::exec_sandbox_event::Payload::Stdout(chunk)) => {
+                    stdout.extend_from_slice(&chunk.data);
+                }
+                Some(proto::exec_sandbox_event::Payload::Stderr(chunk)) => {
+                    stderr.extend_from_slice(&chunk.data);
+                }
+                Some(proto::exec_sandbox_event::Payload::Exit(exit)) => {
+                    exit_code = Some(exit.exit_code);
+                }
+                None => {}
+            }
+        }
+
+        Ok(ExecResult {
+            exit_code: exit_code.unwrap_or(-1),
+            stdout,
+            stderr,
+        })
+    }
+}
+
 fn interceptor_from_config(config: &ClientConfig) -> Result<EdgeAuthInterceptor> {
     match &config.auth {
         None => Ok(EdgeAuthInterceptor::noop()),
@@ -470,6 +760,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         name: name.unwrap_or_default(),
         labels,
         annotations: HashMap::new(),
+        workspace: String::new(),
     }
 }
 

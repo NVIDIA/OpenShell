@@ -105,6 +105,9 @@ pub struct GatewayFileSection {
     pub grpc_rate_limit_requests: Option<u64>,
     #[serde(default)]
     pub grpc_rate_limit_window_seconds: Option<u64>,
+    /// Security posture when a sandbox rejects a candidate policy generation.
+    #[serde(default)]
+    pub policy_validation_failure_mode: Option<openshell_core::PolicyValidationFailureMode>,
 
     // ── Service routing ──────────────────────────────────────────────────
     /// Subject Alternative Names configured on the gateway server certificate.
@@ -161,6 +164,8 @@ pub struct GatewayFileSection {
     pub mtls_auth: Option<MtlsAuthConfig>,
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
+    #[serde(default)]
+    pub otlp: Option<OtlpConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
@@ -169,6 +174,23 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
+}
+
+/// `[openshell.gateway.otlp]` section.
+///
+/// Presence of this table enables OTLP export; there is no `enabled` flag.
+/// SDK tuning knobs are deliberately absent — see [`crate::otel_tracing`] for what
+/// this table owns and what the `OTEL_*` environment variables own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OtlpConfig {
+    /// OTLP/gRPC collector endpoint, e.g.
+    /// `http://otel-collector.observability.svc:4317`.
+    pub endpoint: String,
+
+    /// `service.name` resource attribute. Defaults to `openshell-gateway`.
+    #[serde(default)]
+    pub service_name: Option<String>,
 }
 
 /// `[openshell.supervisor]` section.
@@ -403,6 +425,7 @@ compute_drivers = ["kubernetes"]
 sandbox_namespace = "agents"
 grpc_rate_limit_requests = 120
 grpc_rate_limit_window_seconds = 60
+policy_validation_failure_mode = "retain_last_valid"
 default_image = "ghcr.io/nvidia/openshell/sandbox:latest"
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
 client_tls_secret_name = "openshell-sandbox-tls"
@@ -431,9 +454,83 @@ grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
         );
         assert_eq!(gw.grpc_rate_limit_requests, Some(120));
         assert_eq!(gw.grpc_rate_limit_window_seconds, Some(60));
+        assert_eq!(
+            gw.policy_validation_failure_mode,
+            Some(openshell_core::PolicyValidationFailureMode::RetainLastValid)
+        );
         assert!(gw.tls.is_some());
         assert!(gw.oidc.is_some());
         assert!(file.openshell.drivers.contains_key("kubernetes"));
+    }
+
+    #[test]
+    fn parses_gateway_otlp_config() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://otel-collector.observability.svc:4317"
+service_name = "openshell-gateway-dev"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid otlp config parses");
+        let otlp = file.openshell.gateway.otlp.expect("otlp config");
+        assert_eq!(
+            otlp.endpoint,
+            "http://otel-collector.observability.svc:4317"
+        );
+        assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
+    }
+
+    #[test]
+    fn otlp_config_requires_only_endpoint() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("minimal otlp config parses");
+        let otlp = file.openshell.gateway.otlp.expect("otlp config");
+        assert_eq!(otlp.endpoint, "http://127.0.0.1:4317");
+        assert!(otlp.service_name.is_none());
+    }
+
+    #[test]
+    fn otlp_config_rejects_unknown_fields() {
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+protocol = "http"
+"#;
+        let tmp = write_tmp(toml);
+        assert!(load(tmp.path()).is_err(), "unknown otlp field is rejected");
+    }
+
+    #[test]
+    fn otlp_config_rejects_sdk_tuning_keys() {
+        // Sampling, batching, and limits are the SDK's env-var surface. A
+        // `deny_unknown_fields` rejection is the signal that they do not
+        // belong in the config file.
+        let toml = r#"
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
+sampler = "traceidratio"
+"#;
+        let tmp = write_tmp(toml);
+        assert!(
+            load(tmp.path()).is_err(),
+            "sampler is configured via OTEL_TRACES_SAMPLER, not TOML"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_policy_validation_failure_mode() {
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway]
+policy_validation_failure_mode = "keep_old"
+"#,
+        );
+        let error = load(tmp.path()).expect_err("unknown posture must fail TOML validation");
+        assert!(error.to_string().contains("policy_validation_failure_mode"));
     }
 
     #[test]
@@ -720,7 +817,8 @@ version = 2
     /// `load()` path that the gateway uses at runtime, catching:
     ///   - template corruption or unknown fields (`deny_unknown_fields`)
     ///   - schema drift (version bump or field renames)
-    ///   - accidental changes to the bind address or compute driver list
+    ///   - accidental addition of a wildcard bind-address override
+    ///   - accidental changes to the compute driver list
     #[test]
     fn rpm_default_config_parses_and_has_podman_defaults() {
         let path =
@@ -729,20 +827,12 @@ version = 2
             load(&path).expect("deploy/rpm/gateway.toml.default must parse against current schema");
         let gw = &config.openshell.gateway;
 
-        let addr = gw
-            .bind_address
-            .expect("bind_address must be explicitly set in the RPM default config");
-        assert!(
-            addr.ip().is_unspecified(),
-            "RPM default bind_address must be 0.0.0.0 so Podman sandbox containers \
-             can reach the gateway over the host network bridge, got {addr}"
-        );
-        assert_eq!(
-            addr.port(),
-            openshell_core::config::DEFAULT_SERVER_PORT,
-            "RPM default port must match DEFAULT_SERVER_PORT ({})",
-            openshell_core::config::DEFAULT_SERVER_PORT
-        );
+        if let Some(addr) = gw.bind_address {
+            assert!(
+                !addr.ip().is_unspecified(),
+                "RPM default config must not expose the primary listener on every interface"
+            );
+        }
 
         let drivers = gw
             .compute_drivers

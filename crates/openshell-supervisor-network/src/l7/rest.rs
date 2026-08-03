@@ -130,6 +130,19 @@ pub(crate) struct DenyResponseContext<'a> {
     pub(crate) host: Option<&'a str>,
     pub(crate) port: Option<u16>,
     pub(crate) binary: Option<&'a str>,
+    pub(crate) agent_proposals_enabled: bool,
+}
+
+impl<'a> DenyResponseContext<'a> {
+    #[must_use]
+    pub(crate) fn from_l7_context(ctx: &'a crate::l7::relay::L7EvalContext) -> Self {
+        Self {
+            host: Some(&ctx.host),
+            port: Some(ctx.port),
+            binary: Some(&ctx.binary_path),
+            agent_proposals_enabled: ctx.agent_proposals.enabled(),
+        }
+    }
 }
 
 impl RestProvider {
@@ -2360,9 +2373,10 @@ fn deny_response_body(
     // module; this side picks up the change automatically.
     body.insert(
         "next_steps".to_string(),
-        crate::policy_local::agent_next_steps(),
+        crate::policy_local::agent_next_steps(context.agent_proposals_enabled),
     );
-    if let Some(guidance) = crate::policy_local::agent_guidance() {
+    if let Some(guidance) = crate::policy_local::agent_guidance_for(context.agent_proposals_enabled)
+    {
         body.insert("agent_guidance".to_string(), serde_json::json!(guidance));
     }
 
@@ -3183,6 +3197,7 @@ mod tests {
     use super::*;
     use crate::opa::OpaEngine;
     use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+    use openshell_core::proposals::AgentProposals;
     use openshell_core::secrets::SecretResolver;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -3348,6 +3363,31 @@ mod tests {
         })
         .await
         .expect("WebSocket frame should arrive")
+    }
+
+    async fn policy_local_json_response(
+        ctx: Arc<crate::policy_local::PolicyLocalContext>,
+    ) -> serde_json::Value {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            crate::policy_local::handle_forward_request(
+                ctx.as_ref(),
+                "GET",
+                "/v1/policy/current",
+                b"GET http://policy.local/v1/policy/current HTTP/1.1\r\nHost: policy.local\r\n\r\n",
+                &mut server,
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        task.await.unwrap();
+
+        let response = String::from_utf8(received).unwrap();
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        serde_json::from_str(body).unwrap()
     }
 
     fn masked_frame_with_rsv(opcode: u8, rsv: u8, payload: &[u8]) -> Vec<u8> {
@@ -3565,9 +3605,6 @@ mod tests {
 
     #[test]
     fn deny_response_body_is_agent_readable_and_redacted() {
-        // Agent-readable next_steps is gated on the proposals feature flag.
-        let _proposals =
-            openshell_core::proposals::test_helpers::ProposalsFlagGuard::set_blocking(true);
         let req = L7Request {
             action: "PUT".to_string(),
             target: "/repos/NVIDIA/OpenShell/contents/README.md?access_token=secret-token"
@@ -3586,6 +3623,7 @@ mod tests {
                 host: Some("api.github.com"),
                 port: Some(443),
                 binary: Some("/usr/bin/gh"),
+                agent_proposals_enabled: true,
             }),
         );
 
@@ -3632,8 +3670,6 @@ mod tests {
 
     #[test]
     fn deny_response_body_omits_agent_guidance_when_policy_advisor_is_off() {
-        let _proposals =
-            openshell_core::proposals::test_helpers::ProposalsFlagGuard::set_blocking(false);
         let req = L7Request {
             action: "GET".to_string(),
             target: "/gists".to_string(),
@@ -3651,6 +3687,7 @@ mod tests {
                 host: Some("api.github.com"),
                 port: Some(443),
                 binary: Some("/usr/bin/gh"),
+                agent_proposals_enabled: false,
             }),
         );
 
@@ -3662,10 +3699,76 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shared_agent_proposals_state_gates_policy_local_and_l7_next_steps() {
+        let agent_proposals = AgentProposals::new(false);
+        let (_workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
+        let policy_local_ctx = Arc::new(crate::policy_local::PolicyLocalContext::new(
+            Some(openshell_core::proto::SandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+            agent_proposals.clone(),
+            workspace_rx,
+        ));
+        let l7_ctx = crate::l7::relay::L7EvalContext {
+            host: "api.github.com".to_string(),
+            port: 443,
+            binary_path: "/usr/bin/gh".to_string(),
+            agent_proposals: agent_proposals.clone(),
+            ..Default::default()
+        };
+        let req = L7Request {
+            action: "POST".to_string(),
+            target: "/user/repos".to_string(),
+            query_params: HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: BodyLength::None,
+        };
+
+        let policy_body = policy_local_json_response(policy_local_ctx.clone()).await;
+        assert_eq!(policy_body["error"], "feature_disabled");
+        let deny_body = deny_response_body(
+            &req,
+            "github-readonly",
+            "no matching L7 allow rule",
+            None,
+            Some(DenyResponseContext::from_l7_context(&l7_ctx)),
+        );
+        assert_eq!(deny_body["next_steps"], serde_json::json!([]));
+        assert!(deny_body.get("agent_guidance").is_none());
+
+        agent_proposals.set_enabled(true);
+
+        let policy_body = policy_local_json_response(policy_local_ctx).await;
+        assert_eq!(policy_body["format"], "yaml");
+        assert!(
+            policy_body["policy_yaml"]
+                .as_str()
+                .unwrap()
+                .contains("version: 1")
+        );
+        let deny_body = deny_response_body(
+            &req,
+            "github-readonly",
+            "no matching L7 allow rule",
+            None,
+            Some(DenyResponseContext::from_l7_context(&l7_ctx)),
+        );
+        assert_eq!(deny_body["next_steps"][0]["action"], "read_skill");
+        assert_eq!(deny_body["next_steps"][3]["action"], "submit_proposal");
+        assert!(
+            deny_body["agent_guidance"]
+                .as_str()
+                .unwrap()
+                .contains("http://policy.local/v1/proposals")
+        );
+    }
+
     #[test]
     fn middleware_deny_response_identifies_config_without_policy_remediation() {
-        let _proposals =
-            openshell_core::proposals::test_helpers::ProposalsFlagGuard::set_blocking(true);
         let req = L7Request {
             action: "POST".to_string(),
             target: "/v1/messages?token=secret-token".to_string(),
@@ -3687,6 +3790,7 @@ mod tests {
                 host: Some("api.example.com"),
                 port: Some(443),
                 binary: Some("/usr/bin/curl"),
+                agent_proposals_enabled: true,
             }),
         );
 
@@ -3705,9 +3809,6 @@ mod tests {
 
     #[tokio::test]
     async fn send_deny_response_writes_structured_json_403() {
-        // Agent-readable next_steps is gated on the proposals feature flag.
-        let _proposals =
-            openshell_core::proposals::test_helpers::ProposalsFlagGuard::set(true).await;
         let (mut client, mut server) = tokio::io::duplex(4096);
         let send = tokio::spawn(async move {
             let req = L7Request {
@@ -3727,6 +3828,7 @@ mod tests {
                     host: Some("api.github.com"),
                     port: Some(443),
                     binary: Some("/usr/bin/gh"),
+                    agent_proposals_enabled: true,
                 }),
             )
             .await

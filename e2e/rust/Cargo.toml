@@ -30,7 +30,13 @@ e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
+e2e-oidc-pkce = []
 e2e-vm = ["e2e", "e2e-host-gateway"]
+
+[[test]]
+name = "oidc_pkce"
+path = "tests/oidc_pkce.rs"
+required-features = ["e2e-oidc-pkce"]
 
 [[test]]
 name = "custom_image"
@@ -60,6 +66,16 @@ required-features = ["e2e"]
 [[test]]
 name = "podman_gateway_resume"
 path = "tests/podman_gateway_resume.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
+name = "podman_corporate_proxy"
+path = "tests/podman_corporate_proxy.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
+name = "podman_oci_identity"
+path = "tests/podman_oci_identity.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
@@ -103,6 +119,16 @@ path = "tests/forward_proxy_jsonrpc_l7.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
+name = "workspace_lifecycle"
+path = "tests/workspace_lifecycle.rs"
+required-features = ["e2e"]
+
+[[test]]
+name = "proxy_egress_pipeline"
+path = "tests/proxy_egress_pipeline.rs"
+required-features = ["e2e-host-gateway"]
+
+[[test]]
 name = "gpu"
 path = "tests/gpu.rs"
 required-features = ["e2e-gpu"]
@@ -125,6 +151,7 @@ rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = "0.0.12"
+url = "2"
 
 [dev-dependencies]
 serial_test = "3"

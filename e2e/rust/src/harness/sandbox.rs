@@ -7,6 +7,7 @@
 //! is dropped, replacing the `trap cleanup EXIT` pattern from the bash tests.
 
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -153,6 +154,19 @@ impl SandboxGuard {
         let stdout = child.stdout.take().expect("stdout must be piped");
         let mut reader = BufReader::new(stdout).lines();
 
+        let stderr_handle = child.stderr.take().expect("stderr must be piped");
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let stderr_buf_clone = Arc::clone(&stderr_buf);
+        let stderr_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr_handle).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let clean = strip_ansi(&line);
+                let mut buf = stderr_buf_clone.lock().unwrap();
+                buf.push_str(&clean);
+                buf.push('\n');
+            }
+        });
+
         let mut accumulated = String::new();
         let mut name: Option<String> = None;
         let mut ready = false;
@@ -179,26 +193,38 @@ impl SandboxGuard {
         })
         .await;
 
+        let collect_stderr = || {
+            stderr_task.abort();
+            let buf = stderr_buf.lock().unwrap();
+            buf.clone()
+        };
+
         if poll_result.is_err() {
             // Timeout — kill the child and report.
             let _ = child.kill().await;
+            let stderr_output = collect_stderr();
             return Err(format!(
                 "sandbox did not become ready within {SANDBOX_READY_TIMEOUT:?}.\n\
-                 Output so far:\n{accumulated}"
+                 Stdout:\n{accumulated}\nStderr:\n{stderr_output}"
             ));
         }
 
         if !ready {
             // The line reader ended before seeing the marker (process exited).
             let _ = child.kill().await;
+            let stderr_output = collect_stderr();
             return Err(format!(
                 "sandbox create exited before ready marker '{ready_marker}' was seen.\n\
-                 Output:\n{accumulated}"
+                 Stdout:\n{accumulated}\nStderr:\n{stderr_output}"
             ));
         }
 
         let sandbox_name = name.ok_or_else(|| {
-            format!("could not parse sandbox name from create output:\n{accumulated}")
+            let stderr_output = collect_stderr();
+            format!(
+                "could not parse sandbox name from create output:\n\
+                 Stdout:\n{accumulated}\nStderr:\n{stderr_output}"
+            )
         })?;
 
         Ok(Self {

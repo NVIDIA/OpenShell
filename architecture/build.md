@@ -77,7 +77,12 @@ and the supervisor image from `deploy/docker/Dockerfile.supervisor`. Neither
 Dockerfile compiles Rust — both copy a staged binary out of
 `deploy/docker/.build/prebuilt-binaries/<arch>/` into the final image.
 
-Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Gateway
+Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Because
+staging cross-compiles on the host, it sources `tasks/scripts/build-env.sh` and
+raises the per-process open-file limit before invoking `cargo zigbuild` on
+macOS — the static musl link opens hundreds of `.rlib` files at once and would
+otherwise fail with `ProcessFdQuotaExceeded` under macOS's default soft limit of
+256. The guard is a no-op on Linux and when `cargo-zigbuild` is absent. Gateway
 binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.28, including
 native-architecture builds, so the gateway image, standalone tarballs, and Linux
 packages share the same host portability floor. The gateway build enables
@@ -148,12 +153,31 @@ contexts use `KIND_EXPERIMENTAL_PROVIDER=docker|podman` when set, and ambiguous
 or unknown contexts require an explicit `CONTAINER_ENGINE`. Other image builds
 do not infer from kube context.
 
+## Disposable Test Guests
+
+The Nix test guest harness under `nix/test-guest` boots native-architecture cloud images
+through QEMU for package, release, and E2E validation. A prepared cache entry is
+captured after the exact ordered Ansible configuration list and before
+test-specific packages, copied binaries, forwarded ports, or commands.
+
+Prepared disks are flattened, sanitized QCOW2 images. The local cache keeps them
+read-only and each test receives a fresh writable overlay and cloud-init
+identity. The optional shared cache stores the compressed standalone disk and
+its compatibility metadata as a custom OCI artifact. Normal test runs ensure
+the exact local entry exists, invoking the cache builder automatically on a
+miss before booting a disposable overlay. The separate cache app owns OCI
+pulls and explicit publication. OCI pulls require a trusted manifest digest
+and retain that provenance with the local entry; mutable tags are used only
+for explicit publication.
+
 ## Python Wheel Packaging
 
 The generated protobuf/gRPC stubs under `python/openshell/_proto/` are gitignored
-build outputs of `mise run python:proto`. maturin honors `.gitignore` when
-collecting `python-source` files, so native builds (Linux CI, local
-`pip install .`) would drop them and ship an unimportable wheel. `pyproject.toml`
+build outputs of `mise run python:proto`. The task uses `uv run --frozen` to
+synchronize the current worktree's `.venv` from `uv.lock` before generation.
+maturin honors `.gitignore` when collecting `python-source` files, so native
+builds (Linux CI, local `pip install .`) would drop them and ship an unimportable
+wheel. `pyproject.toml`
 pins them back in with `[tool.maturin].include` globs. The release workflows
 install each Linux wheel in a clean image and import `openshell.sandbox` as a
 smoke check.

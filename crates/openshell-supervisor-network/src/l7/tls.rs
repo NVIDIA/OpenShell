@@ -184,7 +184,7 @@ pub async fn tls_terminate_client(
 ///
 /// Returns a TLS stream for re-encrypted upstream communication.
 pub async fn tls_connect_upstream(
-    upstream: TcpStream,
+    upstream: impl AsyncRead + AsyncWrite + Unpin + Send,
     hostname: &str,
     client_config: &Arc<ClientConfig>,
 ) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send> {

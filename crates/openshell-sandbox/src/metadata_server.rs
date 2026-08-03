@@ -135,3 +135,93 @@ async fn handle_connection<H: MetadataHandler>(
         Ok(())
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
+
+    struct RecordingHandler {
+        requests: mpsc::UnboundedSender<(String, String)>,
+    }
+
+    impl MetadataHandler for RecordingHandler {
+        async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(
+            &self,
+            method: &str,
+            path: &str,
+            _request: &[u8],
+            stream: &mut S,
+        ) -> Result<()> {
+            self.requests
+                .send((method.to_string(), path.to_string()))
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .map_err(|error| miette::miette!("{error}"))?;
+            Ok(())
+        }
+    }
+
+    async fn connection_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn metadata_loopback_dispatches_method_path_and_response() {
+        let (requests_tx, mut requests_rx) = mpsc::unbounded_channel();
+        let handler = RecordingHandler {
+            requests: requests_tx,
+        };
+        let (mut client, server) = connection_pair().await;
+        let server_task = tokio::spawn(async move { handle_connection(&handler, server).await });
+
+        client
+            .write_all(b"GET /computeMetadata/v1/instance HTTP/1.1\r\nHost: metadata\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server_task.await.unwrap().unwrap();
+
+        assert_eq!(
+            requests_rx.try_recv().unwrap(),
+            (
+                "GET".to_string(),
+                "/computeMetadata/v1/instance".to_string()
+            )
+        );
+        assert_eq!(response, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    }
+
+    #[tokio::test]
+    async fn metadata_loopback_rejects_oversized_headers_before_handler() {
+        let (requests_tx, mut requests_rx) = mpsc::unbounded_channel();
+        let handler = RecordingHandler {
+            requests: requests_tx,
+        };
+        let (mut client, server) = connection_pair().await;
+        let server_task = tokio::spawn(async move { handle_connection(&handler, server).await });
+
+        client
+            .write_all(&vec![b'x'; MAX_REQUEST_BYTES])
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server_task.await.unwrap().unwrap();
+
+        assert_eq!(
+            response,
+            b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(requests_rx.try_recv().is_err());
+    }
+}

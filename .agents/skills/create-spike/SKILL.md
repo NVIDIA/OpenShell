@@ -5,7 +5,7 @@ description: Investigate a plain-language problem description by deeply explorin
 
 # Create Spike
 
-Investigate a problem, map it to the codebase, and produce a structured GitHub issue ready for `build-from-issue`.
+Investigate a problem, map it to the codebase, and produce a structured GitHub issue ready for human disposition and roadmap placement.
 
 A **spike** is an exploratory investigation. The user has a vague idea — a feature they want, a bug they've noticed, a performance concern — but hasn't mapped it to code, assessed feasibility, or structured it as a buildable issue. This skill does that mapping.
 
@@ -122,7 +122,9 @@ Based on the investigation results, select appropriate labels:
 - **Do not add issue type labels** — GitHub built-in issue types come from issue templates or manual follow-up, not labels
 - **Include area labels** if they exist in the repo (e.g., `area:sandbox`, `area:proxy`, `area:policy`, `area:cli`)
 - **Do not invent labels** — only use labels that already exist in the repo
-- **Add `state:review-ready`** — the issue is ready for human review upon creation
+- **Add `state:validated` only when the evidence is sufficient for human disposition** — the spike established a coherent problem or proposal and completed the factual assessment needed for a human yes/no decision
+- **Add `state:needs-info` instead when material evidence is missing** — identify the exact evidence, reproduction details, or decision input still needed in the issue body
+- **Never add `state:accepted`, an `agent:*` label, or the `roadmap` label** — acceptance, roadmap placement, and requests for agent work require a human decision
 
 ## Step 4: Create the GitHub Issue
 
@@ -131,7 +133,7 @@ Create the issue with a structured body containing both the stakeholder-readable
 ```bash
 gh issue create \
   --title "<type>: <concise description of the problem/feature>" \
-  --label "<area:component>" --label "state:review-ready" \
+  --label "<area:component>" --label "<state:validated|state:needs-info>" \
   --body "$(cat <<'EOF'
 ## Problem Statement
 
@@ -195,6 +197,12 @@ gh issue create \
 - <design decision that could go either way>
 - ...
 
+## Disposition Readiness
+
+- **State:** `<state:validated|state:needs-info>`
+- **Assessment:** <why the available evidence is or is not sufficient for a human accept/decline decision>
+- **Missing evidence:** <specific evidence still needed, or "None">
+
 ## Test Considerations
 
 - <what testing strategy makes sense for this change>
@@ -203,7 +211,7 @@ gh issue create \
 - <what tests exist for the affected area today, what patterns should be followed, any test infrastructure gaps>
 
 ---
-*Created by spike investigation. Use `build-from-issue` to plan and implement.*
+*Created by spike investigation. `state:validated` means the issue is ready for human disposition; `state:needs-info` means specific evidence is still required. A human applies `state:accepted` if OpenShell should pursue the work and places it on the roadmap separately. To queue unattended agent planning, a human applies `agent:plan-requested`; a direct request to an agent does not require that label.*
 EOF
 )"
 ```
@@ -225,7 +233,13 @@ After creating the issue, report:
 3. Key risks or decisions that need human attention
 4. Next steps:
 
-> Review the issue. Refine the proposed approach if needed, then use `build-from-issue` on the issue to create an implementation plan and build it.
+For `state:validated`:
+
+> Review the issue and decide whether OpenShell should pursue it. If yes, replace `state:validated` with `state:accepted` and separately associate it with a roadmap item. The work may remain human-owned. Apply `agent:plan-requested` to queue planning for an unattended agent, or directly ask an agent to use `build-from-issue`. If no, close it as not planned and record the rationale.
+
+For `state:needs-info`:
+
+> Collect the missing evidence identified in the issue. Leave it off the roadmap. Once the evidence is sufficient, replace `state:needs-info` with `state:validated` for human disposition.
 
 ## Design Principles
 
@@ -238,6 +252,8 @@ After creating the issue, report:
 4. **The issue should save `build-from-issue` work.** When `build-from-issue` runs, it reads the issue body as input context. The technical investigation section should contain enough detail that its `principal-engineer-reviewer` can build on the investigation rather than starting from scratch.
 
 5. **Cross-reference `build-from-issue`.** Mention it as the natural next step in the issue body footer.
+
+6. **Treat validation as an evidence threshold, not an automatic spike outcome.** Apply `state:validated` only when the investigation supports a human accept/decline decision. Otherwise apply `state:needs-info`, state what is missing, and leave the issue off the roadmap.
 
 ## Useful Commands Reference
 
@@ -263,9 +279,9 @@ User says: "Allow sandbox egress to private IP space via networking policy"
    - Reads `architecture/security-policy.md` and `architecture/sandbox.md`
    - Identifies exact insertion points: policy field addition, SSRF check bypass path, OPA rule extension
    - Assesses: Medium complexity, High confidence, ~6 files
-3. Fetch labels — select `area:sandbox`, `area:proxy`, `area:policy`, `state:review-ready`
+3. Fetch labels — select `area:sandbox`, `area:proxy`, `area:policy`, `state:validated`
 4. Create issue: `feat: allow sandbox egress to private IP space via networking policy` — body includes both the summary and full investigation (code references, architecture context, alternative approaches)
-5. Report: "Created issue #59. The investigation found that private IP blocking is enforced at the SSRF check layer in the proxy. The proposed approach adds a policy-level override. Review the issue and use `build-from-issue` when ready."
+5. Report: "Created issue #59. The investigation found that private IP blocking is enforced at the SSRF check layer in the proxy. The proposed approach adds a policy-level override. A human must now accept or decline it and place it on the roadmap if accepted."
 
 ### Bug investigation spike
 
@@ -279,9 +295,9 @@ User says: "The proxy retry logic seems too aggressive — I'm seeing cascading 
    - Maps the failure propagation path
    - Identifies that retries happen without backoff jitter, causing thundering herd
    - Assesses: Low complexity, High confidence, ~2 files
-3. Fetch labels — select `area:proxy`, `state:review-ready`
+3. Fetch labels — select `area:proxy`, `state:validated`
 4. Create issue: `fix: proxy retry logic causes cascading failures under load` — body includes both the summary and full investigation (retry code references, current behavior trace, comparison to standard backoff patterns)
-5. Report: "Created issue #74. The proxy retries without jitter or circuit breaking, which amplifies failures under load. Straightforward fix. Review and use `build-from-issue` when ready."
+5. Report: "Created issue #74. The proxy retries without jitter or circuit breaking, which amplifies failures under load. A human must now accept or decline it and place it on the roadmap if accepted."
 
 ### Performance/refactoring spike
 
@@ -295,6 +311,6 @@ User says: "Policy evaluation is getting slow — can we cache compiled OPA poli
    - Reads the policy reload/hot-swap mechanism
    - Identifies that policies are recompiled on every evaluation
    - Assesses: Medium complexity, Medium confidence (cache invalidation is a design decision), ~4 files
-3. Fetch labels — select `area:policy`, `state:review-ready`
+3. Fetch labels — select `area:policy`, `state:validated`
 4. Create issue: `perf: cache compiled OPA policies to reduce evaluation latency` — body includes both the summary and full investigation (compilation hot path, per-request overhead, cache invalidation strategies with trade-offs)
-5. Report: "Created issue #81. Policies are recompiled per-request with no caching. The main design decision is the cache invalidation strategy — flagged as an open question. Review and use `build-from-issue` when ready."
+5. Report: "Created issue #81. Policies are recompiled per-request with no caching. The main design decision is the cache invalidation strategy. A human must now accept or decline it and place it on the roadmap if accepted."

@@ -33,6 +33,11 @@ data:
     {{- end }}
     log_level             = {{ .Values.server.logLevel | quote }}
     sandbox_namespace     = {{ include "openshell.sandboxNamespace" . | quote }}
+    {{- $policyValidationFailureMode := .Values.server.policyValidationFailureMode }}
+    {{- if not (has $policyValidationFailureMode (list "fail_closed" "retain_last_valid")) }}
+    {{- fail "server.policyValidationFailureMode must be fail_closed or retain_last_valid" }}
+    {{- end }}
+    policy_validation_failure_mode = {{ $policyValidationFailureMode | quote }}
     default_image         = {{ .Values.server.sandboxImage | quote }}
     {{- if include "openshell.supervisorImageOverrideEnabled" . }}
     supervisor_image      = {{ include "openshell.supervisorImage" . | quote }}
@@ -134,6 +139,9 @@ data:
     {{- end }}
     {{- if .Values.server.workspaceDefaultStorageSize }}
     workspace_default_storage_size = {{ .Values.server.workspaceDefaultStorageSize | quote }}
+    {{- end }}
+    {{- if .Values.server.workspaceStorageClass }}
+    workspace_storage_class      = {{ .Values.server.workspaceStorageClass | quote }}
     {{- end }}
     {{- if .Values.server.defaultRuntimeClassName }}
     default_runtime_class_name   = {{ .Values.server.defaultRuntimeClassName | quote }}

@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use openshell_e2e::harness::binary::{openshell_cmd, openshell_tty_cmd};
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
+
+const SANDBOX_PRESENCE_TIMEOUT: Duration = Duration::from_secs(30);
+const SANDBOX_LIST_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 fn normalize_output(output: &str) -> String {
     let stripped = strip_ansi(output).replace('\r', "");
@@ -35,13 +38,20 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
     extract_field(output, "Created sandbox").or_else(|| extract_field(output, "Name"))
 }
 
-async fn sandbox_list_names() -> Vec<String> {
+async fn sandbox_list_names(deadline: Instant) -> Option<Vec<String>> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+
     let mut cmd = openshell_cmd();
     cmd.args(["sandbox", "list", "--names"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn openshell sandbox list");
+    let output = match tokio::time::timeout_at(deadline, cmd.output()).await {
+        Ok(output) => output.expect("spawn openshell sandbox list"),
+        Err(_) => return None,
+    };
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = normalize_output(&format!("{stdout}{stderr}"));
@@ -51,12 +61,40 @@ async fn sandbox_list_names() -> Vec<String> {
         output.status.code()
     );
 
-    combined
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+    Some(
+        combined
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+    )
+}
+
+async fn assert_sandbox_presence_eventually(
+    sandbox_name: &str,
+    should_exist: bool,
+) -> Result<(), Vec<String>> {
+    let deadline = Instant::now() + SANDBOX_PRESENCE_TIMEOUT;
+    let mut last_sandbox_names = Vec::new();
+
+    loop {
+        let Some(sandbox_names) = sandbox_list_names(deadline).await else {
+            return Err(last_sandbox_names);
+        };
+        let exists = sandbox_names.iter().any(|name| name == sandbox_name);
+        if exists == should_exist {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(sandbox_names);
+        }
+
+        last_sandbox_names = sandbox_names;
+        sleep(SANDBOX_LIST_POLL_INTERVAL.min(deadline - now)).await;
+    }
 }
 
 async fn delete_sandbox(name: &str) {
@@ -90,15 +128,15 @@ async fn sandbox_create_keeps_sandbox_after_tty_command_by_default() {
     let sandbox_name =
         extract_sandbox_name(&combined).expect("sandbox name should be present in output");
 
-    for _ in 0..20 {
-        if sandbox_list_names().await.contains(&sandbox_name) {
-            delete_sandbox(&sandbox_name).await;
-            return;
-        }
-        sleep(Duration::from_millis(500)).await;
+    if let Err(last_sandbox_list) = assert_sandbox_presence_eventually(&sandbox_name, true).await {
+        delete_sandbox(&sandbox_name).await;
+        panic!(
+            "sandbox {sandbox_name} should still exist by default after {SANDBOX_PRESENCE_TIMEOUT:?}; \
+             last observed sandbox list: {last_sandbox_list:?}"
+        );
     }
 
-    panic!("sandbox {sandbox_name} should still exist by default");
+    delete_sandbox(&sandbox_name).await;
 }
 
 #[tokio::test]
@@ -124,13 +162,11 @@ async fn sandbox_create_with_no_keep_cleans_up_after_tty_command() {
     let sandbox_name =
         extract_sandbox_name(&combined).expect("sandbox name should be present in output");
 
-    for _ in 0..20 {
-        if !sandbox_list_names().await.contains(&sandbox_name) {
-            return;
-        }
-        sleep(Duration::from_millis(500)).await;
+    if let Err(last_sandbox_list) = assert_sandbox_presence_eventually(&sandbox_name, false).await {
+        delete_sandbox(&sandbox_name).await;
+        panic!(
+            "sandbox {sandbox_name} should have been deleted automatically after \
+             {SANDBOX_PRESENCE_TIMEOUT:?}; last observed sandbox list: {last_sandbox_list:?}"
+        );
     }
-
-    delete_sandbox(&sandbox_name).await;
-    panic!("sandbox {sandbox_name} should have been deleted automatically");
 }

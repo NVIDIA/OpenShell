@@ -364,6 +364,13 @@ message GetSandboxConfigResponse {
   // Operator-registered supervisor middleware services required by the
   // effective policy. Built-in middleware is not included.
   repeated SupervisorMiddlewareService supervisor_middleware_services = 9;
+  // Workspace the sandbox belongs to. Allows the supervisor to learn its
+  // workspace context for subsequent workspace-scoped RPCs.
+  string workspace = 10;
+  // Gateway-configured posture for rejected policy generations. Valid values
+  // are "fail_closed" and "retain_last_valid". Unknown or empty values must
+  // be treated as fail_closed by the supervisor.
+  string policy_validation_failure_mode = 11;
 }
 
 // Connection details for one operator-registered supervisor middleware service.

@@ -8,10 +8,12 @@ use futures::{Stream, stream};
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DriverSandbox, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
-    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
-    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
-    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    DriverSandbox, GatewayListenerRequirement, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
+    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
 };
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -33,6 +35,7 @@ type WatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>
 #[derive(Debug, Clone, PartialEq)]
 pub enum FakeComputeDriverCall {
     GetCapabilities,
+    GetGatewayListenerRequirements,
     ValidateSandboxCreate {
         sandbox: Option<DriverSandbox>,
     },
@@ -65,6 +68,8 @@ struct FakeComputeDriverState {
     driver_name: String,
     driver_version: String,
     default_image: String,
+    gateway_listener_requirements: Vec<GatewayListenerRequirement>,
+    gateway_listener_requirements_supported: bool,
     sandboxes: HashMap<String, DriverSandbox>,
     calls: Vec<FakeComputeDriverCall>,
 }
@@ -83,6 +88,8 @@ impl FakeComputeDriver {
                 driver_name: "fake-compute-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
+                gateway_listener_requirements: Vec::new(),
+                gateway_listener_requirements_supported: true,
                 sandboxes: HashMap::new(),
                 calls: Vec::new(),
             })),
@@ -104,6 +111,29 @@ impl FakeComputeDriver {
     #[must_use]
     pub fn with_default_image(self, default_image: impl Into<String>) -> Self {
         self.with_state(|state| state.default_image = default_image.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_gateway_listener_requirement(
+        self,
+        bind_address: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        self.with_state(|state| {
+            state
+                .gateway_listener_requirements
+                .push(GatewayListenerRequirement {
+                    reason: reason.into(),
+                    selector: Some(Selector::ExactBindAddress(bind_address.into())),
+                });
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn without_gateway_listener_requirements_api(self) -> Self {
+        self.with_state(|state| state.gateway_listener_requirements_supported = false);
         self
     }
 
@@ -192,6 +222,24 @@ impl ComputeDriver for FakeComputeDriver {
             }
         });
         Ok(Response::new(response))
+    }
+
+    async fn get_gateway_listener_requirements(
+        &self,
+        _request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        self.with_state(|state| {
+            state
+                .calls
+                .push(FakeComputeDriverCall::GetGatewayListenerRequirements);
+            state
+                .gateway_listener_requirements_supported
+                .then(|| GetGatewayListenerRequirementsResponse {
+                    requirements: state.gateway_listener_requirements.clone(),
+                })
+                .map(Response::new)
+                .ok_or_else(|| Status::unimplemented("listener requirements unsupported"))
+        })
     }
 
     async fn validate_sandbox_create(

@@ -36,6 +36,43 @@ pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
+/// Gateway posture when a sandbox rejects a candidate policy generation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyValidationFailureMode {
+    /// Deactivate the previous policy and deny new egress until a valid
+    /// generation is loaded.
+    #[default]
+    FailClosed,
+    /// Keep the last valid generation active when a newer candidate fails
+    /// validation. Startup still fails closed when no valid generation exists.
+    RetainLastValid,
+}
+
+impl PolicyValidationFailureMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FailClosed => "fail_closed",
+            Self::RetainLastValid => "retain_last_valid",
+        }
+    }
+}
+
+impl FromStr for PolicyValidationFailureMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "fail_closed" => Ok(Self::FailClosed),
+            "retain_last_valid" => Ok(Self::RetainLastValid),
+            _ => Err(format!(
+                "invalid policy validation failure mode '{value}'; expected fail_closed or retain_last_valid"
+            )),
+        }
+    }
+}
+
 /// Default OCI repository for the supervisor image (no tag).
 pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
 
@@ -171,9 +208,19 @@ pub fn detect_driver() -> Option<ComputeDriverKind> {
 }
 
 fn is_podman_available() -> bool {
-    podman_socket_candidates()
+    detect_podman_socket().is_some()
+}
+
+/// Return the first responsive Podman API socket, or `None` if none respond.
+pub fn detect_podman_socket() -> Option<PathBuf> {
+    detect_podman_socket_from_candidates(&podman_socket_candidates())
+}
+
+fn detect_podman_socket_from_candidates(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
         .iter()
-        .any(|path| podman_socket_responds(path))
+        .find(|path| podman_socket_responds(path))
+        .cloned()
 }
 
 fn podman_socket_candidates() -> Vec<PathBuf> {
@@ -385,6 +432,9 @@ pub struct Config {
 
     /// Log level (trace, debug, info, warn, error).
     pub log_level: String,
+
+    /// Security posture for rejected sandbox policy generations.
+    pub policy_validation_failure_mode: PolicyValidationFailureMode,
 
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
     pub tls: Option<TlsConfig>,
@@ -727,6 +777,7 @@ impl Config {
             health_bind_address: None,
             metrics_bind_address: None,
             log_level: default_log_level(),
+            policy_validation_failure_mode: PolicyValidationFailureMode::default(),
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
@@ -971,7 +1022,8 @@ mod tests {
     use super::{
         ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
         GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
-        GatewayProviderProfileSourceConfig, detect_docker_socket_from_candidates, detect_driver,
+        GatewayProviderProfileSourceConfig, PolicyValidationFailureMode,
+        detect_docker_socket_from_candidates, detect_driver, detect_podman_socket_from_candidates,
         docker_host_unix_socket_path, docker_socket_responds, is_unix_socket,
         normalize_compute_driver_name, podman_socket_candidates_from_env, podman_socket_responds,
     };
@@ -1007,6 +1059,21 @@ mod tests {
     fn compute_driver_kind_rejects_unknown_values() {
         let err = "firecracker".parse::<ComputeDriverKind>().unwrap_err();
         assert!(err.contains("unsupported compute driver 'firecracker'"));
+    }
+
+    #[test]
+    fn policy_validation_failure_mode_is_secure_by_default() {
+        assert_eq!(
+            Config::new(None).policy_validation_failure_mode,
+            PolicyValidationFailureMode::FailClosed
+        );
+        assert_eq!(
+            "retain_last_valid"
+                .parse::<PolicyValidationFailureMode>()
+                .unwrap(),
+            PolicyValidationFailureMode::RetainLastValid
+        );
+        assert!("keep_old".parse::<PolicyValidationFailureMode>().is_err());
     }
 
     #[test]
@@ -1347,6 +1414,34 @@ mod tests {
         assert!(candidates.contains(&PathBuf::from(
             "/tmp/home/.local/share/containers/podman/machine/podman.sock"
         )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn podman_socket_detection_returns_the_responsive_candidate() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let inactive_path = temp_dir.path().join("inactive.sock");
+        let inactive_listener = UnixListener::bind(&inactive_path).expect("bind inactive socket");
+        drop(inactive_listener);
+
+        let responsive_path = temp_dir.path().join("responsive.sock");
+        let listener = UnixListener::bind(&responsive_path).expect("bind responsive socket");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept podman probe");
+            let mut request = [0_u8; 128];
+            let _ = stream.read(&mut request).expect("read podman probe");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nLibpod-Api-Version: 5.8.2\r\nContent-Length: 2\r\n\r\nOK",
+                )
+                .expect("write podman ping response");
+        });
+
+        assert_eq!(
+            detect_podman_socket_from_candidates(&[inactive_path, responsive_path.clone(),]),
+            Some(responsive_path)
+        );
+        handle.join().expect("probe server exits");
     }
 
     #[test]
