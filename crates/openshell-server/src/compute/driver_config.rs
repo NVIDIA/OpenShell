@@ -7,15 +7,12 @@
 //! driver-specific environment overrides, and applying gateway startup defaults.
 //! It does not acquire, connect to, or start compute drivers.
 
+#[cfg(not(target_os = "windows"))]
+pub mod in_process;
+
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;
 use openshell_core::{ComputeDriverKind, Error, Result};
-#[cfg(not(target_os = "windows"))]
-use openshell_driver_docker::DockerComputeConfig;
-#[cfg(not(target_os = "windows"))]
-use openshell_driver_kubernetes::KubernetesComputeConfig;
-#[cfg(not(target_os = "windows"))]
-use openshell_driver_podman::PodmanComputeConfig;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -46,53 +43,6 @@ pub struct DriverStartupContext<'a> {
     pub gateway_port: u16,
     pub gateway_tls_enabled: bool,
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
-}
-
-/// Build the selected Kubernetes config from TOML plus runtime defaults.
-#[cfg(not(target_os = "windows"))]
-pub fn kubernetes_config_from_context(
-    context: DriverStartupContext<'_>,
-) -> Result<KubernetesComputeConfig> {
-    let mut cfg = driver_config_from_context(context, ComputeDriverKind::Kubernetes.as_str())?;
-    apply_kubernetes_runtime_defaults(&mut cfg);
-    Ok(cfg)
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn kubernetes_config_for_k8s_sa_bootstrap(
-    file: Option<&config_file::ConfigFile>,
-) -> Result<KubernetesComputeConfig> {
-    let Some(file) = file else {
-        return Err(Error::config(
-            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
-        ));
-    };
-    if !file.openshell.drivers.contains_key("kubernetes") {
-        return Err(Error::config(
-            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
-        ));
-    }
-    driver_config_from_file(Some(file), ComputeDriverKind::Kubernetes.as_str())
-}
-
-/// Build the selected Podman config from TOML plus runtime defaults.
-#[cfg(not(target_os = "windows"))]
-pub fn podman_config_from_context(
-    context: DriverStartupContext<'_>,
-) -> Result<PodmanComputeConfig> {
-    let mut podman = driver_config_from_context(context, ComputeDriverKind::Podman.as_str())?;
-    apply_podman_runtime_defaults(&mut podman, context);
-    Ok(podman)
-}
-
-/// Build the selected Docker config from TOML plus runtime defaults.
-#[cfg(not(target_os = "windows"))]
-pub fn docker_config_from_context(
-    context: DriverStartupContext<'_>,
-) -> Result<DockerComputeConfig> {
-    let mut cfg = driver_config_from_context(context, ComputeDriverKind::Docker.as_str())?;
-    apply_docker_runtime_defaults(&mut cfg, context);
-    Ok(cfg)
 }
 
 /// Build the selected VM config from TOML plus runtime defaults.
@@ -148,41 +98,6 @@ where
     })
 }
 
-#[cfg(not(target_os = "windows"))]
-fn apply_kubernetes_runtime_defaults(k8s: &mut KubernetesComputeConfig) {
-    if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
-        k8s.workspace_default_storage_size = size;
-    }
-    if let Ok(storage_class) = std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS") {
-        k8s.workspace_storage_class = storage_class;
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn apply_podman_runtime_defaults(
-    podman: &mut PodmanComputeConfig,
-    context: DriverStartupContext<'_>,
-) {
-    podman.gateway_port = context.gateway_port;
-    apply_podman_env_overrides(podman);
-    apply_guest_tls_defaults_to_split_fields(
-        &mut podman.guest_tls_ca,
-        &mut podman.guest_tls_cert,
-        &mut podman.guest_tls_key,
-        context.guest_tls,
-    );
-}
-
-#[cfg(not(target_os = "windows"))]
-fn apply_docker_runtime_defaults(cfg: &mut DockerComputeConfig, context: DriverStartupContext<'_>) {
-    apply_guest_tls_defaults_to_split_fields(
-        &mut cfg.guest_tls_ca,
-        &mut cfg.guest_tls_cert,
-        &mut cfg.guest_tls_key,
-        context.guest_tls,
-    );
-}
-
 fn apply_vm_runtime_defaults(cfg: &mut VmComputeConfig, context: DriverStartupContext<'_>) {
     if cfg.state_dir.as_os_str().is_empty() {
         cfg.state_dir = VmComputeConfig::default_state_dir();
@@ -204,16 +119,6 @@ fn apply_vm_runtime_defaults(cfg: &mut VmComputeConfig, context: DriverStartupCo
         &mut cfg.guest_tls_key,
         context.guest_tls,
     );
-}
-
-#[cfg(not(target_os = "windows"))]
-fn apply_podman_env_overrides(podman: &mut PodmanComputeConfig) {
-    if let Ok(p) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
-        podman.socket_path = Some(PathBuf::from(p));
-    }
-    if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
-        podman.host_gateway_ip = ip;
-    }
 }
 
 fn apply_remote_driver_overrides(
@@ -277,85 +182,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn k8s_sa_bootstrap_rejects_missing_kubernetes_driver_config() {
-        let err = kubernetes_config_for_k8s_sa_bootstrap(None).unwrap_err();
-        assert!(err.to_string().contains("[openshell.drivers.kubernetes]"));
-
-        let file: config_file::ConfigFile =
-            toml::from_str("[openshell.gateway]\n").expect("valid config");
-        let err = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap_err();
-        assert!(err.to_string().contains("[openshell.drivers.kubernetes]"));
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn k8s_sa_bootstrap_uses_configured_namespace_and_service_account() {
-        let file: config_file::ConfigFile = toml::from_str(
-            r#"
-[openshell.gateway]
-
-[openshell.drivers.kubernetes]
-namespace = "sandboxes"
-service_account_name = "sandbox-sa"
-"#,
-        )
-        .expect("valid config");
-
-        let cfg = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap();
-        assert_eq!(cfg.namespace, "sandboxes");
-        assert_eq!(cfg.service_account_name, "sandbox-sa");
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn podman_config_reads_bind_mount_opt_in_from_driver_table() {
-        let file: config_file::ConfigFile = toml::from_str(
-            r"
-[openshell.drivers.podman]
-enable_bind_mounts = true
-",
-        )
-        .expect("valid config");
-
-        let cfg = podman_config_from_context(test_context(Some(&file))).expect("podman config");
-
-        assert!(cfg.enable_bind_mounts);
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn docker_config_reads_bind_mount_opt_in_from_driver_table() {
-        let file: config_file::ConfigFile = toml::from_str(
-            r"
-[openshell.drivers.docker]
-enable_bind_mounts = true
-",
-        )
-        .expect("valid config");
-
-        let cfg = docker_config_from_context(test_context(Some(&file))).expect("docker config");
-
-        assert!(cfg.enable_bind_mounts);
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn docker_config_reads_socket_path_from_driver_table() {
-        let file: config_file::ConfigFile = toml::from_str(
-            r#"
-[openshell.drivers.docker]
-socket_path = "/tmp/docker.sock"
-"#,
-        )
-        .expect("valid config");
-
-        let cfg = docker_config_from_context(test_context(Some(&file))).expect("docker config");
-
-        assert_eq!(cfg.socket_path, Some(PathBuf::from("/tmp/docker.sock")));
-    }
-
-    #[test]
     fn remote_driver_config_reads_socket_path_from_named_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r#"
@@ -413,25 +239,6 @@ socket_path = "/run/openshell/kyma.sock"
         assert!(
             err.to_string()
                 .contains("remote compute driver 'kyma' requires socket_path")
-        );
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn docker_config_reports_selected_invalid_driver_table() {
-        let file: config_file::ConfigFile = toml::from_str(
-            r"
-[openshell.drivers.docker]
-unknown_docker_key = true
-",
-        )
-        .expect("valid config");
-
-        let err = docker_config_from_context(test_context(Some(&file))).unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("invalid [openshell.drivers.docker] table")
         );
     }
 

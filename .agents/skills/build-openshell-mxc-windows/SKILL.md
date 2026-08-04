@@ -69,9 +69,10 @@ Out of scope:
 - Do not enable Docker, Kubernetes, Podman, or VM runtimes on Windows.
 - Do not build, package, ship, or smoke-test standalone Windows binaries for
   unsupported compute drivers.
-- Keep unsupported driver crates out of the Windows gateway dependency graph.
-- Reject unsupported built-in drivers at the gateway orchestration boundary
-  before deserializing driver-specific configuration.
+- Keep unsupported drivers in the Windows build graph only as library/config
+  stubs when needed by the gateway.
+- Unsupported Windows runtime entry points must return a clear unsupported
+  error.
 - Keep Windows-specific code behind `#[cfg(target_os = "windows")]`.
 - Keep Unix/Linux-only code behind `#[cfg(unix)]` or
   `#[cfg(target_os = "linux")]`.
@@ -206,7 +207,7 @@ installer tests and Linux service/RPM packaging-asset tests skip explicitly;
 the Linux build-environment shell-helper test also skips; cross-platform checks
 continue to run. The blocking Windows Clippy pass excludes unsupported
 Windows runtime packages as top-level targets. It allows only unused imports,
-dead code, and unused async functions that result from cfg-gated platform code;
+dead code, and unused async functions that result from cfg-gated Windows stubs;
 other warnings remain errors.
 
 The wrapper limits Cargo to four jobs by default and serializes wrapper-owned
@@ -219,8 +220,8 @@ crypto dependency builds.
 
 | Task | Expected behavior |
 |---|---|
-| `windows:check:x64` | `cargo check --workspace` for `x86_64-pc-windows-msvc`, excluding unsupported Windows packages as top-level workspace targets, then verifies the gateway graph excludes the in-process driver crates. |
-| `windows:check:arm64` | `cargo check --workspace` for `aarch64-pc-windows-msvc`, with the same exclusions and gateway graph assertion. |
+| `windows:check:x64` | `cargo check --workspace` for `x86_64-pc-windows-msvc`, excluding unsupported Windows packages as top-level workspace targets. |
+| `windows:check:arm64` | `cargo check --workspace` for `aarch64-pc-windows-msvc`, with the same top-level exclusions. |
 | `windows:build:x64` | Release-builds `openshell-gateway.exe` and `openshell.exe` for x64. |
 | `windows:build:arm64` | Release-builds `openshell-gateway.exe` and `openshell.exe` for ARM64. |
 | `windows:test:x64` | Runs native x64 workspace tests with `--no-fail-fast`, excluding unsupported Windows packages as top-level workspace targets. |
@@ -231,9 +232,8 @@ crypto dependency builds.
 | `windows:ci` | Runs the full ordered x64-host Windows CI lane, plus ARM64 check/build when not skipped. |
 
 The unsupported driver package excludes are intentional. They prevent standalone
-driver crates from being top-level Windows check/test targets. Target-specific
-gateway dependencies also keep Docker, Kubernetes, and Podman out of the
-Windows dependency graph.
+driver crates from being top-level Windows check/test targets while still
+allowing Windows stubs to compile through gateway dependencies.
 
 ## Unsupported Driver Contract
 
@@ -241,15 +241,16 @@ Windows must continue to reject unsupported compute drivers clearly.
 
 | Driver | Windows build behavior | Runtime behavior |
 |---|---|---|
-| Docker | Driver crate is excluded from the gateway dependency graph. | Gateway driver selection returns unsupported. |
-| Kubernetes | Driver crate is excluded from the gateway dependency graph. | Gateway driver selection returns unsupported. |
-| Podman | Driver crate is excluded from the gateway dependency graph. | Gateway driver selection returns unsupported. |
-| VM | Server-side launcher configuration compiles without the VM driver crate. | Gateway driver selection returns unsupported. |
+| Docker | Config/library stub may compile as a gateway dependency. | Gateway construction returns unsupported. |
+| Kubernetes | Config/library stub may compile as a gateway dependency. | Gateway construction returns unsupported. |
+| Podman | Config/library stub may compile as a gateway dependency. | Gateway construction returns unsupported. |
+| VM | Server-side VM path compiles. | VM spawn returns unsupported. |
 
 The focused contract tasks for either native architecture run:
 
 ```text
-windows_builtin_compute_drivers_report_unsupported
+windows_compute_driver_stubs_report_unsupported
+windows_spawn_reports_unsupported
 ```
 
 These tests are also included in the full x64 workspace test run; the focused
@@ -302,12 +303,12 @@ PowerShell process.
 
 When Windows validation fails:
 
-1. Identify whether the error is from a top-level Windows deliverable, an
-   unsupported crate leaking into the gateway graph, or a Unix-only module.
+1. Identify whether the error is from a top-level Windows deliverable, a
+   gateway dependency stub, or a Unix-only module leaking into the Windows build.
 2. Prefer existing local patterns in the same crate.
 3. Gate Unix imports and modules with `#[cfg(unix)]` or
    `#[cfg(target_os = "linux")]`.
-4. Reject unsupported built-in drivers at the gateway orchestration boundary.
+4. Add or preserve Windows stubs that return unsupported errors.
 5. Keep Linux behavior unchanged.
 6. Run `cargo fmt --all`, `git diff --check`, and the relevant `windows:*`
    tasks after changes.

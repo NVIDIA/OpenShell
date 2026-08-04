@@ -22,11 +22,9 @@ Podman, or VM runtime host.
 
 ## Unsupported Driver Strategy
 
-The gateway rejects unsupported built-in drivers at its orchestration boundary
-on Windows, before deserializing driver-specific configuration. Docker,
-Kubernetes, and Podman are target-specific Cargo dependencies and do not enter
-the Windows gateway build graph. Their raw TOML tables can remain in a shared
-configuration file without requiring Windows copies of the driver schemas.
+Unsupported compute drivers use contract stubs on Windows. The stubs preserve
+configuration structs and public library entry points so the gateway can parse
+existing config files and reject unsupported driver selection with a clear error.
 
 The Windows lane does not build, release, package, or smoke-test standalone
 driver binaries for Docker, Kubernetes, Podman, or VM. Those binaries are Linux
@@ -34,10 +32,10 @@ or macOS deliverables only.
 
 | Driver | Windows build behavior | Runtime behavior |
 |---|---|---|
-| Docker | Driver crate is excluded from the gateway dependency graph. | Gateway driver selection returns unsupported. |
-| Kubernetes | Driver crate is excluded from the gateway dependency graph. | Gateway driver selection returns unsupported. |
-| Podman | Driver crate is excluded from the gateway dependency graph. | Gateway driver selection returns unsupported. |
-| VM | Server-side launcher configuration compiles without the VM driver crate. | Gateway driver selection returns unsupported. |
+| Docker | Library config stub compiles as a gateway dependency. | Gateway construction returns unsupported. |
+| Kubernetes | Library config stub compiles as a gateway dependency. | Gateway construction returns unsupported. |
+| Podman | Library config stub compiles as a gateway dependency. | Gateway construction returns unsupported. |
+| VM | Library config stub compiles as a gateway dependency. | VM spawn returns unsupported. |
 
 This keeps Windows behavior explicit without carrying runtime dependencies or
 creating misleading Windows driver artifacts.
@@ -48,8 +46,8 @@ Windows validation is exposed through `tasks/windows.toml`:
 
 | Task | Purpose |
 |---|---|
-| `windows:check:x64` | Check the x64 MSVC gateway/CLI and assert unsupported driver crates are absent from the gateway dependency graph. |
-| `windows:check:arm64` | Check the ARM64 MSVC gateway/CLI and assert unsupported driver crates are absent from the gateway dependency graph. |
+| `windows:check:x64` | Check the x64 MSVC gateway/CLI build graph. |
+| `windows:check:arm64` | Check the ARM64 MSVC gateway/CLI build graph. |
 | `windows:build:x64` | Build release x64 `openshell-gateway.exe` and `openshell.exe`. |
 | `windows:build:arm64` | Build release ARM64 `openshell-gateway.exe` and `openshell.exe`. |
 | `windows:test:x64` | Run native x64 workspace tests, excluding unsupported Windows packages as top-level test targets. |
@@ -68,7 +66,7 @@ the same wrapper with the host-native MSVC target. The wrapper preserves the
 Unix Cargo commands on Linux and macOS, excludes unsupported Windows runtime
 packages, and runs the server test-support suite separately. Windows Clippy
 continues to deny all warnings except unused imports, dead code, and unused
-async functions caused by cfg-gated platform code. Repository-wide pre-commit
+async functions caused by cfg-gated Windows stubs. Repository-wide pre-commit
 skips only Linux-specific installer, build-environment shell-helper, and
 packaging-asset tests; its
 cross-platform Python, Markdown, license, and documentation checks still run.
