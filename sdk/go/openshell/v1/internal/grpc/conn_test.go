@@ -4,6 +4,7 @@
 package grpc
 
 import (
+	"context"
 	"net"
 	"testing"
 
@@ -49,6 +50,17 @@ func TestNewConnectionNoSchemeUsesTLS(t *testing.T) {
 }
 
 func TestNewConnectionInsecureTLSConfig(t *testing.T) {
+	// Insecure: true means TLS with InsecureSkipVerify, not plaintext.
+	// We can verify the connection is created (handshake will fail since
+	// the server is not TLS, but NewClient itself should succeed).
+	conn, err := NewConnection("127.0.0.1:1", &TLSParams{Insecure: true}, nil)
+	if err != nil {
+		t.Fatalf("NewConnection with Insecure TLS config failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+}
+
+func TestNewConnectionHTTPWithTokenAuth(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -59,9 +71,22 @@ func TestNewConnectionInsecureTLSConfig(t *testing.T) {
 	go func() { _ = srv.Serve(lis) }()
 	defer srv.Stop()
 
-	conn, err := NewConnection(lis.Addr().String(), &TLSParams{Insecure: true}, nil)
+	auth := &testTokenAuth{token: "dev-token"}
+	conn, err := NewConnection("http://"+lis.Addr().String(), nil, auth)
 	if err != nil {
-		t.Fatalf("NewConnection with Insecure TLS config failed: %v", err)
+		t.Fatalf("NewConnection with http:// + token auth failed: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
+}
+
+type testTokenAuth struct {
+	token string
+}
+
+func (a *testTokenAuth) GetRequestMetadata(_ context.Context, _ ...string) (map[string]string, error) {
+	return map[string]string{"authorization": "Bearer " + a.token}, nil
+}
+
+func (a *testTokenAuth) RequireTransportSecurity() bool {
+	return true
 }

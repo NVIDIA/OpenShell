@@ -5,6 +5,7 @@
 package grpc
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -38,9 +39,7 @@ func NewConnection(address string, tlsCfg *TLSParams, auth credentials.PerRPCCre
 	}
 	opts := []grpc.DialOption{}
 
-	if tlsCfg != nil && tlsCfg.Insecure {
-		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	} else if usePlaintext {
+	if usePlaintext {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else if tlsCfg != nil {
 		creds, err := buildTLSCredentials(tlsCfg)
@@ -53,6 +52,9 @@ func NewConnection(address string, tlsCfg *TLSParams, auth credentials.PerRPCCre
 	}
 
 	if auth != nil {
+		if usePlaintext {
+			auth = &insecureAuthWrapper{base: auth}
+		}
 		opts = append(opts, grpc.WithPerRPCCredentials(auth))
 	}
 
@@ -64,7 +66,10 @@ func NewConnection(address string, tlsCfg *TLSParams, auth credentials.PerRPCCre
 }
 
 func buildTLSCredentials(cfg *TLSParams) (credentials.TransportCredentials, error) {
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	tlsConfig := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: cfg.Insecure, //nolint:gosec // user-requested skip for dev gateways
+	}
 
 	if cfg.CAFile != "" {
 		caCert, err := os.ReadFile(cfg.CAFile)
@@ -89,4 +94,16 @@ func buildTLSCredentials(cfg *TLSParams) (credentials.TransportCredentials, erro
 	}
 
 	return credentials.NewTLS(tlsConfig), nil
+}
+
+type insecureAuthWrapper struct {
+	base credentials.PerRPCCredentials
+}
+
+func (w *insecureAuthWrapper) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	return w.base.GetRequestMetadata(ctx, uri...)
+}
+
+func (w *insecureAuthWrapper) RequireTransportSecurity() bool {
+	return false
 }

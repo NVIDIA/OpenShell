@@ -42,6 +42,9 @@ type TLSConfig struct {
 	CertFile string
 	KeyFile  string
 	CAFile   string
+	// Insecure disables TLS certificate verification (development only).
+	// The connection still uses TLS; only the server certificate check is
+	// skipped. For plaintext (no TLS), use an http:// scheme in the address.
 	Insecure bool
 }
 
