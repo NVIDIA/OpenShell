@@ -49,6 +49,33 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+CNI DaemonSet selector labels. The CNI installer runs a distinct
+`app.kubernetes.io/name` (`<name>-cni`) so it does NOT share the gateway's base
+selector labels. This lets the gateway Service and workload selectors stay
+base-only (name + instance) without also matching CNI pods — which in turn
+avoids requiring an immutable-selector or component-label change on existing
+gateway releases during upgrade.
+*/}}
+{{- define "openshell.cniSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "openshell.name" . }}-cni
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Full label set for the CNI DaemonSet and its pods, mirroring openshell.labels
+but keyed on the distinct CNI selector labels.
+*/}}
+{{- define "openshell.cniLabels" -}}
+helm.sh/chart: {{ include "openshell.chart" . }}
+{{ include "openshell.cniSelectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/component: cni
+{{- end }}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "openshell.serviceAccountName" -}}

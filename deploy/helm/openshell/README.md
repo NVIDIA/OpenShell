@@ -155,8 +155,8 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | cni.configFile | string | `""` | Host CNI conflist filename patched by the installer. Empty selects the first non-OpenShell .conflist. |
 | cni.enabled | bool | `false` | Install the OpenShell chained CNI plugin with a privileged node DaemonSet. Required when supervisor.topology is "cni-sidecar". |
 | cni.image.pullPolicy | string | `""` | CNI installer image pull policy. Empty uses supervisor.image.pullPolicy, then image.pullPolicy. |
-| cni.image.repository | string | `""` | CNI installer image repository. Empty uses supervisor.image.repository. |
-| cni.image.tag | string | `""` | CNI installer image tag. Empty uses supervisor.image.tag, then chart appVersion. |
+| cni.image.repository | string | `""` | CNI installer image repository. Empty falls back to supervisor.image.repository, then the official supervisor repository. |
+| cni.image.tag | string | `""` | CNI installer image tag. Empty falls back to supervisor.image.tag, then image.tag, then chart appVersion. |
 | cni.logFile | string | `"/var/log/openshell-cni.log"` | Host log file written by the OpenShell CNI plugin and tailed by the installer DaemonSet. |
 | cni.logLevel | string | `"info"` | Log level passed to the OpenShell CNI plugin. |
 | cni.mode | string | `"conflist"` | CNI installer strategy. "conflist" appends the OpenShell plugin to an existing CNI .conflist (k3s / vanilla). "multus-chain" writes a standalone plugin .conf into a Multus vendor-cni-chain subdirectory (OpenShift), which never modifies a CNO-managed file. |

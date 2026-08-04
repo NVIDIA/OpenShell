@@ -75,11 +75,11 @@ cni:
   # never modifies a CNO-managed file.
   mode: conflist
   image:
-    # -- CNI installer image repository. Empty uses supervisor.image.repository.
+    # -- CNI installer image repository. Empty falls back to supervisor.image.repository, then the official supervisor repository.
     repository: ""
     # -- CNI installer image pull policy. Empty uses supervisor.image.pullPolicy, then image.pullPolicy.
     pullPolicy: ""
-    # -- CNI installer image tag. Empty uses supervisor.image.tag, then chart appVersion.
+    # -- CNI installer image tag. Empty falls back to supervisor.image.tag, then image.tag, then chart appVersion.
     tag: ""
   # -- Host CNI binary directory.
   binDir: /opt/cni/bin
