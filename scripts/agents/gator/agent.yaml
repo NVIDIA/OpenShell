@@ -17,7 +17,7 @@ harness:
   supported:
     codex:
       model: gpt-5.5
-      reasoning: high
+      reasoning: medium
 
 runtime:
   mode: watch
