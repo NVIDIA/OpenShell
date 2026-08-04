@@ -24,7 +24,7 @@ FROM registry.access.redhat.com/ubi9/ubi:9.6@sha256:dec374e05cc13ebbc0975c9f521f
 
 ARG MUSL_VERSION
 
-RUN dnf install -y --nodocs gcc make tar gzip \
+RUN dnf install -y --nodocs --setopt=install_weak_deps=0 gcc make tar gzip \
     && dnf clean all
 
 WORKDIR /tmp/musl-build
@@ -42,7 +42,7 @@ FROM registry.access.redhat.com/ubi9/ubi:9.6@sha256:dec374e05cc13ebbc0975c9f521f
 ARG RUST_VERSION
 ARG TARGETARCH
 
-RUN dnf install -y --nodocs \
+RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
         gcc gcc-c++ make cmake \
         openssl-devel git-core xz \
     && dnf clean all
@@ -95,7 +95,7 @@ FROM registry.access.redhat.com/ubi9/ubi-minimal:9.6@sha256:34880b64c07f28f64d95
 
 ARG TARGETARCH
 
-RUN microdnf install -y --nodocs \
+RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 \
         nftables \
         iptables-nft \
         iproute \
