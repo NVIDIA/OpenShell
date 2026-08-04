@@ -8,6 +8,8 @@
 //! in later implementation slices.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+#[cfg(unix)]
+use std::future::Future;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Stdio;
@@ -24,9 +26,9 @@ use async_trait::async_trait;
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
 use openshell_core::proto::credentials::v1::{
-    DeleteCredentialRequest, GetCredentialDriverCapabilitiesRequest, ResolveCredentialRequest,
-    ResolveCredentialsRequest, ResolvedCredential, StoreCredentialRequest,
-    credential_driver_client::CredentialDriverClient,
+    DeleteCredentialRequest, GetCredentialDriverCapabilitiesRequest,
+    GetCredentialDriverCapabilitiesResponse, ResolveCredentialRequest, ResolveCredentialsRequest,
+    ResolvedCredential, StoreCredentialRequest, credential_driver_client::CredentialDriverClient,
 };
 use openshell_core::proto::{CredentialHandle, Provider};
 use openshell_core::{Config, Error, Result as CoreResult};
@@ -1423,15 +1425,34 @@ async fn connect_ready_credential_driver(
     let channel = connect_credential_driver_socket(driver_name, socket_path).await?;
     let mut client = CredentialDriverClient::new(channel.clone());
     let mut request = Request::new(GetCredentialDriverCapabilitiesRequest {});
-    request.set_timeout(Duration::from_secs(
-        DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS,
-    ));
-    client.get_capabilities(request).await.map_err(|status| {
-        Error::config(format!(
-            "credential driver '{driver_name}' GetCapabilities failed: {status}"
-        ))
-    })?;
+    let timeout = Duration::from_secs(DEFAULT_CREDENTIAL_DRIVER_RPC_TIMEOUT_SECS);
+    request.set_timeout(timeout);
+    await_credential_driver_capabilities(driver_name, timeout, client.get_capabilities(request))
+        .await?;
     Ok(channel)
+}
+
+#[cfg(unix)]
+async fn await_credential_driver_capabilities(
+    driver_name: &str,
+    timeout: Duration,
+    response: impl Future<
+        Output = Result<tonic::Response<GetCredentialDriverCapabilitiesResponse>, Status>,
+    >,
+) -> CoreResult<()> {
+    tokio::time::timeout(timeout, response)
+        .await
+        .map_err(|_| {
+            Error::config(format!(
+                "credential driver '{driver_name}' GetCapabilities timed out"
+            ))
+        })?
+        .map_err(|status| {
+            Error::config(format!(
+                "credential driver '{driver_name}' GetCapabilities failed: {status}"
+            ))
+        })?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2082,6 +2103,24 @@ socket_path = "/tmp/openshell-enterprise-secrets.sock"
             parsed.startup_timeout_secs,
             DEFAULT_CREDENTIAL_DRIVER_STARTUP_TIMEOUT_SECS
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_capabilities_has_a_local_timeout() {
+        let response = std::future::pending::<
+            Result<tonic::Response<GetCredentialDriverCapabilitiesResponse>, Status>,
+        >();
+
+        let err = await_credential_driver_capabilities(
+            "enterprise-secrets",
+            Duration::from_millis(10),
+            response,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("GetCapabilities timed out"));
     }
 
     #[test]
