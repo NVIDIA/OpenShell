@@ -166,26 +166,18 @@ spec:
                   'any((.plugins // [])[]; .type == "openshell-cni" and .openshell.owner == $o and .openshell.configVersion == $v)' \
                   "${_t}" >/dev/null 2>&1
               }
-              # True when the target carries an openshell-cni plugin with a
-              # non-OpenShell owner. The installer is a cluster singleton owned by
-              # "openshell"; refuse to overwrite an entry owned by anything else
-              # (fail closed rather than clobber a foreign plugin of the same type).
-              conflist_foreign() {
-                _t="$1"
-                [ -n "${_t}" ] && [ -f "${_t}" ] && jq -e --arg o "${owner}" \
-                  'any((.plugins // [])[]; .type == "openshell-cni" and (.openshell.owner // "") != $o)' \
-                  "${_t}" >/dev/null 2>&1
-              }
               patch_conflist() {
                 target="$(resolve_conflist_target)"
                 if [ -z "${target}" ] || [ ! -f "${target}" ]; then
                   echo "OpenShell CNI requires an existing CNI .conflist in ${conf_dir}" >&2
                   return 1
                 fi
-                if conflist_foreign "${target}"; then
-                  echo "OpenShell CNI refuses to overwrite a chained plugin with a non-OpenShell owner in ${target}" >&2
-                  return 1
-                fi
+                # The patch below preserves every non-openshell-cni plugin and
+                # replaces only the openshell-cni entry, so it never clobbers a
+                # foreign plugin. The plugin type is itself the ownership signal
+                # (the cluster singleton always writes owner "openshell"), so any
+                # existing openshell-cni entry — including one from an older owner
+                # format — is ours to upgrade in place.
                 if [ ! -f "${target}.openshell-backup" ]; then
                   cp "${target}" "${target}.openshell-backup"
                 fi
@@ -230,17 +222,11 @@ spec:
                   and (.openshell.kubeconfig // "") != ""
                 ' "${chain_conf}" >/dev/null 2>&1
               }
-              # True when a chain conf with a non-OpenShell owner is present.
-              chain_conf_foreign() {
-                [ -f "${chain_conf}" ] && jq -e --arg o "${owner}" \
-                  '.type == "openshell-cni" and (.openshell.owner // "") != $o' \
-                  "${chain_conf}" >/dev/null 2>&1
-              }
               write_chain_conf() {
-                if chain_conf_foreign; then
-                  echo "OpenShell CNI refuses to overwrite ${chain_conf}: it carries a non-OpenShell owner" >&2
-                  return 1
-                fi
+                # openshell-cni.conf is an OpenShell-owned file (fixed name, our
+                # plugin type); the cluster singleton always writes owner
+                # "openshell", so overwriting an existing one — including from an
+                # older owner format — is an in-place upgrade, not a clobber.
                 _tmp="$(mktemp "${chain_dir}/openshell-cni.XXXXXX")"
                 # Same fail-closed contract as patch_conflist: never install a
                 # truncated chain config if jq fails.
