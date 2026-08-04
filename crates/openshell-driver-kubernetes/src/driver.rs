@@ -3177,18 +3177,20 @@ fn apply_workspace_persistence(
         // Callers pass the sandbox UID in that mode (non-exempt, still able to
         // seed the PVC via fsGroup) and 0 otherwise (where UID 0 is not exempt).
         //
-        // Harden the securityContext regardless: dropping all capabilities and
-        // disabling privilege escalation stops a setuid binary in the untrusted
-        // image from regaining the exempt UID 0 and bypassing egress. When the
-        // container runs non-root, also assert runAsNonRoot so the kubelet
-        // refuses an image that would otherwise force UID 0.
-        let mut security_context = serde_json::json!({
-            "runAsUser": workspace_init_uid,
-            "allowPrivilegeEscalation": false,
-            "capabilities": { "drop": ["ALL"] },
-        });
+        // Hardening applies only when the init runs as the non-root exempt UID
+        // (the Sidecar/CniSidecar binary-aware case). There, dropping all
+        // capabilities and disabling privilege escalation stops a setuid binary
+        // in the untrusted image from regaining the exempt UID 0 and bypassing
+        // egress, and runAsNonRoot makes the kubelet refuse an image that would
+        // force UID 0. When the init runs as root (combined topology, where UID 0
+        // is not exempt), keep the default root capabilities so it retains the
+        // broad DAC read access needed to seed the PVC from image files owned by
+        // other UIDs with restrictive modes.
+        let mut security_context = serde_json::json!({ "runAsUser": workspace_init_uid });
         if workspace_init_uid != 0 {
+            security_context["allowPrivilegeEscalation"] = serde_json::json!(false);
             security_context["runAsNonRoot"] = serde_json::json!(true);
+            security_context["capabilities"] = serde_json::json!({ "drop": ["ALL"] });
         }
         let mut init_spec = serde_json::json!({
             "name": WORKSPACE_INIT_CONTAINER_NAME,
@@ -6611,12 +6613,11 @@ mod tests {
             serde_json::json!(0),
             "combined topology keeps root workspace-init even with binary-aware policy"
         );
-        // Hardening still applies, but runAsNonRoot must not be asserted for root.
-        assert_eq!(
-            init["securityContext"]["allowPrivilegeEscalation"],
-            serde_json::json!(false)
-        );
+        // Root init keeps default capabilities (UID 0 is not CNI-exempt here) so
+        // it retains broad DAC read access; the setuid-hardening must NOT apply.
+        assert!(init["securityContext"]["allowPrivilegeEscalation"].is_null());
         assert!(init["securityContext"]["runAsNonRoot"].is_null());
+        assert!(init["securityContext"]["capabilities"].is_null());
     }
 
     /// Companion: without binary-aware policy, UID 0 is not exempt, so the init

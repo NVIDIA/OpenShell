@@ -41,9 +41,13 @@ tests:
           content:
             name: cni-log
             mountPath: /host/var/log
+      # Cluster singleton: annotation-driven, empty namespace allowlist.
       - matchRegex:
           path: spec.template.spec.containers[0].command[2]
-          pattern: '"sandboxNamespaces": \["NAMESPACE"\]'
+          pattern: '"sandboxNamespaces": \[\]'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'owner="openshell"'
       - matchRegex:
           path: spec.template.spec.containers[0].command[2]
           pattern: '"logFile": "\$\{log_file\}"'
@@ -105,23 +109,44 @@ tests:
           path: spec.template.spec.containers[0].command[2]
           pattern: 'refuses to overwrite'
 
-  - it: scopes cni annotation lookup to explicit sandbox namespace
+  - it: binds readiness to a config version
     template: templates/cni-daemonset.yaml
     set:
       cni.enabled: true
-      server.sandboxNamespace: agents
     asserts:
       - matchRegex:
           path: spec.template.spec.containers[0].command[2]
-          pattern: '"sandboxNamespaces": \["agents"\]'
+          pattern: 'config_version='
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: '"configVersion": "'
 
-  - it: fails cni-sidecar topology when cni installer is disabled
+  - it: creates the host token atomically at mode 0600
+    template: templates/cni-daemonset.yaml
+    set:
+      cni.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'install -m 0600 /var/run/secrets/kubernetes.io/serviceaccount/token'
+
+  - it: fails cni-sidecar topology when no CNI installer is available
     template: templates/cni-daemonset.yaml
     set:
       supervisor.topology: cni-sidecar
     asserts:
       - failedTemplate:
-          errorMessage: supervisor.topology=cni-sidecar requires cni.enabled=true so the OpenShell chained CNI plugin is installed on every node
+          errorMessage: "supervisor.topology=cni-sidecar requires the OpenShell CNI installer: set cni.enabled=true to install the cluster singleton here, or cni.external=true if it is installed by another release"
+
+  - it: allows cni-sidecar with an external singleton and renders no installer
+    template: templates/cni-daemonset.yaml
+    set:
+      supervisor.topology: cni-sidecar
+      cni.enabled: false
+      cni.external: true
+    asserts:
+      - hasDocuments:
+          count: 0
 
   - it: renders multus-chain conf and state volumes when mode is multus-chain
     template: templates/cni-daemonset.yaml

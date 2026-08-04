@@ -135,6 +135,63 @@ openshell gateway add https://<external-hostname> \
 openshell gateway login openshift
 ```
 
+## Enable the cni-sidecar topology
+
+The `cni-sidecar` topology moves pod-network egress enforcement out of the
+sandbox pod and onto a node-level CNI plugin, removing the per-pod privileged
+network-init container. See [Supervisor Topology](/kubernetes/topology) for the
+model. On OpenShift it uses Multus `multus-chain` mode plus purpose-built SCCs.
+
+The CNI installer is a **cluster singleton**: one installation enforces every
+OpenShell release's sandbox pods across all namespaces. Enable it in exactly one
+release per cluster.
+
+<Steps>
+
+### Install with the cni-sidecar example values
+
+```shell
+helm install openshell deploy/helm/openshell \
+  --namespace openshell \
+  -f deploy/helm/openshell/examples/cni-sidecar-openshift.yaml
+```
+
+The example sets `cni.mode: multus-chain`, the OpenShift CNI paths, and the two
+SCC grants (`cni.openshift.privilegedSCC`, `sandboxServiceAccount.openshift.binaryAwareSCC`).
+It requires a Multus thick daemon with `auxiliaryCNIChainName` configured
+(default on OpenShift 4.x).
+
+### Verify the CNI installer is Ready on every node
+
+```shell
+oc -n openshell rollout status daemonset/openshell-cni
+oc get nodes -L openshell.ai/cni-ready
+```
+
+Every schedulable node should show `cni-ready=true`. Sandbox pods carry a
+required `nodeAffinity` on this label, so they will not schedule onto a node
+before its egress enforcement is active.
+
+### Create a sandbox and confirm enforcement
+
+```shell
+openshell sandbox create --name probe -- sleep infinity
+# The pod reaches 2/2 (agent + network sidecar) only on a cni-ready node:
+oc get pod default--probe -n openshell
+# Default-deny egress: a disallowed destination is blocked.
+oc exec default--probe -n openshell -c agent -- \
+  sh -c 'curl -sS -m 10 https://example.com; echo "exit=$?"'
+```
+
+A blocked request (connection/resolution failure) confirms the sandbox's egress
+is routed through the OpenShell network sidecar and enforced by policy.
+
+</Steps>
+
+To run **additional** gateway releases on the same cluster, do not install a
+second CNI. Use `-f deploy/helm/openshell/examples/cni-sidecar-openshift-extra-release.yaml`
+(`cni.enabled=false`, `cni.external=true`), which reuses the cluster singleton.
+
 ## Next Steps
 
 - For more on certificate provisioning modes, refer to [Managing Certificates](/kubernetes/managing-certificates).
