@@ -118,6 +118,11 @@ checksum = "sha256:ded590cae2c72042c61178632906bef62d635fa20d45f8b22110a2241f430
 url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-aarch64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060416"
 
+[tools."github:mozilla/sccache"."platforms.windows-x64"]
+checksum = "sha256:b8514ed7552e148b0a032114f745118dcb801791adafafeaf9935e4bfb0edf1b"
+url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060720"
+
 [[tools."github:rust-cross/cargo-zigbuild"]]
 version = "0.22.3"
 backend = "github:rust-cross/cargo-zigbuild"
