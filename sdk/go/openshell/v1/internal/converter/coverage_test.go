@@ -12,18 +12,13 @@ import (
 )
 
 // These tests use protobuf reflection to detect proto fields that the
-// converter layer does not handle.  When buf generates new fields from an
+// converter layer does not handle. When buf generates new fields from an
 // updated .proto, the field name appears in the proto descriptor but not in
 // the "handled" set below.
 //
-// Unhandled fields are reported via t.Log (non-breaking) so that proto
-// contributors are not forced to fix SDK converters in the same PR.
-// A separate CI workflow (planned) will create a GitHub issue when
-// converter drift lands on main.
-//
-// This closes the silent-drift gap described in the PR #2271 review: Go
-// compiles happily when a converter ignores a new proto field, so without
-// this detection the SDK quietly loses the ability to express that field.
+// Unhandled fields FAIL the test so that proto drift is caught immediately.
+// If a field is intentionally deferred, add it to the "skipped" set with a
+// justification comment.
 
 func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 	handled := fieldSet{
@@ -91,22 +86,88 @@ func TestConverterCoversAllProtoFields_SandboxPolicy(t *testing.T) {
 
 	skipped := fieldSet{
 		// Middleware support is not yet exposed in the SDK domain model.
-		// Tracked for a later PR in the Go SDK series.
+		// Tracked in GitHub issue #36 for Drop D.
 		"network_middlewares": true,
 	}
 
 	assertAllFieldsCovered(t, (&sandboxpb.SandboxPolicy{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
+func TestConverterCoversAllProtoFields_NetworkEndpoint(t *testing.T) {
+	handled := fieldSet{
+		"host":                           true,
+		"port":                           true,
+		"ports":                          true,
+		"protocol":                       true,
+		"tls":                            true,
+		"enforcement":                    true,
+		"access":                         true,
+		"rules":                          true,
+		"allowed_ips":                    true,
+		"deny_rules":                    true,
+		"allow_encoded_slash":            true,
+		"persisted_queries":              true,
+		"graphql_persisted_queries":      true,
+		"graphql_max_body_bytes":         true,
+		"path":                           true,
+		"websocket_credential_rewrite":   true,
+		"request_body_credential_rewrite": true,
+		"advisor_proposed":               true,
+		"credential_signing":             true,
+		"signing_service":                true,
+		"signing_region":                 true,
+		"json_rpc_max_body_bytes":        true,
+		"mcp":                            true,
+	}
+
+	assertAllFieldsCovered(t, (&sandboxpb.NetworkEndpoint{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_L7Allow(t *testing.T) {
+	handled := fieldSet{
+		"method":         true,
+		"path":           true,
+		"command":        true,
+		"query":          true,
+		"operation_type": true,
+		"operation_name": true,
+		"fields":         true,
+		"params":         true,
+	}
+
+	assertAllFieldsCovered(t, (&sandboxpb.L7Allow{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_L7DenyRule(t *testing.T) {
+	handled := fieldSet{
+		"method":         true,
+		"path":           true,
+		"command":        true,
+		"query":          true,
+		"operation_type": true,
+		"operation_name": true,
+		"fields":         true,
+		"params":         true,
+	}
+
+	assertAllFieldsCovered(t, (&sandboxpb.L7DenyRule{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_McpOptions(t *testing.T) {
+	handled := fieldSet{
+		"strict_tool_names":          true,
+		"allow_all_known_mcp_methods": true,
+	}
+
+	assertAllFieldsCovered(t, (&sandboxpb.McpOptions{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
 // fieldSet tracks proto field names that the converter handles.
 type fieldSet map[string]bool
 
-// assertAllFieldsCovered logs warnings for proto fields not present in
-// either handled or skipped.  It does not fail the test so that proto
-// changes can merge without simultaneously fixing SDK converters.
-// Stale entries in the handled set (fields removed from the proto) DO
-// fail, since they indicate the converter references something that no
-// longer exists.
+// assertAllFieldsCovered fails the test for proto fields not present in
+// either handled or skipped. Stale entries in the handled set (fields
+// removed from the proto) also fail.
 func assertAllFieldsCovered(
 	t *testing.T,
 	desc protoreflect.MessageDescriptor,
@@ -121,8 +182,8 @@ func assertAllFieldsCovered(
 		if handled[name] || skipped[name] {
 			continue
 		}
-		t.Logf(
-			"WARNING: proto %s field %q is not handled by the converter and not explicitly skipped. "+
+		t.Errorf(
+			"proto %s field %q is not handled by the converter and not explicitly skipped. "+
 				"Add converter support in the appropriate FromProto/ToProto function, "+
 				"or add it to the skipped set with a justification.",
 			desc.FullName(), name,
