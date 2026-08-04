@@ -409,10 +409,9 @@ network setup, inspect the DaemonSet logs, the host CNI config, and whether the
 cluster actually invokes chained CNI plugins for the sandbox runtime class.
 
 The CNI installer is a **cluster singleton** with a fixed identity
-(`openshell-cni`): one installation serves every OpenShell release across all
-namespaces. It is not necessarily in the release you are debugging — the owner is
-the release with `cni.enabled=true`; other gateway releases set `cni.external=true`
-and reuse it. Locate the owner and its resources cluster-wide:
+(`openshell-cni`). It is not necessarily in the release you are debugging — the
+owner is the release with `cni.enabled=true`; other gateway releases set
+`cni.external=true` and reuse it. Locate the owner and its resources cluster-wide:
 
 ```bash
 kubectl get daemonset -A -l app.kubernetes.io/name=openshell-cni
@@ -422,6 +421,28 @@ kubectl get clusterrole,clusterrolebinding openshell-cni
 A gateway release using `cni-sidecar` with neither `cni.enabled` nor
 `cni.external` fails to render (template error), so if the gateway installed but
 sandboxes are unenforced, confirm the singleton exists and is Ready.
+
+**Namespace allowlist (silent unenforced sandboxes).** The plugin only inspects
+pods whose namespace is in its `sandboxNamespaces` allowlist
+(`cni.sandboxNamespaces`, default the owner's sandbox namespace); pods elsewhere
+are passed through unenforced. If a sandbox reaches 2/2 but its egress is NOT
+blocked, confirm its namespace is in the installed allowlist — a common cause is
+an additional `cni.external=true` release whose namespace was never added to the
+owner's list:
+
+```bash
+# On a CNI installer pod, read the installed plugin config's sandboxNamespaces:
+kubectl -n <owner-ns> exec ds/openshell-cni -c install-cni -- \
+  sh -c 'cat /host/run/multus/cni/net.d/vendor-cni-chain/openshell-cni.conf 2>/dev/null \
+         || cat /host/etc/cni/net.d/*.conflist'
+```
+
+**Node reboot / boot taint.** In `multus-chain` mode the chain file lives under
+`/run` (tmpfs) and is wiped on reboot while the `cni-ready` label persists.
+Clusters that apply the optional boot-time taint (`openshell.ai/cni-not-ready`,
+see `deploy/helm/openshell/examples/`) will show it on a node until the installer
+removes it; a node stuck with the taint means the installer has not reached ready
+there. Check with `kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints`.
 
 A per-node scheduling gate can also keep cni-sidecar sandbox pods `Pending`. The
 CNI DaemonSet labels each node `openshell.ai/cni-ready=true` after installing the

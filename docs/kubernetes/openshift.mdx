@@ -141,8 +141,24 @@ is routed through the OpenShell network sidecar and enforced by policy.
 </Steps>
 
 To run **additional** gateway releases on the same cluster, do not install a
-second CNI. Use `-f deploy/helm/openshell/examples/cni-sidecar-openshift-extra-release.yaml`
-(`cni.enabled=false`, `cni.external=true`), which reuses the cluster singleton.
+second CNI — reuse the singleton with `cni.enabled=false`, `cni.external=true`
+(`-f deploy/helm/openshell/examples/cni-sidecar-openshift-extra-release.yaml`).
+
+<Warning>
+The singleton only enforces pods in namespaces listed in its
+`cni.sandboxNamespaces` allowlist (default: the owner release's sandbox
+namespace); pods elsewhere are passed through **unenforced**. Before enabling an
+additional release you **must** add its sandbox namespace to the singleton
+owner's allowlist and let every node re-reconcile:
+
+```shell
+helm upgrade <owner-release> deploy/helm/openshell -n <owner-ns> \
+  --reuse-values --set 'cni.sandboxNamespaces={openshell,team-b}'
+```
+
+Only then install the additional gateway. Skipping this step silently leaves the
+new release's sandboxes without egress enforcement.
+</Warning>
 
 <Warning>
 On node reboot the Multus chain file (under `/run`, tmpfs) is wiped while the
