@@ -505,7 +505,7 @@ async fn connect_container_api(driver: &str) -> Result<Docker, String> {
         "docker" => Docker::connect_with_local_defaults()
             .map_err(|err| format!("connect to Docker API: {err}"))?,
         "podman" => {
-            let socket = podman_socket_path();
+            let socket = podman_socket_path()?;
             let socket_display = socket.display().to_string();
             Docker::connect_with_unix(
                 socket
@@ -525,36 +525,10 @@ async fn connect_container_api(driver: &str) -> Result<Docker, String> {
     Ok(docker)
 }
 
-fn podman_socket_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("OPENSHELL_PODMAN_SOCKET") {
-        return PathBuf::from(path);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var_os("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".local/share/containers/podman/machine/podman.sock")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
-            || {
-                let uid = std::process::Command::new("id")
-                    .arg("-u")
-                    .output()
-                    .ok()
-                    .and_then(|output| {
-                        String::from_utf8(output.stdout)
-                            .ok()
-                            .map(|value| value.trim().to_string())
-                    })
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "1000".to_string());
-                PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
-            },
-            |xdg| PathBuf::from(xdg).join("podman/podman.sock"),
-        )
-    }
+fn podman_socket_path() -> Result<PathBuf, String> {
+    let path = std::env::var_os("OPENSHELL_PODMAN_SOCKET")
+        .ok_or_else(|| "OPENSHELL_PODMAN_SOCKET must be set by e2e/with-podman-gateway.sh".to_string())?;
+    Ok(PathBuf::from(path))
 }
 
 fn unique_volume_name(driver: &str) -> String {
