@@ -408,6 +408,21 @@ sandbox pod should carry `openshell.ai/cni=enabled`,
 network setup, inspect the DaemonSet logs, the host CNI config, and whether the
 cluster actually invokes chained CNI plugins for the sandbox runtime class.
 
+The CNI installer is a **cluster singleton** with a fixed identity
+(`openshell-cni`): one installation serves every OpenShell release across all
+namespaces. It is not necessarily in the release you are debugging — the owner is
+the release with `cni.enabled=true`; other gateway releases set `cni.external=true`
+and reuse it. Locate the owner and its resources cluster-wide:
+
+```bash
+kubectl get daemonset -A -l app.kubernetes.io/name=openshell-cni
+kubectl get clusterrole,clusterrolebinding openshell-cni
+```
+
+A gateway release using `cni-sidecar` with neither `cni.enabled` nor
+`cni.external` fails to render (template error), so if the gateway installed but
+sandboxes are unenforced, confirm the singleton exists and is Ready.
+
 A per-node scheduling gate can also keep cni-sidecar sandbox pods `Pending`. The
 CNI DaemonSet labels each node `openshell.ai/cni-ready=true` after installing the
 plugin, and the gateway sets a required `nodeAffinity` on that label. If a

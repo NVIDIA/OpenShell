@@ -164,6 +164,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | cni.nodeSelector | object | `{}` |  |
 | cni.openshift.privilegedSCC | bool | `false` | Grant the privileged SecurityContextConstraints to the CNI ServiceAccount. Required on OpenShift for the privileged installer DaemonSet. Creates a ClusterRole + ClusterRoleBinding. |
 | cni.resources | object | `{}` |  |
+| cni.sandboxNamespaces | list | `[]` | Namespaces whose pods the plugin inspects at CNI ADD. Pods in other namespaces are passed through WITHOUT a Kubernetes API lookup, so an API/RBAC problem cannot block unrelated workloads. Empty defaults to the release's sandbox namespace. A cluster running multiple OpenShell releases must list EVERY sandbox namespace here on the singleton (a pod in an unlisted namespace is not enforced). |
 | cni.stateDir | string | `""` | Persistent host directory for plugin credentials (kubeconfig, token, ca.crt) in "multus-chain" mode. Empty falls back to confDir. Must not be a tmpfs path such as one under /run. |
 | cni.tolerations | list | `[]` |  |
 | fullnameOverride | string | `""` | Override the full generated resource name. |

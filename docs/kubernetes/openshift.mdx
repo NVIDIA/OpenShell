@@ -144,6 +144,16 @@ To run **additional** gateway releases on the same cluster, do not install a
 second CNI. Use `-f deploy/helm/openshell/examples/cni-sidecar-openshift-extra-release.yaml`
 (`cni.enabled=false`, `cni.external=true`), which reuses the cluster singleton.
 
+<Warning>
+On node reboot the Multus chain file (under `/run`, tmpfs) is wiped while the
+`openshell.ai/cni-ready` Node label persists, so a sandbox could briefly schedule
+onto a node before enforcement is re-established. To close this window, apply the
+boot-time taint MachineConfig at
+`deploy/helm/openshell/examples/cni-sidecar-openshift-boot-taint.yaml` (read its
+caveats first — it is operator-provided node config and requires taint RBAC). The
+CNI DaemonSet tolerates the taint and removes it once enforcement is ready.
+</Warning>
+
 ## Next Steps
 
 - For TLS-enabled deployments, refer to [Managing Certificates](/kubernetes/managing-certificates).

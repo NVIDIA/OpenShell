@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OPTIONAL, OpenShift-specific: close the node-reboot fail-open window for the
+# cni-sidecar topology.
+#
+# Why this is needed: on OpenShift (multus-chain) the chained plugin config lives
+# under /run (tmpfs) and is wiped on reboot, but the persistent
+# `openshell.ai/cni-ready` Node label survives. Between a node coming back up and
+# the OpenShell CNI DaemonSet re-installing the plugin, a sandbox pod could
+# schedule onto a node with no egress enforcement. A boot-time NoSchedule taint
+# repels workloads until enforcement is back; the OpenShell CNI DaemonSet
+# tolerates this taint and REMOVES it once enforcement is ready (see
+# `openshell-cni node-ready`). It never re-adds the taint, so a transient
+# reconcile failure does not over-repel a running node.
+#
+# This is operator-provided NODE configuration, not part of the Helm chart: the
+# taint must be applied before the kubelet marks the node schedulable, which only
+# node-level config can do. Apply it to the MachineConfigPool(s) whose nodes run
+# sandbox pods.
+#
+# CAVEATS / prerequisites:
+#   * Tradeoff: a NoSchedule taint repels ALL non-tolerating pods on the node
+#     until the OpenShell CNI is ready — not just sandboxes. Scope it to a
+#     sandbox-dedicated MachineConfigPool if that is undesirable on shared nodes.
+#   * RBAC: the command below must authenticate as an identity allowed to patch
+#     node taints. The kubelet's own identity is restricted by the NodeRestriction
+#     admission plugin, so bind a dedicated ServiceAccount (with a ClusterRole
+#     granting nodes get/patch) and place its kubeconfig at the path referenced
+#     below, or adapt the command to your node tooling.
+#   * `oc`/`kubectl` is assumed on the node image; adjust for your RHCOS tooling.
+#
+# The taint key/effect MUST match what the OpenShell CNI removes:
+#   openshell.ai/cni-not-ready=:NoSchedule
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  labels:
+    machineconfiguration.openshift.io/role: worker
+  name: 50-openshell-cni-boot-taint
+spec:
+  config:
+    ignition:
+      version: 3.4.0
+    systemd:
+      units:
+        - name: openshell-cni-boot-taint.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=Taint node not-ready for OpenShell CNI until enforcement is up
+            # Run once the kubelet/API client is available.
+            After=kubelet.service
+            Wants=kubelet.service
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            # KUBECONFIG must authenticate as an identity allowed to patch node
+            # taints (see CAVEATS above). Adjust the path/tooling for your nodes.
+            Environment=KUBECONFIG=/var/lib/openshell/cni-boot-taint.kubeconfig
+            ExecStart=/usr/bin/oc adm taint node "%H" openshell.ai/cni-not-ready=:NoSchedule --overwrite
+            [Install]
+            WantedBy=multi-user.target

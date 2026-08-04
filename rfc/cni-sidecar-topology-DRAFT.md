@@ -398,10 +398,19 @@ behavior is behind a default-off value.
   repairs (clears the label the instant enforcement is not verifiably present),
   and enforcement lives in the host CNI config so ordinary DaemonSet restarts
   never strip it — `preStop` removes it only on a real teardown, fencing first.
-  Residual: an ungraceful installer-pod deletion (no `preStop`) can leave a stale
-  `cni-ready=true` until the pod is rescheduled and the next reconcile re-checks.
-  Operators diagnose via `kubectl logs daemonset/openshell-cni` and the tailed
-  plugin log.
+- **Node reboot (tmpfs enforcement).** In `multus-chain` mode the chain file
+  lives under `/run` (tmpfs) and is wiped on reboot, but the persistent
+  `cni-ready` label survives, so the label gate alone cannot cover a reboot. A
+  boot-time `NoSchedule` taint (`openshell.ai/cni-not-ready`) closes this: it is
+  applied by operator-provided node config (only node config runs before the
+  scheduler; a MachineConfig example ships under `deploy/helm/openshell/examples/`),
+  the CNI DaemonSet tolerates it, and `openshell-cni node-ready` removes it once
+  enforcement is ready (never re-adding it, so a transient unready never
+  over-repels). `conflist` mode stores the plugin on persistent disk and is
+  unaffected by reboot. Residual: an ungraceful installer-pod deletion (no
+  `preStop`) can leave a stale `cni-ready=true` until the pod is rescheduled and
+  the next reconcile re-checks. Operators diagnose via
+  `kubectl logs daemonset/openshell-cni` and the tailed plugin log.
 - **Cluster-singleton CNI.** The chained plugin and readiness label are
   cluster-global host state. Rather than key them to a per-release namespace list
   (which two releases would fight over), the installer is a cluster singleton: the

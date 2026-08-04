@@ -2072,6 +2072,7 @@ fn apply_workspace_persistence(
     image_pull_policy: &str,
     sandbox_gid: u32,
     workspace_init_uid: u32,
+    harden_init: bool,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
@@ -2156,20 +2157,24 @@ fn apply_workspace_persistence(
         // Callers pass the sandbox UID in that mode (non-exempt, still able to
         // seed the PVC via fsGroup) and 0 otherwise (where UID 0 is not exempt).
         //
-        // Hardening applies only when the init runs as the non-root exempt UID
-        // (the Sidecar/CniSidecar binary-aware case). There, dropping all
-        // capabilities and disabling privilege escalation stops a setuid binary
-        // in the untrusted image from regaining the exempt UID 0 and bypassing
-        // egress, and runAsNonRoot makes the kubelet refuse an image that would
-        // force UID 0. When the init runs as root (combined topology, where UID 0
-        // is not exempt), keep the default root capabilities so it retains the
-        // broad DAC read access needed to seed the PVC from image files owned by
-        // other UIDs with restrictive modes.
+        // Harden the init in every sidecar topology (`harden_init`), not just the
+        // binary-aware case. A sidecar pod always has a separate network
+        // supervisor at an exempt UID and shares the pod netns, so a root init
+        // with default capabilities could switch to the exempt UID (CAP_SETUID)
+        // or craft packets around the L4 firewall (CAP_NET_RAW) to bypass egress.
+        // Dropping all capabilities and disabling privilege escalation closes
+        // both; runAsNonRoot is asserted only when the init already runs non-root
+        // (binary-aware), since the non-binary-aware sidecar init still needs
+        // UID 0. Only the Combined topology (no separate exempt sidecar) keeps
+        // default root capabilities, preserving broad DAC read access to seed the
+        // PVC from image files owned by other UIDs with restrictive modes.
         let mut security_context = serde_json::json!({ "runAsUser": workspace_init_uid });
-        if workspace_init_uid != 0 {
+        if harden_init {
             security_context["allowPrivilegeEscalation"] = serde_json::json!(false);
-            security_context["runAsNonRoot"] = serde_json::json!(true);
             security_context["capabilities"] = serde_json::json!({ "drop": ["ALL"] });
+            if workspace_init_uid != 0 {
+                security_context["runAsNonRoot"] = serde_json::json!(true);
+            }
         }
         let mut init_spec = serde_json::json!({
             "name": WORKSPACE_INIT_CONTAINER_NAME,
@@ -2812,19 +2817,19 @@ fn sandbox_template_to_k8s_with_validated_config(
     // that /sandbox data survives pod rescheduling. Skipped when the user
     // provides custom storage through driver_config.
     if inject_workspace {
-        // Under binary-aware network policy the CNI firewall exempts UID 0, so
-        // the untrusted workspace-init must not run as root or it could bypass
-        // egress policy. This exemption only exists in the sidecar topologies
-        // (Sidecar / CniSidecar), which run a separate network supervisor at the
-        // exempt UID; the combined topology has no such exemption, so it keeps
-        // root to preserve the widest read access to the image's /sandbox
-        // contents and PVC data. Run as the (non-exempt) sandbox UID only where
-        // the exemption applies.
-        let workspace_init_uid = if matches!(
+        // The sidecar topologies run a separate network supervisor at an exempt
+        // UID and share the pod netns, so their untrusted workspace-init must be
+        // hardened against egress bypass; the combined topology has no separate
+        // exempt sidecar and keeps default root capabilities for read access.
+        let harden_init = matches!(
             params.topology,
             SupervisorTopology::Sidecar | SupervisorTopology::CniSidecar
-        ) && params.process_binary_aware_network_policy
-        {
+        );
+        // In binary-aware mode the CNI firewall exempts UID 0 itself, so the init
+        // must not run as root at all; run it as the non-exempt sandbox UID.
+        // Otherwise it runs as UID 0 but hardened (no CAP_SETUID/CAP_NET_RAW), so
+        // it cannot switch to the exempt proxy UID or craft raw packets.
+        let workspace_init_uid = if harden_init && params.process_binary_aware_network_policy {
             params.sandbox_uid
         } else {
             0
@@ -2835,6 +2840,7 @@ fn sandbox_template_to_k8s_with_validated_config(
             params.image_pull_policy,
             params.sandbox_gid,
             workspace_init_uid,
+            harden_init,
         );
     }
 
@@ -5100,8 +5106,10 @@ mod tests {
         assert!(init["securityContext"]["capabilities"].is_null());
     }
 
-    /// Companion: without binary-aware policy, UID 0 is not exempt, so the init
-    /// keeps root for the widest read access to the image's /sandbox contents.
+    /// Without binary-aware policy the sidecar init still runs as UID 0 (it needs
+    /// root), but must be hardened: a sidecar pod has a separate exempt network
+    /// supervisor, so the untrusted init must not keep `CAP_SETUID`/`CAP_NET_RAW`
+    /// (it could switch to the exempt UID or craft raw packets to bypass egress).
     #[test]
     fn non_binary_aware_workspace_init_runs_as_root() {
         let params = SandboxPodParams {
@@ -5133,11 +5141,17 @@ mod tests {
             .iter()
             .find(|container| container["name"] == WORKSPACE_INIT_CONTAINER_NAME)
             .expect("workspace-init container must be present");
+        let sc = &init["securityContext"];
         assert_eq!(
-            init["securityContext"]["runAsUser"],
+            sc["runAsUser"],
             serde_json::json!(0),
-            "workspace-init keeps root when UID 0 is not CNI-exempt"
+            "non-binary-aware sidecar init still needs UID 0"
         );
+        // Hardened even at UID 0: no CAP_SETUID/CAP_NET_RAW, no privilege
+        // escalation. runAsNonRoot is NOT set (it runs as root).
+        assert_eq!(sc["allowPrivilegeEscalation"], serde_json::json!(false));
+        assert_eq!(sc["capabilities"]["drop"], serde_json::json!(["ALL"]));
+        assert!(sc["runAsNonRoot"].is_null());
     }
 
     #[test]
@@ -5636,8 +5650,9 @@ mod tests {
             &mut pod_template,
             "openshell/sandbox:latest",
             "IfNotPresent",
-            1000, // sandbox_gid
-            0,    // workspace_init_uid (non-binary-aware: root)
+            1000,  // sandbox_gid
+            0,     // workspace_init_uid (root)
+            false, // harden_init (combined)
         );
 
         // Init container
@@ -5698,6 +5713,7 @@ mod tests {
             "IfNotPresent",
             1000,
             0,
+            false,
         );
 
         let init_image = pod_template["spec"]["initContainers"][0]["image"]
@@ -5720,7 +5736,7 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1000, 0);
+        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1000, 0, false);
 
         let cmd = pod_template["spec"]["initContainers"][0]["command"]
             .as_array()
