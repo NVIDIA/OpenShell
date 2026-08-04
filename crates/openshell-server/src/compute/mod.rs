@@ -2515,7 +2515,7 @@ fn driver_sandbox_spec_from_public(
     spec: &SandboxSpec,
     driver_name: &str,
 ) -> Result<DriverSandboxSpec, Box<Status>> {
-    let workspace_validation_identity = matches!(driver_name, "docker" | "podman").then(|| {
+    let workspace_validation_identity = (driver_name == "podman").then(|| {
         let process = spec
             .policy
             .as_ref()
@@ -3296,7 +3296,7 @@ mod tests {
     }
 
     #[test]
-    fn driver_sandbox_spec_projects_process_identity_for_local_image_probe() {
+    fn driver_sandbox_spec_projects_process_identity_only_for_podman_probe() {
         let public = SandboxSpec {
             policy: Some(openshell_core::proto::SandboxPolicy {
                 process: Some(openshell_core::proto::ProcessPolicy {
@@ -3323,6 +3323,9 @@ mod tests {
                 .unwrap()
                 .discover_from_image_policy
         );
+
+        let docker = driver_sandbox_spec_from_public(&public, "docker").unwrap();
+        assert!(docker.workspace_validation_identity.is_none());
     }
 
     #[test]

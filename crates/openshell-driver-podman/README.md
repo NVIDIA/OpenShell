@@ -28,10 +28,14 @@ write and enter the workdir. The path must be a real directory without symlink
 components. The probe also rejects kernel-managed filesystems and overlaps with
 concrete OpenShell control resources. It emits a normalized identity
 attestation; the final supervisor must resolve to the same identity, including
-when the image supplies the default process policy. On failure, the driver
-captures a bounded, sanitized diagnostic before removing the probe. Only then
-does Podman mount and prepare the managed workspace volume at that path; normal
-copy-up preserves image content. The workspace is the child cwd and `HOME`.
+when the image supplies the default process policy. The probe inherits the
+sandbox CPU, memory, and PID limits and has a bounded runtime. Its lifecycle
+continues to forced cleanup if the create request is cancelled, and a dedicated
+label lets a restarted gateway remove any probe left by process termination.
+On failure, the driver captures a bounded, sanitized diagnostic before removing
+the probe. Only then does Podman mount and prepare the managed workspace volume
+at that path; normal copy-up preserves image content. The workspace is the
+child cwd and `HOME`.
 
 For a rootless networking deep dive, see [NETWORKING.md](NETWORKING.md).
 

@@ -45,6 +45,10 @@ pub use openshell_core::driver_utils::{
 pub const LABEL_MANAGED: &str = "openshell.managed";
 /// Label filter string for list/event queries.
 pub const LABEL_MANAGED_FILTER: &str = "openshell.managed=true";
+/// Label applied only to temporary OCI workdir validation probes.
+pub const LABEL_WORKSPACE_PROBE: &str = "openshell.workspace-probe";
+/// Label filter used to recover probes left behind by a stopped gateway.
+pub const LABEL_WORKSPACE_PROBE_FILTER: &str = "openshell.workspace-probe=true";
 
 /// Container name prefix to avoid collisions with user containers.
 const CONTAINER_PREFIX: &str = "openshell-";
@@ -233,6 +237,30 @@ struct ContainerSpec {
     /// Port mappings from host to container. Using `host_port=0` requests an
     /// ephemeral port, readable back from the inspect response.
     portmappings: Vec<PortMapping>,
+}
+
+/// Minimal Podman spec for an OpenShell-owned auxiliary container.
+///
+/// Keep this typed separately from [`ContainerSpec`] so probes cannot
+/// accidentally inherit sandbox networking, secrets, or workspace mounts,
+/// while still sharing resource-limit construction and recovery metadata.
+#[derive(Serialize)]
+struct WorkspaceProbeSpec {
+    name: String,
+    image: String,
+    labels: BTreeMap<String, String>,
+    entrypoint: Vec<String>,
+    command: Vec<String>,
+    user: String,
+    work_dir: String,
+    image_volumes: Vec<ImageVolume>,
+    image_volume_mode: String,
+    netns: NetNS,
+    no_new_privileges: bool,
+    cap_drop: Vec<String>,
+    cap_add: Vec<String>,
+    image_pull_policy: String,
+    resource_limits: ResourceLimits,
 }
 
 /// A port mapping entry for the libpod `SpecGenerator`.
@@ -542,6 +570,16 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
     labels.insert(LABEL_MANAGED.into(), "true".into());
 
     labels
+}
+
+fn build_workspace_probe_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (LABEL_WORKSPACE_PROBE.into(), "true".into()),
+        (LABEL_SANDBOX_ID.into(), sandbox.id.clone()),
+        (LABEL_SANDBOX_NAME.into(), sandbox.name.clone()),
+        (LABEL_SANDBOX_NAMESPACE.into(), sandbox.namespace.clone()),
+        (LABEL_SANDBOX_WORKSPACE.into(), sandbox.workspace.clone()),
+    ])
 }
 
 /// Parse resource limits from the sandbox template, falling back to defaults.
@@ -1277,27 +1315,35 @@ pub fn build_workspace_probe_spec(
         }
     }
 
-    Ok(Some(serde_json::json!({
-        "name": probe_name,
-        "image": inspected_image.id,
-        "entrypoint": [SUPERVISOR_BINARY_PATH],
-        "command": command,
-        "user": "0:0",
-        "work_dir": "/",
-        "image_volumes": [{
-            "source": config.supervisor_image,
-            "destination": SUPERVISOR_MOUNT_DIR,
-            "rw": false
+    let probe_spec = WorkspaceProbeSpec {
+        name: probe_name.to_string(),
+        image: inspected_image.id.clone(),
+        labels: build_workspace_probe_labels(sandbox),
+        entrypoint: vec![SUPERVISOR_BINARY_PATH.into()],
+        command,
+        user: "0:0".into(),
+        work_dir: "/".into(),
+        image_volumes: vec![ImageVolume {
+            source: config.supervisor_image.clone(),
+            destination: SUPERVISOR_MOUNT_DIR.into(),
+            rw: false,
         }],
         // Do not materialize OCI VOLUME declarations: the probe must inspect
         // the immutable image layer rather than a fresh anonymous volume.
-        "image_volume_mode": "ignore",
-        "netns": {"nsmode": "none"},
-        "no_new_privileges": true,
-        "cap_drop": ["ALL"],
-        "cap_add": ["SETUID", "SETGID"],
-        "image_pull_policy": "never"
-    })))
+        image_volume_mode: "ignore".into(),
+        netns: NetNS {
+            nsmode: "none".into(),
+        },
+        no_new_privileges: true,
+        cap_drop: vec!["ALL".into()],
+        cap_add: vec!["SETUID".into(), "SETGID".into()],
+        image_pull_policy: "never".into(),
+        resource_limits: build_resource_limits(sandbox, config),
+    };
+
+    Ok(Some(
+        serde_json::to_value(probe_spec).expect("WorkspaceProbeSpec serialization cannot fail"),
+    ))
 }
 
 fn hostadd_entries(config: &PodmanComputeConfig) -> Vec<String> {
@@ -1614,6 +1660,13 @@ mod tests {
     fn workspace_probe_uses_pinned_image_without_workspace_or_network() {
         let mut sandbox = test_sandbox("test-id", "test-name");
         let spec = sandbox.spec.get_or_insert_default();
+        spec.template.get_or_insert_default().resources = Some(
+            openshell_core::proto::compute::v1::DriverResourceRequirements {
+                cpu_limit: "750m".into(),
+                memory_limit: "1Gi".into(),
+                ..Default::default()
+            },
+        );
         spec.workspace_validation_identity = Some(
             openshell_core::proto::compute::v1::WorkspaceValidationIdentity {
                 run_as_user: "policy-user".into(),
@@ -1621,9 +1674,11 @@ mod tests {
                 discover_from_image_policy: false,
             },
         );
+        let mut config = test_config();
+        config.sandbox_pids_limit = 37;
         let probe = build_workspace_probe_spec(
             &sandbox,
-            &test_config(),
+            &config,
             &inspected_image("sha256:immutable", "app:staff", "/workspace/project"),
             "openshell-test-probe",
         )
@@ -1635,6 +1690,15 @@ mod tests {
         assert_eq!(probe["image_volume_mode"], "ignore");
         assert_eq!(probe["cap_drop"], serde_json::json!(["ALL"]));
         assert_eq!(probe["cap_add"], serde_json::json!(["SETUID", "SETGID"]));
+        assert_eq!(probe["labels"][LABEL_WORKSPACE_PROBE], "true");
+        assert_eq!(probe["labels"][LABEL_SANDBOX_ID], "test-id");
+        assert!(probe["labels"].get(LABEL_MANAGED).is_none());
+        assert_eq!(probe["resource_limits"]["cpu"]["quota"], 75_000);
+        assert_eq!(
+            probe["resource_limits"]["memory"]["limit"],
+            1024 * 1024 * 1024_u64
+        );
+        assert_eq!(probe["resource_limits"]["PidsLimit"], 37);
         assert!(probe.get("volumes").is_none());
         assert!(probe.get("secrets").is_none());
         assert!(probe.get("env").is_none());

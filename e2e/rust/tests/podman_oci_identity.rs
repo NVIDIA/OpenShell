@@ -22,7 +22,7 @@ const BASE_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:late
 const READY_MARKER: &str = "podman-oci-identity-ready";
 const OCI_UID: &str = "2345";
 const OCI_GID: &str = "2346";
-const OCI_FALLBACK_POLICY: &str = r#"version: 1
+const IMAGE_POLICY: &str = r#"version: 1
 
 filesystem_policy:
   include_workdir: true
@@ -32,6 +32,10 @@ landlock:
   compatibility: best_effort
 
 network_policies: {}
+
+process:
+  run_as_user: "2345"
+  run_as_group: "2346"
 "#;
 
 struct ImageGuard {
@@ -52,6 +56,8 @@ impl ImageGuard {
 
         let context = tempfile::tempdir().map_err(|err| format!("create build context: {err}"))?;
         let containerfile = context.path().join("Containerfile");
+        std::fs::write(context.path().join("policy.yaml"), IMAGE_POLICY)
+            .map_err(|err| format!("write image policy: {err}"))?;
         std::fs::write(
             &containerfile,
             format!(
@@ -60,6 +66,7 @@ impl ImageGuard {
                  RUN mkdir -p /home/app/project && \
                      chown {OCI_UID}:{OCI_GID} /home/app /home/app/project && \
                      chmod 0700 /home/app\n\
+                 COPY policy.yaml /etc/openshell/policy.yaml\n\
                  WORKDIR /home/app/project\n\
                  RUN printf root-owned > root-owned.txt && chown {OCI_UID}:{OCI_GID} .\n\
                  USER {OCI_UID}:{OCI_GID}\n"
@@ -180,14 +187,10 @@ async fn podman_uses_oci_identity_workspace_and_inspected_image_id() {
     }
 
     let image = ImageGuard::build().expect("build Podman OCI identity image");
-    // The community base image contains a baked default policy with an
-    // explicit `sandbox` process identity. Supply a complete policy that
-    // intentionally omits `process` so this test exercises OCI fallback.
-    let policy = tempfile::NamedTempFile::new().expect("create OCI fallback policy");
-    std::fs::write(policy.path(), OCI_FALLBACK_POLICY).expect("write OCI fallback policy");
-    let policy_path = policy.path().to_str().expect("policy path is UTF-8");
+    // Do not supply a policy at create time. The probe must discover the
+    // image's policy before the workspace volume hides the immutable layer.
     let mut sandbox = SandboxGuard::create_keep_with_args(
-        &["--from", &image.tag, "--policy", policy_path, "--no-tty"],
+        &["--from", &image.tag, "--no-tty"],
         &[
             "sh",
             "-c",
