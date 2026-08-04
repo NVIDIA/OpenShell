@@ -46,7 +46,7 @@ and stores them in the provider.
 Supply a credential value directly:
 
 ```shell
-openshell provider create --name my-api --type generic --credential API_KEY=sk-abc123
+openshell provider create --name my-nvidia --type nvidia --credential NVIDIA_API_KEY=nvapi-example
 ```
 
 ### Bare Key Form
@@ -55,10 +55,10 @@ Pass a key name without a value to read the value from the environment variable
 of that name:
 
 ```shell
-openshell provider create --name my-api --type generic --credential API_KEY
+openshell provider create --name my-nvidia --type nvidia --credential NVIDIA_API_KEY
 ```
 
-This looks up the current value of `$API_KEY` in your shell and stores it.
+This looks up the current value of `$NVIDIA_API_KEY` in your shell and stores it.
 
 Provider profile metadata is available for known provider types. Provider profile
 network policy is gateway opt-in:
@@ -67,7 +67,9 @@ network policy is gateway opt-in:
 openshell settings set --global --key providers_v2_enabled --value true
 ```
 
-Without `providers_v2_enabled=true`, provider behavior remains credential-only.
+Without `providers_v2_enabled=true`, attached provider profiles do not contribute
+network policy to the sandbox. Static credential endpoint binding remains active
+in either mode.
 
 When `providers_v2_enabled=true`, `--from-existing` uses profile-backed
 discovery instead of the legacy provider registry. The requested `--type` must
@@ -89,6 +91,14 @@ read-only. The target ID must match the profile ID in the file. Update accepts
 one file at a time and rejects stale resource versions. When
 `providers_v2_enabled=true`, updated profile policy applies to all provider
 instances of that type on the next sandbox config sync.
+
+<Warning>
+Static credentials require a built-in or imported provider profile. Profiles
+normally define at least one endpoint. An endpointless profile requires an
+explicit `credential_binding.provider` on a sandbox policy endpoint. OpenShell
+does not activate static credentials from a profileless provider because it
+cannot determine which credential definition applies.
+</Warning>
 
 ## Manage Providers
 
@@ -247,11 +257,14 @@ Pass one or more `--provider` flags when creating a sandbox:
 openshell sandbox create --provider my-claude --provider my-github -- claude
 ```
 
-Each `--provider` flag attaches one provider. The sandbox receives all
-credentials from every attached provider at runtime. Profile-managed providers
-also contribute provider-generated network policy entries when
-`providers_v2_enabled` is enabled at the gateway. When the setting is disabled,
-providers keep the previous behavior and only provide credentials.
+Each `--provider` flag attaches one provider. The sandbox receives eligible
+credentials from every attached provider as placeholders at runtime. Each
+static credential resolves only for endpoints in that provider's profile, or
+for explicitly bound sandbox policy endpoints when the profile is endpointless.
+Profile-managed providers also contribute provider-generated network policy
+entries when `providers_v2_enabled` is enabled at the gateway. When the setting
+is disabled, endpoint binding still applies, but provider-generated policy does
+not.
 
 <Warning>
 Legacy provider attachment is fixed at sandbox creation time. Providers v2 adds
@@ -282,9 +295,35 @@ provider instance, and pass `--provider <name>` explicitly.
 
 ## How Credential Injection Works
 
-The agent process inside the sandbox never sees real credential values. At startup, the proxy replaces each credential with an opaque placeholder token in the agent's environment. When the agent sends an HTTP request containing a placeholder, the proxy resolves it to the real credential before forwarding upstream.
+The agent process inside the sandbox never sees real credential values. At
+startup, OpenShell replaces each credential with an opaque placeholder token in
+the agent's environment. When the agent sends an HTTP request containing a
+placeholder, the proxy resolves it immediately before forwarding the request.
 
-This resolution requires the proxy to see plaintext HTTP. Endpoints must use `protocol: rest` in the policy (which auto-terminates TLS) or explicit `tls: terminate`. Endpoints without TLS termination pass traffic through as an opaque stream, and credential placeholders are forwarded unresolved.
+Static credential resolution has two independent authorization boundaries:
+
+1. Network policy must allow the calling binary and request destination.
+2. The credential binding must include the request host, port, and path. Profile
+   endpoints provide the binding by default. An endpointless profile can use a
+   sandbox policy endpoint that names the attached provider instance through
+   `credential_binding.provider`.
+
+Both checks must pass. A provider profile endpoint does not grant network access
+unless provider policy composition or the sandbox's own policy allows the
+request. A plain sandbox policy endpoint does not grant credential use unless
+the profile already covers it or the endpoint explicitly binds an endpointless
+provider.
+
+Endpoint binding applies whether `providers_v2_enabled` is enabled or disabled.
+The setting controls provider policy composition only. Every static credential
+declared by a provider receives the complete endpoint set from that provider's
+profile, or the explicitly bound sandbox policy endpoints for an endpointless
+profile.
+
+Credential resolution requires the proxy to handle the request as HTTP. Raw
+`tls: skip` and non-HTTP tunnels remain opaque and do not support credential
+rewrite. Refer to [Providers v2](/sandboxes/providers-v2#understand-static-credential-endpoint-binding)
+for endpoint matching and migration guidance.
 
 ### Supported injection locations
 
@@ -296,30 +335,42 @@ The proxy resolves credential placeholders in the following parts of an HTTP req
 | Header value (Basic auth) | Agent base64-encodes `user:<placeholder>` in an `Authorization: Basic` header. The proxy decodes, resolves, and re-encodes. | `Authorization: Basic <base64>` |
 | Query parameter value | Agent places the placeholder in a URL query parameter. | `GET /api?key=<placeholder>` |
 | URL path segment | Agent builds a URL with the placeholder in the path. Supports concatenated patterns. | `POST /bot<placeholder>/sendMessage` |
+| Supported request body | An inspected REST endpoint opts in with `request_body_credential_rewrite: true`. | `{"api_key":"<placeholder>"}` |
+| WebSocket text message | A REST or WebSocket endpoint opts in with `websocket_credential_rewrite: true`. | `{"token":"<placeholder>"}` |
+| AWS SigV4 signing | An endpoint configures `credential_signing`, and the proxy signs with the endpoint-bound AWS credentials. | `credential_signing: sigv4` |
 
-The proxy does not modify request bodies, cookies, or response content.
+The proxy does not rewrite cookies, response content, unsupported request
+bodies, or WebSocket binary frames.
 
 ### Fail-closed behavior
 
-If the proxy detects a credential placeholder in a request but cannot resolve it, it rejects the request with HTTP 500 instead of forwarding the raw placeholder to the upstream server. This prevents accidental credential leakage in server logs or error responses.
+If policy allows a request but the credential binding does not include the
+request endpoint, the proxy rejects the request with HTTP 403 and the
+`credential_endpoint_mismatch` reason. It emits a denied activity event and a
+security finding without recording the secret, placeholder, environment key, or
+query string.
 
-### Example: Telegram Bot API (path-based credential)
+Unknown, malformed, expired, or otherwise unresolved placeholders also fail
+closed instead of being forwarded to the upstream service.
 
-Create a provider with the Telegram bot token:
+### Inspect an Endpoint Binding
+
+Export the profile used by a provider to inspect its credential boundary:
 
 ```shell
-openshell provider create --name telegram --type generic --credential TELEGRAM_BOT_TOKEN=123456:ABC-DEF
+openshell provider profile export github -o yaml
 ```
 
-The agent reads `TELEGRAM_BOT_TOKEN` from its environment and builds a request like `POST /bot<placeholder>/sendMessage`. The proxy resolves the placeholder in the URL path and forwards `POST /bot123456:ABC-DEF/sendMessage` to the upstream.
+For the built-in GitHub profile, `GITHUB_TOKEN` and `GH_TOKEN` can resolve for
+the profile's `api.github.com:443` and `github.com:443` endpoints. Even if a
+sandbox policy allows `uploads.example.com:443`, sending either placeholder
+there returns `credential_endpoint_mismatch`.
 
-### Example: Google API (query parameter credential)
-
-```shell
-openshell provider create --name google --type generic --credential YOUTUBE_API_KEY=AIzaSy-secret
-```
-
-The agent sends `GET /youtube/v3/search?part=snippet&key=<placeholder>`. The proxy resolves the placeholder in the query parameter value and percent-encodes the result before forwarding.
+For a custom service, define the credential in a custom provider profile. Put
+stable endpoints in the profile, or leave the profile endpointless and bind
+each concrete provider instance from sandbox policy. Refer to [Provider
+Profiles](/sandboxes/providers-v2#provider-profiles) for the profile workflow
+and schema.
 
 ## Supported Provider Types
 
@@ -333,7 +384,7 @@ The following provider types are supported.
 | `codex` | `OPENAI_API_KEY` | OpenAI Codex |
 | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` | GitHub Copilot CLI |
 | `deepinfra` | `DEEPINFRA_API_KEY` | DeepInfra inference API |
-| `generic` | User-defined | Any service with custom credentials |
+| `generic` | User-defined | Legacy credential storage. Import an endpoint-bearing custom profile for credentials attached to a sandbox. |
 | `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API and `gh` CLI. Refer to [GitHub Sandbox](/get-started/tutorials/github-sandbox). |
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
@@ -345,8 +396,9 @@ The following provider types are supported.
 </Note>
 
 <Tip>
-Use the `generic` type for any service not listed above. You define the
-environment variable names and values yourself with `--credential`.
+For a service not listed above, import a custom provider profile that declares
+its credential environment variables and endpoints. Use the imported profile
+ID as the provider `--type`.
 
 </Tip>
 

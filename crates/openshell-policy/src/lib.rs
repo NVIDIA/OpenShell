@@ -157,9 +157,17 @@ struct NetworkEndpointDef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     signing_region: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_binding: Option<NetworkCredentialBindingDef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     json_rpc: Option<JsonRpcConfigDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mcp: Option<McpConfigDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkCredentialBindingDef {
+    provider: String,
 }
 
 // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
@@ -759,6 +767,11 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             credential_signing: e.credential_signing,
                             signing_service: e.signing_service,
                             signing_region: e.signing_region,
+                            credential_binding: e.credential_binding.map(|binding| {
+                                openshell_core::proto::NetworkCredentialBinding {
+                                    provider: binding.provider,
+                                }
+                            }),
                             json_rpc_max_body_bytes: json_rpc_max_body_bytes(&e.json_rpc, &e.mcp),
                             mcp: mcp_options(&e.mcp),
                         }
@@ -907,6 +920,11 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                             credential_signing: e.credential_signing.clone(),
                             signing_service: e.signing_service.clone(),
                             signing_region: e.signing_region.clone(),
+                            credential_binding: e.credential_binding.as_ref().map(|binding| {
+                                NetworkCredentialBindingDef {
+                                    provider: binding.provider.clone(),
+                                }
+                            }),
                             json_rpc,
                             mcp,
                         }
@@ -3002,6 +3020,37 @@ network_policies:
         let ep2 = &proto2.network_policies["test"].endpoints[0];
         assert_eq!(ep1.path, "/graphql");
         assert_eq!(ep1.path, ep2.path);
+    }
+
+    #[test]
+    fn round_trip_preserves_endpoint_credential_binding() {
+        let yaml = r"
+version: 1
+network_policies:
+  gcp_storage:
+    endpoints:
+      - host: storage.googleapis.com
+        port: 443
+        protocol: rest
+        credential_binding:
+          provider: work-gcp
+";
+
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let endpoint = &proto1.network_policies["gcp_storage"].endpoints[0];
+        assert_eq!(
+            endpoint
+                .credential_binding
+                .as_ref()
+                .map(|binding| binding.provider.as_str()),
+            Some("work-gcp")
+        );
+
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(proto1, proto2);
+        assert!(yaml_out.contains("credential_binding:"));
+        assert!(yaml_out.contains("provider: work-gcp"));
     }
 
     #[test]

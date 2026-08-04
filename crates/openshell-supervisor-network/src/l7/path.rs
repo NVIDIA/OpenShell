@@ -135,13 +135,24 @@ pub fn canonicalize_request_target(
         None => (target, None),
     };
 
-    // 4. Handle absolute-form by stripping scheme://authority.
-    let raw_path = path_part.find("://").map_or(path_part, |idx| {
-        let after_scheme = &path_part[idx + 3..];
-        after_scheme
-            .find('/')
-            .map_or("/", |slash| &after_scheme[slash..])
-    });
+    // 4. Handle absolute-form by stripping the URI authority. Origin-form
+    // targets may legitimately embed `://` in a path segment, so only a URI
+    // with a scheme is absolute-form.
+    let absolute_form_uri = path_part
+        .parse::<http::Uri>()
+        .ok()
+        .filter(|uri| uri.scheme().is_some());
+    let raw_path = absolute_form_uri
+        .as_ref()
+        .map(http::Uri::path)
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| {
+            if absolute_form_uri.is_some() {
+                "/"
+            } else {
+                path_part
+            }
+        });
 
     // 5. Empty is equivalent to "/".
     let raw_path = if raw_path.is_empty() { "/" } else { raw_path };
@@ -441,6 +452,20 @@ mod tests {
         assert_eq!(canon("http://host/a/../b").unwrap(), "/b");
         assert_eq!(canon("https://host").unwrap(), "/");
         assert_eq!(canon("http://host:443/foo").unwrap(), "/foo");
+    }
+
+    #[test]
+    fn origin_form_with_embedded_url_is_not_stripped_as_absolute_form() {
+        let (path, query) = canonicalize_request_target(
+            "/fetch/http://example.test?next=http://other.test",
+            &CanonicalizeOptions::default(),
+        )
+        .expect("origin-form target with embedded URLs must be accepted");
+        // Repeated slashes are canonicalized everywhere, but the embedded
+        // URL must remain part of the origin-form path rather than being
+        // treated as a new absolute-form authority.
+        assert_eq!(path.path, "/fetch/http:/example.test");
+        assert_eq!(query.as_deref(), Some("next=http://other.test"));
     }
 
     #[test]

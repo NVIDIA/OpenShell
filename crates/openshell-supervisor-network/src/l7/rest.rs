@@ -240,6 +240,11 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
     if version != "HTTP/1.1" && version != "HTTP/1.0" {
         return Err(miette!("Unsupported HTTP version: {version}"));
     }
+    let host_authority = request_host_authority_from_str(header_str)?;
+    if version == "HTTP/1.1" && host_authority.is_none() {
+        return Err(miette!("HTTP/1.1 request is missing a Host header"));
+    }
+    validate_absolute_form_authority(&target, host_authority.as_ref())?;
 
     // Determine body framing from headers
     let body_length = parse_body_length(header_str)?;
@@ -383,6 +388,130 @@ pub(crate) fn validate_http_request_header_block(headers: &[u8]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) struct RequestAuthority {
+    pub(crate) authority: http::uri::Authority,
+    pub(crate) effective_port: u16,
+}
+
+pub(crate) fn request_authority(
+    raw_header: &[u8],
+    transport_default_port: Option<u16>,
+) -> Result<Option<RequestAuthority>> {
+    let header_end = raw_header
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| miette!("HTTP request headers are missing the CRLF terminator"))?
+        + 4;
+    let headers = std::str::from_utf8(&raw_header[..header_end])
+        .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    let Some(host_authority) = request_host_authority_from_str(headers)? else {
+        return Ok(None);
+    };
+
+    let request_target = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| miette!("HTTP request is missing a request target"))?;
+    let absolute_uri = absolute_form_uri(request_target)?;
+    let (authority, default_port) = if let Some(uri) = absolute_uri {
+        let authority = uri
+            .authority()
+            .ok_or_else(|| miette!("HTTP absolute-form request target is missing an authority"))?
+            .clone();
+        let default_port = default_port_for_scheme(uri.scheme_str()).ok_or_else(|| {
+            miette!("HTTP absolute-form request target uses an unsupported scheme")
+        })?;
+        (authority, default_port)
+    } else {
+        let default_port = transport_default_port
+            .ok_or_else(|| miette!("HTTP origin-form request transport scheme is unavailable"))?;
+        (host_authority, default_port)
+    };
+
+    let effective_port = authority.port_u16().unwrap_or(default_port);
+    Ok(Some(RequestAuthority {
+        authority,
+        effective_port,
+    }))
+}
+
+fn request_host_authority_from_str(headers: &str) -> Result<Option<http::uri::Authority>> {
+    let mut authorities = headers.lines().skip(1).filter_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("host").then_some(value.trim())
+    });
+    let Some(authority) = authorities.next() else {
+        return Ok(None);
+    };
+    if authorities.next().is_some() {
+        return Err(miette!("HTTP request contains multiple Host headers"));
+    }
+    authority
+        .parse()
+        .map(Some)
+        .map_err(|_| miette!("HTTP request Host header contains an invalid authority"))
+}
+
+fn validate_absolute_form_authority(
+    target: &str,
+    host_authority: Option<&http::uri::Authority>,
+) -> Result<()> {
+    let Some(uri) = absolute_form_uri(target)? else {
+        return Ok(());
+    };
+    let request_authority = uri
+        .authority()
+        .ok_or_else(|| miette!("HTTP absolute-form request target is missing an authority"))?;
+    let host_authority = host_authority
+        .ok_or_else(|| miette!("HTTP absolute-form request is missing a Host header"))?;
+    if !authorities_match(request_authority, host_authority, uri.scheme_str()) {
+        return Err(miette!(
+            "HTTP absolute-form request authority does not match the Host header"
+        ));
+    }
+    Ok(())
+}
+
+/// Return a URI only when the request-target uses HTTP absolute form.
+///
+/// Origin-form request-targets can legitimately contain `://` in a path or
+/// query value, so a substring check would incorrectly make those requests
+/// participate in authority validation.
+fn absolute_form_uri(target: &str) -> Result<Option<http::Uri>> {
+    let uri = target
+        .parse::<http::Uri>()
+        .map_err(|_| miette!("HTTP absolute-form request target contains an invalid URI"))?;
+    Ok(uri.scheme().is_some().then_some(uri))
+}
+
+fn authorities_match(
+    left: &http::uri::Authority,
+    right: &http::uri::Authority,
+    scheme: Option<&str>,
+) -> bool {
+    if !normalized_authority_host(left.host())
+        .eq_ignore_ascii_case(normalized_authority_host(right.host()))
+    {
+        return false;
+    }
+    let default_port = default_port_for_scheme(scheme);
+    left.port_u16().or(default_port) == right.port_u16().or(default_port)
+}
+
+fn default_port_for_scheme(scheme: Option<&str>) -> Option<u16> {
+    match scheme {
+        Some(scheme) if scheme.eq_ignore_ascii_case("http") => Some(80),
+        Some(scheme) if scheme.eq_ignore_ascii_case("https") => Some(443),
+        _ => None,
+    }
+}
+
+fn normalized_authority_host(host: &str) -> &str {
+    host.trim_end_matches('.')
 }
 
 fn validate_http_request_line(request_line: &str) -> Result<()> {
@@ -593,6 +722,7 @@ where
         upstream,
         RelayRequestOptions {
             resolver,
+            credential_generation: None,
             generation_guard,
             websocket_extensions: WebSocketExtensionMode::Preserve,
             request_body_credential_rewrite: false,
@@ -616,6 +746,7 @@ pub(crate) enum WebSocketExtensionMode {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) resolver: Option<&'a SecretResolver>,
+    pub(crate) credential_generation: Option<CredentialGenerationGuard<'a>>,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) websocket_extensions: WebSocketExtensionMode,
     pub(crate) request_body_credential_rewrite: bool,
@@ -624,6 +755,38 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) signing_region: &'a str,
     pub(crate) host: &'a str,
     pub(crate) port: u16,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CredentialGenerationGuard<'a> {
+    state: &'a openshell_core::provider_credentials::ProviderCredentialState,
+    revision: u64,
+}
+
+impl<'a> CredentialGenerationGuard<'a> {
+    pub(crate) fn new(
+        state: &'a openshell_core::provider_credentials::ProviderCredentialState,
+        revision: u64,
+    ) -> Self {
+        Self { state, revision }
+    }
+
+    pub(crate) fn ensure_current(self) -> Result<()> {
+        if self.state.revision() == self.revision {
+            Ok(())
+        } else {
+            Err(miette!(
+                "provider credential generation changed before upstream write"
+            ))
+        }
+    }
+}
+
+fn ensure_credential_generation_current(options: RelayRequestOptions<'_>) -> Result<()> {
+    if let Some(guard) = options.credential_generation {
+        guard.ensure_current()?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn relay_http_request_with_options_guarded<C, U>(
@@ -636,6 +799,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    ensure_credential_generation_current(options)?;
     let header_end = req
         .raw_header
         .windows(4)
@@ -677,8 +841,8 @@ where
                 offered_subprotocols: request.subprotocols.clone(),
             });
 
-    let rewrite_result = rewrite_http_header_block(&header_bytes, options.resolver)
-        .map_err(|e| miette!("credential injection failed: {e}"))?;
+    let rewrite_result =
+        rewrite_http_header_block(&header_bytes, options.resolver).map_err(miette::Report::new)?;
 
     if let Some(guard) = options.generation_guard {
         guard.ensure_current()?;
@@ -706,19 +870,18 @@ where
             client.flush().await.into_diagnostic()?;
         }
         if let Some(resolver) = options.resolver {
-            let access_key_placeholder =
-                openshell_core::secrets::placeholder_for_env_key("AWS_ACCESS_KEY_ID");
-            let secret_key_placeholder =
-                openshell_core::secrets::placeholder_for_env_key("AWS_SECRET_ACCESS_KEY");
-            let session_token_placeholder =
-                openshell_core::secrets::placeholder_for_env_key("AWS_SESSION_TOKEN");
+            let access_key = resolver
+                .resolve_current_env_key_checked("AWS_ACCESS_KEY_ID", "sigv4")
+                .map_err(miette::Report::new)?;
+            let secret_key = resolver
+                .resolve_current_env_key_checked("AWS_SECRET_ACCESS_KEY", "sigv4")
+                .map_err(miette::Report::new)?;
+            let session_token = resolver
+                .resolve_current_env_key_checked("AWS_SESSION_TOKEN", "sigv4")
+                .map_err(miette::Report::new)?;
 
-            match (
-                resolver.resolve_placeholder(&access_key_placeholder),
-                resolver.resolve_placeholder(&secret_key_placeholder),
-            ) {
+            match (access_key, secret_key) {
                 (Some(access_key), Some(secret_key)) => {
-                    let session_token = resolver.resolve_placeholder(&session_token_placeholder);
                     // Use explicit signing_region from policy if set,
                     // otherwise extract from hostname.
                     let region = if options.signing_region.is_empty() {
@@ -815,6 +978,7 @@ where
                             secret_key,
                             session_token,
                         )?;
+                        ensure_credential_generation_current(options)?;
                         upstream.write_all(&signed).await.into_diagnostic()?;
                     } else {
                         // Sign headers only, stream body through.
@@ -834,6 +998,7 @@ where
                             session_token,
                             signable_body,
                         )?;
+                        ensure_credential_generation_current(options)?;
                         upstream
                             .write_all(&signed_headers)
                             .await
@@ -917,11 +1082,13 @@ where
             options.generation_guard,
         )
         .await?;
+        ensure_credential_generation_current(options)?;
         upstream.write_all(&body.headers).await.into_diagnostic()?;
         if !body.body.is_empty() {
             upstream.write_all(&body.body).await.into_diagnostic()?;
         }
     } else {
+        ensure_credential_generation_current(options)?;
         upstream
             .write_all(&rewrite_result.rewritten)
             .await
@@ -1295,7 +1462,7 @@ fn rewrite_buffered_body(
     } else {
         resolver
             .rewrite_text_placeholders(&mut text, "request_body")
-            .map_err(|e| miette!("credential injection failed: {e}"))?
+            .map_err(miette::Report::new)?
     };
     if replacements == 0 || contains_reserved_credential_marker(&text) {
         return Err(miette!(
@@ -1342,7 +1509,7 @@ fn rewrite_form_urlencoded_body(body: &str, resolver: &SecretResolver) -> Result
         let mut rewritten_value = decoded_value;
         let field_replacements = resolver
             .rewrite_text_placeholders(&mut rewritten_value, "request_body")
-            .map_err(|e| miette!("credential injection failed: {e}"))?;
+            .map_err(miette::Report::new)?;
         if field_replacements == 0 || contains_reserved_credential_marker(&rewritten_value) {
             return Err(miette!(
                 "request body credential rewrite left unresolved credential placeholders"
@@ -4709,6 +4876,73 @@ mod tests {
         assert_eq!(
             req.raw_header, b"GET /secret HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
             "outbound request line must carry the canonical path"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_rejects_absolute_authority_mismatched_with_host() {
+        let (mut client, mut peer) = tokio::io::duplex(1024);
+        peer.write_all(
+            b"GET http://attacker.example.test/v1 HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let error = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .expect_err("absolute-form authority mismatch must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("request authority does not match the Host header"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn origin_form_targets_with_embedded_urls_use_host_authority() {
+        let host: http::uri::Authority = "api.example.test".parse().unwrap();
+
+        for target in ["/fetch/http://example.test", "/?next=http://example.test"] {
+            assert!(
+                absolute_form_uri(target).unwrap().is_none(),
+                "{target} must remain origin-form"
+            );
+            validate_absolute_form_authority(target, Some(&host))
+                .expect("embedded URL must not trigger absolute-form validation");
+
+            let raw = format!("GET {target} HTTP/1.1\r\nHost: api.example.test\r\n\r\n");
+            let authority = request_authority(raw.as_bytes(), Some(443))
+                .unwrap()
+                .expect("origin-form request with Host must have an authority");
+            assert_eq!(authority.authority, host);
+            assert_eq!(authority.effective_port, 443);
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_keeps_embedded_url_in_origin_form_path() {
+        let (mut client, mut peer) = tokio::io::duplex(1024);
+        peer.write_all(
+            b"GET /fetch/http://example.test?next=http://other.test HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let request = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .expect("embedded URL origin-form request must parse")
+        .expect("request must be present");
+        assert_eq!(request.target, "/fetch/http:/example.test");
+        assert_eq!(
+            request.raw_header,
+            b"GET /fetch/http:/example.test?next=http://other.test HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
         );
     }
 
