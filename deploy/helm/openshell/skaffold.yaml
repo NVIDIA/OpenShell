@@ -121,6 +121,10 @@ deploy:
           #- ci/values-spire.yaml
           # To exercise the Kubernetes supervisor sidecar topology:
           #- ci/values-sidecar.yaml
+          # To exercise CNI sidecar topology, use the cni-sidecar Skaffold
+          # profile against a cluster where the OpenShell CNI DaemonSet can
+          # patch the node CNI conflist.
+          #- ci/values-cni-sidecar.yaml
           # To test multi-replica external PostgreSQL behavior:
           #- ci/values-high-availability.yaml
         setValueTemplates:
@@ -143,3 +147,8 @@ profiles:
         path: /deploy/helm/releases/0/setValues
         value:
           server.disableTls: "false"
+  - name: cni-sidecar
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-cni-sidecar.yaml

@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway service
+templates:
+  - templates/service.yaml
+tests:
+  # The Service selector stays base-only (name + instance) so a helm upgrade
+  # from a release whose gateway pods predate the component label does not blank
+  # the Service endpoints. The CNI DaemonSet uses a distinct app name
+  # (<name>-cni), so base-only selection never matches CNI pods.
+  - it: selects gateway pods by base labels
+    template: templates/service.yaml
+    asserts:
+      - equal:
+          path: spec.selector["app.kubernetes.io/name"]
+          value: openshell
+      - notExists:
+          path: spec.selector["app.kubernetes.io/component"]

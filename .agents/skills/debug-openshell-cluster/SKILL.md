@@ -398,12 +398,83 @@ The shared state directory should preserve `sandbox_gid` inheritance
 `@openshell-sidecar-ssh`; the network sidecar verifies its peer PID before
 bridging gateway relay requests. No `ssh.sock` file should appear in the shared
 state directory.
+
+If `topology = "cni-sidecar"` is rendered, the gateway should render
+the same process container and long-running network sidecar as sidecar mode, but
+there should be no `openshell-network-init` init container in sandbox pods.
+Instead, the chart must install the privileged `openshell-cni` DaemonSet and the
+sandbox pod should carry `openshell.ai/cni=enabled`,
+`openshell.ai/network-enforcement-mode=cni-sidecar`, and
+`openshell.ai/proxy-uid=<uid>` annotations. The CNI DaemonSet copies
+`/openshell-cni` into the host CNI binary directory and patches an existing CNI
+`.conflist`; if sandbox pods bypass network enforcement or fail during pod
+network setup, inspect the DaemonSet logs, the host CNI config, and whether the
+cluster actually invokes chained CNI plugins for the sandbox runtime class.
+
+The CNI installer is a **cluster singleton** with a fixed identity
+(`openshell-cni`). It is not necessarily in the release you are debugging — the
+owner is the release with `cni.enabled=true`; other gateway releases set
+`cni.external=true` and reuse it. Locate the owner and its resources cluster-wide:
+
+```bash
+kubectl get daemonset -A -l app.kubernetes.io/name=openshell-cni
+kubectl get clusterrole,clusterrolebinding openshell-cni
+```
+
+A gateway release using `cni-sidecar` with neither `cni.enabled` nor
+`cni.external` fails to render (template error), so if the gateway installed but
+sandboxes are unenforced, confirm the singleton exists and is Ready.
+
+**Namespace allowlist (silent unenforced sandboxes).** The plugin only inspects
+pods whose namespace is in its `sandboxNamespaces` allowlist. That allowlist is
+built automatically from Helm-owned marker ConfigMaps
+(`openshell.ai/cni-registration=true`) — one per cni-sidecar release, in its
+sandbox namespace — unioned with the static `cni.sandboxNamespaces`. If a sandbox
+reaches 2/2 but its egress is NOT blocked, confirm its namespace is registered and
+in the installed allowlist:
+
+```bash
+# Registration markers (their namespaces are what the singleton enforces):
+kubectl get configmaps -A -l openshell.ai/cni-registration=true
+# Installed plugin config's aggregated sandboxNamespaces:
+kubectl -n <owner-ns> exec ds/openshell-cni -c install-cni -- \
+  sh -c 'cat /host/run/multus/cni/net.d/vendor-cni-chain/openshell-cni.conf 2>/dev/null \
+         || cat /host/etc/cni/net.d/*.conflist'
+```
+
+**Gateway stuck in Init (`wait-cni-coverage`).** A cni-sidecar gateway pod has a
+`wait-cni-coverage` init container that blocks until every `cni-ready` node's
+`openshell.ai/cni-sandbox-namespaces` annotation includes the gateway's namespace.
+If the gateway is stuck initializing, the singleton has not yet acknowledged the
+namespace on all nodes — check the per-node coverage:
+`kubectl get nodes -o custom-columns=NAME:.metadata.name,COVERAGE:.metadata.annotations.openshell\.ai/cni-sandbox-namespaces`
+and confirm a marker ConfigMap exists for that namespace.
+
+**Node reboot / boot taint.** In `multus-chain` mode the chain file lives under
+`/run` (tmpfs) and is wiped on reboot while the `cni-ready` label persists.
+Clusters that apply the optional boot-time taint (`openshell.ai/cni-not-ready`,
+see `deploy/helm/openshell/examples/`) will show it on a node until the installer
+removes it; a node stuck with the taint means the installer has not reached ready
+there. Check with `kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints`.
+
+A per-node scheduling gate can also keep cni-sidecar sandbox pods `Pending`. The
+CNI DaemonSet labels each node `openshell.ai/cni-ready=true` after installing the
+plugin, and the gateway sets a required `nodeAffinity` on that label. If a
+sandbox pod stays `Pending` with an "unmatched nodeAffinity" event, check that
+the CNI DaemonSet is Ready on schedulable nodes and that the label is present
+(`kubectl get nodes -L openshell.ai/cni-ready`). A missing label means the
+installer has not completed its first patch or a reconcile tick cleared it after
+a plugin-restore failure.
+
 Inspect all three when sandbox registration or egress enforcement fails:
 
 ```bash
 kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E '^\[openshell\.drivers\.kubernetes\]|^topology\s*='
 kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.initContainers[*]}{.name}{" "}{.command}{"\n"}{end}'
 kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.containers[*]}{.name}{" "}{.command}{"\n"}{end}'
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{.metadata.annotations}'
+kubectl -n openshell get daemonset,pod -l app.kubernetes.io/component=cni
+kubectl -n openshell logs daemonset/openshell-cni -c install-cni --tail=200
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-network-init --tail=200
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-network --tail=200
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c agent --tail=200
@@ -449,6 +520,7 @@ openshell logs <sandbox-name>
 | HTTP request returns `middleware_failed` or `middleware_denied` | Selected stage failed or explicitly denied the admitted request | Sandbox OCSF logs; policy-local middleware config; service availability; `on_error` |
 | Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or configured with a reserved/mismatched name | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
+| CNI-sidecar sandbox pods fail network setup | OpenShell CNI DaemonSet did not patch the node CNI conflist, cannot read pods, or the runtime class does not invoke the chained plugin | `kubectl -n openshell logs daemonset/openshell-cni -c install-cni`, chart `cni.*` values, host CNI config |
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |
 | HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
 | HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |

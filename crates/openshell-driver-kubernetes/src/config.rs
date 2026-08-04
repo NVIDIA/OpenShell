@@ -65,6 +65,10 @@ pub enum SupervisorTopology {
     /// Run network supervision in a privileged sidecar and process supervision
     /// as a low-capability wrapper in the agent container.
     Sidecar,
+    /// Run network supervision in a sidecar, with pod-network rules installed
+    /// by the `OpenShell` chained CNI plugin instead of a privileged init
+    /// container.
+    CniSidecar,
 }
 
 impl std::fmt::Display for SupervisorTopology {
@@ -72,6 +76,7 @@ impl std::fmt::Display for SupervisorTopology {
         match self {
             Self::Combined => f.write_str("combined"),
             Self::Sidecar => f.write_str("sidecar"),
+            Self::CniSidecar => f.write_str("cni-sidecar"),
         }
     }
 }
@@ -83,6 +88,7 @@ impl FromStr for SupervisorTopology {
         match s {
             "combined" => Ok(Self::Combined),
             "sidecar" => Ok(Self::Sidecar),
+            "cni-sidecar" => Ok(Self::CniSidecar),
             other => Err(format!("unknown topology '{other}'")),
         }
     }
@@ -562,6 +568,16 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.topology, SupervisorTopology::Combined);
+    }
+
+    #[test]
+    fn serde_override_topology_cni_sidecar() {
+        let json = serde_json::json!({
+            "topology": "cni-sidecar"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.topology, SupervisorTopology::CniSidecar);
+        assert_eq!(cfg.topology.to_string(), "cni-sidecar");
     }
 
     #[test]

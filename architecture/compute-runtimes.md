@@ -260,6 +260,103 @@ already unprivileged. Sidecar pods use a shared process namespace so the
 network sidecar can resolve workload process and binary identity through
 `/proc/<entrypoint-pid>`.
 
+The cni-sidecar topology keeps the sidecar runtime model and its shared-state
+boundary, but removes the privileged `openshell-network-init` init container and
+its `NET_ADMIN`. Instead, the privileged OpenShell CNI DaemonSet installs the
+pod-network bypass-prevention rules during CNI `ADD` using nftables or iptables.
+The driver annotates sandbox pods so the chained CNI plugin can read the proxy
+UID and enforcement mode. The network sidecar keeps the same privilege profile
+as the other sidecar topologies: in the default binary-aware mode it runs as UID
+0 with `SYS_PTRACE` and `DAC_READ_SEARCH` (but no `NET_ADMIN`) to resolve
+cross-UID `/proc`, and only stays non-root with no added capabilities when
+`process_binary_aware_network_policy` is disabled. The agent container stays
+non-root with no added Linux capabilities in either mode. Because the node CNI —
+not an in-pod container — programs the firewall, no container in the sandbox pod
+holds `NET_ADMIN`.
+
+The CNI installer supports two modes. `conflist` (default) appends the
+`openshell-cni` plugin to an existing CNI `.conflist` (k3s / vanilla). On
+OpenShift (Multus / OVN-Kubernetes) there is no appendable `.conflist`, so
+`multus-chain` writes a standalone plugin `.conf` into the Multus
+`vendor-cni-chain` auxiliary-chain directory and stores plugin credentials in a
+persistent `stateDir`. Neither mode modifies a CNO-managed file.
+
+The installer patches the chained plugin at startup and then re-verifies it on a
+reconcile tick, re-patching when the plugin is missing. This keeps enforcement in
+place across CNI config rewrites (for example a CNO reconcile) and DaemonSet
+restarts, bounding any such gap to one reconcile interval. The chained plugin
+lives in the host CNI config and survives installer pod restarts, so an ordinary
+DaemonSet restart or rolling update never strips enforcement: the `preStop` hook
+removes it only when the owning DaemonSet is actually being deleted (helm
+uninstall), and fences the node before doing so.
+
+A per-node scheduling gate closes the cold-start race. Once the chained plugin is
+installed, the installer labels its node `openshell.ai/cni-ready=true`. Each
+reconcile tick fences before it repairs: the instant enforcement is not
+verifiably in place it clears the label, attempts repair, and only re-marks the
+node ready once the plugin is healthy again. The gateway sets a required
+`nodeAffinity` on that label for every cni-sidecar sandbox pod, so a pod cannot
+schedule onto a node before that node's egress enforcement is active, and a node
+whose enforcement later breaks stops accepting new sandbox pods. The label is set
+through a minimal cluster-scoped grant (`nodes` `get`/`patch`, plus `get` on the
+installer's own DaemonSet) bound to the dedicated CNI ServiceAccount.
+
+The persistent label cannot by itself cover a node reboot that wipes tmpfs-backed
+enforcement (`multus-chain` stores the chain file under `/run`). A boot-time
+`NoSchedule` taint (`openshell.ai/cni-not-ready`) **narrows** that window but does
+not fully close it: operator node config applies it at boot (only node config
+runs before the scheduler; a MachineConfig example ships under
+`deploy/helm/openshell/examples/`), the CNI DaemonSet tolerates it, and the
+installer removes it once enforcement is ready (never re-adding it, so a transient
+unready does not over-repel). A small residual race remains because the taint is
+applied after the kubelet starts, so the kubelet can briefly mark the node
+schedulable before the taint lands; `--register-with-taints` covers the initial
+join but not reboot re-registration. `conflist` mode keeps the plugin on
+persistent disk and is unaffected by reboot, and is the way to avoid the window
+entirely. One residual
+limitation: an ungraceful DaemonSet pod deletion (no `preStop`) leaves a stale
+`cni-ready=true` until the pod is rescheduled and the next reconcile tick
+re-evaluates it.
+
+The CNI installer is a **cluster singleton**. Its chained plugin enforces pods
+that carry the OpenShell annotations (`openshell.ai/cni=enabled` plus the
+proxy-UID and enforcement-mode annotations, set only by a gateway on its own
+sandbox pods) **and** whose namespace is in the plugin's `sandboxNamespaces`
+allowlist. Pods in other namespaces are passed through without a Kubernetes API
+lookup, so the allowlist bounds the blast radius of the per-pod annotation read.
+The allowlist is built **automatically**: each `cni-sidecar` gateway release
+ships a Helm-owned marker ConfigMap (`openshell.ai/cni-registration=true`) in its
+sandbox namespace, and the installer's reconcile aggregates every marker's
+namespace (via `list-sandbox-namespaces`) — unioned with the optional static
+`cni.sandboxNamespaces` — into the plugin config. Because the marker is a normal
+Helm resource, uninstalling a release or changing its `sandboxNamespace` removes
+the registration (no orphaned allowlist entries). An additional `cni.external`
+release is discovered within one reconcile, with no manual allowlist edit. To
+eliminate the discovery-window race, the installer publishes on each node the CSV
+of namespaces it currently enforces (`openshell.ai/cni-sandbox-namespaces`
+annotation, via `set-node-coverage`), and every gateway runs a `wait-coverage`
+init container that blocks until each enforcement-ready node acknowledges the
+gateway's namespace — so a newly-registered release does not serve sandboxes until
+enforcement is confirmed cluster-wide. The installer resources use a fixed
+release-independent name, the plugin config carries a fixed `openshell` owner, and
+a `configVersion` (over the aggregated allowlist and config) binds readiness so a
+stale-version entry is repaired before the node is re-marked ready. Install the
+singleton (`cni.enabled=true`) in one release per cluster; additional releases set
+`cni.enabled=false` + `cni.external=true`. The installer treats any `openshell-cni`
+chained entry as its own and upgrades it in place (the conflist patch preserves
+all other plugins). The `pods get` and `configmaps list` grants are cluster-scoped
+so the one installer can discover marker ConfigMaps and read sandbox pods in any
+allowlisted namespace.
+
+On OpenShift, binary-aware network policy also requires a purpose-built
+SecurityContextConstraints for sandbox pods: the network sidecar runs as UID 0
+with `SYS_PTRACE` and `DAC_READ_SEARCH` to inspect cross-UID `/proc`, which
+`restricted-v2` forbids. `sandboxServiceAccount.openshift.binaryAwareSCC` creates
+a minimal SCC (the `restricted-v2` baseline plus only those two capabilities, UID
+0, and the `image` volume type) and binds it to the sandbox ServiceAccount.
+Disabling `processBinaryAwareNetworkPolicy` drops the capability requirement and
+lets the stock `restricted-v2` SCC apply.
+
 ## Images
 
 The gateway image and Helm chart are built from this repository. Sandbox images

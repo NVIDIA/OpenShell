@@ -1449,6 +1449,22 @@ const SIDECAR_TLS_VOLUME_NAME: &str = "openshell-supervisor-tls";
 const SIDECAR_TLS_MOUNT_PATH: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
 const SIDECAR_CLIENT_TLS_MOUNT_PATH: &str = openshell_core::container_paths::SIDECAR_CLIENT_TLS_DIR;
 
+const SIDECAR_PROXY_PORT: u16 = 3128;
+
+const OPENSHELL_CNI_ENABLED_ANNOTATION: &str = "openshell.ai/cni";
+const OPENSHELL_CNI_SANDBOX_ID_ANNOTATION: &str = "openshell.ai/sandbox-id";
+const OPENSHELL_CNI_PROXY_UID_ANNOTATION: &str = "openshell.ai/proxy-uid";
+const OPENSHELL_CNI_PROXY_PORT_ANNOTATION: &str = "openshell.ai/proxy-port";
+const OPENSHELL_CNI_NETWORK_ENFORCEMENT_MODE_ANNOTATION: &str =
+    "openshell.ai/network-enforcement-mode";
+const CNI_SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "cni-sidecar";
+/// Node label the CNI installer sets once per-node egress enforcement is in
+/// place. Sandbox pods in the cni-sidecar topology require it via nodeAffinity
+/// so they cannot schedule onto a node before the chained plugin is active
+/// (closing the cold-start fail-open window). Must stay in sync with
+/// `NODE_READY_LABEL` in `openshell-cni` and the CNI `DaemonSet`'s node-patch RBAC.
+const OPENSHELL_CNI_READY_NODE_LABEL: &str = "openshell.ai/cni-ready";
+
 /// Build the emptyDir volume that holds the supervisor binary.
 ///
 /// The init container writes the binary here; the agent container reads it.
@@ -1677,6 +1693,7 @@ fn supervisor_sidecar_env(
     template_environment: &std::collections::HashMap<String, String>,
     spec_environment: &std::collections::HashMap<String, String>,
     params: &SandboxPodParams<'_>,
+    topology: SupervisorTopology,
 ) -> Vec<serde_json::Value> {
     let mut env = Vec::new();
     apply_required_env(
@@ -1709,7 +1726,7 @@ fn supervisor_sidecar_env(
     upsert_env(
         &mut env,
         openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY,
-        "sidecar",
+        &topology.to_string(),
     );
     upsert_env(
         &mut env,
@@ -1746,6 +1763,7 @@ fn supervisor_sidecar_container(
     template_environment: &std::collections::HashMap<String, String>,
     spec_environment: &std::collections::HashMap<String, String>,
     params: &SandboxPodParams<'_>,
+    topology: SupervisorTopology,
 ) -> serde_json::Value {
     let proxy_uid = effective_sidecar_proxy_uid(params);
     let capabilities = if params.process_binary_aware_network_policy {
@@ -1765,7 +1783,7 @@ fn supervisor_sidecar_container(
             SUPERVISOR_IMAGE_BINARY_PATH,
             "--mode=network",
         ],
-        "env": supervisor_sidecar_env(template_environment, spec_environment, params),
+        "env": supervisor_sidecar_env(template_environment, spec_environment, params, topology),
         "securityContext": {
             "runAsUser": proxy_uid,
             "runAsGroup": params.sandbox_gid,
@@ -1783,6 +1801,22 @@ fn supervisor_sidecar_container(
             }
         ]
     });
+    // In the CNI-sidecar topology there is no network-init container to copy the
+    // gateway client mTLS bundle into the shared TLS emptyDir, because CNI-sidecar
+    // omits network-init (the node CNI plugin programs egress redirection instead).
+    // Mount the client TLS secret directly at the client subdir so the network
+    // supervisor can authenticate to the gateway (policy fetch, callbacks). The
+    // secret volume is provisioned by the base template with fsGroup-readable mode.
+    if topology == SupervisorTopology::CniSidecar && !params.client_tls_secret_name.is_empty() {
+        container["volumeMounts"]
+            .as_array_mut()
+            .expect("volumeMounts is an array")
+            .push(serde_json::json!({
+                "name": CLIENT_TLS_VOLUME_NAME,
+                "mountPath": SIDECAR_CLIENT_TLS_MOUNT_PATH,
+                "readOnly": true
+            }));
+    }
     if !params.supervisor_image_pull_policy.is_empty() {
         container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
     }
@@ -1864,6 +1898,7 @@ fn apply_supervisor_sidecar_topology(
     template_environment: &std::collections::HashMap<String, String>,
     spec_environment: &std::collections::HashMap<String, String>,
     params: &SandboxPodParams<'_>,
+    install_network_init: bool,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
@@ -1900,12 +1935,14 @@ fn apply_supervisor_sidecar_topology(
         }));
     }
 
-    let init_containers = spec
-        .entry("initContainers")
-        .or_insert_with(|| serde_json::json!([]))
-        .as_array_mut();
-    if let Some(init_containers) = init_containers {
-        init_containers.push(supervisor_network_init_container(params));
+    if install_network_init {
+        let init_containers = spec
+            .entry("initContainers")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(init_containers) = init_containers {
+            init_containers.push(supervisor_network_init_container(params));
+        }
     }
 
     let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
@@ -1989,7 +2026,7 @@ fn apply_supervisor_sidecar_topology(
             upsert_env(
                 env,
                 openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY,
-                "sidecar",
+                &params.topology.to_string(),
             );
             upsert_env(
                 env,
@@ -2019,6 +2056,7 @@ fn apply_supervisor_sidecar_topology(
         template_environment,
         spec_environment,
         params,
+        params.topology,
     ));
 }
 
@@ -2043,6 +2081,8 @@ fn apply_workspace_persistence(
     image: &str,
     image_pull_policy: &str,
     sandbox_gid: u32,
+    workspace_init_uid: u32,
+    harden_init: bool,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
@@ -2119,13 +2159,38 @@ fn apply_workspace_persistence(
              fi"
         );
 
+        // The workspace-init container runs the user-selected (untrusted) agent
+        // image. Running it as UID 0 is a policy-bypass risk under binary-aware
+        // network policy, where the CNI firewall exempts UID 0 so the network
+        // sidecar can reach the gateway: an init running as root would inherit
+        // that exemption and egress freely before the sidecar enforces policy.
+        // Callers pass the sandbox UID in that mode (non-exempt, still able to
+        // seed the PVC via fsGroup) and 0 otherwise (where UID 0 is not exempt).
+        //
+        // Harden the init in every sidecar topology (`harden_init`), not just the
+        // binary-aware case. A sidecar pod always has a separate network
+        // supervisor at an exempt UID and shares the pod netns, so a root init
+        // with default capabilities could switch to the exempt UID (CAP_SETUID)
+        // or craft packets around the L4 firewall (CAP_NET_RAW) to bypass egress.
+        // Dropping all capabilities and disabling privilege escalation closes
+        // both; runAsNonRoot is asserted only when the init already runs non-root
+        // (binary-aware), since the non-binary-aware sidecar init still needs
+        // UID 0. Only the Combined topology (no separate exempt sidecar) keeps
+        // default root capabilities, preserving broad DAC read access to seed the
+        // PVC from image files owned by other UIDs with restrictive modes.
+        let mut security_context = serde_json::json!({ "runAsUser": workspace_init_uid });
+        if harden_init {
+            security_context["allowPrivilegeEscalation"] = serde_json::json!(false);
+            security_context["capabilities"] = serde_json::json!({ "drop": ["ALL"] });
+            if workspace_init_uid != 0 {
+                security_context["runAsNonRoot"] = serde_json::json!(true);
+            }
+        }
         let mut init_spec = serde_json::json!({
             "name": WORKSPACE_INIT_CONTAINER_NAME,
             "image": image,
             "command": ["sh", "-c", copy_cmd],
-            "securityContext": {
-                "runAsUser": 0,
-            },
+            "securityContext": security_context,
             "volumeMounts": [{
                 "name": WORKSPACE_VOLUME_NAME,
                 "mountPath": WORKSPACE_INIT_MOUNT_PATH
@@ -2245,7 +2310,11 @@ impl Default for SandboxPodParams<'_> {
 fn validate_sidecar_proxy_identity(
     params: &SandboxPodParams<'_>,
 ) -> Result<(), KubernetesDriverError> {
-    if params.topology == SupervisorTopology::Sidecar && params.proxy_uid == params.sandbox_uid {
+    if matches!(
+        params.topology,
+        SupervisorTopology::Sidecar | SupervisorTopology::CniSidecar
+    ) && params.proxy_uid == params.sandbox_uid
+    {
         return Err(KubernetesDriverError::Precondition(format!(
             "proxy_uid ({}) must not match sandbox_uid ({}) in sidecar topology",
             params.proxy_uid, params.sandbox_uid
@@ -2412,6 +2481,7 @@ fn sandbox_template_to_k8s_with_validated_config(
         .iter()
         .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
         .collect::<serde_json::Map<String, serde_json::Value>>();
+    let cni_sidecar_topology = params.topology == SupervisorTopology::CniSidecar;
     if params.provider_spiffe_enabled {
         pod_labels.insert(
             LABEL_MANAGED_BY.to_string(),
@@ -2445,6 +2515,36 @@ fn sandbox_template_to_k8s_with_validated_config(
             serde_json::Value::String(params.sandbox_id.to_string()),
         );
     }
+    if cni_sidecar_topology {
+        pod_annotations.insert(
+            OPENSHELL_CNI_ENABLED_ANNOTATION.to_string(),
+            serde_json::Value::String("enabled".to_string()),
+        );
+        if !params.sandbox_id.is_empty() {
+            pod_annotations.insert(
+                OPENSHELL_CNI_SANDBOX_ID_ANNOTATION.to_string(),
+                serde_json::Value::String(params.sandbox_id.to_string()),
+            );
+        }
+        // Annotate the UID the sidecar proxy actually runs as so the node CNI
+        // plugin exempts the right identity from egress redirection. In
+        // binary-aware mode the sidecar runs as UID 0 (see
+        // effective_sidecar_proxy_uid); annotating the raw params.proxy_uid
+        // (e.g. 1337) would make the CNI redirect the sidecar's own egress and
+        // block it from reaching the gateway.
+        pod_annotations.insert(
+            OPENSHELL_CNI_PROXY_UID_ANNOTATION.to_string(),
+            serde_json::Value::String(effective_sidecar_proxy_uid(params).to_string()),
+        );
+        pod_annotations.insert(
+            OPENSHELL_CNI_PROXY_PORT_ANNOTATION.to_string(),
+            serde_json::Value::String(SIDECAR_PROXY_PORT.to_string()),
+        );
+        pod_annotations.insert(
+            OPENSHELL_CNI_NETWORK_ENFORCEMENT_MODE_ANNOTATION.to_string(),
+            serde_json::Value::String(CNI_SIDECAR_NETWORK_ENFORCEMENT_MODE.to_string()),
+        );
+    }
     if !pod_annotations.is_empty() {
         metadata.insert(
             "annotations".to_string(),
@@ -2475,6 +2575,14 @@ fn sandbox_template_to_k8s_with_validated_config(
         spec.insert("tolerations".to_string(), tolerations);
     }
     apply_pod_driver_config(&mut spec, &driver_config.pod);
+
+    // In the cni-sidecar topology, egress enforcement is programmed by the node
+    // CNI plugin, not an in-pod init container. Require the CNI installer's
+    // node-ready label so a sandbox pod cannot schedule onto a node before that
+    // node's chained plugin is active — closing the cold-start fail-open window.
+    if params.topology == SupervisorTopology::CniSidecar {
+        apply_cni_ready_node_affinity(&mut spec);
+    }
 
     // Per-sandbox platform_config.host_users overrides the cluster-wide default.
     let use_user_namespaces = platform_config_bool(template, "host_users")
@@ -2616,7 +2724,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     if !params.client_tls_secret_name.is_empty() {
         let client_tls_default_mode = match params.topology {
             SupervisorTopology::Combined => 0o400,
-            SupervisorTopology::Sidecar => 0o440,
+            SupervisorTopology::Sidecar | SupervisorTopology::CniSidecar => 0o440,
         };
         volumes.push(serde_json::json!({
             "name": CLIENT_TLS_VOLUME_NAME,
@@ -2642,7 +2750,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     // supervisor containers run with the sandbox GID and need group-read access.
     let sa_token_default_mode = match params.topology {
         SupervisorTopology::Combined => 0o400,
-        SupervisorTopology::Sidecar => 0o440,
+        SupervisorTopology::Sidecar | SupervisorTopology::CniSidecar => 0o440,
     };
     volumes.push(serde_json::json!({
         "name": SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
@@ -2701,6 +2809,16 @@ fn sandbox_template_to_k8s_with_validated_config(
                 &template.environment,
                 spec_environment,
                 params,
+                true,
+            );
+        }
+        SupervisorTopology::CniSidecar => {
+            apply_supervisor_sidecar_topology(
+                &mut result,
+                &template.environment,
+                spec_environment,
+                params,
+                false,
             );
         }
     }
@@ -2709,15 +2827,80 @@ fn sandbox_template_to_k8s_with_validated_config(
     // that /sandbox data survives pod rescheduling. Skipped when the user
     // provides custom storage through driver_config.
     if inject_workspace {
+        // The sidecar topologies run a separate network supervisor at an exempt
+        // UID and share the pod netns, so their untrusted workspace-init must be
+        // hardened against egress bypass; the combined topology has no separate
+        // exempt sidecar and keeps default root capabilities for read access.
+        let harden_init = matches!(
+            params.topology,
+            SupervisorTopology::Sidecar | SupervisorTopology::CniSidecar
+        );
+        // In binary-aware mode the CNI firewall exempts UID 0 itself, so the init
+        // must not run as root at all; run it as the non-exempt sandbox UID.
+        // Otherwise it runs as UID 0 but hardened (no CAP_SETUID/CAP_NET_RAW), so
+        // it cannot switch to the exempt proxy UID or craft raw packets.
+        let workspace_init_uid = if harden_init && params.process_binary_aware_network_policy {
+            params.sandbox_uid
+        } else {
+            0
+        };
         apply_workspace_persistence(
             &mut result,
             image,
             params.image_pull_policy,
             params.sandbox_gid,
+            workspace_init_uid,
+            harden_init,
         );
     }
 
     result
+}
+
+/// Adds a required nodeAffinity term that gates scheduling on the CNI
+/// installer's node-ready label. The requirement is added to every existing
+/// nodeSelectorTerm (or a fresh one when none exist) — a match expression is
+/// conjunctive within a term — so it composes with any operator-supplied
+/// affinity without weakening it. `IgnoredDuringExecution` matches upstream
+/// behavior: it gates placement, not eviction of running pods.
+fn apply_cni_ready_node_affinity(spec: &mut serde_json::Map<String, serde_json::Value>) {
+    let requirement = serde_json::json!({
+        "key": OPENSHELL_CNI_READY_NODE_LABEL,
+        "operator": "In",
+        "values": ["true"],
+    });
+
+    let terms = spec
+        .entry("affinity")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("affinity is an object")
+        .entry("nodeAffinity")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("nodeAffinity is an object")
+        .entry("requiredDuringSchedulingIgnoredDuringExecution")
+        .or_insert_with(|| serde_json::json!({ "nodeSelectorTerms": [] }))
+        .as_object_mut()
+        .expect("nodeSelector is an object")
+        .entry("nodeSelectorTerms")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .expect("nodeSelectorTerms is an array");
+
+    if terms.is_empty() {
+        terms.push(serde_json::json!({ "matchExpressions": [requirement] }));
+        return;
+    }
+    for term in terms.iter_mut() {
+        term.as_object_mut()
+            .expect("nodeSelectorTerm is an object")
+            .entry("matchExpressions")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .expect("matchExpressions is an array")
+            .push(requirement.clone());
+    }
 }
 
 fn apply_pod_driver_config(
@@ -4570,6 +4753,431 @@ mod tests {
     }
 
     #[test]
+    fn cni_sidecar_topology_omits_network_init_and_adds_cni_annotations() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::CniSidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::ImageVolume,
+            supervisor_image: "supervisor-image:latest",
+            grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
+            sandbox_id: "sb-cni",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            // Non-binary-aware: the sidecar runs as proxy_uid, so the CNI
+            // proxy-uid annotation should reflect that raw UID.
+            process_binary_aware_network_policy: false,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        let annotations = pod_template["metadata"]["annotations"].as_object().unwrap();
+        assert_eq!(
+            annotations[OPENSHELL_CNI_ENABLED_ANNOTATION],
+            serde_json::json!("enabled")
+        );
+        assert_eq!(
+            annotations[OPENSHELL_CNI_SANDBOX_ID_ANNOTATION],
+            serde_json::json!("sb-cni")
+        );
+        assert_eq!(
+            annotations[OPENSHELL_CNI_PROXY_UID_ANNOTATION],
+            serde_json::json!("2200")
+        );
+        assert_eq!(
+            annotations[OPENSHELL_CNI_PROXY_PORT_ANNOTATION],
+            serde_json::json!(SIDECAR_PROXY_PORT.to_string())
+        );
+        assert_eq!(
+            annotations[OPENSHELL_CNI_NETWORK_ENFORCEMENT_MODE_ANNOTATION],
+            serde_json::json!(CNI_SIDECAR_NETWORK_ENFORCEMENT_MODE)
+        );
+
+        let init_containers = pod_template["spec"]
+            .get("initContainers")
+            .and_then(|containers| containers.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !init_containers
+                .iter()
+                .any(|container| container["name"] == SUPERVISOR_NETWORK_INIT_CONTAINER_NAME)
+        );
+
+        let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        assert_eq!(containers.len(), 2);
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY),
+            Some("cni-sidecar")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE),
+            Some("sidecar-nftables")
+        );
+        let sidecar = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY),
+            Some("cni-sidecar")
+        );
+    }
+
+    /// Regression test for the cni-sidecar proxy-uid annotation.
+    ///
+    /// In binary-aware mode the network sidecar runs as UID 0 (see
+    /// `effective_sidecar_proxy_uid`), not `params.proxy_uid`. The CNI proxy-uid
+    /// annotation tells the node plugin which UID to exempt from egress
+    /// redirection; annotating the raw `params.proxy_uid` would make the CNI
+    /// redirect the sidecar's own egress and block it from reaching the gateway.
+    /// The annotation must reflect the effective (runAsUser) UID.
+    #[test]
+    fn cni_sidecar_binary_aware_annotates_effective_proxy_uid() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::CniSidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::ImageVolume,
+            supervisor_image: "supervisor-image:latest",
+            grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
+            sandbox_id: "sb-cni-ba",
+            proxy_uid: 1337,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            process_binary_aware_network_policy: true,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        // The sidecar runs as UID 0 in binary-aware mode; the annotation must
+        // match so the node CNI exempts the sidecar's own egress.
+        let annotations = pod_template["metadata"]["annotations"].as_object().unwrap();
+        assert_eq!(
+            annotations[OPENSHELL_CNI_PROXY_UID_ANNOTATION],
+            serde_json::json!(BINARY_AWARE_SIDECAR_PROXY_UID.to_string())
+        );
+
+        let sidecar = pod_template["spec"]["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert_eq!(
+            sidecar["securityContext"]["runAsUser"],
+            serde_json::json!(BINARY_AWARE_SIDECAR_PROXY_UID)
+        );
+    }
+
+    /// Regression test for the cni-sidecar gateway client mTLS bundle.
+    ///
+    /// The cni-sidecar topology omits the network-init container (the node CNI
+    /// plugin programs egress redirection instead). In the standard sidecar
+    /// topology, network-init also copies the gateway client mTLS bundle into
+    /// the shared TLS emptyDir at `<proxy>/client`; dropping network-init would
+    /// otherwise leave that path empty, so the network supervisor cannot read
+    /// its client cert and crash-loops on policy fetch. cni-sidecar must instead
+    /// mount the client TLS secret directly onto the network sidecar so the
+    /// bundle is present at the path the sidecar env points at.
+    #[test]
+    fn cni_sidecar_topology_mounts_client_tls_on_network_sidecar() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::CniSidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::ImageVolume,
+            supervisor_image: "supervisor-image:latest",
+            grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
+            sandbox_id: "sb-cni-tls",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            client_tls_secret_name: "openshell-client-tls",
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        // The client TLS secret volume must be present in the pod spec.
+        let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
+        let client_tls_volume = volumes
+            .iter()
+            .find(|volume| volume["name"] == CLIENT_TLS_VOLUME_NAME)
+            .expect("client TLS secret volume must be provisioned");
+        assert_eq!(
+            client_tls_volume["secret"]["secretName"],
+            serde_json::json!("openshell-client-tls")
+        );
+
+        // The network sidecar must mount that secret at the client subdir the
+        // sidecar env points OPENSHELL_TLS_CA/CERT/KEY at, read-only.
+        let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        let sidecar = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        let mounts = sidecar["volumeMounts"].as_array().unwrap();
+        let client_tls_mount = mounts
+            .iter()
+            .find(|mount| mount["name"] == CLIENT_TLS_VOLUME_NAME)
+            .expect("network sidecar must mount the client TLS secret");
+        assert_eq!(
+            client_tls_mount["mountPath"],
+            serde_json::json!(SIDECAR_CLIENT_TLS_MOUNT_PATH)
+        );
+        assert_eq!(client_tls_mount["readOnly"], serde_json::json!(true));
+
+        // The sidecar env must reference that same mount path so the mount and
+        // the consuming paths stay in lockstep.
+        assert_eq!(
+            rendered_env(sidecar, "OPENSHELL_TLS_CA"),
+            Some(format!("{SIDECAR_CLIENT_TLS_MOUNT_PATH}/ca.crt").as_str())
+        );
+    }
+
+    /// Regression test for the cold-start scheduling gate.
+    ///
+    /// cni-sidecar pods must carry a required nodeAffinity on the CNI installer's
+    /// node-ready label so they cannot land on a node before that node's chained
+    /// plugin is active.
+    #[test]
+    fn cni_sidecar_requires_cni_ready_node_affinity() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::CniSidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::ImageVolume,
+            supervisor_image: "supervisor-image:latest",
+            grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
+            sandbox_id: "sb-cni-gate",
+            proxy_uid: 1337,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            process_binary_aware_network_policy: true,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        let terms = &pod_template["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+            ["nodeSelectorTerms"];
+        let expressions = terms[0]["matchExpressions"].as_array().unwrap();
+        let requirement = expressions
+            .iter()
+            .find(|expr| expr["key"] == OPENSHELL_CNI_READY_NODE_LABEL)
+            .expect("cni-sidecar pod must require the cni-ready node label");
+        assert_eq!(requirement["operator"], "In");
+        assert_eq!(requirement["values"], serde_json::json!(["true"]));
+    }
+
+    /// The scheduling gate is cni-sidecar-specific; other topologies enforce in
+    /// pod and must not carry the node-ready affinity.
+    #[test]
+    fn non_cni_sidecar_has_no_cni_ready_node_affinity() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::ImageVolume,
+            supervisor_image: "supervisor-image:latest",
+            grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
+            sandbox_id: "sb-no-gate",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+        assert!(
+            pod_template["spec"]["affinity"]["nodeAffinity"].is_null(),
+            "non-cni-sidecar pods must not carry cni-ready nodeAffinity"
+        );
+    }
+
+    /// Regression test for the workspace-init policy-bypass hole.
+    ///
+    /// The workspace-init container runs the untrusted user image. Under
+    /// binary-aware network policy the CNI firewall exempts UID 0 so the network
+    /// sidecar can reach the gateway; an init running as root would inherit that
+    /// exemption and egress before policy is enforced. It must run as the
+    /// non-exempt sandbox UID instead.
+    #[test]
+    fn binary_aware_workspace_init_runs_as_sandbox_uid() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::CniSidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::ImageVolume,
+            supervisor_image: "supervisor-image:latest",
+            grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
+            sandbox_id: "sb-cni-init",
+            proxy_uid: 1337,
+            sandbox_uid: 1_000_790_000,
+            sandbox_gid: 1_000_790_000,
+            process_binary_aware_network_policy: true,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            true, // inject_workspace
+            &params,
+        );
+
+        let init = pod_template["spec"]["initContainers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|container| container["name"] == WORKSPACE_INIT_CONTAINER_NAME)
+            .expect("workspace-init container must be present");
+        let sc = &init["securityContext"];
+        assert_eq!(
+            sc["runAsUser"],
+            serde_json::json!(1_000_790_000),
+            "workspace-init must run as the non-exempt sandbox UID in binary-aware mode"
+        );
+        // Hardening: a setuid binary in the untrusted image must not be able to
+        // regain the exempt UID 0.
+        assert_eq!(sc["allowPrivilegeEscalation"], serde_json::json!(false));
+        assert_eq!(sc["runAsNonRoot"], serde_json::json!(true));
+        assert_eq!(sc["capabilities"]["drop"], serde_json::json!(["ALL"]));
+    }
+
+    /// The UID-0 exemption only exists in the sidecar topologies. A combined
+    /// deployment with binary-aware policy on must keep root for workspace-init
+    /// so it retains access to root-owned image and PVC contents.
+    #[test]
+    fn combined_topology_workspace_init_keeps_root() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Combined,
+            supervisor_sideload_method: SupervisorSideloadMethod::ImageVolume,
+            supervisor_image: "supervisor-image:latest",
+            grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
+            sandbox_id: "sb-combined-init",
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            process_binary_aware_network_policy: true,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            true, // inject_workspace
+            &params,
+        );
+
+        let init = pod_template["spec"]["initContainers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|container| container["name"] == WORKSPACE_INIT_CONTAINER_NAME)
+            .expect("workspace-init container must be present");
+        assert_eq!(
+            init["securityContext"]["runAsUser"],
+            serde_json::json!(0),
+            "combined topology keeps root workspace-init even with binary-aware policy"
+        );
+        // Root init keeps default capabilities (UID 0 is not CNI-exempt here) so
+        // it retains broad DAC read access; the setuid-hardening must NOT apply.
+        assert!(init["securityContext"]["allowPrivilegeEscalation"].is_null());
+        assert!(init["securityContext"]["runAsNonRoot"].is_null());
+        assert!(init["securityContext"]["capabilities"].is_null());
+    }
+
+    /// Without binary-aware policy the sidecar init still runs as UID 0 (it needs
+    /// root), but must be hardened: a sidecar pod has a separate exempt network
+    /// supervisor, so the untrusted init must not keep `CAP_SETUID`/`CAP_NET_RAW`
+    /// (it could switch to the exempt UID or craft raw packets to bypass egress).
+    #[test]
+    fn non_binary_aware_workspace_init_runs_as_root() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::ImageVolume,
+            supervisor_image: "supervisor-image:latest",
+            grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
+            sandbox_id: "sb-init-root",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            process_binary_aware_network_policy: false,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            true, // inject_workspace
+            &params,
+        );
+
+        let init = pod_template["spec"]["initContainers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|container| container["name"] == WORKSPACE_INIT_CONTAINER_NAME)
+            .expect("workspace-init container must be present");
+        let sc = &init["securityContext"];
+        assert_eq!(
+            sc["runAsUser"],
+            serde_json::json!(0),
+            "non-binary-aware sidecar init still needs UID 0"
+        );
+        // Hardened even at UID 0: no CAP_SETUID/CAP_NET_RAW, no privilege
+        // escalation. runAsNonRoot is NOT set (it runs as root).
+        assert_eq!(sc["allowPrivilegeEscalation"], serde_json::json!(false));
+        assert_eq!(sc["capabilities"]["drop"], serde_json::json!(["ALL"]));
+        assert!(sc["runAsNonRoot"].is_null());
+    }
+
+    #[test]
     fn sidecar_topology_rejects_proxy_uid_matching_sandbox_uid() {
         let params = SandboxPodParams {
             topology: SupervisorTopology::Sidecar,
@@ -5065,7 +5673,9 @@ mod tests {
             &mut pod_template,
             "openshell/sandbox:latest",
             "IfNotPresent",
-            1000, // sandbox_gid
+            1000,  // sandbox_gid
+            0,     // workspace_init_uid (root)
+            false, // harden_init (combined)
         );
 
         // Init container
@@ -5125,6 +5735,8 @@ mod tests {
             "my-custom-image:v2",
             "IfNotPresent",
             1000,
+            0,
+            false,
         );
 
         let init_image = pod_template["spec"]["initContainers"][0]["image"]
@@ -5147,7 +5759,7 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1000);
+        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1000, 0, false);
 
         let cmd = pod_template["spec"]["initContainers"][0]["command"]
             .as_array()

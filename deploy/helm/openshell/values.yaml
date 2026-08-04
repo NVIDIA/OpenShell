@@ -48,19 +48,82 @@ supervisor:
   # "combined" runs the current single supervisor container in the agent pod.
   # "sidecar" runs network enforcement in a dedicated sidecar and the process
   # supervisor as a low-capability wrapper in the agent container.
+  # "cni-sidecar" keeps the sidecar runtime model but installs pod-network rules
+  # through the OpenShell CNI plugin.
   topology: "combined"
   sidecar:
-    # -- UID for relaxed long-running network sidecars in sidecar topology.
-    # Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants
-    # the required /proc inspection capabilities into the effective set. The
-    # network init container installs nftables rules that exempt the effective
-    # sidecar UID.
+    # -- UID for relaxed long-running network sidecars in sidecar and cni-sidecar
+    # topologies. Strict process/binary-aware sidecars run as UID 0 so Kubernetes
+    # grants the required /proc inspection capabilities into the effective set. In
+    # sidecar topology the network init container installs nftables rules that
+    # exempt the effective sidecar UID; in cni-sidecar topology the CNI plugin
+    # installs equivalent nftables or iptables rules.
     proxyUid: 1337
     # -- Keep process/binary-aware network policy enabled in sidecar topology.
     # When false, the network sidecar runs as proxyUid, drops the extra /proc
     # inspection capabilities, and enforces endpoint/L7 policy without matching
     # policy.binaries.
     processBinaryAwareNetworkPolicy: true
+
+cni:
+  # -- Install the OpenShell chained CNI plugin as a privileged node DaemonSet.
+  # The installer is a CLUSTER SINGLETON: one installation serves every OpenShell
+  # release's sandbox pods across all namespaces (enforcement is keyed on pod
+  # annotations the gateway sets). Enable it in exactly one release per cluster.
+  # Required for supervisor.topology="cni-sidecar" unless cni.external=true.
+  enabled: false
+  # -- Use a CNI singleton installed by another release/chart instead of
+  # installing one here. Set this (with supervisor.topology="cni-sidecar" and
+  # cni.enabled=false) on additional gateway releases that share the cluster's
+  # existing OpenShell CNI installation.
+  external: false
+  # -- Optional STATIC additions to the plugin's enforcement allowlist. The
+  # allowlist is normally built automatically: each cni-sidecar release ships a
+  # Helm-owned marker ConfigMap (openshell.ai/cni-registration=true) in its sandbox
+  # namespace and the singleton aggregates all marker namespaces. This value is
+  # unioned with that discovery for namespaces you want enforced without a marker.
+  # Pods in namespaces neither registered nor listed are passed through without a
+  # Kubernetes API lookup (blast-radius guard). Empty additionally seeds the owner
+  # release's sandbox namespace.
+  sandboxNamespaces: []
+  # -- CNI installer strategy. "conflist" appends the OpenShell plugin to an
+  # existing CNI .conflist (k3s / vanilla). "multus-chain" writes a standalone
+  # plugin .conf into a Multus vendor-cni-chain subdirectory (OpenShift), which
+  # never modifies a CNO-managed file.
+  mode: conflist
+  image:
+    # -- CNI installer image repository. Empty falls back to supervisor.image.repository, then the official supervisor repository.
+    repository: ""
+    # -- CNI installer image pull policy. Empty uses supervisor.image.pullPolicy, then image.pullPolicy.
+    pullPolicy: ""
+    # -- CNI installer image tag. Empty falls back to supervisor.image.tag, then image.tag, then chart appVersion.
+    tag: ""
+  # -- Host CNI binary directory.
+  binDir: /opt/cni/bin
+  # -- Host CNI config directory.
+  confDir: /etc/cni/net.d
+  # -- Log level passed to the OpenShell CNI plugin.
+  logLevel: info
+  # -- Host log file written by the OpenShell CNI plugin and tailed by the installer DaemonSet.
+  logFile: /var/log/openshell-cni.log
+  # -- Host CNI conflist filename patched by the installer. Empty selects the first non-OpenShell .conflist.
+  configFile: ""
+  # -- Host Multus vendor-cni-chain directory. Only used when mode is
+  # "multus-chain". The installer writes openshell-cni.conf here.
+  chainDir: ""
+  # -- Persistent host directory for plugin credentials (kubeconfig, token,
+  # ca.crt) in "multus-chain" mode. Empty falls back to confDir. Must not be a
+  # tmpfs path such as one under /run.
+  stateDir: ""
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  openshift:
+    # -- Grant the privileged SecurityContextConstraints to the CNI
+    # ServiceAccount. Required on OpenShift for the privileged installer
+    # DaemonSet. Creates a ClusterRole + ClusterRoleBinding.
+    privilegedSCC: false
 
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []
@@ -84,6 +147,17 @@ sandboxServiceAccount:
   annotations: {}
   # -- Existing service account name for sandbox pods when sandboxServiceAccount.create is false.
   name: ""
+  openshift:
+    # -- Create a minimal SecurityContextConstraints for sandbox pods and grant
+    # it to the sandbox ServiceAccount. Required on OpenShift for "sidecar" and
+    # "cni-sidecar" topologies when supervisor.sidecar.processBinaryAwareNetworkPolicy
+    # is true: the network sidecar must run as UID 0 with SYS_PTRACE and
+    # DAC_READ_SEARCH to inspect cross-UID /proc, which restricted-v2 forbids.
+    # The SCC is minimal — it adds only those two capabilities plus the image
+    # volume type over the restricted baseline; everything else stays locked
+    # down (no privileged, no host namespaces, drop ALL, seccomp runtime/default).
+    # Creates a SecurityContextConstraints + ClusterRole + ClusterRoleBinding.
+    binaryAwareSCC: false
 
 # -- Extra annotations to add to the gateway pod.
 podAnnotations: {}

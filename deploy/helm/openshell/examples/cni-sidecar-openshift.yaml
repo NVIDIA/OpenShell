@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example values for the cni-sidecar topology on OpenShift (Multus / OVN-K).
+#
+# The OpenShell CNI installer is a CLUSTER SINGLETON: one installation enforces
+# every OpenShell release's sandbox pods across all namespaces. Enable it
+# (cni.enabled=true) in exactly one release per cluster. Additional gateway
+# releases that share it set cni.enabled=false and cni.external=true (see
+# cni-sidecar-openshift-extra-release.yaml).
+#
+# Copy and adjust, then:
+#   helm install openshell deploy/helm/openshell -n openshell \
+#     -f deploy/helm/openshell/examples/cni-sidecar-openshift.yaml
+
+cni:
+  enabled: true
+  # OpenShift's default network is managed by the Cluster Network Operator; there
+  # is no appendable CNI .conflist, so chain the plugin via Multus instead.
+  mode: multus-chain
+  # OpenShift cri-o resolves plugins from /var/lib/cni/bin (/opt/cni/bin is absent).
+  binDir: /var/lib/cni/bin
+  # Multus vendor-cni-chain directory (tmpfs; the installer re-asserts it).
+  chainDir: /run/multus/cni/net.d/vendor-cni-chain
+  # Persistent directory for plugin credentials (chainDir is tmpfs).
+  stateDir: /etc/kubernetes/cni/openshell
+  openshift:
+    # Grant the privileged SCC to the dedicated CNI ServiceAccount only.
+    privilegedSCC: true
+
+supervisor:
+  topology: cni-sidecar
+
+sandboxServiceAccount:
+  openshift:
+    # The network sidecar runs as UID 0 with SYS_PTRACE + DAC_READ_SEARCH for
+    # binary-aware policy; restricted-v2 forbids this, so grant the sandbox SA a
+    # minimal purpose-built SCC.
+    binaryAwareSCC: true

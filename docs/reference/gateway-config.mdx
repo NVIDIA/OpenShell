@@ -331,6 +331,10 @@ supervisor_sideload_method     = "image-volume"
 # "combined" runs the existing single supervisor container with full process,
 # filesystem, and network enforcement in the agent container. "sidecar" moves
 # pod-level network enforcement and gateway session handling into a network sidecar.
+# "cni-sidecar" keeps the sidecar runtime model but expects an OpenShell CNI
+# plugin to install the pod-network rules before the workload starts. In sidecar
+# and cni-sidecar modes, the agent container runs non-root with no added Linux
+# capabilities and process/filesystem enforcement is network-only.
 topology                       = "combined"
 grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"
@@ -364,7 +368,8 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # UID used by relaxed long-running network sidecars. Strict process/binary-aware
 # sidecars run as UID 0 so Kubernetes grants the required /proc inspection
 # capabilities into the effective set. In sidecar topology the network init
-# container installs nftables rules that exempt the effective sidecar UID.
+# container installs nftables rules that exempt the effective sidecar UID; in
+# cni-sidecar topology the OpenShell CNI plugin installs equivalent rules.
 proxy_uid                      = 1337
 # Keep process/binary-aware network policy enabled in sidecar topology. Set
 # false to run the sidecar as proxy_uid, drop the sidecar's extra /proc

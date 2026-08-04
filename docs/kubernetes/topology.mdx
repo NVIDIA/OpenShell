@@ -3,14 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Kubernetes Sandbox Topology"
 sidebar-title: "Topology"
-description: "Choose between combined and sidecar supervisor topology for Kubernetes sandbox pods."
+description: "Choose between combined, sidecar, and cni-sidecar supervisor topology for Kubernetes sandbox pods."
 keywords: "Generative AI, Cybersecurity, Kubernetes, Sandboxing, Sidecar, Network Policy, RuntimeClass"
 position: 2
 ---
 
-Kubernetes sandbox pods can run the OpenShell supervisor in `combined` or
-`sidecar` topology. Choose the topology based on which controls you need inside
-the pod and how much privilege your cluster allows on the agent container.
+Kubernetes sandbox pods can run the OpenShell supervisor in `combined`,
+`sidecar`, or `cni-sidecar` topology. Choose the topology based on which
+controls you need inside the pod, how much privilege your cluster allows on the
+agent container, and whether the cluster can install node-level CNI enforcement.
 
 ## Choose a Topology
 
@@ -22,6 +23,7 @@ lower-privilege agent container.
 |---|---|---|
 | `combined` | You need OpenShell network, filesystem, and process controls in the sandbox workload. | The agent container carries the Linux capabilities the supervisor needs. |
 | `sidecar` | You need the agent container to run as non-root without added Linux capabilities, and network policy is the primary control. | Privilege-dropping and supervisor mount isolation do not run in the agent container. |
+| `cni-sidecar` | You need sidecar-mode behavior without a privileged sandbox-pod init container, and a cluster admin can install the OpenShell CNI plugin on every node. | Requires privileged node-level CNI installation; the agent process supervisor is network-only. |
 
 ## Privilege Model
 
@@ -33,6 +35,8 @@ The long-running container permissions differ by topology:
 | `sidecar` | Agent container, process-only supervisor (`network-only`) | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Agent and workload run without added Linux capabilities. |
 | `sidecar` | Network supervisor sidecar, binary-aware mode (default) | `0:sandbox_gid` | `false` | Drops `ALL`; adds `SYS_PTRACE` and `DAC_READ_SEARCH` | Root sidecar inspects cross-UID workload `/proc` entries. The nftables fence exempts UID 0, so do not inject other root containers into these pods. |
 | `sidecar` | Network supervisor sidecar, endpoint/L7-only mode | `proxyUid:sandbox_gid` | `false` | Drops `ALL` | Non-root sidecar enforces endpoint and L7 policy without matching `policy.binaries`. |
+| `cni-sidecar` | Agent container, process-only supervisor (`network-only`) | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Agent and workload run without added Linux capabilities. |
+| `cni-sidecar` | Network supervisor sidecar | Same as `sidecar` mode | `false` | Same as `sidecar` mode | Node-level CNI installs the pod network rules instead of a pod-local init container. |
 
 Short-lived setup containers still have the permissions needed to prepare the
 pod:
@@ -41,6 +45,7 @@ pod:
 |---|---|---|---|---|---|
 | `combined` | Supervisor install init container | `0` | Not set | Not set | Copies the supervisor binary into the agent container volume. |
 | `sidecar` | Network init container | `0` | `false` | Drops `ALL`; adds `NET_ADMIN`, `NET_RAW`, `CHOWN`, and `FOWNER` | Installs pod-local nftables rules and prepares shared sidecar state. |
+| `cni-sidecar` | None for network rules | N/A | N/A | N/A | The OpenShell CNI DaemonSet installs rules during pod network setup. |
 
 ## Combined Topology
 
@@ -158,12 +163,100 @@ Sidecar pods use `shareProcessNamespace: true` so the network sidecar can
 resolve workload process and binary identity through `/proc/<entrypoint-pid>`.
 </Warning>
 
+## CNI Sidecar Topology
+
+CNI sidecar topology keeps the sidecar runtime model but moves network rule
+installation out of the sandbox pod. A privileged OpenShell DaemonSet installs a
+chained CNI plugin on each node. During CNI `ADD`, the plugin reads OpenShell
+pod annotations and installs the sidecar bypass-prevention rules in the pod
+network namespace before the workload starts.
+
+```mermaid
+flowchart TB
+  Sandbox["agents.x-k8s.io Sandbox"]
+
+  subgraph Node["Kubernetes node"]
+    DaemonSet["OpenShell CNI DaemonSet"]
+    CNIPlugin["OpenShell chained CNI plugin"]
+    Runtime["container runtime<br/>CNI ADD / CHECK"]
+
+    subgraph Pod["Sandbox pod"]
+      NetNS["pod network namespace"]
+
+      subgraph Agent["agent container"]
+        ProcessSupervisor["process supervisor<br/>network-only"]
+        Workload["Agent workload"]
+      end
+
+      NetworkSidecar["network supervisor sidecar<br/>proxyUid"]
+    end
+  end
+
+  Gateway["OpenShell Gateway"]
+  External["External services"]
+
+  Sandbox --> Pod
+  DaemonSet -->|"installs binary + patches conflist"| CNIPlugin
+  Runtime -->|"invokes"| CNIPlugin
+  CNIPlugin -->|"reads pod annotations"| Pod
+  CNIPlugin -->|"installs nftables or iptables rules"| NetNS
+  ProcessSupervisor --> Workload
+  Workload -->|"egress redirected on loopback"| NetworkSidecar
+  NetworkSidecar -->|"gateway forwarding"| Gateway
+  NetworkSidecar -->|"policy-enforced egress"| External
+```
+
+Use this topology when a cluster admin can install node-level CNI components and
+you want sandbox pods to avoid the sidecar topology's privileged network init
+container.
+
+Each node must provide a firewall backend usable from the host-executed plugin.
+The plugin prefers `nft` and falls back to `iptables` when `nft` is unavailable.
+The installer DaemonSet writes plugin failures to `cni.logFile` and tails that
+file, so `kubectl logs daemonset/openshell-cni -c install-cni` includes CNI
+`ADD` and `CHECK` errors that would otherwise only appear in pod events or node
+logs.
+
+A per-node scheduling gate ensures enforcement is in place before a sandbox
+runs. Once the chained plugin is installed, the installer labels its node
+`openshell.ai/cni-ready=true`, and clears the label on shutdown or when a
+reconcile tick cannot restore the plugin. The gateway sets a required
+`nodeAffinity` on that label for every cni-sidecar sandbox pod, so a pod cannot
+schedule onto a node whose egress enforcement is not active. An ungraceful CNI
+DaemonSet pod deletion can briefly leave a stale `cni-ready=true` until the pod
+is rescheduled and the next reconcile tick re-evaluates it.
+
+<Warning>
+`cni-sidecar` is experimental. It currently targets normal Kubernetes runtimes
+first. Kata Containers and gVisor remain validation targets, because each
+runtime must honor the CNI-installed pod-network rules for this topology to
+provide the expected network enforcement.
+</Warning>
+
+<Note>
+The CNI installer is a **cluster singleton**. Its chained plugin enforces pods
+that carry the OpenShell annotations (set only by a gateway on its own sandbox
+pods) **and** whose namespace is in the plugin's enforcement allowlist. Pods in
+other namespaces are passed through without an API lookup, so the allowlist
+bounds the blast radius. The allowlist is built automatically: each `cni-sidecar`
+release ships a Helm-owned marker ConfigMap (`openshell.ai/cni-registration=true`)
+in its sandbox namespace and the singleton aggregates every marker's namespace
+each reconcile — so enable the installer (`cni.enabled=true`) in exactly one
+release per cluster, and additional releases (`cni.enabled=false`,
+`cni.external=true`) are discovered automatically, with registration removed by
+Helm on uninstall. Each gateway waits (via a `wait-cni-coverage` init container)
+until every enforcement-ready node acknowledges its namespace before serving, so
+there is no discovery-window bypass. `cni.sandboxNamespaces` is an optional static
+addition. The installer treats any `openshell-cni` chained entry as its own and
+upgrades it in place.
+</Note>
+
 ## Credential Exposure
 
-Sidecar topology keeps gateway credentials in the network sidecar. The agent
-container does not mount the projected ServiceAccount token used for sandbox
-token bootstrap, does not mount the sandbox client TLS secret, and does not get
-gateway callback environment variables.
+Sidecar and cni-sidecar topologies keep gateway credentials in the network
+sidecar. The agent container does not mount the projected ServiceAccount token
+used for sandbox token bootstrap, does not mount the sandbox client TLS secret,
+and does not get gateway callback environment variables.
 
 The network sidecar serves the policy and workload-facing provider environment
 over a Unix control socket in the shared sidecar state volume. Before launching
@@ -190,10 +283,13 @@ gVisor does not provide to the init container. A supported sandboxed runtime
 strengthens the container boundary while OpenShell focuses on network policy
 enforcement from the sidecar.
 
+`cni-sidecar` is intended to test whether CNI-installed pod-network rules can
+make sidecar-style enforcement work on stricter runtime classes.
+
 Runtime classes do not re-enable the OpenShell privilege-drop or supervisor
-mount-isolation controls that sidecar mode relaxes. Use them as an additional
-workload boundary, not as a replacement for the combined topology's full
-supervisor controls.
+mount-isolation controls that sidecar and cni-sidecar modes relax. Use them as
+an additional workload boundary, not as a replacement for the combined
+topology's full supervisor controls.
 
 You can set a default runtime class in the Kubernetes driver configuration or
 override it per sandbox with driver config:
@@ -206,7 +302,10 @@ openshell sandbox create \
 
 ## Enable Sidecar Mode
 
-For direct gateway TOML configuration, set the Kubernetes driver fields:
+For direct gateway TOML configuration, set the Kubernetes driver fields for
+the topology you want to test.
+
+For sidecar mode:
 
 ```toml
 [openshell.drivers.kubernetes]
@@ -222,6 +321,19 @@ runs the sidecar as UID 0 instead. The network init container exempts the
 effective sidecar UID from proxy redirection so the sidecar can reach the
 gateway.
 
+For CNI-sidecar mode:
+
+```toml
+[openshell.drivers.kubernetes]
+topology = "cni-sidecar"
+
+[openshell.drivers.kubernetes.sidecar]
+proxy_uid = 1337
+```
+
+In CNI-sidecar mode, the OpenShell CNI plugin installs the pod-network rules
+that the network init container installs in `sidecar` mode.
+
 When the Helm chart renders `gateway.toml`, set the equivalent chart values:
 
 ```yaml
@@ -231,6 +343,64 @@ supervisor:
     proxyUid: 1337
     processBinaryAwareNetworkPolicy: true
 ```
+
+Set `supervisor.topology=cni-sidecar` and enable the CNI installer to use CNI
+sidecar mode:
+
+```yaml
+cni:
+  enabled: true
+supervisor:
+  topology: cni-sidecar
+  sidecar:
+    proxyUid: 1337
+```
+
+The OpenShell CNI installer requires privileged node access so it can copy the
+plugin into the host CNI binary directory and patch the node CNI conflist.
+
+### OpenShift (Multus / OVN-Kubernetes)
+
+On OpenShift the default network is managed by the Cluster Network Operator and
+there is no CNI `.conflist` to append to. Use `cni.mode: multus-chain`, which
+injects the OpenShell plugin through the Multus `vendor-cni-chain` auxiliary chain
+without modifying any operator-managed file. The installer also needs the
+`privileged` SecurityContextConstraints.
+
+Install with the example values (a step-by-step OpenShift walkthrough with
+verification is in [OpenShift](/kubernetes/openshift#enable-the-cni-sidecar-topology)):
+
+```shell
+helm install openshell deploy/helm/openshell \
+  -f deploy/helm/openshell/examples/cni-sidecar-openshift.yaml
+```
+
+This sets `cni.binDir: /var/lib/cni/bin`, `cni.chainDir:
+/run/multus/cni/net.d/vendor-cni-chain`, a persistent `cni.stateDir`,
+`cni.openshift.privilegedSCC: true`, and
+`sandboxServiceAccount.openshift.binaryAwareSCC: true`. It requires a Multus
+thick daemon with `auxiliaryCNIChainName` configured (default on OpenShift 4.x).
+
+#### Sandbox pod SecurityContextConstraints
+
+With `supervisor.sidecar.processBinaryAwareNetworkPolicy` enabled (the default),
+the network sidecar runs as UID 0 with the `SYS_PTRACE` and `DAC_READ_SEARCH`
+capabilities so it can inspect the agent process's `/proc` entries across UID
+boundaries. OpenShift's `restricted-v2` SCC forbids UID 0 and those
+capabilities, so the sandbox ServiceAccount needs a purpose-built SCC.
+
+Setting `sandboxServiceAccount.openshift.binaryAwareSCC: true` creates a minimal
+SCC — the `restricted-v2` baseline plus only UID 0, `SYS_PTRACE`,
+`DAC_READ_SEARCH`, and the `image` volume type used to sideload the supervisor
+binary — and a ClusterRole/ClusterRoleBinding granting it to the sandbox
+ServiceAccount. Everything else stays locked down: no privileged container, no
+host namespaces, `allowPrivilegeEscalation: false`, drop `ALL`, and the
+`runtime/default` seccomp profile.
+
+To run with lower privileges at the cost of binary matching, set
+`supervisor.sidecar.processBinaryAwareNetworkPolicy: false`; the sidecar then
+runs as `proxyUid` without the extra capabilities, and the built-in
+`restricted-v2` SCC suffices (leave `binaryAwareSCC` unset).
 
 Leave `topology` unset, or set it to `combined`, to keep the original
 single-container supervisor path. For Helm installs, leave

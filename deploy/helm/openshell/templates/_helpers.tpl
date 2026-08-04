@@ -49,6 +49,33 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+CNI DaemonSet selector labels. The CNI installer runs a distinct
+`app.kubernetes.io/name` (`<name>-cni`) so it does NOT share the gateway's base
+selector labels. This lets the gateway Service and workload selectors stay
+base-only (name + instance) without also matching CNI pods — which in turn
+avoids requiring an immutable-selector or component-label change on existing
+gateway releases during upgrade.
+*/}}
+{{- define "openshell.cniSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "openshell.cniName" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Full label set for the CNI DaemonSet and its pods, mirroring openshell.labels
+but keyed on the distinct CNI selector labels.
+*/}}
+{{- define "openshell.cniLabels" -}}
+helm.sh/chart: {{ include "openshell.chart" . }}
+{{ include "openshell.cniSelectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/component: cni
+{{- end }}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "openshell.serviceAccountName" -}}
@@ -60,6 +87,30 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
+Cluster-singleton name for the CNI installer and its RBAC/SCC. The CNI installer
+is a per-cluster singleton: one chained plugin serves every OpenShell release's
+sandbox pods (keyed on pod annotations), and it writes fixed host state (the
+`/run` chain file / conflist entry and the `openshell.ai/cni-ready` Node label).
+The name is therefore a genuinely FIXED cluster identity — a constant, not
+derived from nameOverride/fullname — so two releases with different name
+overrides cannot install competing "singletons" over the same host state. A
+second release that also sets cni.enabled=true collides on these fixed-named
+cluster resources (Helm ownership) and must instead set cni.external=true.
+*/}}
+{{- define "openshell.cniName" -}}
+{{- "openshell-cni" }}
+{{- end }}
+
+{{/*
+ServiceAccount used by the CNI installer DaemonSet. Same singleton name so the
+privileged SCC and CNI RBAC stay scoped to the CNI installer rather than the
+shared gateway service account.
+*/}}
+{{- define "openshell.cniServiceAccountName" -}}
+{{- include "openshell.cniName" . }}
+{{- end }}
+
+{{/*
 Create the name of the service account assigned to sandbox pods
 */}}
 {{- define "openshell.sandboxServiceAccountName" -}}
@@ -68,6 +119,14 @@ Create the name of the service account assigned to sandbox pods
 {{- else }}
 {{- default "default" .Values.sandboxServiceAccount.name }}
 {{- end }}
+{{- end }}
+
+{{/*
+Name of the minimal SecurityContextConstraints (and its ClusterRole/binding)
+granted to sandbox pods on OpenShift for binary-aware network policy.
+*/}}
+{{- define "openshell.sandboxSccName" -}}
+{{- printf "%s-sandbox" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
@@ -101,6 +160,23 @@ a repository-only override uses the effective gateway image tag.
 {{- $repository := .Values.supervisor.image.repository | default (include "openshell.defaultSupervisorRepository" .) -}}
 {{- $tag := .Values.supervisor.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
 {{- printf "%s:%s" $repository $tag }}
+{{- end }}
+
+{{/*
+CNI installer image reference. Defaults to the supervisor image because the
+supervisor image carries both openshell-sandbox and openshell-cni. The
+repository and tag fallbacks mirror openshell.supervisorImage so a
+gateway-only tag override (image.tag) keeps the CNI image in lockstep with
+the supervisor instead of silently pinning to the chart AppVersion.
+*/}}
+{{- define "openshell.cniImage" -}}
+{{- $repository := .Values.cni.image.repository | default .Values.supervisor.image.repository | default (include "openshell.defaultSupervisorRepository" .) -}}
+{{- $tag := .Values.cni.image.tag | default .Values.supervisor.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
+{{- printf "%s:%s" $repository $tag }}
+{{- end }}
+
+{{- define "openshell.cniImagePullPolicy" -}}
+{{- .Values.cni.image.pullPolicy | default .Values.supervisor.image.pullPolicy | default .Values.image.pullPolicy -}}
 {{- end }}
 
 {{/*
