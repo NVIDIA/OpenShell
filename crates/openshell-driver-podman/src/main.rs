@@ -67,7 +67,7 @@ struct Args {
     #[arg(
         long,
         env = "OPENSHELL_SANDBOX_SSH_SOCKET_PATH",
-        default_value = "/run/openshell/ssh.sock"
+        default_value = openshell_core::container_paths::SSH_SOCKET_PATH
     )]
     sandbox_ssh_socket_path: String,
 

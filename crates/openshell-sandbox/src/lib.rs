@@ -70,7 +70,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
 
 const SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "sidecar-nftables";
-const SIDECAR_TLS_DIR: &str = "/etc/openshell-tls/proxy";
+const SIDECAR_TLS_DIR: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
 const SIDECAR_CA_CERT: &str = "openshell-ca.pem";
 const SIDECAR_CA_BUNDLE: &str = "ca-bundle.pem";
 const SIDECAR_PROCESS_PROXY_ADDR: &str = "127.0.0.1:3128";
@@ -189,19 +189,32 @@ pub async fn run_sandbox(
 
     // Normalize the active driver's identity contract once, while both the
     // policy and launched image filesystem are available. Kubernetes and
-    // OpenShift retain their authoritative numeric pair; Docker and Podman
-    // fill only omitted policy fields from OCI Config.User.
+    // OpenShift retain their authoritative numeric pair; Docker fills only
+    // omitted policy fields from OCI Config.User.
     #[cfg(unix)]
-    let resolved_process_identity = {
+    let (resolved_process_identity, workspace) = {
         let driver_identity = openshell_supervisor_process::identity::DriverIdentity::from_env()?;
-        openshell_supervisor_process::identity::resolve_process_identity(
+        let use_workdir_as_home = matches!(
+            &driver_identity,
+            openshell_supervisor_process::identity::DriverIdentity::OciUser { .. }
+        );
+        let resolved = openshell_supervisor_process::identity::resolve_process_identity(
             &mut policy,
             &driver_identity,
-        )?
+        )?;
+        (
+            resolved,
+            openshell_supervisor_process::process::ResolvedWorkspace::new(
+                workdir.clone(),
+                use_workdir_as_home,
+            ),
+        )
     };
     #[cfg(not(unix))]
-    let resolved_process_identity =
-        openshell_supervisor_process::process::ResolvedProcessIdentity::default();
+    let (resolved_process_identity, workspace) = (
+        openshell_supervisor_process::process::ResolvedProcessIdentity::default(),
+        openshell_supervisor_process::process::ResolvedWorkspace::new(workdir.clone(), false),
+    );
 
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let (provider_credentials, mut provider_env) =
@@ -686,7 +699,7 @@ pub async fn run_sandbox(
         let process = openshell_supervisor_process::run::run_process(
             program,
             args,
-            workdir.as_deref(),
+            workspace,
             timeout_secs,
             interactive,
             sandbox_id.as_deref(),
@@ -1157,9 +1170,9 @@ const PROXY_BASELINE_READ_ONLY: &[&str] = &[
     "/dev/urandom",
 ];
 
-/// Minimum read-write paths required for a proxy-mode sandbox child process:
-/// user working directory and temporary files.
-const PROXY_BASELINE_READ_WRITE: &[&str] = &["/sandbox", "/tmp"];
+/// Minimum read-write paths required for a proxy-mode sandbox child process.
+/// The active workspace is granted separately through `include_workdir`.
+const PROXY_BASELINE_READ_WRITE: &[&str] = &["/tmp"];
 
 /// GPU read-only paths.
 ///
@@ -1508,10 +1521,10 @@ mod baseline_tests {
     }
 
     #[test]
-    fn baseline_read_write_always_includes_sandbox_and_tmp() {
+    fn baseline_read_write_does_not_hardcode_sandbox() {
         let (_ro, rw) = baseline_enrichment_paths();
-        assert!(rw.contains(&"/sandbox".to_string()));
         assert!(rw.contains(&"/tmp".to_string()));
+        assert!(!rw.contains(&"/sandbox".to_string()));
     }
 
     #[test]

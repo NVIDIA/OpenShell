@@ -57,6 +57,7 @@ mod tracing_setup;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::{ComputeDriverKind, Config, Error, ObjectLabels, Result};
 use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::HashMap;
@@ -597,6 +598,8 @@ async fn serve_gateway_listener(
                 spec.scope
             }
         };
+
+        set_tcp_nodelay_best_effort(&stream);
 
         spawn_gateway_connection(
             stream,

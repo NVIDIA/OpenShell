@@ -963,6 +963,11 @@ pub fn build_container_spec_for_image(
         rw: false,
     }];
     image_volumes.extend(user_mounts.image_volumes);
+    let mut command = vec![
+        "--workdir".to_string(),
+        driver_mounts::DEFAULT_WORKSPACE_ROOT.to_string(),
+    ];
+    command.extend(upstream_proxy_cli_args(config));
 
     let container_spec = ContainerSpec {
         name,
@@ -984,10 +989,11 @@ pub fn build_container_spec_for_image(
         // Without this, the container would run the entrypoint binary with
         // the supervisor path as an argument instead of executing it directly.
         entrypoint: vec![SUPERVISOR_BINARY_PATH.into()],
-        // Operator-owned corporate proxy flags. The workload command is not
-        // part of argv (the supervisor takes it from the reserved command
-        // env var), so these flags are the whole command list.
-        command: upstream_proxy_cli_args(config),
+        // Keep Podman's existing /sandbox workspace contract explicit while
+        // the supervisor supports driver-selected workdirs. Operator-owned
+        // corporate proxy flags follow it; the workload command comes from
+        // the reserved environment variable.
+        command,
         // Force the supervisor to run as root (UID 0). Sandbox images may
         // set a non-root USER directive (e.g. `USER sandbox`), but the
         // supervisor needs root to create network namespaces, set up the
@@ -1127,7 +1133,7 @@ pub fn build_container_spec_for_image(
             let mut m = vec![Mount {
                 kind: "tmpfs".into(),
                 source: "tmpfs".into(),
-                destination: "/run/netns".into(),
+                destination: openshell_core::container_paths::NETNS_MOUNT_ROOT.into(),
                 options: vec!["rw".into(), "nosuid".into(), "nodev".into()],
             }];
             // Bind-mount client TLS materials into the container when mTLS
@@ -1400,6 +1406,10 @@ mod tests {
         assert_eq!(
             container["env"][openshell_core::sandbox_env::SANDBOX_GID].as_str(),
             Some("")
+        );
+        assert_eq!(
+            container["command"],
+            serde_json::json!(["--workdir", "/sandbox"])
         );
     }
 
@@ -2506,7 +2516,7 @@ mod tests {
                     "mounts": [{
                         "type": "volume",
                         "source": "work-nfs",
-                        "target": "/etc/openshell/tls/custom"
+                        "target": "/etc/openshell/tls/client"
                     }]
                 }))),
                 ..Default::default()

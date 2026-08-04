@@ -145,12 +145,12 @@ const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
 /// Both names ultimately route through the gvproxy NAT path on
 /// `GVPROXY_HOST_LOOPBACK_IP` — they do **not** go through the gateway IP.
 const GVPROXY_HOST_LOOPBACK_ALIAS: &str = OPENSHELL_HOST_GATEWAY_ALIAS;
-const GUEST_SSH_SOCKET_PATH: &str = "/run/openshell/ssh.sock";
-const GUEST_TLS_CA_PATH: &str = "/opt/openshell/tls/ca.crt";
-const GUEST_TLS_CERT_PATH: &str = "/opt/openshell/tls/tls.crt";
-const GUEST_TLS_KEY_PATH: &str = "/opt/openshell/tls/tls.key";
-const GUEST_SANDBOX_TOKEN_PATH: &str = "/opt/openshell/auth/sandbox.jwt";
-const GUEST_INIT_DROPIN_DIR: &str = "/opt/openshell/init.d";
+const GUEST_SSH_SOCKET_PATH: &str = openshell_core::container_paths::SSH_SOCKET_PATH;
+const GUEST_TLS_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CA_PATH;
+const GUEST_TLS_CERT_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CERT_PATH;
+const GUEST_TLS_KEY_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_KEY_PATH;
+const GUEST_SANDBOX_TOKEN_PATH: &str = openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH;
+const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_INIT_DROPIN_DIR;
 /// Guest path of the driver-authored manifest enumerating which
 /// `init.d` drop-ins the guest init script is allowed to execute.
 ///
@@ -158,7 +158,8 @@ const GUEST_INIT_DROPIN_DIR: &str = "/opt/openshell/init.d";
 /// else found under `init.d` — e.g. files baked into a user-controlled
 /// guest image — is ignored. The driver writes this file into the overlay
 /// upperdir on every launch, so the image cannot forge or shadow it.
-const GUEST_INIT_DROPIN_MANIFEST: &str = "/opt/openshell/init.d.manifest";
+const GUEST_INIT_DROPIN_MANIFEST: &str =
+    openshell_core::container_paths::VM_GUEST_INIT_DROPIN_MANIFEST;
 const IMAGE_CACHE_ROOT_DIR: &str = "images";
 const IMAGE_CACHE_ROOTFS_IMAGE: &str = "rootfs.ext4";
 const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";

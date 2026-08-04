@@ -1391,7 +1391,9 @@ enum SandboxCommands {
         #[arg(long, value_name = "JSON")]
         driver_config_json: Option<String>,
 
-        /// Provider names to attach to this sandbox.
+        /// Attach a configured credential provider to the sandbox.
+        /// Use providers for API keys, tokens, and other secrets so commands in
+        /// the sandbox do not receive the real credential values. Repeatable.
         #[arg(long = "provider")]
         providers: Vec<String>,
 
@@ -1431,7 +1433,9 @@ enum SandboxCommands {
         #[arg(long = "label")]
         labels: Vec<String>,
 
-        /// Environment variables to inject into the sandbox (KEY=VALUE format, repeatable).
+        /// Set a non-secret environment variable in the sandbox.
+        /// Do not use this option for API keys, tokens, or other secrets; create
+        /// a provider and attach it with `--provider` instead. Repeatable.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
 
@@ -1553,7 +1557,9 @@ enum SandboxCommands {
         #[arg(long, overrides_with = "tty")]
         no_tty: bool,
 
-        /// Environment variables to set for the command (KEY=VALUE format, repeatable).
+        /// Set a non-secret environment variable for the command.
+        /// Do not use this option for API keys, tokens, or other secrets; attach
+        /// a provider to the sandbox instead. Repeatable.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
 

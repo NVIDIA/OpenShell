@@ -825,7 +825,6 @@ filesystem_policy:
     - /etc
     - /var/log
   read_write:
-    - /sandbox
     - /tmp
     - /dev/null
 

@@ -36,6 +36,7 @@ use openshell_core::denial::DenialEvent;
 use crate::managed_children;
 use crate::process::{
     ProcessEnforcementMode, ProcessHandle, ProcessStatus, ResolvedProcessIdentity,
+    ResolvedWorkspace,
 };
 
 fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
@@ -53,7 +54,7 @@ fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
 pub async fn run_process(
     program: &str,
     args: &[String],
-    workdir: Option<&str>,
+    workspace: ResolvedWorkspace,
     timeout_secs: u64,
     interactive: bool,
     sandbox_id: Option<&str>,
@@ -95,7 +96,12 @@ pub async fn run_process(
     // is forked so the workload sees writable paths it owns.
     #[cfg(unix)]
     if enforcement_mode.uses_privileged_process_setup() {
-        crate::process::prepare_filesystem_with_identity(policy, resolved_process_identity)?;
+        crate::process::prepare_filesystem_with_identity(
+            policy,
+            resolved_process_identity,
+            workspace.root(),
+            workspace.home().is_some(),
+        )?;
     }
 
     // Eagerly fetch initial settings and install the agent skill if the
@@ -225,7 +231,7 @@ pub async fn run_process(
     let ssh_socket_path: Option<std::path::PathBuf> = ssh_socket_path.map(std::path::PathBuf::from);
     if let Some(listen_path) = ssh_socket_path.clone() {
         let policy_clone = policy.clone();
-        let workdir_clone = workdir.map(str::to_string);
+        let workspace_clone = workspace.clone();
         let proxy_url = ssh_proxy_url;
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
@@ -243,7 +249,7 @@ pub async fn run_process(
                 listen_path,
                 ssh_ready_tx,
                 policy_clone,
-                workdir_clone,
+                workspace_clone,
                 netns_fd,
                 proxy_url,
                 ca_paths,
@@ -319,7 +325,7 @@ pub async fn run_process(
     let mut handle = ProcessHandle::spawn(
         program,
         args,
-        workdir,
+        &workspace,
         interactive,
         policy,
         resolved_process_identity,
@@ -333,7 +339,7 @@ pub async fn run_process(
     let mut handle = ProcessHandle::spawn(
         program,
         args,
-        workdir,
+        &workspace,
         interactive,
         policy,
         resolved_process_identity,

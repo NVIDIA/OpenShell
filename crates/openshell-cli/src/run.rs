@@ -31,6 +31,7 @@ use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
     GatewayMetadata, clear_last_sandbox_if_matches, get_gateway_metadata, save_last_sandbox,
 };
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
@@ -1570,6 +1571,7 @@ pub async fn service_forward_tcp(
                 let (socket, peer) = accepted
                     .into_diagnostic()
                     .wrap_err("failed to accept local forward connection")?;
+                set_tcp_nodelay_best_effort(&socket);
                 let mut client = client.clone();
                 let sandbox_id = sandbox_id.clone();
                 let target_host = target_host.to_string();

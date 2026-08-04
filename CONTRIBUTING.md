@@ -289,6 +289,24 @@ Project requirements:
 - Docker (running)
 - Z3 solver library (for the policy prover crate)
 
+### Optional: Bazel (experimental)
+
+Install [Bazelisk](https://github.com/bazelbuild/bazelisk), which auto-downloads the Bazel version pinned in `.bazelversion`:
+
+```bash
+# macOS
+brew install bazelisk
+
+# npm (any platform)
+npm install -g @bazel/bazelisk
+```
+
+Bazel builds Z3 from source, so no system Z3 installation is needed when using Bazel. If you have previously built with Cargo, add Cargo's output directory to `.bazelignore` to prevent conflicts:
+
+```bash
+echo "target" >> .bazelignore
+```
+
 ### macOS build tools
 
 Install Apple Command Line Tools before building locally:
@@ -389,6 +407,26 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run docs`      | Validate Fern docs locally                              |
 | `mise run helm:docs` | Regenerate the Helm chart README                        |
 | `mise run clean`     | Clean build artifacts                                   |
+
+### Bazel targets (experimental)
+
+> [!IMPORTANT]
+> Bazel support is experimental and under evaluation via [RFC 0012](https://github.com/NVIDIA/OpenShell/pull/2543).
+> It may be removed at any time depending on the RFC outcome.
+> Feedback is welcome: [open an issue](https://github.com/NVIDIA/OpenShell/issues/new) or find us on CNCF Slack in [#openshell-dev](https://cloud-native.slack.com/archives/openshell-dev).
+
+The following Bazel commands are available alongside the mise tasks above. Cargo and mise remain the primary build system.
+
+| Task | Bazel command | Notes |
+| ---- | ------------- | ----- |
+| Build everything | `bazel build //...` | All crates and protos |
+| Run all tests | `bazel test //...` | Unit tests only, no E2E |
+| Build the CLI | `bazel build //crates/openshell-cli:openshell` | |
+| Build the gateway | `bazel build //crates/openshell-server:openshell-gateway` | |
+| Build the supervisor | `bazel build //crates/openshell-sandbox:openshell-sandbox-bin` | |
+| Clean | `bazel clean` | |
+
+Bazel does not yet cover `mise run gateway`, `mise run sandbox`, `mise run e2e`, `mise run docs`, or `mise run helm:docs`. Those are runtime and infrastructure tasks that remain with mise. Additional Bazel targets will be added over time as the experiment progresses.
 
 ## Project Structure
 

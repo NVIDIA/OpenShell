@@ -32,13 +32,14 @@ const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 /// run `openshell-sandbox debug-rpc get-sandbox-config --sandbox-id <other>`
 /// to confirm the cross-sandbox IDOR guard fires.
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
+const VALIDATE_WORKSPACE_SUBCOMMAND: &str = "validate-workspace";
 
 /// Default `--mode` value: run both supervisor leaves in a single binary.
 const DEFAULT_MODE: &str = "network,process";
-const SIDECAR_STATE_DIR: &str = "/run/openshell-sidecar";
-const SIDECAR_TLS_DIR: &str = "/etc/openshell-tls/proxy";
+const SIDECAR_STATE_DIR: &str = openshell_core::container_paths::SIDECAR_RUN_ROOT;
+const SIDECAR_TLS_DIR: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
 #[cfg(target_os = "linux")]
-const CLIENT_TLS_DIR: &str = "/etc/openshell-tls/client";
+const CLIENT_TLS_DIR: &str = openshell_core::container_paths::CLIENT_TLS_DIR;
 #[cfg(target_os = "linux")]
 const SIDECAR_CLIENT_TLS_SUBDIR: &str = "client";
 #[cfg(target_os = "linux")]
@@ -229,6 +230,50 @@ struct Args {
     /// (for proxies whose ACLs filter on hostnames).
     #[arg(long)]
     upstream_proxy_connect_by_hostname: bool,
+}
+
+/// Internal one-shot command used by the privileged supervisor to validate an
+/// image-provided workdir as the final sandbox identity.
+#[derive(Parser, Debug)]
+#[command(name = "validate-workspace", hide = true)]
+struct ValidateWorkspaceArgs {
+    #[arg(long)]
+    workdir: String,
+    #[arg(long)]
+    expected_uid: u32,
+    #[arg(long)]
+    expected_gid: u32,
+}
+
+#[cfg(target_os = "linux")]
+fn validate_workspace(args: &[String]) -> Result<()> {
+    let args = ValidateWorkspaceArgs::try_parse_from(
+        std::iter::once(VALIDATE_WORKSPACE_SUBCOMMAND.to_string()).chain(args.iter().cloned()),
+    )
+    .into_diagnostic()?;
+    let actual = (
+        nix::unistd::geteuid().as_raw(),
+        nix::unistd::getegid().as_raw(),
+    );
+    if actual != (args.expected_uid, args.expected_gid) {
+        return Err(miette::miette!(
+            "workspace validator privilege drop failed: expected {}:{}, got {}:{}",
+            args.expected_uid,
+            args.expected_gid,
+            actual.0,
+            actual.1
+        ));
+    }
+    openshell_supervisor_process::process::validate_oci_workspace_as_effective_identity(Path::new(
+        &args.workdir,
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_workspace(_args: &[String]) -> Result<()> {
+    Err(miette::miette!(
+        "workspace validation is only supported on Unix"
+    ))
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -479,6 +524,9 @@ fn main() -> Result<()> {
             std::process::exit(exit);
         });
     }
+    if raw_args.get(1).map(String::as_str) == Some(VALIDATE_WORKSPACE_SUBCOMMAND) {
+        return validate_workspace(&raw_args[2..]);
+    }
 
     let args = Args::parse();
 
@@ -647,6 +695,31 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workspace_validation_subcommand_uses_final_policy_identity() {
+        let uid = nix::unistd::geteuid().as_raw();
+        let gid = nix::unistd::getegid().as_raw();
+        if uid < 1000 || gid < 1000 {
+            return;
+        }
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+        let root = dir.path().canonicalize().unwrap().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let args = vec![
+            "--workdir".to_string(),
+            root.display().to_string(),
+            "--expected-uid".to_string(),
+            uid.to_string(),
+            "--expected-gid".to_string(),
+            gid.to_string(),
+        ];
+
+        validate_workspace(&args).expect("current identity should retain workspace authority");
+    }
 
     /// Drives `copy_self`'s file-copy logic against an arbitrary source path
     /// so tests don't depend on `current_exe()`.

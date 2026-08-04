@@ -7,13 +7,14 @@ use crate::child_env;
 #[cfg(target_os = "linux")]
 use crate::managed_children;
 use crate::process::{
-    ProcessEnforcementMode, ResolvedProcessIdentity, drop_privileges_with_identity,
-    is_supervisor_only_env_var,
+    ProcessEnforcementMode, ResolvedProcessIdentity, ResolvedWorkspace,
+    drop_privileges_with_identity, is_supervisor_only_env_var,
 };
 use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_ocsf::{
@@ -110,7 +111,7 @@ pub async fn run_ssh_server(
     listen_path: PathBuf,
     ready_tx: tokio::sync::oneshot::Sender<Result<()>>,
     policy: SandboxPolicy,
-    workdir: Option<String>,
+    workspace: ResolvedWorkspace,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<(PathBuf, PathBuf)>,
@@ -144,7 +145,7 @@ pub async fn run_ssh_server(
         let (stream, _peer) = listener.accept().await.into_diagnostic()?;
         let config = config.clone();
         let policy = policy.clone();
-        let workdir = workdir.clone();
+        let workspace = workspace.clone();
         let proxy_url = proxy_url.clone();
         let ca_paths = ca_paths.clone();
         let provider_credentials = provider_credentials.clone();
@@ -155,7 +156,7 @@ pub async fn run_ssh_server(
                 stream,
                 config,
                 policy,
-                workdir,
+                workspace,
                 netns_fd,
                 proxy_url,
                 ca_paths,
@@ -184,7 +185,7 @@ async fn handle_connection(
     stream: tokio::net::UnixStream,
     config: Arc<russh::server::Config>,
     policy: SandboxPolicy,
-    workdir: Option<String>,
+    workspace: ResolvedWorkspace,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
@@ -209,7 +210,7 @@ async fn handle_connection(
 
     let handler = SshHandler::new(
         policy,
-        workdir,
+        workspace,
         netns_fd,
         proxy_url,
         ca_file_paths,
@@ -239,7 +240,7 @@ struct ChannelState {
 
 struct SshHandler {
     policy: SandboxPolicy,
-    workdir: Option<String>,
+    workspace: ResolvedWorkspace,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
@@ -254,7 +255,7 @@ impl SshHandler {
     #[allow(clippy::too_many_arguments)]
     fn new(
         policy: SandboxPolicy,
-        workdir: Option<String>,
+        workspace: ResolvedWorkspace,
         netns_fd: Option<RawFd>,
         proxy_url: Option<String>,
         ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
@@ -265,7 +266,7 @@ impl SshHandler {
     ) -> Self {
         Self {
             policy,
-            workdir,
+            workspace,
             netns_fd,
             proxy_url,
             ca_file_paths,
@@ -487,7 +488,7 @@ impl russh::server::Handler for SshHandler {
             // transfer files into and out of the sandbox.
             let input_sender = spawn_pipe_exec(
                 &self.policy,
-                self.workdir.clone(),
+                &self.workspace,
                 Some("/usr/lib/openssh/sftp-server".to_string()),
                 session.handle(),
                 channel,
@@ -584,7 +585,7 @@ impl SshHandler {
             // exec that explicitly asked for a terminal).
             let (pty_master, input_sender) = spawn_pty_shell(
                 &self.policy,
-                self.workdir.clone(),
+                &self.workspace,
                 command,
                 &pty,
                 handle,
@@ -605,7 +606,7 @@ impl SshHandler {
             // path VSCode Remote-SSH exec commands take.
             let input_sender = spawn_pipe_exec(
                 &self.policy,
-                self.workdir.clone(),
+                &self.workspace,
                 command,
                 handle,
                 channel,
@@ -663,13 +664,17 @@ pub async fn connect_in_netns(
             .await
             .map_err(|_| std::io::Error::other("netns connect thread panicked"))??;
         std_stream.set_nonblocking(true)?;
-        return tokio::net::TcpStream::from_std(std_stream);
+        let stream = tokio::net::TcpStream::from_std(std_stream)?;
+        set_tcp_nodelay_best_effort(&stream);
+        return Ok(stream);
     }
 
     #[cfg(not(target_os = "linux"))]
     let _ = netns_fd;
 
-    tokio::net::TcpStream::connect(addr).await
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    set_tcp_nodelay_best_effort(&stream);
+    Ok(stream)
 }
 
 #[derive(Clone)]
@@ -698,28 +703,31 @@ impl Default for PtyRequest {
 /// For name-based identities, looks up the home directory via `/etc/passwd`
 /// (or defaults to `/home/{user}`).
 ///
-/// For numeric UIDs, there is no passwd entry — falls back to
-/// `("{uid}", "/sandbox")` so the agent session still has a meaningful
-/// USER identifier.
-fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
-    match policy.process.run_as_user.as_deref() {
+/// For numeric UIDs, there is no passwd entry, so the default remains
+/// `("{uid}", "/sandbox")`. Docker replaces that default with its resolved
+/// image workspace.
+fn session_user_and_home(policy: &SandboxPolicy, workdir_home: Option<&str>) -> (String, String) {
+    let (user, default_home) = match policy.process.run_as_user.as_deref() {
         Some(user) if !user.is_empty() => {
             // Numeric UID — no passwd entry expected; use default HOME.
             if user.parse::<u32>().is_ok() {
-                return (user.to_string(), "/sandbox".to_string());
+                (user.to_string(), "/sandbox".to_string())
+            } else {
+                // Name-based identity — look up home from /etc/passwd.
+                let home = nix::unistd::User::from_name(user)
+                    .ok()
+                    .flatten()
+                    .map_or_else(
+                        || format!("/home/{user}"),
+                        |u| u.dir.to_string_lossy().into_owned(),
+                    );
+                (user.to_string(), home)
             }
-            // Name-based identity — look up home from /etc/passwd.
-            let home = nix::unistd::User::from_name(user)
-                .ok()
-                .flatten()
-                .map_or_else(
-                    || format!("/home/{user}"),
-                    |u| u.dir.to_string_lossy().into_owned(),
-                );
-            (user.to_string(), home)
         }
         _ => ("sandbox".to_string(), "/sandbox".to_string()),
-    }
+    };
+    let home = workdir_home.map_or(default_home, str::to_string);
+    (user, home)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -772,7 +780,7 @@ fn apply_child_env(
 #[allow(clippy::too_many_arguments)]
 fn spawn_pty_shell(
     policy: &SandboxPolicy,
-    workdir: Option<String>,
+    workspace: &ResolvedWorkspace,
     command: Option<String>,
     pty: &PtyRequest,
     handle: Handle,
@@ -823,7 +831,7 @@ fn spawn_pty_shell(
 
     // Derive USER and HOME from the policy's run_as_user when available,
     // falling back to "sandbox" / "/sandbox" for backward compatibility.
-    let (session_user, session_home) = session_user_and_home(policy);
+    let (session_user, session_home) = session_user_and_home(policy, workspace.home());
     apply_child_env(
         &mut cmd,
         &session_home,
@@ -836,20 +844,20 @@ fn spawn_pty_shell(
     );
     cmd.stdin(stdin).stdout(stdout).stderr(stderr);
 
-    if let Some(dir) = workdir.as_deref() {
+    if let Some(dir) = workspace.root() {
         cmd.current_dir(dir);
     }
 
     // Probe Landlock availability from the parent process where tracing works.
     #[cfg(target_os = "linux")]
     if enforcement_mode.enforces_child_sandbox() {
-        sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
+        sandbox::linux::log_sandbox_readiness(policy, workspace.root());
     }
 
     // Phase 1: Prepare Landlock ruleset before the child applies it.
     #[cfg(target_os = "linux")]
     let prepared_sandbox =
-        crate::process::prepare_child_sandbox(policy, workdir.as_deref(), enforcement_mode)
+        crate::process::prepare_child_sandbox(policy, workspace.root(), enforcement_mode)
             .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
 
     #[cfg(unix)]
@@ -857,7 +865,7 @@ fn spawn_pty_shell(
         unsafe_pty::install_pre_exec(
             &mut cmd,
             policy.clone(),
-            workdir.clone(),
+            workspace.owned_root(),
             slave_fd,
             netns_fd,
             resolved_identity,
@@ -945,7 +953,7 @@ fn spawn_pty_shell(
 #[allow(clippy::too_many_arguments)]
 fn spawn_pipe_exec(
     policy: &SandboxPolicy,
-    workdir: Option<String>,
+    workspace: &ResolvedWorkspace,
     command: Option<String>,
     handle: Handle,
     channel: ChannelId,
@@ -977,7 +985,7 @@ fn spawn_pipe_exec(
         },
     );
 
-    let (session_user, session_home) = session_user_and_home(policy);
+    let (session_user, session_home) = session_user_and_home(policy, workspace.home());
     apply_child_env(
         &mut cmd,
         &session_home,
@@ -992,20 +1000,20 @@ fn spawn_pipe_exec(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    if let Some(dir) = workdir.as_deref() {
+    if let Some(dir) = workspace.root() {
         cmd.current_dir(dir);
     }
 
     // Probe Landlock availability from the parent process where tracing works.
     #[cfg(target_os = "linux")]
     if enforcement_mode.enforces_child_sandbox() {
-        sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
+        sandbox::linux::log_sandbox_readiness(policy, workspace.root());
     }
 
     // Phase 1: Prepare Landlock ruleset before the child applies it.
     #[cfg(target_os = "linux")]
     let prepared_sandbox =
-        crate::process::prepare_child_sandbox(policy, workdir.as_deref(), enforcement_mode)
+        crate::process::prepare_child_sandbox(policy, workspace.root(), enforcement_mode)
             .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
 
     #[cfg(unix)]
@@ -1013,7 +1021,7 @@ fn spawn_pipe_exec(
         unsafe_pty::install_pre_exec_no_pty(
             &mut cmd,
             policy.clone(),
-            workdir.clone(),
+            workspace.owned_root(),
             netns_fd,
             resolved_identity,
             enforcement_mode,
@@ -1347,6 +1355,20 @@ fn is_loopback_host(host: &str) -> bool {
 mod tests {
     use super::*;
     use std::process::Stdio;
+
+    /// Regression test: the direct-tcpip connect path sets `TCP_NODELAY`.
+    #[tokio::test]
+    async fn connect_in_netns_sets_tcp_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let stream = connect_in_netns(&addr.to_string(), None)
+            .await
+            .expect("connect");
+        assert!(stream.nodelay().expect("query TCP_NODELAY"));
+    }
 
     #[cfg(unix)]
     fn file_mode(path: &Path) -> u32 {
@@ -1692,10 +1714,31 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home) = session_user_and_home(&policy, None);
         assert_eq!(user, "1000");
         // Numeric UID has no passwd entry — defaults to /sandbox.
         assert_eq!(home, "/sandbox");
+    }
+
+    #[test]
+    fn session_user_and_home_uses_driver_workspace_when_supplied() {
+        use openshell_core::policy::{
+            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
+        };
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: Some("1234".into()),
+                run_as_group: Some("1235".into()),
+            },
+        };
+
+        let (user, home) = session_user_and_home(&policy, Some("/workspace/project"));
+        assert_eq!(user, "1234");
+        assert_eq!(home, "/workspace/project");
     }
 
     #[test]
@@ -1713,7 +1756,7 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home) = session_user_and_home(&policy, None);
         assert_eq!(user, "sandbox");
         // Name-based — should resolve via passwd (or /home/{user}).
         assert!(!home.is_empty());
@@ -1734,7 +1777,7 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home) = session_user_and_home(&policy, None);
         assert_eq!(user, "sandbox");
         assert_eq!(home, "/sandbox");
     }
@@ -1754,7 +1797,7 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home) = session_user_and_home(&policy, None);
         assert_eq!(user, "sandbox");
         assert_eq!(home, "/sandbox");
     }
@@ -1774,7 +1817,7 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home) = session_user_and_home(&policy, None);
         assert_eq!(user, "1000660000");
         assert_eq!(home, "/sandbox");
     }

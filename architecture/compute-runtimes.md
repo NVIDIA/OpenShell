@@ -185,7 +185,8 @@ The gateway preserves whether each policy process field was omitted. The active
 driver then supplies one authoritative identity input to the supervisor:
 
 - Docker and Podman inspect the final sandbox image, pin container creation to
-  its immutable image ID, and pass its raw OCI `Config.User`.
+  its immutable image ID, and pass its raw OCI `Config.User`. Docker also
+  resolves the workspace from OCI `Config.WorkingDir` during that inspection.
 - Kubernetes passes its platform-resolved numeric UID/GID, including OpenShift
   SCC-derived values.
 - VM keeps its existing guest identity behavior.
@@ -197,6 +198,24 @@ the image. The supervisor resolves names from the image's `/etc/passwd` and
 and uses the same privilege-drop path for direct and SSH children. When a
 declaration omits the group, the supervisor fills it with the user's numeric
 primary GID. It does not rewrite the account files.
+
+Docker uses an absolute OCI working directory as the workspace. An
+empty, root (`/`), or explicit `/sandbox` declaration uses `/sandbox`, which
+OpenShell creates and owns as a compatibility workspace. Any other workdir must already
+exist in the immutable image without symlink components. The completed
+identity, including supplementary groups, must already be able to traverse
+every parent and write and enter the workdir; OpenShell does not change that
+directory's ownership or mode. A one-shot validator drops to that identity and
+uses kernel effective-access checks so POSIX ACL and LSM decisions are honored.
+Path checks reserve the standard OCI runtime namespaces under `/proc`, `/sys`,
+and `/dev`, while separate collision checks are derived from actual OpenShell
+control paths.
+Docker performs the check in the final container before workload launch and
+rejects image `VOLUME` declarations that would mask the workdir ancestry. The
+resolved workspace is the child cwd and `HOME`; when
+`filesystem.include_workdir` is enabled, it becomes the automatic writable
+policy path. Podman, Kubernetes/OpenShift, and VM retain their existing
+`/sandbox` workspace behavior.
 
 Sandbox creation fails before the workload becomes ready when a required image
 identity is absent, malformed, unknown, ambiguous, or resolves to UID/GID 0.

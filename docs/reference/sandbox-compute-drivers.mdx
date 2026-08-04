@@ -178,9 +178,10 @@ Docker mount schema:
 
 OpenShell rejects mount `source`, `target`, and Docker volume `subpath` values
 with surrounding whitespace. OpenShell also rejects mount targets that replace
-the workspace root, container root, supervisor files, `/etc/openshell`,
-`/etc/openshell-tls`, authentication material, or network namespace paths. These
-checks do not make host bind mounts safe.
+the workspace root or container root, or contain or are contained by the
+configured SSH socket or reserved `/opt/openshell`, `/etc/openshell`,
+`/etc/openshell-tls`, `/run/openshell`, `/run/openshell-sidecar`, and network
+namespace roots. These checks do not make host bind mounts safe.
 
 ## Podman Driver
 
@@ -443,6 +444,24 @@ declared name or numeric components for both direct and SSH children. When
 `USER` omits the group, the supervisor uses the user's numeric primary GID. It
 does not modify `/etc/passwd` or `/etc/group`.
 
+Docker also inspects OCI `WorkingDir`. An absolute value becomes the
+agent workspace; an empty, root (`/`), or explicit `/sandbox` value uses the
+managed `/sandbox` compatibility workspace.
+OpenShell creates and owns that compatibility workspace. Any other workdir must
+already exist in the immutable image without symlink components. The completed
+UID/GID and supplementary groups must already be able to traverse every parent
+and write and enter the workdir. OpenShell does not change that directory's
+ownership or mode. A one-shot validator drops to that identity and uses kernel
+effective-access checks, including POSIX ACL grants and LSM denials. It rejects
+workdirs that overlap the OCI runtime namespaces under `/proc`, `/sys`, or
+`/dev`, and rejects overlap with actual OpenShell control paths. Docker checks
+the original image filesystem in the final supervisor and rejects image
+`VOLUME` declarations that would mask the workdir or one of its parents before
+validation. The resolved workspace is the cwd and `HOME` for direct and SSH
+children. The supervisor itself starts from `/`, so a missing or invalid
+workspace is handled during readiness instead of preventing the container
+runtime from starting it.
+
 Sandbox creation fails before readiness if a required `USER` component is
 missing, malformed, unknown, ambiguous, or resolves to UID/GID 0. An image
 without `USER` therefore works only when policy explicitly provides both
@@ -472,7 +491,9 @@ The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/e
 Docker and Podman custom images do not need a baked-in `"sandbox"` user. Declare
 a non-root OCI `USER`, or set both process identity fields explicitly in policy.
 Named image users require matching account entries; a numeric `UID:GID` pair
-does not. OpenShell continues to use `/sandbox` as the workspace; it does not
-adopt the image's OCI working directory. Until OCI working-directory support is
-added, custom images must create `/sandbox` and make it writable by the selected
-identity.
+does not. For Docker, declare an absolute OCI `WORKDIR` to select the workspace.
+Images with no working directory, `WORKDIR /`, or `WORKDIR /sandbox` use
+OpenShell's managed `/sandbox` compatibility workspace. For any other Docker
+path, create the directory in the image and grant the final process identity
+write and execute permission in the Dockerfile. Podman, Kubernetes/OpenShift,
+and VM sandboxes continue to use `/sandbox`.
