@@ -20,6 +20,15 @@
 # files, relative to the repository root or absolute, to layer additional chart
 # configuration on top of ci/values-skaffold.yaml.
 #
+# Set OPENSHELL_E2E_KUBE_USE_ENVOY=1 to exercise the Gateway API/Envoy
+# GRPCRoute path for the standard single-replica suite. This does not enable HA
+# or change chart replica counts. It installs or reuses an Envoy Gateway
+# controller, enables the chart's Gateway and GRPCRoute, and connects through
+# the generated Envoy proxy Service. Resources created by this mode use
+# test-owned names and are removed without modifying pre-existing Envoy
+# resources. It is independent of the database backend; callers that enable
+# multi-replica overlays must still provide an external PostgreSQL Secret.
+#
 # Image source:
 #   - Ephemeral k3d mode builds local `openshell/{gateway,supervisor}:${IMAGE_TAG}`
 #     images by default, imports them into k3d, then installs the chart. This
@@ -80,6 +89,16 @@ EXTERNAL_PG_FIXTURE_SERVICE="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_USER="openshell"
 EXTERNAL_PG_FIXTURE_PASSWORD="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_DATABASE="openshell"
+E2E_RESOURCE_SUFFIX="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-$$"
+ENVOY_CHART_VERSION="${OPENSHELL_E2E_ENVOY_VERSION:-v1.7.2}"
+ENVOY_RELEASE_NAME="${OPENSHELL_E2E_ENVOY_RELEASE_NAME:-envoy-gateway}"
+ENVOY_NAMESPACE="${OPENSHELL_E2E_ENVOY_NAMESPACE:-openshell-e2e-envoy-${E2E_RESOURCE_SUFFIX}}"
+ENVOY_GATEWAY_CLASS_NAME="${OPENSHELL_E2E_ENVOY_GATEWAY_CLASS_NAME:-openshell-e2e-${E2E_RESOURCE_SUFFIX}}"
+ENVOY_BACKEND_POLICY_NAME="${OPENSHELL_E2E_ENVOY_BACKEND_POLICY_NAME:-openshell-e2e-timeouts-${E2E_RESOURCE_SUFFIX}}"
+ENVOY_HELM_RELEASE_CREATED_BY_US=0
+ENVOY_NAMESPACE_CREATED_BY_US=0
+ENVOY_GATEWAY_CLASS_CREATED_BY_US=0
+ENVOY_BACKEND_POLICY_CREATED_BY_US=0
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -133,6 +152,207 @@ kube_workload_ref() {
   return 1
 }
 
+use_envoy_gateway() {
+  case "${OPENSHELL_E2E_KUBE_USE_ENVOY:-0}" in
+    1 | true | TRUE | yes | YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+envoy_gateway_controller_available() {
+  local gateway_classes
+  local deployments
+
+  gateway_classes="$(kctl get gatewayclass \
+    -o 'jsonpath={range .items[?(@.spec.controllerName=="gateway.envoyproxy.io/gatewayclass-controller")]}{.metadata.name}{"\n"}{end}' \
+    2>/dev/null || true)"
+  deployments="$(kctl get deployment -A -l control-plane=envoy-gateway \
+    -o name 2>/dev/null || true)"
+  [ -n "${gateway_classes}${deployments}" ]
+}
+
+wait_for_envoy_gateway_class() {
+  local accepted
+
+  for _ in $(seq 1 60); do
+    accepted="$(kctl get gatewayclass "${ENVOY_GATEWAY_CLASS_NAME}" \
+      -o 'jsonpath={.status.conditions[?(@.type=="Accepted")].status}' \
+      2>/dev/null || true)"
+    if [ "${accepted}" = "True" ]; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "ERROR: Envoy GatewayClass ${ENVOY_GATEWAY_CLASS_NAME} was not accepted" >&2
+  kctl get gatewayclass "${ENVOY_GATEWAY_CLASS_NAME}" -o yaml >&2 || true
+  return 1
+}
+
+prepare_envoy_gateway() {
+  if envoy_gateway_controller_available; then
+    echo "Using the existing Envoy Gateway controller without modifying its release."
+  else
+    if kctl get namespace "${ENVOY_NAMESPACE}" >/dev/null 2>&1; then
+      echo "ERROR: refusing to install Envoy Gateway into pre-existing namespace ${ENVOY_NAMESPACE}" >&2
+      return 1
+    fi
+
+    echo "Installing test-owned Envoy Gateway ${ENVOY_CHART_VERSION} in ${ENVOY_NAMESPACE}..."
+    if ! kctl create namespace "${ENVOY_NAMESPACE}"; then
+      return 1
+    fi
+    ENVOY_NAMESPACE_CREATED_BY_US=1
+    # Record ownership before install so the EXIT trap also cleans up a failed
+    # or timed-out Helm release in this invocation's unique namespace.
+    ENVOY_HELM_RELEASE_CREATED_BY_US=1
+    if ! helmctl install "${ENVOY_RELEASE_NAME}" \
+      oci://docker.io/envoyproxy/gateway-helm \
+      --version "${ENVOY_CHART_VERSION}" \
+      --namespace "${ENVOY_NAMESPACE}" \
+      --wait --timeout 5m; then
+      return 1
+    fi
+  fi
+
+  if kctl get gatewayclass "${ENVOY_GATEWAY_CLASS_NAME}" >/dev/null 2>&1; then
+    echo "ERROR: refusing to modify pre-existing GatewayClass ${ENVOY_GATEWAY_CLASS_NAME}" >&2
+    return 1
+  fi
+
+  if ! kctl create -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: ${ENVOY_GATEWAY_CLASS_NAME}
+  labels:
+    app.kubernetes.io/managed-by: openshell-e2e
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+EOF
+  then
+    return 1
+  fi
+  ENVOY_GATEWAY_CLASS_CREATED_BY_US=1
+  wait_for_envoy_gateway_class
+}
+
+configure_envoy_backend_policy() {
+  use_envoy_gateway || return 0
+  [ "${ENVOY_BACKEND_POLICY_CREATED_BY_US}" = "0" ] || return 0
+
+  if kctl -n "${NAMESPACE}" get backendtrafficpolicy.gateway.envoyproxy.io \
+    "${ENVOY_BACKEND_POLICY_NAME}" >/dev/null 2>&1; then
+    echo "ERROR: refusing to modify pre-existing BackendTrafficPolicy ${NAMESPACE}/${ENVOY_BACKEND_POLICY_NAME}" >&2
+    return 1
+  fi
+
+  # OpenShell gRPC streams can outlive Envoy's default request and stream
+  # duration limits during sandbox create, exec, and watch operations.
+  if ! kctl create -f - <<EOF
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: ${ENVOY_BACKEND_POLICY_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: openshell-e2e
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: GRPCRoute
+      name: ${RELEASE_NAME}
+  timeout:
+    http:
+      requestTimeout: 0s
+      maxStreamDuration: 0s
+EOF
+  then
+    return 1
+  fi
+  ENVOY_BACKEND_POLICY_CREATED_BY_US=1
+}
+
+wait_for_envoy_service() {
+  local service_ref
+  local service_namespace
+
+  for _ in $(seq 1 60); do
+    service_ref="$(kctl get service -A \
+      -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+      -o 'jsonpath={.items[0].metadata.namespace}{"/"}{.items[0].metadata.name}' \
+      2>/dev/null || true)"
+    if [ -n "${service_ref}" ]; then
+      service_namespace="${service_ref%%/*}"
+      if kctl -n "${service_namespace}" wait --for=condition=Ready pod \
+        -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+        --timeout=5s >/dev/null 2>&1; then
+        printf '%s\n' "${service_ref}"
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+
+  echo "ERROR: Envoy proxy Service for Gateway ${NAMESPACE}/${RELEASE_NAME} was not ready" >&2
+  kctl -n "${NAMESPACE}" get gateway,grpcroute -o wide >&2 || true
+  kctl get service,pod -A \
+    -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+    -o wide >&2 || true
+  return 1
+}
+
+start_gateway_portforward() {
+  local elapsed=0
+  local timeout=30
+  local target_namespace="${NAMESPACE}"
+  local target_service="${RELEASE_NAME}"
+  local target_port=8080
+  local service_ref
+
+  LOCAL_PORT="$(e2e_pick_port)"
+  if use_envoy_gateway; then
+    if ! service_ref="$(wait_for_envoy_service)"; then
+      return 1
+    fi
+    target_namespace="${service_ref%%/*}"
+    target_service="${service_ref#*/}"
+    target_port=80
+    echo "Starting kubectl port-forward -n ${target_namespace} svc/${target_service} ${LOCAL_PORT}:${target_port} (Envoy Gateway)..."
+  else
+    echo "Starting kubectl port-forward svc/${target_service} ${LOCAL_PORT}:${target_port}..."
+  fi
+
+  kctl -n "${target_namespace}" port-forward "svc/${target_service}" \
+    "${LOCAL_PORT}:${target_port}" >"${PORTFORWARD_LOG}" 2>&1 &
+  PORTFORWARD_PID=$!
+
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    if ! kill -0 "${PORTFORWARD_PID}" 2>/dev/null; then
+      echo "ERROR: kubectl port-forward exited before becoming reachable" >&2
+      cat "${PORTFORWARD_LOG}" >&2 || true
+      return 1
+    fi
+    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  echo "ERROR: port-forward did not accept TCP within ${timeout}s" >&2
+  cat "${PORTFORWARD_LOG}" >&2 || true
+  return 1
+}
+
+stop_gateway_portforward() {
+  [ -n "${PORTFORWARD_PID}" ] || return 0
+
+  kill "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
+  wait "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
+  PORTFORWARD_PID=""
+}
+
 deploy_postgres_fixture() {
   local secret_name="$1"
   local pg_uri
@@ -170,13 +390,47 @@ cleanup_postgres_fixture() {
   EXTERNAL_PG_FIXTURE_SECRET=""
 }
 
+cleanup_envoy_backend_policy() {
+  [ "${ENVOY_BACKEND_POLICY_CREATED_BY_US}" = "1" ] || return 0
+
+  if [ -n "${KUBE_CONTEXT}" ] && command -v kubectl >/dev/null 2>&1; then
+    kctl -n "${NAMESPACE}" delete backendtrafficpolicy.gateway.envoyproxy.io \
+      "${ENVOY_BACKEND_POLICY_NAME}" --ignore-not-found --wait=false \
+      >/dev/null 2>&1 || true
+  fi
+  ENVOY_BACKEND_POLICY_CREATED_BY_US=0
+}
+
+cleanup_envoy_gateway() {
+  if [ "${ENVOY_GATEWAY_CLASS_CREATED_BY_US}" = "1" ] \
+     && [ -n "${KUBE_CONTEXT}" ] \
+     && command -v kubectl >/dev/null 2>&1; then
+    kctl delete gatewayclass "${ENVOY_GATEWAY_CLASS_NAME}" \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    ENVOY_GATEWAY_CLASS_CREATED_BY_US=0
+  fi
+
+  if [ "${ENVOY_HELM_RELEASE_CREATED_BY_US}" = "1" ] \
+     && [ -n "${KUBE_CONTEXT}" ] \
+     && command -v helm >/dev/null 2>&1; then
+    helmctl uninstall "${ENVOY_RELEASE_NAME}" --namespace "${ENVOY_NAMESPACE}" \
+      --wait --timeout 60s >/dev/null 2>&1 || true
+    ENVOY_HELM_RELEASE_CREATED_BY_US=0
+  fi
+
+  if [ "${ENVOY_NAMESPACE_CREATED_BY_US}" = "1" ] \
+     && [ -n "${KUBE_CONTEXT}" ] \
+     && command -v kubectl >/dev/null 2>&1; then
+    kctl delete namespace "${ENVOY_NAMESPACE}" --wait=true --timeout=60s \
+      --ignore-not-found >/dev/null 2>&1 || true
+    ENVOY_NAMESPACE_CREATED_BY_US=0
+  fi
+}
+
 cleanup() {
   local exit_code=$?
 
-  if [ -n "${PORTFORWARD_PID}" ]; then
-    kill "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
-    wait "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
-  fi
+  stop_gateway_portforward
 
   if [ -n "${PORTFORWARD_HEALTH_PID}" ]; then
     kill "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
@@ -196,6 +450,15 @@ cleanup() {
         -l "app.kubernetes.io/instance=${RELEASE_NAME}" --tail=200 \
         --all-containers --prefix 2>&1 || true
       echo "=== end gateway debug output ==="
+      if use_envoy_gateway; then
+        echo "=== Envoy Gateway state ==="
+        kctl -n "${NAMESPACE}" get gateway,grpcroute,backendtrafficpolicy \
+          -o wide 2>&1 || true
+        kctl get service,pod -A \
+          -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+          -o wide 2>&1 || true
+        echo "=== end Envoy Gateway state ==="
+      fi
     fi
     if [ -f "${PORTFORWARD_LOG}" ]; then
       echo "=== port-forward log ==="
@@ -213,6 +476,8 @@ cleanup() {
     cleanup_postgres_fixture "${EXTERNAL_PG_FIXTURE_SECRET}"
   fi
 
+  cleanup_envoy_backend_policy
+
   if [ "${HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
     if command -v helm >/dev/null 2>&1; then
       helmctl uninstall "${RELEASE_NAME}" --namespace "${NAMESPACE}" --wait \
@@ -225,6 +490,8 @@ cleanup() {
         --ignore-not-found >/dev/null 2>&1 || true
     fi
   fi
+
+  cleanup_envoy_gateway
 
   if [ "${CLUSTER_CREATED_BY_US}" = "1" ] && [ -n "${CLUSTER_NAME}" ]; then
     if command -v k3d >/dev/null 2>&1 && k3d cluster list "${CLUSTER_NAME}" \
@@ -241,11 +508,7 @@ trap cleanup EXIT
 # --- DB-scenario helpers (used only when OPENSHELL_E2E_KUBE_DB_SCENARIOS=1) ---
 
 scenario_stop_portforward() {
-  if [ -n "${PORTFORWARD_PID}" ]; then
-    kill "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
-    wait "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
-    PORTFORWARD_PID=""
-  fi
+  stop_gateway_portforward
   if [ -n "${PORTFORWARD_HEALTH_PID}" ]; then
     kill "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
     wait "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
@@ -304,39 +567,15 @@ run_scenario() {
     --wait --timeout 5m
   HELM_INSTALLED=1
 
-  LOCAL_PORT="$(e2e_pick_port)"
-  echo "Starting kubectl port-forward svc/openshell ${LOCAL_PORT}:8080..."
-  kctl -n "${NAMESPACE}" port-forward "svc/openshell" \
-    "${LOCAL_PORT}:8080" >"${PORTFORWARD_LOG}" 2>&1 &
-  PORTFORWARD_PID=$!
-
-  local elapsed=0 pf_timeout=30
-  while [ "${elapsed}" -lt "${pf_timeout}" ]; do
-    if ! kill -0 "${PORTFORWARD_PID}" 2>/dev/null; then
-      echo "ERROR: kubectl port-forward exited before becoming reachable" >&2
-      cat "${PORTFORWARD_LOG}" >&2 || true
-      DB_FAILED=$((DB_FAILED + 1))
-      DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: port-forward died")
-      scenario_stop_portforward
-      scenario_cleanup_release
-      return
-    fi
-    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
-      break
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  if [ "${elapsed}" -ge "${pf_timeout}" ]; then
-    echo "ERROR: port-forward did not accept TCP within ${pf_timeout}s" >&2
-    cat "${PORTFORWARD_LOG}" >&2 || true
+  if ! configure_envoy_backend_policy || ! start_gateway_portforward; then
     DB_FAILED=$((DB_FAILED + 1))
-    DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: port-forward timeout")
+    DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: port-forward failed")
     scenario_stop_portforward
     scenario_cleanup_release
     return
   fi
 
+  local elapsed=0 pf_timeout=30
   HEALTH_LOCAL_PORT="$(e2e_pick_port)"
   local workload_ref
   workload_ref="$(kube_workload_ref "${RELEASE_NAME}")"
@@ -612,6 +851,11 @@ if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
     helm_values_args+=(--values "${values_file}")
   done
 fi
+if use_envoy_gateway; then
+  prepare_envoy_gateway
+  helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway.yaml")
+  helm_extra_args+=(--set "grpcRoute.gateway.className=${ENVOY_GATEWAY_CLASS_NAME}")
+fi
 
 if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
   # --- Multi-scenario mode: test all database backends ---
@@ -662,31 +906,8 @@ else
     --wait --timeout 5m
   HELM_INSTALLED=1
 
-  LOCAL_PORT="$(e2e_pick_port)"
-  echo "Starting kubectl port-forward svc/openshell ${LOCAL_PORT}:8080..."
-  kctl -n "${NAMESPACE}" port-forward "svc/openshell" \
-    "${LOCAL_PORT}:8080" >"${PORTFORWARD_LOG}" 2>&1 &
-  PORTFORWARD_PID=$!
-
-  elapsed=0
-  timeout=30
-  while [ "${elapsed}" -lt "${timeout}" ]; do
-    if ! kill -0 "${PORTFORWARD_PID}" 2>/dev/null; then
-      echo "ERROR: kubectl port-forward exited before becoming reachable" >&2
-      cat "${PORTFORWARD_LOG}" >&2 || true
-      exit 1
-    fi
-    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
-      break
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  if [ "${elapsed}" -ge "${timeout}" ]; then
-    echo "ERROR: port-forward did not accept TCP within ${timeout}s" >&2
-    cat "${PORTFORWARD_LOG}" >&2 || true
-    exit 1
-  fi
+  configure_envoy_backend_policy
+  start_gateway_portforward
 
   HEALTH_LOCAL_PORT="$(e2e_pick_port)"
   WORKLOAD_REF="$(kube_workload_ref "${RELEASE_NAME}")"
