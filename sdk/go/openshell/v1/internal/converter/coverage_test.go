@@ -95,29 +95,29 @@ func TestConverterCoversAllProtoFields_SandboxPolicy(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_NetworkEndpoint(t *testing.T) {
 	handled := fieldSet{
-		"host":                           true,
-		"port":                           true,
-		"ports":                          true,
-		"protocol":                       true,
-		"tls":                            true,
-		"enforcement":                    true,
-		"access":                         true,
-		"rules":                          true,
-		"allowed_ips":                    true,
-		"deny_rules":                    true,
-		"allow_encoded_slash":            true,
-		"persisted_queries":              true,
-		"graphql_persisted_queries":      true,
-		"graphql_max_body_bytes":         true,
-		"path":                           true,
-		"websocket_credential_rewrite":   true,
+		"host":                            true,
+		"port":                            true,
+		"ports":                           true,
+		"protocol":                        true,
+		"tls":                             true,
+		"enforcement":                     true,
+		"access":                          true,
+		"rules":                           true,
+		"allowed_ips":                     true,
+		"deny_rules":                      true,
+		"allow_encoded_slash":             true,
+		"persisted_queries":               true,
+		"graphql_persisted_queries":       true,
+		"graphql_max_body_bytes":          true,
+		"path":                            true,
+		"websocket_credential_rewrite":    true,
 		"request_body_credential_rewrite": true,
-		"advisor_proposed":               true,
-		"credential_signing":             true,
-		"signing_service":                true,
-		"signing_region":                 true,
-		"json_rpc_max_body_bytes":        true,
-		"mcp":                            true,
+		"advisor_proposed":                true,
+		"credential_signing":              true,
+		"signing_service":                 true,
+		"signing_region":                  true,
+		"json_rpc_max_body_bytes":         true,
+		"mcp":                             true,
 	}
 
 	assertAllFieldsCovered(t, (&sandboxpb.NetworkEndpoint{}).ProtoReflect().Descriptor(), handled, nil)
@@ -155,7 +155,7 @@ func TestConverterCoversAllProtoFields_L7DenyRule(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_McpOptions(t *testing.T) {
 	handled := fieldSet{
-		"strict_tool_names":          true,
+		"strict_tool_names":           true,
 		"allow_all_known_mcp_methods": true,
 	}
 

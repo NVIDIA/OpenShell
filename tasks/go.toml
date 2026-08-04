@@ -33,9 +33,24 @@ dir = "sdk/go"
 run = "go build ./..."
 hide = true
 
+["go:format:check"]
+description = "Verify Go SDK code is gofmt-formatted"
+dir = "sdk/go"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+UNFORMATTED=$(gofmt -l . 2>/dev/null || true)
+if [ -n "$UNFORMATTED" ]; then
+  echo "ERROR: The following files are not gofmt-formatted:"
+  echo "$UNFORMATTED"
+  exit 1
+fi
+"""
+hide = true
+
 ["go:ci"]
 description = "Run Go SDK full CI pipeline"
-depends = ["go:lint", "go:build", "go:test", "go:proto:check", "go:docs:check"]
+depends = ["go:format:check", "go:lint", "go:build", "go:test", "go:proto:check", "go:docs:check"]
 
 ["go:docs:check"]
 description = "Verify every public Go SDK package has a docs page"
