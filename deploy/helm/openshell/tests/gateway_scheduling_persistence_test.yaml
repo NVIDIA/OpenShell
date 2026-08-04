@@ -1,0 +1,122 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway scheduling fields and data volume
+templates:
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+  - templates/deployment.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  # priorityClassName — shared pod template, so both workload shapes
+  - it: omits priorityClassName by default on the StatefulSet
+    template: templates/statefulset.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.priorityClassName
+
+  - it: sets priorityClassName on the StatefulSet when configured
+    template: templates/statefulset.yaml
+    set:
+      priorityClassName: system-cluster-critical
+    asserts:
+      - equal:
+          path: spec.template.spec.priorityClassName
+          value: system-cluster-critical
+
+  - it: sets priorityClassName on the Deployment when configured
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: openshell-db
+      priorityClassName: system-cluster-critical
+    asserts:
+      - equal:
+          path: spec.template.spec.priorityClassName
+          value: system-cluster-critical
+
+  # topologySpreadConstraints — shared pod template, so both workload shapes
+  - it: omits topologySpreadConstraints by default on the StatefulSet
+    template: templates/statefulset.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.topologySpreadConstraints
+
+  - it: sets topologySpreadConstraints on the StatefulSet when configured
+    template: templates/statefulset.yaml
+    set:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: openshell
+    asserts:
+      - equal:
+          path: spec.template.spec.topologySpreadConstraints[0].maxSkew
+          value: 1
+      - equal:
+          path: spec.template.spec.topologySpreadConstraints[0].topologyKey
+          value: topology.kubernetes.io/zone
+      - equal:
+          path: spec.template.spec.topologySpreadConstraints[0].whenUnsatisfiable
+          value: DoNotSchedule
+
+  - it: sets topologySpreadConstraints on the Deployment when configured
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: openshell-db
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+    asserts:
+      - equal:
+          path: spec.template.spec.topologySpreadConstraints[0].topologyKey
+          value: kubernetes.io/hostname
+
+  # persistence — StatefulSet only
+  - it: defaults the data volume to 1Gi with no storageClassName
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.resources.requests.storage
+          value: 1Gi
+      - notExists:
+          path: spec.volumeClaimTemplates[0].spec.storageClassName
+
+  - it: sets the data volume size when configured
+    template: templates/statefulset.yaml
+    set:
+      persistence.size: 10Gi
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.resources.requests.storage
+          value: 10Gi
+
+  - it: sets the data volume storageClassName when configured
+    template: templates/statefulset.yaml
+    set:
+      persistence.storageClassName: fast-ssd
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.storageClassName
+          value: fast-ssd
+
+  - it: keeps the claim name and access mode unchanged
+    template: templates/statefulset.yaml
+    set:
+      persistence.size: 5Gi
+      persistence.storageClassName: fast-ssd
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].metadata.name
+          value: openshell-data
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.accessModes[0]
+          value: ReadWriteOnce

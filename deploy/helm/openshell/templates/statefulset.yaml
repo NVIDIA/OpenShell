@@ -21,7 +21,10 @@ spec:
         name: openshell-data
       spec:
         accessModes: ["ReadWriteOnce"]
+        {{- with .Values.persistence.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
-            storage: 1Gi
+            storage: {{ .Values.persistence.size }}
 {{- end }}
