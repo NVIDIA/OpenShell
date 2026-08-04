@@ -382,7 +382,10 @@ provider-profile policy—before it stores a direct update, incremental merge,
 approved proposal, provider attachment, or profile update that affects attached
 sandboxes. An ambiguity failure returns `FAILED_PRECONDITION`; the rejected
 candidate does not create a policy revision or partially update affected
-sandboxes. Fix the conflicting endpoint selectors and submit again.
+sandboxes. The same fail-closed response applies when `credential_signing`
+does not have an attached AWS profile whose credential boundary covers the
+endpoint, or an explicit binding to an endpointless AWS profile. Fix the
+conflicting endpoint selectors or credential source and submit again.
 
 The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls every second). Exit codes:
 - **0**: Policy loaded successfully

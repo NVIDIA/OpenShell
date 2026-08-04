@@ -198,6 +198,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 - `rules: []` (empty list) is rejected; use `access: full` or remove `rules`.
 - Non-empty `rules` must contain at least one effective allow clause; rules where every entry lacks an allow are rejected as deny-all.
 - `deny_rules: []` (empty list) is rejected; remove it if no denials are needed.
+- `credential_signing` requires a resolvable AWS credential source before a sandbox policy can activate. Use an attached endpoint-bearing profile that declares `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` and covers the signed endpoint, or bind an attached endpointless profile that declares those keys with `credential_binding.provider`.
 
 Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token provider-shaped aliases such as `provider-OPENSHELL-RESOLVE-ENV-API_TOKEN` when the referenced environment key exists in the configured provider credentials.
 

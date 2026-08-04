@@ -153,6 +153,13 @@ headers, Basic and Bearer authorization, URL paths, query parameters, opted-in
 request bodies, AWS SigV4 signing, and opted-in WebSocket text messages. Raw
 `tls: skip` and non-HTTP tunnels do not perform static credential substitution.
 
+Before it activates a sandbox policy, OpenShell verifies that every endpoint
+with `credential_signing` has an attached profile that declares
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. An endpoint-bearing profile must
+cover the signed host, port, and path. An endpointless profile must be selected
+by `credential_binding.provider` on that endpoint. A missing or mismatched
+source rejects the whole policy update with `FAILED_PRECONDITION`.
+
 If an HTTP request contains a known placeholder at a destination outside its
 binding, OpenShell returns HTTP 403 with this response:
 
