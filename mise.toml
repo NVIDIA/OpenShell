@@ -39,7 +39,7 @@ zig = "0.14.1"
 "npm:markdownlint-cli2" = "0.22.0"
 
 [tools."github:mozilla/sccache"]
-version = "0.14.0"
+version = "0.16.0"
 
 [tools."github:mozilla/sccache".platforms]
 # NOTE: this override is necessary only for linux-x64, otherwise it selects an invalid artifact (sccache-dist-vx.y.z-x86_64-unknown-linux-musl.tar.gz)

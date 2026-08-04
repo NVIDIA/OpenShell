@@ -12,6 +12,7 @@
 pub mod activity;
 pub mod auth;
 pub mod config;
+pub mod container_paths;
 pub mod denial;
 pub mod driver_mounts;
 pub mod driver_utils;
@@ -45,7 +46,7 @@ pub use config::{
     ComputeDriverKind, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,
     GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
     GatewayInterceptorPhaseConfig, GatewayJwtConfig, GatewayProviderProfileSourceConfig,
-    MtlsAuthConfig, OidcConfig, TlsConfig,
+    MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TlsConfig,
 };
 pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{

@@ -20,6 +20,7 @@ use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
 };
+use tokio::sync::watch;
 use tracing::info;
 
 /// Baked-in rego rules for OPA policy evaluation.
@@ -124,6 +125,26 @@ pub struct OpaEngine {
     generation: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
+    generation_tx: watch::Sender<u64>,
+    fail_closed_reason: RwLock<Option<String>>,
+}
+
+#[cfg(test)]
+static TEST_OPA_QUERY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn record_test_opa_query() {
+    TEST_OPA_QUERY_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_opa_query_count() {
+    TEST_OPA_QUERY_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn test_opa_query_count() -> u64 {
+    TEST_OPA_QUERY_COUNT.load(Ordering::SeqCst)
 }
 
 /// Generation guard captured when an HTTP tunnel or request path starts.
@@ -131,6 +152,7 @@ pub struct OpaEngine {
 pub struct PolicyGenerationGuard {
     captured_generation: u64,
     current_generation: Arc<AtomicU64>,
+    generation_rx: watch::Receiver<u64>,
 }
 
 impl PolicyGenerationGuard {
@@ -155,6 +177,19 @@ impl PolicyGenerationGuard {
             ));
         }
         Ok(())
+    }
+
+    /// Wait until the policy generation changes.
+    ///
+    /// Relay boundaries use this to close even an idle or raw stream as soon
+    /// as a new generation (including fail-closed quarantine) is published.
+    pub async fn wait_until_stale(&self) {
+        let mut receiver = self.generation_rx.clone();
+        while !self.is_stale() {
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -215,6 +250,34 @@ impl OpaEngine {
         self.websocket_assembly_budget.clone()
     }
 
+    fn with_engine(engine: regorus::Engine) -> Self {
+        let generation = Arc::new(AtomicU64::new(0));
+        let (generation_tx, _) = watch::channel(0);
+        Self {
+            engine: Mutex::new(engine),
+            generation,
+            middleware_runner: RwLock::new(ChainRunner::default()),
+            websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
+            generation_tx,
+            fail_closed_reason: RwLock::new(None),
+        }
+    }
+
+    fn advance_generation(&self) -> u64 {
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.generation_tx.send_replace(generation);
+        generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_lock_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.engine.lock().expect("test engine lock");
+            panic!("poison OPA engine lock for compatibility fallback test");
+        }));
+        assert!(self.engine.is_poisoned());
+    }
+
     /// Load policy from a `.rego` rules file and data from a YAML file.
     ///
     /// Preprocesses the YAML data to expand access presets and validate L7 config.
@@ -246,12 +309,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self {
-            engine: Mutex::new(engine),
-            generation: Arc::new(AtomicU64::new(0)),
-            middleware_runner: RwLock::new(ChainRunner::default()),
-            websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
-        })
+        Ok(Self::with_engine(engine))
     }
 
     /// Load policy rules and data from strings (data is YAML).
@@ -302,12 +360,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self {
-            engine: Mutex::new(engine),
-            generation: Arc::new(AtomicU64::new(0)),
-            middleware_runner: RwLock::new(ChainRunner::default()),
-            websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
-        })
+        Ok(Self::with_engine(engine))
     }
 
     /// Create OPA engine from a typed proto policy.
@@ -341,6 +394,18 @@ impl OpaEngine {
         entrypoint_pid: u32,
         require_binary_identity: bool,
     ) -> Result<Self> {
+        let ambiguities = openshell_policy::find_endpoint_ambiguities(proto);
+        if !ambiguities.is_empty() {
+            return Err(miette::miette!(
+                "network endpoint ambiguity validation failed:\n{}",
+                ambiguities
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+
         emit_binary_identity_mode(require_binary_identity, "proto");
         if let Err(violations) = openshell_policy::validate_sandbox_policy(proto) {
             let errors = violations
@@ -382,12 +447,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self {
-            engine: Mutex::new(engine),
-            generation: Arc::new(AtomicU64::new(0)),
-            middleware_runner: RwLock::new(ChainRunner::default()),
-            websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
-        })
+        Ok(Self::with_engine(engine))
     }
 
     /// Evaluate a network access request against the loaded policy.
@@ -402,6 +462,19 @@ impl OpaEngine {
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+
+        let fail_closed_reason = self
+            .fail_closed_reason
+            .read()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .clone();
+        if let Some(reason) = fail_closed_reason {
+            return Ok(PolicyDecision {
+                allowed: false,
+                reason,
+                matched_policy: None,
+            });
+        }
 
         engine
             .set_input_json(&input_json.to_string())
@@ -446,6 +519,9 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(NetworkAction, u64)> {
+        #[cfg(test)]
+        record_test_opa_query();
+
         let input_json = network_input_json(input);
 
         let mut engine = self
@@ -453,6 +529,15 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         let generation = self.current_generation();
+
+        let fail_closed_reason = self
+            .fail_closed_reason
+            .read()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .clone();
+        if let Some(reason) = fail_closed_reason {
+            return Ok((NetworkAction::Deny { reason }, generation));
+        }
 
         engine
             .set_input_json(&input_json.to_string())
@@ -500,7 +585,11 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         *engine = new_engine;
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.advance_generation();
         Ok(())
     }
 
@@ -535,7 +624,11 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         *engine = new_engine;
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.advance_generation();
         Ok(())
     }
 
@@ -569,8 +662,59 @@ impl OpaEngine {
         let new_runner = runner.with_replacement_registry(registry);
         *engine = new_engine;
         *runner = new_runner;
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.advance_generation();
         Ok(())
+    }
+
+    /// Publish a deny-all quarantine generation without activating any part
+    /// of the invalid candidate policy.
+    ///
+    /// The existing compiled engine remains available for an explicit
+    /// `retain_last_valid` posture or a later valid reload, but all new network
+    /// decisions deny with `reason` while the quarantine is active. Advancing
+    /// the generation invalidates and wakes every pinned relay.
+    pub fn enter_fail_closed(&self, reason: impl Into<String>) -> Result<u64> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? =
+            Some(reason.into());
+        Ok(self.advance_generation())
+    }
+
+    pub fn fail_closed_reason(&self) -> Option<String> {
+        self.fail_closed_reason
+            .read()
+            .ok()
+            .and_then(|reason| reason.clone())
+    }
+
+    /// Reactivate the compiled last-known-good engine after an operator
+    /// explicitly selects the availability-oriented retention posture.
+    pub fn exit_fail_closed(&self) -> Result<u64> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let was_fail_closed = self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .take()
+            .is_some();
+        if was_fail_closed {
+            Ok(self.advance_generation())
+        } else {
+            Ok(self.current_generation())
+        }
     }
 
     /// Current policy generation. Successful reloads increment this value.
@@ -586,7 +730,7 @@ impl OpaEngine {
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
         *runner = runner.with_replacement_registry(registry);
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.advance_generation();
         Ok(())
     }
 
@@ -619,6 +763,7 @@ impl OpaEngine {
         Ok(PolicyGenerationGuard {
             captured_generation: generation,
             current_generation: Arc::clone(&self.generation),
+            generation_rx: self.generation_tx.subscribe(),
         })
     }
 
@@ -681,6 +826,9 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(Vec<regorus::Value>, u64)> {
+        #[cfg(test)]
+        record_test_opa_query();
+
         let input_json = network_input_json(input);
 
         let mut engine = self
@@ -739,6 +887,9 @@ impl OpaEngine {
     /// denial while preserving separate handling for `allowed_ips` and advisor
     /// proposals.
     pub fn query_exact_declared_endpoint_host(&self, input: &NetworkInput) -> Result<bool> {
+        #[cfg(test)]
+        record_test_opa_query();
+
         let input_json = network_input_json(input);
 
         let mut engine = self
@@ -778,6 +929,7 @@ impl OpaEngine {
             generation_guard: PolicyGenerationGuard {
                 captured_generation: generation,
                 current_generation: Arc::clone(&self.generation),
+                generation_rx: self.generation_tx.subscribe(),
             },
             middleware_runner: self.middleware_runner()?,
             websocket_assembly_budget: self.websocket_assembly_budget(),
@@ -3060,12 +3212,7 @@ network_policies:
             .expect("policy should load");
         rego.add_data_json(&data_json.to_string())
             .expect("data should load");
-        let engine = OpaEngine {
-            engine: Mutex::new(rego),
-            generation: Arc::new(AtomicU64::new(0)),
-            middleware_runner: RwLock::new(ChainRunner::default()),
-            websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
-        };
+        let engine = OpaEngine::with_engine(rego);
         let input = l7_websocket_graphql_input(
             "realtime.graphql.com",
             serde_json::json!([{
@@ -4695,6 +4842,97 @@ network_policies:
     }
 
     #[test]
+    fn proto_load_rejects_ambiguous_endpoint_metadata_with_rationale() {
+        let mut policy = ProtoSandboxPolicy::default();
+        policy.network_policies.insert(
+            "wildcard".to_string(),
+            NetworkPolicyRule {
+                name: "wildcard".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.example.com".to_string(),
+                    port: 443,
+                    tls: "skip".to_string(),
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        policy.network_policies.insert(
+            "exact".to_string(),
+            NetworkPolicyRule {
+                name: "exact".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/bash".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        let Err(error) = OpaEngine::from_proto(&policy) else {
+            panic!("ambiguity must reject activation");
+        };
+        let message = error.to_string();
+        assert!(message.contains("ambiguity validation failed"));
+        assert!(message.contains("wildcard"));
+        assert!(message.contains("exact"));
+        assert!(message.contains("tls"));
+    }
+
+    #[tokio::test]
+    async fn fail_closed_quarantine_denies_and_wakes_generation_guards() {
+        let engine = test_engine();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let stale = guard.wait_until_stale();
+
+        let generation = engine
+            .enter_fail_closed("candidate policy validation failed: conflicting tls")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), stale)
+            .await
+            .expect("generation waiter should wake");
+        assert_eq!(generation, 1);
+        assert!(guard.is_stale());
+
+        let input = NetworkInput {
+            host: "api.anthropic.com".to_string(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let action = engine.evaluate_network_action(&input).unwrap();
+        assert_eq!(
+            action,
+            NetworkAction::Deny {
+                reason: "candidate policy validation failed: conflicting tls".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn valid_reload_exits_fail_closed_quarantine() {
+        let engine = test_engine();
+        engine.enter_fail_closed("invalid candidate").unwrap();
+        assert!(engine.fail_closed_reason().is_some());
+
+        engine.reload(TEST_POLICY, TEST_DATA_YAML).unwrap();
+
+        assert!(engine.fail_closed_reason().is_none());
+        assert_eq!(engine.current_generation(), 2);
+    }
+
+    #[test]
     fn endpoint_config_generation_matches_query_generation() {
         let engine = l7_engine();
         let input = NetworkInput {
@@ -5021,6 +5259,7 @@ network_policies:
         port: 8567
         protocol: rest
         enforcement: enforce
+        tls: skip
         allowed_ips:
           - 192.168.1.100
         rules:
@@ -5059,7 +5298,7 @@ process:
     }
 
     #[test]
-    fn overlapping_policies_endpoint_config_returns_result() {
+    fn overlapping_policy_outputs_are_snapshotted_independently() {
         let engine = OpaEngine::from_strings(TEST_POLICY, OVERLAPPING_L7_TEST_DATA)
             .expect("engine should load overlapping data");
         let input = NetworkInput {
@@ -5070,12 +5309,29 @@ process:
             ancestors: vec![],
             cmdline_paths: vec![],
         };
-        // Should return config from one of the entries without error.
-        let config = engine.query_endpoint_config(&input).unwrap();
-        assert!(
-            config.is_some(),
-            "Expected endpoint config for overlapping policies"
+        assert_eq!(
+            engine.evaluate_network_action(&input).unwrap(),
+            NetworkAction::Allow {
+                matched_policy: Some("allow_192_168_1_100_8567".to_string())
+            }
         );
+
+        let (configs, generation) = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap();
+        assert_eq!(generation, engine.current_generation());
+        assert_eq!(configs.len(), 2);
+        assert_eq!(get_str(&configs[0], "tls").as_deref(), Some("skip"));
+        assert_eq!(get_str_array(&configs[0], "allowed_ips"), ["192.168.1.100"]);
+        assert_eq!(get_str(&configs[1], "tls"), None);
+
+        let selected = engine.query_endpoint_config(&input).unwrap().unwrap();
+        assert_eq!(
+            crate::l7::parse_tls_mode(&selected),
+            crate::l7::TlsMode::Skip
+        );
+        assert_eq!(engine.query_allowed_ips(&input).unwrap(), ["192.168.1.100"]);
+        assert!(engine.query_exact_declared_endpoint_host(&input).unwrap());
     }
 
     // ========================================================================

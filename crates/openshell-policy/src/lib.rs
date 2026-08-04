@@ -18,6 +18,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 
+mod ambiguity;
+
+pub use ambiguity::{EndpointAmbiguity, find_endpoint_ambiguities};
+
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
@@ -1040,7 +1044,7 @@ pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolic
 ///
 /// When the gateway provides no policy at sandbox creation time, the sandbox
 /// supervisor probes this path before falling back to the restrictive default.
-pub const CONTAINER_POLICY_PATH: &str = "/etc/openshell/policy.yaml";
+pub use openshell_core::container_paths::CONTAINER_POLICY_PATH;
 
 /// Legacy path used before the navigator → openshell rename.
 ///
@@ -1070,7 +1074,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
                 "/etc".into(),
                 "/var/log".into(),
             ],
-            read_write: vec!["/sandbox".into(), "/tmp".into(), "/dev/null".into()],
+            read_write: vec!["/tmp".into(), "/dev/null".into()],
         }),
         landlock: Some(LandlockPolicy {
             compatibility: "best_effort".into(),
@@ -1650,8 +1654,8 @@ network_policies:
             "read_only should contain /usr"
         );
         assert!(
-            fs.read_write.iter().any(|p| p == "/sandbox"),
-            "read_write should contain /sandbox"
+            !fs.read_write.iter().any(|p| p == "/sandbox"),
+            "the workspace should be granted through include_workdir, not a literal /sandbox path"
         );
         assert!(
             fs.read_write.iter().any(|p| p == "/tmp"),

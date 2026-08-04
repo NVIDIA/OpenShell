@@ -93,11 +93,12 @@ pub fn generate_bypass_commands(
     ];
 
     if let Some(prefix) = log_prefix {
+        let quoted = nft_quote(prefix);
         cmds.push(nft_cmd(
             false,
             &[
                 "add", "rule", "inet", table, "output", "tcp", "flags", "syn", "limit", "rate",
-                "5/second", "burst", "10", "packets", "log", "prefix", prefix, "flags", "skuid",
+                "5/second", "burst", "10", "packets", "log", "prefix", &quoted, "flags", "skuid",
             ],
         ));
     }
@@ -146,11 +147,12 @@ pub fn generate_bypass_commands(
     ));
 
     if let Some(prefix) = log_prefix {
+        let quoted = nft_quote(prefix);
         cmds.push(nft_cmd(
             false,
             &[
                 "add", "rule", "inet", table, "output", "meta", "l4proto", "udp", "limit", "rate",
-                "5/second", "burst", "10", "packets", "log", "prefix", prefix, "flags", "skuid",
+                "5/second", "burst", "10", "packets", "log", "prefix", &quoted, "flags", "skuid",
             ],
         ));
     }
@@ -258,11 +260,12 @@ pub fn generate_sidecar_bypass_commands(
     ];
 
     if let Some(prefix) = log_prefix {
+        let quoted = nft_quote(prefix);
         cmds.push(nft_cmd(
             false,
             &[
                 "add", "rule", "inet", table, "output", "tcp", "flags", "syn", "limit", "rate",
-                "5/second", "burst", "10", "packets", "log", "prefix", prefix, "flags", "skuid",
+                "5/second", "burst", "10", "packets", "log", "prefix", &quoted, "flags", "skuid",
             ],
         ));
     }
@@ -311,11 +314,12 @@ pub fn generate_sidecar_bypass_commands(
     ));
 
     if let Some(prefix) = log_prefix {
+        let quoted = nft_quote(prefix);
         cmds.push(nft_cmd(
             false,
             &[
                 "add", "rule", "inet", table, "output", "meta", "l4proto", "udp", "limit", "rate",
-                "5/second", "burst", "10", "packets", "log", "prefix", prefix, "flags", "skuid",
+                "5/second", "burst", "10", "packets", "log", "prefix", &quoted, "flags", "skuid",
             ],
         ));
     }
@@ -371,6 +375,12 @@ fn nft_cmd(required: bool, args: &[&str]) -> NftCommand {
         args: args.iter().map(|s| (*s).to_string()).collect(),
         required,
     }
+}
+
+fn nft_quote(s: &str) -> String {
+    // nft quoted strings don't support escape sequences; strip any embedded
+    // double-quotes that would terminate the string early.
+    format!("\"{}\"", s.replace('"', ""))
 }
 
 #[cfg(test)]
@@ -451,7 +461,9 @@ mod tests {
     fn log_commands_contain_prefix_for_tcp_and_udp() {
         let cmds = generate_bypass_commands("10.0.2.2", 8080, Some("openshell:bypass:test:"));
         let text = all_strs(&cmds);
-        let count = text.matches("log prefix openshell:bypass:test:").count();
+        let count = text
+            .matches("log prefix \"openshell:bypass:test:\"")
+            .count();
         assert_eq!(count, 2, "need log rules for both TCP and UDP");
         assert!(text.contains("tcp flags syn limit rate 5/second burst 10 packets"));
         assert!(text.contains("meta l4proto udp limit rate 5/second burst 10 packets"));
@@ -524,8 +536,32 @@ mod tests {
         assert!(text.contains("meta nfproto ipv4 meta l4proto udp reject"));
         assert!(text.contains("meta nfproto ipv6 meta l4proto udp reject"));
         assert_eq!(
-            text.matches("log prefix openshell:sidecar:test:").count(),
+            text.matches("log prefix \"openshell:sidecar:test:\"")
+                .count(),
             2
         );
+    }
+
+    #[test]
+    fn log_prefix_is_quoted_as_nft_string_literal() {
+        let cmds = generate_bypass_commands("10.0.2.2", 8080, Some("openshell:bypass:test:"));
+        for cmd in &cmds {
+            let s = cmd_str(cmd);
+            if let Some(idx) = s.find("log prefix ") {
+                let after_prefix = &s[idx + "log prefix ".len()..];
+                assert!(
+                    after_prefix.starts_with('"'),
+                    "log prefix value must be an nft-quoted string, got: {after_prefix}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nft_quote_wraps_in_double_quotes() {
+        assert_eq!(nft_quote("simple"), "\"simple\"");
+        assert_eq!(nft_quote("has:colons:"), "\"has:colons:\"");
+        assert_eq!(nft_quote("has\"quote"), "\"hasquote\"");
+        assert_eq!(nft_quote("has\\backslash"), "\"has\\backslash\"");
     }
 }

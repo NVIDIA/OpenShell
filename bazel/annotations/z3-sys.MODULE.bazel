@@ -1,0 +1,10 @@
+crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
+crate.annotation(
+    additive_build_file = "//bazel/annotations/z3-sys:additive.BUILD.bazel",
+    crate = "z3-sys",
+    extra_aliased_targets = {"z3_sys_build_info": "z3_sys_build_info"},
+    gen_build_script = "off",
+    deps = ["@crates//:z3_sys_build_info"],
+)
+
+inject_repo(crate, "z3")

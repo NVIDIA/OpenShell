@@ -208,7 +208,7 @@ pub async fn run_networking(
         match SandboxCa::generate() {
             Ok(ca) => {
                 let tls_dir = std::env::var(openshell_core::sandbox_env::PROXY_TLS_DIR)
-                    .unwrap_or_else(|_| "/etc/openshell-tls".to_string());
+                    .unwrap_or_else(|_| openshell_core::container_paths::TLS_ROOT.to_string());
                 let tls_dir = std::path::Path::new(&tls_dir);
                 let system_ca_bundle = read_system_ca_bundle();
                 match write_ca_files(&ca, tls_dir, &system_ca_bundle) {
@@ -217,7 +217,7 @@ pub async fn run_networking(
                         // path injected by enrich_*_baseline_paths(), so no
                         // explicit Landlock entry is needed here.
 
-                        let upstream_config = build_upstream_client_config(&system_ca_bundle);
+                        let upstream_config = build_upstream_client_config(&system_ca_bundle)?;
                         let cert_cache = CertCache::new(ca);
                         let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
                         ocsf_emit!(

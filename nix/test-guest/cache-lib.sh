@@ -129,27 +129,16 @@ test_vm_cache_local_entry_valid() {
 	local distro_name=$3
 	shift 3
 	local entry
-	local expected_sha
-	local actual_sha
 	entry=$(test_vm_cache_entry_dir "${root}" "${key}")
 
+	# Cache builders and OCI pulls verify the disk before atomically installing
+	# the complete entry. Keep cache-hit validation metadata-only so launching a
+	# guest does not hash and inspect the entire QCOW2 on every run.
 	[ -f "${entry}/complete" ] &&
-		[ -f "${entry}/disk.qcow2" ] &&
+		[ -s "${entry}/disk.qcow2" ] &&
 		[ -f "${entry}/metadata.json" ] &&
 		test_vm_cache_metadata_matches \
-			"${entry}/metadata.json" "${key}" "${distro_name}" "$@" ||
-		return 1
-
-	expected_sha=$(jq -er '
-		.disk_sha256 |
-		select(type == "string" and test("^[a-f0-9]{64}$"))
-	' "${entry}/metadata.json") ||
-		return 1
-	actual_sha=$(test_vm_cache_sha256 "${entry}/disk.qcow2") ||
-		return 1
-
-	[ "${actual_sha}" = "${expected_sha}" ] &&
-		test_vm_cache_validate_disk "${entry}/disk.qcow2"
+			"${entry}/metadata.json" "${key}" "${distro_name}" "$@"
 }
 
 test_vm_cache_validate_disk() {

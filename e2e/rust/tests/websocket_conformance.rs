@@ -373,7 +373,7 @@ def proxy_parts():
         raise RuntimeError(f"invalid proxy URL: {{proxy_url!r}}")
     return parsed.hostname, parsed.port or 80
 
-def connect_with_retry(host, port, timeout_seconds=20):
+def proxy_socket_with_retry(host, port, mode, timeout_seconds=20):
     proxy_host, proxy_port = proxy_parts()
     target = f"{{host}}:{{port}}"
     deadline = time.monotonic() + timeout_seconds
@@ -382,13 +382,14 @@ def connect_with_retry(host, port, timeout_seconds=20):
         sock = None
         try:
             sock = socket.create_connection((proxy_host, proxy_port), timeout=5)
-            request = f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n"
-            sock.sendall(request.encode("ascii"))
-            response = recv_until(sock, b"\r\n\r\n").decode("iso-8859-1", "replace")
-            if response.startswith("HTTP/1.1 200") or response.startswith("HTTP/1.0 200"):
-                return sock
-            first_line = response.splitlines()[0] if response else "<empty response>"
-            raise RuntimeError(f"proxy CONNECT failed: {{first_line}}")
+            if mode == "connect":
+                request = f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n"
+                sock.sendall(request.encode("ascii"))
+                response = recv_until(sock, b"\r\n\r\n").decode("iso-8859-1", "replace")
+                if not (response.startswith("HTTP/1.1 200") or response.startswith("HTTP/1.0 200")):
+                    first_line = response.splitlines()[0] if response else "<empty response>"
+                    raise RuntimeError(f"proxy CONNECT failed: {{first_line}}")
+            return sock
         except (OSError, RuntimeError) as error:
             if sock is not None:
                 sock.close()
@@ -398,25 +399,28 @@ def connect_with_retry(host, port, timeout_seconds=20):
 
 token = os.environ[TOKEN_ENV]
 payload = json.dumps({{"authorization": "Bearer " + token}}, sort_keys=True)
-key = base64.b64encode(os.urandom(16)).decode("ascii")
-
-with connect_with_retry(HOST, PORT) as sock:
-    request = (
-        f"GET /ws HTTP/1.1\r\n"
-        f"Host: {{HOST}}:{{PORT}}\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {{key}}\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        "\r\n"
-    )
-    sock.sendall(request.encode("ascii"))
-    response = recv_until(sock, b"\r\n\r\n").decode("iso-8859-1", "replace")
-    if not response.startswith("HTTP/1.1 101"):
-        raise RuntimeError("websocket upgrade failed")
-    sock.sendall(masked_text_frame(payload))
-    _, response_payload = read_frame(sock)
-    print(response_payload.decode("utf-8"))
+results = {{}}
+for mode in ("connect", "forward"):
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    with proxy_socket_with_retry(HOST, PORT, mode) as sock:
+        request_target = "/ws" if mode == "connect" else f"http://{{HOST}}:{{PORT}}/ws"
+        request = (
+            f"GET {{request_target}} HTTP/1.1\r\n"
+            f"Host: {{HOST}}:{{PORT}}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {{key}}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        sock.sendall(request.encode("ascii"))
+        response = recv_until(sock, b"\r\n\r\n").decode("iso-8859-1", "replace")
+        if not response.startswith("HTTP/1.1 101"):
+            raise RuntimeError(f"{{mode}} websocket upgrade failed: {{response!r}}")
+        sock.sendall(masked_text_frame(payload))
+        _, response_payload = read_frame(sock)
+        results[mode] = json.loads(response_payload.decode("utf-8"))
+print(json.dumps(results, sort_keys=True))
 "#,
         host = host,
         port = port,
@@ -425,7 +429,7 @@ with connect_with_retry(HOST, PORT) as sock:
 }
 
 #[tokio::test]
-async fn websocket_text_placeholder_is_rewritten_in_sandbox() {
+async fn websocket_text_placeholder_is_rewritten_through_both_adapters() {
     let _provider_lock = PROVIDER_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -465,7 +469,14 @@ async fn websocket_text_placeholder_is_rewritten_in_sandbox() {
     assert!(
         guard
             .create_output
-            .contains(r#"{"saw_placeholder": false, "saw_secret": true}"#),
+            .contains(r#""connect": {"saw_placeholder": false, "saw_secret": true}"#),
+        "expected CONNECT upstream to see only the resolved secret marker:\n{}",
+        guard.create_output
+    );
+    assert!(
+        guard
+            .create_output
+            .contains(r#""forward": {"saw_placeholder": false, "saw_secret": true}"#),
         "expected upstream to see only the resolved secret marker:\n{}",
         guard.create_output
     );

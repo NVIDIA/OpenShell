@@ -15,6 +15,7 @@ use crate::auth::workspace_authz::{
 };
 use crate::persistence::{ObjectLabels, ObjectType, WriteCondition, generate_name};
 use futures::future;
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateSandboxRequest,
     CreateSshSessionRequest, CreateSshSessionResponse, DeleteSandboxRequest, DeleteSandboxResponse,
@@ -37,6 +38,7 @@ use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -58,6 +60,54 @@ use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
+
+#[derive(Debug)]
+pub struct WatchSandboxStream {
+    receiver: ReceiverStream<Result<SandboxStreamEvent, Status>>,
+    producer: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl WatchSandboxStream {
+    fn new(
+        receiver: mpsc::Receiver<Result<SandboxStreamEvent, Status>>,
+        producer: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            receiver: ReceiverStream::new(receiver),
+            producer: Some(producer),
+        }
+    }
+
+    fn stop_producer(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.receiver.close();
+        let producer = self.producer.take()?;
+        producer.abort();
+        Some(producer)
+    }
+
+    #[cfg(test)]
+    async fn disconnect_and_wait(mut self) {
+        let producer = self.stop_producer().expect("watch producer task");
+        let error = producer
+            .await
+            .expect_err("watch producer should be aborted");
+        assert!(error.is_cancelled(), "watch producer abort result: {error}");
+    }
+}
+
+impl futures::Stream for WatchSandboxStream {
+    type Item = Result<SandboxStreamEvent, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.receiver).poll_next(context)
+    }
+}
+
+impl Drop for WatchSandboxStream {
+    fn drop(&mut self) {
+        let _ = self.stop_producer();
+    }
+}
 
 /// Fetch a sandbox by ID and authorize the caller in one step, returning
 /// `NOT_FOUND` for both missing and unauthorized sandboxes so that callers
@@ -504,6 +554,13 @@ pub(super) async fn handle_attach_sandbox_provider(
         &candidate_spec.providers,
     )
     .await?;
+    super::policy::validate_candidate_provider_attachments(
+        state,
+        &workspace,
+        &sandbox,
+        &candidate_spec.providers,
+    )
+    .await?;
 
     let provider_name = request.provider_name.clone();
     let attached = Arc::new(AtomicBool::new(false));
@@ -745,7 +802,7 @@ fn dedupe_provider_names(provider_names: &mut Vec<String>) {
 pub(super) async fn handle_watch_sandbox(
     state: &Arc<ServerState>,
     request: Request<WatchSandboxRequest>,
-) -> Result<Response<ReceiverStream<Result<SandboxStreamEvent, Status>>>, Status> {
+) -> Result<Response<WatchSandboxStream>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     if req.id.is_empty() {
@@ -772,201 +829,210 @@ pub(super) async fn handle_watch_sandbox(
     let (tx, rx) = mpsc::channel::<Result<SandboxStreamEvent, Status>>(256);
     let state = state.clone();
 
-    // Spawn producer task.
-    tokio::spawn(async move {
-        // Validate that the sandbox exists BEFORE subscribing to any buses.
-        match state.store.get_message::<Sandbox>(&sandbox_id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                let _ = tx.send(Err(Status::not_found("sandbox not found"))).await;
-                return;
+    // Spawn producer task. `tokio::spawn` detaches from the current span, so
+    // carry it across to keep the producer's store reads in the request trace.
+    let request_span = tracing::Span::current();
+    let producer = tokio::spawn(tracing::Instrument::instrument(
+        async move {
+            // Validate that the sandbox exists BEFORE subscribing to any buses.
+            match state.store.get_message::<Sandbox>(&sandbox_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let _ = tx.send(Err(Status::not_found("sandbox not found"))).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!("fetch sandbox failed: {e}"))))
+                        .await;
+                    return;
+                }
             }
-            Err(e) => {
-                let _ = tx
-                    .send(Err(Status::internal(format!("fetch sandbox failed: {e}"))))
-                    .await;
-                return;
-            }
-        }
 
-        // Subscribe to all buses BEFORE reading the snapshot.
-        let mut status_rx = if follow_status {
-            Some(state.sandbox_watch_bus.subscribe(&sandbox_id))
-        } else {
-            None
-        };
-        let mut log_rx = if follow_logs {
-            Some(state.tracing_log_bus.subscribe(&sandbox_id))
-        } else {
-            None
-        };
-        let mut platform_rx = if follow_events {
-            Some(
-                state
-                    .tracing_log_bus
-                    .platform_event_bus
-                    .subscribe(&sandbox_id),
-            )
-        } else {
-            None
-        };
+            // Subscribe to all buses BEFORE reading the snapshot.
+            let mut status_rx = if follow_status {
+                Some(state.sandbox_watch_bus.subscribe(&sandbox_id))
+            } else {
+                None
+            };
+            let mut log_rx = if follow_logs {
+                Some(state.tracing_log_bus.subscribe(&sandbox_id))
+            } else {
+                None
+            };
+            let mut platform_rx = if follow_events {
+                Some(
+                    state
+                        .tracing_log_bus
+                        .platform_event_bus
+                        .subscribe(&sandbox_id),
+                )
+            } else {
+                None
+            };
 
-        // Re-read the snapshot now that we have subscriptions active.
-        match state.store.get_message::<Sandbox>(&sandbox_id).await {
-            Ok(Some(sandbox)) => {
-                state.sandbox_index.update_from_sandbox(&sandbox);
-                let _ = tx
-                    .send(Ok(SandboxStreamEvent {
-                        payload: Some(
-                            openshell_core::proto::sandbox_stream_event::Payload::Sandbox(
-                                sandbox.clone(),
+            // Re-read the snapshot now that we have subscriptions active.
+            match state.store.get_message::<Sandbox>(&sandbox_id).await {
+                Ok(Some(sandbox)) => {
+                    state.sandbox_index.update_from_sandbox(&sandbox);
+                    let _ = tx
+                        .send(Ok(SandboxStreamEvent {
+                            payload: Some(
+                                openshell_core::proto::sandbox_stream_event::Payload::Sandbox(
+                                    sandbox.clone(),
+                                ),
                             ),
-                        ),
-                    }))
-                    .await;
+                        }))
+                        .await;
 
-                if stop_on_terminal {
-                    let phase =
-                        SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-                    if phase == SandboxPhase::Ready {
+                    if stop_on_terminal {
+                        let phase = SandboxPhase::try_from(sandbox.phase())
+                            .unwrap_or(SandboxPhase::Unknown);
+                        if phase == SandboxPhase::Ready {
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let _ = tx.send(Err(Status::not_found("sandbox not found"))).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!("fetch sandbox failed: {e}"))))
+                        .await;
+                    return;
+                }
+            }
+
+            // Replay tail logs (best-effort), filtered by log_since_ms and log_sources.
+            if follow_logs {
+                for evt in state.tracing_log_bus.tail(&sandbox_id, log_tail as usize) {
+                    if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
+                        ref log,
+                    )) = evt.payload
+                    {
+                        if log_since_ms > 0 && log.timestamp_ms < log_since_ms {
+                            continue;
+                        }
+                        if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
+                            continue;
+                        }
+                        if !level_matches(&log.level, &log_min_level) {
+                            continue;
+                        }
+                    }
+                    if tx.send(Ok(evt)).await.is_err() {
                         return;
                     }
                 }
             }
-            Ok(None) => {
-                let _ = tx.send(Err(Status::not_found("sandbox not found"))).await;
-                return;
-            }
-            Err(e) => {
-                let _ = tx
-                    .send(Err(Status::internal(format!("fetch sandbox failed: {e}"))))
-                    .await;
-                return;
-            }
-        }
 
-        // Replay tail logs (best-effort), filtered by log_since_ms and log_sources.
-        if follow_logs {
-            for evt in state.tracing_log_bus.tail(&sandbox_id, log_tail as usize) {
-                if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(ref log)) =
-                    evt.payload
+            // Replay buffered platform events.
+            if follow_events {
+                for evt in state
+                    .tracing_log_bus
+                    .platform_event_bus
+                    .tail(&sandbox_id, event_tail as usize)
                 {
-                    if log_since_ms > 0 && log.timestamp_ms < log_since_ms {
-                        continue;
+                    if tx.send(Ok(evt)).await.is_err() {
+                        return;
                     }
-                    if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
-                        continue;
-                    }
-                    if !level_matches(&log.level, &log_min_level) {
-                        continue;
-                    }
-                }
-                if tx.send(Ok(evt)).await.is_err() {
-                    return;
                 }
             }
-        }
 
-        // Replay buffered platform events.
-        if follow_events {
-            for evt in state
-                .tracing_log_bus
-                .platform_event_bus
-                .tail(&sandbox_id, event_tail as usize)
-            {
-                if tx.send(Ok(evt)).await.is_err() {
-                    return;
-                }
-            }
-        }
-
-        loop {
-            tokio::select! {
-                res = async {
-                    match status_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => future::pending().await,
+            loop {
+                tokio::select! {
+                    () = tx.closed() => {
+                        return;
                     }
-                } => {
-                    match res {
-                        Ok(()) => {
-                            match state.store.get_message::<Sandbox>(&sandbox_id).await {
-                                Ok(Some(sandbox)) => {
-                                    state.sandbox_index.update_from_sandbox(&sandbox);
-                                    if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
-                                        return;
-                                    }
-                                    if stop_on_terminal {
-                                        let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-                                        if phase == SandboxPhase::Ready {
+                    res = async {
+                        match status_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => future::pending().await,
+                        }
+                    } => {
+                        match res {
+                            Ok(()) => {
+                                match state.store.get_message::<Sandbox>(&sandbox_id).await {
+                                    Ok(Some(sandbox)) => {
+                                        state.sandbox_index.update_from_sandbox(&sandbox);
+                                        if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
                                             return;
                                         }
+                                        if stop_on_terminal {
+                                            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+                                            if phase == SandboxPhase::Ready {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(Status::internal(format!("fetch sandbox failed: {e}")))).await;
+                                        return;
                                     }
                                 }
-                                Ok(None) => {
-                                    return;
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(Err(Status::internal(format!("fetch sandbox failed: {e}")))).await;
-                                    return;
-                                }
                             }
-                        }
-                        Err(err) => {
-                            let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
-                            return;
-                        }
-                    }
-                }
-                res = async {
-                    match log_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => future::pending().await,
-                    }
-                } => {
-                    match res {
-                        Ok(evt) => {
-                            if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(ref log)) = evt.payload {
-                                if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
-                                    continue;
-                                }
-                                if !level_matches(&log.level, &log_min_level) {
-                                    continue;
-                                }
-                            }
-                            if tx.send(Ok(evt)).await.is_err() {
+                            Err(err) => {
+                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
                                 return;
                             }
                         }
-                        Err(err) => {
-                            let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
-                            return;
+                    }
+                    res = async {
+                        match log_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => future::pending().await,
                         }
-                    }
-                }
-                res = async {
-                    match platform_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => future::pending().await,
-                    }
-                } => {
-                    match res {
-                        Ok(evt) => {
-                            if tx.send(Ok(evt)).await.is_err() {
+                    } => {
+                        match res {
+                            Ok(evt) => {
+                                if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(ref log)) = evt.payload {
+                                    if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
+                                        continue;
+                                    }
+                                    if !level_matches(&log.level, &log_min_level) {
+                                        continue;
+                                    }
+                                }
+                                if tx.send(Ok(evt)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
                                 return;
                             }
                         }
-                        Err(err) => {
-                            let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
-                            return;
+                    }
+                    res = async {
+                        match platform_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => future::pending().await,
+                        }
+                    } => {
+                        match res {
+                            Ok(evt) => {
+                                if tx.send(Ok(evt)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
+                                return;
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+        },
+        request_span,
+    ));
 
-    Ok(Response::new(ReceiverStream::new(rx)))
+    Ok(Response::new(WatchSandboxStream::new(rx, producer)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1923,6 +1989,9 @@ async fn run_interactive_exec_with_russh(
     let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
         .await
         .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
+    // russh client end of the loopback exec bridge — disable Nagle so keystroke
+    // and PTY tinygrams don't stall on delayed ACKs.
+    set_tcp_nodelay_best_effort(&stream);
 
     let config = Arc::new(exec_ssh_client_config());
     let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
@@ -2056,6 +2125,9 @@ async fn start_single_use_ssh_proxy_over_relay(
             warn!("SSH relay proxy: failed to accept local connection");
             return;
         };
+        // Loopback bridge for interactive SSH exec (keystrokes, line-buffered
+        // PTY output) — disable Nagle so tinygrams don't stall on delayed ACKs.
+        set_tcp_nodelay_best_effort(&client_conn);
         let _ = tokio::io::copy_bidirectional(&mut client_conn, &mut relay_stream).await;
     });
 
@@ -2098,6 +2170,9 @@ async fn run_exec_with_russh(
     let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
         .await
         .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
+    // russh client end of the loopback exec bridge — disable Nagle so keystroke
+    // and PTY tinygrams don't stall on delayed ACKs.
+    set_tcp_nodelay_best_effort(&stream);
 
     let config = Arc::new(exec_ssh_client_config());
     let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
@@ -2557,6 +2632,51 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         sandbox.set_current_policy_version(7);
         sandbox
+    }
+
+    #[tokio::test]
+    #[ignore = "flaky under concurrent test execution"]
+    async fn watch_producer_releases_request_span_when_client_disconnects() {
+        use crate::otel_tracing::test_exporter;
+        use tokio_stream::StreamExt as _;
+        use tracing::Instrument as _;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("watched", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let traced = test_exporter::install_traced();
+        let request_span = tracing::info_span!("disconnected_watch_request");
+        let mut handler = Box::pin(
+            handle_watch_sandbox(
+                &state,
+                authed_request(WatchSandboxRequest {
+                    id: sandbox.object_id().to_string(),
+                    ..Default::default()
+                }),
+            )
+            .instrument(request_span.clone()),
+        );
+        let response = handler.as_mut().await.unwrap();
+        // A completed instrumented future can retain its span until the future
+        // itself is dropped. Release the handler's clone so this test isolates
+        // whether the spawned watch producer retains the request span.
+        drop(handler);
+        let mut stream = response.into_inner();
+        stream
+            .next()
+            .await
+            .expect("watch producer should send the initial snapshot")
+            .unwrap();
+
+        drop(request_span);
+        stream.disconnect_and_wait().await;
+
+        assert_eq!(
+            traced.spans_named("disconnected_watch_request").len(),
+            1,
+            "watch producer should release the request span after client disconnect"
+        );
     }
 
     #[tokio::test]

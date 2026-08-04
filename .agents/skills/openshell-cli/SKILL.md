@@ -183,13 +183,13 @@ openshell sandbox create \
 ```
 
 Key flags:
-- `--provider`: Attach one or more providers (repeatable)
+- `--provider`: Attach configured credential providers for API keys, tokens, and other secrets (repeatable)
 - `--policy`: Custom policy YAML (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var)
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
 - `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
-- `--env KEY=VALUE`: Inject sandbox environment variables (repeatable)
+- `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
@@ -223,16 +223,22 @@ openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ### Upload and download files
 
 ```bash
-# Upload local files to sandbox
-openshell sandbox upload my-sandbox ./src /sandbox/src
+# Upload local files to the sandbox working directory
+openshell sandbox upload my-sandbox ./src
 
-# Download files from sandbox
-openshell sandbox download my-sandbox /sandbox/output ./local-output
+# Download a path relative to the sandbox working directory
+openshell sandbox download my-sandbox output ./local-output
 ```
 
 Uploads honor `.gitignore` by default. Add `--no-git-ignore` only when ignored files are intentionally in scope.
 
 Uploads preserve symlinks, including dangling symlinks, instead of dereferencing their targets. A symlink source bypasses Git-aware filtering so the link itself is archived.
+
+When the upload destination is omitted, the CLI discovers the remote working
+directory. Uploading a named directory merges it into an existing directory of
+the same name, overwriting matching entries without deleting unrelated entries.
+Downloads accept paths relative to that working directory or absolute paths
+within it.
 
 ### Execute a non-interactive command
 
@@ -242,6 +248,8 @@ openshell sandbox exec --name my-sandbox --env MODE=test -- cargo test
 ```
 
 `sandbox exec` streams output and exits with the remote command's exit code. Use `sandbox connect` for an interactive shell.
+Use `--env` only for non-secret values. Attach credentials to the sandbox with a
+provider instead of passing API keys, tokens, or other secrets to `sandbox exec`.
 
 ### Change attached providers
 
@@ -355,6 +363,13 @@ Middleware can inspect parsed HTTP request bodies and complete client-to-upstrea
 ```bash
 openshell policy set dev --policy current-policy.yaml --wait
 ```
+
+The gateway validates the complete effective candidate—including attached
+provider-profile policy—before it stores a direct update, incremental merge,
+approved proposal, provider attachment, or profile update that affects attached
+sandboxes. An ambiguity failure returns `FAILED_PRECONDITION`; the rejected
+candidate does not create a policy revision or partially update affected
+sandboxes. Fix the conflicting endpoint selectors and submit again.
 
 The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls every second). Exit codes:
 - **0**: Policy loaded successfully
@@ -579,6 +594,13 @@ openshell settings set --global --key providers_v2_enabled --value true
 ```
 
 Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.
+
+`policy_validation_failure_mode` is gateway startup configuration, not a
+mutable `openshell settings` key. Set it under `[openshell.gateway]` in
+`gateway.toml` and restart the gateway. The security-first default is
+`fail_closed`; `retain_last_valid` is an explicit availability tradeoff. OCSF
+configuration events state whether the previous generation is active after a
+runtime validation failure.
 
 ## Workflow 10: Service Access
 

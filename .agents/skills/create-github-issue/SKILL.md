@@ -114,6 +114,8 @@ EOF
 
 GitHub built-in issue types (`Bug`, `Feature`, `Task`) should come from the matching issue template when possible, or be set manually afterward. Do not try to emulate them through labels.
 
+Creating an issue does not accept it for roadmap work or queue agent work. Agents never apply the `roadmap` label, add issues to the roadmap project, or apply `agent:plan-requested` or `agent:implementation-requested`. Community issues proceed through `triage-issue`; a human decides whether technically validated work should be accepted and places it on the roadmap. The request labels queue work for unattended agents; a user may instead direct an agent to a specific issue.
+
 ## Useful Options
 
 | Option              | Description                        |

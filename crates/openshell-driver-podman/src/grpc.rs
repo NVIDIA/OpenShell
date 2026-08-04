@@ -6,7 +6,8 @@
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
     ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
     WatchSandboxesRequest, compute_driver_server::ComputeDriver,
@@ -38,6 +39,18 @@ impl ComputeDriver for ComputeDriverService {
             .capabilities()
             .map(Response::new)
             .map_err(Status::from)
+    }
+
+    async fn get_gateway_listener_requirements(
+        &self,
+        _request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        Ok(Response::new(GetGatewayListenerRequirementsResponse {
+            requirements: self
+                .driver
+                .gateway_listener_requirements()
+                .map_err(Status::from)?,
+        }))
     }
 
     async fn validate_sandbox_create(

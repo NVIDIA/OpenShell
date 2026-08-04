@@ -30,7 +30,6 @@ EOF
 if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_DISTROS:-}" ] ||
 	[ ! -d "${OPENSHELL_TEST_GUEST_CONFIGURATIONS:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_GUEST_ARTIFACT_PLAYBOOK:-}" ] ||
 	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ] ||
 	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_RUNNER:-}" ]; then
 	echo "run this script through 'nix run .#test-guest -- ...'" >&2
@@ -265,6 +264,14 @@ fi
 # shellcheck disable=SC1090
 . "${OPENSHELL_TEST_GUEST_CACHE_LIB}"
 
+report_timing() {
+	local label=$1
+	local started_at=$2
+
+	echo "==> Timing: ${label}: $((SECONDS - started_at))s"
+}
+
+phase_started_at=${SECONDS}
 prepared_image=0
 TEST_GUEST_IMAGE=
 if [ -n "${OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE:-}" ]; then
@@ -306,7 +313,9 @@ if [ "${prepared_image}" -eq 0 ]; then
 	echo "==> Realizing the pinned ${distro} cloud image"
 	TEST_GUEST_IMAGE=$(nix build --no-link --print-out-paths "${TEST_GUEST_IMAGE_DRV}^out")
 fi
+report_timing "guest image resolution" "${phase_started_at}"
 
+phase_started_at=${SECONDS}
 umask 077
 run_parent=${TMPDIR:-/tmp}/openshell-test-guest
 mkdir -p "${run_parent}"
@@ -315,6 +324,7 @@ ssh_control_dir=$(mktemp -d /tmp/openshell-test-guest-ssh.XXXXXX)
 overlay=${run_dir}/disk.qcow2
 seed=${run_dir}/seed.iso
 vars=${run_dir}/firmware-vars.fd
+vars_json=${run_dir}/firmware-vars.json
 private_key=${run_dir}/id_ed25519
 ssh_control_path=${ssh_control_dir}/ctl
 serial_log=${run_dir}/serial.log
@@ -322,9 +332,10 @@ qemu_log=${run_dir}/qemu.log
 qemu_pid=
 ssh_port=
 ssh_args=()
+ssh_forward_args=()
+scp_args=()
 ansible_config=${run_dir}/ansible.cfg
 ansible_inventory=${run_dir}/inventory.ini
-artifacts_vars=${run_dir}/artifacts.json
 
 show_logs() {
 	if [ -s "${qemu_log}" ]; then
@@ -405,7 +416,18 @@ if [ "${prepared_image}" -eq 0 ]; then
 fi
 cp "${TEST_GUEST_FIRMWARE_VARS}" "${vars}"
 chmod 0600 "${vars}"
+# The generic EDK2 varstore defaults to a five-second boot-manager timeout.
+# Seed the standard global Timeout variable before the disposable VM starts.
+cat >"${vars_json}" <<'EOF'
+{"version":2,"variables":[{"name":"Timeout","guid":"8be4df61-93ca-11d2-aa0d-00e098032b8c","attr":7,"data":"0000"}]}
+EOF
+virt-fw-vars \
+	--loglevel WARNING \
+	--inplace "${vars}" \
+	--set-json "${vars_json}"
+report_timing "VM runtime preparation" "${phase_started_at}"
 
+phase_started_at=${SECONDS}
 for attempt in $(seq 1 5); do
 	if [ -n "${requested_ssh_port}" ]; then
 		ssh_port=${requested_ssh_port}
@@ -418,11 +440,6 @@ for attempt in $(seq 1 5); do
 		done
 	fi
 	netdev_arg="user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
-	for forward_spec in "${forward_ports[@]}"; do
-		host_port=${forward_spec%%:*}
-		guest_port=${forward_spec#*:}
-		netdev_arg+=",hostfwd=tcp:127.0.0.1:${host_port}-:${guest_port}"
-	done
 	: >"${qemu_log}"
 	echo "==> Booting ${distro} (${TEST_GUEST_ARCHITECTURE}) with QEMU/${TEST_GUEST_ACCELERATOR}"
 	"${TEST_GUEST_QEMU}" \
@@ -472,6 +489,7 @@ ssh_args=(
 	-i "${private_key}"
 	-p "${ssh_port}"
 	-o BatchMode=yes
+	-o Compression=yes
 	-o ConnectTimeout=5
 	-o ControlMaster=auto
 	-o ControlPersist=60
@@ -481,6 +499,32 @@ ssh_args=(
 	-o StrictHostKeyChecking=no
 	-o UserKnownHostsFile=/dev/null
 )
+scp_args=(
+	-F /dev/null
+	-C
+	-i "${private_key}"
+	-P "${ssh_port}"
+	-o BatchMode=yes
+	-o Compression=yes
+	-o ConnectTimeout=5
+	-o ControlMaster=auto
+	-o ControlPersist=60
+	-o "ControlPath=${ssh_control_path}"
+	-o IdentitiesOnly=yes
+	-o LogLevel=ERROR
+	-o StrictHostKeyChecking=no
+	-o UserKnownHostsFile=/dev/null
+)
+if [ "${#forward_ports[@]}" -gt 0 ]; then
+	ssh_forward_args+=(-o ExitOnForwardFailure=yes)
+	for forward_spec in "${forward_ports[@]}"; do
+		host_port=${forward_spec%%:*}
+		guest_port=${forward_spec#*:}
+		ssh_forward_args+=(
+			-L "127.0.0.1:${host_port}:127.0.0.1:${guest_port}"
+		)
+	done
+fi
 
 echo "==> Waiting up to ${ssh_wait_seconds} seconds for SSH on 127.0.0.1:${ssh_port}"
 ssh_ready=0
@@ -501,7 +545,9 @@ if [ "${ssh_ready}" -ne 1 ]; then
 	echo "SSH did not become ready within ${ssh_wait_seconds} seconds" >&2
 	exit 1
 fi
+report_timing "VM boot and SSH" "${phase_started_at}"
 
+phase_started_at=${SECONDS}
 echo "==> Validating ${distro}"
 # Profile values come from the trusted Nix-generated catalog.
 # shellcheck disable=SC2029
@@ -510,6 +556,7 @@ ssh "${ssh_args[@]}" openshell@127.0.0.1 \
 # cloud-init returns 2 when it completes with recoverable errors. Fedora can
 # report that status for an initial transient-hostname warning even though the
 # requested user and SSH configuration were applied successfully.
+report_timing "guest validation" "${phase_started_at}"
 
 cat >"${ansible_config}" <<EOF
 [defaults]
@@ -537,25 +584,54 @@ else
 fi
 
 if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
-	package_artifacts=$(jq -cn --args '$ARGS.positional' "${packages[@]}")
-	copy_artifacts=$(
-		jq -cn --args '
-			$ARGS.positional
-			| map(capture("^(?<source>[^:]+):(?<destination>.*)$"))
-		' "${copies[@]}"
-	)
-	jq -n \
-		--arg package_family "${TEST_GUEST_PACKAGE_FAMILY}" \
-		--argjson packages "${package_artifacts}" \
-		--argjson copies "${copy_artifacts}" \
-		'{test_guest_package_family: $package_family, test_guest_packages: $packages, test_guest_copies: $copies}' \
-		>"${artifacts_vars}"
+	phase_started_at=${SECONDS}
+	artifact_staging_dir=/tmp/openshell-test-guest-artifacts-$$
+	ssh "${ssh_args[@]}" openshell@127.0.0.1 \
+		"install -d -m 0700 -- '${artifact_staging_dir}'"
 
-	echo "==> Installing per-run artifacts"
-	ANSIBLE_CONFIG="${ansible_config}" ANSIBLE_NOCOLOR=1 \
-		ansible-playbook \
-		--extra-vars "@${artifacts_vars}" \
-		"${OPENSHELL_TEST_GUEST_ARTIFACT_PLAYBOOK}"
+	remote_packages=()
+	artifact_index=0
+	for package in "${packages[@]}"; do
+		remote_path=${artifact_staging_dir}/package-${artifact_index}.${TEST_GUEST_PACKAGE_FAMILY}
+		echo "==> Copying package: ${package##*/}"
+		scp -q "${scp_args[@]}" \
+			"${package}" "openshell@127.0.0.1:${remote_path}"
+		remote_packages+=("${remote_path}")
+		artifact_index=$((artifact_index + 1))
+	done
+
+	if [ "${#remote_packages[@]}" -gt 0 ]; then
+		printf -v quoted_packages ' %q' "${remote_packages[@]}"
+		case "${TEST_GUEST_PACKAGE_FAMILY}" in
+		deb)
+			ssh "${ssh_args[@]}" openshell@127.0.0.1 \
+				"sudo apt-get update >/dev/null && sudo apt-get install -y --${quoted_packages}"
+			;;
+		rpm)
+			ssh "${ssh_args[@]}" openshell@127.0.0.1 \
+				"sudo dnf install -y --nogpgcheck --${quoted_packages}"
+			;;
+		esac
+	fi
+
+	artifact_index=0
+	for copy_spec in "${copies[@]}"; do
+		source_path=${copy_spec%%:*}
+		destination=${copy_spec#*:}
+		remote_path=${artifact_staging_dir}/copy-${artifact_index}
+		echo "==> Copying artifact: ${destination}"
+		scp -q "${scp_args[@]}" \
+			"${source_path}" "openshell@127.0.0.1:${remote_path}"
+		printf -v install_command \
+			'sudo install -D -m 0755 -- %q %q' \
+			"${remote_path}" "${destination}"
+		ssh "${ssh_args[@]}" openshell@127.0.0.1 "${install_command}"
+		artifact_index=$((artifact_index + 1))
+	done
+
+	ssh "${ssh_args[@]}" openshell@127.0.0.1 \
+		"rm -rf -- '${artifact_staging_dir}'"
+	report_timing "artifact transfer" "${phase_started_at}"
 fi
 
 # Configuration may change the test user's groups. Close the SSH control
@@ -565,12 +641,13 @@ ssh "${ssh_args[@]}" -O exit openshell@127.0.0.1 >/dev/null 2>&1 || true
 
 echo "==> Test guest ready: ${distro} (SSH port ${ssh_port})"
 if [ "${#guest_command[@]}" -eq 0 ]; then
-	ssh -t "${ssh_args[@]}" openshell@127.0.0.1
+	ssh -t "${ssh_args[@]}" "${ssh_forward_args[@]}" openshell@127.0.0.1
 else
 	printf -v quoted_command '%q ' "${guest_command[@]}"
 	# quoted_command is shell-escaped locally before it reaches the guest.
 	# shellcheck disable=SC2029
-	ssh "${ssh_args[@]}" openshell@127.0.0.1 "bash -lc $(printf '%q' "${quoted_command}")"
+	ssh "${ssh_args[@]}" "${ssh_forward_args[@]}" \
+		openshell@127.0.0.1 "bash -lc $(printf '%q' "${quoted_command}")"
 fi
 
 echo "==> Shutting down ${distro}"

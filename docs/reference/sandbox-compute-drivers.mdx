@@ -107,6 +107,16 @@ It overrides the gateway's configured default runtime class for that sandbox,
 while a typed `SandboxTemplate.runtime_class_name` value from the API still
 takes precedence.
 
+Docker and Podman callback listeners accept only supervisor callback gRPC
+methods. Use the gateway's primary endpoint for CLI, administrator, health,
+reflection, inference-route management, and HTTP requests. A
+`PermissionDenied` response from one of the sandbox-visible callback addresses
+is expected for those requests. The gateway fails startup if a callback
+requirement resolves to the exact primary listener address because one socket
+cannot preserve both authorization scopes. For the IPv4-loopback callback used
+by Podman Machine, bind the primary listener to a distinct address such as
+`[::1]:17670`.
+
 ## Docker Driver
 
 [Docker](https://www.docker.com/get-started/)-backed sandboxes run as containers on the gateway host. Use Docker for local development, single-machine gateways, and hosts that already use Docker Desktop or Docker Engine.
@@ -168,9 +178,10 @@ Docker mount schema:
 
 OpenShell rejects mount `source`, `target`, and Docker volume `subpath` values
 with surrounding whitespace. OpenShell also rejects mount targets that replace
-the workspace root, container root, supervisor files, `/etc/openshell`,
-`/etc/openshell-tls`, authentication material, or network namespace paths. These
-checks do not make host bind mounts safe.
+the workspace root or container root, or contain or are contained by the
+configured SSH socket or reserved `/opt/openshell`, `/etc/openshell`,
+`/etc/openshell-tls`, `/run/openshell`, `/run/openshell-sidecar`, and network
+namespace roots. These checks do not make host bind mounts safe.
 
 ## Podman Driver
 
@@ -186,7 +197,7 @@ Podman sandboxes default to a 45-second graceful stop window before Podman escal
 
 For proxy-required networks, the Podman driver also accepts the corporate egress proxy keys `https_proxy`, `no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`, and `proxy_connect_by_hostname`. The supervisor chains policy-approved TLS tunnels through the proxy with HTTP CONNECT instead of dialing destinations directly. See the [Gateway Configuration File](./gateway-config) reference for the full contract, including the cleartext-credential acknowledgement and the validated-IP CONNECT behavior.
 
-On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192.168.127.254`, for sandbox host aliases by default. Set `host_gateway_ip` only when your Podman machine uses a non-standard host-loopback address. On Linux, an empty `host_gateway_ip` keeps Podman's `host-gateway` resolver behavior.
+On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192.168.127.254`, for sandbox host aliases by default. Set `host_gateway_ip` only when your Podman machine uses a non-standard host-loopback address. On Linux, an empty `host_gateway_ip` keeps Podman's `host-gateway` resolver behavior. Direct local callbacks from rootless Podman require Podman to report the pasta network helper. Slirp4netns, other helpers, and Podman versions that do not report their helper require an explicitly remote `grpc_endpoint`; otherwise the gateway fails startup rather than leaving sandbox callbacks unreachable. Rootful Podman continues to use the configured network's bridge gateway address.
 
 ### Podman Driver Config Mounts
 
@@ -433,6 +444,24 @@ declared name or numeric components for both direct and SSH children. When
 `USER` omits the group, the supervisor uses the user's numeric primary GID. It
 does not modify `/etc/passwd` or `/etc/group`.
 
+Docker also inspects OCI `WorkingDir`. An absolute value becomes the
+agent workspace; an empty, root (`/`), or explicit `/sandbox` value uses the
+managed `/sandbox` compatibility workspace.
+OpenShell creates and owns that compatibility workspace. Any other workdir must
+already exist in the immutable image without symlink components. The completed
+UID/GID and supplementary groups must already be able to traverse every parent
+and write and enter the workdir. OpenShell does not change that directory's
+ownership or mode. A one-shot validator drops to that identity and uses kernel
+effective-access checks, including POSIX ACL grants and LSM denials. It rejects
+workdirs that overlap the OCI runtime namespaces under `/proc`, `/sys`, or
+`/dev`, and rejects overlap with actual OpenShell control paths. Docker checks
+the original image filesystem in the final supervisor and rejects image
+`VOLUME` declarations that would mask the workdir or one of its parents before
+validation. The resolved workspace is the cwd and `HOME` for direct and SSH
+children. The supervisor itself starts from `/`, so a missing or invalid
+workspace is handled during readiness instead of preventing the container
+runtime from starting it.
+
 Sandbox creation fails before readiness if a required `USER` component is
 missing, malformed, unknown, ambiguous, or resolves to UID/GID 0. An image
 without `USER` therefore works only when policy explicitly provides both
@@ -462,7 +491,9 @@ The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/e
 Docker and Podman custom images do not need a baked-in `"sandbox"` user. Declare
 a non-root OCI `USER`, or set both process identity fields explicitly in policy.
 Named image users require matching account entries; a numeric `UID:GID` pair
-does not. OpenShell continues to use `/sandbox` as the workspace; it does not
-adopt the image's OCI working directory. Until OCI working-directory support is
-added, custom images must create `/sandbox` and make it writable by the selected
-identity.
+does not. For Docker, declare an absolute OCI `WORKDIR` to select the workspace.
+Images with no working directory, `WORKDIR /`, or `WORKDIR /sandbox` use
+OpenShell's managed `/sandbox` compatibility workspace. For any other Docker
+path, create the directory in the image and grant the final process identity
+write and execute permission in the Dockerfile. Podman, Kubernetes/OpenShift,
+and VM sandboxes continue to use `/sandbox`.

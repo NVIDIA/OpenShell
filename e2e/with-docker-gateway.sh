@@ -512,7 +512,6 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"
-  --bind-address 0.0.0.0
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
   --drivers docker

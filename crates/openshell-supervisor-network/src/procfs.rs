@@ -603,6 +603,8 @@ pub fn file_sha256(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use std::io::Write;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::process::CommandExt as _;
 
     /// Block until `/proc/<pid>/exe` points at `target`. `Command::spawn` returns
     /// once the child is scheduled, not once it has completed `exec()`; on
@@ -648,6 +650,15 @@ mod tests {
                 Err(err) => panic!("spawn failed after {attempts} ETXTBSY retries: {err}"),
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sleep_binary() -> PathBuf {
+        let path = std::env::var_os("PATH").expect("PATH should be set for tests");
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("sleep"))
+            .find(|candidate| candidate.is_file())
+            .expect("sleep should be available on PATH")
     }
 
     #[test]
@@ -698,10 +709,10 @@ mod tests {
     fn binary_path_strips_deleted_suffix() {
         use std::os::unix::fs::PermissionsExt;
 
-        // Copy /bin/sleep to a temp path we control so we can unlink it.
+        // Copy sleep to a temp path we control so we can unlink it.
         let tmp = tempfile::TempDir::new().unwrap();
         let exe_path = tmp.path().join("deleted-sleep");
-        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::copy(sleep_binary(), &exe_path).unwrap();
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // Spawn a child from the temp binary, then unlink it while the
@@ -709,6 +720,7 @@ mod tests {
         // `/proc/<pid>/exe`, but readlink will now return the tainted
         // "<path> (deleted)" string.
         let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg0("sleep");
         cmd.arg("5");
         let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();
@@ -755,10 +767,11 @@ mod tests {
         // Basename literally ends with " (deleted)" while the file is still
         // on disk — a pathological but legal filename.
         let exe_path = tmp.path().join("sleepy (deleted)");
-        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::copy(sleep_binary(), &exe_path).unwrap();
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg0("sleep");
         cmd.arg("5");
         let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();
@@ -798,10 +811,11 @@ mod tests {
         raw_name.extend_from_slice(b".bin");
         let exe_path = tmp.path().join(OsString::from_vec(raw_name));
 
-        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::copy(sleep_binary(), &exe_path).unwrap();
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg0("sleep");
         cmd.arg("5");
         let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();

@@ -153,9 +153,9 @@ impl NetworkNamespace {
         }
 
         // Open the namespace file descriptor for later use with setns
-        let ns_path = format!("/var/run/netns/{name}");
+        let ns_path = openshell_core::container_paths::netns_path(&name);
         let ns_fd = match nix::fcntl::open(
-            ns_path.as_str(),
+            ns_path.as_path(),
             nix::fcntl::OFlag::O_RDONLY,
             nix::sys::stat::Mode::empty(),
         ) {
@@ -731,8 +731,8 @@ fn run_nft_commands_current_namespace(
 fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
     let ip_path = find_trusted_binary("ip", IP_SEARCH_PATHS)?;
     let nsenter_path = find_trusted_binary("nsenter", NSENTER_SEARCH_PATHS)?;
-    let ns_path = format!("/var/run/netns/{netns}");
-    let net_flag = format!("--net={ns_path}");
+    let ns_path = openshell_core::container_paths::netns_path(netns);
+    let net_flag = format!("--net={}", ns_path.display());
 
     let mut full_args = vec![net_flag.as_str(), "--", ip_path];
     full_args.extend(args);
@@ -751,7 +751,7 @@ fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(miette::miette!(
             "{nsenter_path} --net={} {ip_path} {} failed: {}",
-            ns_path,
+            ns_path.display(),
             args.join(" "),
             stderr.trim()
         ));
@@ -770,8 +770,8 @@ fn run_nft_commands_netns(
     commands: &[nft_ruleset::NftCommand],
 ) -> Result<()> {
     let nsenter_path = find_trusted_binary("nsenter", NSENTER_SEARCH_PATHS)?;
-    let ns_path = format!("/var/run/netns/{netns}");
-    let net_flag = format!("--net={ns_path}");
+    let ns_path = openshell_core::container_paths::netns_path(netns);
+    let net_flag = format!("--net={}", ns_path.display());
 
     for cmd in commands {
         let args_str = cmd.args.join(" ");
@@ -972,8 +972,8 @@ fe800000000000000000000000000001 02 40 20 80 eth0
         let name = ns.name().to_string();
 
         // Verify namespace exists
-        let ns_path = format!("/var/run/netns/{name}");
-        assert!(Path::new(&ns_path).exists(), "Namespace file should exist");
+        let ns_path = openshell_core::container_paths::netns_path(&name);
+        assert!(ns_path.exists(), "Namespace file should exist");
 
         // Verify IPs are set correctly
         assert_eq!(

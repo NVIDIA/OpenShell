@@ -33,6 +33,11 @@ data:
     {{- end }}
     log_level             = {{ .Values.server.logLevel | quote }}
     sandbox_namespace     = {{ include "openshell.sandboxNamespace" . | quote }}
+    {{- $policyValidationFailureMode := .Values.server.policyValidationFailureMode }}
+    {{- if not (has $policyValidationFailureMode (list "fail_closed" "retain_last_valid")) }}
+    {{- fail "server.policyValidationFailureMode must be fail_closed or retain_last_valid" }}
+    {{- end }}
+    policy_validation_failure_mode = {{ $policyValidationFailureMode | quote }}
     default_image         = {{ .Values.server.sandboxImage | quote }}
     {{- if include "openshell.supervisorImageOverrideEnabled" . }}
     supervisor_image      = {{ include "openshell.supervisorImage" . | quote }}

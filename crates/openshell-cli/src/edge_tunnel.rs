@@ -26,6 +26,7 @@
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use miette::{IntoDiagnostic, Result};
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -101,6 +102,7 @@ async fn accept_loop(listener: TcpListener, config: Arc<TunnelConfig>) {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 debug!(peer = %peer, "accepted local tunnel connection");
+                set_tcp_nodelay_best_effort(&stream);
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(stream, &config).await {
@@ -173,6 +175,20 @@ async fn open_ws(config: &TunnelConfig) -> Result<WebSocketStream<MaybeTlsStream
     let (ws_stream, response) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|e| miette::miette!("WebSocket connect failed: {e}"))?;
+
+    let tcp = match ws_stream.get_ref() {
+        MaybeTlsStream::Plain(tcp) => Some(tcp),
+        MaybeTlsStream::Rustls(tls) => Some(tls.get_ref().0),
+        // `MaybeTlsStream` is #[non_exhaustive]; surface any future/unknown
+        // variant so a silent TCP_NODELAY miss doesn't go unnoticed.
+        _ => {
+            debug!("edge tunnel: unrecognized MaybeTlsStream variant; skipping TCP_NODELAY");
+            None
+        }
+    };
+    if let Some(tcp) = tcp {
+        set_tcp_nodelay_best_effort(tcp);
+    }
 
     debug!(
         status = %response.status(),
