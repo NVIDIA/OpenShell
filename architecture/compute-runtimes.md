@@ -213,13 +213,10 @@ control paths.
 Docker performs the check in the final container before workload launch and
 rejects image `VOLUME` declarations that would mask the workdir ancestry.
 Podman performs it in a minimal networkless container from the same pinned
-image ID before its managed workspace volume covers the path. The probe retains
-only the capabilities needed to adopt the completed process identity, drops to
-that identity, and asks the kernel to validate access. It emits a normalized
-identity attestation that the final supervisor must match, including when the
-image supplies the default process policy. The driver captures a bounded,
-sanitized diagnostic before removing a failed probe. The resolved workspace is
-the child cwd and `HOME`; when `filesystem.include_workdir` is enabled, it
+image ID before its managed workspace volume covers the path. The probe adopts
+the completed process identity and emits an attestation that the final
+supervisor must match. The resolved workspace is the child cwd and `HOME`;
+when `filesystem.include_workdir` is enabled, it
 becomes the automatic writable policy path. Kubernetes/OpenShift keep their
 `/sandbox` PVC and `fsGroup` behavior, and VM keeps its `/sandbox` guest
 initialization path.

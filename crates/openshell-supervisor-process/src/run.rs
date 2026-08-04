@@ -101,6 +101,7 @@ pub async fn run_process(
             resolved_process_identity,
             workspace.root(),
             workspace.home().is_some(),
+            workspace.prevalidated(),
         )?;
     }
 

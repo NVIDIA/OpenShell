@@ -96,15 +96,6 @@ fn validated_container_name(sandbox: &DriverSandbox) -> Result<String, ComputeDr
     Ok(name)
 }
 
-fn workspace_probe_name(container_name: &str) -> String {
-    const SUFFIX: &str = "-workdir-probe";
-    let keep = 255usize.saturating_sub(SUFFIX.len());
-    format!(
-        "{}{SUFFIX}",
-        &container_name[..container_name.len().min(keep)]
-    )
-}
-
 fn podman_volume_is_bind_backed(volume: &VolumeInspect) -> bool {
     (volume.driver.is_empty() || volume.driver == "local")
         && volume.options.get("o").is_some_and(|options| {
@@ -272,7 +263,6 @@ fn sanitized_probe_diagnostic(logs: &str) -> String {
 
 async fn remove_workspace_probes(
     client: &PodmanClient,
-    lifecycle_lock: &tokio::sync::Mutex<()>,
     stop_timeout_secs: u32,
 ) -> Result<usize, PodmanApiError> {
     let probes = client
@@ -280,7 +270,6 @@ async fn remove_workspace_probes(
         .await?;
     let mut removed = 0;
     for probe in probes {
-        let _lifecycle_guard = lifecycle_lock.lock().await;
         match client.remove_container(&probe.id, stop_timeout_secs).await {
             Ok(()) => removed += 1,
             Err(PodmanApiError::NotFound(_)) => {}
@@ -294,17 +283,18 @@ async fn run_workspace_probe(
     client: PodmanClient,
     lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     stop_timeout_secs: u32,
-    spec: serde_json::Value,
-    probe_name: String,
-    image_id: String,
+    probe: container::WorkspaceProbeSpec,
     timeout: Duration,
-) -> Result<Option<String>, ComputeDriverError> {
+) -> Result<String, ComputeDriverError> {
+    let probe_name = probe.name().to_string();
+    let image_id = probe.image_id().to_string();
+    let create_body = probe.to_value();
     let mut created = false;
     let validation = tokio::time::timeout(timeout, async {
         {
             let _lifecycle_guard = lifecycle_lock.lock().await;
             client
-                .create_container(&spec)
+                .create_container(&create_body)
                 .await
                 .map_err(ComputeDriverError::from)?;
             created = true;
@@ -321,7 +311,7 @@ async fn run_workspace_probe(
         let logs = client.container_logs(&probe_name).await;
         if exit_code == 0 {
             let logs = logs.map_err(ComputeDriverError::from)?;
-            parse_workspace_identity(&logs).map(Some)
+            parse_workspace_identity(&logs)
         } else {
             let diagnostic = logs.map_or_else(
                 |error| format!("unable to read probe diagnostic: {error}"),
@@ -350,19 +340,17 @@ async fn run_workspace_probe(
             .remove_container(&probe_name, stop_timeout_secs)
             .await
     };
-    match (validation, cleanup) {
-        (Ok(identity), Ok(())) => Ok(identity),
-        (Ok(_), Err(error)) => Err(ComputeDriverError::from(error)),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup_error)) => {
-            warn!(
-                probe = %probe_name,
-                %cleanup_error,
-                "Failed to remove workspace validation probe"
-            );
-            Err(error)
+    if let Err(cleanup_error) = cleanup {
+        if validation.is_ok() {
+            return Err(ComputeDriverError::from(cleanup_error));
         }
+        warn!(
+            probe = %probe_name,
+            %cleanup_error,
+            "Failed to remove workspace validation probe"
+        );
     }
+    validation
 }
 
 /// Resolve the socket to connect to: explicit configuration wins, otherwise
@@ -389,36 +377,28 @@ impl PodmanComputeDriver {
     async fn validate_image_workspace(
         &self,
         sandbox: &DriverSandbox,
-        container_name: &str,
-        inspected_image: &crate::client::ImageInspect,
+        image: &container::ResolvedPodmanImage,
     ) -> Result<Option<String>, ComputeDriverError> {
-        let probe_name = workspace_probe_name(container_name);
-        crate::client::validate_name(&probe_name)
-            .map_err(|error| ComputeDriverError::Precondition(error.to_string()))?;
-        let Some(spec) = container::build_workspace_probe_spec(
-            sandbox,
-            &self.config,
-            inspected_image,
-            &probe_name,
-        )?
+        let Some(probe) = container::build_workspace_probe_spec(sandbox, &self.config, image)?
         else {
             return Ok(None);
         };
+        crate::client::validate_name(probe.name())
+            .map_err(|error| ComputeDriverError::Precondition(error.to_string()))?;
 
         let task = tokio::spawn(run_workspace_probe(
             self.client.clone(),
             Arc::clone(&self.container_lifecycle_lock),
             self.config.stop_timeout_secs,
-            spec,
-            probe_name,
-            inspected_image.id.clone(),
+            probe,
             WORKSPACE_PROBE_TIMEOUT,
         ));
-        task.await.map_err(|error| {
+        let identity = task.await.map_err(|error| {
             ComputeDriverError::Message(format!(
                 "OCI WorkingDir validation probe task failed: {error}"
             ))
-        })?
+        })??;
+        Ok(Some(identity))
     }
 
     /// Create a new driver, verifying the Podman socket is reachable.
@@ -555,10 +535,7 @@ impl PodmanComputeDriver {
             "Bridge network ready"
         );
 
-        let container_lifecycle_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let removed_probes =
-            remove_workspace_probes(&client, &container_lifecycle_lock, config.stop_timeout_secs)
-                .await?;
+        let removed_probes = remove_workspace_probes(&client, config.stop_timeout_secs).await?;
         if removed_probes > 0 {
             info!(
                 count = removed_probes,
@@ -580,7 +557,7 @@ impl PodmanComputeDriver {
             network_gateway_ip,
             rootless,
             rootless_network_cmd,
-            container_lifecycle_lock,
+            container_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,
@@ -882,8 +859,10 @@ impl PodmanComputeDriver {
                 "podman image '{image}' inspection did not return an immutable image ID"
             )));
         }
+        let resolved_image =
+            container::ResolvedPodmanImage::from_inspect(&inspected_image, &self.config)?;
         let workspace_identity = self
-            .validate_image_workspace(sandbox, &name, &inspected_image)
+            .validate_image_workspace(sandbox, &resolved_image)
             .await?;
         for image in
             container::podman_driver_image_mount_sources(sandbox, self.config.enable_bind_mounts)
@@ -949,7 +928,7 @@ impl PodmanComputeDriver {
             token_secret_name.as_deref(),
             gpu_devices.as_deref(),
             image,
-            &inspected_image,
+            &resolved_image,
             workspace_identity.as_deref(),
         ) {
             Ok(spec) => spec,
@@ -2312,6 +2291,26 @@ mod tests {
         }
     }
 
+    fn workspace_probe_sandbox(id: &str) -> DriverSandbox {
+        let mut sandbox = plain_sandbox(id, "demo");
+        sandbox.spec = Some(DriverSandboxSpec::default());
+        sandbox
+    }
+
+    fn workspace_probe_image(config: &PodmanComputeConfig) -> container::ResolvedPodmanImage {
+        container::ResolvedPodmanImage::from_inspect(
+            &crate::client::ImageInspect {
+                id: "sha256:immutable".into(),
+                config: Some(crate::client::ImageConfig {
+                    user: "1234:1235".into(),
+                    working_dir: "/workspace".into(),
+                }),
+            },
+            config,
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn workspace_probe_waits_for_success_and_always_removes_container() {
         let (socket_path, request_log, handle) = spawn_podman_stub(
@@ -2328,19 +2327,11 @@ mod tests {
             ],
         );
         let driver = test_driver(socket_path.clone());
-        let mut sandbox = plain_sandbox("sandbox-probe", "demo");
-        sandbox.spec = Some(DriverSandboxSpec::default());
-        let image = crate::client::ImageInspect {
-            id: "sha256:immutable".into(),
-            config: Some(crate::client::ImageConfig {
-                user: "1234:1235".into(),
-                working_dir: "/workspace".into(),
-            }),
-        };
-        let name = validated_container_name(&sandbox).unwrap();
+        let sandbox = workspace_probe_sandbox("sandbox-probe");
+        let image = workspace_probe_image(&driver.config);
 
         let identity = driver
-            .validate_image_workspace(&sandbox, &name, &image)
+            .validate_image_workspace(&sandbox, &image)
             .await
             .expect("successful probe should pass");
         assert_eq!(identity.as_deref(), Some("1234:1235:"));
@@ -2372,19 +2363,11 @@ mod tests {
             ],
         );
         let driver = test_driver(socket_path.clone());
-        let mut sandbox = plain_sandbox("sandbox-probe-fail", "demo");
-        sandbox.spec = Some(DriverSandboxSpec::default());
-        let image = crate::client::ImageInspect {
-            id: "sha256:immutable".into(),
-            config: Some(crate::client::ImageConfig {
-                user: "1234:1235".into(),
-                working_dir: "/workspace".into(),
-            }),
-        };
-        let name = validated_container_name(&sandbox).unwrap();
+        let sandbox = workspace_probe_sandbox("sandbox-probe-fail");
+        let image = workspace_probe_image(&driver.config);
 
         let error = driver
-            .validate_image_workspace(&sandbox, &name, &image)
+            .validate_image_workspace(&sandbox, &image)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("exited with code 1"));
@@ -2413,22 +2396,11 @@ mod tests {
             ],
         );
         let driver = test_driver(socket_path.clone());
-        let mut sandbox = plain_sandbox("sandbox-probe-cancel", "demo");
-        sandbox.spec = Some(DriverSandboxSpec::default());
-        let image = crate::client::ImageInspect {
-            id: "sha256:immutable".into(),
-            config: Some(crate::client::ImageConfig {
-                user: "1234:1235".into(),
-                working_dir: "/workspace".into(),
-            }),
-        };
-        let name = validated_container_name(&sandbox).unwrap();
+        let sandbox = workspace_probe_sandbox("sandbox-probe-cancel");
+        let image = workspace_probe_image(&driver.config);
 
-        let caller = tokio::spawn(async move {
-            driver
-                .validate_image_workspace(&sandbox, &name, &image)
-                .await
-        });
+        let caller =
+            tokio::spawn(async move { driver.validate_image_workspace(&sandbox, &image).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if request_log
@@ -2469,32 +2441,17 @@ mod tests {
             ],
         );
         let driver = test_driver(socket_path.clone());
-        let mut sandbox = plain_sandbox("sandbox-probe-timeout", "demo");
-        sandbox.spec = Some(DriverSandboxSpec::default());
-        let image = crate::client::ImageInspect {
-            id: "sha256:immutable".into(),
-            config: Some(crate::client::ImageConfig {
-                user: "1234:1235".into(),
-                working_dir: "/workspace".into(),
-            }),
-        };
-        let name = validated_container_name(&sandbox).unwrap();
-        let spec = container::build_workspace_probe_spec(
-            &sandbox,
-            &driver.config,
-            &image,
-            &workspace_probe_name(&name),
-        )
-        .unwrap()
-        .unwrap();
+        let sandbox = workspace_probe_sandbox("sandbox-probe-timeout");
+        let image = workspace_probe_image(&driver.config);
+        let probe = container::build_workspace_probe_spec(&sandbox, &driver.config, &image)
+            .unwrap()
+            .unwrap();
 
         let error = run_workspace_probe(
             driver.client.clone(),
             Arc::clone(&driver.container_lifecycle_lock),
             driver.config.stop_timeout_secs,
-            spec,
-            workspace_probe_name(&name),
-            image.id,
+            probe,
             Duration::from_millis(25),
         )
         .await

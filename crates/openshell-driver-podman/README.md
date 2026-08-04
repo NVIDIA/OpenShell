@@ -19,23 +19,14 @@ with the user's numeric primary GID. Explicit `process.run_as_user` and
 
 An absolute OCI working directory becomes the agent workspace. An empty,
 root (`/`), or explicit `/sandbox` declaration uses `/sandbox`, which OpenShell
-creates when necessary and owns as a compatibility workspace. For any other workdir, Podman
-first starts a minimal, networkless probe from the pinned image ID without the
-workspace volume, tokens, or TLS secrets. The probe retains only `SETUID` and
-`SETGID`, resolves and adopts the completed identity, including supplementary
-groups, and uses the kernel to verify that it can traverse every parent and
-write and enter the workdir. The path must be a real directory without symlink
-components. The probe also rejects kernel-managed filesystems and overlaps with
-concrete OpenShell control resources. It emits a normalized identity
-attestation; the final supervisor must resolve to the same identity, including
-when the image supplies the default process policy. The probe inherits the
-sandbox CPU, memory, and PID limits and has a bounded runtime. Its lifecycle
-continues to forced cleanup if the create request is cancelled, and a dedicated
-label lets a restarted gateway remove any probe left by process termination.
-On failure, the driver captures a bounded, sanitized diagnostic before removing
-the probe. Only then does Podman mount and prepare the managed workspace volume
-at that path; normal copy-up preserves image content. The workspace is the
-child cwd and `HOME`.
+creates and owns as a compatibility workspace. For any other workdir, a
+resource-limited, networkless probe verifies the original pinned image before
+Podman covers the path with the managed workspace volume. The completed process
+identity must already be able to traverse every parent and write and enter the
+directory, without symlink components or OpenShell control-path collisions.
+The final supervisor must match the probe's identity before preparing the
+volume. See [Compute runtimes](../../architecture/compute-runtimes.md#process-identity)
+for the invariant and probe lifecycle.
 
 For a rootless networking deep dive, see [NETWORKING.md](NETWORKING.md).
 

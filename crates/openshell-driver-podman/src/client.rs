@@ -345,17 +345,26 @@ impl PodmanClient {
         builder.body(body).expect("valid request")
     }
 
+    /// Send a pre-built HTTP request for bounded or complete body collection.
+    async fn send_response(
+        &self,
+        req: Request<Full<Bytes>>,
+        timeout: Duration,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, PodmanApiError> {
+        let mut sender = self.connect().await?;
+        tokio::time::timeout(timeout, sender.send_request(req))
+            .await
+            .map_err(|_| PodmanApiError::Timeout(timeout))?
+            .map_err(|error| PodmanApiError::Connection(error.to_string()))
+    }
+
     /// Send a pre-built HTTP request and return status + body bytes.
     async fn send_request(
         &self,
         req: Request<Full<Bytes>>,
         timeout: Duration,
     ) -> Result<(hyper::StatusCode, Bytes), PodmanApiError> {
-        let mut sender = self.connect().await?;
-        let response = tokio::time::timeout(timeout, sender.send_request(req))
-            .await
-            .map_err(|_| PodmanApiError::Timeout(timeout))?
-            .map_err(|e| PodmanApiError::Connection(e.to_string()))?;
+        let response = self.send_response(req, timeout).await?;
         let status = response.status();
         let bytes = tokio::time::timeout(timeout, response.into_body().collect())
             .await
@@ -374,11 +383,7 @@ impl PodmanClient {
     ) -> Result<(hyper::StatusCode, Bytes), PodmanApiError> {
         use hyper::body::Body;
 
-        let mut sender = self.connect().await?;
-        let response = tokio::time::timeout(timeout, sender.send_request(req))
-            .await
-            .map_err(|_| PodmanApiError::Timeout(timeout))?
-            .map_err(|error| PodmanApiError::Connection(error.to_string()))?;
+        let response = self.send_response(req, timeout).await?;
         let status = response.status();
         let deadline = tokio::time::Instant::now() + timeout;
         let mut body = response.into_body();

@@ -202,14 +202,20 @@ pub async fn run_sandbox(
             &mut policy,
             &driver_identity,
         )?;
-        if matches!(
+        let workspace_attestation = if matches!(
             &driver_identity,
             openshell_supervisor_process::identity::DriverIdentity::OciUser { .. }
-        ) && std::env::var_os(openshell_core::sandbox_env::OCI_WORKSPACE_IDENTITY)
-            .is_some_and(|value| !value.is_empty())
-        {
-            let expected = std::env::var(openshell_core::sandbox_env::OCI_WORKSPACE_IDENTITY)
-                .map_err(|_| miette::miette!("Podman workspace identity attestation is missing"))?;
+        ) {
+            match std::env::var_os(openshell_core::sandbox_env::OCI_WORKSPACE_IDENTITY) {
+                Some(value) if !value.is_empty() => Some(value.into_string().map_err(|_| {
+                    miette::miette!("Podman workspace identity attestation is not valid UTF-8")
+                })?),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(expected) = workspace_attestation.as_deref() {
             let actual =
                 openshell_supervisor_process::process::resolved_workspace_identity_attestation(
                     &policy, resolved,
@@ -225,13 +231,18 @@ pub async fn run_sandbox(
             openshell_supervisor_process::process::ResolvedWorkspace::new(
                 workdir.clone(),
                 use_workdir_as_home,
+                workspace_attestation.is_some(),
             ),
         )
     };
     #[cfg(not(unix))]
     let (resolved_process_identity, workspace) = (
         openshell_supervisor_process::process::ResolvedProcessIdentity::default(),
-        openshell_supervisor_process::process::ResolvedWorkspace::new(workdir.clone(), false),
+        openshell_supervisor_process::process::ResolvedWorkspace::new(
+            workdir.clone(),
+            false,
+            false,
+        ),
     );
 
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]

@@ -86,12 +86,17 @@ impl ResolvedProcessIdentity {
 pub struct ResolvedWorkspace {
     root: Option<String>,
     use_as_home: bool,
+    prevalidated: bool,
 }
 
 impl ResolvedWorkspace {
     #[must_use]
-    pub fn new(root: Option<String>, use_as_home: bool) -> Self {
-        Self { root, use_as_home }
+    pub fn new(root: Option<String>, use_as_home: bool, prevalidated: bool) -> Self {
+        Self {
+            root,
+            use_as_home,
+            prevalidated,
+        }
     }
 
     #[must_use]
@@ -107,6 +112,11 @@ impl ResolvedWorkspace {
     #[must_use]
     pub fn home(&self) -> Option<&str> {
         self.use_as_home.then(|| self.root()).flatten()
+    }
+
+    #[must_use]
+    pub const fn prevalidated(&self) -> bool {
+        self.prevalidated
     }
 }
 
@@ -1950,7 +1960,13 @@ fn chown_recursive(
 /// UIDs/GIDs (passed directly to `chown` without a passwd lookup).
 #[cfg(unix)]
 pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
-    prepare_filesystem_with_identity(policy, ResolvedProcessIdentity::default(), None, false)
+    prepare_filesystem_with_identity(
+        policy,
+        ResolvedProcessIdentity::default(),
+        None,
+        false,
+        false,
+    )
 }
 
 #[cfg(unix)]
@@ -1959,6 +1975,7 @@ pub fn prepare_filesystem_with_identity(
     resolved_identity: ResolvedProcessIdentity,
     workdir: Option<&str>,
     prepare_workspace: bool,
+    workspace_prevalidated: bool,
 ) -> Result<()> {
     use nix::unistd::chown;
 
@@ -1990,8 +2007,7 @@ pub fn prepare_filesystem_with_identity(
         })?;
         let workspace = Path::new(workspace);
         if workspace == Path::new(openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT)
-            || std::env::var_os(openshell_core::sandbox_env::OCI_WORKSPACE_IDENTITY)
-                .is_some_and(|value| !value.is_empty())
+            || workspace_prevalidated
         {
             info!(path = %workspace.display(), ?uid, ?gid, "Preparing managed workspace");
             prepare_oci_workspace(workspace, uid, gid, &supplementary_gids)?;
