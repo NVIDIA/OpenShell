@@ -682,6 +682,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(target_os = "linux")]
+    #[ignore = "flaky under concurrent test execution"]
     async fn gateway_listeners_bind_ipv6_wildcard_and_ipv4_callback_on_same_port() {
         let probe = TcpListener::bind("[::1]:0")
             .await

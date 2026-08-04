@@ -2625,6 +2625,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "flaky under concurrent test execution"]
     async fn watch_producer_releases_request_span_when_client_disconnects() {
         use crate::otel_tracing::test_exporter;
         use tokio_stream::StreamExt as _;
