@@ -233,6 +233,14 @@ runtime must honor the CNI-installed pod-network rules for this topology to
 provide the expected network enforcement.
 </Warning>
 
+<Warning>
+Install only **one** OpenShell release per cluster when using `cni-sidecar`. The
+chained CNI plugin and the readiness label are cluster-global host state; the
+installer stamps an owner on its plugin entry and refuses to overwrite another
+release's entry, so a second release (or a `sandboxNamespace`-changing upgrade)
+fails closed rather than silently unrestricting sandboxes.
+</Warning>
+
 ## Credential Exposure
 
 Sidecar and cni-sidecar topologies keep gateway credentials in the network

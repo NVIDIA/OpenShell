@@ -4,6 +4,8 @@
 suite: cni rbac
 templates:
   - templates/cni-rbac.yaml
+release:
+  name: openshell
 tests:
   - it: does not render by default
     asserts:
@@ -63,6 +65,19 @@ tests:
             verbs:
               - get
               - patch
+      # daemonsets get, scoped by resourceNames to this release's DaemonSet.
+      - documentIndex: 3
+        contains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - daemonsets
+            resourceNames:
+              - openshell-cni
+            verbs:
+              - get
       - documentIndex: 4
         isKind:
           of: ClusterRoleBinding
