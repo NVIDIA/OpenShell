@@ -105,21 +105,44 @@ spec:
               # the sandboxNamespaces allowlist. The allowlist is a blast-radius
               # guard: pods in namespaces NOT listed are passed through WITHOUT a
               # Kubernetes API lookup, so control-plane latency or an RBAC/token
-              # problem cannot block unrelated workloads' pod creation. It defaults
-              # to this release's sandbox namespace; a cluster running multiple
-              # OpenShell releases must list every sandbox namespace here (a pod in
-              # an unlisted namespace is not enforced). `configVersion` binds node
-              # readiness to the desired config so a stale entry is repaired before
-              # the node is re-marked ready.
+              # problem cannot block unrelated workloads' pod creation.
+              #
+              # The allowlist is computed automatically as the union of the static
+              # cni.sandboxNamespaces value and every namespace labeled
+              # openshell.ai/sandbox=true (each gateway release labels its own
+              # sandbox namespace via a helm hook). So an additional cni.external
+              # release is discovered and enforced automatically — no manual
+              # allowlist edit. `configVersion` binds node readiness to the desired
+              # config, so when the discovered set changes the reconcile repairs the
+              # entry before re-marking the node ready.
               owner="openshell"
-              sandbox_namespaces_json='{{ $cniSandboxNamespaces | toJson }}'
-              config_version="$(printf '%s|%s|%s|%s|v2' "${owner}" "${host_state_dir}/openshell-cni-kubeconfig" "{{ .Values.cni.logLevel }}" "${sandbox_namespaces_json}" | sha256sum | cut -d' ' -f1 | cut -c1-16)"
-              cat > "${plugin_config}" <<EOF
+              openshell_cni="/openshell-cni"
+              sandbox_static_json='{{ $cniSandboxNamespaces | toJson }}'
+              # (Re)write the plugin config with the current aggregated allowlist.
+              # On a discovery failure we keep the already-installed config rather
+              # than shrinking the allowlist (which would fail a running external
+              # namespace open); at first run with no config we fall back to static.
+              write_plugin_config() {
+                if discovered="$("${openshell_cni}" list-sandbox-namespaces 2>/dev/null)"; then
+                  :
+                elif [ -f "${plugin_config}" ]; then
+                  echo "OpenShell CNI: namespace discovery failed; keeping installed allowlist" >&2
+                  return 0
+                else
+                  discovered=""
+                fi
+                allowlist_json="$(
+                  { printf '%s' "${sandbox_static_json}" | jq -r '.[]'; printf '%s\n' "${discovered}"; } \
+                    | grep -v '^$' | sort -u | jq -R . | jq -s .
+                )"
+                config_version="$(printf '%s|%s|%s|%s|v3' "${owner}" "${host_state_dir}/openshell-cni-kubeconfig" "{{ .Values.cni.logLevel }}" "${allowlist_json}" | sha256sum | cut -d' ' -f1 | cut -c1-16)"
+                _pc_tmp="$(mktemp "${state_dir}/openshell-cni-plugin.XXXXXX")"
+                cat > "${_pc_tmp}" <<EOF
               {
                 "type": "openshell-cni",
                 "openshell": {
                   "kubeconfig": "${host_state_dir}/openshell-cni-kubeconfig",
-                  "sandboxNamespaces": ${sandbox_namespaces_json},
+                  "sandboxNamespaces": ${allowlist_json},
                   "owner": "${owner}",
                   "configVersion": "${config_version}",
                   "logLevel": {{ .Values.cni.logLevel | quote }},
@@ -127,12 +150,12 @@ spec:
                 }
               }
               EOF
+                mv "${_pc_tmp}" "${plugin_config}"
+              }
+              write_plugin_config
               # Per-node readiness gate. The gateway sets a required nodeAffinity
               # on sandbox pods for this label, so a node is only eligible once
-              # the chained plugin is installed. mark_ready/mark_unready are
-              # best-effort: a failed set fails closed (pods keep avoiding the
-              # node); a failed clear is retried on the next reconcile tick.
-              openshell_cni="/openshell-cni"
+              # the chained plugin is installed.
               mark_ready() {
                 "${openshell_cni}" node-ready --set \
                   || echo "OpenShell CNI: failed to mark node ready" >&2
@@ -260,6 +283,10 @@ spec:
               while true; do
                 cp /var/run/secrets/kubernetes.io/serviceaccount/token "${token_file}"
                 chmod 0600 "${token_file}"
+                # Refresh the aggregated allowlist (picks up newly labeled sandbox
+                # namespaces); config_version changes when the set does, so the
+                # health check below repairs the entry and re-enforces.
+                write_plugin_config
                 # Fence before repair: the instant enforcement is not verifiably in
                 # place, clear readiness so no new sandbox pod schedules here, then
                 # attempt repair and only re-mark ready once it is healthy again.

@@ -284,12 +284,17 @@ installer's own DaemonSet) bound to the dedicated CNI ServiceAccount.
 
 The persistent label cannot by itself cover a node reboot that wipes tmpfs-backed
 enforcement (`multus-chain` stores the chain file under `/run`). A boot-time
-`NoSchedule` taint (`openshell.ai/cni-not-ready`) closes that window: operator
-node config applies it at boot (only node config runs before the scheduler; a
-MachineConfig example ships under `deploy/helm/openshell/examples/`), the CNI
-DaemonSet tolerates it, and the installer removes it once enforcement is ready
-(never re-adding it, so a transient unready does not over-repel). `conflist` mode
-keeps the plugin on persistent disk and is unaffected by reboot. One residual
+`NoSchedule` taint (`openshell.ai/cni-not-ready`) **narrows** that window but does
+not fully close it: operator node config applies it at boot (only node config
+runs before the scheduler; a MachineConfig example ships under
+`deploy/helm/openshell/examples/`), the CNI DaemonSet tolerates it, and the
+installer removes it once enforcement is ready (never re-adding it, so a transient
+unready does not over-repel). A small residual race remains because the taint is
+applied after the kubelet starts, so the kubelet can briefly mark the node
+schedulable before the taint lands; `--register-with-taints` covers the initial
+join but not reboot re-registration. `conflist` mode keeps the plugin on
+persistent disk and is unaffected by reboot, and is the way to avoid the window
+entirely. One residual
 limitation: an ungraceful DaemonSet pod deletion (no `preStop`) leaves a stale
 `cni-ready=true` until the pod is rescheduled and the next reconcile tick
 re-evaluates it.
@@ -300,18 +305,22 @@ proxy-UID and enforcement-mode annotations, set only by a gateway on its own
 sandbox pods) **and** whose namespace is in the plugin's `sandboxNamespaces`
 allowlist. Pods in other namespaces are passed through without a Kubernetes API
 lookup, so the allowlist bounds the blast radius of the per-pod annotation read.
-The allowlist defaults to the owner release's sandbox namespace
-(`cni.sandboxNamespaces`); a cluster running multiple OpenShell releases must add
-every additional sandbox namespace to the owner's list, or those sandboxes run
-unenforced. The installer resources use a fixed release-independent name, the
-plugin config carries a fixed `openshell` owner, and a `configVersion` (over the
-allowlist and config) binds readiness to the desired config so a stale-version
-entry is repaired before the node is re-marked ready. Install the singleton
-(`cni.enabled=true`) in one release per cluster; additional gateway releases set
-`cni.enabled=false` + `cni.external=true` to share it. The installer treats any
-`openshell-cni` chained entry as its own and upgrades it in place (the conflist
-patch preserves all other plugins). The `pods get` grant is cluster-scoped so the
-one installer can read sandbox pods in any allowlisted namespace.
+The allowlist is built **automatically**: each `cni-sidecar` gateway release
+labels its sandbox namespace `openshell.ai/sandbox=true` (a helm hook runs
+`openshell-cni label-namespace`), and the installer's reconcile aggregates every
+labeled namespace (via `list-sandbox-namespaces`) — unioned with the optional
+static `cni.sandboxNamespaces` — into the plugin config. An additional
+`cni.external` release is therefore discovered and enforced within one reconcile,
+with no manual allowlist edit. The installer resources use a fixed
+release-independent name, the plugin config carries a fixed `openshell` owner, and
+a `configVersion` (over the aggregated allowlist and config) binds readiness so a
+stale-version entry is repaired before the node is re-marked ready. Install the
+singleton (`cni.enabled=true`) in one release per cluster; additional releases set
+`cni.enabled=false` + `cni.external=true`. The installer treats any `openshell-cni`
+chained entry as its own and upgrades it in place (the conflist patch preserves
+all other plugins). The `pods get` and `namespaces list` grants are cluster-scoped
+so the one installer can discover labeled namespaces and read sandbox pods in any
+of them.
 
 On OpenShift, binary-aware network policy also requires a purpose-built
 SecurityContextConstraints for sandbox pods: the network sidecar runs as UID 0

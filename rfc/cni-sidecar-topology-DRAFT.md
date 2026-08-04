@@ -214,17 +214,19 @@ settings live in the overlay `ci/values-cni-sidecar-openshift.yaml`.
 
 Guardrails enforced at template render time:
 
-- `supervisor.topology=cni-sidecar` requires `cni.enabled=true` (existing
-  guard).
+- `supervisor.topology=cni-sidecar` requires the CNI singleton: `cni.enabled=true`
+  to install it here, or `cni.external=true` to use one installed by another
+  release.
 - `cni.mode` must be `conflist` or `multus-chain`.
 - `cni.mode=multus-chain` requires `cni.chainDir`.
 
 Because `cni.chainDir` is tmpfs (under `/run`), credentials cannot live there.
 The DaemonSet writes kubeconfig/token/ca.crt to the persistent `cni.stateDir`,
-references those paths from the plugin `.conf`, and its periodic loop (already
-refreshing the SA token every 300s) re-asserts the chain `.conf` if it goes
-missing, so the config survives a Multus restart; a node reboot is covered by
-the DaemonSet re-writing on startup.
+references those paths from the plugin `.conf`, and its periodic reconcile loop
+(every 30s, which also refreshes the SA token) re-asserts the chain `.conf` if it
+goes missing, so the config survives a Multus restart. A node reboot wipes the
+tmpfs chain file; the DaemonSet re-writes it on startup, and a boot-time taint
+(see Risks) narrows the pre-reconcile scheduling window.
 
 ### SCC model (OpenShift)
 
@@ -412,17 +414,24 @@ behavior is behind a default-off value.
   the next reconcile re-checks. Operators diagnose via
   `kubectl logs daemonset/openshell-cni` and the tailed plugin log.
 - **Cluster-singleton CNI.** The chained plugin and readiness label are
-  cluster-global host state. Rather than key them to a per-release namespace list
-  (which two releases would fight over), the installer is a cluster singleton: the
-  plugin enforces any pod carrying the OpenShell annotations — set only by a
-  gateway on its own sandbox pods — so one installation serves every release
-  across all namespaces (empty namespace allowlist, fixed `openshell` owner,
-  release-independent resource names). Enable it in one release per cluster;
-  additional gateway releases set `cni.enabled=false` + `cni.external=true` to
-  share it. Readiness is bound to a `configVersion` so a stale entry is repaired
-  before the node is re-marked ready, and the installer refuses to overwrite a
-  chained plugin entry with a non-OpenShell owner (fail closed). The singleton's
-  `pods get` RBAC is necessarily cluster-scoped.
+  cluster-global host state. Rather than key them to a per-release identity (which
+  two releases would fight over), the installer is a cluster singleton with a
+  fixed `openshell` owner and release-independent resource names. Its plugin
+  enforces pods that carry the OpenShell annotations (set only by a gateway on its
+  own sandbox pods) **and** whose namespace is in the plugin's `sandboxNamespaces`
+  allowlist; pods elsewhere pass through without an API lookup, bounding blast
+  radius. The allowlist is built automatically: each `cni-sidecar` release labels
+  its sandbox namespace `openshell.ai/sandbox=true` (a helm hook), and the
+  installer's reconcile aggregates every labeled namespace (unioned with the
+  optional static `cni.sandboxNamespaces`) into the config. So an additional
+  `cni.external` release is discovered and enforced within one reconcile with no
+  manual allowlist edit. Enable the installer in one release per cluster.
+  Readiness is bound to a `configVersion` (over the aggregated allowlist and
+  config) so a stale entry is repaired before the node is re-marked ready, and the
+  installer treats any `openshell-cni` chained entry as its own to upgrade in place
+  (the conflist patch preserves all other plugins). The singleton's `pods get` and
+  `namespaces list` RBAC are cluster-scoped so it can discover labeled namespaces
+  and read sandbox pods in any of them.
 - **Dependency on Multus aux chain.** `multus-chain` requires the Multus thick
   daemon to have `auxiliaryCNIChainName` set. It is default on OpenShift 4.x but
   not guaranteed everywhere. Mitigation: document the requirement; the chart does
