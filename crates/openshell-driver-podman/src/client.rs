@@ -345,8 +345,8 @@ impl PodmanClient {
         builder.body(body).expect("valid request")
     }
 
-    /// Send a pre-built HTTP request for bounded or complete body collection.
-    async fn send_response(
+    /// Execute a pre-built HTTP request and return the streaming response.
+    async fn execute_request(
         &self,
         req: Request<Full<Bytes>>,
         timeout: Duration,
@@ -364,7 +364,7 @@ impl PodmanClient {
         req: Request<Full<Bytes>>,
         timeout: Duration,
     ) -> Result<(hyper::StatusCode, Bytes), PodmanApiError> {
-        let response = self.send_response(req, timeout).await?;
+        let response = self.execute_request(req, timeout).await?;
         let status = response.status();
         let bytes = tokio::time::timeout(timeout, response.into_body().collect())
             .await
@@ -383,7 +383,7 @@ impl PodmanClient {
     ) -> Result<(hyper::StatusCode, Bytes), PodmanApiError> {
         use hyper::body::Body;
 
-        let response = self.send_response(req, timeout).await?;
+        let response = self.execute_request(req, timeout).await?;
         let status = response.status();
         let deadline = tokio::time::Instant::now() + timeout;
         let mut body = response.into_body();
