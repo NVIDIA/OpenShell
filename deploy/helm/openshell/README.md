@@ -166,6 +166,8 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | nameOverride | string | `"openshell"` | Override the chart name used in generated resource names. |
 | networkPolicy.enabled | bool | `true` | Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway. |
 | nodeSelector | object | `{}` | Node selector for the gateway pod. |
+| persistence.size | string | `"1Gi"` | Size of the gateway data volume. Note that volumeClaimTemplates is immutable: changing this only affects claims created from now on, and does not resize the volume of an existing StatefulSet. |
+| persistence.storageClassName | string | `""` | StorageClass for the gateway data volume. Empty = omit the field, using the cluster's default StorageClass. Set this on clusters that have no default StorageClass, otherwise the claim stays Pending. |
 | pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. When certManager.enabled=true, cert-manager owns TLS and this same hook runs in JWT-only mode even if pkiInitJob.enabled remains true. |
 | pkiInitJob.serverDnsNames | list | `[]` | Extra DNS SANs to append to the server certificate. |
 | pkiInitJob.serverIpAddresses | list | `[]` | Extra IP SANs to append to the server certificate. |
@@ -173,6 +175,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | podLabels | object | `{}` | Extra labels to add to the gateway pod. |
 | podLifecycle.terminationGracePeriodSeconds | int | `5` | Grace period, in seconds, before Kubernetes terminates the gateway pod. |
 | podSecurityContext.fsGroup | int | `1000` | fsGroup assigned to the gateway pod. |
+| priorityClassName | string | `""` | PriorityClass for the gateway pod. The gateway is a control-plane component; when it shares nodes with the workloads it serves, the default priority gives it no advantage under node pressure. Empty = omit the field. |
 | probes.liveness.failureThreshold | int | `3` | Liveness probe failure threshold before the container is restarted. |
 | probes.liveness.initialDelaySeconds | int | `2` | Liveness probe initial delay, in seconds. |
 | probes.liveness.periodSeconds | int | `5` | Liveness probe period, in seconds. |
@@ -246,6 +249,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | supervisor.sideloadMethod | string | `""` | How the supervisor binary is delivered into sandbox pods. Empty (default) = auto-detect from cluster version:   K8s >= v1.35 -> "image-volume" (ImageVolume enabled by default; GA in v1.36)   K8s < v1.35 -> "init-container" (copies via init container + emptyDir) On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled, set this to "image-volume" explicitly. |
 | supervisor.topology | string | `"combined"` | Supervisor pod topology for Kubernetes sandboxes. "combined" runs the current single supervisor container in the agent pod. "sidecar" runs network enforcement in a dedicated sidecar and the process supervisor as a low-capability wrapper in the agent container. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
+| topologySpreadConstraints | list | `[]` | Topology spread constraints for the gateway pod, used to spread replicas across zones or nodes. Empty = omit the field. |
 | workload.allowMultiReplicaStatefulSet | bool | `false` | Allow replicaCount > 1 while rendering a StatefulSet. Prefer workload.kind=deployment for external database-backed multi-replica gateways; this override exists for operators who explicitly require StatefulSet identity or storage semantics. |
 | workload.kind | string | `"statefulset"` | Gateway workload controller kind. Use `statefulset` for the default SQLite database, or `deployment` when server.externalDbSecret points at an external database. |
 
