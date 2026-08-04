@@ -83,9 +83,17 @@ upstreamProxy:
   connectByHostname: false
 
 cni:
-  # -- Install the OpenShell chained CNI plugin with a privileged node DaemonSet.
-  # Required when supervisor.topology is "cni-sidecar".
+  # -- Install the OpenShell chained CNI plugin as a privileged node DaemonSet.
+  # The installer is a CLUSTER SINGLETON: one installation serves every OpenShell
+  # release's sandbox pods across all namespaces (enforcement is keyed on pod
+  # annotations the gateway sets). Enable it in exactly one release per cluster.
+  # Required for supervisor.topology="cni-sidecar" unless cni.external=true.
   enabled: false
+  # -- Use a CNI singleton installed by another release/chart instead of
+  # installing one here. Set this (with supervisor.topology="cni-sidecar" and
+  # cni.enabled=false) on additional gateway releases that share the cluster's
+  # existing OpenShell CNI installation.
+  external: false
   # -- CNI installer strategy. "conflist" appends the OpenShell plugin to an
   # existing CNI .conflist (k3s / vanilla). "multus-chain" writes a standalone
   # plugin .conf into a Multus vendor-cni-chain subdirectory (OpenShift), which

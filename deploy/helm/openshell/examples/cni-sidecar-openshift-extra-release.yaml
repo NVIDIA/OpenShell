@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example values for an ADDITIONAL gateway release on a cluster that already has
+# the OpenShell CNI singleton installed by another release. This release does not
+# install its own CNI; it reuses the cluster's existing installation. Its sandbox
+# pods are enforced by the shared plugin (enforcement is keyed on pod annotations
+# the gateway sets) and gated on the same per-node readiness label.
+#
+#   helm install openshell-team-b deploy/helm/openshell -n team-b \
+#     -f deploy/helm/openshell/examples/cni-sidecar-openshift-extra-release.yaml
+
+cni:
+  # Do not install a second CNI installer; use the cluster singleton.
+  enabled: false
+  external: true
+
+supervisor:
+  topology: cni-sidecar
+
+sandboxServiceAccount:
+  openshift:
+    binaryAwareSCC: true

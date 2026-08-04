@@ -408,6 +408,12 @@ fn workload_from_config(
     let Some(pod) = env.pod_ref() else {
         return Ok(None);
     };
+    // sandbox_namespaces is an OPTIONAL allowlist. The cluster-singleton
+    // installer leaves it empty, which means "enforce any pod that carries the
+    // OpenShell annotations, in any namespace" — enforcement is gated by the
+    // per-pod annotations below (set only by a gateway on its own sandbox pods),
+    // so one installation safely serves every release. A non-empty list narrows
+    // enforcement to those namespaces.
     if !config.openshell.sandbox_namespaces.is_empty()
         && !config
             .openshell

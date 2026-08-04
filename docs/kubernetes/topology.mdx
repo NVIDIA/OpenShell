@@ -233,13 +233,15 @@ runtime must honor the CNI-installed pod-network rules for this topology to
 provide the expected network enforcement.
 </Warning>
 
-<Warning>
-Install only **one** OpenShell release per cluster when using `cni-sidecar`. The
-chained CNI plugin and the readiness label are cluster-global host state; the
-installer stamps an owner on its plugin entry and refuses to overwrite another
-release's entry, so a second release (or a `sandboxNamespace`-changing upgrade)
-fails closed rather than silently unrestricting sandboxes.
-</Warning>
+<Note>
+The CNI installer is a **cluster singleton**. Its chained plugin enforces any
+pod carrying the OpenShell annotations (set only by a gateway on its own sandbox
+pods), so a single installation serves every OpenShell release across all
+namespaces. Enable the installer (`cni.enabled=true`) in exactly one release per
+cluster; additional gateway releases set `cni.enabled=false` and
+`cni.external=true` to share it. The installer refuses to overwrite a chained
+plugin entry with a non-OpenShell owner (fail closed).
+</Note>
 
 ## Credential Exposure
 
@@ -357,11 +359,12 @@ injects the OpenShell plugin through the Multus `vendor-cni-chain` auxiliary cha
 without modifying any operator-managed file. The installer also needs the
 `privileged` SecurityContextConstraints.
 
-Install with the provided overlay:
+Install with the example values (a step-by-step OpenShift walkthrough with
+verification is in [OpenShift](/kubernetes/openshift#enable-the-cni-sidecar-topology)):
 
 ```shell
 helm install openshell deploy/helm/openshell \
-  -f deploy/helm/openshell/ci/values-cni-sidecar-openshift.yaml
+  -f deploy/helm/openshell/examples/cni-sidecar-openshift.yaml
 ```
 
 This sets `cni.binDir: /var/lib/cni/bin`, `cni.chainDir:

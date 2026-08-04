@@ -6,57 +6,31 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: {{ include "openshell.cniServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "openshell.labels" . | nindent 4 }}
-    app.kubernetes.io/component: cni
+    {{- include "openshell.cniLabels" . | nindent 4 }}
 ---
+# The CNI installer is a cluster singleton: one chained plugin enforces every
+# OpenShell release's sandbox pods (keyed on pod annotations) across all
+# namespaces. Its RBAC is therefore cluster-scoped. It is still minimal:
+#   - pods get: read a sandbox pod's annotations during CNI ADD (any namespace,
+#     because the singleton serves all sandbox namespaces).
+#   - nodes get/patch: set/clear the per-node readiness label for the gate.
+#   - daemonsets get (this DaemonSet only): let preStop tell an ordinary restart
+#     from a real teardown.
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
-  name: {{ include "openshell.cniServiceAccountName" . }}
-  namespace: {{ include "openshell.sandboxNamespace" . }}
+  name: {{ include "openshell.cniName" . }}
   labels:
-    {{- include "openshell.labels" . | nindent 4 }}
-    app.kubernetes.io/component: cni
+    {{- include "openshell.cniLabels" . | nindent 4 }}
 rules:
-  # The CNI plugin reads the sandbox pod's annotations during CNI ADD to
-  # decide whether to install bypass-prevention rules in the pod netns.
   - apiGroups:
       - ""
     resources:
       - pods
     verbs:
       - get
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: {{ include "openshell.cniServiceAccountName" . }}
-  namespace: {{ include "openshell.sandboxNamespace" . }}
-  labels:
-    {{- include "openshell.labels" . | nindent 4 }}
-    app.kubernetes.io/component: cni
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: {{ include "openshell.cniServiceAccountName" . }}
-subjects:
-  - kind: ServiceAccount
-    name: {{ include "openshell.cniServiceAccountName" . }}
-    namespace: {{ .Release.Namespace }}
----
-# Nodes are cluster-scoped, so the readiness-label grant must be a ClusterRole.
-# It is deliberately minimal: only get/patch on nodes, so the installer can
-# label its own node ready/unready for the sandbox scheduling gate. No create,
-# delete, or list, and no other resources.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: {{ include "openshell.cniServiceAccountName" . }}
-  labels:
-    {{- include "openshell.labels" . | nindent 4 }}
-    app.kubernetes.io/component: cni
-rules:
   - apiGroups:
       - ""
     resources:
@@ -64,28 +38,25 @@ rules:
     verbs:
       - get
       - patch
-  # get on this DaemonSet only, so the preStop hook can tell an ordinary restart
-  # from a real teardown. resourceNames keeps the grant scoped to our object.
   - apiGroups:
       - apps
     resources:
       - daemonsets
     resourceNames:
-      - {{ include "openshell.fullname" . }}-cni
+      - {{ include "openshell.cniName" . }}
     verbs:
       - get
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "openshell.cniServiceAccountName" . }}
+  name: {{ include "openshell.cniName" . }}
   labels:
-    {{- include "openshell.labels" . | nindent 4 }}
-    app.kubernetes.io/component: cni
+    {{- include "openshell.cniLabels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "openshell.cniServiceAccountName" . }}
+  name: {{ include "openshell.cniName" . }}
 subjects:
   - kind: ServiceAccount
     name: {{ include "openshell.cniServiceAccountName" . }}

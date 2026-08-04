@@ -402,15 +402,18 @@ behavior is behind a default-off value.
   `cni-ready=true` until the pod is rescheduled and the next reconcile re-checks.
   Operators diagnose via `kubectl logs daemonset/openshell-cni` and the tailed
   plugin log.
-- **Single release per cluster.** The chained plugin and readiness label are
-  cluster-global host state keyed to one `sandboxNamespaces` list, so two
-  OpenShell releases (or a `sandboxNamespace`-changing upgrade) would otherwise
-  overwrite each other and leave one release's sandboxes unenforced. Mitigation:
-  the installer stamps an owner (`<namespace>/<release>`) on its plugin entry and
-  refuses to overwrite an entry owned by a different release (fail closed); only
-  one OpenShell release per cluster is supported for `cni-sidecar` today.
-  Aggregating multiple releases (a cluster-singleton installer, or release-scoped
-  config and readiness ownership) is future work.
+- **Cluster-singleton CNI.** The chained plugin and readiness label are
+  cluster-global host state. Rather than key them to a per-release namespace list
+  (which two releases would fight over), the installer is a cluster singleton: the
+  plugin enforces any pod carrying the OpenShell annotations — set only by a
+  gateway on its own sandbox pods — so one installation serves every release
+  across all namespaces (empty namespace allowlist, fixed `openshell` owner,
+  release-independent resource names). Enable it in one release per cluster;
+  additional gateway releases set `cni.enabled=false` + `cni.external=true` to
+  share it. Readiness is bound to a `configVersion` so a stale entry is repaired
+  before the node is re-marked ready, and the installer refuses to overwrite a
+  chained plugin entry with a non-OpenShell owner (fail closed). The singleton's
+  `pods get` RBAC is necessarily cluster-scoped.
 - **Dependency on Multus aux chain.** `multus-chain` requires the Multus thick
   daemon to have `auxiliaryCNIChainName` set. It is default on OpenShift 4.x but
   not guaranteed everywhere. Mitigation: document the requirement; the chart does

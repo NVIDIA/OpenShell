@@ -12,22 +12,29 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: renders service account, role and binding when cni enabled
+  # The CNI installer is a cluster singleton, so its RBAC is a ServiceAccount
+  # plus a cluster-scoped ClusterRole/ClusterRoleBinding (no namespaced Role).
+  - it: renders singleton service account and cluster-scoped rbac when cni enabled
     set:
       cni.enabled: true
     asserts:
       - hasDocuments:
-          count: 5
+          count: 3
       - documentIndex: 0
         isKind:
           of: ServiceAccount
       - documentIndex: 0
-        matchRegex:
+        equal:
           path: metadata.name
-          pattern: -cni$
+          value: openshell-cni
       - documentIndex: 1
         isKind:
-          of: Role
+          of: ClusterRole
+      - documentIndex: 1
+        equal:
+          path: metadata.name
+          value: openshell-cni
+      # pods get is cluster-wide because one installer serves all sandbox namespaces.
       - documentIndex: 1
         contains:
           path: rules
@@ -38,23 +45,7 @@ tests:
               - pods
             verbs:
               - get
-      - documentIndex: 2
-        isKind:
-          of: RoleBinding
-      - documentIndex: 2
-        matchRegex:
-          path: subjects[0].name
-          pattern: -cni$
-      - documentIndex: 2
-        matchRegex:
-          path: roleRef.name
-          pattern: -cni$
-      # ClusterRole/ClusterRoleBinding grant the minimal cluster-scoped node
-      # get/patch the installer needs to set the readiness label.
-      - documentIndex: 3
-        isKind:
-          of: ClusterRole
-      - documentIndex: 3
+      - documentIndex: 1
         contains:
           path: rules
           content:
@@ -65,8 +56,8 @@ tests:
             verbs:
               - get
               - patch
-      # daemonsets get, scoped by resourceNames to this release's DaemonSet.
-      - documentIndex: 3
+      # daemonsets get, scoped by resourceNames to the singleton DaemonSet.
+      - documentIndex: 1
         contains:
           path: rules
           content:
@@ -78,24 +69,27 @@ tests:
               - openshell-cni
             verbs:
               - get
-      - documentIndex: 4
+      - documentIndex: 2
         isKind:
           of: ClusterRoleBinding
-      - documentIndex: 4
-        matchRegex:
+      - documentIndex: 2
+        equal:
           path: roleRef.name
-          pattern: -cni$
+          value: openshell-cni
+      - documentIndex: 2
+        equal:
+          path: subjects[0].name
+          value: openshell-cni
 
-  - it: scopes cni pod-get role to the explicit sandbox namespace
+  # The singleton name is release-independent (chart name), so a different
+  # release name still yields the fixed cluster-singleton name.
+  - it: uses a release-independent singleton name
+    release:
+      name: my-gateway
     set:
       cni.enabled: true
-      server.sandboxNamespace: agents
     asserts:
       - documentIndex: 1
         equal:
-          path: metadata.namespace
-          value: agents
-      - documentIndex: 2
-        equal:
-          path: metadata.namespace
-          value: agents
+          path: metadata.name
+          value: openshell-cni
