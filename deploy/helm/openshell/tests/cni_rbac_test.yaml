@@ -15,7 +15,7 @@ tests:
       cni.enabled: true
     asserts:
       - hasDocuments:
-          count: 3
+          count: 5
       - documentIndex: 0
         isKind:
           of: ServiceAccount
@@ -44,6 +44,29 @@ tests:
           path: subjects[0].name
           pattern: -cni$
       - documentIndex: 2
+        matchRegex:
+          path: roleRef.name
+          pattern: -cni$
+      # ClusterRole/ClusterRoleBinding grant the minimal cluster-scoped node
+      # get/patch the installer needs to set the readiness label.
+      - documentIndex: 3
+        isKind:
+          of: ClusterRole
+      - documentIndex: 3
+        contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - nodes
+            verbs:
+              - get
+              - patch
+      - documentIndex: 4
+        isKind:
+          of: ClusterRoleBinding
+      - documentIndex: 4
         matchRegex:
           path: roleRef.name
           pattern: -cni$

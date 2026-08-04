@@ -54,6 +54,37 @@ tests:
       - matchRegex:
           path: spec.template.spec.serviceAccountName
           pattern: -cni$
+      # The CNI DaemonSet uses a distinct app name so the gateway Service and
+      # workload base selectors (name + instance) never match CNI pods.
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/name"]
+          value: openshell-cni
+      - notExists:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/name"]
+          value: openshell-cni
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/component"]
+          value: cni
+      # Readiness gate: the installer needs its node name and marks the node
+      # ready/unready so the gateway can gate sandbox scheduling.
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'node-ready --set'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'node-ready --clear'
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.preStop.exec.command[2]
+          pattern: 'node-ready --clear'
 
   - it: scopes cni annotation lookup to explicit sandbox namespace
     template: templates/cni-daemonset.yaml

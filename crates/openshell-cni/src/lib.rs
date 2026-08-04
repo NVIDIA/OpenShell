@@ -19,6 +19,12 @@ const OPENSHELL_CNI_PROXY_UID_ANNOTATION: &str = "openshell.ai/proxy-uid";
 const OPENSHELL_CNI_NETWORK_ENFORCEMENT_MODE_ANNOTATION: &str =
     "openshell.ai/network-enforcement-mode";
 const CNI_SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "cni-sidecar";
+/// Node label set by the CNI installer once the chained plugin is in place and
+/// cleared when it is not, so the gateway can gate sandbox scheduling on
+/// per-node egress-enforcement readiness. Must stay in sync with the identical
+/// constant in `openshell-driver-kubernetes` (used for the sandbox pod
+/// nodeAffinity) and with the CNI `DaemonSet`'s node-patch RBAC.
+const NODE_READY_LABEL: &str = "openshell.ai/cni-ready";
 #[allow(dead_code)]
 const OPENSHELL_TABLE: &str = "openshell_sidecar_bypass";
 #[allow(dead_code)]
@@ -149,8 +155,35 @@ trait PodReader {
 }
 
 trait RuleInstaller {
-    fn install(&self, netns: &Path, proxy_uid: u32) -> Result<InstallReport>;
+    fn install(&self, netns: &Path, proxy_uid: u32, enforce_ipv6: bool) -> Result<InstallReport>;
     fn cleanup(&self, netns: &Path) -> Result<()>;
+}
+
+/// Returns true when the chained CNI `prevResult` reports at least one routable
+/// IPv6 address for the pod. Loopback and link-local (`fe80::/10`) addresses are
+/// ignored because they cannot carry egress off the node, so a pod with only
+/// those needs no IPv6 firewall enforcement. IPv4-only pods return false, which
+/// lets the iptables fallback skip the (possibly absent) ip6tables binary.
+fn prev_result_has_ipv6(config: &CniConfig) -> bool {
+    let Some(prev) = config.prev_result.as_ref() else {
+        return false;
+    };
+    let Some(ips) = prev.get("ips").and_then(Value::as_array) else {
+        return false;
+    };
+    ips.iter().any(|entry| {
+        entry
+            .get("address")
+            .and_then(Value::as_str)
+            .and_then(|addr| addr.split('/').next())
+            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| match ip {
+                std::net::IpAddr::V6(v6) => {
+                    !v6.is_loopback() && (v6.segments()[0] & 0xffc0) != 0xfe80
+                }
+                std::net::IpAddr::V4(_) => false,
+            })
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +193,37 @@ struct InstallReport {
 
 /// CNI spec reserves error codes >= 100 for plugin-specific failures.
 const CNI_PLUGIN_ERROR_CODE: u32 = 100;
+
+/// Parses the `node-ready` subcommand flags into the desired readiness state.
+/// `--set` marks the node ready; `--clear` fences it.
+fn parse_node_ready_args(args: &[String]) -> Result<bool> {
+    let mut ready = None;
+    for arg in args {
+        match arg.as_str() {
+            "--set" => ready = Some(true),
+            "--clear" => ready = Some(false),
+            other => return Err(miette::miette!("unknown node-ready argument '{other}'")),
+        }
+    }
+    ready.ok_or_else(|| miette::miette!("node-ready requires --set or --clear"))
+}
+
+/// Entry point for `openshell-cni node-ready`, the CNI installer's readiness gate.
+///
+/// Invoked by the installer `DaemonSet` to gate sandbox scheduling on per-node
+/// enforcement readiness. `--set` labels the node ready once the chained plugin
+/// is installed; `--clear` removes the label on shutdown or repair failure so
+/// new sandbox pods will not schedule on a node where egress enforcement is
+/// absent. Reads the target node from `NODE_NAME` and authenticates with the
+/// pod's in-cluster service account.
+pub fn node_ready(args: &[String]) -> Result<()> {
+    let ready = parse_node_ready_args(args)?;
+    let node = std::env::var("NODE_NAME")
+        .map_err(|_| miette::miette!("NODE_NAME env var is required for node-ready"))?;
+    let client = KubeApiClient::from_in_cluster()?;
+    let value = if ready { Some("true") } else { None };
+    client.patch_node_label(&node, NODE_READY_LABEL, value)
+}
 
 pub fn run() -> Result<()> {
     let env = CniEnv::from_process();
@@ -270,7 +334,8 @@ fn handle_command(
                 let netns = env.netns.as_deref().ok_or_else(|| {
                     miette::miette!("CNI_NETNS is required for OpenShell CNI ADD")
                 })?;
-                let report = installer.install(netns, workload.proxy_uid)?;
+                let report =
+                    installer.install(netns, workload.proxy_uid, prev_result_has_ipv6(&config))?;
                 log_cni_info(
                     &config,
                     env,
@@ -288,7 +353,8 @@ fn handle_command(
                 let netns = env.netns.as_deref().ok_or_else(|| {
                     miette::miette!("CNI_NETNS is required for OpenShell CNI CHECK")
                 })?;
-                let report = installer.install(netns, workload.proxy_uid)?;
+                let report =
+                    installer.install(netns, workload.proxy_uid, prev_result_has_ipv6(&config))?;
                 log_cni_info(
                     &config,
                     env,
@@ -455,6 +521,66 @@ impl KubeApiClient {
         })
     }
 
+    /// Builds a client from the pod's mounted in-cluster service account,
+    /// independent of the plugin kubeconfig (whose token-file path is a host
+    /// path that does not resolve inside the installer container).
+    fn from_in_cluster() -> Result<Self> {
+        const TOKEN_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+        const CA_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+        let host = std::env::var("KUBERNETES_SERVICE_HOST").map_err(|_| {
+            miette::miette!("KUBERNETES_SERVICE_HOST is required for in-cluster access")
+        })?;
+        let port = std::env::var("KUBERNETES_SERVICE_PORT").map_err(|_| {
+            miette::miette!("KUBERNETES_SERVICE_PORT is required for in-cluster access")
+        })?;
+        let token = std::fs::read_to_string(TOKEN_PATH)
+            .into_diagnostic()
+            .wrap_err("failed to read in-cluster service account token")?
+            .trim()
+            .to_string();
+        let ca_pem = std::fs::read(CA_PATH)
+            .into_diagnostic()
+            .wrap_err("failed to read in-cluster CA certificate")?;
+        let ca = reqwest::Certificate::from_pem(&ca_pem).into_diagnostic()?;
+        let client = reqwest::blocking::Client::builder()
+            .add_root_certificate(ca)
+            .build()
+            .into_diagnostic()?;
+        Ok(Self {
+            server: format!("https://{host}:{port}"),
+            token,
+            client,
+        })
+    }
+
+    /// Sets (`value = Some`) or removes (`value = None`) a single node label via
+    /// a JSON merge patch. A null value in a merge patch deletes the key.
+    fn patch_node_label(&self, node: &str, key: &str, value: Option<&str>) -> Result<()> {
+        let url = format!("{}/api/v1/nodes/{}", self.server, node);
+        let label_value = value.map_or(Value::Null, |v| Value::String(v.to_string()));
+        let body = serde_json::json!({ "metadata": { "labels": { key: label_value } } });
+        let response = self
+            .client
+            .patch(url)
+            .bearer_auth(&self.token)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/merge-patch+json",
+            )
+            .body(serde_json::to_vec(&body).into_diagnostic()?)
+            .send()
+            .into_diagnostic()
+            .wrap_err("failed to patch node label")?;
+        if !response.status().is_success() {
+            return Err(miette::miette!(
+                "Kubernetes API returned {} while patching node {}",
+                response.status(),
+                node
+            ));
+        }
+        Ok(())
+    }
+
     fn pod_annotations(&self, pod: &PodRef) -> Result<BTreeMap<String, String>> {
         let url = format!(
             "{}/api/v1/namespaces/{}/pods/{}",
@@ -511,8 +637,8 @@ fn cluster_certificate_authority(
 }
 
 impl RuleInstaller for Runtime {
-    fn install(&self, netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
-        install_rules(netns, proxy_uid)
+    fn install(&self, netns: &Path, proxy_uid: u32, enforce_ipv6: bool) -> Result<InstallReport> {
+        install_rules(netns, proxy_uid, enforce_ipv6)
     }
 
     fn cleanup(&self, netns: &Path) -> Result<()> {
@@ -556,7 +682,11 @@ fn generate_sidecar_bypass_ruleset(proxy_uid: u32, log_prefix: Option<&str>) -> 
 }
 
 #[cfg(target_os = "linux")]
-fn install_rules(netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
+fn install_rules(netns: &Path, proxy_uid: u32, enforce_ipv6: bool) -> Result<InstallReport> {
+    // The preferred nft backend programs both families in one inet ruleset, so
+    // its IPv6 reject rules are harmless no-ops on IPv4-only pods; enforce_ipv6
+    // only gates the iptables fallback, where a missing ip6tables binary would
+    // otherwise reject an IPv4-only node outright.
     let nft_error = if let Some(nft) = find_nft() {
         match install_nft_rules(netns, proxy_uid, &nft) {
             Ok(()) => {
@@ -569,7 +699,8 @@ fn install_rules(netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
     };
 
     if let Some(iptables) = find_iptables() {
-        install_iptables_rules(netns, proxy_uid, &iptables).wrap_err("iptables fallback failed")?;
+        install_iptables_rules(netns, proxy_uid, &iptables, enforce_ipv6)
+            .wrap_err("iptables fallback failed")?;
         return Ok(InstallReport {
             backend: "iptables",
         });
@@ -594,8 +725,8 @@ fn install_nft_rules(netns: &Path, proxy_uid: u32, nft: &str) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn install_rules(netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
-    let _ = (netns, proxy_uid);
+fn install_rules(netns: &Path, proxy_uid: u32, enforce_ipv6: bool) -> Result<InstallReport> {
+    let _ = (netns, proxy_uid, enforce_ipv6);
     Err(miette::miette!(
         "OpenShell CNI rule installation is supported only on Linux nodes"
     ))
@@ -705,23 +836,28 @@ struct IptablesBackend {
 }
 
 #[cfg(target_os = "linux")]
-fn install_iptables_rules(netns: &Path, proxy_uid: u32, backend: &IptablesBackend) -> Result<()> {
-    // Fail closed on IPv6 first: without ip6tables we cannot prove IPv6 egress is
-    // blocked, so a dual-stack sandbox could bypass policy over IPv6. Refuse before
-    // installing any rules rather than leaving IPv4-only enforcement in place. The
-    // preferred nft backend always programs both families in one ruleset; this path
-    // only runs when nft is unavailable.
-    let ipv6 = backend.ipv6.as_deref().ok_or_else(|| {
-        miette::miette!(
-            "ip6tables not found on node; OpenShell CNI requires it to enforce IPv6 egress in the iptables fallback (install ip6tables or nft)"
-        )
-    })?;
-
+fn install_iptables_rules(
+    netns: &Path,
+    proxy_uid: u32,
+    backend: &IptablesBackend,
+    enforce_ipv6: bool,
+) -> Result<()> {
     cleanup_iptables_family(netns, &backend.ipv4);
     install_iptables_family(netns, &backend.ipv4, proxy_uid, "icmp-port-unreachable")?;
 
-    cleanup_iptables_family(netns, ipv6);
-    install_iptables_family(netns, ipv6, proxy_uid, "icmp6-port-unreachable")?;
+    if enforce_ipv6 {
+        // The pod has a routable IPv6 address, so unenforced IPv6 would be a
+        // policy bypass. Fail closed if ip6tables is missing rather than leaving
+        // IPv4-only enforcement in place. IPv4-only pods skip this entirely so
+        // nodes without ip6tables still work.
+        let ipv6 = backend.ipv6.as_deref().ok_or_else(|| {
+            miette::miette!(
+                "pod has IPv6 connectivity but ip6tables was not found on node; OpenShell CNI requires it to enforce IPv6 egress in the iptables fallback (install ip6tables or nft)"
+            )
+        })?;
+        cleanup_iptables_family(netns, ipv6);
+        install_iptables_family(netns, ipv6, proxy_uid, "icmp6-port-unreachable")?;
+    }
 
     Ok(())
 }
@@ -890,7 +1026,12 @@ mod tests {
     }
 
     impl RuleInstaller for TestInstaller {
-        fn install(&self, _netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
+        fn install(
+            &self,
+            _netns: &Path,
+            proxy_uid: u32,
+            _enforce_ipv6: bool,
+        ) -> Result<InstallReport> {
             self.installed.lock().unwrap().push(proxy_uid);
             Ok(InstallReport { backend: "test" })
         }
@@ -1149,5 +1290,69 @@ mod tests {
         let error = miette::miette!("boom");
         let payload = cni_error_payload("not valid json", &error);
         assert_eq!(payload["cniVersion"], DEFAULT_CNI_VERSION);
+    }
+
+    fn config_with_prev_result(prev_result: Value) -> CniConfig {
+        CniConfig {
+            cni_version: Some("1.0.0".to_string()),
+            prev_result: Some(prev_result),
+            openshell: OpenShellConfig::default(),
+        }
+    }
+
+    #[test]
+    fn prev_result_has_ipv6_true_for_routable_ipv6() {
+        let config = config_with_prev_result(serde_json::json!({
+            "ips": [
+                { "address": "10.1.2.3/24" },
+                { "address": "fd00:10:244::5/64" }
+            ]
+        }));
+        assert!(prev_result_has_ipv6(&config));
+    }
+
+    #[test]
+    fn prev_result_has_ipv6_false_for_ipv4_only() {
+        let config = config_with_prev_result(serde_json::json!({
+            "ips": [{ "address": "10.1.2.3/24" }]
+        }));
+        assert!(!prev_result_has_ipv6(&config));
+    }
+
+    #[test]
+    fn prev_result_has_ipv6_ignores_link_local_and_loopback() {
+        let config = config_with_prev_result(serde_json::json!({
+            "ips": [
+                { "address": "fe80::1/64" },
+                { "address": "::1/128" }
+            ]
+        }));
+        assert!(!prev_result_has_ipv6(&config));
+    }
+
+    #[test]
+    fn prev_result_has_ipv6_false_when_prev_result_absent() {
+        let config = CniConfig {
+            cni_version: Some("1.0.0".to_string()),
+            prev_result: None,
+            openshell: OpenShellConfig::default(),
+        };
+        assert!(!prev_result_has_ipv6(&config));
+    }
+
+    #[test]
+    fn parse_node_ready_args_set_and_clear() {
+        assert!(parse_node_ready_args(&["--set".to_string()]).unwrap());
+        assert!(!parse_node_ready_args(&["--clear".to_string()]).unwrap());
+    }
+
+    #[test]
+    fn parse_node_ready_args_requires_a_flag() {
+        assert!(parse_node_ready_args(&[]).is_err());
+    }
+
+    #[test]
+    fn parse_node_ready_args_rejects_unknown_flag() {
+        assert!(parse_node_ready_args(&["--bogus".to_string()]).is_err());
     }
 }

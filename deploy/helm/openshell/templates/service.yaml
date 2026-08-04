@@ -26,4 +26,3 @@ spec:
     {{- end }}
   selector:
     {{- include "openshell.selectorLabels" . | nindent 4 }}
-    app.kubernetes.io/component: gateway
