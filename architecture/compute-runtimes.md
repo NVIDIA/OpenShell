@@ -265,19 +265,33 @@ persistent `stateDir`. Neither mode modifies a CNO-managed file.
 The installer patches the chained plugin at startup and then re-verifies it on a
 reconcile tick, re-patching when the plugin is missing. This keeps enforcement in
 place across CNI config rewrites (for example a CNO reconcile) and DaemonSet
-restarts, bounding any such gap to one reconcile interval.
+restarts, bounding any such gap to one reconcile interval. The chained plugin
+lives in the host CNI config and survives installer pod restarts, so an ordinary
+DaemonSet restart or rolling update never strips enforcement: the `preStop` hook
+removes it only when the owning DaemonSet is actually being deleted (helm
+uninstall), and fences the node before doing so.
 
 A per-node scheduling gate closes the cold-start race. Once the chained plugin is
-installed, the installer labels its node `openshell.ai/cni-ready=true`; it clears
-the label on shutdown and whenever a reconcile tick cannot restore the plugin.
-The gateway sets a required `nodeAffinity` on that label for every cni-sidecar
-sandbox pod, so a pod cannot schedule onto a node before that node's egress
-enforcement is active, and a node whose enforcement later breaks stops accepting
-new sandbox pods. The label is set through a minimal cluster-scoped grant
-(`nodes` `get`/`patch` only) bound to the dedicated CNI ServiceAccount. One
-residual limitation: an ungraceful DaemonSet pod deletion (no `preStop`) leaves a
-stale `cni-ready=true` until the pod is rescheduled and the next reconcile tick
+installed, the installer labels its node `openshell.ai/cni-ready=true`. Each
+reconcile tick fences before it repairs: the instant enforcement is not
+verifiably in place it clears the label, attempts repair, and only re-marks the
+node ready once the plugin is healthy again. The gateway sets a required
+`nodeAffinity` on that label for every cni-sidecar sandbox pod, so a pod cannot
+schedule onto a node before that node's egress enforcement is active, and a node
+whose enforcement later breaks stops accepting new sandbox pods. The label is set
+through a minimal cluster-scoped grant (`nodes` `get`/`patch`, plus `get` on the
+installer's own DaemonSet) bound to the dedicated CNI ServiceAccount. One residual
+limitation: an ungraceful DaemonSet pod deletion (no `preStop`) leaves a stale
+`cni-ready=true` until the pod is rescheduled and the next reconcile tick
 re-evaluates it.
+
+The installer stamps each chained plugin entry with an owner (`<namespace>/<release>`)
+and refuses to overwrite an entry owned by a different release, failing closed
+rather than silently unrestricting another release's sandboxes. Because the host
+CNI config and the readiness label are cluster-global, **only one OpenShell
+release per cluster is supported for the cni-sidecar topology today**; aggregating
+multiple releases (or a namespace-changing upgrade) is future work noted in the
+cni-sidecar RFC.
 
 On OpenShift, binary-aware network policy also requires a purpose-built
 SecurityContextConstraints for sandbox pods: the network sidecar runs as UID 0

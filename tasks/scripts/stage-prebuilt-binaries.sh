@@ -97,7 +97,9 @@ components_for_target() {
       echo "cni"
       ;;
     all)
-      echo "gateway supervisor"
+      # The supervisor image bundles openshell-cni, so the aggregate prebuilt
+      # target must stage it too (kept in sync with the supervisor target above).
+      echo "gateway supervisor cni"
       ;;
     *)
       usage

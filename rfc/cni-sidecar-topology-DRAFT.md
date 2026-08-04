@@ -391,10 +391,26 @@ behavior is behind a default-off value.
 ## Risks
 
 - **Fail-open window.** If the OpenShell CNI conf is missing (post-reboot before
-  the DaemonSet re-asserts), pods can network without the fence. Mitigation: the
-  re-assert loop and startup write shrink the window; true fail-closed is a
-  follow-up. Operators diagnose via `kubectl logs daemonset/openshell-cni` and
-  the tailed plugin log.
+  the DaemonSet re-asserts), pods could network without the fence. Mitigation: a
+  per-node readiness gate — the installer labels its node `openshell.ai/cni-ready`
+  and the gateway requires that label via `nodeAffinity`, so sandbox pods cannot
+  schedule before enforcement is verified. The reconcile loop fences before it
+  repairs (clears the label the instant enforcement is not verifiably present),
+  and enforcement lives in the host CNI config so ordinary DaemonSet restarts
+  never strip it — `preStop` removes it only on a real teardown, fencing first.
+  Residual: an ungraceful installer-pod deletion (no `preStop`) can leave a stale
+  `cni-ready=true` until the pod is rescheduled and the next reconcile re-checks.
+  Operators diagnose via `kubectl logs daemonset/openshell-cni` and the tailed
+  plugin log.
+- **Single release per cluster.** The chained plugin and readiness label are
+  cluster-global host state keyed to one `sandboxNamespaces` list, so two
+  OpenShell releases (or a `sandboxNamespace`-changing upgrade) would otherwise
+  overwrite each other and leave one release's sandboxes unenforced. Mitigation:
+  the installer stamps an owner (`<namespace>/<release>`) on its plugin entry and
+  refuses to overwrite an entry owned by a different release (fail closed); only
+  one OpenShell release per cluster is supported for `cni-sidecar` today.
+  Aggregating multiple releases (a cluster-singleton installer, or release-scoped
+  config and readiness ownership) is future work.
 - **Dependency on Multus aux chain.** `multus-chain` requires the Multus thick
   daemon to have `auxiliaryCNIChainName` set. It is default on OpenShift 4.x but
   not guaranteed everywhere. Mitigation: document the requirement; the chart does
