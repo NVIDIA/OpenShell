@@ -1100,7 +1100,7 @@ mod tests {
         );
         let compute = crate::compute::new_test_runtime(store.clone()).await;
         Arc::new(ServerState::new(
-            Config::new(None)
+            Config::default()
                 .with_database_url("sqlite::memory:?cache=shared")
                 .with_bind_address(bind_addr)
                 .with_server_sans(["*.dev.openshell.localhost"])
@@ -1377,7 +1377,7 @@ mod tests {
 
     #[test]
     fn configured_compute_driver_triggers_auto_detection_when_empty() {
-        let config = Config::new(None).with_compute_drivers(std::iter::empty::<String>());
+        let config = Config::default().with_compute_drivers(std::iter::empty::<String>());
         // Empty drivers triggers auto-detection, which may return Some or None
         // depending on the environment. This test verifies the auto-detection path
         // is taken rather than immediately returning an error.
@@ -1410,7 +1410,7 @@ mod tests {
 
     #[test]
     fn configured_compute_driver_rejects_multiple_entries() {
-        let config = Config::new(None)
+        let config = Config::default()
             .with_compute_drivers([ComputeDriverKind::Kubernetes, ComputeDriverKind::Podman]);
         let err =
             configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
@@ -1423,7 +1423,7 @@ mod tests {
 
     #[test]
     fn configured_compute_driver_accepts_podman() {
-        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Podman]);
+        let config = Config::default().with_compute_drivers([ComputeDriverKind::Podman]);
         let driver =
             configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
         assert!(matches!(
@@ -1434,7 +1434,7 @@ mod tests {
 
     #[test]
     fn configured_compute_driver_accepts_vm() {
-        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Vm]);
+        let config = Config::default().with_compute_drivers([ComputeDriverKind::Vm]);
         let driver =
             configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
         assert!(matches!(
@@ -1445,7 +1445,7 @@ mod tests {
 
     #[test]
     fn configured_compute_driver_accepts_docker() {
-        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Docker]);
+        let config = Config::default().with_compute_drivers([ComputeDriverKind::Docker]);
         let driver =
             configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
         assert!(matches!(
@@ -1456,7 +1456,7 @@ mod tests {
 
     #[test]
     fn configured_compute_driver_resolves_named_remote() {
-        let config = Config::new(None).with_compute_drivers(["kyma"]);
+        let config = Config::default().with_compute_drivers(["kyma"]);
 
         let driver =
             configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
@@ -1473,7 +1473,7 @@ mod tests {
 
     #[test]
     fn configured_compute_driver_rejects_vm_endpoint_from_config() {
-        let config = Config::new(None)
+        let config = Config::default()
             .with_compute_drivers([ComputeDriverKind::Vm])
             .with_compute_driver_endpoint("vm", "/run/openshell/vm.sock");
 
@@ -1489,7 +1489,7 @@ mod tests {
 
     #[test]
     fn configured_compute_driver_rejects_builtin_endpoint() {
-        let config = Config::new(None)
+        let config = Config::default()
             .with_compute_drivers([ComputeDriverKind::Docker])
             .with_compute_driver_endpoint("docker", "/run/openshell/docker.sock");
 
@@ -1506,7 +1506,7 @@ mod tests {
     #[test]
     fn kubernetes_sandbox_jwt_expiry_disabled_warns_for_zero_ttl() {
         fn config_with_jwt_ttl(ttl_secs: u64) -> Config {
-            let mut config = Config::new(None);
+            let mut config = Config::default();
             config.gateway_jwt = Some(openshell_core::GatewayJwtConfig {
                 signing_key_path: "/tmp/signing.pem".into(),
                 public_key_path: "/tmp/public.pem".into(),
@@ -1523,7 +1523,7 @@ mod tests {
         assert!(!kubernetes_sandbox_jwt_expiry_disabled(
             &config_with_jwt_ttl(3600)
         ));
-        assert!(!kubernetes_sandbox_jwt_expiry_disabled(&Config::new(None)));
+        assert!(!kubernetes_sandbox_jwt_expiry_disabled(&Config::default()));
     }
 
     #[tokio::test]
