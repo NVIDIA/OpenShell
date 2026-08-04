@@ -1767,6 +1767,99 @@ fn compress_permessage_deflate(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(test)]
+pub fn compressed_masked_text_frame_for_test(payload: &[u8]) -> Vec<u8> {
+    let compressed = compress_permessage_deflate(payload).expect("compress test WebSocket frame");
+    let (mut frame, masked) = masked_frame_parts(OPCODE_TEXT, 0x40, &compressed);
+    frame.extend_from_slice(&masked);
+    frame
+}
+
+#[cfg(test)]
+pub fn decode_compressed_masked_text_frame_for_test(frame: &[u8]) -> String {
+    assert_eq!(frame[0] & 0x0f, OPCODE_TEXT);
+    assert_eq!(frame[0] & 0x40, 0x40);
+    let header = parse_test_frame_layout(frame);
+    assert!(header.masked, "client-to-upstream frame must be masked");
+    let mut payload =
+        frame[header.payload_offset..header.payload_offset + header.payload_len].to_vec();
+    apply_mask(&mut payload, header.mask_key.expect("masked test frame"));
+    String::from_utf8(
+        decompress_permessage_deflate(&payload).expect("decompress test WebSocket frame"),
+    )
+    .expect("UTF-8 test WebSocket text")
+}
+
+#[cfg(test)]
+pub async fn read_frame_for_test<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+    let mut frame = vec![0u8; 2];
+    reader
+        .read_exact(&mut frame)
+        .await
+        .expect("read test WebSocket frame header");
+    let extended_len_bytes = match frame[1] & 0x7f {
+        0..=125 => 0,
+        126 => 2,
+        127 => 8,
+        _ => unreachable!(),
+    };
+    let header_len = extended_len_bytes + if frame[1] & 0x80 != 0 { 4 } else { 0 };
+    frame.resize(2 + header_len, 0);
+    reader
+        .read_exact(&mut frame[2..])
+        .await
+        .expect("read test WebSocket frame metadata");
+    let payload_len = match frame[1] & 0x7f {
+        0..=125 => usize::from(frame[1] & 0x7f),
+        126 => usize::from(u16::from_be_bytes([frame[2], frame[3]])),
+        127 => usize::try_from(u64::from_be_bytes(frame[2..10].try_into().unwrap())).unwrap(),
+        _ => unreachable!(),
+    };
+    let frame_len = frame.len();
+    frame.resize(frame_len + payload_len, 0);
+    reader
+        .read_exact(&mut frame[frame_len..])
+        .await
+        .expect("read test WebSocket frame payload");
+    frame
+}
+
+#[cfg(test)]
+struct TestFrameLayout {
+    masked: bool,
+    mask_key: Option<[u8; 4]>,
+    payload_offset: usize,
+    payload_len: usize,
+}
+
+#[cfg(test)]
+fn parse_test_frame_layout(frame: &[u8]) -> TestFrameLayout {
+    let masked = frame[1] & 0x80 != 0;
+    let len_code = frame[1] & 0x7f;
+    let (payload_len, mut payload_offset) = match len_code {
+        0..=125 => (usize::from(len_code), 2),
+        126 => (usize::from(u16::from_be_bytes([frame[2], frame[3]])), 4),
+        127 => (
+            usize::try_from(u64::from_be_bytes(frame[2..10].try_into().unwrap())).unwrap(),
+            10,
+        ),
+        _ => unreachable!(),
+    };
+    let mask_key = masked.then(|| {
+        let key = frame[payload_offset..payload_offset + 4]
+            .try_into()
+            .expect("test frame mask");
+        payload_offset += 4;
+        key
+    });
+    TestFrameLayout {
+        masked,
+        mask_key,
+        payload_offset,
+        payload_len,
+    }
+}
+
 fn new_mask_key() -> [u8; 4] {
     let bytes = uuid::Uuid::new_v4().into_bytes();
     [bytes[0], bytes[1], bytes[2], bytes[3]]

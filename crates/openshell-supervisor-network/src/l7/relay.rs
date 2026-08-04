@@ -568,7 +568,10 @@ where
                 crate::l7::rest::RelayRequestOptions {
                     resolver: ctx.secret_resolver.as_deref(),
                     generation_guard: Some(engine.generation_guard()),
-                    websocket_extensions: websocket_extension_mode(config),
+                    websocket_extensions: websocket_extension_mode(
+                        config,
+                        middleware_session.is_some(),
+                    ),
                     request_body_credential_rewrite: config.protocol == L7Protocol::Rest
                         && config.request_body_credential_rewrite,
                     credential_signing: config.credential_signing,
@@ -956,8 +959,12 @@ pub(crate) fn upgrade_options<'a>(
     }
 }
 
-pub(crate) fn websocket_extension_mode(config: &L7EndpointConfig) -> WebSocketExtensionMode {
-    if config.protocol == L7Protocol::Websocket
+pub(crate) fn websocket_extension_mode(
+    config: &L7EndpointConfig,
+    inspecting_middleware_session: bool,
+) -> WebSocketExtensionMode {
+    if inspecting_middleware_session
+        || config.protocol == L7Protocol::Websocket
         || (config.protocol == L7Protocol::Rest && config.websocket_credential_rewrite)
     {
         WebSocketExtensionMode::PermessageDeflate
@@ -1247,7 +1254,10 @@ where
                 crate::l7::rest::RelayRequestOptions {
                     resolver: ctx.secret_resolver.as_deref(),
                     generation_guard: Some(engine.generation_guard()),
-                    websocket_extensions: websocket_extension_mode(config),
+                    websocket_extensions: websocket_extension_mode(
+                        config,
+                        middleware_session.is_some(),
+                    ),
                     request_body_credential_rewrite: config.protocol == L7Protocol::Rest
                         && config.request_body_credential_rewrite,
                     credential_signing: config.credential_signing,
@@ -5749,6 +5759,108 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn rest_websocket_middleware_inspects_compressed_wss_messages() {
+        let data = r#"
+network_middlewares:
+  redact:
+    middleware: openshell/regex
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  rest_api:
+    name: rest_api
+    endpoints:
+      - host: api.example.test
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/ws"
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        install_builtin_middleware(&engine);
+        let input = NetworkInput {
+            host: "api.example.test".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        let config = crate::l7::parse_l7_config(&endpoint_config.unwrap()).unwrap();
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ..Default::default()
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_rest(
+                &config,
+                &tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /ws HTTP/1.1\r\nHost: api.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let upstream_headers = read_http_headers(&mut upstream).await;
+        let upstream_headers = String::from_utf8_lossy(&upstream_headers);
+        assert!(upstream_headers.contains(
+            "Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n"
+        ));
+        upstream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = read_http_headers(&mut app).await;
+        assert!(String::from_utf8_lossy(&response).contains("101 Switching Protocols"));
+
+        app.write_all(
+            &crate::l7::websocket::compressed_masked_text_frame_for_test(
+                br#"{"token":"sk-1234567890abcdef"}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        let frame = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::l7::websocket::read_frame_for_test(&mut upstream),
+        )
+        .await
+        .expect("compressed WSS message should reach upstream");
+        assert_eq!(
+            crate::l7::websocket::decode_compressed_masked_text_frame_for_test(&frame),
+            r#"{"token":"[REDACTED]"}"#
+        );
+
+        drop(app);
+        drop(upstream);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), relay).await;
+    }
+
+    #[tokio::test]
     async fn route_selected_websocket_upgrade_rejects_invalid_accept_without_forwarding_101() {
         let data = r#"
 network_policies:
@@ -6117,6 +6229,18 @@ network_policies:
                 .map(|(idx, byte)| byte ^ mask[idx % 4]),
         );
         frame
+    }
+
+    async fn read_http_headers<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            reader.read_exact(&mut byte).await.unwrap();
+            bytes.push(byte[0]);
+            if bytes.ends_with(b"\r\n\r\n") {
+                return bytes;
+            }
+        }
     }
 
     async fn read_text_frame<R: AsyncRead + Unpin>(

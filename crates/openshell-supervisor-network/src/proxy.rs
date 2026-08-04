@@ -4359,7 +4359,7 @@ async fn handle_forward_proxy(
         }
         forward_websocket_request =
             crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
-        websocket_extensions = crate::l7::relay::websocket_extension_mode(&l7_config.config);
+        websocket_extensions = crate::l7::relay::websocket_extension_mode(&l7_config.config, false);
         request_body_credential_rewrite = l7_config.config.protocol == crate::l7::L7Protocol::Rest
             && l7_config.config.request_body_credential_rewrite;
         forward_upgrade_config = Some(l7_config.config.clone());
@@ -4825,6 +4825,9 @@ async fn handle_forward_proxy(
     } else {
         None
     };
+    if middleware_session.is_some() {
+        websocket_extensions = crate::l7::rest::WebSocketExtensionMode::PermessageDeflate;
+    }
     forward_request_bytes = match inject_token_grant_for_forward_request(
         method,
         &upstream_target,
@@ -5579,6 +5582,129 @@ network_policies:
             .is_err(),
             "denied preflight must not establish an upstream connection"
         );
+    }
+
+    #[tokio::test]
+    async fn plaintext_websocket_middleware_inspects_compressed_ws_messages() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+        let Some(upstream_ip) = non_loopback_test_ipv4() else {
+            eprintln!("skipping: no routable non-loopback IPv4 test address");
+            return;
+        };
+
+        let upstream_listener = TcpListener::bind((upstream_ip, 0))
+            .await
+            .expect("bind upstream listener");
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let executable = std::env::current_exe().expect("current executable");
+        let data = format!(
+            r#"
+network_middlewares:
+  redact:
+    middleware: openshell/regex
+    on_error: fail_closed
+    endpoints:
+      include: ["{upstream_ip}"]
+network_policies:
+  allow-upstream:
+    name: allow-upstream
+    endpoints:
+      - host: "{upstream_ip}"
+        port: {upstream_port}
+    binaries:
+      - {{ path: "{executable}" }}
+"#,
+            executable = executable.display(),
+        );
+        let engine = Arc::new(
+            OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
+                .expect("load policy"),
+        );
+        let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("connect built-in middleware");
+        engine
+            .replace_middleware_registry(registry)
+            .expect("install built-in middleware");
+
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = upstream_listener.accept().await.unwrap();
+            let request =
+                read_http_headers_with_timeout(&mut socket, std::time::Duration::from_secs(10))
+                    .await;
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("GET /ws HTTP/1.1\r\n"));
+            assert!(request.contains(
+                "Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n"
+            ));
+            socket
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let frame = crate::l7::websocket::read_frame_for_test(&mut socket).await;
+            crate::l7::websocket::decode_compressed_masked_text_frame_for_test(&frame)
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let target = format!("http://{upstream_ip}:{upstream_port}/ws");
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n"
+        );
+        let client = tokio::spawn(async move {
+            let mut socket = TcpStream::connect(proxy_address)
+                .await
+                .expect("connect proxy");
+            let response =
+                read_http_headers_with_timeout(&mut socket, std::time::Duration::from_secs(10))
+                    .await;
+            assert!(String::from_utf8_lossy(&response).contains("101 Switching Protocols"));
+            socket
+                .write_all(
+                    &crate::l7::websocket::compressed_masked_text_frame_for_test(
+                        br#"{"token":"sk-1234567890abcdef"}"#,
+                    ),
+                )
+                .await
+                .unwrap();
+        });
+        let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            handle_forward_proxy(
+                "GET",
+                &target,
+                request.as_bytes(),
+                request.len(),
+                &mut proxy_connection,
+                engine,
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(std::process::id())),
+                None,
+                AgentProposals::default(),
+                Arc::new(None),
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("compressed plaintext WebSocket relay should complete")
+        .expect("handle compressed plaintext WebSocket upgrade");
+        client.await.unwrap();
+        assert_eq!(upstream.await.unwrap(), r#"{"token":"[REDACTED]"}"#);
     }
 
     #[tokio::test]
@@ -6410,14 +6536,20 @@ network_policies:
     }
 
     async fn read_http_headers<R: TokioAsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+        read_http_headers_with_timeout(reader, std::time::Duration::from_secs(1)).await
+    }
+
+    async fn read_http_headers_with_timeout<R: TokioAsyncRead + Unpin>(
+        reader: &mut R,
+        timeout: std::time::Duration,
+    ) -> Vec<u8> {
         let mut bytes = Vec::new();
         let mut chunk = [0u8; 256];
         loop {
-            let n =
-                tokio::time::timeout(std::time::Duration::from_secs(1), reader.read(&mut chunk))
-                    .await
-                    .expect("HTTP headers should arrive")
-                    .expect("header read should succeed");
+            let n = tokio::time::timeout(timeout, reader.read(&mut chunk))
+                .await
+                .expect("HTTP headers should arrive")
+                .expect("header read should succeed");
             assert!(n > 0, "stream closed before HTTP headers");
             bytes.extend_from_slice(&chunk[..n]);
             if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -6478,7 +6610,7 @@ network_policies:
             false,
         )
         .expect("forward websocket request should rewrite to origin form");
-        let websocket_extensions = crate::l7::relay::websocket_extension_mode(&config);
+        let websocket_extensions = crate::l7::relay::websocket_extension_mode(&config, false);
         let target = path.to_string();
         let query_params = std::collections::HashMap::new();
         let (mut proxy_to_upstream, mut upstream) = tokio::io::duplex(8192);
@@ -6590,10 +6722,10 @@ network_policies:
         };
         let query_params = std::collections::HashMap::new();
 
-        let extensions = crate::l7::relay::websocket_extension_mode(&websocket_l7_config(
-            crate::l7::L7Protocol::Websocket,
-            true,
-        ));
+        let extensions = crate::l7::relay::websocket_extension_mode(
+            &websocket_l7_config(crate::l7::L7Protocol::Websocket, true),
+            false,
+        );
         let options = crate::l7::relay::upgrade_options(
             &websocket_l7_config(crate::l7::L7Protocol::Websocket, true),
             &ctx,
@@ -6632,7 +6764,7 @@ network_policies:
         };
         let query_params = std::collections::HashMap::new();
         let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);
-        let extensions = crate::l7::relay::websocket_extension_mode(&config);
+        let extensions = crate::l7::relay::websocket_extension_mode(&config, false);
         let options =
             crate::l7::relay::upgrade_options(&config, &ctx, true, "/ws", &query_params, None);
 
