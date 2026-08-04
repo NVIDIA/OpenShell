@@ -403,13 +403,14 @@ behavior is behind a default-off value.
 - **Node reboot (tmpfs enforcement).** In `multus-chain` mode the chain file
   lives under `/run` (tmpfs) and is wiped on reboot, but the persistent
   `cni-ready` label survives, so the label gate alone cannot cover a reboot. A
-  boot-time `NoSchedule` taint (`openshell.ai/cni-not-ready`) closes this: it is
-  applied by operator-provided node config (only node config runs before the
-  scheduler; a MachineConfig example ships under `deploy/helm/openshell/examples/`),
-  the CNI DaemonSet tolerates it, and `openshell-cni node-ready` removes it once
-  enforcement is ready (never re-adding it, so a transient unready never
-  over-repels). `conflist` mode stores the plugin on persistent disk and is
-  unaffected by reboot. Residual: an ungraceful installer-pod deletion (no
+  boot-time `NoSchedule` taint (`openshell.ai/cni-not-ready`) **narrows** this (it
+  does not fully close it): it is applied by operator-provided node config (only
+  node config runs before the scheduler; a MachineConfig example ships under
+  `deploy/helm/openshell/examples/`), the CNI DaemonSet tolerates it, and
+  `openshell-cni node-ready` removes it once enforcement is ready (never re-adding
+  it, so a transient unready never over-repels). A residual race remains because
+  the taint is applied after the kubelet starts. `conflist` mode stores the plugin
+  on persistent disk and is unaffected by reboot. Residual: an ungraceful installer-pod deletion (no
   `preStop`) can leave a stale `cni-ready=true` until the pod is rescheduled and
   the next reconcile re-checks. Operators diagnose via
   `kubectl logs daemonset/openshell-cni` and the tailed plugin log.
@@ -420,18 +421,23 @@ behavior is behind a default-off value.
   enforces pods that carry the OpenShell annotations (set only by a gateway on its
   own sandbox pods) **and** whose namespace is in the plugin's `sandboxNamespaces`
   allowlist; pods elsewhere pass through without an API lookup, bounding blast
-  radius. The allowlist is built automatically: each `cni-sidecar` release labels
-  its sandbox namespace `openshell.ai/sandbox=true` (a helm hook), and the
-  installer's reconcile aggregates every labeled namespace (unioned with the
-  optional static `cni.sandboxNamespaces`) into the config. So an additional
-  `cni.external` release is discovered and enforced within one reconcile with no
-  manual allowlist edit. Enable the installer in one release per cluster.
-  Readiness is bound to a `configVersion` (over the aggregated allowlist and
-  config) so a stale entry is repaired before the node is re-marked ready, and the
-  installer treats any `openshell-cni` chained entry as its own to upgrade in place
-  (the conflist patch preserves all other plugins). The singleton's `pods get` and
-  `namespaces list` RBAC are cluster-scoped so it can discover labeled namespaces
-  and read sandbox pods in any of them.
+  radius. The allowlist is built automatically: each `cni-sidecar` release ships a
+  Helm-owned marker ConfigMap (`openshell.ai/cni-registration=true`) in its sandbox
+  namespace, and the installer's reconcile aggregates every marker's namespace
+  (unioned with the optional static `cni.sandboxNamespaces`) into the config. As a
+  Helm resource the marker is removed on uninstall / sandboxNamespace change, so
+  registrations have proper lifecycle. An additional `cni.external` release is
+  discovered within one reconcile with no manual allowlist edit. To close the
+  discovery-window race, the installer publishes per-node coverage
+  (`openshell.ai/cni-sandbox-namespaces` annotation) and every gateway runs a
+  `wait-coverage` init container that blocks serving until every enforcement-ready
+  node acknowledges the gateway's namespace. Enable the installer in one release
+  per cluster. Readiness is bound to a `configVersion` (over the aggregated
+  allowlist and config) so a stale entry is repaired before the node is re-marked
+  ready, and the installer treats any `openshell-cni` chained entry as its own to
+  upgrade in place (the conflist patch preserves all other plugins). The
+  singleton's `pods get` and `configmaps list` RBAC are cluster-scoped so it can
+  discover marker ConfigMaps and read sandbox pods in any allowlisted namespace.
 - **Dependency on Multus aux chain.** `multus-chain` requires the Multus thick
   daemon to have `auxiliaryCNIChainName` set. It is default on OpenShift 4.x but
   not guaranteed everywhere. Mitigation: document the requirement; the chart does

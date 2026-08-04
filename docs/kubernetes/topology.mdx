@@ -239,11 +239,14 @@ that carry the OpenShell annotations (set only by a gateway on its own sandbox
 pods) **and** whose namespace is in the plugin's enforcement allowlist. Pods in
 other namespaces are passed through without an API lookup, so the allowlist
 bounds the blast radius. The allowlist is built automatically: each `cni-sidecar`
-release labels its sandbox namespace `openshell.ai/sandbox=true` (via a helm
-hook) and the singleton aggregates every labeled namespace each reconcile — so
-enable the installer (`cni.enabled=true`) in exactly one release per cluster,
-and additional releases (`cni.enabled=false`, `cni.external=true`) are discovered
-and enforced automatically. `cni.sandboxNamespaces` is an optional static
+release ships a Helm-owned marker ConfigMap (`openshell.ai/cni-registration=true`)
+in its sandbox namespace and the singleton aggregates every marker's namespace
+each reconcile — so enable the installer (`cni.enabled=true`) in exactly one
+release per cluster, and additional releases (`cni.enabled=false`,
+`cni.external=true`) are discovered automatically, with registration removed by
+Helm on uninstall. Each gateway waits (via a `wait-cni-coverage` init container)
+until every enforcement-ready node acknowledges its namespace before serving, so
+there is no discovery-window bypass. `cni.sandboxNamespaces` is an optional static
 addition. The installer treats any `openshell-cni` chained entry as its own and
 upgrades it in place.
 </Note>
