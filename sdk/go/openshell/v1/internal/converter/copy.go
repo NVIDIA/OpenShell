@@ -57,11 +57,10 @@ func structToMap(s *structpb.Struct) map[string]any {
 	return s.AsMap()
 }
 
-func mapToStruct(m map[string]any) *structpb.Struct {
+func mapToStruct(m map[string]any) (*structpb.Struct, error) {
 	if m == nil {
-		return nil
+		return nil, nil
 	}
-	s, _ := structpb.NewStruct(m)
-	return s
+	return structpb.NewStruct(m)
 }
 

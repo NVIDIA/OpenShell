@@ -199,8 +199,8 @@ func TestSandboxToProto(t *testing.T) {
 		},
 	}
 
-	p := SandboxToProto(s)
-
+	p, err := SandboxToProto(s)
+	require.NoError(t, err)
 	require.NotNil(t, p)
 	require.NotNil(t, p.Metadata)
 	assert.Equal(t, "sb-1", p.Metadata.Id)
@@ -233,7 +233,8 @@ func TestSandboxToProto(t *testing.T) {
 }
 
 func TestSandboxToProto_Nil(t *testing.T) {
-	p := SandboxToProto(nil)
+	p, err := SandboxToProto(nil)
+	require.NoError(t, err)
 	assert.Nil(t, p)
 }
 
@@ -244,8 +245,8 @@ func TestSandboxToProto_NilTemplate(t *testing.T) {
 		},
 	}
 
-	p := SandboxToProto(s)
-
+	p, err := SandboxToProto(s)
+	require.NoError(t, err)
 	require.NotNil(t, p)
 	require.NotNil(t, p.Spec)
 	assert.Nil(t, p.Spec.Template)
@@ -300,7 +301,8 @@ func TestSandboxRoundTrip(t *testing.T) {
 		},
 	}
 
-	p := SandboxToProto(original)
+	p, err := SandboxToProto(original)
+	require.NoError(t, err)
 	back := SandboxFromProto(p)
 
 	assert.Equal(t, original.ID, back.ID)
@@ -360,8 +362,8 @@ func TestSandboxSpecToProto(t *testing.T) {
 		},
 	}
 
-	p := SandboxSpecToProto(spec)
-
+	p, err := SandboxSpecToProto(spec)
+	require.NoError(t, err)
 	require.NotNil(t, p)
 	assert.Equal(t, "debug", p.LogLevel)
 	assert.Equal(t, map[string]string{"X": "Y"}, p.Environment)
@@ -379,7 +381,8 @@ func TestSandboxSpecToProto(t *testing.T) {
 }
 
 func TestSandboxSpecToProto_Nil(t *testing.T) {
-	p := SandboxSpecToProto(nil)
+	p, err := SandboxSpecToProto(nil)
+	require.NoError(t, err)
 	assert.Nil(t, p)
 }
 

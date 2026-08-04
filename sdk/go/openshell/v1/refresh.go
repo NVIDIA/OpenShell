@@ -25,6 +25,7 @@ const (
 	RefreshStrategyOAuth2RefreshToken      = types.RefreshStrategyOAuth2RefreshToken
 	RefreshStrategyOAuth2ClientCredentials = types.RefreshStrategyOAuth2ClientCredentials
 	RefreshStrategyGoogleServiceAccountJWT = types.RefreshStrategyGoogleServiceAccountJWT
+	RefreshStrategyAWSStsAssumeRole        = types.RefreshStrategyAWSStsAssumeRole
 )
 
 // RefreshInterface defines operations for managing provider credential refresh.

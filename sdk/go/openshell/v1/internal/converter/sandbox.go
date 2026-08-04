@@ -4,6 +4,8 @@
 package converter
 
 import (
+	"fmt"
+
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
@@ -132,9 +134,14 @@ func SandboxPhaseToProto(phase types.SandboxPhase) pb.SandboxPhase {
 }
 
 // SandboxToProto converts an SDK Sandbox to a proto Sandbox.
-func SandboxToProto(s *types.Sandbox) *pb.Sandbox {
+func SandboxToProto(s *types.Sandbox) (*pb.Sandbox, error) {
 	if s == nil {
-		return nil
+		return nil, nil
+	}
+
+	spec, err := SandboxSpecToProto(&s.Spec)
+	if err != nil {
+		return nil, fmt.Errorf("convert sandbox spec: %w", err)
 	}
 
 	return &pb.Sandbox{
@@ -148,14 +155,14 @@ func SandboxToProto(s *types.Sandbox) *pb.Sandbox {
 			Workspace:           s.Workspace,
 			DeletionTimestampMs: MillisFromTimePtr(s.DeletionTimestamp),
 		},
-		Spec: SandboxSpecToProto(&s.Spec),
-	}
+		Spec: spec,
+	}, nil
 }
 
 // SandboxSpecToProto converts an SDK SandboxSpec to a proto SandboxSpec.
-func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
+func SandboxSpecToProto(spec *types.SandboxSpec) (*pb.SandboxSpec, error) {
 	if spec == nil {
-		return nil
+		return nil, nil
 	}
 
 	result := &pb.SandboxSpec{
@@ -166,6 +173,14 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 	}
 
 	if spec.Template != nil {
+		resources, err := mapToStruct(spec.Template.Resources)
+		if err != nil {
+			return nil, fmt.Errorf("convert template resources: %w", err)
+		}
+		driverConfig, err := mapToStruct(spec.Template.DriverConfig)
+		if err != nil {
+			return nil, fmt.Errorf("convert template driver config: %w", err)
+		}
 		result.Template = &pb.SandboxTemplate{
 			Image:            spec.Template.Image,
 			RuntimeClassName: spec.Template.RuntimeClassName,
@@ -173,9 +188,9 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 			Labels:           CopyStringMap(spec.Template.Labels),
 			Annotations:      CopyStringMap(spec.Template.Annotations),
 			Environment:      CopyStringMap(spec.Template.Environment),
-			Resources:        mapToStruct(spec.Template.Resources),
+			Resources:        resources,
 			UserNamespaces:   CopyBoolPtr(spec.Template.UserNamespaces),
-			DriverConfig:     mapToStruct(spec.Template.DriverConfig),
+			DriverConfig:     driverConfig,
 		}
 	}
 
@@ -187,5 +202,7 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 		}
 	}
 
-	return result
+	return result, nil
 }
+
+

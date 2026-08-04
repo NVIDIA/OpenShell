@@ -15,6 +15,7 @@ const (
 	RefreshStrategyOAuth2RefreshToken      RefreshStrategy = "OAuth2RefreshToken"
 	RefreshStrategyOAuth2ClientCredentials RefreshStrategy = "OAuth2ClientCredentials"
 	RefreshStrategyGoogleServiceAccountJWT RefreshStrategy = "GoogleServiceAccountJWT"
+	RefreshStrategyAWSStsAssumeRole        RefreshStrategy = "AWSStsAssumeRole"
 )
 
 // RefreshStatus reports the current state of credential refresh for a specific

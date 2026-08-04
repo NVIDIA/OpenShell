@@ -4,3 +4,19 @@
 // Package v1 provides the OpenShell SDK client.
 // gRPC error conversion is handled by the internal/converter package.
 package v1
+
+import "context"
+
+func contextError(err error) error {
+	if err == nil {
+		return nil
+	}
+	switch err {
+	case context.DeadlineExceeded:
+		return &StatusError{Code: ErrorDeadlineExceeded, Message: err.Error()}
+	case context.Canceled:
+		return &StatusError{Code: ErrorCancelled, Message: err.Error()}
+	default:
+		return &StatusError{Code: ErrorInternal, Message: err.Error()}
+	}
+}

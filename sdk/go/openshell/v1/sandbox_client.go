@@ -26,9 +26,13 @@ func newSandboxClient(conn grpc.ClientConnInterface) *sandboxClient {
 }
 
 func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string) (*Sandbox, error) {
+	pbSpec, err := converter.SandboxSpecToProto(spec)
+	if err != nil {
+		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
+	}
 	resp, err := s.client.CreateSandbox(ctx, &pb.CreateSandboxRequest{
 		Name:      name,
-		Spec:      converter.SandboxSpecToProto(spec),
+		Spec:      pbSpec,
 		Labels:    labels,
 		Workspace: workspace,
 	})
@@ -159,7 +163,7 @@ func (s *sandboxClient) WaitReady(ctx context.Context, workspace, name string, o
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, contextError(ctx.Err())
 		case <-ticker.C:
 			sb, err = s.Get(ctx, workspace, name)
 			if err != nil {
