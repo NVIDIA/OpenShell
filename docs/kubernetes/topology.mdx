@@ -217,6 +217,15 @@ file, so `kubectl logs daemonset/openshell-cni -c install-cni` includes CNI
 `ADD` and `CHECK` errors that would otherwise only appear in pod events or node
 logs.
 
+A per-node scheduling gate ensures enforcement is in place before a sandbox
+runs. Once the chained plugin is installed, the installer labels its node
+`openshell.ai/cni-ready=true`, and clears the label on shutdown or when a
+reconcile tick cannot restore the plugin. The gateway sets a required
+`nodeAffinity` on that label for every cni-sidecar sandbox pod, so a pod cannot
+schedule onto a node whose egress enforcement is not active. An ungraceful CNI
+DaemonSet pod deletion can briefly leave a stale `cni-ready=true` until the pod
+is rescheduled and the next reconcile tick re-evaluates it.
+
 <Warning>
 `cni-sidecar` is experimental. It currently targets normal Kubernetes runtimes
 first. Kata Containers and gVisor remain validation targets, because each

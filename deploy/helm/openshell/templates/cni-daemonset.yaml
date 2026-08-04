@@ -24,18 +24,15 @@ kind: DaemonSet
 metadata:
   name: {{ include "openshell.fullname" . }}-cni
   labels:
-    {{- include "openshell.labels" . | nindent 4 }}
-    app.kubernetes.io/component: cni
+    {{- include "openshell.cniLabels" . | nindent 4 }}
 spec:
   selector:
     matchLabels:
-      {{- include "openshell.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: cni
+      {{- include "openshell.cniSelectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "openshell.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: cni
+        {{- include "openshell.cniLabels" . | nindent 8 }}
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -48,6 +45,13 @@ spec:
         - name: install-cni
           image: {{ include "openshell.cniImage" . | quote }}
           imagePullPolicy: {{ include "openshell.cniImagePullPolicy" . | quote }}
+          env:
+            # Used by `openshell-cni node-ready` to label this node ready/unready
+            # so the gateway can gate sandbox scheduling on per-node enforcement.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           command:
             - sh
             - -ec
@@ -98,6 +102,20 @@ spec:
                 }
               }
               EOF
+              # Per-node readiness gate. The gateway sets a required nodeAffinity
+              # on sandbox pods for this label, so a node is only eligible once
+              # the chained plugin is installed. mark_ready/mark_unready are
+              # best-effort: a failed set fails closed (pods keep avoiding the
+              # node); a failed clear is retried on the next reconcile tick.
+              openshell_cni="/openshell-cni"
+              mark_ready() {
+                "${openshell_cni}" node-ready --set \
+                  || echo "OpenShell CNI: failed to mark node ready" >&2
+              }
+              mark_unready() {
+                "${openshell_cni}" node-ready --clear \
+                  || echo "OpenShell CNI: failed to mark node unready" >&2
+              }
               {{- if eq $mode "conflist" }}
               conf_dir="/host{{ .Values.cni.confDir }}"
               resolve_conflist_target() {
@@ -117,10 +135,20 @@ spec:
                   cp "${target}" "${target}.openshell-backup"
                 fi
                 tmp="$(mktemp "${conf_dir}/openshell-cni.XXXXXX")"
-                jq --slurpfile openshell "${plugin_config}" '
+                # Only replace the live conflist when jq succeeded AND wrote a
+                # non-empty file. This function is invoked through `||`, which
+                # disables `set -e` inside it, so a bare `jq; mv` would clobber a
+                # working host conflist with an empty file on jq failure and break
+                # node networking. Fail closed instead: leave the target intact.
+                if jq --slurpfile openshell "${plugin_config}" '
                   .plugins = ((.plugins // []) | map(select(.type != "openshell-cni")) + [$openshell[0]])
-                ' "${target}" > "${tmp}"
-                mv "${tmp}" "${target}"
+                ' "${target}" > "${tmp}" && [ -s "${tmp}" ]; then
+                  mv "${tmp}" "${target}"
+                else
+                  rm -f "${tmp}"
+                  echo "OpenShell CNI conflist patch failed (jq error); left ${target} unchanged" >&2
+                  return 1
+                fi
               }
               # Re-patch only when the chained plugin is absent, so a CNI config
               # rewrite (CNO reconcile, node reimage) or a jq no-op cannot leave the
@@ -135,6 +163,7 @@ spec:
                 patch_conflist
               }
               patch_conflist || exit 1
+              mark_ready
               echo "OpenShell CNI installed (conflist mode); plugin log ${log_file}; firewall backend selected during CNI ADD"
               {{- else }}
               chain_dir="/host{{ .Values.cni.chainDir }}"
@@ -142,11 +171,19 @@ spec:
               mkdir -p "${chain_dir}"
               write_chain_conf() {
                 _tmp="$(mktemp "${chain_dir}/openshell-cni.XXXXXX")"
-                jq -n --slurpfile openshell "${plugin_config}" \
-                  '{"cniVersion": "1.0.0", "name": "openshell-cni"} + $openshell[0]' > "${_tmp}"
-                mv "${_tmp}" "${chain_conf}"
+                # Same fail-closed contract as patch_conflist: never install a
+                # truncated chain config if jq fails.
+                if jq -n --slurpfile openshell "${plugin_config}" \
+                  '{"cniVersion": "1.0.0", "name": "openshell-cni"} + $openshell[0]' > "${_tmp}" && [ -s "${_tmp}" ]; then
+                  mv "${_tmp}" "${chain_conf}"
+                else
+                  rm -f "${_tmp}"
+                  echo "OpenShell CNI chain conf generation failed (jq error); left ${chain_conf} unchanged" >&2
+                  return 1
+                fi
               }
-              write_chain_conf
+              write_chain_conf || exit 1
+              mark_ready
               echo "OpenShell CNI installed (multus-chain mode) at ${chain_conf}; plugin log ${log_file}; firewall backend selected during CNI ADD"
               {{- end }}
               tail -n 0 -F "${host_log_file}" &
@@ -157,9 +194,12 @@ spec:
                 cp /var/run/secrets/kubernetes.io/serviceaccount/token "${token_file}"
                 chmod 0600 "${token_file}"
                 {{- if eq $mode "conflist" }}
-                ensure_conflist || true
+                # Keep the node's readiness label in lockstep with enforcement:
+                # mark unready if the chained plugin cannot be restored, so no new
+                # sandbox pods schedule here until it is.
+                if ensure_conflist; then mark_ready; else mark_unready; fi
                 {{- else }}
-                [ -f "${chain_conf}" ] || write_chain_conf
+                if { [ -f "${chain_conf}" ] || write_chain_conf; }; then mark_ready; else mark_unready; fi
                 {{- end }}
                 sleep 300
               done
@@ -173,6 +213,9 @@ spec:
                   - sh
                   - -ec
                   - |
+                    # Fence the node before removing enforcement so no sandbox pod
+                    # schedules here during teardown.
+                    /openshell-cni node-ready --clear || true
                     {{- if eq $mode "conflist" }}
                     conf_dir="/host{{ .Values.cni.confDir }}"
                     for target in "${conf_dir}"/*.conflist; do

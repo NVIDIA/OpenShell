@@ -495,6 +495,15 @@ sandbox pod should carry `openshell.ai/cni=enabled`,
 network setup, inspect the DaemonSet logs, the host CNI config, and whether the
 cluster actually invokes chained CNI plugins for the sandbox runtime class.
 
+A per-node scheduling gate can also keep cni-sidecar sandbox pods `Pending`. The
+CNI DaemonSet labels each node `openshell.ai/cni-ready=true` after installing the
+plugin, and the gateway sets a required `nodeAffinity` on that label. If a
+sandbox pod stays `Pending` with an "unmatched nodeAffinity" event, check that
+the CNI DaemonSet is Ready on schedulable nodes and that the label is present
+(`kubectl get nodes -L openshell.ai/cni-ready`). A missing label means the
+installer has not completed its first patch or a reconcile tick cleared it after
+a plugin-restore failure.
+
 Inspect all three when sandbox registration or egress enforcement fails:
 
 ```bash

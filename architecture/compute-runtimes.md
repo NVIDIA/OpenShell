@@ -307,14 +307,19 @@ persistent `stateDir`. Neither mode modifies a CNO-managed file.
 The installer patches the chained plugin at startup and then re-verifies it on a
 reconcile tick, re-patching when the plugin is missing. This keeps enforcement in
 place across CNI config rewrites (for example a CNO reconcile) and DaemonSet
-restarts, bounding any such gap to one reconcile interval. It does not cover the
-cold-start scheduling race: a sandbox pod scheduled on a node before that node's
-CNI DaemonSet pod has completed its first patch is admitted with unrestricted
-egress, because the cni-sidecar topology deliberately omits the in-pod
-fail-closed network-init backstop. Closing that window requires gating sandbox
-scheduling on verified per-node CNI readiness (tracked as a follow-up); until
-then, operators should ensure the CNI DaemonSet is Ready on every node that can
-schedule sandbox pods before enabling the topology in production.
+restarts, bounding any such gap to one reconcile interval.
+
+A per-node scheduling gate closes the cold-start race. Once the chained plugin is
+installed, the installer labels its node `openshell.ai/cni-ready=true`; it clears
+the label on shutdown and whenever a reconcile tick cannot restore the plugin.
+The gateway sets a required `nodeAffinity` on that label for every cni-sidecar
+sandbox pod, so a pod cannot schedule onto a node before that node's egress
+enforcement is active, and a node whose enforcement later breaks stops accepting
+new sandbox pods. The label is set through a minimal cluster-scoped grant
+(`nodes` `get`/`patch` only) bound to the dedicated CNI ServiceAccount. One
+residual limitation: an ungraceful DaemonSet pod deletion (no `preStop`) leaves a
+stale `cni-ready=true` until the pod is rescheduled and the next reconcile tick
+re-evaluates it.
 
 On OpenShift, binary-aware network policy also requires a purpose-built
 SecurityContextConstraints for sandbox pods: the network sidecar runs as UID 0
