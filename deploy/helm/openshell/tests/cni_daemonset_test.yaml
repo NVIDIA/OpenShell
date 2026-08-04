@@ -6,6 +6,7 @@ templates:
   - templates/cni-daemonset.yaml
 release:
   name: openshell
+  namespace: openshell
 tests:
   - it: does not render by default
     template: templates/cni-daemonset.yaml
@@ -41,10 +42,18 @@ tests:
           content:
             name: cni-log
             mountPath: /host/var/log
-      # Cluster singleton: annotation-driven, empty namespace allowlist.
+      # Tolerates the boot-time not-ready taint so it can run on a rebooted node
+      # and remove the taint once enforcement is ready.
+      - contains:
+          path: spec.template.spec.tolerations
+          content:
+            key: openshell.ai/cni-not-ready
+            operator: Exists
+            effect: NoSchedule
+      # Singleton owner + namespace allowlist defaulting to the release namespace.
       - matchRegex:
           path: spec.template.spec.containers[0].command[2]
-          pattern: '"sandboxNamespaces": \[\]'
+          pattern: 'sandbox_namespaces_json=.\["openshell"\].'
       - matchRegex:
           path: spec.template.spec.containers[0].command[2]
           pattern: 'owner="openshell"'
@@ -105,6 +114,18 @@ tests:
       - matchRegex:
           path: spec.template.spec.containers[0].command[2]
           pattern: 'owner="openshell"'
+
+  - it: aggregates multiple sandbox namespaces into the allowlist
+    template: templates/cni-daemonset.yaml
+    set:
+      cni.enabled: true
+      cni.sandboxNamespaces:
+        - team-a
+        - team-b
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'sandbox_namespaces_json=.\["team-a","team-b"\].'
 
   - it: binds readiness to a config version
     template: templates/cni-daemonset.yaml

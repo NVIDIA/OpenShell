@@ -13,6 +13,7 @@
 {{- fail "cni.mode=multus-chain requires cni.chainDir" -}}
 {{- end }}
 {{- $sandboxNamespace := .Values.server.sandboxNamespace | default .Release.Namespace }}
+{{- $cniSandboxNamespaces := .Values.cni.sandboxNamespaces | default (list $sandboxNamespace) }}
 {{- $cniLogFile := .Values.cni.logFile | default "/var/log/openshell-cni.log" }}
 {{- $cniLogDir := dir $cniLogFile }}
 {{- $stateDir := .Values.cni.confDir }}
@@ -98,22 +99,27 @@ spec:
                   cluster: cluster
                   user: openshell-cni
               EOF
-              # The CNI installer is a cluster singleton. The chained plugin
-              # enforces any pod carrying the OpenShell annotations (set only by a
-              # gateway on its sandbox pods), so a single installation serves every
-              # release across all namespaces — hence an empty sandboxNamespaces
-              # allowlist and a fixed "openshell" owner rather than a per-release
-              # namespace list. `configVersion` binds node readiness to the desired
-              # config: a reconcile that finds a stale-version entry repairs it
-              # before re-marking the node ready.
+              # The CNI installer is a cluster singleton with a fixed "openshell"
+              # owner. Its plugin enforces any pod carrying the OpenShell
+              # annotations (set only by a gateway on its sandbox pods), scoped to
+              # the sandboxNamespaces allowlist. The allowlist is a blast-radius
+              # guard: pods in namespaces NOT listed are passed through WITHOUT a
+              # Kubernetes API lookup, so control-plane latency or an RBAC/token
+              # problem cannot block unrelated workloads' pod creation. It defaults
+              # to this release's sandbox namespace; a cluster running multiple
+              # OpenShell releases must list every sandbox namespace here (a pod in
+              # an unlisted namespace is not enforced). `configVersion` binds node
+              # readiness to the desired config so a stale entry is repaired before
+              # the node is re-marked ready.
               owner="openshell"
-              config_version="$(printf '%s|%s|%s|v1' "${owner}" "${host_state_dir}/openshell-cni-kubeconfig" "{{ .Values.cni.logLevel }}" | sha256sum | cut -d' ' -f1 | cut -c1-16)"
+              sandbox_namespaces_json='{{ $cniSandboxNamespaces | toJson }}'
+              config_version="$(printf '%s|%s|%s|%s|v2' "${owner}" "${host_state_dir}/openshell-cni-kubeconfig" "{{ .Values.cni.logLevel }}" "${sandbox_namespaces_json}" | sha256sum | cut -d' ' -f1 | cut -c1-16)"
               cat > "${plugin_config}" <<EOF
               {
                 "type": "openshell-cni",
                 "openshell": {
                   "kubeconfig": "${host_state_dir}/openshell-cni-kubeconfig",
-                  "sandboxNamespaces": [],
+                  "sandboxNamespaces": ${sandbox_namespaces_json},
                   "owner": "${owner}",
                   "configVersion": "${config_version}",
                   "logLevel": {{ .Values.cni.logLevel | quote }},
@@ -368,10 +374,15 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.cni.tolerations }}
       tolerations:
+        # Tolerate the boot-time not-ready taint so the installer can run on a
+        # freshly rebooted node and remove the taint once enforcement is ready.
+        - key: openshell.ai/cni-not-ready
+          operator: Exists
+          effect: NoSchedule
+        {{- with .Values.cni.tolerations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       {{- with .Values.cni.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
