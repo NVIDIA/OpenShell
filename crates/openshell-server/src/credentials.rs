@@ -74,6 +74,11 @@ pub trait CredentialDriver: std::fmt::Debug + Send + Sync {
         &self,
         requests: Vec<ResolveCredentialRequest>,
     ) -> Result<Vec<ResolvedCredential>, Status>;
+
+    #[cfg(test)]
+    fn stored_credential_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -199,11 +204,38 @@ impl CredentialRuntime {
         normalize_driver_name(&handle.driver) == self.registry.storage_owner_name()
     }
 
+    #[cfg(test)]
+    pub(crate) fn stored_credential_count(&self) -> Option<usize> {
+        self.drivers
+            .get(&self.registry.storage_owner_name())
+            .and_then(|driver| driver.stored_credential_count())
+    }
+
     pub async fn store_provider_credentials(
         &self,
         provider_name: &str,
         workspace: &str,
         provider_id: &str,
+        credentials: &HashMap<String, String>,
+        existing_handles: &HashMap<String, CredentialHandle>,
+    ) -> Result<HashMap<String, CredentialHandle>, Status> {
+        self.store_provider_credentials_with_object_id(
+            provider_name,
+            workspace,
+            provider_id,
+            provider_id,
+            credentials,
+            existing_handles,
+        )
+        .await
+    }
+
+    pub async fn store_provider_credentials_with_object_id(
+        &self,
+        provider_name: &str,
+        workspace: &str,
+        provider_id: &str,
+        object_id: &str,
         credentials: &HashMap<String, String>,
         existing_handles: &HashMap<String, CredentialHandle>,
     ) -> Result<HashMap<String, CredentialHandle>, Status> {
@@ -233,6 +265,7 @@ impl CredentialRuntime {
                         existing_handle,
                         workspace: workspace.to_string(),
                         provider_id: provider_id.to_string(),
+                        object_id: object_id.to_string(),
                     })
                     .await?;
                 handle.driver.clone_from(&driver_name);
@@ -1461,7 +1494,12 @@ impl CredentialDriver for TestStaticCredentialDriver {
             .existing_handle
             .map(|handle| handle.handle)
             .filter(|handle| !handle.trim().is_empty())
-            .unwrap_or_else(|| format!("{}:{}", request.provider_name, request.credential_key));
+            .unwrap_or_else(|| {
+                format!(
+                    "{}:{}:{}",
+                    request.provider_name, request.credential_key, request.object_id
+                )
+            });
         self.values
             .lock()
             .map_err(|_| Status::internal("test-static credential store lock poisoned"))?
@@ -1504,6 +1542,11 @@ impl CredentialDriver for TestStaticCredentialDriver {
         }
 
         Ok(responses)
+    }
+
+    #[cfg(test)]
+    fn stored_credential_count(&self) -> Option<usize> {
+        self.values.lock().ok().map(|values| values.len())
     }
 }
 

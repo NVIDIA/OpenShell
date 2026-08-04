@@ -528,15 +528,17 @@ async fn apply_minted_credential(
         // Stage under new handles with a unique staging ID to ensure we don't overwrite
         // the still-committed values before validation/CAS succeeds
         let staged = credentials
-            .store_provider_credentials(
+            .store_provider_credentials_with_object_id(
                 provider.object_name(),
                 provider.object_workspace(),
-                &staging_id, // Use unique staging ID instead of real provider ID
+                provider.object_id(),
+                &staging_id,
                 &creds_to_store,
                 &HashMap::new(), // Empty map forces creation of new handles
             )
             .await?;
         if !staged.contains_key(credential_key) {
+            cleanup_staged_refresh_handles(credentials, provider, &staged).await;
             return Err(Status::internal(
                 "credential driver did not return refreshed credential handle",
             ));
@@ -572,30 +574,35 @@ async fn apply_minted_credential(
             updated.credential_expires_at_ms.remove(key);
         }
     }
-    crate::grpc::provider::validate_provider_update_against_attached_sandboxes(
+    if let Err(err) = crate::grpc::provider::validate_provider_update_against_attached_sandboxes(
         store, workspace, &updated,
     )
-    .await?;
+    .await
+    {
+        if let Some(credentials) = credentials
+            && let Some(handles) = &staged_handles
+        {
+            cleanup_staged_refresh_handles(credentials, provider, handles).await;
+        }
+        return Err(err);
+    }
 
-    // Collect old handles that will be replaced after successful CAS
-    let old_handles_to_delete: HashMap<String, CredentialHandle> = if staged_handles.is_some() {
-        provider
-            .credential_handles
-            .iter()
-            .filter(|(key, _)| updated.credential_handles.contains_key(*key))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    } else {
-        HashMap::new()
-    };
+    // Capture only handles actually replaced in the CAS snapshot. This avoids
+    // deleting unchanged sibling handles and remains correct if another refresh
+    // updated the provider after this refresh began.
+    let mut old_handles_to_delete = HashMap::new();
     let cas_result = store
         .update_message_cas::<Provider, _>(provider.object_id(), 0, |current| {
             if let Some(handles) = staged_handles.clone() {
                 for (key, handle) in &handles {
                     current.credentials.remove(key);
-                    current
+                    if let Some(old_handle) = current
                         .credential_handles
-                        .insert(key.clone(), handle.clone());
+                        .insert(key.clone(), handle.clone())
+                        && old_handle != *handle
+                    {
+                        old_handles_to_delete.insert(key.clone(), old_handle);
+                    }
                 }
             } else {
                 current
@@ -629,20 +636,8 @@ async fn apply_minted_credential(
     if cas_result.is_err()
         && let Some(credentials) = credentials
         && let Some(ref handles) = staged_handles
-        && let Err(cleanup_err) = credentials
-            .delete_provider_credential_handles(
-                provider.object_name(),
-                provider.object_workspace(),
-                &staging_id, // Use staging ID for cleanup - matches how they were stored
-                handles,
-            )
-            .await
     {
-        warn!(
-            provider_name = %provider.object_name(),
-            error = %cleanup_err,
-            "failed to clean up staged provider credentials after refresh CAS failure"
-        );
+        cleanup_staged_refresh_handles(credentials, provider, handles).await;
     }
 
     // If CAS succeeded and we have old handles to delete, clean them up
@@ -667,6 +662,28 @@ async fn apply_minted_credential(
     }
 
     cas_result
+}
+
+async fn cleanup_staged_refresh_handles(
+    credentials: &crate::credentials::CredentialRuntime,
+    provider: &Provider,
+    handles: &HashMap<String, CredentialHandle>,
+) {
+    if let Err(cleanup_err) = credentials
+        .delete_provider_credential_handles(
+            provider.object_name(),
+            provider.object_workspace(),
+            provider.object_id(),
+            handles,
+        )
+        .await
+    {
+        warn!(
+            provider_name = %provider.object_name(),
+            error = %cleanup_err,
+            "failed to clean up staged provider credentials after refresh failure"
+        );
+    }
 }
 
 /// Reject minting for strategies that require `providers_v2_enabled` when the
@@ -1212,11 +1229,11 @@ mod tests {
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
     use openshell_core::Config;
-    use openshell_core::ObjectId;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{
         Provider, ProviderCredentialRefreshStrategy, Sandbox, SandboxSpec,
     };
+    use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
     use std::collections::HashMap;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2107,6 +2124,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_minted_credential_replaces_only_refreshed_handles() {
+        use super::apply_minted_credential;
+
+        let store = test_store().await;
+        let credentials = CredentialRuntime::from_config(
+            &Config::new(None).with_credential_drivers(["test-static"]),
+        )
+        .unwrap();
+        let mut prov = provider("stored-aws", "aws");
+        let original_handles = credentials
+            .store_provider_credentials(
+                prov.object_name(),
+                prov.object_workspace(),
+                prov.object_id(),
+                &HashMap::from([
+                    ("AWS_ACCESS_KEY_ID".to_string(), "old-key".to_string()),
+                    (
+                        "AWS_SECRET_ACCESS_KEY".to_string(),
+                        "unchanged-secret".to_string(),
+                    ),
+                ]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        prov.credential_handles.clone_from(&original_handles);
+        store.put_message(&prov).await.unwrap();
+
+        let minted = super::MintedCredential {
+            access_token: "new-key".to_string(),
+            expires_at_ms: 4_000_000_000_000,
+            refresh_token: None,
+            additional_credentials: HashMap::new(),
+        };
+
+        apply_minted_credential(
+            &store,
+            "default",
+            Some(&credentials),
+            &prov,
+            "AWS_ACCESS_KEY_ID",
+            &minted,
+        )
+        .await
+        .unwrap();
+
+        let stored = store
+            .get_message_by_name::<Provider>("default", "stored-aws")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            stored.credential_handles.get("AWS_ACCESS_KEY_ID"),
+            original_handles.get("AWS_ACCESS_KEY_ID")
+        );
+        assert_eq!(
+            stored.credential_handles.get("AWS_SECRET_ACCESS_KEY"),
+            original_handles.get("AWS_SECRET_ACCESS_KEY")
+        );
+        let resolved = credentials
+            .resolve_provider_handles(&stored, current_time_ms())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.values.get("AWS_ACCESS_KEY_ID"),
+            Some(&"new-key".to_string())
+        );
+        assert_eq!(
+            resolved.values.get("AWS_SECRET_ACCESS_KEY"),
+            Some(&"unchanged-secret".to_string())
+        );
+
+        let old_handle_provider = Provider {
+            credential_handles: HashMap::from([(
+                "AWS_ACCESS_KEY_ID".to_string(),
+                original_handles["AWS_ACCESS_KEY_ID"].clone(),
+            )]),
+            ..prov
+        };
+        let err = credentials
+            .resolve_provider_handles(&old_handle_provider, current_time_ms())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
     async fn apply_minted_credential_validates_additional_keys_against_sandboxes() {
         use super::apply_minted_credential;
 
@@ -2153,11 +2257,15 @@ mod tests {
                 ("AWS_SESSION_TOKEN".to_string(), "session-token".to_string()),
             ]),
         };
+        let credentials = CredentialRuntime::from_config(
+            &Config::new(None).with_credential_drivers(["test-static"]),
+        )
+        .unwrap();
 
         let err = apply_minted_credential(
             &store,
             "default",
-            None,
+            Some(&credentials),
             &refreshing_provider,
             "AWS_ACCESS_KEY_ID",
             &minted,
@@ -2166,6 +2274,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("AWS_SECRET_ACCESS_KEY"));
+        assert_eq!(credentials.stored_credential_count(), Some(0));
     }
 
     // A wiremock responder that blocks the STS response until the test releases

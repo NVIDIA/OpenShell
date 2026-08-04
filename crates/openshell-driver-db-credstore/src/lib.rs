@@ -1035,6 +1035,7 @@ mod tests {
             existing_handle,
             workspace: "test-workspace".to_string(),
             provider_id: "test-provider-id".to_string(),
+            object_id: "test-provider-id".to_string(),
         }
     }
 
