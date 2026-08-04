@@ -7,7 +7,7 @@ set -euo pipefail
 
 REAL_GH="${OPENSHELL_REAL_GH:-/usr/bin/gh}"
 GATOR_MARKER='> **gator-agent**'
-GATOR_PAYLOAD_VERSION="${OPENSHELL_AGENT_PAYLOAD_VERSION:-2}"
+GATOR_PAYLOAD_VERSION="${OPENSHELL_AGENT_PAYLOAD_VERSION:-3}"
 
 if [[ $# -lt 1 || "$1" != "api" ]]; then
     exec "$REAL_GH" "$@"
@@ -100,6 +100,22 @@ is_draft_only_blocker_disposition() {
     [[ "$lower_body" == *"marked as a draft"* || "$lower_body" == *"pull request is a draft"* || "$lower_body" == *"pr is draft"* ]] || return 1
 }
 
+is_ttl_state_nudge() {
+    local body="$1"
+
+    [[ "$body" == *"$GATOR_MARKER"* ]] || return 1
+    [[ "$body" == *"more than 48 business hours"* ]] || return 1
+
+    case "$body" in
+        *"## Author Follow-Up Nudge"*|*"## Maintainer Review Nudge"*|*"## Merge Decision Nudge"*|*"## Blocker Follow-Up Nudge"*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 has_blocking_same_sha_disposition() {
     local head_sha="$1"
     local current_is_draft="$2"
@@ -134,6 +150,10 @@ guard_duplicate_gator_disposition() {
 
     [[ "$body" == *"$GATOR_MARKER"* ]] || return 0
     [[ "$body" != *"## Monitoring Complete"* ]] || return 0
+
+    # A TTL state nudge is not a review disposition. Its frequency and target
+    # are governed by the gator skill; allow it to keep an unchanged PR moving.
+    is_ttl_state_nudge "$body" && return 0
 
     local pull_json head_sha current_is_draft
     if ! pull_json="$($REAL_GH api "repos/$owner/$repo/pulls/$number" 2>/dev/null)"; then
