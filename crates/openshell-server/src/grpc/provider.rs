@@ -6586,7 +6586,7 @@ mod tests {
 
         let err = handle_create_provider(
             &state,
-            Request::new(CreateProviderRequest {
+            authed_request(CreateProviderRequest {
                 provider: Some(provider_with_credential_handle(
                     "openai-ref",
                     "openai",
@@ -6616,7 +6616,7 @@ mod tests {
 
         let response = handle_create_provider(
             &state,
-            Request::new(CreateProviderRequest {
+            authed_request(CreateProviderRequest {
                 provider: Some(provider_with_credential_value(
                     "openai-local",
                     "openai",
@@ -6679,7 +6679,7 @@ mod tests {
 
         let err = handle_update_provider(
             &state,
-            Request::new(UpdateProviderRequest {
+            authed_request(UpdateProviderRequest {
                 provider: Some(provider_with_credential_handle(
                     "openai-local",
                     "openai",
@@ -8685,7 +8685,7 @@ mod tests {
 
         handle_create_provider(
             &state,
-            Request::new(CreateProviderRequest {
+            authed_request(CreateProviderRequest {
                 provider: Some(provider_with_credential_value(
                     "openai-local",
                     "openai",
@@ -8713,7 +8713,7 @@ mod tests {
 
         let err = handle_update_provider(
             &state,
-            Request::new(UpdateProviderRequest {
+            authed_request(UpdateProviderRequest {
                 provider: Some(stale_provider),
                 credential_expires_at_ms: HashMap::new(),
                 workspace: "default".to_string(),
