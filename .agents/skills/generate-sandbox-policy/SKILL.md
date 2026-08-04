@@ -449,6 +449,10 @@ The policy needs to go somewhere. Determine which mode applies:
    - If the sandbox uses an attached provider credential, confirm the provider
      profile also declares the intended host, port, and path. A sandbox policy
      allow cannot expand the profile's static credential binding.
+   - For `credential_signing`, confirm an attached endpoint-bearing profile
+     declares `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` and covers the
+     signed endpoint. For an endpointless AWS profile, add
+     `credential_binding.provider` with the exact attached provider name.
 
 3. **Apply the change**:
    - **Adding a new policy**: Insert the new policy block under `network_policies`, maintaining the file's existing indentation and style.

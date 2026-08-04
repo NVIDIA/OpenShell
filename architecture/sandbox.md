@@ -237,7 +237,12 @@ For AWS endpoints that require request-level signing, the proxy supports SigV4
 re-signing. When `credential_signing: sigv4` is set on an L7 endpoint, the proxy
 strips the client's placeholder-based AWS auth headers, re-signs with real
 credentials from the provider, and forwards the request upstream. The signing
-mode is auto-detected from the client SDK's `x-amz-content-sha256` header:
+endpoint must have a credential source before the policy generation activates:
+an attached endpoint-bearing AWS profile whose boundary covers the endpoint, or
+an attached endpointless AWS profile explicitly named by the endpoint's
+`credential_binding.provider`. Policy activation rejects missing or mismatched
+sources atomically. The signing mode is auto-detected from the client SDK's
+`x-amz-content-sha256` header:
 
 - **Signed body** (hex hash): buffers the request body (up to 10 MiB), computes
   its SHA-256, and includes the hash in the signature. Used by Bedrock and most

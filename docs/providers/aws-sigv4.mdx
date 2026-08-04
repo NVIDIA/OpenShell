@@ -156,8 +156,9 @@ endpoints:
 
 - `credential_signing` and `request_body_credential_rewrite` are mutually exclusive on the same endpoint. The policy validator rejects policies that set both.
 - `credential_binding.provider` must name a provider attached to that sandbox. Use it only when the selected provider profile has no endpoints. Endpoint-bearing profiles already define their credential boundary.
+- OpenShell rejects a signed sandbox policy before activation unless the endpoint has a resolvable AWS credential source. An endpoint-bearing profile must declare `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` and cover the signed host, port, and path. An endpointless profile must declare those keys and be selected with `credential_binding.provider` on the signed endpoint.
 - The `sigv4:body` mode buffers at most 10 MiB. Requests with larger bodies are rejected. Use `sigv4:no_body` or `sigv4` (auto-detect) for large payloads.
-- The proxy requires `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the provider. If either is missing, the request fails with an error.
+- The active provider must contain current `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` values. If either becomes unavailable after policy activation, the request fails closed.
 
 ## Use from a Sandbox
 

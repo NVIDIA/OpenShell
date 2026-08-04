@@ -51,6 +51,8 @@ use openshell_core::telemetry::{
 };
 use openshell_core::{
     VERSION,
+    endpoint_path::EndpointPathPattern,
+    host_pattern::host_matches,
     settings::{self, SettingValueKind},
 };
 use openshell_ocsf::{
@@ -1220,6 +1222,7 @@ pub(super) fn policy_has_credential_binding_for_provider(
 fn validate_policy_credential_binding_context(
     catalog: &EffectiveProviderProfileCatalog,
     records: &[super::provider::ProviderEnvironmentRecord],
+    policy: &ProtoSandboxPolicy,
     bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
 ) -> Result<(), Status> {
     for provider_name in bindings.keys() {
@@ -1250,7 +1253,136 @@ fn validate_policy_credential_binding_context(
             )));
         }
     }
+
+    validate_policy_signing_credential_sources(catalog, records, policy)?;
     Ok(())
+}
+
+const SIGV4_REQUIRED_CREDENTIAL_KEYS: [&str; 2] = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"];
+
+fn validate_policy_signing_credential_sources(
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[super::provider::ProviderEnvironmentRecord],
+    policy: &ProtoSandboxPolicy,
+) -> Result<(), Status> {
+    for rule in policy.network_policies.values() {
+        for endpoint in &rule.endpoints {
+            if endpoint.credential_signing.is_empty() {
+                continue;
+            }
+
+            let source = endpoint.credential_binding.as_ref().map_or_else(
+                || {
+                    records.iter().find_map(|record| {
+                        signing_profile_for_record(catalog, record).filter(|profile| {
+                            profile_declares_sigv4_credentials(profile)
+                                && !profile.endpoints.is_empty()
+                                && signed_endpoint_is_covered(
+                                    endpoint,
+                                    &profile.to_proto().endpoints,
+                                )
+                        })
+                    })
+                },
+                |binding| {
+                    records
+                        .iter()
+                        .find(|record| record.name == binding.provider)
+                        .and_then(|record| signing_profile_for_record(catalog, record))
+                        .filter(|profile| {
+                            profile_declares_sigv4_credentials(profile)
+                                && profile.endpoints.is_empty()
+                        })
+                },
+            );
+
+            if source.is_none() {
+                let selector = format_endpoint_selector(endpoint);
+                return Err(Status::failed_precondition(format!(
+                    "credential_signing endpoint '{selector}' has no resolvable AWS credential source; attach an endpoint-bearing provider profile that declares AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and covers this endpoint, or set credential_binding.provider to an attached endpointless profile that declares those credentials"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn signing_profile_for_record(
+    catalog: &EffectiveProviderProfileCatalog,
+    record: &super::provider::ProviderEnvironmentRecord,
+) -> Option<openshell_providers::ProviderTypeProfile> {
+    let profile_id =
+        normalize_provider_type(&record.provider.r#type).unwrap_or(record.provider.r#type.as_str());
+    super::provider::get_provider_type_profile_for_scope(
+        catalog,
+        profile_id,
+        &record.provider.profile_workspace,
+    )
+}
+
+fn profile_declares_sigv4_credentials(profile: &openshell_providers::ProviderTypeProfile) -> bool {
+    let env_vars = profile.credential_env_vars();
+    SIGV4_REQUIRED_CREDENTIAL_KEYS
+        .iter()
+        .all(|required| env_vars.contains(required))
+}
+
+fn signed_endpoint_is_covered(
+    signed: &NetworkEndpoint,
+    profile_endpoints: &[NetworkEndpoint],
+) -> bool {
+    endpoint_ports_for_validation(signed)
+        .into_iter()
+        .all(|port| {
+            profile_endpoints.iter().any(|profile| {
+                endpoint_ports_for_validation(profile).contains(&port)
+                    && host_pattern_covers(&profile.host, &signed.host)
+                    && path_pattern_covers(&profile.path, &signed.path)
+            })
+        })
+}
+
+fn endpoint_ports_for_validation(endpoint: &NetworkEndpoint) -> Vec<u32> {
+    if endpoint.ports.is_empty() {
+        vec![endpoint.port]
+    } else {
+        endpoint.ports.clone()
+    }
+}
+
+fn host_pattern_covers(binding_pattern: &str, policy_pattern: &str) -> bool {
+    if binding_pattern.eq_ignore_ascii_case(policy_pattern) {
+        return true;
+    }
+    if contains_glob_syntax(policy_pattern) {
+        return false;
+    }
+    host_matches(binding_pattern, policy_pattern).unwrap_or(false)
+}
+
+fn path_pattern_covers(binding_pattern: &str, policy_pattern: &str) -> bool {
+    if binding_pattern == policy_pattern || matches!(binding_pattern, "" | "**" | "/**") {
+        return true;
+    }
+    if contains_glob_syntax(policy_pattern) {
+        return false;
+    }
+    EndpointPathPattern::new(binding_pattern).matches(policy_pattern)
+}
+
+fn contains_glob_syntax(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| matches!(character, '*' | '?' | '['))
+}
+
+fn format_endpoint_selector(endpoint: &NetworkEndpoint) -> String {
+    let ports = endpoint_ports_for_validation(endpoint)
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}:{ports}{}", endpoint.host, endpoint.path)
 }
 
 async fn validate_policy_credential_bindings_for_sandbox(
@@ -1261,7 +1393,12 @@ async fn validate_policy_credential_bindings_for_sandbox(
     policy: &ProtoSandboxPolicy,
 ) -> Result<HashMap<String, Vec<StaticCredentialEndpointBinding>>, Status> {
     let bindings = policy_static_credential_endpoint_bindings(Some(policy))?;
-    if bindings.is_empty() {
+    let has_signing = policy.network_policies.values().any(|rule| {
+        rule.endpoints
+            .iter()
+            .any(|endpoint| !endpoint.credential_signing.is_empty())
+    });
+    if bindings.is_empty() && !has_signing {
         return Ok(bindings);
     }
     let records = super::provider::load_provider_environment_records(
@@ -1270,7 +1407,7 @@ async fn validate_policy_credential_bindings_for_sandbox(
         provider_names,
     )
     .await?;
-    validate_policy_credential_binding_context(catalog, &records, &bindings)?;
+    validate_policy_credential_binding_context(catalog, &records, policy, &bindings)?;
     Ok(bindings)
 }
 
@@ -2098,6 +2235,7 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     validate_policy_credential_binding_context(
         &provider_profile_catalog,
         &provider_records,
+        &effective_policy,
         &policy_credential_bindings,
     )?;
     let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
@@ -4814,6 +4952,7 @@ async fn apply_merge_operations_with_retry(
             validate_policy_credential_binding_context(
                 context.catalog,
                 context.records,
+                &effective_policy,
                 &bindings,
             )?;
         }
@@ -6044,6 +6183,20 @@ mod tests {
         }
     }
 
+    fn test_aws_provider(name: &str, provider_type: &str) -> Provider {
+        let mut provider = test_provider(name, provider_type);
+        provider.credentials = [
+            ("AWS_ACCESS_KEY_ID".to_string(), "AKIATEST".to_string()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "test-secret".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        provider
+    }
+
     fn test_policy_with_rule(rule_name: &str, host: &str) -> ProtoSandboxPolicy {
         ProtoSandboxPolicy {
             network_policies: std::iter::once((
@@ -6077,6 +6230,21 @@ mod tests {
             .credential_binding = Some(openshell_core::proto::NetworkCredentialBinding {
             provider: provider.to_string(),
         });
+        policy
+    }
+
+    fn test_sigv4_policy(host: &str, provider: Option<&str>) -> ProtoSandboxPolicy {
+        let mut policy = test_policy_with_rule("aws", host);
+        let endpoint = &mut policy.network_policies.get_mut("aws").unwrap().endpoints[0];
+        endpoint.protocol = "rest".to_string();
+        endpoint.tls = "terminate".to_string();
+        endpoint.access = "full".to_string();
+        endpoint.credential_signing = "sigv4".to_string();
+        endpoint.signing_service = "s3".to_string();
+        endpoint.credential_binding =
+            provider.map(|provider| openshell_core::proto::NetworkCredentialBinding {
+                provider: provider.to_string(),
+            });
         policy
     }
 
@@ -6923,6 +7091,190 @@ mod tests {
 
         assert_eq!(error.code(), Code::FailedPrecondition);
         assert!(error.message().contains("already defines endpoints"));
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_sigv4_without_credential_source_before_persisting_revision() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox(
+            "sb-signing-no-source",
+            "signing-no-source",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "signing-no-source".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(test_sigv4_policy("s3.amazonaws.com", None)),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("SigV4 policy without an AWS credential source must fail before persistence");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("no resolvable AWS credential source")
+        );
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-signing-no-source")
+                .await
+                .unwrap()
+                .is_none(),
+            "invalid policy must not leave a revision in history"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_sigv4_for_unbound_endpointless_aws_profile() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_aws_provider("aws-prod", "aws"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-signing-unbound-aws",
+            "signing-unbound-aws",
+            ProtoSandboxPolicy::default(),
+            vec!["aws-prod".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "signing-unbound-aws".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(test_sigv4_policy("s3.amazonaws.com", None)),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("endpointless AWS profile must be bound explicitly");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("no resolvable AWS credential source")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_accepts_sigv4_bound_to_endpointless_aws_profile() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_aws_provider("aws-prod", "aws"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-signing-bound-aws",
+            "signing-bound-aws",
+            ProtoSandboxPolicy::default(),
+            vec!["aws-prod".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "signing-bound-aws".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(test_sigv4_policy("s3.amazonaws.com", Some("aws-prod"))),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("bound endpointless AWS profile supplies SigV4 credentials");
+
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-signing-bound-aws")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_accepts_sigv4_covered_by_endpointful_aws_profile() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_aws_provider("s3-prod", "aws-s3"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-signing-profile-endpoint",
+            "signing-profile-endpoint",
+            ProtoSandboxPolicy::default(),
+            vec!["s3-prod".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "signing-profile-endpoint".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(test_sigv4_policy("bucket.s3.amazonaws.com", None)),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("endpoint-bearing AWS profile covers the signed endpoint");
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_sigv4_outside_endpointful_aws_profile_boundary() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_aws_provider("s3-prod", "aws-s3"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-signing-profile-mismatch",
+            "signing-profile-mismatch",
+            ProtoSandboxPolicy::default(),
+            vec!["s3-prod".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "signing-profile-mismatch".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(test_sigv4_policy("api.example.com", None)),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("profile endpoint boundary must cover a signed endpoint");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("no resolvable AWS credential source")
+        );
     }
 
     #[tokio::test]
