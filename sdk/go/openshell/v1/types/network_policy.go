@@ -35,6 +35,11 @@ type PolicyNetworkEndpoint struct {
 	WebsocketCredentialRewrite   bool
 	RequestBodyCredentialRewrite bool
 	AdvisorProposed              bool
+	CredentialSigning            string
+	SigningService               string
+	SigningRegion                string
+	JsonRpcMaxBodyBytes          uint32
+	Mcp                          *McpOptions
 }
 
 // PolicyNetworkBinary identifies a binary subject to network policy enforcement.
@@ -50,7 +55,7 @@ type L7Rule struct {
 	Allow *L7Allow
 }
 
-// L7Allow specifies layer-7 allow criteria for HTTP/GraphQL traffic.
+// L7Allow specifies layer-7 allow criteria for HTTP/GraphQL/MCP traffic.
 type L7Allow struct {
 	Method        string
 	Path          string
@@ -59,9 +64,10 @@ type L7Allow struct {
 	OperationType string
 	OperationName string
 	Fields        []string
+	Params        map[string]L7QueryMatcher
 }
 
-// L7DenyRule specifies layer-7 deny criteria for HTTP/GraphQL traffic.
+// L7DenyRule specifies layer-7 deny criteria for HTTP/GraphQL/MCP traffic.
 type L7DenyRule struct {
 	Method        string
 	Path          string
@@ -70,6 +76,13 @@ type L7DenyRule struct {
 	OperationType string
 	OperationName string
 	Fields        []string
+	Params        map[string]L7QueryMatcher
+}
+
+// McpOptions holds MCP-specific policy and inspection options.
+type McpOptions struct {
+	StrictToolNames         *bool
+	AllowAllKnownMcpMethods *bool
 }
 
 // L7QueryMatcher matches query parameters by glob pattern or exact values.

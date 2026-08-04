@@ -77,6 +77,13 @@ func policyNetworkEndpointFromProto(ep *sbv1.NetworkEndpoint) types.PolicyNetwor
 		WebsocketCredentialRewrite:   ep.GetWebsocketCredentialRewrite(),
 		RequestBodyCredentialRewrite: ep.GetRequestBodyCredentialRewrite(),
 		AdvisorProposed:              ep.GetAdvisorProposed(),
+		CredentialSigning:            ep.GetCredentialSigning(),
+		SigningService:               ep.GetSigningService(),
+		SigningRegion:                ep.GetSigningRegion(),
+		JsonRpcMaxBodyBytes:          ep.GetJsonRpcMaxBodyBytes(),
+	}
+	if mcp := ep.GetMcp(); mcp != nil {
+		result.Mcp = mcpOptionsFromProto(mcp)
 	}
 	if ports := ep.GetPorts(); len(ports) > 0 {
 		result.Ports = make([]uint32, len(ports))
@@ -127,6 +134,13 @@ func policyNetworkEndpointToProto(ep *types.PolicyNetworkEndpoint) *sbv1.Network
 		WebsocketCredentialRewrite:   ep.WebsocketCredentialRewrite,
 		RequestBodyCredentialRewrite: ep.RequestBodyCredentialRewrite,
 		AdvisorProposed:              ep.AdvisorProposed,
+		CredentialSigning:            ep.CredentialSigning,
+		SigningService:               ep.SigningService,
+		SigningRegion:                ep.SigningRegion,
+		JsonRpcMaxBodyBytes:          ep.JsonRpcMaxBodyBytes,
+	}
+	if ep.Mcp != nil {
+		result.Mcp = mcpOptionsToProto(ep.Mcp)
 	}
 	if len(ep.Ports) > 0 {
 		result.Ports = make([]uint32, len(ep.Ports))
@@ -172,6 +186,9 @@ func l7RuleFromProto(r *sbv1.L7Rule) types.L7Rule {
 		if q := a.GetQuery(); len(q) > 0 {
 			result.Allow.Query = l7QueryMapFromProto(q)
 		}
+		if p := a.GetParams(); len(p) > 0 {
+			result.Allow.Params = l7QueryMapFromProto(p)
+		}
 	}
 	return result
 }
@@ -190,6 +207,9 @@ func l7RuleToProto(r *types.L7Rule) *sbv1.L7Rule {
 		if len(r.Allow.Query) > 0 {
 			result.Allow.Query = l7QueryMapToProto(r.Allow.Query)
 		}
+		if len(r.Allow.Params) > 0 {
+			result.Allow.Params = l7QueryMapToProto(r.Allow.Params)
+		}
 	}
 	return result
 }
@@ -197,7 +217,7 @@ func l7RuleToProto(r *types.L7Rule) *sbv1.L7Rule {
 // --- L7DenyRule ---
 
 func l7DenyRuleFromProto(r *sbv1.L7DenyRule) types.L7DenyRule {
-	return types.L7DenyRule{
+	result := types.L7DenyRule{
 		Method:        r.GetMethod(),
 		Path:          r.GetPath(),
 		Command:       r.GetCommand(),
@@ -206,6 +226,10 @@ func l7DenyRuleFromProto(r *sbv1.L7DenyRule) types.L7DenyRule {
 		Fields:        CopyStringSlice(r.GetFields()),
 		Query:         l7QueryMapFromProtoDeny(r.GetQuery()),
 	}
+	if p := r.GetParams(); len(p) > 0 {
+		result.Params = l7QueryMapFromProto(p)
+	}
+	return result
 }
 
 func l7DenyRuleToProto(r *types.L7DenyRule) *sbv1.L7DenyRule {
@@ -219,6 +243,9 @@ func l7DenyRuleToProto(r *types.L7DenyRule) *sbv1.L7DenyRule {
 	}
 	if len(r.Query) > 0 {
 		result.Query = l7QueryMapToProtoDeny(r.Query)
+	}
+	if len(r.Params) > 0 {
+		result.Params = l7QueryMapToProto(r.Params)
 	}
 	return result
 }
@@ -279,5 +306,27 @@ func graphqlOperationToProto(op *types.GraphqlOperation) *sbv1.GraphqlOperation 
 		OperationType: op.OperationType,
 		OperationName: op.OperationName,
 		Fields:        CopyStringSlice(op.Fields),
+	}
+}
+
+// --- McpOptions ---
+
+func mcpOptionsFromProto(m *sbv1.McpOptions) *types.McpOptions {
+	if m == nil {
+		return nil
+	}
+	return &types.McpOptions{
+		StrictToolNames:         m.StrictToolNames,
+		AllowAllKnownMcpMethods: m.AllowAllKnownMcpMethods,
+	}
+}
+
+func mcpOptionsToProto(m *types.McpOptions) *sbv1.McpOptions {
+	if m == nil {
+		return nil
+	}
+	return &sbv1.McpOptions{
+		StrictToolNames:         m.StrictToolNames,
+		AllowAllKnownMcpMethods: m.AllowAllKnownMcpMethods,
 	}
 }
