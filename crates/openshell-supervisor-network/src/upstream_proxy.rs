@@ -1654,10 +1654,10 @@ mod tests {
         // Trusted CA; the client config trusts it, and the fake upstream
         // server presents a leaf for SERVER_HOSTNAME signed by it.
         let ca = tls::SandboxCa::generate().unwrap();
-        let client_config = tls::build_upstream_client_config(ca.cert_pem());
+        let client_config = tls::build_upstream_client_config(ca.cert_pem()).unwrap();
         let tls_state = Arc::new(tls::ProxyTlsState::new(
             tls::CertCache::new(ca),
-            tls::build_upstream_client_config(""),
+            tls::build_upstream_client_config("").unwrap(),
         ));
 
         // Fake upstream TLS server: accepts tunneled connections and completes

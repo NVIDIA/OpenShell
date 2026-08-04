@@ -42,6 +42,18 @@ run = [
   # Guard: telemetry-free builds must contain no telemetry markers.
   "cargo build -p openshell-server --bin openshell-gateway --no-default-features",
   "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway",
-  "cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features",
+  "cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features --features bundled-ca-roots",
   "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-sandbox",
+]
+
+["rust:verify:system-ca-roots"]
+description = "Verify system CA roots build mode compiles and excludes bundled Mozilla root crates"
+run = [
+  # Check that the sandbox compiles cleanly in system CA roots mode (all
+  # defaults except bundled-ca-roots).
+  "cargo check -p openshell-sandbox --all-targets --no-default-features --features system-ca-roots",
+  # Guard: webpki-roots must not appear in the dependency graph.
+  "bash -c 'if cargo tree -p openshell-sandbox -i webpki-roots --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-roots; then echo \"ERROR: webpki-roots found in system CA roots build\" >&2; exit 1; fi'",
+  # Guard: webpki-root-certs must not appear either (webpki-roots re-exports it).
+  "bash -c 'if cargo tree -p openshell-sandbox -i webpki-root-certs --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-root-certs; then echo \"ERROR: webpki-root-certs found in system CA roots build\" >&2; exit 1; fi'",
 ]
