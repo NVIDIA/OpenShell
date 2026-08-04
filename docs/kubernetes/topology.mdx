@@ -234,13 +234,17 @@ provide the expected network enforcement.
 </Warning>
 
 <Note>
-The CNI installer is a **cluster singleton**. Its chained plugin enforces any
-pod carrying the OpenShell annotations (set only by a gateway on its own sandbox
-pods), so a single installation serves every OpenShell release across all
-namespaces. Enable the installer (`cni.enabled=true`) in exactly one release per
-cluster; additional gateway releases set `cni.enabled=false` and
-`cni.external=true` to share it. The installer refuses to overwrite a chained
-plugin entry with a non-OpenShell owner (fail closed).
+The CNI installer is a **cluster singleton**. Its chained plugin enforces pods
+that carry the OpenShell annotations (set only by a gateway on its own sandbox
+pods) **and** whose namespace is in the plugin's `cni.sandboxNamespaces`
+allowlist (default: the owner release's sandbox namespace). Pods in other
+namespaces are passed through without an API lookup, so the allowlist bounds the
+blast radius. Enable the installer (`cni.enabled=true`) in exactly one release
+per cluster; additional gateway releases set `cni.enabled=false` and
+`cni.external=true` to share it — and their sandbox namespace must be added to
+the owner's `cni.sandboxNamespaces` first (see
+[OpenShift](/kubernetes/openshift#enable-the-cni-sidecar-topology)). The installer
+treats any `openshell-cni` chained entry as its own and upgrades it in place.
 </Note>
 
 ## Credential Exposure
