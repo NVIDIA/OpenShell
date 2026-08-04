@@ -37,6 +37,20 @@ spec:
   {{- end }}
   securityContext:
     {{- toYaml .Values.podSecurityContext | nindent 4 }}
+  {{- if eq (.Values.supervisor.topology | default "combined") "cni-sidecar" }}
+  # Wait for cluster-wide CNI acknowledgement of this gateway's sandbox namespace
+  # before the gateway serves. Blocks until every cni-ready node reports the
+  # namespace in its coverage annotation, so a newly-registered (e.g. additional
+  # cni.external) release cannot create sandboxes during the discovery window.
+  initContainers:
+    - name: wait-cni-coverage
+      image: {{ include "openshell.cniImage" . | quote }}
+      imagePullPolicy: {{ include "openshell.cniImagePullPolicy" . | quote }}
+      command:
+        - /openshell-cni
+        - wait-coverage
+        - {{ .Values.server.sandboxNamespace | default .Release.Namespace | quote }}
+  {{- end }}
   containers:
     - name: openshell-gateway
       securityContext:

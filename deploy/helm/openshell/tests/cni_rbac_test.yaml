@@ -45,7 +45,7 @@ tests:
               - pods
             verbs:
               - get
-      # namespaces list: aggregate labeled sandbox namespaces into the allowlist.
+      # configmaps list: aggregate registration-marker namespaces into the allowlist.
       - documentIndex: 1
         contains:
           path: rules
@@ -53,7 +53,7 @@ tests:
             apiGroups:
               - ""
             resources:
-              - namespaces
+              - configmaps
             verbs:
               - list
       - documentIndex: 1

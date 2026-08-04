@@ -114,10 +114,14 @@ tests:
       - matchRegex:
           path: spec.template.spec.containers[0].command[2]
           pattern: 'owner="openshell"'
-      # Auto-discovery: reconcile aggregates labeled namespaces into the allowlist.
+      # Auto-discovery: reconcile aggregates marker-ConfigMap namespaces, and
+      # publishes per-node coverage for the gateway wait-for-ack gate.
       - matchRegex:
           path: spec.template.spec.containers[0].command[2]
           pattern: 'list-sandbox-namespaces'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'set-node-coverage'
 
   - it: aggregates multiple sandbox namespaces into the allowlist
     template: templates/cni-daemonset.yaml

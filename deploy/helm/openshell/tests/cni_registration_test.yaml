@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: cni registration marker
+templates:
+  - templates/cni-registration.yaml
+release:
+  name: openshell
+  namespace: openshell
+tests:
+  - it: does not render without cni-sidecar topology
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  # Every cni-sidecar release (owner or cni.external) publishes a Helm-owned
+  # marker ConfigMap so the singleton auto-discovers its sandbox namespace, with
+  # lifecycle handled by Helm.
+  - it: renders a labeled marker ConfigMap for a cni-sidecar release
+    set:
+      supervisor.topology: cni-sidecar
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: ConfigMap
+      - equal:
+          path: metadata.labels["openshell.ai/cni-registration"]
+          value: "true"
+      - equal:
+          path: metadata.namespace
+          value: openshell
+
+  - it: places the marker in the configured sandbox namespace
+    set:
+      supervisor.topology: cni-sidecar
+      server.sandboxNamespace: team-b
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: team-b
+
+  # External releases render the marker too (topology drives it, not cni.enabled).
+  - it: renders the marker for an external release
+    set:
+      supervisor.topology: cni-sidecar
+      cni.enabled: false
+      cni.external: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.labels["openshell.ai/cni-registration"]
+          value: "true"

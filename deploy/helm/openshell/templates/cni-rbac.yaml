@@ -31,12 +31,13 @@ rules:
       - pods
     verbs:
       - get
-  # list namespaces to aggregate those labeled openshell.ai/sandbox=true into the
-  # plugin allowlist (automatic multi-release discovery).
+  # list registration marker ConfigMaps (openshell.ai/cni-registration=true) to
+  # aggregate their namespaces into the plugin allowlist (automatic multi-release
+  # discovery with Helm-owned lifecycle).
   - apiGroups:
       - ""
     resources:
-      - namespaces
+      - configmaps
     verbs:
       - list
   - apiGroups:

@@ -95,12 +95,13 @@ cni:
   # existing OpenShell CNI installation.
   external: false
   # -- Optional STATIC additions to the plugin's enforcement allowlist. The
-  # allowlist is normally built automatically: each cni-sidecar release labels its
-  # sandbox namespace (openshell.ai/sandbox=true) via a helm hook and the singleton
-  # aggregates all labeled namespaces. This value is unioned with that discovery
-  # for namespaces you want enforced without the label. Pods in namespaces neither
-  # labeled nor listed are passed through without a Kubernetes API lookup (blast
-  # radius guard). Empty additionally seeds the owner release's sandbox namespace.
+  # allowlist is normally built automatically: each cni-sidecar release ships a
+  # Helm-owned marker ConfigMap (openshell.ai/cni-registration=true) in its sandbox
+  # namespace and the singleton aggregates all marker namespaces. This value is
+  # unioned with that discovery for namespaces you want enforced without a marker.
+  # Pods in namespaces neither registered nor listed are passed through without a
+  # Kubernetes API lookup (blast-radius guard). Empty additionally seeds the owner
+  # release's sandbox namespace.
   sandboxNamespaces: []
   # -- CNI installer strategy. "conflist" appends the OpenShell plugin to an
   # existing CNI .conflist (k3s / vanilla). "multus-chain" writes a standalone

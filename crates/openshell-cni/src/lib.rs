@@ -37,10 +37,15 @@ const NODE_NOT_READY_TAINT_KEY: &str = "openshell.ai/cni-not-ready";
 const NODE_NOT_READY_TAINT_EFFECT: &str = "NoSchedule";
 /// Namespace label a gateway release stamps on its sandbox namespace so the CNI
 /// singleton discovers and enforces it automatically — no manual allowlist edit
-/// per release. The installer aggregates all namespaces carrying this label into
-/// the plugin's `sandboxNamespaces`. Must stay in sync with the label written by
-/// the namespace-label hook.
-const SANDBOX_NAMESPACE_LABEL: &str = "openshell.ai/sandbox";
+/// per release. The installer aggregates every namespace containing a marker
+/// `ConfigMap` with this label into the plugin's `sandboxNamespaces`. The marker is
+/// a Helm-owned resource, so uninstalling a release (or changing its sandbox
+/// namespace) removes the marker and de-registers the namespace automatically.
+const CNI_REGISTRATION_LABEL: &str = "openshell.ai/cni-registration";
+/// Node annotation the installer sets to the sorted CSV of the namespaces it
+/// currently enforces on that node, so the gateway can wait for cluster-wide
+/// acknowledgement of its namespace before it serves sandboxes.
+const NODE_COVERAGE_ANNOTATION: &str = "openshell.ai/cni-sandbox-namespaces";
 #[allow(dead_code)]
 const OPENSHELL_TABLE: &str = "openshell_sidecar_bypass";
 #[allow(dead_code)]
@@ -247,31 +252,62 @@ pub fn node_ready(args: &[String]) -> Result<()> {
     }
 }
 
-/// Entry point for `openshell-cni label-namespace <namespace>`.
-///
-/// Run by the gateway's namespace-label helm hook so the CNI singleton
-/// auto-discovers this release's sandbox namespace. Stamps
-/// `openshell.ai/sandbox=true`.
-pub fn label_namespace(args: &[String]) -> Result<()> {
-    let namespace = args
-        .first()
-        .ok_or_else(|| miette::miette!("label-namespace requires a namespace argument"))?;
-    let client = KubeApiClient::from_in_cluster()?;
-    client.patch_namespace_label(namespace, SANDBOX_NAMESPACE_LABEL, Some("true"))
-}
-
 /// Entry point for `openshell-cni list-sandbox-namespaces`.
 ///
-/// Run by the installer reconcile to aggregate every namespace carrying
-/// `openshell.ai/sandbox=true` into the plugin allowlist. Prints one namespace
-/// name per line.
+/// Run by the installer reconcile to aggregate every namespace that contains a
+/// Helm-owned registration marker `ConfigMap` (label
+/// `openshell.ai/cni-registration=true`) into the plugin allowlist. Prints one
+/// namespace name per line.
 pub fn list_sandbox_namespaces() -> Result<()> {
     let client = KubeApiClient::from_in_cluster()?;
-    let namespaces = client.list_namespaces_by_label(SANDBOX_NAMESPACE_LABEL, "true")?;
+    let namespaces = client.list_registration_namespaces(CNI_REGISTRATION_LABEL)?;
     for ns in namespaces {
         println!("{ns}");
     }
     Ok(())
+}
+
+/// Entry point for `openshell-cni set-node-coverage <csv>`.
+///
+/// Run by the installer reconcile to publish, on its own node, the sorted CSV of
+/// namespaces it currently enforces, so gateways can wait for cluster-wide
+/// acknowledgement of their namespace before serving sandboxes.
+pub fn set_node_coverage(args: &[String]) -> Result<()> {
+    let csv = args.first().map_or("", String::as_str);
+    let node = std::env::var("NODE_NAME")
+        .map_err(|_| miette::miette!("NODE_NAME env var is required for set-node-coverage"))?;
+    let client = KubeApiClient::from_in_cluster()?;
+    client.patch_node_annotation(&node, NODE_COVERAGE_ANNOTATION, csv)
+}
+
+/// Entry point for `openshell-cni wait-coverage <namespace>`, run as a gateway
+/// init container so the gateway does not serve sandboxes until every
+/// enforcement-ready node acknowledges the namespace.
+///
+/// Blocks until at least one node carries the `cni-ready` label and every such
+/// node's coverage annotation includes the namespace. Times out (non-zero exit,
+/// failing the init container fail-closed) after a bounded wait.
+pub fn wait_coverage(args: &[String]) -> Result<()> {
+    let namespace = args
+        .first()
+        .ok_or_else(|| miette::miette!("wait-coverage requires a namespace argument"))?;
+    let client = KubeApiClient::from_in_cluster()?;
+    // ~5 minutes of 5s polls; fail closed if enforcement never converges.
+    for _ in 0..60 {
+        match client.namespace_covered_on_all_ready_nodes(
+            namespace,
+            NODE_READY_LABEL,
+            NODE_COVERAGE_ANNOTATION,
+        ) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => eprintln!("wait-coverage: transient error: {error:?}"),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+    Err(miette::miette!(
+        "namespace {namespace} not enforced on all cni-ready nodes within timeout"
+    ))
 }
 
 /// Entry point for `openshell-cni daemonset-active`.
@@ -666,11 +702,10 @@ impl KubeApiClient {
         Ok(())
     }
 
-    /// Sets a label on a namespace via a JSON merge patch (null value removes).
-    fn patch_namespace_label(&self, namespace: &str, key: &str, value: Option<&str>) -> Result<()> {
-        let url = format!("{}/api/v1/namespaces/{}", self.server, namespace);
-        let label_value = value.map_or(Value::Null, |v| Value::String(v.to_string()));
-        let body = serde_json::json!({ "metadata": { "labels": { key: label_value } } });
+    /// Sets a single node annotation to `value` via a JSON merge patch.
+    fn patch_node_annotation(&self, node: &str, key: &str, value: &str) -> Result<()> {
+        let url = format!("{}/api/v1/nodes/{}", self.server, node);
+        let body = serde_json::json!({ "metadata": { "annotations": { key: Value::String(value.to_string()) } } });
         let response = self
             .client
             .patch(url)
@@ -682,21 +717,22 @@ impl KubeApiClient {
             .body(serde_json::to_vec(&body).into_diagnostic()?)
             .send()
             .into_diagnostic()
-            .wrap_err("failed to patch namespace label")?;
+            .wrap_err("failed to patch node annotation")?;
         if !response.status().is_success() {
             return Err(miette::miette!(
-                "Kubernetes API returned {} while labeling namespace {}",
+                "Kubernetes API returned {} while annotating node {}",
                 response.status(),
-                namespace
+                node
             ));
         }
         Ok(())
     }
 
-    /// Returns the names of all namespaces carrying `key=value`.
-    fn list_namespaces_by_label(&self, key: &str, value: &str) -> Result<Vec<String>> {
-        let selector = format!("{key}={value}");
-        let url = format!("{}/api/v1/namespaces", self.server);
+    /// Returns the namespaces of all registration marker `ConfigMaps` (those
+    /// carrying `key=true`) across the cluster.
+    fn list_registration_namespaces(&self, key: &str) -> Result<Vec<String>> {
+        let selector = format!("{key}=true");
+        let url = format!("{}/api/v1/configmaps", self.server);
         let response = self
             .client
             .get(url)
@@ -704,24 +740,65 @@ impl KubeApiClient {
             .bearer_auth(&self.token)
             .send()
             .into_diagnostic()
-            .wrap_err("failed to list namespaces by label")?;
+            .wrap_err("failed to list registration ConfigMaps")?;
         if !response.status().is_success() {
             return Err(miette::miette!(
-                "Kubernetes API returned {} while listing namespaces",
+                "Kubernetes API returned {} while listing ConfigMaps",
                 response.status()
             ));
         }
         let list = response.json::<Value>().into_diagnostic()?;
-        let names = list["items"]
+        let mut namespaces: Vec<String> = list["items"]
             .as_array()
             .map(|items| {
                 items
                     .iter()
-                    .filter_map(|item| item["metadata"]["name"].as_str().map(str::to_string))
+                    .filter_map(|item| item["metadata"]["namespace"].as_str().map(str::to_string))
                     .collect()
             })
             .unwrap_or_default();
-        Ok(names)
+        namespaces.sort();
+        namespaces.dedup();
+        Ok(namespaces)
+    }
+
+    /// Returns true when at least one node carries `ready_label` and every such
+    /// node's `coverage_annotation` (a comma-separated list) contains `namespace`.
+    fn namespace_covered_on_all_ready_nodes(
+        &self,
+        namespace: &str,
+        ready_label: &str,
+        coverage_annotation: &str,
+    ) -> Result<bool> {
+        let url = format!("{}/api/v1/nodes", self.server);
+        let response = self
+            .client
+            .get(url)
+            .query(&[("labelSelector", ready_label)])
+            .bearer_auth(&self.token)
+            .send()
+            .into_diagnostic()
+            .wrap_err("failed to list cni-ready nodes")?;
+        if !response.status().is_success() {
+            return Err(miette::miette!(
+                "Kubernetes API returned {} while listing nodes",
+                response.status()
+            ));
+        }
+        let list = response.json::<Value>().into_diagnostic()?;
+        let Some(nodes) = list["items"].as_array() else {
+            return Ok(false);
+        };
+        if nodes.is_empty() {
+            return Ok(false);
+        }
+        Ok(nodes.iter().all(|node| {
+            node["metadata"]["annotations"][coverage_annotation]
+                .as_str()
+                .unwrap_or_default()
+                .split(',')
+                .any(|ns| ns == namespace)
+        }))
     }
 
     /// Removes the given taint (key + effect) from the node if present, using a

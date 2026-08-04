@@ -159,6 +159,15 @@ spec:
               mark_ready() {
                 "${openshell_cni}" node-ready --set \
                   || echo "OpenShell CNI: failed to mark node ready" >&2
+                publish_coverage
+              }
+              # Publish, on this node, the CSV of namespaces we currently enforce
+              # (from the installed plugin config) so gateways can wait for
+              # cluster-wide acknowledgement of their namespace before serving.
+              publish_coverage() {
+                _csv="$(jq -r '(.openshell.sandboxNamespaces // []) | join(",")' "${plugin_config}" 2>/dev/null || echo "")"
+                "${openshell_cni}" set-node-coverage "${_csv}" \
+                  || echo "OpenShell CNI: failed to publish coverage" >&2
               }
               # Fencing (clearing readiness) is security-critical: while enforcement
               # is not in place the node must not advertise readiness. Retry a few

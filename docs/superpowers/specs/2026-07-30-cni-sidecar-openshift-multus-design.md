@@ -94,9 +94,10 @@ New/updated values (OpenShift defaults):
 
 `cni.chainDir` is tmpfs (`/run`), so credentials cannot live there. The DaemonSet writes
 kubeconfig/token/ca.crt to the persistent `cni.stateDir`, and the plugin `.conf`
-references those `stateDir` paths. The DaemonSet's periodic loop (already refreshing the
-SA token every 300s) additionally **re-asserts the chain `.conf` if missing**, so it
-survives a Multus restart; on a full node reboot the DaemonSet re-writes at startup.
+references those `stateDir` paths. The DaemonSet's periodic reconcile loop (every 30s,
+which also refreshes the SA token) additionally **re-asserts the chain `.conf` if
+missing**, so it survives a Multus restart; on a full node reboot the DaemonSet
+re-writes at startup.
 
 For back-compat, when `cni.mode == conflist` the `stateDir` default resolves to
 `cni.confDir` (current behavior).

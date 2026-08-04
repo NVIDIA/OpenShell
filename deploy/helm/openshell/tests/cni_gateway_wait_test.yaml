@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway cni-coverage wait init
+templates:
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+release:
+  name: openshell
+  namespace: openshell
+tests:
+  - it: has no wait init container by default
+    template: templates/statefulset.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.initContainers
+
+  # cni-sidecar gateways must not serve until their namespace is enforced
+  # cluster-wide, enforced by a wait-coverage init container.
+  - it: adds the wait-coverage init container in cni-sidecar mode
+    template: templates/statefulset.yaml
+    set:
+      supervisor.topology: cni-sidecar
+      cni.external: true
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].name
+          value: wait-cni-coverage
+      - equal:
+          path: spec.template.spec.initContainers[0].command
+          value:
+            - /openshell-cni
+            - wait-coverage
+            - openshell
