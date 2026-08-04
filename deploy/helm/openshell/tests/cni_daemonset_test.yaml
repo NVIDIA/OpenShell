@@ -53,7 +53,7 @@ tests:
       # Singleton owner + namespace allowlist defaulting to the release namespace.
       - matchRegex:
           path: spec.template.spec.containers[0].command[2]
-          pattern: 'sandbox_namespaces_json=.\["openshell"\].'
+          pattern: 'sandbox_static_json=.\["openshell"\].'
       - matchRegex:
           path: spec.template.spec.containers[0].command[2]
           pattern: 'owner="openshell"'
@@ -114,6 +114,10 @@ tests:
       - matchRegex:
           path: spec.template.spec.containers[0].command[2]
           pattern: 'owner="openshell"'
+      # Auto-discovery: reconcile aggregates labeled namespaces into the allowlist.
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'list-sandbox-namespaces'
 
   - it: aggregates multiple sandbox namespaces into the allowlist
     template: templates/cni-daemonset.yaml
@@ -125,7 +129,7 @@ tests:
     asserts:
       - matchRegex:
           path: spec.template.spec.containers[0].command[2]
-          pattern: 'sandbox_namespaces_json=.\["team-a","team-b"\].'
+          pattern: 'sandbox_static_json=.\["team-a","team-b"\].'
 
   - it: binds readiness to a config version
     template: templates/cni-daemonset.yaml

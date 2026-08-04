@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: cni namespace-label hook
+templates:
+  - templates/cni-namespace-label-hook.yaml
+release:
+  name: openshell
+  namespace: openshell
+tests:
+  - it: does not render without cni-sidecar topology
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  # Every cni-sidecar release (owner or cni.external) labels its own sandbox
+  # namespace so the singleton auto-discovers it.
+  - it: renders the label hook for a cni-sidecar release
+    set:
+      supervisor.topology: cni-sidecar
+    asserts:
+      - hasDocuments:
+          count: 4
+      - documentIndex: 3
+        isKind:
+          of: Job
+      - documentIndex: 3
+        equal:
+          path: metadata.annotations["helm.sh/hook"]
+          value: post-install,post-upgrade
+      - documentIndex: 3
+        equal:
+          path: spec.template.spec.containers[0].command
+          value:
+            - /openshell-cni
+            - label-namespace
+            - openshell
+
+  # An additional external release still runs the label hook (topology drives it,
+  # not cni.enabled), so its namespace is auto-registered with the singleton.
+  - it: renders the label hook for an external release
+    set:
+      supervisor.topology: cni-sidecar
+      cni.enabled: false
+      cni.external: true
+    asserts:
+      - hasDocuments:
+          count: 4
+      - documentIndex: 3
+        isKind:
+          of: Job
+
+  # RBAC is scoped to only this release's sandbox namespace.
+  - it: scopes the label ClusterRole to the sandbox namespace
+    set:
+      supervisor.topology: cni-sidecar
+      server.sandboxNamespace: team-b
+    asserts:
+      - template: templates/cni-namespace-label-hook.yaml
+        documentIndex: 1
+        contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - namespaces
+            resourceNames:
+              - team-b
+            verbs:
+              - get
+              - patch

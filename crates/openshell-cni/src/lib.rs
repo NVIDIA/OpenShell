@@ -28,12 +28,19 @@ const NODE_READY_LABEL: &str = "openshell.ai/cni-ready";
 /// Node taint applied at boot (via an operator-provided `MachineConfig` / node
 /// config) so a rebooted node repels workloads until egress enforcement is
 /// re-established — the persistent `cni-ready` label cannot reflect a reboot that
-/// wipes tmpfs-backed enforcement, so a boot-time taint closes that window. The
+/// wipes tmpfs-backed enforcement, so a boot-time taint narrows that window
+/// (a small residual reboot race remains — see the `MachineConfig` example). The
 /// installer only REMOVES this taint (once enforcement is ready); it never adds
 /// it, so a transient unready never over-repels a running node. Must stay in sync
 /// with the taint key used by the `MachineConfig` and the `DaemonSet` toleration.
 const NODE_NOT_READY_TAINT_KEY: &str = "openshell.ai/cni-not-ready";
 const NODE_NOT_READY_TAINT_EFFECT: &str = "NoSchedule";
+/// Namespace label a gateway release stamps on its sandbox namespace so the CNI
+/// singleton discovers and enforces it automatically — no manual allowlist edit
+/// per release. The installer aggregates all namespaces carrying this label into
+/// the plugin's `sandboxNamespaces`. Must stay in sync with the label written by
+/// the namespace-label hook.
+const SANDBOX_NAMESPACE_LABEL: &str = "openshell.ai/sandbox";
 #[allow(dead_code)]
 const OPENSHELL_TABLE: &str = "openshell_sidecar_bypass";
 #[allow(dead_code)]
@@ -238,6 +245,33 @@ pub fn node_ready(args: &[String]) -> Result<()> {
         // transient unready); the label gate is sandbox-specific.
         client.patch_node_label(&node, NODE_READY_LABEL, None)
     }
+}
+
+/// Entry point for `openshell-cni label-namespace <namespace>`.
+///
+/// Run by the gateway's namespace-label helm hook so the CNI singleton
+/// auto-discovers this release's sandbox namespace. Stamps
+/// `openshell.ai/sandbox=true`.
+pub fn label_namespace(args: &[String]) -> Result<()> {
+    let namespace = args
+        .first()
+        .ok_or_else(|| miette::miette!("label-namespace requires a namespace argument"))?;
+    let client = KubeApiClient::from_in_cluster()?;
+    client.patch_namespace_label(namespace, SANDBOX_NAMESPACE_LABEL, Some("true"))
+}
+
+/// Entry point for `openshell-cni list-sandbox-namespaces`.
+///
+/// Run by the installer reconcile to aggregate every namespace carrying
+/// `openshell.ai/sandbox=true` into the plugin allowlist. Prints one namespace
+/// name per line.
+pub fn list_sandbox_namespaces() -> Result<()> {
+    let client = KubeApiClient::from_in_cluster()?;
+    let namespaces = client.list_namespaces_by_label(SANDBOX_NAMESPACE_LABEL, "true")?;
+    for ns in namespaces {
+        println!("{ns}");
+    }
+    Ok(())
 }
 
 /// Entry point for `openshell-cni daemonset-active`.
@@ -630,6 +664,64 @@ impl KubeApiClient {
             ));
         }
         Ok(())
+    }
+
+    /// Sets a label on a namespace via a JSON merge patch (null value removes).
+    fn patch_namespace_label(&self, namespace: &str, key: &str, value: Option<&str>) -> Result<()> {
+        let url = format!("{}/api/v1/namespaces/{}", self.server, namespace);
+        let label_value = value.map_or(Value::Null, |v| Value::String(v.to_string()));
+        let body = serde_json::json!({ "metadata": { "labels": { key: label_value } } });
+        let response = self
+            .client
+            .patch(url)
+            .bearer_auth(&self.token)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/merge-patch+json",
+            )
+            .body(serde_json::to_vec(&body).into_diagnostic()?)
+            .send()
+            .into_diagnostic()
+            .wrap_err("failed to patch namespace label")?;
+        if !response.status().is_success() {
+            return Err(miette::miette!(
+                "Kubernetes API returned {} while labeling namespace {}",
+                response.status(),
+                namespace
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the names of all namespaces carrying `key=value`.
+    fn list_namespaces_by_label(&self, key: &str, value: &str) -> Result<Vec<String>> {
+        let selector = format!("{key}={value}");
+        let url = format!("{}/api/v1/namespaces", self.server);
+        let response = self
+            .client
+            .get(url)
+            .query(&[("labelSelector", selector.as_str())])
+            .bearer_auth(&self.token)
+            .send()
+            .into_diagnostic()
+            .wrap_err("failed to list namespaces by label")?;
+        if !response.status().is_success() {
+            return Err(miette::miette!(
+                "Kubernetes API returned {} while listing namespaces",
+                response.status()
+            ));
+        }
+        let list = response.json::<Value>().into_diagnostic()?;
+        let names = list["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["metadata"]["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(names)
     }
 
     /// Removes the given taint (key + effect) from the node if present, using a

@@ -94,12 +94,13 @@ cni:
   # cni.enabled=false) on additional gateway releases that share the cluster's
   # existing OpenShell CNI installation.
   external: false
-  # -- Namespaces whose pods the plugin inspects at CNI ADD. Pods in other
-  # namespaces are passed through WITHOUT a Kubernetes API lookup, so an API/RBAC
-  # problem cannot block unrelated workloads. Empty defaults to the release's
-  # sandbox namespace. A cluster running multiple OpenShell releases must list
-  # EVERY sandbox namespace here on the singleton (a pod in an unlisted namespace
-  # is not enforced).
+  # -- Optional STATIC additions to the plugin's enforcement allowlist. The
+  # allowlist is normally built automatically: each cni-sidecar release labels its
+  # sandbox namespace (openshell.ai/sandbox=true) via a helm hook and the singleton
+  # aggregates all labeled namespaces. This value is unioned with that discovery
+  # for namespaces you want enforced without the label. Pods in namespaces neither
+  # labeled nor listed are passed through without a Kubernetes API lookup (blast
+  # radius guard). Empty additionally seeds the owner release's sandbox namespace.
   sandboxNamespaces: []
   # -- CNI installer strategy. "conflist" appends the OpenShell plugin to an
   # existing CNI .conflist (k3s / vanilla). "multus-chain" writes a standalone
