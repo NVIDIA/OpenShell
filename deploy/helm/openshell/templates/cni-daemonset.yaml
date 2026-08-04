@@ -52,6 +52,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # Used by `openshell-cni daemonset-active` so the preStop hook can tell
+            # an ordinary pod restart from a real teardown (helm uninstall).
+            - name: DS_NAME
+              value: {{ include "openshell.fullname" . }}-cni
+            - name: DS_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
           command:
             - sh
             - -ec
@@ -91,12 +97,21 @@ spec:
                   cluster: cluster
                   user: openshell-cni
               EOF
+              # Ownership stamp so a second OpenShell release (or a namespace-
+              # changing upgrade) cannot silently overwrite this release's chained
+              # plugin and leave its sandboxes unenforced. Install/repair refuse
+              # to clobber an entry owned by a different release (fail closed).
+              # NOTE: one OpenShell release per cluster is the supported model for
+              # cni-sidecar today (see the cni-sidecar RFC for the multi-release
+              # follow-up).
+              owner="{{ .Release.Namespace }}/{{ .Release.Name }}"
               cat > "${plugin_config}" <<EOF
               {
                 "type": "openshell-cni",
                 "openshell": {
                   "kubeconfig": "${host_state_dir}/openshell-cni-kubeconfig",
                   "sandboxNamespaces": [{{ $sandboxNamespace | quote }}],
+                  "owner": "${owner}",
                   "logLevel": {{ .Values.cni.logLevel | quote }},
                   "logFile": "${log_file}"
                 }
@@ -125,10 +140,31 @@ spec:
                 find "${conf_dir}" -maxdepth 1 -type f -name '*.conflist' ! -name '*openshell*' | sort | head -n 1
               {{- end }}
               }
+              # True when the target already carries our openshell-cni plugin
+              # (matching owner). Used to decide whether enforcement is in place.
+              conflist_ours() {
+                _t="$1"
+                [ -n "${_t}" ] && [ -f "${_t}" ] && jq -e --arg o "${owner}" \
+                  'any((.plugins // [])[]; .type == "openshell-cni" and .openshell.owner == $o)' \
+                  "${_t}" >/dev/null 2>&1
+              }
+              # True when the target carries an openshell-cni plugin owned by a
+              # DIFFERENT release. We must never overwrite it (that would silently
+              # unrestrict the other release's sandboxes).
+              conflist_foreign() {
+                _t="$1"
+                [ -n "${_t}" ] && [ -f "${_t}" ] && jq -e --arg o "${owner}" \
+                  'any((.plugins // [])[]; .type == "openshell-cni" and (.openshell.owner // "") != $o)' \
+                  "${_t}" >/dev/null 2>&1
+              }
               patch_conflist() {
                 target="$(resolve_conflist_target)"
                 if [ -z "${target}" ] || [ ! -f "${target}" ]; then
                   echo "OpenShell CNI requires an existing CNI .conflist in ${conf_dir}" >&2
+                  return 1
+                fi
+                if conflist_foreign "${target}"; then
+                  echo "OpenShell CNI refuses to overwrite a chained plugin owned by another release in ${target}; only one OpenShell release per cluster is supported for cni-sidecar" >&2
                   return 1
                 fi
                 if [ ! -f "${target}.openshell-backup" ]; then
@@ -150,18 +186,6 @@ spec:
                   return 1
                 fi
               }
-              # Re-patch only when the chained plugin is absent, so a CNI config
-              # rewrite (CNO reconcile, node reimage) or a jq no-op cannot leave the
-              # node forwarding sandbox traffic without OpenShell egress enforcement.
-              ensure_conflist() {
-                target="$(resolve_conflist_target)"
-                if [ -n "${target}" ] && [ -f "${target}" ] \
-                  && jq -e 'any((.plugins // [])[]; .type == "openshell-cni")' "${target}" >/dev/null 2>&1; then
-                  return 0
-                fi
-                echo "OpenShell CNI re-patching ${target:-<none>}; chained plugin missing (CNI config rewrite or restart)" >&2
-                patch_conflist
-              }
               patch_conflist || exit 1
               mark_ready
               echo "OpenShell CNI installed (conflist mode); plugin log ${log_file}; firewall backend selected during CNI ADD"
@@ -169,7 +193,28 @@ spec:
               chain_dir="/host{{ .Values.cni.chainDir }}"
               chain_conf="${chain_dir}/openshell-cni.conf"
               mkdir -p "${chain_dir}"
+              # True only when the chain conf is a well-formed openshell-cni config
+              # owned by this release. Mere file existence is not enough — an empty,
+              # corrupt, stale, or foreign file must NOT mark the node ready.
+              chain_conf_healthy() {
+                [ -f "${chain_conf}" ] && jq -e --arg o "${owner}" '
+                  .type == "openshell-cni"
+                  and .openshell.owner == $o
+                  and (.openshell.kubeconfig // "") != ""
+                  and ((.openshell.sandboxNamespaces // []) | length) > 0
+                ' "${chain_conf}" >/dev/null 2>&1
+              }
+              # True when a chain conf owned by a different release is present.
+              chain_conf_foreign() {
+                [ -f "${chain_conf}" ] && jq -e --arg o "${owner}" \
+                  '.type == "openshell-cni" and (.openshell.owner // "") != $o' \
+                  "${chain_conf}" >/dev/null 2>&1
+              }
               write_chain_conf() {
+                if chain_conf_foreign; then
+                  echo "OpenShell CNI refuses to overwrite ${chain_conf} owned by another release; only one OpenShell release per cluster is supported for cni-sidecar" >&2
+                  return 1
+                fi
                 _tmp="$(mktemp "${chain_dir}/openshell-cni.XXXXXX")"
                 # Same fail-closed contract as patch_conflist: never install a
                 # truncated chain config if jq fails.
@@ -193,15 +238,25 @@ spec:
               while true; do
                 cp /var/run/secrets/kubernetes.io/serviceaccount/token "${token_file}"
                 chmod 0600 "${token_file}"
+                # Fence before repair: the instant enforcement is not verifiably in
+                # place, clear readiness so no new sandbox pod schedules here, then
+                # attempt repair and only re-mark ready once it is healthy again.
                 {{- if eq $mode "conflist" }}
-                # Keep the node's readiness label in lockstep with enforcement:
-                # mark unready if the chained plugin cannot be restored, so no new
-                # sandbox pods schedule here until it is.
-                if ensure_conflist; then mark_ready; else mark_unready; fi
+                if conflist_ours "$(resolve_conflist_target)"; then
+                  mark_ready
+                else
+                  mark_unready
+                  if patch_conflist; then mark_ready; fi
+                fi
                 {{- else }}
-                if { [ -f "${chain_conf}" ] || write_chain_conf; }; then mark_ready; else mark_unready; fi
+                if chain_conf_healthy; then
+                  mark_ready
+                else
+                  mark_unready
+                  if write_chain_conf; then mark_ready; fi
+                fi
                 {{- end }}
-                sleep 300
+                sleep 30
               done
           securityContext:
             privileged: true
@@ -213,9 +268,22 @@ spec:
                   - sh
                   - -ec
                   - |
-                    # Fence the node before removing enforcement so no sandbox pod
-                    # schedules here during teardown.
-                    /openshell-cni node-ready --clear || true
+                    # Enforcement lives in the host CNI config and survives pod
+                    # restarts, so an ordinary restart/rolling update must NOT strip
+                    # it (that would fail open for running sandboxes). Only tear it
+                    # down on a real teardown: daemonset-active exits 0 (preserve)
+                    # unless the owning DaemonSet is confirmed gone/terminating.
+                    if /openshell-cni daemonset-active; then
+                      echo "OpenShell CNI: DaemonSet still active; preserving enforcement across restart" >&2
+                      exit 0
+                    fi
+                    # Teardown: fence the node first and only remove enforcement if
+                    # fencing succeeded, so we never strip enforcement while the node
+                    # still advertises readiness.
+                    if ! /openshell-cni node-ready --clear; then
+                      echo "OpenShell CNI: fencing failed during teardown; leaving enforcement in place" >&2
+                      exit 0
+                    fi
                     {{- if eq $mode "conflist" }}
                     conf_dir="/host{{ .Values.cni.confDir }}"
                     for target in "${conf_dir}"/*.conflist; do

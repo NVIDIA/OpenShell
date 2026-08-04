@@ -4,6 +4,8 @@
 suite: cni daemonset
 templates:
   - templates/cni-daemonset.yaml
+release:
+  name: openshell
 tests:
   - it: does not render by default
     template: templates/cni-daemonset.yaml
@@ -85,6 +87,23 @@ tests:
       - matchRegex:
           path: spec.template.spec.containers[0].lifecycle.preStop.exec.command[2]
           pattern: 'node-ready --clear'
+      # preStop preserves enforcement across ordinary restarts (only tears down
+      # on real teardown, gated by daemonset-active).
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: DS_NAME
+            value: openshell-cni
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.preStop.exec.command[2]
+          pattern: 'daemonset-active'
+      # Ownership stamp + fence-before-repair reconcile.
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: '"owner": "'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'refuses to overwrite'
 
   - it: scopes cni annotation lookup to explicit sandbox namespace
     template: templates/cni-daemonset.yaml

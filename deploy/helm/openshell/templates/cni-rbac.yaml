@@ -64,6 +64,16 @@ rules:
     verbs:
       - get
       - patch
+  # get on this DaemonSet only, so the preStop hook can tell an ordinary restart
+  # from a real teardown. resourceNames keeps the grant scoped to our object.
+  - apiGroups:
+      - apps
+    resources:
+      - daemonsets
+    resourceNames:
+      - {{ include "openshell.fullname" . }}-cni
+    verbs:
+      - get
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

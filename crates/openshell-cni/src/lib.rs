@@ -101,6 +101,17 @@ struct PodMetadata {
 }
 
 #[derive(Debug, Deserialize)]
+struct DaemonSetResponse {
+    metadata: ObjectMeta,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ObjectMeta {
+    #[serde(rename = "deletionTimestamp")]
+    deletion_timestamp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct KubeConfig {
     #[serde(rename = "current-context")]
     current_context: String,
@@ -155,34 +166,20 @@ trait PodReader {
 }
 
 trait RuleInstaller {
-    fn install(&self, netns: &Path, proxy_uid: u32, enforce_ipv6: bool) -> Result<InstallReport>;
+    fn install(&self, netns: &Path, proxy_uid: u32) -> Result<InstallReport>;
     fn cleanup(&self, netns: &Path) -> Result<()>;
 }
 
-/// Returns true when the chained CNI `prevResult` reports at least one routable
-/// IPv6 address for the pod. Loopback and link-local (`fe80::/10`) addresses are
-/// ignored because they cannot carry egress off the node, so a pod with only
-/// those needs no IPv6 firewall enforcement. IPv4-only pods return false, which
-/// lets the iptables fallback skip the (possibly absent) ip6tables binary.
-fn prev_result_has_ipv6(config: &CniConfig) -> bool {
-    let Some(prev) = config.prev_result.as_ref() else {
-        return false;
-    };
-    let Some(ips) = prev.get("ips").and_then(Value::as_array) else {
-        return false;
-    };
-    ips.iter().any(|entry| {
-        entry
-            .get("address")
-            .and_then(Value::as_str)
-            .and_then(|addr| addr.split('/').next())
-            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
-            .is_some_and(|ip| match ip {
-                std::net::IpAddr::V6(v6) => {
-                    !v6.is_loopback() && (v6.segments()[0] & 0xffc0) != 0xfe80
-                }
-                std::net::IpAddr::V4(_) => false,
-            })
+/// Returns true when `/proc/net/if_inet6` contents report at least one
+/// non-loopback IPv6 address. Link-local (`fe80::/10`) counts because it can
+/// still reach on-link peers and node services; only loopback (`::1`) is
+/// excluded. Empty contents (IPv6 disabled in the kernel) return false.
+fn if_inet6_has_non_loopback_ipv6(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        // Format: <32-hex-addr> <ifidx> <prefixlen> <scope> <flags> <devname>
+        line.split_whitespace()
+            .next()
+            .is_some_and(|addr| addr != "00000000000000000000000000000001")
     })
 }
 
@@ -223,6 +220,36 @@ pub fn node_ready(args: &[String]) -> Result<()> {
     let client = KubeApiClient::from_in_cluster()?;
     let value = if ready { Some("true") } else { None };
     client.patch_node_label(&node, NODE_READY_LABEL, value)
+}
+
+/// Entry point for `openshell-cni daemonset-active`.
+///
+/// Used by the installer `preStop` hook to distinguish an ordinary pod
+/// restart/rolling update from a real teardown (helm uninstall / `DaemonSet`
+/// delete).
+///
+/// Returns `Ok(())` (exit 0) whenever enforcement should be **preserved** — the
+/// owning `DaemonSet` still exists and is not being deleted, OR the state cannot
+/// be determined (missing env, API error). Enforcement lives in the host CNI
+/// config and survives pod restarts, so preserving is the fail-safe default.
+/// Returns `Err` (non-zero) only when the `DaemonSet` is positively confirmed
+/// gone or terminating, signalling the caller that cleanup is appropriate.
+pub fn daemonset_active() -> Result<()> {
+    let (Ok(name), Ok(namespace)) = (std::env::var("DS_NAME"), std::env::var("DS_NAMESPACE"))
+    else {
+        // Cannot identify the owning DaemonSet; preserve enforcement.
+        return Ok(());
+    };
+    let Ok(client) = KubeApiClient::from_in_cluster() else {
+        return Ok(());
+    };
+    match client.daemonset_terminating(&namespace, &name) {
+        Ok(true) => Err(miette::miette!(
+            "owning DaemonSet {namespace}/{name} is gone or terminating"
+        )),
+        // Active, or an API error we cannot interpret: preserve enforcement.
+        Ok(false) | Err(_) => Ok(()),
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -334,8 +361,7 @@ fn handle_command(
                 let netns = env.netns.as_deref().ok_or_else(|| {
                     miette::miette!("CNI_NETNS is required for OpenShell CNI ADD")
                 })?;
-                let report =
-                    installer.install(netns, workload.proxy_uid, prev_result_has_ipv6(&config))?;
+                let report = installer.install(netns, workload.proxy_uid)?;
                 log_cni_info(
                     &config,
                     env,
@@ -353,8 +379,7 @@ fn handle_command(
                 let netns = env.netns.as_deref().ok_or_else(|| {
                     miette::miette!("CNI_NETNS is required for OpenShell CNI CHECK")
                 })?;
-                let report =
-                    installer.install(netns, workload.proxy_uid, prev_result_has_ipv6(&config))?;
+                let report = installer.install(netns, workload.proxy_uid)?;
                 log_cni_info(
                     &config,
                     env,
@@ -581,6 +606,36 @@ impl KubeApiClient {
         Ok(())
     }
 
+    /// Returns true when the named `DaemonSet` is gone (404) or has a
+    /// `deletionTimestamp` set (being deleted). A non-404 HTTP error is
+    /// propagated so the caller can treat it as indeterminate.
+    fn daemonset_terminating(&self, namespace: &str, name: &str) -> Result<bool> {
+        let url = format!(
+            "{}/apis/apps/v1/namespaces/{}/daemonsets/{}",
+            self.server, namespace, name
+        );
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.token)
+            .send()
+            .into_diagnostic()
+            .wrap_err("failed to query Kubernetes API for DaemonSet state")?;
+        if response.status().as_u16() == 404 {
+            return Ok(true);
+        }
+        if !response.status().is_success() {
+            return Err(miette::miette!(
+                "Kubernetes API returned {} while reading DaemonSet {}/{}",
+                response.status(),
+                namespace,
+                name
+            ));
+        }
+        let ds = response.json::<DaemonSetResponse>().into_diagnostic()?;
+        Ok(ds.metadata.deletion_timestamp.is_some())
+    }
+
     fn pod_annotations(&self, pod: &PodRef) -> Result<BTreeMap<String, String>> {
         let url = format!(
             "{}/api/v1/namespaces/{}/pods/{}",
@@ -637,8 +692,8 @@ fn cluster_certificate_authority(
 }
 
 impl RuleInstaller for Runtime {
-    fn install(&self, netns: &Path, proxy_uid: u32, enforce_ipv6: bool) -> Result<InstallReport> {
-        install_rules(netns, proxy_uid, enforce_ipv6)
+    fn install(&self, netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
+        install_rules(netns, proxy_uid)
     }
 
     fn cleanup(&self, netns: &Path) -> Result<()> {
@@ -682,11 +737,11 @@ fn generate_sidecar_bypass_ruleset(proxy_uid: u32, log_prefix: Option<&str>) -> 
 }
 
 #[cfg(target_os = "linux")]
-fn install_rules(netns: &Path, proxy_uid: u32, enforce_ipv6: bool) -> Result<InstallReport> {
+fn install_rules(netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
     // The preferred nft backend programs both families in one inet ruleset, so
-    // its IPv6 reject rules are harmless no-ops on IPv4-only pods; enforce_ipv6
-    // only gates the iptables fallback, where a missing ip6tables binary would
-    // otherwise reject an IPv4-only node outright.
+    // its IPv6 reject rules are harmless no-ops on IPv4-only pods and it needs no
+    // IPv6 probe. Only the iptables fallback must decide whether ip6tables is
+    // required, and it does so by inspecting the pod netns (fail-closed).
     let nft_error = if let Some(nft) = find_nft() {
         match install_nft_rules(netns, proxy_uid, &nft) {
             Ok(()) => {
@@ -699,6 +754,7 @@ fn install_rules(netns: &Path, proxy_uid: u32, enforce_ipv6: bool) -> Result<Ins
     };
 
     if let Some(iptables) = find_iptables() {
+        let enforce_ipv6 = netns_requires_ipv6_enforcement(netns);
         install_iptables_rules(netns, proxy_uid, &iptables, enforce_ipv6)
             .wrap_err("iptables fallback failed")?;
         return Ok(InstallReport {
@@ -725,11 +781,51 @@ fn install_nft_rules(netns: &Path, proxy_uid: u32, nft: &str) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn install_rules(netns: &Path, proxy_uid: u32, enforce_ipv6: bool) -> Result<InstallReport> {
-    let _ = (netns, proxy_uid, enforce_ipv6);
+fn install_rules(netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
+    let _ = (netns, proxy_uid);
     Err(miette::miette!(
         "OpenShell CNI rule installation is supported only on Linux nodes"
     ))
+}
+
+/// Decides whether the iptables fallback must enforce IPv6, by probing the pod
+/// netns for any non-loopback IPv6 address. Fails closed: any error (setns/exec
+/// failure, or the probe reporting IPv6 present) returns true, so a pod with
+/// IPv6 is never left unenforced just because detection was inconclusive. Only a
+/// clean "no IPv6" result (probe exit 0) returns false, keeping IPv4-only nodes
+/// working without ip6tables.
+#[cfg(target_os = "linux")]
+fn netns_requires_ipv6_enforcement(netns: &Path) -> bool {
+    // Re-exec this binary inside the target netns; its exit status encodes the
+    // result (exit 0 = no IPv6 → Ok, non-zero = IPv6/undetermined → Err).
+    run_command_in_netns(netns, "/proc/self/exe", &[NETNS_IPV6_PROBE_ARG]).is_err()
+}
+
+/// Argument that runs the in-netns IPv6 probe (see `netns_probe_ipv6`).
+#[cfg(target_os = "linux")]
+const NETNS_IPV6_PROBE_ARG: &str = "__netns-probe-ipv6";
+
+/// In-netns IPv6 probe entry point, re-exec'd inside the pod netns.
+///
+/// Reports via exit status whether IPv6 enforcement is needed: success (exit 0)
+/// means no non-loopback IPv6 is present; a non-success exit means IPv6 is
+/// present or could not be determined, so the caller fails closed. A missing
+/// `/proc/net/if_inet6` means IPv6 is disabled in the kernel (no enforcement
+/// needed); any other read error is treated as indeterminate.
+pub fn netns_probe_ipv6() -> Result<()> {
+    match std::fs::read_to_string("/proc/net/if_inet6") {
+        Ok(contents) => {
+            if if_inet6_has_non_loopback_ipv6(&contents) {
+                Err(miette::miette!("pod netns has non-loopback IPv6"))
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .into_diagnostic()
+            .wrap_err("failed to read /proc/net/if_inet6 for IPv6 probe"),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1026,12 +1122,7 @@ mod tests {
     }
 
     impl RuleInstaller for TestInstaller {
-        fn install(
-            &self,
-            _netns: &Path,
-            proxy_uid: u32,
-            _enforce_ipv6: bool,
-        ) -> Result<InstallReport> {
+        fn install(&self, _netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
             self.installed.lock().unwrap().push(proxy_uid);
             Ok(InstallReport { backend: "test" })
         }
@@ -1292,52 +1383,30 @@ mod tests {
         assert_eq!(payload["cniVersion"], DEFAULT_CNI_VERSION);
     }
 
-    fn config_with_prev_result(prev_result: Value) -> CniConfig {
-        CniConfig {
-            cni_version: Some("1.0.0".to_string()),
-            prev_result: Some(prev_result),
-            openshell: OpenShellConfig::default(),
-        }
+    #[test]
+    fn if_inet6_detects_global_and_ula() {
+        // Global address on eth0.
+        let contents = "fd0010244000000000000000000000005 03 40 00 80 eth0\n";
+        assert!(if_inet6_has_non_loopback_ipv6(contents));
     }
 
     #[test]
-    fn prev_result_has_ipv6_true_for_routable_ipv6() {
-        let config = config_with_prev_result(serde_json::json!({
-            "ips": [
-                { "address": "10.1.2.3/24" },
-                { "address": "fd00:10:244::5/64" }
-            ]
-        }));
-        assert!(prev_result_has_ipv6(&config));
+    fn if_inet6_counts_link_local() {
+        // Link-local fe80::/10 can still reach on-link peers and node services.
+        let contents = "fe800000000000000042acfffe110002 02 40 20 80 eth0\n";
+        assert!(if_inet6_has_non_loopback_ipv6(contents));
     }
 
     #[test]
-    fn prev_result_has_ipv6_false_for_ipv4_only() {
-        let config = config_with_prev_result(serde_json::json!({
-            "ips": [{ "address": "10.1.2.3/24" }]
-        }));
-        assert!(!prev_result_has_ipv6(&config));
+    fn if_inet6_ignores_loopback_only() {
+        // Only ::1 on lo → no enforcement needed.
+        let contents = "00000000000000000000000000000001 01 80 10 80 lo\n";
+        assert!(!if_inet6_has_non_loopback_ipv6(contents));
     }
 
     #[test]
-    fn prev_result_has_ipv6_ignores_link_local_and_loopback() {
-        let config = config_with_prev_result(serde_json::json!({
-            "ips": [
-                { "address": "fe80::1/64" },
-                { "address": "::1/128" }
-            ]
-        }));
-        assert!(!prev_result_has_ipv6(&config));
-    }
-
-    #[test]
-    fn prev_result_has_ipv6_false_when_prev_result_absent() {
-        let config = CniConfig {
-            cni_version: Some("1.0.0".to_string()),
-            prev_result: None,
-            openshell: OpenShellConfig::default(),
-        };
-        assert!(!prev_result_has_ipv6(&config));
+    fn if_inet6_empty_means_no_ipv6() {
+        assert!(!if_inet6_has_non_loopback_ipv6(""));
     }
 
     #[test]
