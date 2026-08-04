@@ -336,19 +336,24 @@ limitation: an ungraceful DaemonSet pod deletion (no `preStop`) leaves a stale
 `cni-ready=true` until the pod is rescheduled and the next reconcile tick
 re-evaluates it.
 
-The CNI installer is a **cluster singleton**. The chained plugin enforces any pod
-carrying the OpenShell annotations (`openshell.ai/cni=enabled` plus the proxy-UID
-and enforcement-mode annotations, set only by a gateway on its own sandbox pods),
-so a single installation serves every OpenShell release across all namespaces —
-enforcement is gated by per-pod annotations, not a namespace list. The installer
-resources use release-independent names, the plugin config carries a fixed
-`openshell` owner and an empty namespace allowlist, and a `configVersion` binds
-readiness to the desired config so a stale-version entry is repaired before the
-node is re-marked ready. Install the singleton (`cni.enabled=true`) in one release
-per cluster; additional gateway releases set `cni.enabled=false` +
-`cni.external=true` to share it, and the installer refuses to overwrite a chained
-plugin entry with a non-OpenShell owner. Because the plugin serves all sandbox
-namespaces, its `pods get` grant is cluster-scoped.
+The CNI installer is a **cluster singleton**. Its chained plugin enforces pods
+that carry the OpenShell annotations (`openshell.ai/cni=enabled` plus the
+proxy-UID and enforcement-mode annotations, set only by a gateway on its own
+sandbox pods) **and** whose namespace is in the plugin's `sandboxNamespaces`
+allowlist. Pods in other namespaces are passed through without a Kubernetes API
+lookup, so the allowlist bounds the blast radius of the per-pod annotation read.
+The allowlist defaults to the owner release's sandbox namespace
+(`cni.sandboxNamespaces`); a cluster running multiple OpenShell releases must add
+every additional sandbox namespace to the owner's list, or those sandboxes run
+unenforced. The installer resources use a fixed release-independent name, the
+plugin config carries a fixed `openshell` owner, and a `configVersion` (over the
+allowlist and config) binds readiness to the desired config so a stale-version
+entry is repaired before the node is re-marked ready. Install the singleton
+(`cni.enabled=true`) in one release per cluster; additional gateway releases set
+`cni.enabled=false` + `cni.external=true` to share it. The installer treats any
+`openshell-cni` chained entry as its own and upgrades it in place (the conflist
+patch preserves all other plugins). The `pods get` grant is cluster-scoped so the
+one installer can read sandbox pods in any allowlisted namespace.
 
 On OpenShift, binary-aware network policy also requires a purpose-built
 SecurityContextConstraints for sandbox pods: the network sidecar runs as UID 0

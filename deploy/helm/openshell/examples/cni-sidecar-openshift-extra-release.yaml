@@ -3,12 +3,26 @@
 
 # Example values for an ADDITIONAL gateway release on a cluster that already has
 # the OpenShell CNI singleton installed by another release. This release does not
-# install its own CNI; it reuses the cluster's existing installation. Its sandbox
-# pods are enforced by the shared plugin (enforcement is keyed on pod annotations
-# the gateway sets) and gated on the same per-node readiness label.
+# install its own CNI; it reuses the cluster's existing installation.
 #
-#   helm install openshell-team-b deploy/helm/openshell -n team-b \
-#     -f deploy/helm/openshell/examples/cni-sidecar-openshift-extra-release.yaml
+# ┌─ REQUIRED TWO-STEP WORKFLOW ────────────────────────────────────────────────┐
+# │ The CNI singleton only inspects (and enforces) pods in the namespaces listed │
+# │ in its cni.sandboxNamespaces allowlist. Pods in any other namespace are      │
+# │ passed through WITHOUT enforcement. So before enabling this gateway you MUST  │
+# │ add its sandbox namespace to the SINGLETON OWNER release's allowlist, or its  │
+# │ sandboxes will silently run unrestricted.                                     │
+# │                                                                              │
+# │ 1. Update the singleton owner to include this release's sandbox namespace:    │
+# │      helm upgrade <owner-release> deploy/helm/openshell -n <owner-ns> \       │
+# │        --reuse-values \                                                       │
+# │        --set 'cni.sandboxNamespaces={openshell,team-b}'                       │
+# │    Confirm every schedulable node re-reconciles (configVersion changes) and   │
+# │    stays cni-ready before proceeding.                                         │
+# │                                                                              │
+# │ 2. THEN install this gateway (its sandbox namespace = team-b here):           │
+# │      helm install openshell-team-b deploy/helm/openshell -n team-b \          │
+# │        -f deploy/helm/openshell/examples/cni-sidecar-openshift-extra-release.yaml
+# └──────────────────────────────────────────────────────────────────────────────┘
 
 cni:
   # Do not install a second CNI installer; use the cluster singleton.
