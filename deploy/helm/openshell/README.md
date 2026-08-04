@@ -153,7 +153,8 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | cni.chainDir | string | `""` | Host Multus vendor-cni-chain directory. Only used when mode is "multus-chain". The installer writes openshell-cni.conf here. |
 | cni.confDir | string | `"/etc/cni/net.d"` | Host CNI config directory. |
 | cni.configFile | string | `""` | Host CNI conflist filename patched by the installer. Empty selects the first non-OpenShell .conflist. |
-| cni.enabled | bool | `false` | Install the OpenShell chained CNI plugin with a privileged node DaemonSet. Required when supervisor.topology is "cni-sidecar". |
+| cni.enabled | bool | `false` | Install the OpenShell chained CNI plugin as a privileged node DaemonSet. The installer is a CLUSTER SINGLETON: one installation serves every OpenShell release's sandbox pods across all namespaces (enforcement is keyed on pod annotations the gateway sets). Enable it in exactly one release per cluster. Required for supervisor.topology="cni-sidecar" unless cni.external=true. |
+| cni.external | bool | `false` | Use a CNI singleton installed by another release/chart instead of installing one here. Set this (with supervisor.topology="cni-sidecar" and cni.enabled=false) on additional gateway releases that share the cluster's existing OpenShell CNI installation. |
 | cni.image.pullPolicy | string | `""` | CNI installer image pull policy. Empty uses supervisor.image.pullPolicy, then image.pullPolicy. |
 | cni.image.repository | string | `""` | CNI installer image repository. Empty falls back to supervisor.image.repository, then the official supervisor repository. |
 | cni.image.tag | string | `""` | CNI installer image tag. Empty falls back to supervisor.image.tag, then image.tag, then chart appVersion. |

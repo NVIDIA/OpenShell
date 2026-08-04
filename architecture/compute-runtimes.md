@@ -285,13 +285,19 @@ limitation: an ungraceful DaemonSet pod deletion (no `preStop`) leaves a stale
 `cni-ready=true` until the pod is rescheduled and the next reconcile tick
 re-evaluates it.
 
-The installer stamps each chained plugin entry with an owner (`<namespace>/<release>`)
-and refuses to overwrite an entry owned by a different release, failing closed
-rather than silently unrestricting another release's sandboxes. Because the host
-CNI config and the readiness label are cluster-global, **only one OpenShell
-release per cluster is supported for the cni-sidecar topology today**; aggregating
-multiple releases (or a namespace-changing upgrade) is future work noted in the
-cni-sidecar RFC.
+The CNI installer is a **cluster singleton**. The chained plugin enforces any pod
+carrying the OpenShell annotations (`openshell.ai/cni=enabled` plus the proxy-UID
+and enforcement-mode annotations, set only by a gateway on its own sandbox pods),
+so a single installation serves every OpenShell release across all namespaces —
+enforcement is gated by per-pod annotations, not a namespace list. The installer
+resources use release-independent names, the plugin config carries a fixed
+`openshell` owner and an empty namespace allowlist, and a `configVersion` binds
+readiness to the desired config so a stale-version entry is repaired before the
+node is re-marked ready. Install the singleton (`cni.enabled=true`) in one release
+per cluster; additional gateway releases set `cni.enabled=false` +
+`cni.external=true` to share it, and the installer refuses to overwrite a chained
+plugin entry with a non-OpenShell owner. Because the plugin serves all sandbox
+namespaces, its `pods get` grant is cluster-scoped.
 
 On OpenShift, binary-aware network policy also requires a purpose-built
 SecurityContextConstraints for sandbox pods: the network sidecar runs as UID 0
