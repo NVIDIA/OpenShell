@@ -16,7 +16,7 @@
 # ---------------------------------------------------------------------------
 FROM registry.access.redhat.com/ubi9/ubi:9.6@sha256:dec374e05cc13ebbc0975c9f521f3db6942d27f8ccdf06b180160490eef8bdbc AS builder
 
-RUN dnf install -y --nodocs \
+RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
         rust cargo \
         gcc gcc-c++ make cmake \
         openssl-devel git-core clang-devel \
@@ -56,7 +56,7 @@ RUN mkdir -p /tmp/z3-src \
 # ---------------------------------------------------------------------------
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.6@sha256:34880b64c07f28f64d95737f82f891516de9a3b43583f39970f7bf8e4cfa48b7
 
-RUN microdnf install -y --nodocs ca-certificates \
+RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 ca-certificates \
     && microdnf clean all
 
 COPY --from=builder --chmod=0555 \
