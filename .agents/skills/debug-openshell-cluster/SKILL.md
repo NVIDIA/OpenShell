@@ -423,19 +423,29 @@ A gateway release using `cni-sidecar` with neither `cni.enabled` nor
 sandboxes are unenforced, confirm the singleton exists and is Ready.
 
 **Namespace allowlist (silent unenforced sandboxes).** The plugin only inspects
-pods whose namespace is in its `sandboxNamespaces` allowlist
-(`cni.sandboxNamespaces`, default the owner's sandbox namespace); pods elsewhere
-are passed through unenforced. If a sandbox reaches 2/2 but its egress is NOT
-blocked, confirm its namespace is in the installed allowlist — a common cause is
-an additional `cni.external=true` release whose namespace was never added to the
-owner's list:
+pods whose namespace is in its `sandboxNamespaces` allowlist. That allowlist is
+built automatically from Helm-owned marker ConfigMaps
+(`openshell.ai/cni-registration=true`) — one per cni-sidecar release, in its
+sandbox namespace — unioned with the static `cni.sandboxNamespaces`. If a sandbox
+reaches 2/2 but its egress is NOT blocked, confirm its namespace is registered and
+in the installed allowlist:
 
 ```bash
-# On a CNI installer pod, read the installed plugin config's sandboxNamespaces:
+# Registration markers (their namespaces are what the singleton enforces):
+kubectl get configmaps -A -l openshell.ai/cni-registration=true
+# Installed plugin config's aggregated sandboxNamespaces:
 kubectl -n <owner-ns> exec ds/openshell-cni -c install-cni -- \
   sh -c 'cat /host/run/multus/cni/net.d/vendor-cni-chain/openshell-cni.conf 2>/dev/null \
          || cat /host/etc/cni/net.d/*.conflist'
 ```
+
+**Gateway stuck in Init (`wait-cni-coverage`).** A cni-sidecar gateway pod has a
+`wait-cni-coverage` init container that blocks until every `cni-ready` node's
+`openshell.ai/cni-sandbox-namespaces` annotation includes the gateway's namespace.
+If the gateway is stuck initializing, the singleton has not yet acknowledged the
+namespace on all nodes — check the per-node coverage:
+`kubectl get nodes -o custom-columns=NAME:.metadata.name,COVERAGE:.metadata.annotations.openshell\.ai/cni-sandbox-namespaces`
+and confirm a marker ConfigMap exists for that namespace.
 
 **Node reboot / boot taint.** In `multus-chain` mode the chain file lives under
 `/run` (tmpfs) and is wiped on reboot while the `cni-ready` label persists.

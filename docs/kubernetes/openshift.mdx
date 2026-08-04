@@ -143,12 +143,16 @@ is routed through the OpenShell network sidecar and enforced by policy.
 To run **additional** gateway releases on the same cluster, do not install a
 second CNI — reuse the singleton with `cni.enabled=false`, `cni.external=true`
 (`-f deploy/helm/openshell/examples/cni-sidecar-openshift-extra-release.yaml`).
-Registration is automatic: each `cni-sidecar` release runs a helm hook that
-labels its sandbox namespace `openshell.ai/sandbox=true`, and the singleton
-discovers every labeled namespace and adds it to the enforcement allowlist within
-one reconcile (~30s) — no manual edit of the singleton owner is required.
-(`cni.sandboxNamespaces` remains available as an optional static addition to the
-allowlist for namespaces you want enforced without the label.)
+Registration is automatic and race-free: each `cni-sidecar` release ships a
+Helm-owned marker ConfigMap (`openshell.ai/cni-registration=true`) in its sandbox
+namespace, and the singleton discovers every marker's namespace and adds it to the
+enforcement allowlist — no manual edit of the singleton owner is required. Because
+the marker is a normal Helm resource, uninstalling the release (or changing its
+`sandboxNamespace`) removes the registration automatically. The gateway does not
+serve until enforcement is acknowledged: a `wait-cni-coverage` init container
+blocks the gateway pod until every enforcement-ready node reports the namespace,
+so an additional release never creates sandboxes during the discovery window.
+(`cni.sandboxNamespaces` remains available as an optional static addition.)
 
 <Warning>
 On node reboot the Multus chain file (under `/run`, tmpfs) is wiped while the
