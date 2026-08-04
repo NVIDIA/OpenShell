@@ -69,8 +69,8 @@ $WindowsClippyLintArgs = "-D warnings -A dead-code -A unused-imports -A clippy::
 $BundledZ3WorkspaceFeatures = "--features openshell-prover/bundled-z3"
 $BundledZ3ServerFeatures = "--features openshell-server/bundled-z3,openshell-prover/bundled-z3"
 $BundledZ3Repository = "https://github.com/Z3Prover/z3.git"
-$BundledZ3SysVersion = "0.10.9"
-# This is the matching z3-sys submodule revision. Update both pins together.
+$BundledZ3SysVersion = "0.11.0"
+# This is the matching Z3 4.16.0 source revision. Update both pins together.
 $BundledZ3Revision = "ddb49568d3520e99799e364fb22f35fc67d887b1"
 $Z3WorkspaceFeatures = $BundledZ3WorkspaceFeatures
 $Z3ServerFeatures = $BundledZ3ServerFeatures

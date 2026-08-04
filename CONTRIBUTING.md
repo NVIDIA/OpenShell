@@ -307,10 +307,6 @@ Bazel builds Z3 from source, so no system Z3 installation is needed when using B
 echo "target" >> .bazelignore
 ```
 
-### macOS build tools
-
-The policy prover uses Z3 on supported targets.
-
 ### Z3 installation
 
 The `openshell-prover` crate links against Z3. On macOS and Linux, install the
