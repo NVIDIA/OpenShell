@@ -191,31 +191,25 @@ is routed through the OpenShell network sidecar and enforced by policy.
 To run **additional** gateway releases on the same cluster, do not install a
 second CNI — reuse the singleton with `cni.enabled=false`, `cni.external=true`
 (`-f deploy/helm/openshell/examples/cni-sidecar-openshift-extra-release.yaml`).
-
-<Warning>
-The singleton only enforces pods in namespaces listed in its
-`cni.sandboxNamespaces` allowlist (default: the owner release's sandbox
-namespace); pods elsewhere are passed through **unenforced**. Before enabling an
-additional release you **must** add its sandbox namespace to the singleton
-owner's allowlist and let every node re-reconcile:
-
-```shell
-helm upgrade <owner-release> deploy/helm/openshell -n <owner-ns> \
-  --reuse-values --set 'cni.sandboxNamespaces={openshell,team-b}'
-```
-
-Only then install the additional gateway. Skipping this step silently leaves the
-new release's sandboxes without egress enforcement.
-</Warning>
+Registration is automatic: each `cni-sidecar` release runs a helm hook that
+labels its sandbox namespace `openshell.ai/sandbox=true`, and the singleton
+discovers every labeled namespace and adds it to the enforcement allowlist within
+one reconcile (~30s) — no manual edit of the singleton owner is required.
+(`cni.sandboxNamespaces` remains available as an optional static addition to the
+allowlist for namespaces you want enforced without the label.)
 
 <Warning>
 On node reboot the Multus chain file (under `/run`, tmpfs) is wiped while the
 `openshell.ai/cni-ready` Node label persists, so a sandbox could briefly schedule
-onto a node before enforcement is re-established. To close this window, apply the
-boot-time taint MachineConfig at
+onto a node before enforcement is re-established. To **narrow** this window, apply
+the boot-time taint MachineConfig at
 `deploy/helm/openshell/examples/cni-sidecar-openshift-boot-taint.yaml` (read its
 caveats first — it is operator-provided node config and requires taint RBAC). The
-CNI DaemonSet tolerates the taint and removes it once enforcement is ready.
+CNI DaemonSet tolerates the taint and removes it once enforcement is ready. This
+does not fully close the window: the taint is applied after the kubelet starts, so
+a brief reboot race remains. Use `conflist` mode (plugin stored on persistent
+disk, unaffected by reboot), or cordon/drain nodes before rebooting, to avoid it
+entirely.
 </Warning>
 
 ## Next Steps
