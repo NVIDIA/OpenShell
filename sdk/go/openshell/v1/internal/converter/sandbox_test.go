@@ -258,9 +258,9 @@ func TestSandboxRoundTrip(t *testing.T) {
 	gpuCount := uint32(1)
 	rtDelTime := time.UnixMilli(1700000090000).UTC()
 	original := &v1.Sandbox{
-		ID:              "sb-rt",
-		Name:            "round-trip",
-		CreatedAt:       time.UnixMilli(1700000000000).UTC(),
+		ID:                "sb-rt",
+		Name:              "round-trip",
+		CreatedAt:         time.UnixMilli(1700000000000).UTC(),
 		Labels:            map[string]string{"team": "platform"},
 		Annotations:       map[string]string{"note": "rt-test"},
 		ResourceVersion:   10,
@@ -384,6 +384,20 @@ func TestSandboxSpecToProto_Nil(t *testing.T) {
 	p, err := SandboxSpecToProto(nil)
 	require.NoError(t, err)
 	assert.Nil(t, p)
+}
+
+func TestSandboxSpecToProto_InvalidMapReturnsError(t *testing.T) {
+	spec := &v1.SandboxSpec{
+		Template: &v1.SandboxTemplate{
+			Image:     "img:v1",
+			Resources: map[string]any{"bad": make(chan int)},
+		},
+	}
+
+	p, err := SandboxSpecToProto(spec)
+	require.Error(t, err, "SandboxSpecToProto must return an error for unconvertible map values")
+	assert.Nil(t, p)
+	assert.Contains(t, err.Error(), "convert template resources")
 }
 
 // Verify proto import is used (suppress unused import warning).

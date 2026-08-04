@@ -524,6 +524,28 @@ func TestSandboxWaitReady_ContextTimeout(t *testing.T) {
 	_, err := client.WaitReady(ctx, "default", "stuck-sb", WaitOptions{PollInterval: 20 * time.Millisecond})
 
 	require.Error(t, err)
+	assert.True(t, IsDeadlineExceeded(err), "WaitReady must wrap context.DeadlineExceeded in StatusError")
+}
+
+func TestSandboxWaitReady_ContextCancelled(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["cancel-sb"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Name: "cancel-sb"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_PROVISIONING},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err := client.WaitReady(ctx, "default", "cancel-sb", WaitOptions{PollInterval: 20 * time.Millisecond})
+
+	require.Error(t, err)
+	assert.True(t, IsCancelled(err), "WaitReady must wrap context.Canceled in StatusError")
 }
 
 func TestSandboxWaitReady_SandboxFailed(t *testing.T) {

@@ -204,5 +204,3 @@ func SandboxSpecToProto(spec *types.SandboxSpec) (*pb.SandboxSpec, error) {
 
 	return result, nil
 }
-
-

@@ -63,4 +63,3 @@ func mapToStruct(m map[string]any) (*structpb.Struct, error) {
 	}
 	return structpb.NewStruct(m)
 }
-
