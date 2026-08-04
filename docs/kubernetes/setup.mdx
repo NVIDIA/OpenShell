@@ -164,7 +164,8 @@ The most commonly changed values are:
 | `supervisor.topology` | Sandbox pod topology. Refer to [Topology](/kubernetes/topology). |
 | `supervisor.sidecar.proxyUid` | Non-root UID used when sidecar process/binary-aware network policy is disabled. The default binary-aware sidecar runs as UID 0 instead. The configured UID must not match the sandbox UID. |
 | `upstreamProxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
-| `cni.enabled` | Install the privileged OpenShell CNI DaemonSet. Required when `supervisor.topology=cni-sidecar`. |
+| `cni.enabled` | Install the privileged OpenShell CNI DaemonSet (a per-cluster singleton). Enable in one release per cluster when `supervisor.topology=cni-sidecar`. |
+| `cni.external` | Use a CNI singleton installed by another release instead of installing one here. Set on additional `cni-sidecar` gateway releases (with `cni.enabled=false`). |
 | `cni.configFile` | Existing host CNI conflist to patch. Leave empty to patch the first non-OpenShell `.conflist` in `cni.confDir`. |
 | `cni.logFile` | Host log file written by the OpenShell CNI plugin and tailed by the installer DaemonSet. Defaults to `/var/log/openshell-cni.log`. |
 

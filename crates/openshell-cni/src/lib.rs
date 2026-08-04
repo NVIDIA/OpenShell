@@ -25,6 +25,15 @@ const CNI_SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "cni-sidecar";
 /// constant in `openshell-driver-kubernetes` (used for the sandbox pod
 /// nodeAffinity) and with the CNI `DaemonSet`'s node-patch RBAC.
 const NODE_READY_LABEL: &str = "openshell.ai/cni-ready";
+/// Node taint applied at boot (via an operator-provided `MachineConfig` / node
+/// config) so a rebooted node repels workloads until egress enforcement is
+/// re-established — the persistent `cni-ready` label cannot reflect a reboot that
+/// wipes tmpfs-backed enforcement, so a boot-time taint closes that window. The
+/// installer only REMOVES this taint (once enforcement is ready); it never adds
+/// it, so a transient unready never over-repels a running node. Must stay in sync
+/// with the taint key used by the `MachineConfig` and the `DaemonSet` toleration.
+const NODE_NOT_READY_TAINT_KEY: &str = "openshell.ai/cni-not-ready";
+const NODE_NOT_READY_TAINT_EFFECT: &str = "NoSchedule";
 #[allow(dead_code)]
 const OPENSHELL_TABLE: &str = "openshell_sidecar_bypass";
 #[allow(dead_code)]
@@ -218,8 +227,17 @@ pub fn node_ready(args: &[String]) -> Result<()> {
     let node = std::env::var("NODE_NAME")
         .map_err(|_| miette::miette!("NODE_NAME env var is required for node-ready"))?;
     let client = KubeApiClient::from_in_cluster()?;
-    let value = if ready { Some("true") } else { None };
-    client.patch_node_label(&node, NODE_READY_LABEL, value)
+    if ready {
+        // Set the label first (still fenced by the boot taint if present), then
+        // remove the boot taint so scheduling opens only once both agree.
+        client.patch_node_label(&node, NODE_READY_LABEL, Some("true"))?;
+        client.remove_node_taint(&node, NODE_NOT_READY_TAINT_KEY, NODE_NOT_READY_TAINT_EFFECT)
+    } else {
+        // Clear the label to fence new sandbox pods. Do NOT add the taint here:
+        // the taint is boot-managed (it would over-repel all workloads on a
+        // transient unready); the label gate is sandbox-specific.
+        client.patch_node_label(&node, NODE_READY_LABEL, None)
+    }
 }
 
 /// Entry point for `openshell-cni daemonset-active`.
@@ -408,12 +426,14 @@ fn workload_from_config(
     let Some(pod) = env.pod_ref() else {
         return Ok(None);
     };
-    // sandbox_namespaces is an OPTIONAL allowlist. The cluster-singleton
-    // installer leaves it empty, which means "enforce any pod that carries the
-    // OpenShell annotations, in any namespace" — enforcement is gated by the
-    // per-pod annotations below (set only by a gateway on its own sandbox pods),
-    // so one installation safely serves every release. A non-empty list narrows
-    // enforcement to those namespaces.
+    // sandbox_namespaces is the allowlist of namespaces whose pods we inspect.
+    // A pod outside it is passed through immediately WITHOUT a Kubernetes API
+    // lookup — a blast-radius guard so control-plane/RBAC problems cannot block
+    // unrelated workloads' pod creation. Within the allowlist, enforcement is
+    // gated by the per-pod OpenShell annotations below (set only by a gateway on
+    // its own sandbox pods). The singleton installer populates this from
+    // cni.sandboxNamespaces (default: the release's sandbox namespace). An empty
+    // list means "any namespace" and is intentionally avoided by the chart.
     if !config.openshell.sandbox_namespaces.is_empty()
         && !config
             .openshell
@@ -610,6 +630,80 @@ impl KubeApiClient {
             ));
         }
         Ok(())
+    }
+
+    /// Removes the given taint (key + effect) from the node if present, using a
+    /// JSON Patch whose `test` on `metadata.resourceVersion` provides optimistic
+    /// concurrency so a concurrent taint change by another controller is not
+    /// clobbered (retried on conflict). A no-op when the taint is absent.
+    fn remove_node_taint(&self, node: &str, key: &str, effect: &str) -> Result<()> {
+        let url = format!("{}/api/v1/nodes/{}", self.server, node);
+        for _attempt in 0..5 {
+            let obj = self
+                .client
+                .get(&url)
+                .bearer_auth(&self.token)
+                .send()
+                .into_diagnostic()
+                .wrap_err("failed to read node for taint removal")?;
+            if !obj.status().is_success() {
+                return Err(miette::miette!(
+                    "Kubernetes API returned {} while reading node {}",
+                    obj.status(),
+                    node
+                ));
+            }
+            let node_obj = obj.json::<Value>().into_diagnostic()?;
+            let resource_version = node_obj["metadata"]["resourceVersion"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let taints = node_obj["spec"]["taints"].as_array();
+            let filtered: Vec<Value> = taints
+                .map(|list| {
+                    list.iter()
+                        .filter(|t| {
+                            !(t["key"].as_str() == Some(key)
+                                && t["effect"].as_str() == Some(effect))
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Nothing to remove.
+            if taints.is_none_or(|list| list.len() == filtered.len()) {
+                return Ok(());
+            }
+            let patch = serde_json::json!([
+                { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+                { "op": "replace", "path": "/spec/taints", "value": filtered },
+            ]);
+            let response = self
+                .client
+                .patch(&url)
+                .bearer_auth(&self.token)
+                .header(reqwest::header::CONTENT_TYPE, "application/json-patch+json")
+                .body(serde_json::to_vec(&patch).into_diagnostic()?)
+                .send()
+                .into_diagnostic()
+                .wrap_err("failed to patch node taints")?;
+            let status = response.status().as_u16();
+            // 409 (resourceVersion conflict) or 422 (test op failed) → retry.
+            if status == 409 || status == 422 {
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(miette::miette!(
+                    "Kubernetes API returned {} while removing taint from node {}",
+                    response.status(),
+                    node
+                ));
+            }
+            return Ok(());
+        }
+        Err(miette::miette!(
+            "failed to remove taint from node {node} after retries (conflict)"
+        ))
     }
 
     /// Returns true when the named `DaemonSet` is gone (404) or has a

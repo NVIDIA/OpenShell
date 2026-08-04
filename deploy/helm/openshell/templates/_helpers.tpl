@@ -57,7 +57,7 @@ avoids requiring an immutable-selector or component-label change on existing
 gateway releases during upgrade.
 */}}
 {{- define "openshell.cniSelectorLabels" -}}
-app.kubernetes.io/name: {{ include "openshell.name" . }}-cni
+app.kubernetes.io/name: {{ include "openshell.cniName" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
@@ -88,14 +88,17 @@ Create the name of the service account to use
 
 {{/*
 Cluster-singleton name for the CNI installer and its RBAC/SCC. The CNI installer
-is a per-cluster singleton (one chained plugin serves every OpenShell release's
-sandbox pods, keyed on pod annotations), so its name is release-independent
-(chart name, not fullname). This lets additional gateway releases share one CNI
-installation and keeps the host CNI config, ClusterRole, and readiness label
-unambiguous across releases.
+is a per-cluster singleton: one chained plugin serves every OpenShell release's
+sandbox pods (keyed on pod annotations), and it writes fixed host state (the
+`/run` chain file / conflist entry and the `openshell.ai/cni-ready` Node label).
+The name is therefore a genuinely FIXED cluster identity — a constant, not
+derived from nameOverride/fullname — so two releases with different name
+overrides cannot install competing "singletons" over the same host state. A
+second release that also sets cni.enabled=true collides on these fixed-named
+cluster resources (Helm ownership) and must instead set cni.external=true.
 */}}
 {{- define "openshell.cniName" -}}
-{{- printf "%s-cni" (include "openshell.name" .) | trunc 63 | trimSuffix "-" }}
+{{- "openshell-cni" }}
 {{- end }}
 
 {{/*

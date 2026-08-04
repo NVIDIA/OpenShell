@@ -322,7 +322,16 @@ node ready once the plugin is healthy again. The gateway sets a required
 schedule onto a node before that node's egress enforcement is active, and a node
 whose enforcement later breaks stops accepting new sandbox pods. The label is set
 through a minimal cluster-scoped grant (`nodes` `get`/`patch`, plus `get` on the
-installer's own DaemonSet) bound to the dedicated CNI ServiceAccount. One residual
+installer's own DaemonSet) bound to the dedicated CNI ServiceAccount.
+
+The persistent label cannot by itself cover a node reboot that wipes tmpfs-backed
+enforcement (`multus-chain` stores the chain file under `/run`). A boot-time
+`NoSchedule` taint (`openshell.ai/cni-not-ready`) closes that window: operator
+node config applies it at boot (only node config runs before the scheduler; a
+MachineConfig example ships under `deploy/helm/openshell/examples/`), the CNI
+DaemonSet tolerates it, and the installer removes it once enforcement is ready
+(never re-adding it, so a transient unready does not over-repel). `conflist` mode
+keeps the plugin on persistent disk and is unaffected by reboot. One residual
 limitation: an ungraceful DaemonSet pod deletion (no `preStop`) leaves a stale
 `cni-ready=true` until the pod is rescheduled and the next reconcile tick
 re-evaluates it.
