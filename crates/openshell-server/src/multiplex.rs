@@ -22,7 +22,8 @@ use openshell_core::proto::{
     inference_server::InferenceServer, open_shell_server::OpenShellServer,
 };
 use openshell_gateway_interceptors::{EvaluationContext, GatewayInterceptorRuntime};
-use opentelemetry::propagation::{Extractor, TextMapPropagator};
+use openshell_otel::HeaderMapExtractor;
+use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TraceContextExt as _;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use std::collections::BTreeMap;
@@ -117,7 +118,7 @@ fn make_request_span<B>(req: &Request<B>) -> Span {
     let propagator = TraceContextPropagator::new();
     let parent = propagator.extract_with_context(
         &opentelemetry::Context::new(),
-        &HeaderExtractor(req.headers()),
+        &HeaderMapExtractor::new(req.headers()),
     );
     if parent.span().span_context().is_valid() {
         let _ = span.set_parent(parent);
@@ -163,18 +164,6 @@ fn record_grpc_status(headers: &http::HeaderMap, span: &Span) {
     span.record("rpc.grpc.status_code", code);
     if code != 0 {
         crate::otel_tracing::mark_error(span);
-    }
-}
-
-struct HeaderExtractor<'a>(&'a http::HeaderMap);
-
-impl Extractor for HeaderExtractor<'_> {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(|value| value.to_str().ok())
-    }
-
-    fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(http::HeaderName::as_str).collect()
     }
 }
 
