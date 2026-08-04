@@ -13,10 +13,10 @@ func contextError(err error) error {
 	}
 	switch err {
 	case context.DeadlineExceeded:
-		return &StatusError{Code: ErrorDeadlineExceeded, Message: err.Error()}
+		return &StatusError{Code: ErrorDeadlineExceeded, Message: err.Error(), Cause: err}
 	case context.Canceled:
-		return &StatusError{Code: ErrorCancelled, Message: err.Error()}
+		return &StatusError{Code: ErrorCancelled, Message: err.Error(), Cause: err}
 	default:
-		return &StatusError{Code: ErrorInternal, Message: err.Error()}
+		return &StatusError{Code: ErrorInternal, Message: err.Error(), Cause: err}
 	}
 }

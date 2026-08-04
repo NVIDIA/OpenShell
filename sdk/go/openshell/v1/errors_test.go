@@ -22,15 +22,17 @@ func TestStatusError_Error(t *testing.T) {
 	assert.Contains(t, s, "sandbox not found")
 }
 
-func TestStatusError_ErrorWithDetails(t *testing.T) {
+func TestStatusError_ErrorWithCause(t *testing.T) {
+	cause := fmt.Errorf("underlying issue")
 	err := &StatusError{
 		Code:    ErrorInvalidArgument,
 		Message: "bad name",
-		Details: map[string]string{"field": "name"},
+		Cause:   cause,
 	}
 	s := err.Error()
 	assert.Contains(t, s, "InvalidArgument")
 	assert.Contains(t, s, "bad name")
+	assert.ErrorIs(t, err, cause)
 }
 
 func TestIsNotFound(t *testing.T) {

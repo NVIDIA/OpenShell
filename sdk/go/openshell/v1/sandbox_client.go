@@ -248,7 +248,7 @@ func (s *sandboxClient) Watch(ctx context.Context, workspace, name string, opts 
 				default:
 					if recvErr != io.EOF {
 						select {
-						case ch <- Event[*Sandbox]{Type: EventError, Object: nil}:
+						case ch <- Event[*Sandbox]{Type: EventError, Err: recvErr}:
 						default:
 						}
 					}

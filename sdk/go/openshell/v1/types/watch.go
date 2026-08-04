@@ -7,6 +7,7 @@ package types
 type Event[T any] struct {
 	Type   EventType
 	Object T
+	Err    error
 }
 
 // WatchInterface delivers a stream of typed events. Modeled after

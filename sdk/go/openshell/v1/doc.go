@@ -21,7 +21,7 @@
 //
 // # Sandbox Lifecycle
 //
-//	sandbox, err := client.Sandboxes().Create(ctx, "my-sandbox", &v1.SandboxSpec{
+//	sandbox, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{
 //	    Template: &v1.SandboxTemplate{Image: "python:3.12"},
 //	    Environment: map[string]string{"LANG": "en_US.UTF-8"},
 //	}, nil)
@@ -29,14 +29,14 @@
 //	    log.Fatal(err)
 //	}
 //
-//	sandbox, err = client.Sandboxes().WaitReady(ctx, sandbox.Name)
+//	sandbox, err = client.Sandboxes().WaitReady(ctx, "default", sandbox.Name)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
 //
 // # Command Execution (available in a future release)
 //
-//	result, err := client.Exec().Run(ctx, sandbox.Name, []string{"echo", "hello"}, v1.ExecOptions{})
+//	result, err := client.Exec().Run(ctx, "default", sandbox.Name, []string{"echo", "hello"}, v1.ExecOptions{})
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -44,14 +44,14 @@
 //
 // # Error Handling
 //
-//	_, err = client.Sandboxes().Get(ctx, "missing")
+//	_, err = client.Sandboxes().Get(ctx, "default", "missing")
 //	if v1.IsNotFound(err) {
 //	    // handle not found
 //	}
 //
 // # Watching
 //
-//	watcher, err := client.Sandboxes().Watch(ctx, sandbox.Name)
+//	watcher, err := client.Sandboxes().Watch(ctx, "default", sandbox.Name)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -65,7 +65,7 @@
 // Use StopOnTerminal to auto-close the watcher when the sandbox reaches a
 // terminal phase (Ready or Error):
 //
-//	watcher, err := client.Sandboxes().Watch(ctx, sandbox.Name,
+//	watcher, err := client.Sandboxes().Watch(ctx, "default", sandbox.Name,
 //	    v1.WatchOptions{StopOnTerminal: true},
 //	)
 //	if err != nil {
@@ -80,13 +80,13 @@
 //
 // Expose an HTTP service running inside a sandbox and retrieve its public URL:
 //
-//	endpoint, err := client.Services().Expose(ctx, "my-sandbox", "api", 8080, true)
+//	endpoint, err := client.Services().Expose(ctx, "default", "my-sandbox", "api", 8080, true)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
 //	fmt.Printf("Service URL: %s\n", endpoint.URL)
 //
-//	endpoints, err := client.Services().List(ctx, "my-sandbox")
+//	endpoints, err := client.Services().List(ctx, "default", "my-sandbox")
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -98,7 +98,7 @@
 //
 // List available provider profiles and import new ones:
 //
-//	profiles, err := client.Providers().Profiles().List(ctx)
+//	profiles, err := client.Providers().Profiles().List(ctx, "default")
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -106,7 +106,7 @@
 //	    fmt.Printf("%s (%s): %s\n", p.DisplayName, p.Category, p.Description)
 //	}
 //
-//	result, err := client.Providers().Profiles().Import(ctx, []v1.ProfileImportItem{
+//	result, err := client.Providers().Profiles().Import(ctx, "default", []v1.ProfileImportItem{
 //	    {Source: "openai-profile.yaml", Profile: v1.ProviderProfile{
 //	        DisplayName: "OpenAI",
 //	        Category:    v1.ProfileCategoryInference,
@@ -123,7 +123,7 @@
 //
 // Configure gateway-owned credential refresh for a provider:
 //
-//	status, err := client.Providers().Refresh().Configure(ctx, &v1.RefreshConfig{
+//	status, err := client.Providers().Refresh().Configure(ctx, "default", &v1.RefreshConfig{
 //	    Provider:      "openai",
 //	    CredentialKey:  "api-key",
 //	    Strategy:      v1.RefreshStrategyOAuth2ClientCredentials,
@@ -198,7 +198,7 @@
 // Note: CreateSession accepts a sandbox ID, not a name. For name-based access
 // with automatic session cleanup, prefer SSH().Tunnel() instead.
 //
-//	session, err := client.SSH().CreateSession(ctx, sandbox.ID)
+//	session, err := client.SSH().CreateSession(ctx, "default", sandbox.ID)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -207,7 +207,7 @@
 //	fmt.Printf("Host key: %s\n", session.HostKeyFingerprint)
 //	// Use session.Token to authenticate the SSH connection.
 //
-//	revoked, err := client.SSH().RevokeSession(ctx, session.Token)
+//	revoked, err := client.SSH().RevokeSession(ctx, "default", session.Token)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -217,7 +217,7 @@
 //
 // Forward a local connection to a port inside a sandbox:
 //
-//	conn, err := client.TCP().Forward(ctx, "my-sandbox", 5432)
+//	conn, err := client.TCP().Forward(ctx, "default", "my-sandbox", 5432)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -238,7 +238,7 @@
 // Use WithForwardServiceID to tag the forwarding session with a service
 // identifier for audit logging:
 //
-//	conn, err := client.TCP().Forward(ctx, "my-sandbox", 5432,
+//	conn, err := client.TCP().Forward(ctx, "default", "my-sandbox", 5432,
 //	    v1.WithForwardServiceID("billing-db"),
 //	)
 //
@@ -248,7 +248,7 @@
 // session creation, TCP forwarding with an SSH relay target, and automatic
 // session cleanup into one operation:
 //
-//	tunnel, err := client.SSH().Tunnel(ctx, "my-sandbox", 22)
+//	tunnel, err := client.SSH().Tunnel(ctx, "default", "my-sandbox", 22)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -269,7 +269,7 @@
 //
 // Use WithTunnelServiceID to associate a service identifier with the tunnel:
 //
-//	tunnel, err := client.SSH().Tunnel(ctx, "my-sandbox", 22,
+//	tunnel, err := client.SSH().Tunnel(ctx, "default", "my-sandbox", 22,
 //	    v1.WithTunnelServiceID("dev-ssh"),
 //	)
 //
@@ -277,7 +277,7 @@
 //
 // Set an initial security policy when creating a sandbox:
 //
-//	sandbox, err := client.Sandboxes().Create(ctx, "secure-sandbox", &v1.SandboxSpec{
+//	sandbox, err := client.Sandboxes().Create(ctx, "default", "secure-sandbox", &v1.SandboxSpec{
 //	    Template: &v1.SandboxTemplate{Image: "python:3.12"},
 //	    Policy: &v1.SandboxPolicy{
 //	        Version: 1,
@@ -302,7 +302,7 @@
 //
 // Replace the full policy at runtime via configuration update (available in a future release):
 //
-//	result, err := client.Config().Update(ctx, &v1.ConfigUpdate{
+//	result, err := client.Config().Update(ctx, "default", &v1.ConfigUpdate{
 //	    Name: "secure-sandbox",
 //	    Policy: &v1.SandboxPolicy{
 //	        Version: 2,
@@ -314,7 +314,7 @@
 //
 // Read a policy back from revision history (available in a future release):
 //
-//	revisions, err := client.Policy().List(ctx, "secure-sandbox")
+//	revisions, err := client.Policy().List(ctx, "default")
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -328,7 +328,7 @@
 //
 // Read sandbox and gateway configuration, and update settings:
 //
-//	sbCfg, err := client.Config().GetSandbox(ctx, "my-sandbox")
+//	sbCfg, err := client.Config().GetSandbox(ctx, "default", "my-sandbox")
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -343,7 +343,7 @@
 //	}
 //	fmt.Printf("Gateway settings revision: %d\n", gwCfg.SettingsRevision)
 //
-//	result, err := client.Config().Update(ctx, &v1.ConfigUpdate{
+//	result, err := client.Config().Update(ctx, "default", &v1.ConfigUpdate{
 //	    Name:       "my-sandbox",
 //	    SettingKey:  "max_tokens",
 //	    SettingValue: &v1.SettingValue{

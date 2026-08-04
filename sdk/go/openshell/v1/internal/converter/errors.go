@@ -15,7 +15,7 @@ var grpcToSDK = map[codes.Code]types.ErrorCode{
 	codes.AlreadyExists:      types.ErrorAlreadyExists,
 	codes.Unavailable:        types.ErrorUnavailable,
 	codes.PermissionDenied:   types.ErrorPermissionDenied,
-	codes.Unauthenticated:    types.ErrorPermissionDenied,
+	codes.Unauthenticated:    types.ErrorUnauthenticated,
 	codes.InvalidArgument:    types.ErrorInvalidArgument,
 	codes.DeadlineExceeded:   types.ErrorDeadlineExceeded,
 	codes.Canceled:           types.ErrorCancelled,
@@ -49,5 +49,6 @@ func FromGRPCError(err error) error {
 	return &types.StatusError{
 		Code:    code,
 		Message: st.Message(),
+		Cause:   err,
 	}
 }

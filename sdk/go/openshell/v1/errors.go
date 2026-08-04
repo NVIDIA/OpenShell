@@ -22,6 +22,7 @@ const (
 	ErrorInternal         = types.ErrorInternal
 	ErrorUnimplemented    = types.ErrorUnimplemented
 	ErrorConflict         = types.ErrorConflict
+	ErrorUnauthenticated  = types.ErrorUnauthenticated
 )
 
 // StatusError is the typed error returned by all SDK operations.
@@ -54,3 +55,6 @@ func IsUnimplemented(err error) bool { return types.IsUnimplemented(err) }
 // IsConflict returns true if the error indicates a conflict, such as
 // optimistic concurrency or an invalid state transition.
 func IsConflict(err error) bool { return types.IsConflict(err) }
+
+// IsUnauthenticated returns true if the error indicates missing or invalid credentials.
+func IsUnauthenticated(err error) bool { return types.IsUnauthenticated(err) }
