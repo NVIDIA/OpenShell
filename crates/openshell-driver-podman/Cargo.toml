@@ -35,6 +35,7 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 prost-types = { workspace = true }

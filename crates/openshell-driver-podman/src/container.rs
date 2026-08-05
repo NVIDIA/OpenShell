@@ -619,14 +619,8 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
     labels
 }
 
-fn workspace_probe_name(sandbox: &DriverSandbox) -> String {
-    const SUFFIX: &str = "-workdir-probe";
-    let container_name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
-    let keep = 255usize.saturating_sub(SUFFIX.len());
-    format!(
-        "{}{SUFFIX}",
-        &container_name[..container_name.len().min(keep)]
-    )
+fn workspace_probe_name() -> String {
+    format!("openshell-workdir-probe-{}", uuid::Uuid::new_v4().simple())
 }
 
 /// Parse resource limits from the sandbox template, falling back to defaults.
@@ -1341,7 +1335,9 @@ pub fn build_workspace_probe_spec(
     }
 
     let probe_spec = WorkspaceProbeSpec {
-        name: workspace_probe_name(sandbox),
+        // An attempt-unique name prevents an indeterminate create response
+        // from making a retry conflict with the first probe.
+        name: workspace_probe_name(),
         image: image.id.clone(),
         labels: BTreeMap::from([
             (LABEL_WORKSPACE_PROBE.into(), "true".into()),
@@ -1737,6 +1733,15 @@ mod tests {
                 "policy-group"
             ])
         );
+    }
+
+    #[test]
+    fn workspace_probe_names_are_attempt_unique() {
+        let first = workspace_probe_name();
+        let second = workspace_probe_name();
+
+        assert!(first.starts_with("openshell-workdir-probe-"));
+        assert_ne!(first, second);
     }
 
     #[test]

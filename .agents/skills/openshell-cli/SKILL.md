@@ -446,6 +446,13 @@ field wins independently; omitted fields fall back to the image declaration.
 An image with no `USER` fails before readiness unless policy supplies both
 fields.
 
+Docker and Podman gateways also honor the image's OCI `WORKDIR`. An empty
+value, `/`, or `/sandbox` uses the compatibility workspace at `/sandbox`.
+Any other value must be an absolute, normalized path that already exists in
+the image, contains no symlink components, and is traversable and writable by
+the sandbox UID, GID, and supplementary groups. Podman validates that access
+against the pinned image before its managed workspace volume covers the path.
+
 ### Forward ports
 
 ```bash

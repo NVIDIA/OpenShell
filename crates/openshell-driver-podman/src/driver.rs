@@ -289,15 +289,21 @@ async fn run_workspace_probe(
     let probe_name = probe.name().to_string();
     let image_id = probe.image_id().to_string();
     let create_body = probe.to_value();
-    let mut created = false;
+    // Set before awaiting create because a timeout or transport error can
+    // leave us unable to tell whether Podman created the container.
+    let mut cleanup_required = false;
     let validation = tokio::time::timeout(timeout, async {
         {
             let _lifecycle_guard = lifecycle_lock.lock().await;
-            client
-                .create_container(&create_body)
-                .await
-                .map_err(ComputeDriverError::from)?;
-            created = true;
+            cleanup_required = true;
+            if let Err(error) = client.create_container(&create_body).await {
+                if matches!(error, PodmanApiError::Conflict(_)) {
+                    // Do not remove a container that this attempt did not
+                    // create, even though UUID name collisions are unlikely.
+                    cleanup_required = false;
+                }
+                return Err(ComputeDriverError::from(error));
+            }
             client
                 .start_container(&probe_name)
                 .await
@@ -330,7 +336,7 @@ async fn run_workspace_probe(
         )))
     });
 
-    if !created {
+    if !cleanup_required {
         return validation;
     }
 
@@ -340,7 +346,9 @@ async fn run_workspace_probe(
             .remove_container(&probe_name, stop_timeout_secs)
             .await
     };
-    if let Err(cleanup_error) = cleanup {
+    if let Err(cleanup_error) = cleanup
+        && !matches!(cleanup_error, PodmanApiError::NotFound(_))
+    {
         if validation.is_ok() {
             return Err(ComputeDriverError::from(cleanup_error));
         }
@@ -2458,12 +2466,50 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("timed out"));
 
-        tokio::time::timeout(Duration::from_secs(2), handle)
+        tokio::time::timeout(Duration::from_secs(10), handle)
             .await
             .expect("timed-out probe should be force-removed")
             .expect("stub task should finish");
         let requests = request_log.lock().unwrap();
         assert!(requests.last().unwrap().starts_with("DELETE "));
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn workspace_probe_create_timeout_still_attempts_cleanup() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "workspace-probe-create-timeout",
+            vec![
+                StubResponse::new(StatusCode::CREATED, "{}").with_delay(Duration::from_millis(100)),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+            ],
+        );
+        let driver = test_driver(socket_path.clone());
+        let sandbox = workspace_probe_sandbox("sandbox-probe-create-timeout");
+        let image = workspace_probe_image(&driver.config);
+        let probe = container::build_workspace_probe_spec(&sandbox, &driver.config, &image)
+            .unwrap()
+            .unwrap();
+
+        let error = run_workspace_probe(
+            driver.client.clone(),
+            Arc::clone(&driver.container_lifecycle_lock),
+            driver.config.stop_timeout_secs,
+            probe,
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("ambiguous create should be reconciled")
+            .expect("stub task should finish");
+        let requests = request_log.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("/libpod/containers/create"));
+        assert!(requests[1].starts_with("DELETE "));
         let _ = fs::remove_file(socket_path);
     }
 
