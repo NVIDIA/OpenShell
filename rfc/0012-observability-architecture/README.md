@@ -385,7 +385,7 @@ These approaches are not mutually exclusive. The design follows the same pattern
 
 ### Gateway-owned root span with TRACEPARENT
 
-An earlier version of this design proposed a long-lived gateway root span for the sandbox lifecycle, with agent spans as children via `TRACEPARENT`. This was rejected because sandbox lifetimes are unpredictable (seconds to days) and long-lived parent spans are an OTel antipattern: they delay export, strain backends, hold gateway memory, and misrepresent the semantic structure. Span links provide correlation without duration coupling.
+Instead of span links, the gateway could own a long-lived root span for the entire sandbox lifecycle and pass it to agents via `TRACEPARENT`, making agent spans children of the gateway span. This does not work well because sandbox lifetimes are unpredictable (seconds to days) and long-lived parent spans are an OTel antipattern: the batch exporter delays export until the span closes, trace backends assume traces complete within a time window, and the gateway holds open spans in memory for every concurrent sandbox. Span links provide correlation without duration coupling.
 
 ### Direct OTLP export from the sandbox
 
