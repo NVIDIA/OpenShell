@@ -365,7 +365,7 @@ Several mitigations should be part of the implementation:
 
 The OpenTelemetry Rust SDK is a non-trivial dependency. Feature-gating it at compile time is worth evaluating (alongside [#1943](https://github.com/NVIDIA/OpenShell/issues/1943)) so that builds without OTel support do not pay the binary size and compile time cost.
 
-Not all trace backends handle span links equally well. Jaeger and Grafana Tempo support bidirectional link navigation, but not all agent trace backends surface links in their UI (e.g., MLflow's OTLP ingestion may not). If that turns out to be the case for a given backend, the correlation story would be limited to resource attributes rather than navigable links.
+Not all trace backends handle span links equally well. Span links are ["related to" references between spans](https://opentelemetry.io/docs/concepts/signals/traces/#span-links) (see [Span links for sandbox-to-trace correlation](#span-links-for-sandbox-to-trace-correlation)), and a backend that supports them lets users click from an agent trace to the gateway's `sandbox.create` span and back. Jaeger and Grafana Tempo support this bidirectional navigation, but not all agent trace backends surface links in their UI (e.g., MLflow's OTLP ingestion may not). If a given backend does not render span links, the correlation story falls back to resource attributes (filtering by `openshell.sandbox.id`), which still works but requires manual querying rather than one-click navigation.
 
 ## Alternatives
 
