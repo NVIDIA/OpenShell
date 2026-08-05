@@ -251,7 +251,7 @@ The OTLP relay supports this through per-workspace OTLP endpoint configuration a
 
 Per-workspace sampling and rate limits follow the same pattern as per-sandbox limits described in the Risks section, but scoped to the workspace level. A noisy workspace should not exhaust the gateway's relay capacity for other tenants.
 
-The configuration model for per-workspace OTLP endpoints is not yet designed. Options include extending `gateway.toml` with per-workspace sections, using workspace-level CRDs, or deriving the endpoint from the workspace settings API. This decision depends on how workspace configuration is structured more broadly, which is outside the scope of this RFC but must be resolved before Phase 2 implementation. Per-workspace configuration would compose with the per-domain endpoint extension described in Visibility domains: a workspace could route its infrastructure traces to a shared platform Tempo while sending its agent traces to a workspace-specific MLflow instance.
+The configuration model for per-workspace OTLP endpoints is not yet designed. Options include extending `gateway.toml` with per-workspace sections, using workspace-level CRDs, or deriving the endpoint from the workspace settings API. This decision depends on how workspace configuration is structured more broadly, which is outside the scope of this RFC but must be resolved before the OTLP relay ships (see [Phase 2: Sandbox OTLP relay](#phase-2-sandbox-otlp-relay) in the Implementation plan). Per-workspace configuration would compose with the per-domain endpoint extension described in Visibility domains: a workspace could route its infrastructure traces to a shared platform Tempo while sending its agent traces to a workspace-specific MLflow instance.
 
 ### Metrics direction
 
