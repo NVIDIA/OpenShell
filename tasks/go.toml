@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Go SDK proto drift detection tasks
+# NOTE: This file is merged with the full tasks/go.toml from PR #2271.
+# The drift and build-check tasks below extend the Go SDK task set.
+
+["go:proto:drift"]
+description = "Check Go SDK proto files for drift against root proto definitions"
+run = "uv run python tasks/scripts/sdk_sync.py drift-report --sdk go --upstream-path proto --sdk-path sdk/go/proto"
+hide = true
+
+["go:proto:build-check"]
+description = "Run full Go SDK proto sync, generate, build, and test pipeline"
+dir = "sdk/go"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+STEP_NAMES=("sync" "gen" "build" "test")
+STEP_TASKS=("go:proto:sync" "go:proto:gen" "go:build" "go:test")
+LOG_FILE=$(mktemp)
+trap 'rm -f "$LOG_FILE"' EXIT
+
+FAILED_STEP=""
+for i in "${!STEP_NAMES[@]}"; do
+  STEP="${STEP_NAMES[$i]}"
+  TASK="${STEP_TASKS[$i]}"
+
+  if ! mise run "$TASK" > "$LOG_FILE" 2>&1; then
+    FAILED_STEP="$STEP"
+    break
+  fi
+done
+
+LOG_CONTENT=$(tail -500 "$LOG_FILE")
+
+if [ -z "$FAILED_STEP" ]; then
+  jq -n -c --arg sdk "go" \
+    '{sdk: $sdk, success: true, failed_step: null, log: ""}'
+else
+  jq -n -c --arg sdk "go" --arg step "$FAILED_STEP" --arg log "$LOG_CONTENT" \
+    '{sdk: $sdk, success: false, failed_step: $step, log: $log}'
+  exit 1
+fi
+'''
+hide = true
