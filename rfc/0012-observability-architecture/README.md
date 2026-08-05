@@ -13,9 +13,11 @@ links:
 
 ## Summary
 
-This RFC proposes a unified observability architecture for OpenShell covering tracing, logging, and monitoring. The core idea is a supervisor-local OTLP relay that collects agent-emitted traces from inside network-isolated sandboxes and forwards them through the gateway to an external collector. The relay complements recently merged infrastructure tracing for the gateway and VM driver, and builds on existing OCSF structured logging and Prometheus metrics.
+This RFC proposes a unified observability architecture for OpenShell covering tracing, logging, and monitoring. OpenShell observability splits into two distinct layers: infrastructure-level and agent-level. Infrastructure-level observability covers the platform itself (gateway request traces, compute driver lifecycle, supervisor network decisions, OCSF security events, Prometheus metrics). Agent-level observability covers what happens inside sandboxes (tool calls, LLM invocations, reasoning steps from frameworks like LangChain or CrewAI).
 
-The proposal also covers infrastructure trace instrumentation for components that have no OTEL coverage today (in-process compute drivers, CLI, sandbox supervisor), deployment configuration (Helm values, ServiceMonitor), OCSF-to-OTEL correlation, and the metrics maturity path.
+On the infrastructure side, recent contributions have started building coverage. OTLP trace export merged for the gateway and VM driver, OCSF structured logging covers security events, and Prometheus metrics provide basic request counting. This RFC extends that foundation to the remaining components (in-process compute drivers, CLI, sandbox supervisor) and adds deployment configuration (Helm values, ServiceMonitor), OCSF-to-OTEL correlation, and a metrics maturity path.
+
+On the agent side, the problem is harder: sandboxes are network-isolated, so an agent's OTEL SDK cannot reach an external collector. This RFC proposes a supervisor-local OTLP relay as the solution. The supervisor listens on standard OTLP ports inside the sandbox, collects agent-emitted traces, enriches them with sandbox context, and forwards them through the gateway to an external collector. The agent just exports to `localhost:4318`; the platform handles the rest.
 
 ## Motivation
 
