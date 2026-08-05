@@ -201,6 +201,7 @@ jobs:
     needs: [pr_metadata, build-gateway, build-supervisor]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
     permissions:
+      actions: read
       contents: read
       packages: read
     uses: ./.github/workflows/e2e-kubernetes-test.yml
