@@ -297,6 +297,71 @@ func (x *Workspace) GetStatus() *WorkspaceStatus {
 	return nil
 }
 
+// Opaque handle for a provider credential stored by gateway credential storage.
+// Handles are created by OpenShell and must not be authored by users.
+type CredentialHandle struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Internal storage owner or credential driver that owns this handle.
+	Driver string `protobuf:"bytes,1,opt,name=driver,proto3" json:"driver,omitempty"`
+	// Owner-owned opaque handle string.
+	Handle string `protobuf:"bytes,2,opt,name=handle,proto3" json:"handle,omitempty"`
+	// Owner-owned non-secret metadata.
+	Metadata      map[string]string `protobuf:"bytes,3,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CredentialHandle) Reset() {
+	*x = CredentialHandle{}
+	mi := &file_datamodel_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CredentialHandle) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CredentialHandle) ProtoMessage() {}
+
+func (x *CredentialHandle) ProtoReflect() protoreflect.Message {
+	mi := &file_datamodel_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CredentialHandle.ProtoReflect.Descriptor instead.
+func (*CredentialHandle) Descriptor() ([]byte, []int) {
+	return file_datamodel_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *CredentialHandle) GetDriver() string {
+	if x != nil {
+		return x.Driver
+	}
+	return ""
+}
+
+func (x *CredentialHandle) GetHandle() string {
+	if x != nil {
+		return x.Handle
+	}
+	return ""
+}
+
+func (x *CredentialHandle) GetMetadata() map[string]string {
+	if x != nil {
+		return x.Metadata
+	}
+	return nil
+}
+
 // Provider model stored by OpenShell.
 type Provider struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -315,13 +380,16 @@ type Provider struct {
 	// Empty string = platform/global scope. Must be empty or match
 	// metadata.workspace; cross-workspace references are rejected.
 	ProfileWorkspace string `protobuf:"bytes,6,opt,name=profile_workspace,json=profileWorkspace,proto3" json:"profile_workspace,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Opaque handles for secret values stored through gateway credential storage.
+	// This map is internal gateway state and is not accepted as user-authored input.
+	CredentialHandles map[string]*CredentialHandle `protobuf:"bytes,7,rep,name=credential_handles,json=credentialHandles,proto3" json:"credential_handles,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Provider) Reset() {
 	*x = Provider{}
-	mi := &file_datamodel_proto_msgTypes[3]
+	mi := &file_datamodel_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -333,7 +401,7 @@ func (x *Provider) String() string {
 func (*Provider) ProtoMessage() {}
 
 func (x *Provider) ProtoReflect() protoreflect.Message {
-	mi := &file_datamodel_proto_msgTypes[3]
+	mi := &file_datamodel_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -346,7 +414,7 @@ func (x *Provider) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Provider.ProtoReflect.Descriptor instead.
 func (*Provider) Descriptor() ([]byte, []int) {
-	return file_datamodel_proto_rawDescGZIP(), []int{3}
+	return file_datamodel_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *Provider) GetMetadata() *ObjectMeta {
@@ -391,6 +459,13 @@ func (x *Provider) GetProfileWorkspace() string {
 	return ""
 }
 
+func (x *Provider) GetCredentialHandles() map[string]*CredentialHandle {
+	if x != nil {
+		return x.CredentialHandles
+	}
+	return nil
+}
+
 var File_datamodel_proto protoreflect.FileDescriptor
 
 const file_datamodel_proto_rawDesc = "" +
@@ -416,14 +491,22 @@ const file_datamodel_proto_rawDesc = "" +
 	"\x05phase\x18\x01 \x01(\x0e2&.openshell.datamodel.v1.WorkspacePhaseR\x05phase\"\x8c\x01\n" +
 	"\tWorkspace\x12>\n" +
 	"\bmetadata\x18\x01 \x01(\v2\".openshell.datamodel.v1.ObjectMetaR\bmetadata\x12?\n" +
-	"\x06status\x18\x02 \x01(\v2'.openshell.datamodel.v1.WorkspaceStatusR\x06status\"\xe7\x04\n" +
+	"\x06status\x18\x02 \x01(\v2'.openshell.datamodel.v1.WorkspaceStatusR\x06status\"\xd3\x01\n" +
+	"\x10CredentialHandle\x12\x16\n" +
+	"\x06driver\x18\x01 \x01(\tR\x06driver\x12\x16\n" +
+	"\x06handle\x18\x02 \x01(\tR\x06handle\x12R\n" +
+	"\bmetadata\x18\x03 \x03(\v26.openshell.datamodel.v1.CredentialHandle.MetadataEntryR\bmetadata\x1a;\n" +
+	"\rMetadataEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xbf\x06\n" +
 	"\bProvider\x12>\n" +
 	"\bmetadata\x18\x01 \x01(\v2\".openshell.datamodel.v1.ObjectMetaR\bmetadata\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12Y\n" +
 	"\vcredentials\x18\x03 \x03(\v21.openshell.datamodel.v1.Provider.CredentialsEntryB\x04\x88\xb5\x18\x01R\vcredentials\x12D\n" +
 	"\x06config\x18\x04 \x03(\v2,.openshell.datamodel.v1.Provider.ConfigEntryR\x06config\x12t\n" +
 	"\x18credential_expires_at_ms\x18\x05 \x03(\v2;.openshell.datamodel.v1.Provider.CredentialExpiresAtMsEntryR\x15credentialExpiresAtMs\x12+\n" +
-	"\x11profile_workspace\x18\x06 \x01(\tR\x10profileWorkspace\x1a>\n" +
+	"\x11profile_workspace\x18\x06 \x01(\tR\x10profileWorkspace\x12f\n" +
+	"\x12credential_handles\x18\a \x03(\v27.openshell.datamodel.v1.Provider.CredentialHandlesEntryR\x11credentialHandles\x1a>\n" +
 	"\x10CredentialsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a9\n" +
@@ -432,7 +515,10 @@ const file_datamodel_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aH\n" +
 	"\x1aCredentialExpiresAtMsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x03R\x05value:\x028\x01*n\n" +
+	"\x05value\x18\x02 \x01(\x03R\x05value:\x028\x01\x1an\n" +
+	"\x16CredentialHandlesEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12>\n" +
+	"\x05value\x18\x02 \x01(\v2(.openshell.datamodel.v1.CredentialHandleR\x05value:\x028\x01*n\n" +
 	"\x0eWorkspacePhase\x12\x1f\n" +
 	"\x1bWORKSPACE_PHASE_UNSPECIFIED\x10\x00\x12\x1a\n" +
 	"\x16WORKSPACE_PHASE_ACTIVE\x10\x01\x12\x1f\n" +
@@ -451,34 +537,40 @@ func file_datamodel_proto_rawDescGZIP() []byte {
 }
 
 var file_datamodel_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_datamodel_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_datamodel_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_datamodel_proto_goTypes = []any{
-	(WorkspacePhase)(0),     // 0: openshell.datamodel.v1.WorkspacePhase
-	(*ObjectMeta)(nil),      // 1: openshell.datamodel.v1.ObjectMeta
-	(*WorkspaceStatus)(nil), // 2: openshell.datamodel.v1.WorkspaceStatus
-	(*Workspace)(nil),       // 3: openshell.datamodel.v1.Workspace
-	(*Provider)(nil),        // 4: openshell.datamodel.v1.Provider
-	nil,                     // 5: openshell.datamodel.v1.ObjectMeta.LabelsEntry
-	nil,                     // 6: openshell.datamodel.v1.ObjectMeta.AnnotationsEntry
-	nil,                     // 7: openshell.datamodel.v1.Provider.CredentialsEntry
-	nil,                     // 8: openshell.datamodel.v1.Provider.ConfigEntry
-	nil,                     // 9: openshell.datamodel.v1.Provider.CredentialExpiresAtMsEntry
+	(WorkspacePhase)(0),      // 0: openshell.datamodel.v1.WorkspacePhase
+	(*ObjectMeta)(nil),       // 1: openshell.datamodel.v1.ObjectMeta
+	(*WorkspaceStatus)(nil),  // 2: openshell.datamodel.v1.WorkspaceStatus
+	(*Workspace)(nil),        // 3: openshell.datamodel.v1.Workspace
+	(*CredentialHandle)(nil), // 4: openshell.datamodel.v1.CredentialHandle
+	(*Provider)(nil),         // 5: openshell.datamodel.v1.Provider
+	nil,                      // 6: openshell.datamodel.v1.ObjectMeta.LabelsEntry
+	nil,                      // 7: openshell.datamodel.v1.ObjectMeta.AnnotationsEntry
+	nil,                      // 8: openshell.datamodel.v1.CredentialHandle.MetadataEntry
+	nil,                      // 9: openshell.datamodel.v1.Provider.CredentialsEntry
+	nil,                      // 10: openshell.datamodel.v1.Provider.ConfigEntry
+	nil,                      // 11: openshell.datamodel.v1.Provider.CredentialExpiresAtMsEntry
+	nil,                      // 12: openshell.datamodel.v1.Provider.CredentialHandlesEntry
 }
 var file_datamodel_proto_depIdxs = []int32{
-	5, // 0: openshell.datamodel.v1.ObjectMeta.labels:type_name -> openshell.datamodel.v1.ObjectMeta.LabelsEntry
-	6, // 1: openshell.datamodel.v1.ObjectMeta.annotations:type_name -> openshell.datamodel.v1.ObjectMeta.AnnotationsEntry
-	0, // 2: openshell.datamodel.v1.WorkspaceStatus.phase:type_name -> openshell.datamodel.v1.WorkspacePhase
-	1, // 3: openshell.datamodel.v1.Workspace.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
-	2, // 4: openshell.datamodel.v1.Workspace.status:type_name -> openshell.datamodel.v1.WorkspaceStatus
-	1, // 5: openshell.datamodel.v1.Provider.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
-	7, // 6: openshell.datamodel.v1.Provider.credentials:type_name -> openshell.datamodel.v1.Provider.CredentialsEntry
-	8, // 7: openshell.datamodel.v1.Provider.config:type_name -> openshell.datamodel.v1.Provider.ConfigEntry
-	9, // 8: openshell.datamodel.v1.Provider.credential_expires_at_ms:type_name -> openshell.datamodel.v1.Provider.CredentialExpiresAtMsEntry
-	9, // [9:9] is the sub-list for method output_type
-	9, // [9:9] is the sub-list for method input_type
-	9, // [9:9] is the sub-list for extension type_name
-	9, // [9:9] is the sub-list for extension extendee
-	0, // [0:9] is the sub-list for field type_name
+	6,  // 0: openshell.datamodel.v1.ObjectMeta.labels:type_name -> openshell.datamodel.v1.ObjectMeta.LabelsEntry
+	7,  // 1: openshell.datamodel.v1.ObjectMeta.annotations:type_name -> openshell.datamodel.v1.ObjectMeta.AnnotationsEntry
+	0,  // 2: openshell.datamodel.v1.WorkspaceStatus.phase:type_name -> openshell.datamodel.v1.WorkspacePhase
+	1,  // 3: openshell.datamodel.v1.Workspace.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
+	2,  // 4: openshell.datamodel.v1.Workspace.status:type_name -> openshell.datamodel.v1.WorkspaceStatus
+	8,  // 5: openshell.datamodel.v1.CredentialHandle.metadata:type_name -> openshell.datamodel.v1.CredentialHandle.MetadataEntry
+	1,  // 6: openshell.datamodel.v1.Provider.metadata:type_name -> openshell.datamodel.v1.ObjectMeta
+	9,  // 7: openshell.datamodel.v1.Provider.credentials:type_name -> openshell.datamodel.v1.Provider.CredentialsEntry
+	10, // 8: openshell.datamodel.v1.Provider.config:type_name -> openshell.datamodel.v1.Provider.ConfigEntry
+	11, // 9: openshell.datamodel.v1.Provider.credential_expires_at_ms:type_name -> openshell.datamodel.v1.Provider.CredentialExpiresAtMsEntry
+	12, // 10: openshell.datamodel.v1.Provider.credential_handles:type_name -> openshell.datamodel.v1.Provider.CredentialHandlesEntry
+	4,  // 11: openshell.datamodel.v1.Provider.CredentialHandlesEntry.value:type_name -> openshell.datamodel.v1.CredentialHandle
+	12, // [12:12] is the sub-list for method output_type
+	12, // [12:12] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_datamodel_proto_init() }
@@ -492,7 +584,7 @@ func file_datamodel_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_datamodel_proto_rawDesc), len(file_datamodel_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   9,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

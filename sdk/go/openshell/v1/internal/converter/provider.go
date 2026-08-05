@@ -19,7 +19,8 @@ func ProviderFromProto(p *dm.Provider) *types.Provider {
 	result := &types.Provider{
 		Type: p.GetType(),
 		Spec: types.ProviderSpec{
-			Config: CopyStringMap(p.GetConfig()),
+			Config:           CopyStringMap(p.GetConfig()),
+			ProfileWorkspace: p.GetProfileWorkspace(),
 		},
 	}
 
@@ -38,6 +39,17 @@ func ProviderFromProto(p *dm.Provider) *types.Provider {
 		result.Spec.CredentialExpiresAt = make(map[string]time.Time, len(expires))
 		for k, ms := range expires {
 			result.Spec.CredentialExpiresAt[k] = TimeFromMillis(ms)
+		}
+	}
+
+	if handles := p.GetCredentialHandles(); len(handles) > 0 {
+		result.Spec.CredentialHandles = make(map[string]types.CredentialHandle, len(handles))
+		for k, h := range handles {
+			result.Spec.CredentialHandles[k] = types.CredentialHandle{
+				Driver:   h.GetDriver(),
+				Handle:   h.GetHandle(),
+				Metadata: CopyStringMap(h.GetMetadata()),
+			}
 		}
 	}
 
@@ -61,15 +73,27 @@ func ProviderToProto(p *types.Provider) *dm.Provider {
 			Workspace:           p.Workspace,
 			DeletionTimestampMs: MillisFromTimePtr(p.DeletionTimestamp),
 		},
-		Type:        p.Type,
-		Credentials: CopyStringMap(p.Spec.Credentials),
-		Config:      CopyStringMap(p.Spec.Config),
+		Type:             p.Type,
+		Credentials:      CopyStringMap(p.Spec.Credentials),
+		Config:           CopyStringMap(p.Spec.Config),
+		ProfileWorkspace: p.Spec.ProfileWorkspace,
 	}
 
 	if len(p.Spec.CredentialExpiresAt) > 0 {
 		result.CredentialExpiresAtMs = make(map[string]int64, len(p.Spec.CredentialExpiresAt))
 		for k, t := range p.Spec.CredentialExpiresAt {
 			result.CredentialExpiresAtMs[k] = MillisFromTime(t)
+		}
+	}
+
+	if len(p.Spec.CredentialHandles) > 0 {
+		result.CredentialHandles = make(map[string]*dm.CredentialHandle, len(p.Spec.CredentialHandles))
+		for k, h := range p.Spec.CredentialHandles {
+			result.CredentialHandles[k] = &dm.CredentialHandle{
+				Driver:   h.Driver,
+				Handle:   h.Handle,
+				Metadata: CopyStringMap(h.Metadata),
+			}
 		}
 	}
 

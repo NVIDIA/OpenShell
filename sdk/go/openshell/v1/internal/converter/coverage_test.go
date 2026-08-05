@@ -6,6 +6,7 @@ package converter
 import (
 	"testing"
 
+	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	sandboxpb "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -151,6 +152,30 @@ func TestConverterCoversAllProtoFields_L7DenyRule(t *testing.T) {
 	}
 
 	assertAllFieldsCovered(t, (&sandboxpb.L7DenyRule{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_Provider(t *testing.T) {
+	handled := fieldSet{
+		"metadata":                 true,
+		"type":                     true,
+		"credentials":              true,
+		"config":                   true,
+		"credential_expires_at_ms": true,
+		"profile_workspace":        true,
+		"credential_handles":       true,
+	}
+
+	assertAllFieldsCovered(t, (&dm.Provider{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_CredentialHandle(t *testing.T) {
+	handled := fieldSet{
+		"driver":   true,
+		"handle":   true,
+		"metadata": true,
+	}
+
+	assertAllFieldsCovered(t, (&dm.CredentialHandle{}).ProtoReflect().Descriptor(), handled, nil)
 }
 
 func TestConverterCoversAllProtoFields_McpOptions(t *testing.T) {

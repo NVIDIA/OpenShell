@@ -24,4 +24,15 @@ type ProviderSpec struct {
 	Credentials         map[string]string
 	Config              map[string]string
 	CredentialExpiresAt map[string]time.Time
+	ProfileWorkspace    string
+	CredentialHandles   map[string]CredentialHandle
+}
+
+// CredentialHandle is an opaque handle for a provider credential stored by
+// gateway credential storage. Handles are created by OpenShell and are not
+// accepted as user-authored input.
+type CredentialHandle struct {
+	Driver   string
+	Handle   string
+	Metadata map[string]string
 }
