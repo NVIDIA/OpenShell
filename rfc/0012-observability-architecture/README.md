@@ -121,6 +121,8 @@ The gateway:
 
 For agents, the experience is: `OTEL_EXPORTER_OTLP_ENDPOINT` is set automatically in the sandbox environment, pointing at the supervisor's OTLP receiver. Any OTel-instrumented framework works without OpenShell-specific code.
 
+The relay also creates a clean separation of concerns between three roles. The agent developer exports to a fixed, auto-injected endpoint and never thinks about collector topology, authentication, or routing. The same agent code works in every sandbox, every deployment, every workspace. The workspace administrator decides where their workspace's telemetry goes (which collector, which MLflow instance, what sampling rates) without touching agent configuration. The global administrator configures the default OTLP endpoint and platform-wide policies like rate limits and enrichment. With direct collector access, the agent developer would need to know the collector address, and that address varies by deployment and workspace. The relay makes observability routing an operational concern rather than a development one.
+
 ### OTLP receiver reachability per driver
 
 All container-based drivers share a networking subtlety that affects how the OTLP receiver is reached. The supervisor creates an internal workload network namespace for the agent process, connected to the supervisor's namespace via a veth pair. The proxy already binds to the host-side veth IP (available from `netns.host_ip()`) to intercept agent traffic. This means `localhost` inside the agent's network namespace is not the same `localhost` the supervisor sees.
@@ -358,6 +360,7 @@ The supervisor relay is preferred as the default for four reasons:
 - Multi-tenancy: one collector per gateway host does not scale to multi-tenant deployments where workspaces need separate OTLP endpoints.
 - Reliability: the SSRF engine blocks `host.openshell.internal` on newer gateway versions ([#2478](https://github.com/NVIDIA/OpenShell/issues/2478)), TCP connections hang on the K8s driver, and it requires per-sandbox policy configuration.
 - Enrichment: the relay enables the supervisor to attach sandbox context as resource attributes, which is unavailable on the direct path.
+- Separation of concerns: the relay decouples agent development from observability operations. With direct access, agents need deployment-specific collector addresses. The relay gives every agent a fixed local endpoint regardless of where traces end up.
 
 These approaches are not mutually exclusive. The design follows the same pattern as `inference.local`: the relay is the zero-config default, and users can override `OTEL_EXPORTER_OTLP_ENDPOINT` to `host.openshell.internal:<port>` or any other endpoint.
 
