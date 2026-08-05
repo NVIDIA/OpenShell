@@ -72,6 +72,7 @@ impl TestOpenShell {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         );
     }
@@ -379,6 +380,11 @@ impl OpenShell for TestOpenShell {
                 provider.credential_expires_at_ms,
             ),
             profile_workspace: existing.profile_workspace,
+            credential_handles: if provider.credential_handles.is_empty() {
+                existing.credential_handles
+            } else {
+                provider.credential_handles
+            },
         };
         let updated_name = updated.object_name().to_string();
         providers.insert(updated_name, updated.clone());

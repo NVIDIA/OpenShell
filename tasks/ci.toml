@@ -65,5 +65,5 @@ hide = true
 
 ["pre-commit"]
 description = "Run lint, formatting, and license checks"
-depends = ["lint"]
+depends = ["fmt", "lint"]
 hide = true

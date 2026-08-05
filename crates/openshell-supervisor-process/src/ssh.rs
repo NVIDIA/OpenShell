@@ -14,6 +14,7 @@ use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_ocsf::{
@@ -663,13 +664,17 @@ pub async fn connect_in_netns(
             .await
             .map_err(|_| std::io::Error::other("netns connect thread panicked"))??;
         std_stream.set_nonblocking(true)?;
-        return tokio::net::TcpStream::from_std(std_stream);
+        let stream = tokio::net::TcpStream::from_std(std_stream)?;
+        set_tcp_nodelay_best_effort(&stream);
+        return Ok(stream);
     }
 
     #[cfg(not(target_os = "linux"))]
     let _ = netns_fd;
 
-    tokio::net::TcpStream::connect(addr).await
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    set_tcp_nodelay_best_effort(&stream);
+    Ok(stream)
 }
 
 #[derive(Clone)]
@@ -1350,6 +1355,20 @@ fn is_loopback_host(host: &str) -> bool {
 mod tests {
     use super::*;
     use std::process::Stdio;
+
+    /// Regression test: the direct-tcpip connect path sets `TCP_NODELAY`.
+    #[tokio::test]
+    async fn connect_in_netns_sets_tcp_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let stream = connect_in_netns(&addr.to_string(), None)
+            .await
+            .expect("connect");
+        assert!(stream.nodelay().expect("query TCP_NODELAY"));
+    }
 
     #[cfg(unix)]
     fn file_mode(path: &Path) -> u32 {

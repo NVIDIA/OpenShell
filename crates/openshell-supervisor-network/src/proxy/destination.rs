@@ -9,6 +9,7 @@ use super::{
     resolve_and_check_trusted_gateway, resolve_and_reject_internal,
 };
 use ipnet::IpNet;
+use openshell_core::net::connect_tcp_nodelay_best_effort;
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpStream;
 
@@ -108,6 +109,9 @@ impl UpstreamConnector {
         &self.addrs
     }
 
+    /// Opens the connection with `TCP_NODELAY` set: this is the upstream dial
+    /// boundary for latency-sensitive proxied request/response traffic, where
+    /// Nagle would stall sub-MSS writes on delayed ACKs.
     pub(super) async fn connect(&self) -> std::io::Result<TcpStream> {
         tracing::debug!(
             host = %self.host,
@@ -115,7 +119,7 @@ impl UpstreamConnector {
             address_count = self.addrs.len(),
             "Opening validated upstream connection"
         );
-        TcpStream::connect(self.addrs.as_slice()).await
+        connect_tcp_nodelay_best_effort(self.addrs.as_slice()).await
     }
 
     fn new(host: &str, port: u16, addrs: Vec<SocketAddr>) -> Self {
@@ -192,6 +196,19 @@ mod tests {
             sandbox_entrypoint_pid: 0,
             plan,
         }
+    }
+
+    /// Regression test: the shared upstream dial boundary sets `TCP_NODELAY`.
+    #[tokio::test]
+    async fn upstream_connector_sets_tcp_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let connector = UpstreamConnector::new("127.0.0.1", addr.port(), vec![addr]);
+        let stream = connector.connect().await.expect("connect");
+        assert!(stream.nodelay().expect("query TCP_NODELAY"));
     }
 
     #[tokio::test]

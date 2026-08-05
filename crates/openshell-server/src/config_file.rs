@@ -68,6 +68,11 @@ pub struct OpenShellRoot {
     /// independently of this crate.
     #[serde(default)]
     pub drivers: BTreeMap<String, toml::Value>,
+
+    /// `[openshell.credential_drivers.<name>]` tables — passed verbatim to
+    /// credential driver implementations after gateway-level selection.
+    #[serde(default)]
+    pub credential_drivers: BTreeMap<String, toml::Value>,
 }
 
 /// `[openshell.gateway]` section.
@@ -95,6 +100,12 @@ pub struct GatewayFileSection {
     // ── Drivers ──────────────────────────────────────────────────────────
     #[serde(default)]
     pub compute_drivers: Option<Vec<String>>,
+    #[serde(default)]
+    pub credential_drivers: Option<Vec<String>>,
+    #[serde(default)]
+    pub default_credential_driver: Option<String>,
+    #[serde(default)]
+    pub credential_storage: Option<toml::Table>,
 
     // ── Sandbox / SSH ────────────────────────────────────────────────────
     #[serde(default)]
@@ -255,6 +266,11 @@ pub enum ConfigFileError {
         env: &'static str,
         cli: &'static str,
     },
+    #[error("invalid gateway config field `{field}`: {message}")]
+    InvalidValue {
+        field: &'static str,
+        message: &'static str,
+    },
 }
 
 /// Load and validate a TOML config file.
@@ -285,6 +301,18 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
             field: "database_url",
             env: "OPENSHELL_DB_URL",
             cli: "--db-url",
+        });
+    }
+    if file
+        .openshell
+        .gateway
+        .credential_drivers
+        .as_ref()
+        .is_some_and(Vec::is_empty)
+    {
+        return Err(ConfigFileError::InvalidValue {
+            field: "openshell.gateway.credential_drivers",
+            message: "omit the field to use default encrypted gateway credential storage, or specify exactly one external credential driver",
         });
     }
 
@@ -422,6 +450,7 @@ bind_address = "0.0.0.0:8080"
 health_bind_address = "0.0.0.0:8081"
 log_level = "info"
 compute_drivers = ["kubernetes"]
+credential_drivers = ["kubernetes-secrets"]
 sandbox_namespace = "agents"
 grpc_rate_limit_requests = 120
 grpc_rate_limit_window_seconds = 60
@@ -443,6 +472,9 @@ audience = "openshell-cli"
 [openshell.drivers.kubernetes]
 namespace = "agents"
 grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
+
+[openshell.credential_drivers.kubernetes-secrets]
+namespace = "agents"
 "#;
         let tmp = write_tmp(toml);
         let file = load(tmp.path()).expect("valid file parses");
@@ -460,7 +492,32 @@ grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
         );
         assert!(gw.tls.is_some());
         assert!(gw.oidc.is_some());
+        assert_eq!(
+            gw.credential_drivers.as_deref(),
+            Some(&["kubernetes-secrets".to_string()][..])
+        );
+        assert!(gw.default_credential_driver.is_none());
         assert!(file.openshell.drivers.contains_key("kubernetes"));
+        assert!(
+            file.openshell
+                .credential_drivers
+                .contains_key("kubernetes-secrets")
+        );
+    }
+
+    #[test]
+    fn rejects_explicit_empty_credential_drivers() {
+        let tmp = write_tmp(
+            r"
+[openshell.gateway]
+credential_drivers = []
+",
+        );
+
+        let err = load(tmp.path()).unwrap_err();
+
+        assert!(err.to_string().contains("credential_drivers"));
+        assert!(err.to_string().contains("omit the field"));
     }
 
     #[test]

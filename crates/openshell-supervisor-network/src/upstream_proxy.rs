@@ -52,6 +52,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use base64::Engine as _;
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::debug;
@@ -798,6 +799,7 @@ async fn connect_via_inner(
     target: ConnectTarget,
 ) -> std::io::Result<PrefixedStream> {
     let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
+    set_tcp_nodelay_best_effort(&stream);
 
     let target = match target {
         ConnectTarget::Ip(IpAddr::V6(ip)) => format!("[{ip}]:{port}"),

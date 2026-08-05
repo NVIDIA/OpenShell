@@ -15,7 +15,10 @@ use crate::upstream_proxy::{self, UpstreamProxyConfig};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::denial::DenialEvent;
-use openshell_core::net::{is_always_blocked_ip, is_internal_ip, is_link_local_ip};
+use openshell_core::net::{
+    connect_tcp_nodelay_best_effort, is_always_blocked_ip, is_internal_ip, is_link_local_ip,
+    set_tcp_nodelay_best_effort,
+};
 use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
@@ -314,6 +317,7 @@ impl ProxyHandle {
                     Ok((stream, _addr)) => {
                         consecutive_resource_errors = 0;
                         consecutive_unknown_errors = 0;
+                        set_tcp_nodelay_best_effort(&stream);
                         let opa = opa_engine.clone();
                         let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
@@ -3197,13 +3201,13 @@ async fn dial_upstream(
             }
             upstream_proxy::ProxyDecision::Direct(direct_addrs) => {
                 Ok(upstream_proxy::PrefixedStream::without_prefix(
-                    TcpStream::connect(&direct_addrs[..]).await?,
+                    connect_tcp_nodelay_best_effort(&direct_addrs[..]).await?,
                 ))
             }
         };
     }
     Ok(upstream_proxy::PrefixedStream::without_prefix(
-        TcpStream::connect(addrs).await?,
+        connect_tcp_nodelay_best_effort(addrs).await?,
     ))
 }
 
