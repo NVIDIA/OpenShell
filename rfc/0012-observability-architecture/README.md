@@ -86,7 +86,9 @@ Two distinct visibility domains flow through the same OTLP relay pipeline:
 1. **Infrastructure traces** (operator-only): gateway request spans, driver lifecycle, supervisor network/process/middleware spans. Locked as operator-only per [#2508](https://github.com/NVIDIA/OpenShell/issues/2508).
 2. **Agent traces** (agent developer): tool calls, LLM invocations, reasoning steps from agent frameworks inside sandboxes. Routable to a separate backend (e.g., MLflow) from infrastructure traces (e.g., Tempo).
 
-The platform integrator configures this routing at the collector level (e.g., route spans with `openshell.sandbox.*` attributes to MLflow, route spans with `openshell-gateway` service name to Tempo). OpenShell emits both to the same OTLP endpoint; the collector separates them.
+These two domains serve different user groups with different backend needs. Infrastructure traces typically go to the platform operator's monitoring stack (Tempo, Jaeger) for SLI/SLO dashboards and latency debugging. Agent traces go to the agent developer's tools (MLflow) for inspecting tool calls and reasoning steps. These may be entirely different systems, managed by different teams, with different retention and sampling policies.
+
+Initially, both domains go to the same configured OTLP endpoint, and the platform integrator separates them at the collector level using resource attributes (e.g., route spans with `openshell.sandbox.*` attributes to MLflow, route spans with `openshell-gateway` service name to Tempo). As a future extension, the gateway could support per-domain OTLP endpoints (`infra_endpoint` and `agent_endpoint` alongside the default `endpoint`) so it can route infrastructure and agent traces to different backends directly, without requiring collector-side routing rules. This would also compose with per-workspace endpoints (see Multi-tenant observability below), giving each workspace independent routing for each visibility domain.
 
 ### Supervisor as telemetry relay
 
@@ -224,6 +226,9 @@ The gateway's `gateway.toml` needs an OTLP section:
 [openshell.gateway.otlp]
 endpoint = "http://otel-collector.monitoring:4317"
 service_name = "openshell-gateway"
+# Future: per-domain endpoints (initially, both go to `endpoint`)
+# infra_endpoint = "http://tempo:4317"
+# agent_endpoint = "http://mlflow:4317"
 ```
 
 The Helm chart needs corresponding values that template into the ConfigMap:
@@ -247,7 +252,7 @@ The OTLP relay supports this through per-workspace OTLP endpoint configuration a
 
 Per-workspace sampling and rate limits follow the same pattern as per-sandbox limits described in the Risks section, but scoped to the workspace level. A noisy workspace should not exhaust the gateway's relay capacity for other tenants.
 
-The configuration model for per-workspace OTLP endpoints is not yet designed. Options include extending `gateway.toml` with per-workspace sections, using workspace-level CRDs, or deriving the endpoint from the workspace settings API. This decision depends on how workspace configuration is structured more broadly, which is outside the scope of this RFC but must be resolved before Phase 2 implementation.
+The configuration model for per-workspace OTLP endpoints is not yet designed. Options include extending `gateway.toml` with per-workspace sections, using workspace-level CRDs, or deriving the endpoint from the workspace settings API. This decision depends on how workspace configuration is structured more broadly, which is outside the scope of this RFC but must be resolved before Phase 2 implementation. Per-workspace configuration would compose with the per-domain endpoint extension described in Visibility domains: a workspace could route its infrastructure traces to a shared platform Tempo while sending its agent traces to a workspace-specific MLflow instance.
 
 ### Metrics direction
 
