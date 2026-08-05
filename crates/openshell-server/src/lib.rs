@@ -1597,7 +1597,7 @@ mod tests {
             ComputeDriverKind::Podman,
             ComputeDriverKind::Vm,
         ] {
-            let message = unsupported_builtin_compute_driver(driver).to_string();
+            let message = super::unsupported_builtin_compute_driver(driver).to_string();
             assert!(
                 message.contains("unsupported on Windows"),
                 "{driver} rejection should be explicit, got: {message}"

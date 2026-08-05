@@ -33,6 +33,7 @@
 use super::AcquiredRemoteDriverEndpoint;
 #[cfg(unix)]
 use super::ManagedDriverProcess;
+#[cfg(not(target_os = "windows"))]
 use crate::config_file::OtlpConfig;
 #[cfg(unix)]
 use crate::otel_tracing::TraceContextInterceptor;
