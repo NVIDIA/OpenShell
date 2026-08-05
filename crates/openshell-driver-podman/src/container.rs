@@ -207,6 +207,24 @@ impl ResolvedPodmanImage {
             &config.sandbox_ssh_socket_path,
         )
         .map_err(ComputeDriverError::Precondition)?;
+        if let Some(volumes) = image_config.and_then(|config| config.volumes.as_ref()) {
+            for volume in volumes.keys() {
+                driver_mounts::validate_container_mount_target(volume).map_err(|error| {
+                    ComputeDriverError::Precondition(format!(
+                        "invalid image-declared volume '{volume}': {error}"
+                    ))
+                })?;
+                driver_mounts::validate_workspace_mount_target(volume, &workspace_root).map_err(
+                    |_| {
+                        ComputeDriverError::Precondition(format!(
+                            "image-declared volume '{volume}' masks OCI WorkingDir '{workspace_root}' before workspace validation"
+                        ))
+                    },
+                )?;
+                driver_mounts::validate_mount_control_path(volume, &config.sandbox_ssh_socket_path)
+                    .map_err(ComputeDriverError::Precondition)?;
+            }
+        }
         Ok(Self {
             id: inspected.id.clone(),
             oci_user: image_config
@@ -1470,6 +1488,7 @@ mod tests {
             config: Some(ImageConfig {
                 user: user.to_string(),
                 working_dir: working_dir.to_string(),
+                volumes: None,
             }),
         }
     }
@@ -1675,6 +1694,21 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("OpenShell control path"));
+    }
+
+    #[test]
+    fn container_spec_rejects_image_volume_masking_workdir() {
+        let mut image = image_inspect("sha256:immutable", "app:staff", "/home/app/project");
+        image
+            .config
+            .as_mut()
+            .unwrap()
+            .volumes
+            .get_or_insert_default()
+            .insert("/home".into(), serde_json::json!({}));
+
+        let error = ResolvedPodmanImage::from_inspect(&image, &test_config()).unwrap_err();
+        assert!(error.to_string().contains("masks OCI WorkingDir"));
     }
 
     #[test]

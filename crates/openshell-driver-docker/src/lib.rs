@@ -2251,9 +2251,7 @@ fn build_environment_for_oci_user(
 
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
-    // Docker never uses the Podman prevalidation contract. Emit an explicit
-    // driver-owned empty value so image-baked ENV entries cannot select the
-    // managed-workspace mutation path for an image-provided workdir.
+    // Ignore image-provided Podman probe attestations.
     environment.insert(
         openshell_core::sandbox_env::OCI_WORKSPACE_IDENTITY.to_string(),
         String::new(),

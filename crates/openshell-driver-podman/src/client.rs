@@ -190,6 +190,8 @@ pub struct ImageConfig {
     pub user: String,
     #[serde(default)]
     pub working_dir: String,
+    #[serde(default)]
+    pub volumes: Option<HashMap<String, Value>>,
 }
 
 /// A container summary returned by the list API.
@@ -381,20 +383,15 @@ impl PodmanClient {
         timeout: Duration,
         max_bytes: usize,
     ) -> Result<(hyper::StatusCode, Bytes), PodmanApiError> {
-        use hyper::body::Body;
-
         let response = self.execute_request(req, timeout).await?;
         let status = response.status();
         let deadline = tokio::time::Instant::now() + timeout;
         let mut body = response.into_body();
         let mut bytes = Vec::with_capacity(max_bytes.min(4096));
         while bytes.len() < max_bytes {
-            let frame = tokio::time::timeout_at(
-                deadline,
-                std::future::poll_fn(|context| Pin::new(&mut body).poll_frame(context)),
-            )
-            .await
-            .map_err(|_| PodmanApiError::Timeout(timeout))?;
+            let frame = tokio::time::timeout_at(deadline, body.frame())
+                .await
+                .map_err(|_| PodmanApiError::Timeout(timeout))?;
             let Some(frame) = frame else {
                 break;
             };

@@ -455,12 +455,12 @@ and write and enter the workdir. OpenShell does not change that directory's
 ownership or mode. A one-shot validator drops to that identity and uses kernel
 effective-access checks, including POSIX ACL grants and LSM denials. It rejects
 workdirs that overlap the OCI runtime namespaces under `/proc`, `/sys`, or
-`/dev`, and rejects overlap with actual OpenShell control paths. Docker checks
-the original image filesystem in the final supervisor and rejects image
-`VOLUME` declarations that would mask the workdir or one of its parents before
-validation. Podman checks the same
-pinned image ID in a temporary networkless probe without the workspace volume,
-token, or TLS secrets. The probe retains only `SETUID` and `SETGID`, drops to
+`/dev`, and rejects overlap with actual OpenShell control paths. Both drivers
+reject image `VOLUME` declarations that would mask the workdir or one of its
+parents before validation. Docker checks the original image filesystem in the
+final supervisor. Podman checks the same pinned image ID in a temporary
+networkless probe without the workspace volume, token, or TLS secrets. The
+probe retains only `SETUID` and `SETGID`, drops to
 the identity selected by the effective global-or-sandbox policy, and uses the
 kernel to validate access. When neither policy exists, it discovers the image
 policy identity. The final supervisor must match the probe's normalized

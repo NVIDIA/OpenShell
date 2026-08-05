@@ -2237,6 +2237,7 @@ mod tests {
                 config: Some(crate::client::ImageConfig {
                     user: "1234:1235".into(),
                     working_dir: "/workspace".into(),
+                    volumes: None,
                 }),
             },
             config,
