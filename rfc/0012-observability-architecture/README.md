@@ -19,7 +19,7 @@ On the infrastructure side, contributions have started building coverage. OpenTe
 
 On the agent side, the problem is harder: sandboxes are network-isolated, so an agent's OpenTelemetry (OTel) SDK cannot reach an external collector, OCSF security events stay local with no centralized collection path ([#1922](https://github.com/NVIDIA/OpenShell/issues/1922)), and Prometheus cannot scrape metrics from inside isolated sandboxes. This RFC proposes a supervisor-local telemetry relay as the solution. The supervisor acts as a sidecar that mediates all observability data between the isolated sandbox and the platform. For traces, it listens on standard OTLP ports, collects agent-emitted spans, enriches them with sandbox context, and forwards them through the gateway to an external collector. The existing log push mechanism extends to carry OCSF event batches for centralized security log collection, and the relay can push sandbox-level metrics to the gateway.
 
-Tracing receives the most architectural attention in this RFC because it requires the most novel design (the relay, span links, enrichment pipeline). Logging and metrics build on existing foundations (OCSF is already designed, Prometheus is already wired) and extend through the same relay channel without needing separate architecture.
+Tracing receives the most architectural attention in this RFC because it requires the most novel design (the relay, span links for cross-trace correlation, enrichment pipeline). Logging and metrics build on existing foundations (OCSF is already designed, Prometheus is already wired) and extend through the same relay channel without needing separate architecture.
 
 ## Motivation
 
@@ -148,7 +148,7 @@ This pattern follows [Dapr](https://dapr.io)'s [sidecar](https://docs.dapr.io/co
 
 ### Span links for sandbox-to-trace correlation
 
-Agent traces from inside the sandbox are correlated with gateway infrastructure traces via [span links](https://opentelemetry.io/docs/concepts/signals/traces/#span-links), not parent-child relationships.
+Agent traces from inside the sandbox are correlated with gateway infrastructure traces via [span links](https://opentelemetry.io/docs/concepts/signals/traces/#span-links), not parent-child relationships. Span links are an OTel concept that lets one span reference another as "related" without implying that one is a child of the other. Unlike parent-child relationships (where the child's duration is contained within the parent's), linked spans are independent and can belong to different traces entirely.
 
 ```mermaid
 graph BT
