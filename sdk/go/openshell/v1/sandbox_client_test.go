@@ -26,20 +26,21 @@ const bufSize = 1024 * 1024
 
 type mockSandboxServer struct {
 	pb.UnimplementedOpenShellServer
-	mu            sync.Mutex
-	sandboxes     map[string]*pb.Sandbox
-	providers     map[string][]*dm.Provider
-	createErr     error
-	getErr        error
-	listErr       error
-	deleteErr     error
-	attachErr     error
-	detachErr     error
-	listProvErr   error
-	watchEvents   []*pb.SandboxStreamEvent
-	watchErr      error
-	watchKeepOpen chan struct{}           // if non-nil, WatchSandbox blocks after sending events until closed
-	watchRequest  *pb.WatchSandboxRequest // recorded request
+	mu                 sync.Mutex
+	sandboxes          map[string]*pb.Sandbox
+	providers          map[string][]*dm.Provider
+	createErr          error
+	getErr             error
+	listErr            error
+	deleteErr          error
+	attachErr          error
+	detachErr          error
+	listProvErr        error
+	watchEvents        []*pb.SandboxStreamEvent
+	watchErr           error
+	watchPostEventsErr error
+	watchKeepOpen      chan struct{}           // if non-nil, WatchSandbox blocks after sending events until closed
+	watchRequest       *pb.WatchSandboxRequest // recorded request
 
 	// GetLogs fields
 	getLogsResp    *pb.GetSandboxLogsResponse
@@ -175,6 +176,9 @@ func (s *mockSandboxServer) WatchSandbox(req *pb.WatchSandboxRequest, stream grp
 		if err := stream.Send(ev); err != nil {
 			return err
 		}
+	}
+	if s.watchPostEventsErr != nil {
+		return s.watchPostEventsErr
 	}
 	// If watchKeepOpen is set, block until it is closed (simulates long-running stream)
 	if keepOpen != nil {
@@ -686,6 +690,35 @@ func TestSandboxWatch_RPCError(t *testing.T) {
 
 	require.Error(t, err)
 	assert.True(t, IsUnavailable(err))
+}
+
+func TestSandboxWatch_MidStreamErrorDeliveredAsStatusError(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["sb-1"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Id: "id-1", Name: "sb-1"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_PROVISIONING},
+	}
+	mock.watchEvents = []*pb.SandboxStreamEvent{
+		{Payload: &pb.SandboxStreamEvent_Sandbox{Sandbox: &pb.Sandbox{
+			Metadata: &dm.ObjectMeta{Name: "sb-1", Id: "id-1"},
+			Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_PROVISIONING},
+		}}},
+	}
+	mock.watchPostEventsErr = status.Error(codes.Unavailable, "connection lost")
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	w, err := client.Watch(context.Background(), "default", "sb-1")
+	require.NoError(t, err)
+	defer w.Stop()
+
+	ev1 := <-w.ResultChan()
+	assert.Equal(t, EventAdded, ev1.Type)
+
+	ev2 := <-w.ResultChan()
+	assert.Equal(t, EventError, ev2.Type)
+	require.Error(t, ev2.Err)
+	assert.True(t, IsUnavailable(ev2.Err), "mid-stream error should be converted to StatusError")
 }
 
 // --- T016: Watch name-to-ID resolution verification tests ---

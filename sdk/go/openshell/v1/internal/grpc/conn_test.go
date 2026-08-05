@@ -60,7 +60,15 @@ func TestNewConnectionInsecureTLSConfig(t *testing.T) {
 	defer func() { _ = conn.Close() }()
 }
 
-func TestNewConnectionHTTPWithTokenAuth(t *testing.T) {
+func TestNewConnectionHTTPWithSecureAuthRejects(t *testing.T) {
+	auth := &testTokenAuth{token: "dev-token", requireSecurity: true}
+	_, err := NewConnection("http://127.0.0.1:1", nil, auth)
+	if err == nil {
+		t.Fatal("expected error when using http:// with auth that requires transport security")
+	}
+}
+
+func TestNewConnectionHTTPWithInsecureAuth(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -71,16 +79,17 @@ func TestNewConnectionHTTPWithTokenAuth(t *testing.T) {
 	go func() { _ = srv.Serve(lis) }()
 	defer srv.Stop()
 
-	auth := &testTokenAuth{token: "dev-token"}
+	auth := &testTokenAuth{token: "dev-token", requireSecurity: false}
 	conn, err := NewConnection("http://"+lis.Addr().String(), nil, auth)
 	if err != nil {
-		t.Fatalf("NewConnection with http:// + token auth failed: %v", err)
+		t.Fatalf("NewConnection with http:// + insecure auth failed: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
 }
 
 type testTokenAuth struct {
-	token string
+	token           string
+	requireSecurity bool
 }
 
 func (a *testTokenAuth) GetRequestMetadata(_ context.Context, _ ...string) (map[string]string, error) {
@@ -88,5 +97,5 @@ func (a *testTokenAuth) GetRequestMetadata(_ context.Context, _ ...string) (map[
 }
 
 func (a *testTokenAuth) RequireTransportSecurity() bool {
-	return true
+	return a.requireSecurity
 }

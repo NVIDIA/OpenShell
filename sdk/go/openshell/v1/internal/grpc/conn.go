@@ -5,7 +5,6 @@
 package grpc
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -52,8 +51,8 @@ func NewConnection(address string, tlsCfg *TLSParams, auth credentials.PerRPCCre
 	}
 
 	if auth != nil {
-		if usePlaintext {
-			auth = &insecureAuthWrapper{base: auth}
+		if usePlaintext && auth.RequireTransportSecurity() {
+			return nil, fmt.Errorf("grpc connect: auth provider requires transport security but address uses plaintext (http://)")
 		}
 		opts = append(opts, grpc.WithPerRPCCredentials(auth))
 	}
@@ -94,16 +93,4 @@ func buildTLSCredentials(cfg *TLSParams) (credentials.TransportCredentials, erro
 	}
 
 	return credentials.NewTLS(tlsConfig), nil
-}
-
-type insecureAuthWrapper struct {
-	base credentials.PerRPCCredentials
-}
-
-func (w *insecureAuthWrapper) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
-	return w.base.GetRequestMetadata(ctx, uri...)
-}
-
-func (w *insecureAuthWrapper) RequireTransportSecurity() bool {
-	return false
 }

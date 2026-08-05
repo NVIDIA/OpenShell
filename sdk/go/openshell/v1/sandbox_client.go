@@ -243,14 +243,10 @@ func (s *sandboxClient) Watch(ctx context.Context, workspace, name string, opts 
 			var recvErr error
 			ev, recvErr = stream.Recv()
 			if recvErr != nil {
-				select {
-				case <-w.done:
-				default:
-					if recvErr != io.EOF {
-						select {
-						case ch <- Event[*Sandbox]{Type: EventError, Err: recvErr}:
-						default:
-						}
+				if recvErr != io.EOF {
+					select {
+					case ch <- Event[*Sandbox]{Type: EventError, Err: converter.FromGRPCError(recvErr)}:
+					case <-w.done:
 					}
 				}
 				return
