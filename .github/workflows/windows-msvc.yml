@@ -25,13 +25,14 @@ jobs:
     runs-on: [self-hosted, windows-arm64]
     if: false # flip to true once the runner is online
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           install: false
           experimental: true
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.95.0"
           targets: aarch64-pc-windows-msvc
       - run: mise run --skip-tools windows:check:arm64
       - run: mise run --skip-tools windows:build:arm64
