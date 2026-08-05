@@ -3749,6 +3749,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-db-credstore"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "futures",
+ "openshell-core",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tonic",
+]
+
+[[package]]
 name = "openshell-driver-docker"
 version = "0.0.0"
 dependencies = [
@@ -3795,6 +3813,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-kubernetes-secrets"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "miette",
+ "openshell-core",
+ "serde",
+ "sha2 0.10.9",
+ "tokio",
+ "toml",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "openshell-driver-podman"
 version = "0.0.0"
 dependencies = [
@@ -3818,6 +3855,27 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "openshell-driver-vault"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "miette",
+ "openshell-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]
@@ -4035,6 +4093,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-sts",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "futures",
@@ -4059,9 +4118,12 @@ dependencies = [
  "notify",
  "openshell-bootstrap",
  "openshell-core",
+ "openshell-driver-db-credstore",
  "openshell-driver-docker",
  "openshell-driver-kubernetes",
+ "openshell-driver-kubernetes-secrets",
  "openshell-driver-podman",
+ "openshell-driver-vault",
  "openshell-gateway-interceptors",
  "openshell-ocsf",
  "openshell-otel",
@@ -4081,6 +4143,7 @@ dependencies = [
  "rand 0.9.4",
  "rcgen",
  "reqwest 0.12.28",
+ "ring",
  "russh",
  "rustix 1.1.4",
  "rustls 0.23.38",

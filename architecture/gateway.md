@@ -305,7 +305,13 @@ keeps only the current injectable credential values and optional per-credential
 expiry timestamps. A refresh normally mints one credential, but a strategy may
 co-mint several (AWS STS mints the access key, secret key, and session token in
 one call); the refresh state pins the resolved set of env keys it owns so
-collision checks reserve all of them before the first mint.
+collision checks reserve all of them before the first mint. Provider records
+keep inline credential values only for legacy records created before credential
+driver storage. New provider writes keep driver-owned credential handles. When
+no external credential driver is configured, gateways use server-owned encrypted
+database credential storage for defense in depth. Multi-replica deployments can
+use that default with a shared database and shared key-encryption key, or opt
+into an external backend such as Vault or Kubernetes Secrets.
 
 ### Optimistic Concurrency (CAS)
 

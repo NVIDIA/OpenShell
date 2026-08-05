@@ -12,6 +12,13 @@ One value is intentionally NOT rendered here:
                                  when server.externalDbSecret is set, otherwise
                                  --db-url arg for SQLite
 */}}
+{{- $credentialDrivers := list -}}
+{{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled -}}
+{{- $credentialDrivers = append $credentialDrivers "kubernetes-secrets" -}}
+{{- end -}}
+{{- if .Values.server.credentialDrivers.vault.enabled -}}
+{{- $credentialDrivers = append $credentialDrivers "vault" -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -32,6 +39,9 @@ data:
     metrics_bind_address  = "0.0.0.0:{{ .Values.service.metricsPort }}"
     {{- end }}
     log_level             = {{ .Values.server.logLevel | quote }}
+    {{- if $credentialDrivers }}
+    credential_drivers    = [{{- range $i, $driver := $credentialDrivers }}{{ if $i }}, {{ end }}{{ $driver | quote }}{{- end }}]
+    {{- end }}
     sandbox_namespace     = {{ include "openshell.sandboxNamespace" . | quote }}
     {{- $policyValidationFailureMode := .Values.server.policyValidationFailureMode }}
     {{- if not (has $policyValidationFailureMode (list "fail_closed" "retain_last_valid")) }}
@@ -156,3 +166,40 @@ data:
     [openshell.drivers.kubernetes.sidecar]
     proxy_uid                    = {{ .Values.supervisor.sidecar.proxyUid | default 1337 }}
     process_binary_aware_network_policy = {{ .Values.supervisor.sidecar.processBinaryAwareNetworkPolicy }}
+
+    {{- if not $credentialDrivers }}
+
+    [openshell.gateway.credential_storage]
+    key_encryption_key_env = {{ include "openshell.credentialStorageKeyEncryptionKeyEnvName" . | quote }}
+    {{- end }}
+
+    {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
+
+    [openshell.credential_drivers.kubernetes-secrets]
+    namespace = {{ include "openshell.credentialKubernetesSecretsNamespace" . | quote }}
+    allow_reference_namespace = {{ .Values.server.credentialDrivers.kubernetesSecrets.allowReferenceNamespace }}
+    {{- end }}
+
+    {{- if .Values.server.credentialDrivers.vault.enabled }}
+
+    [openshell.credential_drivers.vault]
+    address = {{ .Values.server.credentialDrivers.vault.address | quote }}
+    mount = {{ .Values.server.credentialDrivers.vault.mount | quote }}
+    kv_version = {{ .Values.server.credentialDrivers.vault.kvVersion | quote }}
+    auth_method = {{ .Values.server.credentialDrivers.vault.authMethod | quote }}
+    {{- if .Values.server.credentialDrivers.vault.role }}
+    role = {{ .Values.server.credentialDrivers.vault.role | quote }}
+    {{- end }}
+    {{- if .Values.server.credentialDrivers.vault.kubernetesAuthMount }}
+    kubernetes_auth_mount = {{ .Values.server.credentialDrivers.vault.kubernetesAuthMount | quote }}
+    {{- end }}
+    {{- if .Values.server.credentialDrivers.vault.serviceAccountTokenPath }}
+    service_account_token_path = {{ .Values.server.credentialDrivers.vault.serviceAccountTokenPath | quote }}
+    {{- end }}
+    {{- if .Values.server.credentialDrivers.vault.tokenPath }}
+    token_path = {{ .Values.server.credentialDrivers.vault.tokenPath | quote }}
+    {{- end }}
+    {{- if .Values.server.credentialDrivers.vault.timeoutSecs }}
+    timeout_secs = {{ .Values.server.credentialDrivers.vault.timeoutSecs }}
+    {{- end }}
+    {{- end }}
