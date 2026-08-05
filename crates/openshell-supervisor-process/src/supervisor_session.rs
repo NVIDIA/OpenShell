@@ -33,6 +33,7 @@ use tokio_stream::StreamExt;
 use tracing::{debug, warn};
 
 use openshell_core::grpc_client;
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -745,10 +746,14 @@ async fn connect_tcp_target(
             .await
             .map_err(|_| "netns tcp connect thread panicked")??;
         stream.set_nonblocking(true)?;
-        return Ok(tokio::net::TcpStream::from_std(stream)?);
+        let stream = tokio::net::TcpStream::from_std(stream)?;
+        set_tcp_nodelay_best_effort(&stream);
+        return Ok(stream);
     }
 
-    Ok(tokio::net::TcpStream::connect((host.as_str(), port)).await?)
+    let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+    set_tcp_nodelay_best_effort(&stream);
+    Ok(stream)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -757,7 +762,9 @@ async fn connect_tcp_target(
     port: u16,
     _netns_fd: Option<i32>,
 ) -> Result<tokio::net::TcpStream, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(tokio::net::TcpStream::connect((host.as_str(), port)).await?)
+    let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+    set_tcp_nodelay_best_effort(&stream);
+    Ok(stream)
 }
 
 #[cfg(test)]
@@ -797,6 +804,20 @@ mod target_tests {
             host: host.to_string(),
             port,
         }
+    }
+
+    /// Regression test: the TCP relay connect path sets `TCP_NODELAY`.
+    #[tokio::test]
+    async fn connect_tcp_target_sets_tcp_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let stream = connect_tcp_target(addr.ip().to_string(), addr.port(), None)
+            .await
+            .expect("connect");
+        assert!(stream.nodelay().expect("query TCP_NODELAY"));
     }
 
     #[test]

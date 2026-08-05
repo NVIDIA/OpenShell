@@ -57,6 +57,7 @@ mod tracing_setup;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::{ComputeDriverKind, Config, Error, ObjectLabels, Result};
 use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::HashMap;
@@ -598,6 +599,8 @@ async fn serve_gateway_listener(
             }
         };
 
+        set_tcp_nodelay_best_effort(&stream);
+
         spawn_gateway_connection(
             stream,
             addr,
@@ -849,7 +852,10 @@ async fn build_compute_runtime(
         }
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Vm) => {
             let vm_config = compute::driver_config::vm_config_from_context(driver_startup)?;
-            let endpoint = compute::vm::spawn(config, &vm_config).await?;
+            let otlp_config = driver_startup
+                .file
+                .and_then(|file| file.openshell.gateway.otlp.as_ref());
+            let endpoint = compute::vm::spawn(config, &vm_config, otlp_config).await?;
             ComputeRuntime::new_remote_driver(
                 endpoint,
                 store,

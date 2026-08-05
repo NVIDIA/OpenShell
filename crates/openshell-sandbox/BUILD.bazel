@@ -2,6 +2,7 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rustfmt_test")
 load("@workspace_version//:version.bzl", "WORKSPACE_VERSION")
 
 rust_library(
@@ -30,6 +31,7 @@ rust_binary(
 
 rust_test(
     name = "openshell-sandbox_lib_test",
+    compile_data = ["//crates/openshell-supervisor-network:sandbox-policy-rego"],
     crate = ":openshell-sandbox",
     crate_features = ["telemetry"],
     deps = all_crate_deps(normal_dev = True),
@@ -56,4 +58,16 @@ rust_test(
         normal = True,
         normal_dev = True,
     ) + [":openshell-sandbox"],
+)
+
+rustfmt_test(
+    name = "rustfmt_test",
+    targets = [
+        ":openshell-sandbox",
+        ":openshell-sandbox-bin",
+        ":openshell-sandbox_bin_test",
+        ":openshell-sandbox_lib_test",
+        ":stdout_logging_integration_test",
+    ],
+    visibility = ["//crates:__pkg__"],
 )

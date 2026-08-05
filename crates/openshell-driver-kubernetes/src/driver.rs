@@ -312,6 +312,10 @@ fn validate_kubernetes_driver_volume_mounts(
         }
 
         driver_mounts::validate_container_mount_target(&mount.mount_path)?;
+        driver_mounts::validate_workspace_mount_target(
+            &mount.mount_path,
+            driver_mounts::DEFAULT_WORKSPACE_ROOT,
+        )?;
         let normalized_mount_path = driver_mounts::normalize_mount_target(&mount.mount_path);
         if !mount_paths.insert(normalized_mount_path.clone()) {
             return Err(format!(
@@ -1432,8 +1436,8 @@ const BINARY_AWARE_SIDECAR_PROXY_UID: u32 = 0;
 /// Shared volume used by the network sidecar and process-only supervisor for
 /// local coordination in sidecar topology.
 const SIDECAR_STATE_VOLUME_NAME: &str = "openshell-sidecar-state";
-const SIDECAR_STATE_MOUNT_PATH: &str = "/run/openshell-sidecar";
-const SIDECAR_CONTROL_SOCKET: &str = "/run/openshell-sidecar/control.sock";
+const SIDECAR_STATE_MOUNT_PATH: &str = openshell_core::container_paths::SIDECAR_RUN_ROOT;
+const SIDECAR_CONTROL_SOCKET: &str = openshell_core::container_paths::SIDECAR_CONTROL_SOCKET;
 // Linux abstract socket names are scoped to the pod's shared network namespace.
 // Unlike a filesystem socket in the shared state volume, the workload cannot
 // unlink and replace this relay endpoint after the trusted supervisor binds it.
@@ -1442,8 +1446,8 @@ const SIDECAR_SSH_SOCKET_FILE: &str = "@openshell-sidecar-ssh";
 /// Shared TLS work directory. The network sidecar writes the proxy CA bundle
 /// here, while the agent container consumes it after sidecar bootstrap.
 const SIDECAR_TLS_VOLUME_NAME: &str = "openshell-supervisor-tls";
-const SIDECAR_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy";
-const SIDECAR_CLIENT_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy/client";
+const SIDECAR_TLS_MOUNT_PATH: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
+const SIDECAR_CLIENT_TLS_MOUNT_PATH: &str = openshell_core::container_paths::SIDECAR_CLIENT_TLS_DIR;
 
 /// Build the emptyDir volume that holds the supervisor binary.
 ///
@@ -1601,7 +1605,11 @@ fn apply_supervisor_sideload(
         // Override command to use the side-loaded supervisor binary
         container.insert(
             "command".to_string(),
-            serde_json::json!([format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH)]),
+            serde_json::json!([
+                format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH),
+                "--workdir",
+                driver_mounts::DEFAULT_WORKSPACE_ROOT
+            ]),
         );
 
         // Force the supervisor to run as root (UID 0). Sandbox images may set
@@ -1841,7 +1849,7 @@ fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_jso
             .expect("volumeMounts is an array")
             .push(serde_json::json!({
                 "name": "openshell-client-tls",
-                "mountPath": "/etc/openshell-tls/client",
+                "mountPath": openshell_core::container_paths::CLIENT_TLS_DIR,
                 "readOnly": true
             }));
     }
@@ -1917,7 +1925,9 @@ fn apply_supervisor_sidecar_topology(
             "command".to_string(),
             serde_json::json!([
                 format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH),
-                "--mode=process"
+                "--mode=process",
+                "--workdir",
+                driver_mounts::DEFAULT_WORKSPACE_ROOT
             ]),
         );
 
@@ -2560,7 +2570,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     if !params.client_tls_secret_name.is_empty() {
         volume_mounts.push(serde_json::json!({
             "name": CLIENT_TLS_VOLUME_NAME,
-            "mountPath": "/etc/openshell-tls/client",
+            "mountPath": openshell_core::container_paths::CLIENT_TLS_DIR,
             "readOnly": true
         }));
     }
@@ -4056,13 +4066,24 @@ mod tests {
             "init container must not depend on a shell"
         );
 
-        // Agent container command should be overridden to the emptyDir path
+        // `--workdir` is optional for standalone supervisor invocations and
+        // has no implicit default, so Kubernetes must pass its fixed workspace.
         let command = pod_template["spec"]["containers"][0]["command"]
             .as_array()
             .expect("command should be set");
         assert_eq!(
             command[0].as_str().unwrap(),
             format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox")
+        );
+        assert_eq!(
+            command,
+            serde_json::json!([
+                format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox"),
+                "--workdir",
+                driver_mounts::DEFAULT_WORKSPACE_ROOT
+            ])
+            .as_array()
+            .unwrap()
         );
 
         // Agent volume mount should be read-only
@@ -4211,7 +4232,9 @@ mod tests {
             agent["command"],
             serde_json::json!([
                 format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox"),
-                "--mode=process"
+                "--mode=process",
+                "--workdir",
+                driver_mounts::DEFAULT_WORKSPACE_ROOT
             ])
         );
         assert_eq!(agent["securityContext"]["runAsUser"], 1500);

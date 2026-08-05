@@ -19,8 +19,9 @@ version: 1
 
 # Static: locked at sandbox creation. Paths the agent can read vs read/write.
 filesystem_policy:
+  include_workdir: true
   read_only: [/usr, /lib, /etc]
-  read_write: [/sandbox, /tmp]
+  read_write: [/tmp]
 
 # Static: Landlock LSM kernel enforcement. best_effort uses highest ABI the host supports.
 landlock:
@@ -99,7 +100,7 @@ See [Supervisor Middleware](/extensibility/supervisor-middleware) for registrati
 
 ## Baseline Filesystem Paths
 
-When a sandbox runs in proxy mode (the default), OpenShell automatically adds baseline filesystem paths required for the sandbox child process to function: `/usr`, `/lib`, `/etc`, `/var/log` (read-only) and `/sandbox`, `/tmp` (read-write). Paths like `/app` are included in the baseline set but are only added if they exist in the container image.
+When a sandbox runs in proxy mode (the default), OpenShell automatically adds baseline filesystem paths required for the sandbox child process to function: `/usr`, `/lib`, `/etc`, and `/var/log` (read-only), plus `/tmp` (read-write). When `filesystem.include_workdir` is `true`, OpenShell also adds the resolved working directory as read-write. Paths like `/app` are included in the baseline set but are only added if they exist in the container image.
 
 For GPU sandboxes, OpenShell also adds existing GPU device nodes as read-write paths. CUDA workloads require write access to procfs for thread metadata, so GPU baseline enrichment moves `/proc` from read-only to read-write when GPU devices are present.
 

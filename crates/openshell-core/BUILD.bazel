@@ -1,6 +1,7 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rustfmt_test")
 load("@workspace_version//:version.bzl", "WORKSPACE_VERSION")
 
 rust_library(
@@ -32,4 +33,13 @@ rust_test(
     crate_features = ["telemetry"],
     rustc_flags = ["--cfg=bazel"],
     deps = all_crate_deps(normal_dev = True),
+)
+
+rustfmt_test(
+    name = "rustfmt_test",
+    targets = [
+        ":openshell-core",
+        ":openshell-core_test",
+    ],
+    visibility = ["//crates:__pkg__"],
 )

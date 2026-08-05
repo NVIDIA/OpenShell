@@ -174,7 +174,7 @@ The policy separates filesystem paths into read-only and read-write groups.
 
 | Aspect | Detail |
 |---|---|
-| Default | System paths (`/usr`, `/lib`, `/etc`, `/var/log`) are read-only. Working paths (`/sandbox`, `/tmp`) are read-write. `/app` is conditionally included if it exists. |
+| Default | System paths (`/usr`, `/lib`, `/etc`, `/var/log`) are read-only. The resolved working directory and `/tmp` are read-write. `/app` is conditionally included if it exists. |
 | What you can change | Add or remove paths in `filesystem_policy.read_only` and `filesystem_policy.read_write`. |
 | Risk if relaxed | Making system paths writable lets the agent replace binaries, modify TLS trust stores, or change DNS resolution. Validation rejects broad read-write paths (like `/`). |
 | Recommendation | Keep system paths read-only. If the agent needs additional writable space, add a specific subdirectory. |

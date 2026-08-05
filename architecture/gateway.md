@@ -637,17 +637,21 @@ export: the table's presence is the on-switch, and `OTEL_EXPORTER_OTLP_ENDPOINT`
 is ignored so enablement has a single source. TOML decides whether and where
 to export; the SDK's `OTEL_*` variables tune how. Transport is OTLP over gRPC
 only. Shared provider, resource, and tracing-layer construction lives in
-`openshell-otel`.
+`openshell-otel`, along with shared HTTP/tonic trace-context propagation and
+gRPC failure recording.
 
-Span emission requires no per-handler instrumentation. The `tower_http`
-`TraceLayer` in `multiplex.rs` opens a span per inbound request, and that span
-continues incoming W3C trace context when present or starts a new trace
-otherwise. It is named for the RPC and carries the request ID that also appears
-in the gateway's logs — the identifier that lets an operator pivot between a
-trace and its log lines. Store and compute-driver spans become children of the
-request span. Reconciliation, provider refresh, and driver-watch loops create
-their own operation spans because they have no inbound request to provide a
-parent. gRPC status is recorded when response trailers arrive.
+The `tower_http` `TraceLayer` in `multiplex.rs` opens a span per inbound request,
+and that span continues incoming W3C trace context when present or starts a new
+trace otherwise. It is named for the RPC and carries the request ID that also
+appears in the gateway's logs — the identifier that lets an operator pivot
+between a trace and its log lines. Store and compute-driver spans become
+children of the request span. Reconciliation, provider refresh, and
+driver-watch loops create their own operation spans because they have no
+inbound request to provide a parent. gRPC status is recorded when response
+trailers arrive.
+
+The gateway forwards OTLP configuration and W3C trace context to managed
+external drivers. Each driver exports under its own service name.
 
 Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
 failure stops the gateway from serving: a malformed endpoint is logged at

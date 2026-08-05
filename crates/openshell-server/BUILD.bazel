@@ -2,6 +2,7 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rustfmt_test")
 
 rust_library(
     name = "openshell-server",
@@ -99,6 +100,23 @@ rust_test(
         normal = True,
         normal_dev = True,
     ) + [":openshell-server"],
+)
+
+rustfmt_test(
+    name = "rustfmt_test",
+    targets = [
+        ":auth_endpoint_integration_test",
+        ":edge_tunnel_auth_integration_test",
+        ":health_endpoint_integration_test",
+        ":multiplex_integration_test",
+        ":multiplex_tls_integration_test",
+        ":openshell-gateway",
+        ":openshell-server",
+        ":openshell-server_test",
+        ":supervisor_relay_integration_test",
+        ":ws_tunnel_integration_test",
+    ],
+    visibility = ["//crates:__pkg__"],
 )
 
 rust_test(

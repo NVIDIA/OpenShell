@@ -154,7 +154,7 @@ impl Default for DockerComputeConfig {
             guest_tls_key: None,
             network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
             host_gateway_ip: String::new(),
-            ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
+            ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
             enable_bind_mounts: false,
         }
@@ -221,6 +221,8 @@ struct DockerProvisioningFailure {
 struct DockerImageMetadata {
     id: String,
     user: String,
+    working_dir: String,
+    volumes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -618,19 +620,13 @@ impl DockerComputeDriver {
         Self::validate_sandbox_auth(sandbox)?;
         self.validate_user_volume_mounts_available(&validated.driver_config)
             .await?;
-        let gpu_devices = self
+        let _ = self
             .resolve_gpu_cdi_devices(
                 validated.gpu_requirements,
                 &validated.driver_config,
                 CdiGpuDefaultSelector::peek_device_ids,
             )
             .await?;
-        let _ = build_container_create_body_with_gpu_devices(
-            sandbox,
-            &self.config,
-            &validated.driver_config,
-            gpu_devices.as_deref(),
-        )?;
 
         if self
             .find_managed_container_summary(&sandbox.id, &sandbox.name)
@@ -1322,11 +1318,22 @@ impl DockerComputeDriver {
                 "docker image '{image}' inspection did not return an immutable image ID"
             ))
         })?;
-        let user = inspect
-            .config
-            .and_then(|config| config.user)
-            .unwrap_or_default();
-        Ok(DockerImageMetadata { id, user })
+        let (user, working_dir, volumes) = inspect.config.map_or_else(
+            || (String::new(), String::new(), Vec::new()),
+            |config| {
+                (
+                    config.user.unwrap_or_default(),
+                    config.working_dir.unwrap_or_default(),
+                    config.volumes.unwrap_or_default(),
+                )
+            },
+        );
+        Ok(DockerImageMetadata {
+            id,
+            user,
+            working_dir,
+            volumes,
+        })
     }
 
     async fn pull_image(&self, sandbox_id: &str, image: &str) -> Result<(), Status> {
@@ -2334,6 +2341,7 @@ fn build_container_create_body(
     build_container_create_body_with_gpu_devices(sandbox, config, &driver_config, cdi_devices)
 }
 
+#[cfg(test)]
 fn build_container_create_body_with_gpu_devices(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
@@ -2353,6 +2361,8 @@ fn build_container_create_body_with_gpu_devices(
         &DockerImageMetadata {
             id: template.image.clone(),
             user: String::new(),
+            working_dir: String::new(),
+            volumes: Vec::new(),
         },
     )
 }
@@ -2373,6 +2383,36 @@ fn build_container_create_body_for_image(
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
+    let workspace_root = driver_mounts::resolve_oci_workspace_root(&image.working_dir)
+        .map_err(Status::failed_precondition)?;
+    driver_mounts::validate_workspace_control_path(&workspace_root, &config.ssh_socket_path)
+        .map_err(Status::failed_precondition)?;
+    for volume in &image.volumes {
+        driver_mounts::validate_container_mount_target(volume).map_err(|error| {
+            Status::failed_precondition(format!(
+                "invalid image-declared volume '{volume}': {error}"
+            ))
+        })?;
+        driver_mounts::validate_workspace_mount_target(volume, &workspace_root).map_err(|_| {
+            Status::failed_precondition(format!(
+                "image-declared volume '{volume}' masks OCI WorkingDir '{workspace_root}' before workspace validation"
+            ))
+        })?;
+        driver_mounts::validate_mount_control_path(volume, &config.ssh_socket_path)
+            .map_err(Status::failed_precondition)?;
+    }
+    for mount in &driver_config.mounts {
+        let target = match mount {
+            DockerDriverMountConfig::Bind { target, .. }
+            | DockerDriverMountConfig::Volume { target, .. }
+            | DockerDriverMountConfig::Tmpfs { target, .. }
+            | DockerDriverMountConfig::Image { target, .. } => target,
+        };
+        driver_mounts::validate_workspace_mount_target(target, &workspace_root)
+            .map_err(Status::failed_precondition)?;
+        driver_mounts::validate_mount_control_path(target, &config.ssh_socket_path)
+            .map_err(Status::failed_precondition)?;
+    }
     let user_mounts = docker_driver_mounts(driver_config)?;
     let user_bind_strings = docker_driver_bind_strings(driver_config)?;
     let device_requests = gpu_device_ids.map(|device_ids| {
@@ -2405,11 +2445,14 @@ fn build_container_create_body_for_image(
     Ok(ContainerCreateBody {
         image: Some(image.id.clone()),
         user: Some("0".to_string()),
+        // The image workspace may need to be created or rejected by the
+        // supervisor, so do not let the OCI runtime chdir there first.
+        working_dir: Some("/".to_string()),
         env: Some(build_environment_for_oci_user(sandbox, config, &image.user)),
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
-        // Clear the image CMD so Docker does not append inherited args to the
-        // supervisor entrypoint.
-        cmd: Some(Vec::new()),
+        // Replace the image CMD with the supervisor's resolved workspace
+        // argument so Docker cannot append inherited image arguments.
+        cmd: Some(vec!["--workdir".to_string(), workspace_root]),
         labels: Some(labels),
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,

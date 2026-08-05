@@ -12,6 +12,7 @@
 pub mod activity;
 pub mod auth;
 pub mod config;
+pub mod container_paths;
 pub mod denial;
 pub mod driver_mounts;
 pub mod driver_utils;

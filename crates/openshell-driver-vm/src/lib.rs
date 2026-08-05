@@ -7,6 +7,7 @@ mod ffi;
 pub mod gpu;
 pub mod lifecycle;
 mod nft_ruleset;
+pub mod otel_tracing;
 pub mod procguard;
 mod rootfs;
 mod runtime;

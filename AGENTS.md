@@ -169,6 +169,19 @@ ocsf_emit!(event);
 
 - If you change sandbox infrastructure, ensure the relevant sandbox e2e path succeeds.
 
+## Network Sockets
+
+- On latency-sensitive TCP streams, disable Nagle's algorithm so small
+  request/response frames don't stall on delayed ACKs. Use
+  `openshell_core::net::set_tcp_nodelay_best_effort` on an accepted or
+  already-connected stream, or `openshell_core::net::connect_tcp_nodelay_best_effort`
+  when dialing.
+- This applies to loopback/localhost TCP too — the delayed-ACK stall is a timer
+  behavior, not wire latency.
+- You should skip it for unix domain sockets (no Nagle). It's not critical for
+  test-only connections, though using it on any non-UDS TCP stream — tests
+  included — is fine and preferred.
+
 ## Commits
 
 - Always use [Conventional Commits](https://www.conventionalcommits.org/) format for commit messages

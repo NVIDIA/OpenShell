@@ -45,11 +45,11 @@ use openshell_core::proto::{
     RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
     RemoveWorkspaceMemberResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
     RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
-    RotateProviderCredentialResponse, SandboxResponse, SandboxStreamEvent, ServiceEndpointResponse,
-    ServiceStatus, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorMessage,
-    TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest,
-    UpdateConfigResponse, UpdateProviderProfilesRequest, UpdateProviderProfilesResponse,
-    UpdateProviderRequest, WatchSandboxRequest, open_shell_server::OpenShell,
+    RotateProviderCredentialResponse, SandboxResponse, ServiceEndpointResponse, ServiceStatus,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame,
+    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
+    WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -272,7 +272,7 @@ impl OpenShell for OpenShellService {
         sandbox::handle_create_sandbox(&self.state, request).await
     }
 
-    type WatchSandboxStream = ReceiverStream<Result<SandboxStreamEvent, Status>>;
+    type WatchSandboxStream = sandbox::WatchSandboxStream;
 
     async fn watch_sandbox(
         &self,

@@ -1,17 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Network IP classification utilities shared across `OpenShell` crates.
+//! Shared networking utilities for `OpenShell` crates.
 //!
-//! These helpers enforce the always-blocked IP invariant (loopback, link-local,
-//! unspecified) and the broader internal-IP classification (adds RFC 1918 and
-//! ULA).  They are used by:
+//! The IP-classification helpers enforce the always-blocked IP invariant
+//! (loopback, link-local, unspecified) and the broader internal-IP
+//! classification (adds RFC 1918 and ULA).  They are used by:
 //! - The sandbox proxy for runtime SSRF enforcement
 //! - The mechanistic mapper for proposal filtering
 //! - The gateway server for defense-in-depth validation on approval
+//!
+//! The socket tuning helpers ([`set_tcp_nodelay_best_effort`],
+//! [`connect_tcp_nodelay_best_effort`]) help avoid the known latency
+//! imposed by conflict between Nagle's algorithm and delayed ACK behaviors.
+//!
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use tokio::net::TcpStream;
 
 /// Check if a hostname is a known cloud metadata hostname that resolves to an
 /// always-blocked metadata service.
@@ -277,6 +283,27 @@ fn is_internal_v4(v4: Ipv4Addr) -> bool {
         return true;
     }
     false
+}
+
+/// Enable `TCP_NODELAY` on a stream, logging (not returning) any failure.
+///
+/// Disabling Nagle's algorithm keeps small writes from waiting on delayed ACKs.
+/// It's a latency optimization: if it fails the connection still works, just a
+/// bit slower, so there is nothing for the caller to act on — we log and move on.
+pub fn set_tcp_nodelay_best_effort(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!(error = %e, "failed to set TCP_NODELAY");
+    }
+}
+
+/// Connect to `addrs`, then enable `TCP_NODELAY` on a best-effort basis, propagating
+/// any errors from `TcpStream::connect`.
+///
+/// The returned stream is not *guaranteed* to have `TCP_NODELAY` set.
+pub async fn connect_tcp_nodelay_best_effort(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
+    let stream = TcpStream::connect(addrs).await?;
+    set_tcp_nodelay_best_effort(&stream);
+    Ok(stream)
 }
 
 #[cfg(test)]
@@ -698,5 +725,32 @@ mod tests {
     fn test_internal_ip_ipv6_mapped_cgnat() {
         let v6 = Ipv4Addr::new(100, 64, 0, 1).to_ipv6_mapped();
         assert!(is_internal_ip(IpAddr::V6(v6)));
+    }
+
+    // -- tcp_nodelay helpers --
+
+    #[tokio::test]
+    async fn set_tcp_nodelay_best_effort_enables_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let stream = TcpStream::connect(addr).await.expect("connect");
+
+        set_tcp_nodelay_best_effort(&stream);
+        assert!(stream.nodelay().expect("query TCP_NODELAY"));
+    }
+
+    #[tokio::test]
+    async fn connect_tcp_nodelay_best_effort_sets_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        let stream = connect_tcp_nodelay_best_effort(&[addr])
+            .await
+            .expect("connect");
+        assert!(stream.nodelay().expect("query TCP_NODELAY"));
     }
 }

@@ -19,13 +19,40 @@ sandbox and starts the `openshell-sandbox` supervisor inside that container. The
 supervisor then creates the nested sandbox namespace for the agent process.
 
 Before creating the container, the driver inspects the final sandbox image and
-captures its immutable image ID and raw OCI `Config.User`. Container creation
-uses that image ID, preventing a mutable tag from changing between inspection
-and launch. The supervisor runs as root, resolves omitted policy identity fields
-from the image declaration, and drops only agent children to the resulting
-identity. Named OCI components remain names after validation; a missing group
-is filled with the user's numeric primary GID. Explicit `process.run_as_user`
-and `process.run_as_group` values take precedence independently.
+captures its immutable image ID, raw OCI `Config.User`, and OCI
+`Config.WorkingDir`. Container creation uses that image ID, preventing a
+mutable tag from changing between inspection and launch. The supervisor runs as
+root, resolves omitted policy identity fields from the image declaration, and
+drops only agent children to the resulting identity. Named OCI components
+remain names after validation; a missing group is filled with the user's
+numeric primary GID. Explicit `process.run_as_user` and
+`process.run_as_group` values take precedence independently.
+
+An absolute OCI working directory becomes the agent workspace. An empty,
+root (`/`), or explicit `/sandbox` declaration uses `/sandbox`, which OpenShell
+creates when necessary and owns as a compatibility workspace. Any other image
+workdir must already exist without symlink components. The completed identity,
+including supplementary groups, must already be able to traverse every parent
+and write and enter the workdir. OpenShell does not change its ownership or
+mode.
+
+OpenShell deliberately asks the Linux kernel to make this access decision
+under the completed sandbox identity instead of reproducing permission rules
+from ownership and mode bits. Mode-bit inspection alone can reject authority
+granted by a POSIX ACL or overlook a denial imposed by a Linux Security Module
+such as SELinux or AppArmor. OpenShell does not configure or otherwise manage
+ACLs or LSM policy here; the one-shot validator only observes the kernel's
+effective decision. This keeps the no-authority-expansion invariant aligned
+with the access the eventual workload will receive without adding a separate,
+incomplete permission model to OpenShell.
+
+Image `VOLUME` declarations must not cover the workdir or one of its parents
+because Docker would mount the volume before the supervisor could validate the
+immutable image path.
+Workdirs under the standard OCI runtime namespaces `/proc`, `/sys`, and `/dev`
+are rejected, as are paths that overlap concrete OpenShell control resources.
+The workspace is the child cwd and `HOME`. The supervisor starts from `/`, then
+reports an invalid workdir as a readiness failure.
 
 Docker containers join an OpenShell-managed bridge network. The driver injects
 `host.openshell.internal` and `host.docker.internal` so supervisors have stable
@@ -77,9 +104,11 @@ optional `selinux_label` of `shared` (applies `:z`) or `private` (applies
 `subpath`. User-supplied bind and volume mounts are read-only by default; set
 `read_only: false` to make them writable. Mount `source`, `target`, and
 `subpath` values must not contain surrounding whitespace. Mount targets must be
-absolute container paths and must not replace the workspace root (`/sandbox`)
-or overlap OpenShell supervisor files, `/etc/openshell`, `/etc/openshell-tls`,
-or `/run/netns`.
+absolute container paths and must not replace or contain the resolved workspace
+root. Nested workspace mounts remain valid. Mounts also must not overlap the
+configured SSH socket or the reserved `/opt/openshell`, `/etc/openshell`,
+`/etc/openshell-tls`, `/run/openshell`, `/run/openshell-sidecar`, and network
+namespace roots.
 
 Example named-volume usage:
 
