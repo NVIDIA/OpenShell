@@ -100,7 +100,7 @@ pub fn reconcile_stale_bindings(sysfs: &SysfsRoot, state_path: &Path) -> Vec<Str
     restored
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::bind::test_refcounts;

@@ -310,13 +310,13 @@ impl VfioIdRegistry {
         self.refcounts.clear();
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn remove(&mut self, id: &str) {
         self.refcounts.remove(id);
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) mod test_refcounts {
     use super::VFIO_ID_REGISTRY;
     use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -337,7 +337,7 @@ pub(crate) mod test_refcounts {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{

@@ -102,21 +102,26 @@ Run them with the architecture-specific focused task on the native host.
 
 ## Cargo Excludes
 
-The Windows wrapper intentionally excludes unsupported driver packages as
+The Windows wrapper intentionally excludes unsupported runtime packages as
 top-level workspace targets for check/test:
 
 ```text
 --exclude openshell-driver-docker
 --exclude openshell-driver-kubernetes
+--exclude openshell-driver-kubernetes-secrets
 --exclude openshell-driver-podman
+--exclude openshell-driver-vault
 --exclude openshell-driver-vm
+--exclude openshell-sandbox
 --exclude openshell-supervisor-process
+--exclude openshell-vfio
 ```
 
-This does not mean all driver code disappears from the build graph. Docker,
-Kubernetes, and Podman stubs can still compile as gateway dependencies. The
-process supervisor is also excluded because its runtime is not supported on
-Windows.
+The gateway keeps platform configuration and unsupported-operation contracts
+without depending on the Docker, Kubernetes, Podman, sandbox supervisor,
+process supervisor, VM, or VFIO runtime crates. The Kubernetes Secrets and
+Vault libraries still compile as gateway dependencies; only their standalone
+Unix-socket binaries and package-level tests are excluded as top-level targets.
 
 ## Common Errors
 

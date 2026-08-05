@@ -69,8 +69,7 @@ Out of scope:
 - Do not enable Docker, Kubernetes, Podman, or VM runtimes on Windows.
 - Do not build, package, ship, or smoke-test standalone Windows binaries for
   unsupported compute drivers.
-- Keep unsupported drivers in the Windows build graph only as library/config
-  stubs when needed by the gateway.
+- Exclude unsupported Windows runtime crates from the Windows gateway dependency graph.
 - Unsupported Windows runtime entry points must return a clear unsupported
   error.
 - Keep Windows-specific code behind `#[cfg(target_os = "windows")]`.
@@ -232,8 +231,10 @@ crypto dependency builds.
 | `windows:ci` | Runs the full ordered x64-host Windows CI lane, plus ARM64 check/build when not skipped. |
 
 The unsupported driver package excludes are intentional. They prevent standalone
-driver crates from being top-level Windows check/test targets while still
-allowing Windows stubs to compile through gateway dependencies.
+driver crates from being top-level Windows check/test targets while allowing
+required libraries and Windows contracts to compile through gateway dependencies.
+This includes the Kubernetes Secrets and Vault packages: their libraries remain
+in the gateway build graph, but their Unix-socket standalone binaries do not.
 
 ## Unsupported Driver Contract
 
@@ -241,10 +242,10 @@ Windows must continue to reject unsupported compute drivers clearly.
 
 | Driver | Windows build behavior | Runtime behavior |
 |---|---|---|
-| Docker | Config/library stub may compile as a gateway dependency. | Gateway construction returns unsupported. |
-| Kubernetes | Config/library stub may compile as a gateway dependency. | Gateway construction returns unsupported. |
-| Podman | Config/library stub may compile as a gateway dependency. | Gateway construction returns unsupported. |
-| VM | Server-side VM path compiles. | VM spawn returns unsupported. |
+| Docker | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
+| Kubernetes | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
+| Podman | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
+| VM | Driver crate excluded from workspace validation. | VM spawn returns unsupported. |
 
 The focused contract tasks for either native architecture run:
 

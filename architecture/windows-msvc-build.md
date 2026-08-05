@@ -22,20 +22,26 @@ Podman, or VM runtime host.
 
 ## Unsupported Driver Strategy
 
-Unsupported compute drivers use contract stubs on Windows. The stubs preserve
-configuration structs and public library entry points so the gateway can parse
-existing config files and reject unsupported driver selection with a clear error.
+The gateway uses platform-specific configuration contracts on Windows. These
+contracts preserve config-file parsing and reject unsupported driver selection
+with a clear error without depending on the runtime driver crates.
 
 The Windows lane does not build, release, package, or smoke-test standalone
 driver binaries for Docker, Kubernetes, Podman, or VM. Those binaries are Linux
 or macOS deliverables only.
 
+The Kubernetes Secrets and Vault packages are also excluded as top-level
+Windows workspace targets because their standalone driver binaries use Unix
+domain sockets. Their libraries remain in the gateway dependency graph, so the
+gateway's credential-driver configuration and in-process behavior still compile
+on Windows.
+
 | Driver | Windows build behavior | Runtime behavior |
 |---|---|---|
-| Docker | Library config stub compiles as a gateway dependency. | Gateway construction returns unsupported. |
-| Kubernetes | Library config stub compiles as a gateway dependency. | Gateway construction returns unsupported. |
-| Podman | Library config stub compiles as a gateway dependency. | Gateway construction returns unsupported. |
-| VM | Library config stub compiles as a gateway dependency. | VM spawn returns unsupported. |
+| Docker | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
+| Kubernetes | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
+| Podman | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
+| VM | Driver crate excluded from workspace validation. | VM spawn returns unsupported. |
 
 This keeps Windows behavior explicit without carrying runtime dependencies or
 creating misleading Windows driver artifacts.

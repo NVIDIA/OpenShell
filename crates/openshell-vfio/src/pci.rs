@@ -523,7 +523,7 @@ pub fn release_pci_group_from_passthrough(
     first_err.map_or(Ok(()), Err)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::bind::test_refcounts;
