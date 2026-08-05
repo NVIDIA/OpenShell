@@ -58,7 +58,7 @@ The personas proposed in this RFC are a reasoning tool for the observability dis
 
 ### Current state
 
-**Tracing:**
+The table below summarizes where tracing coverage exists today and where the gaps are. The gateway and VM driver recently gained OTLP trace export through three merged PRs, with a shared `openshell-otel` crate providing the common infrastructure. Everything else has no OTEL integration. Tracing is configured through `[openshell.gateway.otlp]` in `gateway.toml`, where the table's presence acts as the on-switch.
 
 | Component | OTLP Traces | W3C Propagation | Status |
 |---|---|---|---|
@@ -70,30 +70,20 @@ The personas proposed in this RFC are a reasoning tool for the observability dis
 | CLI | None | None | Gap |
 | Agent traces from inside sandbox | None | N/A | Gap (new) |
 
-Configuration: `[openshell.gateway.otlp]` in `gateway.toml`. Table presence is the on-switch.
+On the logging side, OpenShell has two systems serving distinct purposes. Human-readable operational logs go to stdout via `tracing_subscriber::fmt`. Security-relevant events are captured by the OCSF structured logging system (`openshell-ocsf`), which emits both a shorthand format (always on) and full JSONL records (opt-in). OCSF covers network decisions, HTTP/L7 enforcement, SSH authentication, process lifecycle, security findings, configuration changes, and application lifecycle. It runs only on the sandbox side. Centralized sandbox log collection remains an unsolved problem ([#1922](https://github.com/NVIDIA/OpenShell/issues/1922), currently stale).
 
-**Logging:** Human-readable logs via `tracing_subscriber::fmt` to stdout. OCSF structured security logs via `openshell-ocsf` as shorthand (always on) and JSONL (opt-in), covering network decisions, HTTP/L7 enforcement, SSH authentication, process lifecycle, security findings, configuration changes, and application lifecycle. OCSF is sandbox-side only. Centralized sandbox log collection is unsolved ([#1922](https://github.com/NVIDIA/OpenShell/issues/1922), stale).
-
-**Monitoring:** Prometheus foundation in place (metrics facade, `/metrics` endpoint, Helm port 9090). Basic gRPC/HTTP RED metrics and interceptor metrics implemented. The broader catalog from [#909](https://github.com/NVIDIA/OpenShell/issues/909) (16 families, 3 priority tiers, SLI/SLO definitions) is unimplemented. Zero metrics in the sandbox supervisor. No ServiceMonitor, dashboards, or alerting rules.
+For monitoring, the Prometheus foundation is in place: a `metrics` crate facade, a dedicated `/metrics` endpoint, and Helm chart port 9090 exposed. Basic gRPC/HTTP RED metrics and gateway interceptor metrics are implemented and working. The broader catalog proposed in [#909](https://github.com/NVIDIA/OpenShell/issues/909), which defines 16 metric families across three priority tiers along with SLI/SLO definitions, is mostly unimplemented. The sandbox supervisor has no metrics at all, and there are no ServiceMonitor CRDs, dashboards, or alerting rules.
 
 ### Supervisor as OTLP relay for sandbox traces
 
 The sandbox supervisor listens on `localhost:4317` (OTLP/gRPC) and `localhost:4318` (OTLP/HTTP) inside the sandbox. Agent frameworks export traces to this well-known address. The supervisor buffers, optionally enriches, and forwards spans to the gateway over the existing session protocol. The gateway relays them to the configured external OTLP endpoint.
 
-```
-Agent process (inside sandbox)
-    |  OTLP/HTTP to localhost:4318
-    v
-Supervisor (OTLP receiver, inside sandbox)
-    |  Session protocol (existing gRPC)
-    v
-Gateway (OTLP relay)
-    |  OTLP/gRPC to configured endpoint
-    v
-External Collector (platform-managed)
-    |
-    v
-MLflow / Jaeger / Grafana Tempo
+```mermaid
+graph TD
+    A["Agent process<br/>(inside sandbox)"] -->|"OTLP/HTTP<br/>localhost:4318"| B["Supervisor<br/>(OTLP receiver)"]
+    B -->|"Session protocol<br/>(existing gRPC)"| C["Gateway<br/>(OTLP relay)"]
+    C -->|"OTLP/gRPC<br/>configured endpoint"| D["External Collector<br/>(platform-managed)"]
+    D --> E["MLflow / Jaeger / Grafana Tempo"]
 ```
 
 The supervisor:
@@ -138,17 +128,10 @@ This pattern has prior art in [Dapr](https://dapr.io). Dapr's [sidecar](https://
 
 Agent traces from inside the sandbox are correlated with gateway infrastructure traces via [span links](https://opentelemetry.io/docs/concepts/signals/traces/#span-links), not parent-child relationships.
 
-```
-Gateway
-  sandbox.create span ─────────────────── (short-lived, completes in seconds)
-  {trace_id: abc, span_id: 123}
-       ^                     ^
-       │ span link           │ span link
-       │                     │
-Agent trace #1:         Agent trace #2:
-  root: "agent.task"      root: "agent.task"
-    tool_call_1             tool_call_2
-    llm_invocation_1
+```mermaid
+graph BT
+    A1["Agent trace #1<br/>root: agent.task<br/>├ tool_call_1<br/>└ llm_invocation_1"] -.->|"span link"| GW["Gateway<br/>sandbox.create span<br/>(short-lived, completes in seconds)"]
+    A2["Agent trace #2<br/>root: agent.task<br/>└ tool_call_2"] -.->|"span link"| GW
 ```
 
 Sandbox lifetimes are unpredictable. A CI sandbox runs for 30 seconds, an interactive sandbox might live for hours, a persistent dev environment could run for days. A gateway-owned parent span that lives for the entire sandbox lifecycle is an antipattern: the batch exporter won't export it until the sandbox terminates, trace backends assume traces complete within a time window, and the gateway holds the open span in memory for every concurrent sandbox.
@@ -189,9 +172,9 @@ The sandbox supervisor has zero OTEL integration today, which is the biggest sin
 
 ### Deployment configuration
 
-Add `otlp.endpoint`, `otlp.serviceName`, and `otlp.enabled` to Helm `values.yaml`, templated into the gateway's `gateway.toml` ConfigMap. Pass `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_RESOURCE_ATTRIBUTES` as env vars when configured. Add `[openshell.gateway.otlp]` to Docker Compose's `gateway.toml` example (commented out). Update `docs/reference/gateway-config.mdx`.
+Today, none of the deployment surfaces (Helm, Docker Compose, RPM) include OTLP configuration. The Helm chart needs `otlp.endpoint`, `otlp.serviceName`, and `otlp.enabled` values that template into the gateway's `gateway.toml` ConfigMap as `[openshell.gateway.otlp]`. When these values are set, the chart should also pass `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_RESOURCE_ATTRIBUTES` as environment variables to the gateway container. Docker Compose's example `gateway.toml` should include a commented-out OTLP section so operators can see the option and enable it. The published configuration reference at `docs/reference/gateway-config.mdx` needs to document the OTLP settings.
 
-OpenShell is collector-agnostic. The Helm chart does not deploy an OTel Collector. Every deployment context has its own collector topology, and deploying one would couple OpenShell to a particular backend.
+An important design constraint: OpenShell is collector-agnostic. The Helm chart does not deploy an OTel Collector. Every deployment context (managed Kubernetes, standalone cluster, Docker Compose, bare metal) has its own collector topology, and bundling one would couple OpenShell to a particular backend while creating operational overlap with platform-level monitoring infrastructure.
 
 ### Visibility domains
 
@@ -336,9 +319,9 @@ Leave the current design unchanged. Platform operators cannot debug latency acro
 
 ## Open questions
 
-- **Config surface precedence.** `OTEL_*` env vars vs TOML gateway config. [#2507](https://github.com/NVIDIA/OpenShell/issues/2507) and RFC 0003 discuss this but no decision has been made.
-- **Per-workspace OTLP endpoints.** Multi-tenant deployments likely need per-workspace OTLP endpoint configuration so different tenants' agent traces route to different collectors or MLflow instances. The configuration model for this is not designed.
-- **Span link support in MLflow.** Whether MLflow's OTLP ingestion surfaces span links in its UI needs validation. If it does not, the correlation story for agent developers using MLflow is limited to resource attributes.
-- **Compile-time feature gating.** Whether the OTel SDK dependency should be gated behind a Cargo feature flag for builds that do not need tracing.
-- **OTEL receiver implementation.** Whether the supervisor should implement the OTLP receiver from scratch using the `opentelemetry-proto` crate, or embed a lightweight collector library. The implementation complexity and binary size tradeoffs need evaluation.
-- **`traceparent` injection into agent egress.** [#2508](https://github.com/NVIDIA/OpenShell/issues/2508) deliberately left this unsettled. It is a separate decision from the span link correlation proposed here.
+- How should `OTEL_*` environment variables and TOML gateway configuration interact when both are set? [#2507](https://github.com/NVIDIA/OpenShell/issues/2507) and RFC 0003 discuss this but no decision has been made on precedence.
+- Multi-tenant deployments likely need per-workspace OTLP endpoint configuration so that different tenants' agent traces can route to different collectors or MLflow instances. The configuration model for per-workspace endpoints is not designed yet.
+- Does MLflow's OTLP ingestion surface span links in its UI? If it does not, the correlation story for agent developers using MLflow would be limited to resource attributes rather than navigable links. This needs validation.
+- Should the OTel SDK dependency be gated behind a Cargo feature flag so that builds without tracing support do not pay the binary size and compile time cost?
+- Should the supervisor implement the OTLP receiver from scratch using the `opentelemetry-proto` crate (smaller binary, more control), or embed a lightweight collector library (more features, larger dependency)? The tradeoffs need evaluation during implementation.
+- [#2508](https://github.com/NVIDIA/OpenShell/issues/2508) deliberately left `traceparent` injection into agent egress unsettled. Whether the supervisor stamps W3C trace context onto the agent's outbound HTTP requests is a separate decision from the span link correlation proposed in this RFC.
