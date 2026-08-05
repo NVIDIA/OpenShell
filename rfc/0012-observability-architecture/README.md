@@ -336,18 +336,32 @@ The mitigation is to normalize high-cardinality attributes before they reach the
 
 ### Relay scale and gateway bottleneck
 
-The supervisor-to-gateway session protocol was designed for control plane traffic: sandbox lifecycle events, configuration updates, log pushes. Adding trace relay changes the traffic profile substantially. An active agent with OTel instrumentation can produce 10-100 spans/second. With 100 concurrent sandboxes on one gateway, that adds up to 1,000-10,000 spans/second, roughly 1-10 MB/second sustained through the gateway.
+The supervisor-to-gateway session protocol was designed for control plane traffic: sandbox lifecycle events, configuration updates, log pushes. Using it as a telemetry relay for traces, logs, and metrics changes the traffic profile substantially.
 
-The network bandwidth alone is manageable. The deeper concern is that the gateway now serves two roles (control plane and data plane relay), and these roles compete for resources. If the external collector is slow or unreachable, the gateway accumulates buffered spans from all sandboxes. Memory pressure from the relay can degrade sandbox lifecycle operations.
+Estimated per-sandbox volume by pillar:
+
+| Pillar | Per-sandbox rate | Per-record size | Per-sandbox bandwidth |
+|---|---|---|---|
+| Traces | 10-100 spans/sec (active agent with OTel) | 200-500 bytes | 2-50 KB/sec |
+| OCSF logs | 10-300 events/sec (one per outbound network decision) | 1-5 KB (full JSONL event) | 10 KB - 1.5 MB/sec |
+| Agent stdout/stderr | Varies (verbose LLM agent: 1-10 KB/sec) | Raw text | 1-10 KB/sec |
+| Metrics | 1 push per 15-60 sec | 1-5 KB | Negligible |
+
+At 100 concurrent sandboxes, the aggregate could reach 1-15 MB/second sustained. OCSF logs are potentially the largest contributor because every outbound agent connection generates structured security events, and OCSF JSONL records are larger than trace spans. Agent stdout/stderr volume depends entirely on agent verbosity and is unbounded without rate limiting.
+
+The network bandwidth alone is manageable. The deeper concern is that the gateway now serves two roles (control plane and data plane relay), and these roles compete for resources. If the external collector or log aggregator is slow or unreachable, the gateway accumulates buffered data from all sandboxes. Memory pressure from the relay can degrade sandbox lifecycle operations.
+
+Log sampling has different constraints than trace sampling. Trace head sampling (forward 10% of traces) is a standard practice. But OCSF security events serve compliance and audit purposes, so dropping them silently is not acceptable. Log relay needs separate controls: rate limiting (cap events/second per sandbox) rather than probabilistic sampling, with dropped event counts tracked as a metric.
 
 Several mitigations should be part of the implementation:
 
-- Trace relay should use a separate transport channel (or multiplexed stream) from the control plane session, so trace backpressure does not block sandbox create or delete operations.
-- Head sampling at the supervisor reduces volume before it reaches the gateway. This should be configurable per-sandbox or globally (e.g., sample 10% of traces, but always forward traces containing errors).
-- Per-sandbox span rate limits prevent one noisy agent from overwhelming the gateway. Excess spans are dropped at the supervisor with a counter metric, not silently.
-- The gateway forwards received spans to the external collector asynchronously in batches, not synchronously per-span.
+- The telemetry relay should use a separate transport channel (or multiplexed stream) from the control plane session, so telemetry backpressure does not block sandbox create or delete operations.
+- Head sampling at the supervisor reduces trace volume before it reaches the gateway. This should be configurable per-sandbox or globally (e.g., sample 10% of traces, but always forward traces containing errors).
+- Per-sandbox rate limits prevent one noisy agent from overwhelming the gateway. Excess spans and log events are dropped at the supervisor with counter metrics, not silently. OCSF events should have higher rate limits than traces given their audit value.
+- Agent stdout/stderr needs a per-sandbox byte rate limit. Without one, a verbose agent can dominate the relay channel.
+- The gateway forwards received telemetry to external endpoints asynchronously in batches, not synchronously per-record.
 - When the gateway's relay buffer is full, it should signal the supervisor to slow down or drop rather than silently accepting until it runs out of memory.
-- For high-volume scenarios, users can bypass the relay entirely by setting `OTEL_EXPORTER_OTLP_ENDPOINT` to `host.openshell.internal:<port>` or a direct collector address. The relay is the zero-config default, not a mandatory path.
+- For high-volume scenarios, users can bypass the trace relay entirely by setting `OTEL_EXPORTER_OTLP_ENDPOINT` to `host.openshell.internal:<port>` or a direct collector address. The trace relay is the zero-config default, not a mandatory path.
 
 ### Other considerations
 
