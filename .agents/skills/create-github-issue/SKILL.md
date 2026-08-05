@@ -17,29 +17,25 @@ This project uses YAML form issue templates. When creating issues, match the tem
 
 ### Bug Reports
 
-Do not add a type label automatically. The body must include an **Agent Diagnostic** section — this is required by the template and enforced by project convention. The diagnostic must identify the OpenShell version tested, whether the latest release or known fixes were checked, and whether possible duplicate issues were searched. If the agent cannot verify the latest release or search existing issues, say so explicitly instead of guessing. Apply area or topic labels only when they are clearly known.
+Do not add a type label automatically. Write the issue as a user story. Capture the affected persona, desired user-facing workflow or capability, reason and current impact, the workflow that exposes the problem, and the relevant environment. Do not require a diagnosis, internal implementation design, or agent output. Apply area or topic labels only when they are clearly known.
 
 ```bash
 gh issue create \
   --title "bug: <concise description>" \
   --body "$(cat <<'EOF'
-## Agent Diagnostic
+## What persona does this impact?
 
-- Skills loaded: <skills used during investigation>
-- OpenShell version tested: <version from openshell --version or other source>
-- Latest release checked: <version checked, or unable to verify>
-- Known fixes reviewed: <release notes / merged PRs checked, or unable to verify>
-- Possible duplicates reviewed: <existing issues searched, or unable to verify>
-- Findings: <what the agent found and tried>
-- Remaining reason for filing: <why this still appears to be a bug>
+<The affected role in the workflow, such as an operator, sandbox creator, or agent>
 
-## Description
+## What does this persona need to be able to do?
 
-**Actual behavior:** <what happened>
+<The user-facing workflow, capability, or outcome the persona needs>
 
-**Expected behavior:** <what should happen>
+## Why does this matter to the persona?
 
-## Reproduction Steps
+<What happens today and how it affects the persona's work>
+
+## What workflow exposes the problem?
 
 1. <step>
 2. <step>
@@ -47,15 +43,13 @@ gh issue create \
 ## Environment
 
 - OS: <os>
-- Docker: <version>
 - OpenShell: <version>
-- Latest release checked: <yes/no and reason>
-- Possible duplicates checked: <yes/no and reason>
+- Platform, deployment, runtime, or integration: <relevant details>
 
-## Logs
+## Relevant Logs
 
 ```
-<relevant output>
+<optional minimal, redacted output>
 ```
 EOF
 )"
@@ -63,28 +57,33 @@ EOF
 
 ### Feature Requests
 
-Do not add a type label automatically. The body must include a **Proposed Design** — not a "please build this" request. Apply area or topic labels only when they are clearly known.
+Do not add a type label automatically. Use the same core user-story structure as a bug report. Ask for the desired user-facing workflow, but do not require the reporter to decide whether the gap is a defect or missing capability, design the internal implementation, or include agent output. Apply area or topic labels only when they are clearly known.
 
 ```bash
 gh issue create \
   --title "feat: <concise description>" \
   --body "$(cat <<'EOF'
-## Problem Statement
+## What persona does this impact?
 
-<What problem does this solve? Why does it matter?>
+<The affected role in the workflow, such as an operator, sandbox creator, or agent>
 
-## Proposed Design
+## What does this persona need to be able to do?
 
-<How should this work? Describe the system behavior, components involved,
-and user-facing interface.>
+<The user-facing workflow, capability, or outcome the persona needs>
 
-## Alternatives Considered
+## Why does this matter to the persona?
 
-<What other approaches were evaluated? Why is this design better?>
+<What happens today and how it affects the persona's work>
 
-## Agent Investigation
+## What workflow exposes the need?
 
-<If the agent explored the codebase to assess feasibility, paste findings here.>
+1. <step>
+2. <step>
+
+## Environment
+
+- OpenShell: <version>
+- Platform, deployment, runtime, or integration: <relevant details>
 EOF
 )"
 ```
@@ -114,7 +113,7 @@ EOF
 
 GitHub built-in issue types (`Bug`, `Feature`, `Task`) should come from the matching issue template when possible, or be set manually afterward. Do not try to emulate them through labels.
 
-Creating an issue does not accept it for roadmap work or queue agent work. Agents never apply the `roadmap` label, add issues to the roadmap project, or apply `agent:plan-requested` or `agent:implementation-requested`. Community issues proceed through `triage-issue`; a human decides whether technically validated work should be accepted and places it on the roadmap. The request labels queue work for unattended agents; a user may instead direct an agent to a specific issue.
+Creating an issue does not accept it or queue agent work. Agents never apply `state:accepted`, the `roadmap` label, add issues to the roadmap project, or apply `agent:plan-requested` or `agent:implementation-requested`. Community issues proceed through `triage-issue`; a human accepts technically validated work with `state:accepted` or roadmap placement. The request labels queue work for unattended agents; a user may instead direct an agent to a specific issue.
 
 ## Useful Options
 

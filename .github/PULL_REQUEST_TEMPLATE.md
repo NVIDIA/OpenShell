@@ -13,7 +13,7 @@ No issue required: <brief reason>
 <!-- Bullet list of key changes -->
 
 ## Testing
-<!-- What testing was done? -->
+<!-- Report current verification performed for this implementation. Do not copy diagnostics from the original issue. -->
 - [ ] `mise run pre-commit` passes
 - [ ] Unit tests added/updated
 - [ ] E2E tests added/updated (if applicable)
