@@ -9897,7 +9897,7 @@ network_policies:
         use std::time::Duration;
 
         // Skip if /bin/bash is not present (e.g. minimal containers).
-        if !std::path::Path::new("/bin/bash").exists() {
+        if !Path::new("/bin/bash").exists() {
             eprintln!("skipping: /bin/bash not available");
             return;
         }
@@ -10033,7 +10033,7 @@ network_policies:
             }
         }
 
-        if !std::path::Path::new("/bin/sleep").exists() {
+        if !Path::new("/bin/sleep").exists() {
             eprintln!("skipping: /bin/sleep not available");
             return;
         }
