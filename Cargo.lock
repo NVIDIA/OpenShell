@@ -4022,11 +4022,8 @@ dependencies = [
 name = "openshell-sandbox"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "clap",
  "futures",
- "hex",
- "hmac 0.12.1",
  "miette",
  "nix 0.29.0",
  "openshell-core",
@@ -4041,10 +4038,8 @@ dependencies = [
  "rustls 0.23.38",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "temp-env",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tonic",
