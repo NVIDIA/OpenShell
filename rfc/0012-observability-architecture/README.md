@@ -201,9 +201,7 @@ The OCSF-to-OTel correlation described above complements this: when OCSF events 
 
 ### Metrics relay for sandbox monitoring
 
-The sandbox is network-isolated, so Prometheus cannot scrape supervisor metrics directly. The supervisor can push sandbox-level metrics to the gateway via the session protocol, and the gateway can aggregate them into its own `/metrics` endpoint or forward them via OTLP metrics push.
-
-Candidate sandbox metrics include: agent process CPU and memory usage, OTLP relay buffer depth and drop counts, active network connections, policy evaluation latency, and middleware call duration. These would appear with sandbox resource labels so operators can break down by sandbox, workspace, or driver.
+The supervisor has no metrics today (no `metrics` crate dependency, no Prometheus exporter). Only the gateway exposes a `/metrics` endpoint (port 9090). If sandbox-level metrics are added in the future (relay buffer depth, drop counts, active connections, policy evaluation latency, middleware call duration), the supervisor would need to push them to the gateway via the session protocol, since the sandbox is network-isolated and cannot expose its own scrape target. The gateway would aggregate per-sandbox metrics into its own `/metrics` endpoint with sandbox resource labels.
 
 This is lower priority than the trace and log relays. The gateway-level metrics from [#909](https://github.com/NVIDIA/OpenShell/issues/909) provide platform-wide visibility, and per-sandbox metrics add value mainly for capacity planning and debugging individual sandbox performance issues. The metrics relay can be deferred to a later phase without blocking the overall observability architecture.
 
