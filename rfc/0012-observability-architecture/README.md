@@ -260,7 +260,7 @@ Metrics remain Prometheus-first. The tracing architecture above is the primary f
 Priority order:
 
 1. Complete P0 metrics from [#909](https://github.com/NVIDIA/OpenShell/issues/909) (supervisor sessions, sandbox phase, relay)
-2. Add Helm ServiceMonitor (gated, off by default)
+2. Add Prometheus `ServiceMonitor` CRD to the Helm chart (gated, off by default)
 3. P1 metrics (SSH, compute driver, DB, policy)
 4. Dashboards and alerting rules
 5. OTLP metrics push (opt-in complement)
@@ -313,7 +313,7 @@ This phase fills out the metrics catalog and adds the Kubernetes monitoring surf
 
 The first priority is completing the P0 metrics that tell you whether the platform is fundamentally working: supervisor sessions active (gauge), connect/disconnect counters, sandboxes-by-phase gauge, relay opens/claims/pending. These are emitted from `crates/openshell-server/` using the existing `metrics` crate facade, following the same pattern as the existing gRPC/HTTP RED metrics but covering new subsystems.
 
-Next is a Helm `ServiceMonitor` CRD template, gated behind a Helm value and off by default. When enabled, it wires Prometheus scraping to the gateway's metrics port. The template lives in `deploy/helm/openshell/templates/` alongside the existing Service and StatefulSet templates. Per [#2507](https://github.com/NVIDIA/OpenShell/issues/2507), the question of whether `--metrics-port` should auto-enable when the chart wires scraping needs a decision.
+Next is a Prometheus Operator `ServiceMonitor` CRD template in the Helm chart, gated behind a Helm value and off by default. When enabled, it wires Prometheus scraping to the gateway's metrics port. The template lives in `deploy/helm/openshell/templates/` alongside the existing Service and StatefulSet templates. Per [#2507](https://github.com/NVIDIA/OpenShell/issues/2507), the question of whether `--metrics-port` should auto-enable when the chart wires scraping needs a decision.
 
 After that comes P1 metrics (SSH tunnel saturation, compute driver RPC duration, DB operation latency, policy merge retries), then dashboards (Grafana JSON models in the Helm chart or as separate artifacts), alerting rules (PrometheusRule CRDs), and eventually OTLP metrics push as an opt-in complement to Prometheus scrape for environments that cannot use pull-based collection.
 
