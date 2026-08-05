@@ -727,9 +727,7 @@ pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
         .parse()
         .map_err(|_| miette::miette!("invalid duration: {s} (expected e.g. 5m, 1h, 30s)"))?;
     if num < 0 {
-        return Err(miette::miette!(
-            "duration must not be negative: {s}"
-        ));
+        return Err(miette::miette!("duration must not be negative: {s}"));
     }
     let multiplier = match unit {
         "s" => 1_000,
