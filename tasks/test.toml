@@ -4,8 +4,17 @@
 # Test tasks (Rust + Python)
 
 [test]
-description = "Run all tests (Rust + Python)"
-depends = ["test:rust", "test:python", "test:sbom", "test:install-sh", "test:build-env", "test:packaging-assets", "test:docs-website"]
+description = "Run all tests (Rust + Python + TypeScript SDK)"
+depends = [
+  "test:rust",
+  "test:python",
+  "sdk:ts:test",
+  "test:sbom",
+  "test:install-sh",
+  "test:build-env",
+  "test:packaging-assets",
+  "test:docs-website",
+]
 
 ["test:docs-website"]
 description = "Test the docs-website sync script"

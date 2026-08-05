@@ -43,6 +43,10 @@ COMMENT_STYLES: dict[str, str] = {
     ".yaml": "#",
     ".yml": "#",
     ".rego": "#",
+    ".ts": "//",
+    ".tsx": "//",
+    ".mts": "//",
+    ".cts": "//",
 }
 
 # Directories to skip entirely (relative to repo root).
@@ -55,6 +59,7 @@ EXCLUDE_DIRS: set[str] = {
     ".git",
     ".cache",
     "python/openshell/_proto",
+    "sdk/typescript/src/gen",
 }
 
 # Individual filenames to skip.
@@ -102,6 +107,10 @@ def find_repo_root() -> Path:
 def is_excluded(rel: Path) -> bool:
     """Return True if a path should be skipped."""
     rel_str = str(rel)
+
+    # Vendored dependencies never carry our headers, at any depth.
+    if "node_modules" in rel.parts:
+        return True
 
     # Exact filename exclusions.
     if rel.name in EXCLUDE_FILES:
