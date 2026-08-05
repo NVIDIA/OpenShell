@@ -40,6 +40,37 @@ e2e_pick_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
 }
 
+# Podman Machine forwards host.containers.internal callbacks to IPv4 loopback.
+# Keep the primary listener on IPv6 loopback so the callback listener can retain
+# its narrower authorization scope. Use a DNS authority for the CLI because
+# tonic does not accept a bracketed IPv6 literal as a TLS server name.
+e2e_podman_primary_bind_ip() {
+  local kernel_name=${1:-$(uname -s)}
+
+  case "${kernel_name}" in
+    Darwin) printf '%s\n' '::1' ;;
+    *) printf '%s\n' '127.0.0.1' ;;
+  esac
+}
+
+e2e_podman_cli_endpoint_host() {
+  local kernel_name=${1:-$(uname -s)}
+
+  case "${kernel_name}" in
+    Darwin) printf '%s\n' 'localhost' ;;
+    *) printf '%s\n' '127.0.0.1' ;;
+  esac
+}
+
+e2e_url_host_for_ip() {
+  local ip=$1
+
+  case "${ip}" in
+    *:*) printf '[%s]\n' "${ip}" ;;
+    *) printf '%s\n' "${ip}" ;;
+  esac
+}
+
 e2e_generate_pki() {
   local gateway_bin=$1
   local pki_dir=$2

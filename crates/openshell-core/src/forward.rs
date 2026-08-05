@@ -745,11 +745,11 @@ pub fn resolve_ssh_gateway(
             // Remote cluster: use the remote host but keep the cluster URL port.
             return (host.to_string(), cluster_port);
         }
-        // Both endpoints loopback. The unspecified addresses (0.0.0.0 / ::)
-        // are bind-only — they aren't valid connect targets and aren't in TLS
-        // cert SANs, so fall back to the cluster URL's host (which the CLI
-        // is already using to reach the gateway).
-        if gateway_host == "0.0.0.0" || gateway_host == "::" {
+        // Unspecified addresses are bind-only, and tonic cannot use an IPv6
+        // literal as a TLS DNS name. In those cases, keep the cluster URL's
+        // already-reachable authority. Other loopback addresses retain the
+        // gateway-reported host.
+        if matches!(gateway_host, "0.0.0.0" | "::" | "::1") {
             return (host.to_string(), cluster_port);
         }
         return (gateway_host.to_string(), cluster_port);
@@ -1024,6 +1024,13 @@ mod tests {
         let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://127.0.0.1:443");
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_preserves_loopback_tls_authority() {
+        let (host, port) = resolve_ssh_gateway("::1", 8080, "https://localhost:8443");
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 8443);
     }
 
     #[test]
