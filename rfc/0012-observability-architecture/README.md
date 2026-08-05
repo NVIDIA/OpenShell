@@ -144,7 +144,7 @@ In practice, the OTLP receiver reuses the same networking plumbing the proxy alr
 
 The K8s sidecar topology is the exception. Because it uses nftables-based traffic interception in the pod's shared network namespace rather than creating a separate workload netns, `localhost` is truly shared between the supervisor and agent. Binding to `localhost:4318` works directly.
 
-This pattern follows [Dapr](https://dapr.io)'s [sidecar](https://docs.dapr.io/concepts/dapr-services/sidecar/) approach, where a co-located proxy intercepts application communication and generates distributed traces through an [OTLP collector](https://docs.dapr.io/operations/observability/tracing/otel-collector/open-telemetry-collector/) without requiring application-level instrumentation. The agent exports to a local address; the supervisor handles buffering, enrichment, and forwarding.
+This pattern follows [Dapr](https://github.com/dapr/dapr)'s [sidecar](https://docs.dapr.io/concepts/dapr-services/sidecar/) approach, where a co-located proxy intercepts application communication and generates distributed traces through an [OTLP collector](https://docs.dapr.io/operations/observability/tracing/otel-collector/open-telemetry-collector/) without requiring application-level instrumentation. The agent exports to a local address; the supervisor handles buffering, enrichment, and forwarding.
 
 ### Span links for sandbox-to-trace correlation
 
@@ -397,7 +397,7 @@ Leaving the current state unchanged preserves all the gaps described in the Moti
 
 ## Prior art
 
-**[Dapr](https://dapr.io) sidecar architecture and OTel integration.** Dapr's sidecar model, referenced in the OTLP receiver reachability section above, is the closest prior art for the supervisor relay pattern. Applications opt in with a single Kubernetes annotation (`dapr.io/config`), and the three-tier architecture (application -> sidecar -> collector -> backend) maps directly to OpenShell's design (agent -> supervisor -> gateway -> collector). The lesson is that transparent trace collection through a co-located proxy scales across diverse application frameworks without requiring per-application instrumentation.
+**[Dapr](https://github.com/dapr/dapr) sidecar architecture and OTel integration.** Dapr's sidecar model, referenced in the OTLP receiver reachability section above, is the closest prior art for the supervisor relay pattern. Applications opt in with a single Kubernetes annotation (`dapr.io/config`), and the three-tier architecture (application -> sidecar -> collector -> backend) maps directly to OpenShell's design (agent -> supervisor -> gateway -> collector). The lesson is that transparent trace collection through a co-located proxy scales across diverse application frameworks without requiring per-application instrumentation.
 
 The [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) define the emerging standard for agent trace attributes (`gen_ai.operation.name`, `gen_ai.agent.name`, etc.). OpenShell infrastructure spans use standard RPC/HTTP conventions; agent-emitted spans from inside sandboxes should follow GenAI conventions for MLflow compatibility.
 
