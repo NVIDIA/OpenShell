@@ -17,7 +17,9 @@ This RFC proposes a unified observability architecture for OpenShell covering tr
 
 On the infrastructure side, contributions have started building coverage. OpenTelemetry Protocol (OTLP) trace export merged for the gateway and VM driver, OCSF structured logging covers security events, and Prometheus metrics provide basic request counting. This RFC extends that to the remaining components (in-process compute drivers, CLI, sandbox supervisor) and adds deployment configuration (Helm values, ServiceMonitor), OCSF-to-OTel correlation, and a metrics maturity path.
 
-On the agent side, the problem is harder: sandboxes are network-isolated, so an agent's OpenTelemetry (OTel) SDK cannot reach an external collector. This RFC proposes a supervisor-local OTLP relay as the solution. The supervisor listens on standard OTLP ports inside the sandbox, collects agent-emitted traces, enriches them with sandbox context, and forwards them through the gateway to an external collector. The agent just exports to a well-known local endpoint; the platform handles the rest.
+On the agent side, the problem is harder: sandboxes are network-isolated, so an agent's OpenTelemetry (OTel) SDK cannot reach an external collector, OCSF security events stay local with no centralized collection path ([#1922](https://github.com/NVIDIA/OpenShell/issues/1922)), and Prometheus cannot scrape metrics from inside isolated sandboxes. This RFC proposes a supervisor-local telemetry relay as the solution. The supervisor acts as a sidecar that mediates all observability data between the isolated sandbox and the platform. For traces, it listens on standard OTLP ports, collects agent-emitted spans, enriches them with sandbox context, and forwards them through the gateway to an external collector. The same relay channel carries OCSF log batches for centralized collection and can push sandbox-level metrics to the gateway.
+
+Tracing receives the most architectural attention in this RFC because it requires the most novel design (the relay, span links, enrichment pipeline). Logging and metrics build on existing foundations (OCSF is already designed, Prometheus is already wired) and extend through the same relay channel without needing separate architecture.
 
 ## Motivation
 
@@ -28,6 +30,7 @@ OpenShell's observability story is still early. That is expected for a project a
 - Tracing coverage beyond the gateway and VM driver. The sandbox supervisor, in-process compute drivers (K8s, Docker, Podman), CLI, and Helm chart have no OTel integration yet.
 - No connection between OCSF security events and traces. An operator cannot pivot from a network deny event to the trace that caused it.
 - The metrics catalog proposed in [#909](https://github.com/NVIDIA/OpenShell/issues/909) (16 families, 3 priority tiers, Service Level Indicator/Service Level Objective (SLI/SLO) definitions) is mostly unimplemented beyond the initial wiring. No ServiceMonitor, dashboards, or alerting rules exist.
+- No centralized collection for sandbox logs. OCSF security events are generated inside the sandbox but stay local. Agent stdout/stderr is captured by the process supervisor but has no path to a log aggregator. [#1922](https://github.com/NVIDIA/OpenShell/issues/1922) tracks this and is currently stale.
 - No collection mechanism for agent-level traces (tool calls, LLM invocations, reasoning steps from frameworks like LangChain or CrewAI running inside sandboxes). The sandbox is network-isolated, so an agent's OTel SDK cannot reach an external collector.
 
 [#1055](https://github.com/NVIDIA/OpenShell/issues/1055) tracks the overall enterprise observability effort. If the current design is left unchanged, platform operators cannot debug latency or failures across the gateway/driver/sandbox stack, agent developers cannot get their traces into MLflow without workarounds, and the three observability pillars remain disconnected.
@@ -56,7 +59,7 @@ The personas proposed in this RFC are a reasoning tool for the observability dis
 
 ## Proposal
 
-The proposal is organized around the current state, the novel OTLP relay for agent traces (the architecturally new piece), the supporting mechanisms (span links, enrichment, OCSF correlation), infrastructure instrumentation for the remaining components, deployment configuration, multi-tenant considerations, and the metrics path. The two visibility domains (infrastructure vs. agent traces) cut across all of these.
+The proposal is organized around the current state, the two visibility domains (infrastructure vs. agent), the supervisor telemetry relay (which carries traces, logs, and metrics out of isolated sandboxes), the supporting mechanisms (span links, enrichment, OCSF correlation), the log and metrics relay extensions, infrastructure instrumentation for the remaining components, deployment configuration, and multi-tenant considerations.
 
 ### Current state
 
@@ -72,7 +75,7 @@ Tracing coverage today is limited to the gateway and VM driver. Both gained OTLP
 | CLI | None | None | Gap |
 | Agent traces from inside sandbox | None | N/A | Gap (new) |
 
-On the logging side, OpenShell has two systems serving distinct purposes. Human-readable operational logs go to stdout via `tracing_subscriber::fmt`. Security-relevant events are captured by the OCSF structured logging system (`openshell-ocsf`), which emits both a shorthand format (always on) and full JSONL records (opt-in). OCSF covers network decisions, HTTP/L7 enforcement, SSH authentication, process lifecycle, security findings, configuration changes, and application lifecycle. It runs only on the sandbox side. Centralized sandbox log collection remains an unsolved problem ([#1922](https://github.com/NVIDIA/OpenShell/issues/1922), currently stale).
+On the logging side, OpenShell has two systems serving distinct purposes. Human-readable operational logs go to stdout via `tracing_subscriber::fmt`. Security-relevant events are captured by the OCSF structured logging system (`openshell-ocsf`), which emits both a shorthand format (always on) and full JSONL records (opt-in). OCSF covers network decisions, HTTP/L7 enforcement, SSH authentication, process lifecycle, security findings, configuration changes, and application lifecycle. It runs only on the sandbox side. Centralized sandbox log collection remains an unsolved problem (see Log relay section below).
 
 For monitoring, the Prometheus wiring is in place: a `metrics` crate facade, a dedicated `/metrics` endpoint, and Helm chart port 9090 exposed. Basic gRPC/HTTP RED metrics and gateway interceptor metrics are implemented and working. The broader catalog proposed in [#909](https://github.com/NVIDIA/OpenShell/issues/909), which defines 16 metric families across three priority tiers along with SLI/SLO definitions, is mostly unimplemented. The sandbox supervisor has no metrics at all, and there are no ServiceMonitor CRDs, dashboards, or alerting rules.
 
@@ -85,16 +88,21 @@ Two distinct visibility domains flow through the same OTLP relay pipeline:
 
 The platform integrator configures this routing at the collector level (e.g., route spans with `openshell.sandbox.*` attributes to MLflow, route spans with `openshell-gateway` service name to Tempo). OpenShell emits both to the same OTLP endpoint; the collector separates them.
 
-### Supervisor as OTLP relay for sandbox traces
+### Supervisor as telemetry relay
 
-The sandbox supervisor (hereafter "supervisor") listens on standard OTLP ports inside the sandbox, accepting both gRPC (port 4317) and HTTP (port 4318). Agent frameworks export traces to this address. The supervisor buffers, optionally enriches, and forwards spans to the gateway over the existing session protocol. The gateway relays them to the configured external OTLP endpoint.
+The sandbox supervisor (hereafter "supervisor") acts as a telemetry sidecar for the isolated sandbox, mediating traces, logs, and metrics between the sandbox and the platform. The session protocol between supervisor and gateway provides the transport for all three pillars.
+
+For traces, the supervisor listens on standard OTLP ports inside the sandbox, accepting both gRPC (port 4317) and HTTP (port 4318). Agent frameworks export traces to this address. The supervisor buffers, optionally enriches, and forwards spans to the gateway over the existing session protocol. The gateway relays them to the configured external OTLP endpoint.
 
 ```mermaid
 graph TD
-    A["Agent process<br/>(inside sandbox)"] -->|"OTLP gRPC+HTTP<br/>(ports 4317/4318)"| B["Supervisor<br/>(OTLP receiver)"]
-    B -->|"Session protocol<br/>(existing gRPC)"| C["Gateway<br/>(OTLP relay)"]
-    C -->|"OTLP/gRPC<br/>configured endpoint"| D["External Collector<br/>(platform-managed)"]
-    D --> E["MLflow / Jaeger / Grafana Tempo"]
+    A["Agent process<br/>(inside sandbox)"] -->|"OTLP gRPC+HTTP<br/>(ports 4317/4318)"| B["Supervisor<br/>(telemetry relay)"]
+    A -->|"stdout/stderr"| B
+    B -->|"Session protocol<br/>(traces, logs, metrics)"| C["Gateway<br/>(relay)"]
+    C -->|"OTLP/gRPC"| D["Trace Collector"]
+    C -->|"Log forwarding"| F["Log Aggregator"]
+    C -->|"Metrics"| G["/metrics endpoint"]
+    D --> E["MLflow / Jaeger / Tempo"]
 ```
 
 The supervisor:
@@ -173,6 +181,26 @@ Enrichment is configurable and can be disabled for pass-through forwarding. With
 When a trace context is active, OCSF events include `trace_id` and `span_id` fields. This lets operators pivot between "I see a network deny in the security log" and "show me the trace that triggered it."
 
 The OCSF builders already accept arbitrary fields. Add optional `trace_id`/`span_id` fields to the builder pattern, populated from the current `tracing::Span` when available. [#2508](https://github.com/NVIDIA/OpenShell/issues/2508) sub-issue 5 ("OCSF correlation") tracks this but has not defined the mechanism.
+
+### Log relay for centralized sandbox collection
+
+The same session protocol transport that carries trace batches can carry log data from the sandbox to the gateway, solving the centralized log collection problem ([#1922](https://github.com/NVIDIA/OpenShell/issues/1922)).
+
+The supervisor has access to two log sources inside the sandbox: OCSF JSONL events (security-relevant structured events, already generated by the OCSF subsystem) and agent process stdout/stderr (operational output captured by the process supervisor). Today both stay local. The log relay forwards them to the gateway, which exposes them to the platform's log aggregation infrastructure.
+
+Unlike the trace relay, the log relay does not need an OTLP receiver. OCSF events are generated internally by the supervisor, and agent stdout/stderr is already captured as part of process management. The relay adds a new session protocol message type for log batches, alongside the trace batch message from Phase 2. The gateway forwards received log batches to a configured log endpoint or makes them available for scraping.
+
+Log enrichment follows the same pattern as span enrichment: the supervisor attaches sandbox resource attributes (`openshell.sandbox.id`, `openshell.workspace.id`, etc.) to log records before forwarding. This gives operators the context they need to filter and correlate logs across sandboxes and workspaces.
+
+The OCSF-to-OTel correlation described above complements this: when OCSF events carry `trace_id`/`span_id` fields, an operator can follow a log record into the trace that produced it, even after the logs have been forwarded to a separate aggregation backend.
+
+### Metrics relay for sandbox monitoring
+
+The sandbox is network-isolated, so Prometheus cannot scrape supervisor metrics directly. The supervisor can push sandbox-level metrics to the gateway via the session protocol, and the gateway can aggregate them into its own `/metrics` endpoint or forward them via OTLP metrics push.
+
+Candidate sandbox metrics include: agent process CPU and memory usage, OTLP relay buffer depth and drop counts, active network connections, policy evaluation latency, and middleware call duration. These would appear with sandbox resource labels so operators can break down by sandbox, workspace, or driver.
+
+This is lower priority than the trace and log relays. The gateway-level metrics from [#909](https://github.com/NVIDIA/OpenShell/issues/909) provide platform-wide visibility, and per-sandbox metrics add value mainly for capacity planning and debugging individual sandbox performance issues. The metrics relay can be deferred to a later phase without blocking the overall observability architecture.
 
 ### Infrastructure trace instrumentation
 
