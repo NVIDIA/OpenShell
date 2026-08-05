@@ -17,7 +17,7 @@ This RFC proposes a unified observability architecture for OpenShell covering tr
 
 On the infrastructure side, contributions have started building coverage. OpenTelemetry Protocol (OTLP) trace export merged for the gateway and VM driver, OCSF structured logging covers security events, and Prometheus metrics provide basic request counting. This RFC extends that to the remaining components (in-process compute drivers, CLI, sandbox supervisor) and adds deployment configuration (Helm values, ServiceMonitor), OCSF-to-OTel correlation, and a metrics maturity path.
 
-On the agent side, the problem is harder: sandboxes are network-isolated, so an agent's OpenTelemetry (OTel) SDK cannot reach an external collector, OCSF security events stay local with no centralized collection path ([#1922](https://github.com/NVIDIA/OpenShell/issues/1922)), and Prometheus cannot scrape metrics from inside isolated sandboxes. This RFC proposes a supervisor-local telemetry relay as the solution. The supervisor acts as a sidecar that mediates all observability data between the isolated sandbox and the platform. For traces, it listens on standard OTLP ports, collects agent-emitted spans, enriches them with sandbox context, and forwards them through the gateway to an external collector. The same relay channel carries OCSF log batches for centralized collection and can push sandbox-level metrics to the gateway.
+On the agent side, the problem is harder: sandboxes are network-isolated, so an agent's OpenTelemetry (OTel) SDK cannot reach an external collector, OCSF security events stay local with no centralized collection path ([#1922](https://github.com/NVIDIA/OpenShell/issues/1922)), and Prometheus cannot scrape metrics from inside isolated sandboxes. This RFC proposes a supervisor-local telemetry relay as the solution. The supervisor acts as a sidecar that mediates all observability data between the isolated sandbox and the platform. For traces, it listens on standard OTLP ports, collects agent-emitted spans, enriches them with sandbox context, and forwards them through the gateway to an external collector. The existing log push mechanism extends to carry OCSF event batches for centralized security log collection, and the relay can push sandbox-level metrics to the gateway.
 
 Tracing receives the most architectural attention in this RFC because it requires the most novel design (the relay, span links, enrichment pipeline). Logging and metrics build on existing foundations (OCSF is already designed, Prometheus is already wired) and extend through the same relay channel without needing separate architecture.
 
@@ -30,7 +30,7 @@ OpenShell's observability story is still early. That is expected for a project a
 - Tracing coverage beyond the gateway and VM driver. The sandbox supervisor, in-process compute drivers (K8s, Docker, Podman), CLI, and Helm chart have no OTel integration yet.
 - No connection between OCSF security events and traces. An operator cannot pivot from a network deny event to the trace that caused it.
 - The metrics catalog proposed in [#909](https://github.com/NVIDIA/OpenShell/issues/909) (16 families, 3 priority tiers, Service Level Indicator/Service Level Objective (SLI/SLO) definitions) is mostly unimplemented beyond the initial wiring. No ServiceMonitor, dashboards, or alerting rules exist.
-- No centralized collection for sandbox logs. OCSF security events are generated inside the sandbox but stay local. Agent stdout/stderr is captured by the process supervisor but has no path to a log aggregator. [#1922](https://github.com/NVIDIA/OpenShell/issues/1922) tracks this and is currently stale.
+- No centralized collection for OCSF security events. OCSF events are generated inside the sandbox but stay local with no path to a log aggregator. [#1922](https://github.com/NVIDIA/OpenShell/issues/1922) tracks this and is currently stale.
 - No collection mechanism for agent-level traces (tool calls, LLM invocations, reasoning steps from frameworks like LangChain or CrewAI running inside sandboxes). The sandbox is network-isolated, so an agent's OTel SDK cannot reach an external collector.
 
 [#1055](https://github.com/NVIDIA/OpenShell/issues/1055) tracks the overall enterprise observability effort. If the current design is left unchanged, platform operators cannot debug latency or failures across the gateway/driver/sandbox stack, agent developers cannot get their traces into MLflow without workarounds, and the three observability pillars remain disconnected.
@@ -99,8 +99,7 @@ For traces, the supervisor listens on standard OTLP ports inside the sandbox, ac
 ```mermaid
 graph TD
     A["Agent process<br/>(inside sandbox)"] -->|"OTLP gRPC+HTTP<br/>(ports 4317/4318)"| B["Supervisor<br/>(telemetry relay)"]
-    A -->|"stdout/stderr"| B
-    B -->|"Session protocol<br/>(traces, logs, metrics)"| C["Gateway<br/>(relay)"]
+    B -->|"Session protocol<br/>(traces, OCSF logs, metrics)"| C["Gateway<br/>(relay)"]
     C -->|"OTLP/gRPC"| D["Trace Collector"]
     C -->|"Log forwarding"| F["Log Aggregator"]
     C -->|"Metrics"| G["/metrics endpoint"]
@@ -192,9 +191,9 @@ A log push mechanism already exists. The `LogPushLayer` in `crates/openshell-sup
 
 This existing mechanism covers supervisor-level tracing events but has two gaps that [#1922](https://github.com/NVIDIA/OpenShell/issues/1922) tracks:
 
-1. **OCSF JSONL events** are not pushed through `PushSandboxLogs`. OCSF events go through a separate JSONL layer and stay local to the sandbox. These are the security-relevant structured events (network decisions, L7 enforcement, SSH authentication) that operators and compliance reviewers need centralized access to. Extending the log push to include OCSF events means either adding OCSF records to the existing `SandboxLogLine` format (with a source field to distinguish them) or adding a dedicated OCSF push alongside the existing log push.
+**OCSF JSONL events** are not pushed through `PushSandboxLogs`. OCSF events go through a separate JSONL layer and stay local to the sandbox. These are the security-relevant structured events (network decisions, L7 enforcement, SSH authentication) that operators and compliance reviewers need centralized access to. Extending the log push to include OCSF events means either adding OCSF records to the existing `SandboxLogLine` format (with a source field to distinguish them) or adding a dedicated OCSF push alongside the existing log push.
 
-2. **Agent stdout/stderr** is captured by the process supervisor but not pushed to the gateway. For debugging agent behavior, operators need access to agent output without SSH-ing into the sandbox.
+Agent stdout/stderr is explicitly out of scope for the log relay. Agent sandboxes are interactive sessions with terminal UIs, ANSI escape codes, and multiplexed SSH channels. That output stream is user-facing interaction, not structured log data. If an agent developer wants internal operational logs exported, that is their framework's concern (e.g., configuring Python logging or their agent SDK's log output), not something the platform should capture.
 
 Log enrichment follows the same pattern as span enrichment: the supervisor attaches sandbox resource attributes (`openshell.sandbox.id`, `openshell.workspace.id`, etc.) to log records before forwarding. The existing `SandboxLogLine.fields` map already supports this.
 
@@ -346,10 +345,10 @@ Estimated per-sandbox volume by pillar:
 |---|---|---|---|
 | Traces | 10-100 spans/sec (active agent with OTel) | 200-500 bytes | 2-50 KB/sec |
 | OCSF logs | 10-300 events/sec (one per outbound network decision) | 1-5 KB (full JSONL event) | 10 KB - 1.5 MB/sec |
-| Agent stdout/stderr | Varies (verbose LLM agent: 1-10 KB/sec) | Raw text | 1-10 KB/sec |
+| Supervisor tracing events | Varies (existing LogPushLayer) | 100-500 bytes | 1-10 KB/sec |
 | Metrics | 1 push per 15-60 sec | 1-5 KB | Negligible |
 
-At 100 concurrent sandboxes, the aggregate could reach 1-15 MB/second sustained. OCSF logs are potentially the largest contributor because every outbound agent connection generates structured security events, and OCSF JSONL records are larger than trace spans. Agent stdout/stderr volume depends entirely on agent verbosity and is unbounded without rate limiting.
+At 100 concurrent sandboxes, the aggregate could reach 1-10 MB/second sustained. OCSF logs are potentially the largest contributor because every outbound agent connection generates structured security events, and OCSF JSONL records are larger than trace spans.
 
 The network bandwidth alone is manageable. The deeper concern is that the gateway now serves two roles (control plane and data plane relay), and these roles compete for resources. If the external collector or log aggregator is slow or unreachable, the gateway accumulates buffered data from all sandboxes. Memory pressure from the relay can degrade sandbox lifecycle operations.
 
@@ -360,7 +359,6 @@ Several mitigations should be part of the implementation:
 - The telemetry relay should use a separate transport channel (or multiplexed stream) from the control plane session, so telemetry backpressure does not block sandbox create or delete operations.
 - Head sampling at the supervisor reduces trace volume before it reaches the gateway. This should be configurable per-sandbox or globally (e.g., sample 10% of traces, but always forward traces containing errors).
 - Per-sandbox rate limits prevent one noisy agent from overwhelming the gateway. Excess spans and log events are dropped at the supervisor with counter metrics, not silently. OCSF events should have higher rate limits than traces given their audit value.
-- Agent stdout/stderr needs a per-sandbox byte rate limit. Without one, a verbose agent can dominate the relay channel.
 - The gateway forwards received telemetry to external endpoints asynchronously in batches, not synchronously per-record.
 - When the gateway's relay buffer is full, it should signal the supervisor to slow down or drop rather than silently accepting until it runs out of memory.
 - For high-volume scenarios, users can bypass the trace relay entirely by setting `OTEL_EXPORTER_OTLP_ENDPOINT` to `host.openshell.internal:<port>` or a direct collector address. The trace relay is the zero-config default, not a mandatory path.
