@@ -9,7 +9,9 @@ use openshell_core::ComputeDriverError;
 use openshell_core::driver_mounts::SelinuxLabel;
 #[cfg(test)]
 use openshell_core::gpu::{driver_gpu_requirements, validate_specific_gpu_device_request};
-use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
+use openshell_core::proto::compute::v1::{
+    DriverSandbox, DriverSandboxTemplate, workspace_validation_identity,
+};
 use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
 use openshell_core::{driver_mounts, proto_struct};
 use serde::Serialize;
@@ -45,10 +47,6 @@ pub use openshell_core::driver_utils::{
 pub const LABEL_MANAGED: &str = "openshell.managed";
 /// Label filter string for list/event queries.
 pub const LABEL_MANAGED_FILTER: &str = "openshell.managed=true";
-/// Label applied only to temporary OCI workdir validation probes.
-pub const LABEL_WORKSPACE_PROBE: &str = "openshell.workspace-probe";
-/// Label filter used to recover probes left behind by a stopped gateway.
-pub const LABEL_WORKSPACE_PROBE_FILTER: &str = "openshell.workspace-probe=true";
 
 /// Container name prefix to avoid collisions with user containers.
 const CONTAINER_PREFIX: &str = "openshell-";
@@ -276,12 +274,11 @@ struct ContainerSpec {
 ///
 /// Keep this typed separately from [`ContainerSpec`] so probes cannot
 /// accidentally inherit sandbox networking, secrets, or workspace mounts,
-/// while still sharing resource-limit construction and recovery metadata.
+/// while still sharing resource-limit construction.
 #[derive(Serialize)]
 pub struct WorkspaceProbeSpec {
     name: String,
     image: String,
-    labels: BTreeMap<String, String>,
     entrypoint: Vec<String>,
     command: Vec<String>,
     user: String,
@@ -1319,17 +1316,26 @@ pub fn build_workspace_probe_spec(
         "--oci-user".to_string(),
         image.oci_user.clone(),
     ];
-    if let Some(identity) = &spec.workspace_validation_identity {
-        for (flag, value) in [
-            ("--run-as-user", identity.run_as_user.as_str()),
-            ("--run-as-group", identity.run_as_group.as_str()),
-        ] {
-            if !value.is_empty() {
-                command.push(flag.to_string());
-                command.push(value.to_string());
+    let identity = spec.workspace_validation_identity.as_ref().ok_or_else(|| {
+        ComputeDriverError::Precondition(
+            "workspace_validation_identity is required for a non-default OCI workdir".into(),
+        )
+    })?;
+    match identity.source.as_ref().ok_or_else(|| {
+        ComputeDriverError::Precondition("workspace_validation_identity.source is required".into())
+    })? {
+        workspace_validation_identity::Source::Policy(policy) => {
+            for (flag, value) in [
+                ("--run-as-user", policy.run_as_user.as_str()),
+                ("--run-as-group", policy.run_as_group.as_str()),
+            ] {
+                if !value.is_empty() {
+                    command.push(flag.to_string());
+                    command.push(value.to_string());
+                }
             }
         }
-        if identity.discover_from_image_policy {
+        workspace_validation_identity::Source::Image(_) => {
             command.push("--discover-policy-identity".to_string());
         }
     }
@@ -1339,10 +1345,6 @@ pub fn build_workspace_probe_spec(
         // from making a retry conflict with the first probe.
         name: workspace_probe_name(),
         image: image.id.clone(),
-        labels: BTreeMap::from([
-            (LABEL_WORKSPACE_PROBE.into(), "true".into()),
-            (LABEL_SANDBOX_ID.into(), sandbox.id.clone()),
-        ]),
         entrypoint: vec![SUPERVISOR_BINARY_PATH.into()],
         command,
         user: "0:0".into(),
@@ -1441,7 +1443,9 @@ fn parse_memory_to_bytes(quantity: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::client::ImageConfig;
-    use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
+    use openshell_core::proto::compute::v1::{
+        DriverSandboxSpec, GpuResourceRequirements, ResourceRequirements,
+    };
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -1686,9 +1690,12 @@ mod tests {
         );
         spec.workspace_validation_identity = Some(
             openshell_core::proto::compute::v1::WorkspaceValidationIdentity {
-                run_as_user: "policy-user".into(),
-                run_as_group: "policy-group".into(),
-                discover_from_image_policy: false,
+                source: Some(workspace_validation_identity::Source::Policy(
+                    openshell_core::proto::compute::v1::PolicyProcessIdentity {
+                        run_as_user: "policy-user".into(),
+                        run_as_group: "policy-group".into(),
+                    },
+                )),
             },
         );
         let mut config = test_config();
@@ -1707,9 +1714,7 @@ mod tests {
         assert_eq!(probe["image_volume_mode"], "ignore");
         assert_eq!(probe["cap_drop"], serde_json::json!(["ALL"]));
         assert_eq!(probe["cap_add"], serde_json::json!(["SETUID", "SETGID"]));
-        assert_eq!(probe["labels"][LABEL_WORKSPACE_PROBE], "true");
-        assert_eq!(probe["labels"][LABEL_SANDBOX_ID], "test-id");
-        assert!(probe["labels"].get(LABEL_MANAGED).is_none());
+        assert!(probe.get("labels").is_none());
         assert_eq!(probe["resource_limits"]["cpu"]["quota"], 75_000);
         assert_eq!(
             probe["resource_limits"]["memory"]["limit"],
@@ -1752,8 +1757,9 @@ mod tests {
             .get_or_insert_default()
             .workspace_validation_identity = Some(
             openshell_core::proto::compute::v1::WorkspaceValidationIdentity {
-                discover_from_image_policy: true,
-                ..Default::default()
+                source: Some(workspace_validation_identity::Source::Image(
+                    openshell_core::proto::compute::v1::ImagePolicyDiscovery {},
+                )),
             },
         );
 
@@ -1780,6 +1786,22 @@ mod tests {
     }
 
     #[test]
+    fn workspace_probe_requires_an_explicit_identity_source() {
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec::default());
+
+        let Err(error) = build_workspace_probe_spec(
+            &sandbox,
+            &test_config(),
+            &resolved_image("sha256:immutable", "app:staff", "/home/app/project"),
+        ) else {
+            panic!("non-default workdir should require an identity source");
+        };
+
+        assert!(error.to_string().contains("workspace_validation_identity"));
+    }
+
+    #[test]
     fn workspace_probe_skips_sandbox_compatibility_fallback() {
         let probe = build_workspace_probe_spec(
             &test_sandbox("test-id", "test-name"),
@@ -1793,7 +1815,7 @@ mod tests {
     #[test]
     fn container_spec_reserves_resolved_workspace_root_but_allows_nested_mounts() {
         let mut sandbox = test_sandbox("test-id", "test-name");
-        sandbox.spec = Some(openshell_core::proto::compute::v1::DriverSandboxSpec {
+        sandbox.spec = Some(DriverSandboxSpec {
             template: Some(DriverSandboxTemplate::default()),
             ..Default::default()
         });

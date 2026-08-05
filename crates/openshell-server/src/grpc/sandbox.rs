@@ -30,7 +30,7 @@ use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryComputeDriver,
     TelemetryOutcome,
 };
-use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
+use openshell_core::{ComputeDriverKind, ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -203,9 +203,7 @@ fn emit_sandbox_create_telemetry(
     );
 }
 
-fn telemetry_compute_driver(
-    driver_kind: Option<openshell_core::ComputeDriverKind>,
-) -> TelemetryComputeDriver {
+fn telemetry_compute_driver(driver_kind: Option<ComputeDriverKind>) -> TelemetryComputeDriver {
     TelemetryComputeDriver::from_driver_kind(driver_kind)
 }
 
@@ -275,6 +273,19 @@ async fn handle_create_sandbox_inner(
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
     }
 
+    let workspace_validation_identity =
+        if matches!(state.compute.driver_kind(), Some(ComputeDriverKind::Podman)) {
+            Some(
+                super::policy::workspace_validation_identity_for_create(
+                    state,
+                    spec.policy.as_ref(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
     let id = uuid::Uuid::new_v4().to_string();
     let name = if request.name.is_empty() {
         generate_routable_name()
@@ -305,7 +316,7 @@ async fn handle_create_sandbox_inner(
 
     state
         .compute
-        .validate_sandbox_create(&sandbox)
+        .validate_sandbox_create(&sandbox, workspace_validation_identity.clone())
         .await
         .map_err(|status| {
             warn!(error = %status, "Rejecting sandbox create request");
@@ -332,7 +343,10 @@ async fn handle_create_sandbox_inner(
         None => None,
     };
 
-    let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
+    let sandbox = state
+        .compute
+        .create_sandbox(sandbox, sandbox_token, workspace_validation_identity)
+        .await?;
 
     info!(
         sandbox_id = %id,
@@ -2282,19 +2296,19 @@ mod tests {
     #[test]
     fn telemetry_compute_driver_uses_resolved_driver_kind() {
         assert_eq!(
-            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Docker)),
+            telemetry_compute_driver(Some(ComputeDriverKind::Docker)),
             TelemetryComputeDriver::Docker
         );
         assert_eq!(
-            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Kubernetes)),
+            telemetry_compute_driver(Some(ComputeDriverKind::Kubernetes)),
             TelemetryComputeDriver::Kubernetes
         );
         assert_eq!(
-            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Podman)),
+            telemetry_compute_driver(Some(ComputeDriverKind::Podman)),
             TelemetryComputeDriver::Podman
         );
         assert_eq!(
-            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Vm)),
+            telemetry_compute_driver(Some(ComputeDriverKind::Vm)),
             TelemetryComputeDriver::Vm
         );
         assert_eq!(
@@ -3184,8 +3198,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_get_preserve_partial_process_identity() {
-        let state =
-            test_server_state_with_driver(openshell_core::ComputeDriverKind::Docker.as_str()).await;
+        let state = test_server_state_with_driver(ComputeDriverKind::Docker.as_str()).await;
         let policy = openshell_core::proto::SandboxPolicy {
             version: 1,
             process: Some(openshell_core::proto::ProcessPolicy {
@@ -3248,9 +3261,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_get_restore_legacy_identity_defaults_for_non_local_driver() {
-        let state =
-            test_server_state_with_driver(openshell_core::ComputeDriverKind::Kubernetes.as_str())
-                .await;
+        let state = test_server_state_with_driver(ComputeDriverKind::Kubernetes.as_str()).await;
         let policy = openshell_core::proto::SandboxPolicy {
             version: 1,
             process: Some(openshell_core::proto::ProcessPolicy {

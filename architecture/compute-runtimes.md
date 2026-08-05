@@ -214,8 +214,11 @@ Docker performs the check in the final container before workload launch and
 rejects image `VOLUME` declarations that would mask the workdir ancestry.
 Podman performs it in a minimal networkless container from the same pinned
 image ID before its managed workspace volume covers the path. The probe adopts
-the completed process identity and emits an attestation that the final
-supervisor must match. The resolved workspace is the child cwd and `HOME`;
+the identity source from the effective global-or-sandbox policy, or discovers
+the image policy when neither exists, and emits a normalized attestation that
+the final supervisor must match. This internal Podman-only contract is required
+because the managed volume hides the original image tree before the final
+supervisor starts. The resolved workspace is the child cwd and `HOME`;
 when `filesystem.include_workdir` is enabled, it
 becomes the automatic writable policy path. Kubernetes/OpenShift keep their
 `/sandbox` PVC and `fsGroup` behavior, and VM keeps its `/sandbox` guest

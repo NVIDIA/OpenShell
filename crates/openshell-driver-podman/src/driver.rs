@@ -5,10 +5,7 @@
 
 use crate::client::{PodmanApiError, PodmanClient, VolumeInspect};
 use crate::config::PodmanComputeConfig;
-use crate::container::{
-    self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, LABEL_WORKSPACE_PROBE_FILTER,
-    PodmanSandboxDriverConfig,
-};
+use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, PodmanSandboxDriverConfig};
 use crate::watcher::{
     self, WatchStream, driver_sandbox_from_inspect, driver_sandbox_from_list_entry,
 };
@@ -259,24 +256,6 @@ fn sanitized_probe_diagnostic(logs: &str) -> String {
     } else {
         sanitized.chars().take(2048).collect()
     }
-}
-
-async fn remove_workspace_probes(
-    client: &PodmanClient,
-    stop_timeout_secs: u32,
-) -> Result<usize, PodmanApiError> {
-    let probes = client
-        .list_containers(&[LABEL_WORKSPACE_PROBE_FILTER])
-        .await?;
-    let mut removed = 0;
-    for probe in probes {
-        match client.remove_container(&probe.id, stop_timeout_secs).await {
-            Ok(()) => removed += 1,
-            Err(PodmanApiError::NotFound(_)) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(removed)
 }
 
 async fn run_workspace_probe(
@@ -542,14 +521,6 @@ impl PodmanComputeDriver {
             gateway_ip = ?network_gateway_ip,
             "Bridge network ready"
         );
-
-        let removed_probes = remove_workspace_probes(&client, config.stop_timeout_secs).await?;
-        if removed_probes > 0 {
-            info!(
-                count = removed_probes,
-                "Removed workspace validation probes left by a previous gateway process"
-            );
-        }
 
         let (gpu_inventory, allow_all_default_gpu) = local_podman_gpu_selector_state();
         if !gpu_inventory.is_empty() {
@@ -1285,7 +1256,8 @@ mod tests {
     use crate::test_utils::{StubResponse, spawn_podman_stub};
     use hyper::StatusCode;
     use openshell_core::proto::compute::v1::{
-        DriverSandboxSpec, DriverSandboxTemplate, ResourceRequirements,
+        DriverSandboxSpec, DriverSandboxTemplate, ImagePolicyDiscovery, ResourceRequirements,
+        WorkspaceValidationIdentity, workspace_validation_identity,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -1666,7 +1638,6 @@ mod tests {
                     }"#,
                 ),
                 StubResponse::new(StatusCode::CREATED, "{}"),
-                StubResponse::new(StatusCode::OK, "[]"),
             ],
         );
         let config = PodmanComputeConfig {
@@ -1686,65 +1657,12 @@ mod tests {
             .lock()
             .expect("request log lock should not be poisoned");
         assert_eq!(
-            &requests[..3],
+            requests.as_slice(),
             [
                 "GET /_ping".to_string(),
                 format!("GET {}", api_path("/libpod/info")),
                 format!("POST {}", api_path("/libpod/networks/create")),
             ]
-        );
-        assert!(requests[3].contains("/libpod/containers/json?all=true&filters="));
-    }
-
-    #[tokio::test]
-    async fn constructor_removes_workspace_probes_left_by_previous_process() {
-        let (socket_path, request_log, handle) = spawn_podman_stub(
-            "stale-workspace-probe",
-            vec![
-                StubResponse::new(StatusCode::OK, ""),
-                StubResponse::new(
-                    StatusCode::OK,
-                    r#"{
-                        "host": {
-                            "cgroupVersion": "v2",
-                            "networkBackend": "netavark",
-                            "security": {"rootless": false}
-                        }
-                    }"#,
-                ),
-                StubResponse::new(StatusCode::CREATED, "{}"),
-                StubResponse::new(
-                    StatusCode::OK,
-                    r#"[{
-                        "Id": "stale-probe-id",
-                        "Names": ["openshell-stale-workdir-probe"],
-                        "State": "exited",
-                        "Labels": {"openshell.workspace-probe": "true"}
-                    }]"#,
-                ),
-                StubResponse::new(StatusCode::NO_CONTENT, ""),
-            ],
-        );
-        let config = PodmanComputeConfig {
-            socket_path: Some(socket_path.clone()),
-            grpc_endpoint: "https://gateway.example.test:9443".to_string(),
-            ..PodmanComputeConfig::default()
-        };
-
-        PodmanComputeDriver::new(config)
-            .await
-            .expect("startup should remove a stale workspace probe");
-
-        handle.await.expect("stub task should finish");
-        let requests = request_log.lock().unwrap();
-        assert!(requests[3].contains("/libpod/containers/json?all=true&filters="));
-        assert!(requests[3].contains("openshell.workspace-probe"));
-        assert_eq!(
-            requests[4],
-            format!(
-                "DELETE {}?force=true&volumes=true&timeout=45",
-                api_path("/libpod/containers/stale-probe-id")
-            )
         );
     }
 
@@ -2301,7 +2219,14 @@ mod tests {
 
     fn workspace_probe_sandbox(id: &str) -> DriverSandbox {
         let mut sandbox = plain_sandbox(id, "demo");
-        sandbox.spec = Some(DriverSandboxSpec::default());
+        sandbox.spec = Some(DriverSandboxSpec {
+            workspace_validation_identity: Some(WorkspaceValidationIdentity {
+                source: Some(workspace_validation_identity::Source::Image(
+                    ImagePolicyDiscovery {},
+                )),
+            }),
+            ..Default::default()
+        });
         sandbox
     }
 

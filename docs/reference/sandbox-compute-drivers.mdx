@@ -461,11 +461,13 @@ the original image filesystem in the final supervisor and rejects image
 validation. Podman checks the same
 pinned image ID in a temporary networkless probe without the workspace volume,
 token, or TLS secrets. The probe retains only `SETUID` and `SETGID`, drops to
-the completed process identity, and uses the kernel to validate access. The
-final supervisor must match the probe's normalized identity attestation,
-including when the image supplies the default process policy. Podman captures
-a bounded, sanitized failure diagnostic, removes the probe, and only then
-creates the final volume-backed sandbox. The resolved workspace is the cwd and
+the identity selected by the effective global-or-sandbox policy, and uses the
+kernel to validate access. When neither policy exists, it discovers the image
+policy identity. The final supervisor must match the probe's normalized
+identity attestation. Podman captures a bounded, sanitized failure diagnostic,
+removes the exact probe it created, and only then creates the final
+volume-backed sandbox. Probe names are unique to each attempt, so an ambiguous
+create response cannot poison a retry. The resolved workspace is the cwd and
 `HOME` for direct and SSH children. The supervisor itself starts from `/`, so a
 missing or invalid workspace is handled during readiness instead of preventing
 the container runtime from starting it.

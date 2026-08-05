@@ -132,18 +132,28 @@ message DriverSandboxSpec {
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
   string sandbox_token = 11 [(openshell.options.v1.secret) = true];
-  // Final process-identity inputs needed by local container drivers when they
-  // validate an OCI image workspace before launching the supervisor.
+  // Effective process-identity source needed by local container drivers when
+  // they validate an OCI image workspace before launching the supervisor.
   WorkspaceValidationIdentity workspace_validation_identity = 12;
 }
 
 message WorkspaceValidationIdentity {
+  oneof source {
+    // A sandbox or global policy is authoritative. Empty fields retain the
+    // OCI USER component for that field.
+    PolicyProcessIdentity policy = 1;
+    // No effective policy exists, so discover an image-provided policy before
+    // resolving the final process identity.
+    ImagePolicyDiscovery image = 2;
+  }
+}
+
+message PolicyProcessIdentity {
   string run_as_user = 1;
   string run_as_group = 2;
-  // No public policy was supplied, so the supervisor must discover an
-  // image-provided policy before resolving the final process identity.
-  bool discover_from_image_policy = 3;
 }
+
+message ImagePolicyDiscovery {}
 
 message ResourceRequirements {
   // GPU requirements for the sandbox. Presence indicates a GPU request.

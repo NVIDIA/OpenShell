@@ -23,6 +23,10 @@ use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 #[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
+use openshell_core::proto::compute::v1::{
+    ImagePolicyDiscovery, PolicyProcessIdentity, WorkspaceValidationIdentity,
+    workspace_validation_identity,
+};
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -4824,6 +4828,37 @@ fn decode_policy_from_global_settings(
     let policy = ProtoSandboxPolicy::decode(raw.as_slice())
         .map_err(|e| Status::internal(format!("global policy protobuf decode failed: {e}")))?;
     Ok(Some(policy))
+}
+
+fn workspace_validation_identity_from_policy(
+    policy: Option<&ProtoSandboxPolicy>,
+) -> WorkspaceValidationIdentity {
+    let source = policy.map_or(
+        workspace_validation_identity::Source::Image(ImagePolicyDiscovery {}),
+        |policy| {
+            let process = policy.process.as_ref();
+            workspace_validation_identity::Source::Policy(PolicyProcessIdentity {
+                run_as_user: process.map_or_else(String::new, |p| p.run_as_user.clone()),
+                run_as_group: process.map_or_else(String::new, |p| p.run_as_group.clone()),
+            })
+        },
+    );
+    WorkspaceValidationIdentity {
+        source: Some(source),
+    }
+}
+
+/// Resolve the process-identity source used by a new Podman workspace probe.
+/// Global policy has the same precedence here as it does in `GetSandboxConfig`.
+pub(super) async fn workspace_validation_identity_for_create(
+    state: &ServerState,
+    sandbox_policy: Option<&ProtoSandboxPolicy>,
+) -> Result<WorkspaceValidationIdentity, Status> {
+    let global_settings = load_global_settings(state.store.as_ref()).await?;
+    let global_policy = decode_policy_from_global_settings(&global_settings)?;
+    Ok(workspace_validation_identity_from_policy(
+        global_policy.as_ref().or(sandbox_policy),
+    ))
 }
 
 fn merge_effective_settings(
@@ -11807,6 +11842,56 @@ mod tests {
             .unwrap()
             .expect("policy present");
         assert_eq!(decoded.version, 7);
+    }
+
+    #[test]
+    fn workspace_validation_uses_image_identity_without_an_effective_policy() {
+        let identity = workspace_validation_identity_from_policy(None);
+        assert!(matches!(
+            identity.source,
+            Some(workspace_validation_identity::Source::Image(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_validation_uses_global_policy_identity() {
+        let state = test_server_state().await;
+        let global_policy = ProtoSandboxPolicy {
+            process: Some(openshell_core::proto::ProcessPolicy {
+                run_as_user: "2000".into(),
+                run_as_group: "2000".into(),
+            }),
+            ..Default::default()
+        };
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                POLICY_SETTING_KEY.to_string(),
+                StoredSettingValue::Bytes(hex::encode(global_policy.encode_to_vec())),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+
+        let sandbox_policy = ProtoSandboxPolicy {
+            process: Some(openshell_core::proto::ProcessPolicy {
+                run_as_user: "1000".into(),
+                run_as_group: "1000".into(),
+            }),
+            ..Default::default()
+        };
+        let identity = workspace_validation_identity_for_create(&state, Some(&sandbox_policy))
+            .await
+            .unwrap();
+
+        let Some(workspace_validation_identity::Source::Policy(process)) = identity.source else {
+            panic!("global policy should supply the workspace-validation identity");
+        };
+        assert_eq!(process.run_as_user, "2000");
+        assert_eq!(process.run_as_group, "2000");
     }
 
     #[test]

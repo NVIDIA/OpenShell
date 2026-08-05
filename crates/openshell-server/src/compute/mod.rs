@@ -33,9 +33,9 @@ use openshell_core::proto::compute::v1::{
     GetGatewayListenerRequirementsResponse, GetSandboxRequest,
     GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
     ResourceRequirements as DriverSandboxResourceRequirements, ValidateSandboxCreateRequest,
-    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
-    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
-    watch_sandboxes_event,
+    WatchSandboxesEvent, WatchSandboxesRequest, WorkspaceValidationIdentity,
+    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
+    gateway_listener_requirement::Selector, watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -840,9 +840,17 @@ impl ComputeRuntime {
         &self.gateway_listener_requirements
     }
 
-    pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        let driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
-            .map_err(|status| *status)?;
+    pub async fn validate_sandbox_create(
+        &self,
+        sandbox: &Sandbox,
+        workspace_validation_identity: Option<WorkspaceValidationIdentity>,
+    ) -> Result<(), Status> {
+        let driver_sandbox = driver_sandbox_from_public(
+            sandbox,
+            &self.driver_info.name,
+            workspace_validation_identity,
+        )
+        .map_err(|status| *status)?;
         self.driver
             .call(
                 "driver.validate_sandbox_create",
@@ -863,10 +871,15 @@ impl ComputeRuntime {
         &self,
         sandbox: Sandbox,
         sandbox_token: Option<String>,
+        workspace_validation_identity: Option<WorkspaceValidationIdentity>,
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
-        let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
-            .map_err(|status| *status)?;
+        let mut driver_sandbox = driver_sandbox_from_public(
+            &sandbox,
+            &self.driver_info.name,
+            workspace_validation_identity,
+        )
+        .map_err(|status| *status)?;
 
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
@@ -2496,6 +2509,7 @@ pub async fn connect_remote_compute_driver(
 fn driver_sandbox_from_public(
     sandbox: &Sandbox,
     driver_name: &str,
+    workspace_validation_identity: Option<WorkspaceValidationIdentity>,
 ) -> Result<DriverSandbox, Box<Status>> {
     Ok(DriverSandbox {
         id: sandbox.object_id().to_string(),
@@ -2504,7 +2518,9 @@ fn driver_sandbox_from_public(
         spec: sandbox
             .spec
             .as_ref()
-            .map(|spec| driver_sandbox_spec_from_public(spec, driver_name))
+            .map(|spec| {
+                driver_sandbox_spec_from_public(spec, driver_name, workspace_validation_identity)
+            })
             .transpose()?,
         status: sandbox.status.as_ref().map(driver_status_from_public),
         workspace: sandbox.object_workspace().to_string(),
@@ -2514,18 +2530,8 @@ fn driver_sandbox_from_public(
 fn driver_sandbox_spec_from_public(
     spec: &SandboxSpec,
     driver_name: &str,
+    workspace_validation_identity: Option<WorkspaceValidationIdentity>,
 ) -> Result<DriverSandboxSpec, Box<Status>> {
-    let workspace_validation_identity = (driver_name == "podman").then(|| {
-        let process = spec
-            .policy
-            .as_ref()
-            .and_then(|policy| policy.process.as_ref());
-        openshell_core::proto::compute::v1::WorkspaceValidationIdentity {
-            run_as_user: process.map_or_else(String::new, |process| process.run_as_user.clone()),
-            run_as_group: process.map_or_else(String::new, |process| process.run_as_group.clone()),
-            discover_from_image_policy: spec.policy.is_none(),
-        }
-    });
     Ok(DriverSandboxSpec {
         log_level: spec.log_level.clone(),
         environment: spec.environment.clone(),
@@ -2543,7 +2549,11 @@ fn driver_sandbox_spec_from_public(
             }
         }),
         sandbox_token: String::new(),
-        workspace_validation_identity,
+        workspace_validation_identity: if driver_name == "podman" {
+            workspace_validation_identity
+        } else {
+            None
+        },
     })
 }
 
@@ -3284,7 +3294,7 @@ mod tests {
             ..Default::default()
         };
 
-        let driver = driver_sandbox_spec_from_public(&public, "test-driver")
+        let driver = driver_sandbox_spec_from_public(&public, "test-driver", None)
             .expect("driver spec should map");
 
         let gpu = driver
@@ -3296,35 +3306,26 @@ mod tests {
     }
 
     #[test]
-    fn driver_sandbox_spec_projects_process_identity_only_for_podman_probe() {
-        let public = SandboxSpec {
-            policy: Some(openshell_core::proto::SandboxPolicy {
-                process: Some(openshell_core::proto::ProcessPolicy {
-                    run_as_user: "app".into(),
-                    run_as_group: "staff".into(),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
+    fn driver_sandbox_spec_forwards_workspace_identity_only_to_podman() {
+        use openshell_core::proto::compute::v1::{
+            PolicyProcessIdentity, workspace_validation_identity,
         };
 
-        let driver =
-            driver_sandbox_spec_from_public(&public, "podman").expect("driver spec should map");
-        let identity = driver.workspace_validation_identity.unwrap();
-        assert_eq!(identity.run_as_user, "app");
-        assert_eq!(identity.run_as_group, "staff");
-        assert!(!identity.discover_from_image_policy);
+        let public = SandboxSpec::default();
+        let identity = WorkspaceValidationIdentity {
+            source: Some(workspace_validation_identity::Source::Policy(
+                PolicyProcessIdentity {
+                    run_as_user: "app".into(),
+                    run_as_group: "staff".into(),
+                },
+            )),
+        };
 
-        let without_policy =
-            driver_sandbox_spec_from_public(&SandboxSpec::default(), "podman").unwrap();
-        assert!(
-            without_policy
-                .workspace_validation_identity
-                .unwrap()
-                .discover_from_image_policy
-        );
+        let podman = driver_sandbox_spec_from_public(&public, "podman", Some(identity.clone()))
+            .expect("driver spec should map");
+        assert_eq!(podman.workspace_validation_identity, Some(identity.clone()));
 
-        let docker = driver_sandbox_spec_from_public(&public, "docker").unwrap();
+        let docker = driver_sandbox_spec_from_public(&public, "docker", Some(identity)).unwrap();
         assert!(docker.workspace_validation_identity.is_none());
     }
 
@@ -4364,7 +4365,7 @@ mod tests {
         let traced = test_exporter::install_traced();
         async {
             runtime
-                .create_sandbox(sandbox, None)
+                .create_sandbox(sandbox, None, None)
                 .await
                 .expect("create succeeds");
         }
@@ -4488,7 +4489,7 @@ mod tests {
         let traced = test_exporter::install_traced();
         async {
             runtime
-                .create_sandbox(sandbox, None)
+                .create_sandbox(sandbox, None, None)
                 .await
                 .expect_err("driver refuses the create");
         }
@@ -4703,7 +4704,7 @@ mod tests {
             ..Default::default()
         });
 
-        runtime.create_sandbox(sandbox, None).await.unwrap();
+        runtime.create_sandbox(sandbox, None, None).await.unwrap();
         runtime
             .apply_sandbox_update(ready_driver_sandbox("sb-1", "sandbox-a"))
             .await
@@ -7003,8 +7004,11 @@ mod tests {
             ..Default::default()
         });
 
-        runtime.validate_sandbox_create(&sandbox).await.unwrap();
-        runtime.create_sandbox(sandbox, None).await.unwrap();
+        runtime
+            .validate_sandbox_create(&sandbox, None)
+            .await
+            .unwrap();
+        runtime.create_sandbox(sandbox, None, None).await.unwrap();
         assert!(
             runtime
                 .delete_sandbox("default", "uds-sandbox")
@@ -7113,7 +7117,7 @@ mod tests {
             deletion_timestamp_ms: 0,
         });
 
-        let created = runtime.create_sandbox(sandbox, None).await.unwrap();
+        let created = runtime.create_sandbox(sandbox, None, None).await.unwrap();
 
         assert_eq!(
             created.metadata.as_ref().unwrap().resource_version,
@@ -7148,7 +7152,7 @@ mod tests {
             .labels
             .insert("env".to_string(), "prod".to_string());
 
-        runtime.create_sandbox(sandbox, None).await.unwrap();
+        runtime.create_sandbox(sandbox, None, None).await.unwrap();
 
         let matching = runtime
             .store
@@ -7172,11 +7176,13 @@ mod tests {
         // Spawn two concurrent creation attempts for the same sandbox
         let runtime1 = runtime.clone();
         let sandbox1 = sandbox.clone();
-        let handle1 = tokio::spawn(async move { runtime1.create_sandbox(sandbox1, None).await });
+        let handle1 =
+            tokio::spawn(async move { runtime1.create_sandbox(sandbox1, None, None).await });
 
         let runtime2 = runtime.clone();
         let sandbox2 = sandbox.clone();
-        let handle2 = tokio::spawn(async move { runtime2.create_sandbox(sandbox2, None).await });
+        let handle2 =
+            tokio::spawn(async move { runtime2.create_sandbox(sandbox2, None, None).await });
 
         // Wait for both to complete
         let result1 = handle1.await.unwrap();
@@ -7234,7 +7240,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let driver_sb = driver_sandbox_from_public(&sandbox, "kubernetes").unwrap();
+        let driver_sb = driver_sandbox_from_public(&sandbox, "kubernetes", None).unwrap();
         assert_eq!(driver_sb.workspace, "alpha");
         assert_eq!(driver_sb.name, "work");
         assert_eq!(driver_sb.id, "sb-1");

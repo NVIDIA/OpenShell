@@ -24,7 +24,9 @@ resource-limited, networkless probe verifies the original pinned image before
 Podman covers the path with the managed workspace volume. The completed process
 identity must already be able to traverse every parent and write and enter the
 directory, without symlink components or OpenShell control-path collisions.
-The final supervisor must match the probe's identity before preparing the
+The gateway supplies the identity source from the effective global-or-sandbox
+policy, or requests image-policy discovery when neither exists. The final
+supervisor must match the probe's normalized identity before preparing the
 volume. See [Compute runtimes](../../architecture/compute-runtimes.md#process-identity)
 for the invariant and probe lifecycle.
 
@@ -304,6 +306,13 @@ sequenceDiagram
 
     D->>P: pull_image(supervisor, "missing")
     D->>P: pull_image(sandbox_image, policy)
+    D->>P: inspect_image(sandbox_image)
+
+    opt Non-default OCI workdir
+        D->>P: create + start validation probe
+        D->>P: wait + read bounded logs
+        D->>P: force-remove exact probe name
+    end
 
     D->>P: create_volume(workspace)
     Note over D: On failure below, rollback volume
