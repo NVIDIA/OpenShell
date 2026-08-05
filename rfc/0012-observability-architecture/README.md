@@ -281,7 +281,7 @@ On the deployment side, the Helm and TOML configuration described in the Deploym
 
 ### Phase 2: Sandbox OTLP relay
 
-This is the architecturally new work. It introduces a trace collection path from inside network-isolated sandboxes to the external collector. The relay design is described in the Proposal section; this section focuses on where the code changes land and what depends on what.
+This is the architecturally new work. It introduces a trace collection path from inside network-isolated sandboxes to the external collector. The relay design is described in [Supervisor as telemetry relay](#supervisor-as-telemetry-relay); this section focuses on where the code changes land and what depends on what.
 
 The supervisor needs an OTLP listener on ports 4317 (gRPC) and 4318 (HTTP), bound to the address reachable from the agent process (the veth host IP for container-based drivers, localhost for K8s sidecar; see OTLP receiver reachability). The implementation choice is between using the `opentelemetry-proto` crate to implement the receiver from scratch (smaller binary, more control) or embedding a lightweight collector library (more features, larger dependency). Either way, the receiver accepts `ExportTraceServiceRequest` messages, validates them, and places them in a bounded in-memory buffer. The supervisor sets `OTEL_EXPORTER_OTLP_ENDPOINT` in the agent process environment automatically, pointing at the correct address.
 
