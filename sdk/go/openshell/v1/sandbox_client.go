@@ -156,6 +156,9 @@ func (s *sandboxClient) WaitReady(ctx context.Context, workspace, name string, o
 	if sb.Status.Phase == SandboxError {
 		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is in error state", name)}
 	}
+	if sb.Status.Phase == SandboxDeleting {
+		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is being deleted", name)}
+	}
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -174,6 +177,9 @@ func (s *sandboxClient) WaitReady(ctx context.Context, workspace, name string, o
 			}
 			if sb.Status.Phase == SandboxError {
 				return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is in error state", name)}
+			}
+			if sb.Status.Phase == SandboxDeleting {
+				return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is being deleted", name)}
 			}
 		}
 	}
@@ -217,6 +223,7 @@ func (s *sandboxClient) Watch(ctx context.Context, workspace, name string, opts 
 
 	go func() {
 		defer close(ch)
+		defer streamCancel()
 		ev := first
 		isFirst := true
 		for {

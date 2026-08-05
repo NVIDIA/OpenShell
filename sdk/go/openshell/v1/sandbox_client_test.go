@@ -870,6 +870,8 @@ func TestSandboxWatch_StopOnTerminal_False_DoesNotClose(t *testing.T) {
 		Metadata: &dm.ObjectMeta{Id: "id-1", Name: "sb-1"},
 		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_READY},
 	}
+	mock.watchKeepOpen = make(chan struct{})
+	defer close(mock.watchKeepOpen)
 	mock.watchEvents = []*pb.SandboxStreamEvent{
 		{Payload: &pb.SandboxStreamEvent_Sandbox{Sandbox: &pb.Sandbox{
 			Metadata: &dm.ObjectMeta{Name: "sb-1", Id: "id-1"},
@@ -879,7 +881,6 @@ func TestSandboxWatch_StopOnTerminal_False_DoesNotClose(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	// Default: StopOnTerminal=false — watcher should NOT auto-close on Ready
 	w, err := client.Watch(context.Background(), "default", "sb-1")
 	require.NoError(t, err)
 	defer w.Stop()
@@ -888,14 +889,43 @@ func TestSandboxWatch_StopOnTerminal_False_DoesNotClose(t *testing.T) {
 	assert.Equal(t, EventAdded, ev.Type)
 	assert.Equal(t, SandboxReady, ev.Object.Status.Phase)
 
-	// Channel closes because mock stream ends (not because of StopOnTerminal)
-	// This test verifies the existing behavior is preserved
+	// Channel must NOT close: stream is still open and StopOnTerminal=false
 	select {
-	case _, ok := <-w.ResultChan():
-		assert.False(t, ok, "channel should close after stream ends")
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for channel close")
+	case <-w.ResultChan():
+		t.Fatal("channel should stay open when StopOnTerminal is false")
+	case <-time.After(100 * time.Millisecond):
 	}
+}
+
+func TestSandboxWatch_DeletedEvent(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["sb-1"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Id: "id-1", Name: "sb-1"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_PROVISIONING},
+	}
+	mock.watchEvents = []*pb.SandboxStreamEvent{
+		{Payload: &pb.SandboxStreamEvent_Sandbox{Sandbox: &pb.Sandbox{
+			Metadata: &dm.ObjectMeta{Name: "sb-1", Id: "id-1"},
+			Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_PROVISIONING},
+		}}},
+		{Payload: &pb.SandboxStreamEvent_Sandbox{Sandbox: &pb.Sandbox{
+			Metadata: &dm.ObjectMeta{Name: "sb-1", Id: "id-1"},
+			Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_DELETING},
+		}}},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	w, err := client.Watch(context.Background(), "default", "sb-1")
+	require.NoError(t, err)
+	defer w.Stop()
+
+	ev1 := <-w.ResultChan()
+	assert.Equal(t, EventAdded, ev1.Type)
+
+	ev2 := <-w.ResultChan()
+	assert.Equal(t, EventDeleted, ev2.Type)
+	assert.Equal(t, SandboxDeleting, ev2.Object.Status.Phase)
 }
 
 // --- T027: GetLogs tests ---
