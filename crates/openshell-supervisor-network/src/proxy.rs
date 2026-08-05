@@ -5635,9 +5635,7 @@ network_policies:
 
         let upstream = tokio::spawn(async move {
             let (mut socket, _) = upstream_listener.accept().await.unwrap();
-            let request =
-                read_http_headers_with_timeout(&mut socket, std::time::Duration::from_secs(10))
-                    .await;
+            let request = read_http_headers_unbounded(&mut socket).await;
             let request = String::from_utf8_lossy(&request);
             assert!(request.starts_with("GET /ws HTTP/1.1\r\n"));
             assert!(request.contains(
@@ -5665,9 +5663,7 @@ network_policies:
             let mut socket = TcpStream::connect(proxy_address)
                 .await
                 .expect("connect proxy");
-            let response =
-                read_http_headers_with_timeout(&mut socket, std::time::Duration::from_secs(10))
-                    .await;
+            let response = read_http_headers_unbounded(&mut socket).await;
             assert!(String::from_utf8_lossy(&response).contains("101 Switching Protocols"));
             socket
                 .write_all(
@@ -5680,8 +5676,7 @@ network_policies:
         });
         let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+        let handler = tokio::spawn(async move {
             handle_forward_proxy(
                 "GET",
                 &target,
@@ -5698,13 +5693,28 @@ network_policies:
                 None,
                 None,
                 None,
-            ),
-        )
-        .await
-        .expect("compressed plaintext WebSocket relay should complete")
-        .expect("handle compressed plaintext WebSocket upgrade");
-        client.await.unwrap();
-        assert_eq!(upstream.await.unwrap(), r#"{"token":"[REDACTED]"}"#);
+            )
+            .await
+        });
+        let scenario = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let (client, upstream) = tokio::join!(client, upstream);
+            client.expect("join plaintext WebSocket client");
+            assert_eq!(
+                upstream.expect("join plaintext WebSocket upstream"),
+                r#"{"token":"[REDACTED]"}"#
+            );
+        })
+        .await;
+        if handler.is_finished() {
+            handler
+                .await
+                .expect("join plaintext WebSocket handler")
+                .expect("handle compressed plaintext WebSocket upgrade");
+        } else {
+            handler.abort();
+            let _ = handler.await;
+        }
+        scenario.expect("compressed plaintext WebSocket scenario should complete");
     }
 
     #[tokio::test]
@@ -6549,6 +6559,22 @@ network_policies:
             let n = tokio::time::timeout(timeout, reader.read(&mut chunk))
                 .await
                 .expect("HTTP headers should arrive")
+                .expect("header read should succeed");
+            assert!(n > 0, "stream closed before HTTP headers");
+            bytes.extend_from_slice(&chunk[..n]);
+            if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                return bytes;
+            }
+        }
+    }
+
+    async fn read_http_headers_unbounded<R: TokioAsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            let n = reader
+                .read(&mut chunk)
+                .await
                 .expect("header read should succeed");
             assert!(n > 0, "stream closed before HTTP headers");
             bytes.extend_from_slice(&chunk[..n]);

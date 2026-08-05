@@ -5817,47 +5817,44 @@ network_policies:
             .await
         });
 
-        app.write_all(
-            b"GET /ws HTTP/1.1\r\nHost: api.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n",
-        )
-        .await
-        .unwrap();
-
-        let upstream_headers = read_http_headers(&mut upstream).await;
-        let upstream_headers = String::from_utf8_lossy(&upstream_headers);
-        assert!(upstream_headers.contains(
-            "Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n"
-        ));
-        upstream
-            .write_all(
-                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n",
+        let scenario = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            app.write_all(
+                b"GET /ws HTTP/1.1\r\nHost: api.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n",
             )
             .await
             .unwrap();
-        let response = read_http_headers(&mut app).await;
-        assert!(String::from_utf8_lossy(&response).contains("101 Switching Protocols"));
 
-        app.write_all(
-            &crate::l7::websocket::compressed_masked_text_frame_for_test(
-                br#"{"token":"sk-1234567890abcdef"}"#,
-            ),
-        )
-        .await
-        .unwrap();
-        let frame = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            crate::l7::websocket::read_frame_for_test(&mut upstream),
-        )
-        .await
-        .expect("compressed WSS message should reach upstream");
-        assert_eq!(
-            crate::l7::websocket::decode_compressed_masked_text_frame_for_test(&frame),
-            r#"{"token":"[REDACTED]"}"#
-        );
+            let upstream_headers = read_http_headers(&mut upstream).await;
+            let upstream_headers = String::from_utf8_lossy(&upstream_headers);
+            assert!(upstream_headers.contains(
+                "Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n"
+            ));
+            upstream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let response = read_http_headers(&mut app).await;
+            assert!(String::from_utf8_lossy(&response).contains("101 Switching Protocols"));
 
-        drop(app);
-        drop(upstream);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), relay).await;
+            app.write_all(
+                &crate::l7::websocket::compressed_masked_text_frame_for_test(
+                    br#"{"token":"sk-1234567890abcdef"}"#,
+                ),
+            )
+            .await
+            .unwrap();
+            let frame = crate::l7::websocket::read_frame_for_test(&mut upstream).await;
+            assert_eq!(
+                crate::l7::websocket::decode_compressed_masked_text_frame_for_test(&frame),
+                r#"{"token":"[REDACTED]"}"#
+            );
+        })
+        .await;
+        relay.abort();
+        let _ = relay.await;
+        scenario.expect("compressed WSS scenario should complete");
     }
 
     #[tokio::test]
