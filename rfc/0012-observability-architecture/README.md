@@ -23,7 +23,7 @@ Tracing receives the most architectural attention in this RFC because it require
 
 ## Motivation
 
-Operating OpenShell at scale requires answering questions that span multiple layers. A platform operator needs to know why sandbox creation is slow. A security reviewer needs to correlate a network deny event with the request that triggered it. An agent developer needs to see their agent's tool calls and LLM invocations in MLflow without writing OpenShell-specific instrumentation. A platform integrator needs a clean contract for wiring OpenShell into their monitoring stack.
+Operating OpenShell at scale requires answering questions that span multiple layers. A platform operator needs to know why sandbox creation is slow. A security reviewer needs to correlate a network deny event with the request that triggered it. An agent developer needs to see their agent's tool calls and LLM invocations in their observability tool (MLflow, Langfuse, or similar) without writing OpenShell-specific instrumentation. A platform integrator needs a clean contract for wiring OpenShell into their monitoring stack.
 
 OpenShell's observability story is still early. That is expected for a project at this stage, and contributions have made real progress. OTLP trace export merged for the gateway ([#2534](https://github.com/NVIDIA/OpenShell/pull/2534)) and VM driver ([#2564](https://github.com/NVIDIA/OpenShell/pull/2564)), with a shared `openshell-otel` crate ([#2567](https://github.com/NVIDIA/OpenShell/pull/2567)). OCSF structured logging covers security events in the sandbox. Prometheus metrics provide basic gateway request counting ([#920](https://github.com/NVIDIA/OpenShell/pull/920)). These are reasonable starting points, but the gaps are significant enough that the next contributions need a coherent target rather than growing ad hoc:
 
@@ -33,7 +33,7 @@ OpenShell's observability story is still early. That is expected for a project a
 - No centralized collection for OCSF security events. OCSF events are generated inside the sandbox but stay local with no path to a log aggregator. [#1922](https://github.com/NVIDIA/OpenShell/issues/1922) tracks this and is currently stale.
 - No collection mechanism for agent-level traces (tool calls, LLM invocations, reasoning steps from frameworks like LangChain or CrewAI running inside sandboxes). The sandbox is network-isolated, so an agent's OTel SDK cannot reach an external collector.
 
-[#1055](https://github.com/NVIDIA/OpenShell/issues/1055) tracks the overall enterprise observability effort. If the current design is left unchanged, platform operators cannot debug latency or failures across the gateway/driver/sandbox stack, agent developers cannot get their traces into MLflow without workarounds, and the three observability pillars remain disconnected.
+[#1055](https://github.com/NVIDIA/OpenShell/issues/1055) tracks the overall enterprise observability effort. If the current design is left unchanged, platform operators cannot debug latency or failures across the gateway/driver/sandbox stack, agent developers cannot get their traces into tools like MLflow or Langfuse without workarounds, and the three observability pillars remain disconnected.
 
 ### Personas
 
@@ -43,7 +43,7 @@ The personas below are proposed, not settled. OpenShell's persona model is evolv
 |---|---|---|
 | **Platform operator** | Deploys and operates the gateway cluster, manages compute drivers, monitors platform health | Distributed traces, SLI/SLO dashboards, alerting rules, Prometheus Rate/Errors/Duration (RED) metrics. Tools: Grafana, Jaeger/Tempo, Prometheus/Alertmanager |
 | **Security/compliance reviewer** | Reviews audit logs, investigates security events, ensures policy compliance | OCSF JSONL events, trace-to-OCSF correlation. Tools: log aggregation (Loki, Elasticsearch, Splunk) |
-| **Agent developer** | Runs agents in sandboxes, debugs agent behavior, optimizes performance | Agent-level traces in MLflow or similar, with infrastructure context (sandbox, policy). Note: agent traces are a separate visibility domain from operator-only infrastructure traces per [#2508](https://github.com/NVIDIA/OpenShell/issues/2508) |
+| **Agent developer** | Runs agents in sandboxes, debugs agent behavior, optimizes performance | Agent-level traces in an LLM observability tool (e.g., MLflow, Langfuse), with infrastructure context (sandbox, policy). Note: agent traces are a separate visibility domain from operator-only infrastructure traces per [#2508](https://github.com/NVIDIA/OpenShell/issues/2508) |
 | **Workspace administrator** | Manages a workspace (namespace, tenant) in a multi-tenant deployment | Per-workspace metrics: sandbox counts, policy violation rates, resource utilization |
 | **Platform integrator** | Integrates OpenShell into a larger platform (managed K8s, cloud AI platform, on-prem) | Documented OTLP endpoint contracts, resource attribute schemas, Helm values, integration guides. Tools: OTel Collector config, Helm values |
 
@@ -84,11 +84,11 @@ For monitoring, the Prometheus wiring is in place: a `metrics` crate facade, a d
 Two distinct visibility domains flow through the same OTLP relay pipeline:
 
 1. **Infrastructure traces** (operator-only): gateway request spans, driver lifecycle, supervisor network/process/middleware spans. Locked as operator-only per [#2508](https://github.com/NVIDIA/OpenShell/issues/2508).
-2. **Agent traces** (agent developer): tool calls, LLM invocations, reasoning steps from agent frameworks inside sandboxes. Routable to a separate backend (e.g., MLflow) from infrastructure traces (e.g., Tempo).
+2. **Agent traces** (agent developer): tool calls, LLM invocations, reasoning steps from agent frameworks inside sandboxes. Routable to a separate backend (e.g., MLflow, Langfuse) from infrastructure traces (e.g., Tempo).
 
-These two domains serve different user groups with different backend needs. Infrastructure traces typically go to the platform operator's monitoring stack (Tempo, Jaeger) for SLI/SLO dashboards and latency debugging. Agent traces go to the agent developer's tools (MLflow) for inspecting tool calls and reasoning steps. These may be entirely different systems, managed by different teams, with different retention and sampling policies.
+These two domains serve different user groups with different backend needs. Infrastructure traces typically go to the platform operator's monitoring stack (Tempo, Jaeger) for SLI/SLO dashboards and latency debugging. Agent traces go to the agent developer's LLM observability tools (e.g., MLflow, Langfuse) for inspecting tool calls and reasoning steps. These may be entirely different systems, managed by different teams, with different retention and sampling policies.
 
-Initially, both domains go to the same configured OTLP endpoint, and the platform integrator separates them at the collector level using resource attributes (e.g., route spans with `openshell.sandbox.*` attributes to MLflow, route spans with `openshell-gateway` service name to Tempo). As a future extension, the gateway could support per-domain OTLP endpoints (`infra_endpoint` and `agent_endpoint` alongside the default `endpoint`) so it can route infrastructure and agent traces to different backends directly, without requiring collector-side routing rules. This would also compose with per-workspace endpoints (see Multi-tenant observability below), giving each workspace independent routing for each visibility domain.
+Initially, both domains go to the same configured OTLP endpoint, and the platform integrator separates them at the collector level using resource attributes (e.g., route spans with `openshell.sandbox.*` attributes to an agent trace backend like MLflow, route spans with `openshell-gateway` service name to Tempo). As a future extension, the gateway could support per-domain OTLP endpoints (`infra_endpoint` and `agent_endpoint` alongside the default `endpoint`) so it can route infrastructure and agent traces to different backends directly, without requiring collector-side routing rules. This would also compose with per-workspace endpoints (see Multi-tenant observability below), giving each workspace independent routing for each visibility domain.
 
 ### Supervisor as telemetry relay
 
@@ -103,7 +103,7 @@ graph TD
     C -->|"OTLP/gRPC"| D["Trace Collector"]
     C -->|"Log forwarding"| F["Log Aggregator"]
     C -->|"Metrics"| G["/metrics endpoint"]
-    D --> E["MLflow / Jaeger / Tempo"]
+    D --> E["Agent trace backend / Jaeger / Tempo"]
 ```
 
 The supervisor:
@@ -122,7 +122,7 @@ The gateway:
 
 For agents, the experience is: `OTEL_EXPORTER_OTLP_ENDPOINT` is set automatically in the sandbox environment, pointing at the supervisor's OTLP receiver. Any OTel-instrumented framework works without OpenShell-specific code.
 
-The relay also creates a clean separation of concerns between three roles. The agent developer exports to a fixed, auto-injected endpoint and never thinks about collector topology, authentication, or routing. The same agent code works in every sandbox, every deployment, every workspace. The workspace administrator decides where their workspace's telemetry goes (which collector, which MLflow instance, what sampling rates) without touching agent configuration. The global administrator configures the default OTLP endpoint and platform-wide policies like rate limits and enrichment. With direct collector access, the agent developer would need to know the collector address, and that address varies by deployment and workspace. The relay makes observability routing an operational concern rather than a development one.
+The relay also creates a clean separation of concerns between three roles. The agent developer exports to a fixed, auto-injected endpoint and never thinks about collector topology, authentication, or routing. The same agent code works in every sandbox, every deployment, every workspace. The workspace administrator decides where their workspace's telemetry goes (which collector, which agent trace backend, what sampling rates) without touching agent configuration. The global administrator configures the default OTLP endpoint and platform-wide policies like rate limits and enrichment. With direct collector access, the agent developer would need to know the collector address, and that address varies by deployment and workspace. The relay makes observability routing an operational concern rather than a development one.
 
 ### OTLP receiver reachability per driver
 
@@ -245,13 +245,13 @@ OpenShell is collector-agnostic. The Helm chart does not deploy an OTel Collecto
 
 ### Multi-tenant observability
 
-Multi-tenant deployments need per-workspace observability isolation. Different workspaces may route agent traces to different collectors or MLflow instances, and one tenant's trace data must not leak to another's endpoint.
+Multi-tenant deployments need per-workspace observability isolation. Different workspaces may route agent traces to different collectors or agent trace backends, and one tenant's trace data must not leak to another's endpoint.
 
 The OTLP relay supports this through per-workspace OTLP endpoint configuration at the gateway. When a supervisor forwards spans, the gateway looks up the workspace's configured endpoint and routes accordingly. If no per-workspace endpoint is configured, spans go to the global default. The `openshell.workspace.id` resource attribute (added during span enrichment) enables collector-side routing for deployments that use a shared collector with attribute-based routing rather than per-workspace endpoints.
 
 Per-workspace sampling and rate limits follow the same pattern as per-sandbox limits described in the Risks section, but scoped to the workspace level. A noisy workspace should not exhaust the gateway's relay capacity for other tenants.
 
-The configuration model for per-workspace OTLP endpoints is not yet designed. Options include extending `gateway.toml` with per-workspace sections, using workspace-level CRDs, or deriving the endpoint from the workspace settings API. This decision depends on how workspace configuration is structured more broadly, which is outside the scope of this RFC but must be resolved before the OTLP relay ships (see [Phase 2: Sandbox OTLP relay](#phase-2-sandbox-otlp-relay) in the Implementation plan). Per-workspace configuration would compose with the per-domain endpoint extension described in Visibility domains: a workspace could route its infrastructure traces to a shared platform Tempo while sending its agent traces to a workspace-specific MLflow instance.
+The configuration model for per-workspace OTLP endpoints is not yet designed. Options include extending `gateway.toml` with per-workspace sections, using workspace-level CRDs, or deriving the endpoint from the workspace settings API. This decision depends on how workspace configuration is structured more broadly, which is outside the scope of this RFC but must be resolved before the OTLP relay ships (see [Phase 2: Sandbox OTLP relay](#phase-2-sandbox-otlp-relay) in the Implementation plan). Per-workspace configuration would compose with the per-domain endpoint extension described in Visibility domains: a workspace could route its infrastructure traces to a shared platform Tempo while sending its agent traces to a workspace-specific agent trace backend.
 
 ### Metrics direction
 
@@ -365,7 +365,7 @@ Several mitigations should be part of the implementation:
 
 The OpenTelemetry Rust SDK is a non-trivial dependency. Feature-gating it at compile time is worth evaluating (alongside [#1943](https://github.com/NVIDIA/OpenShell/issues/1943)) so that builds without OTel support do not pay the binary size and compile time cost.
 
-Not all trace backends handle span links equally well. Jaeger and Grafana Tempo support bidirectional link navigation, but MLflow's OTLP ingestion may not surface links in its UI. If that turns out to be the case, the correlation story for agent developers using MLflow would be limited to resource attributes rather than navigable links.
+Not all trace backends handle span links equally well. Jaeger and Grafana Tempo support bidirectional link navigation, but not all agent trace backends surface links in their UI (e.g., MLflow's OTLP ingestion may not). If that turns out to be the case for a given backend, the correlation story would be limited to resource attributes rather than navigable links.
 
 ## Alternatives
 
@@ -399,14 +399,14 @@ Leaving the current state unchanged preserves all the gaps described in the Moti
 
 **[Dapr](https://github.com/dapr/dapr) sidecar architecture and OTel integration.** Dapr's sidecar model, referenced in the OTLP receiver reachability section above, is the closest prior art for the supervisor relay pattern. Applications opt in with a single Kubernetes annotation (`dapr.io/config`), and the three-tier architecture (application -> sidecar -> collector -> backend) maps directly to OpenShell's design (agent -> supervisor -> gateway -> collector). The lesson is that transparent trace collection through a co-located proxy scales across diverse application frameworks without requiring per-application instrumentation.
 
-The [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) define the emerging standard for agent trace attributes (`gen_ai.operation.name`, `gen_ai.agent.name`, etc.). OpenShell infrastructure spans use standard RPC/HTTP conventions; agent-emitted spans from inside sandboxes should follow GenAI conventions for MLflow compatibility.
+The [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) define the emerging standard for agent trace attributes (`gen_ai.operation.name`, `gen_ai.agent.name`, etc.). OpenShell infrastructure spans use standard RPC/HTTP conventions; agent-emitted spans from inside sandboxes should follow GenAI conventions for compatibility with agent trace backends like MLflow and Langfuse.
 
 Red Hat's CI pipelines for running agents in OpenShell sandboxes independently discovered the root span flushing problem for short-lived sandboxes and worked around it with an orchestrator-owned root span passed via `TRACEPARENT`. The span link approach in this RFC avoids the duration coupling while solving the same correlation problem.
 
 ## Open questions
 
 - How should `OTEL_*` environment variables and TOML gateway configuration interact when both are set? [#2507](https://github.com/NVIDIA/OpenShell/issues/2507) and [RFC 0003](../0003-gateway-configuration/README.md) discuss this but no decision has been made on precedence.
-- Does MLflow's OTLP ingestion surface span links in its UI? If it does not, the correlation story for agent developers using MLflow would be limited to resource attributes rather than navigable links. This needs validation.
+- Do common agent trace backends (MLflow, Langfuse) surface span links in their UI? If not, the correlation story for agent developers would be limited to resource attributes rather than navigable links. This needs validation per backend.
 - Should the OTel SDK dependency be gated behind a Cargo feature flag so that builds without tracing support do not pay the binary size and compile time cost?
 - Should the supervisor implement the OTLP receiver from scratch using the `opentelemetry-proto` crate (smaller binary, more control), or embed a lightweight collector library (more features, larger dependency)? The tradeoffs need evaluation during implementation.
 - [#2508](https://github.com/NVIDIA/OpenShell/issues/2508) deliberately left `traceparent` injection into agent egress unsettled. Whether the supervisor stamps W3C trace context onto the agent's outbound HTTP requests is a separate decision from the span link correlation proposed in this RFC.
