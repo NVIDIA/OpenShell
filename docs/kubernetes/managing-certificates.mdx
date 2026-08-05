@@ -98,8 +98,7 @@ Set `certManager.clientCaFromServerTlsSecret=false` whenever `serverIssuerRef`
 is set, and set `server.tls.clientCaSecretName` to name a secret that actually
 contains the client CA — by default that's the same secret named by
 `certManager.caSecretName` (`openshell-ca-tls`), since that's the CA the chart
-issues the client certificate from unless you've also overridden
-`clientIssuerRef`. The client (mTLS) certificate used by sandbox supervisors
+issues the client certificate from. The client (mTLS) certificate used by sandbox supervisors
 stays on the chart's own internal CA — it doesn't need public trust, and
 getting a public CA to sign it isn't practical: ACME only validates domain
 identifiers, not arbitrary workload identity, and issuing one certificate per
