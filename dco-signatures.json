@@ -1079,6 +1079,14 @@
       "created_at": "2026-08-05T13:57:18Z",
       "repoId": 1166129534,
       "pullRequestNo": 2619
+    },
+    {
+      "name": "andre-motta",
+      "id": 30708955,
+      "comment_id": 5167724435,
+      "created_at": "2026-08-03T14:32:37Z",
+      "repoId": 1166129534,
+      "pullRequestNo": 2598
     }
   ]
 }
