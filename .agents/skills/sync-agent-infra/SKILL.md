@@ -119,8 +119,8 @@ For each file in the table above, check for the following inconsistencies:
 
 ### Issue Templates
 
-1. **`bug_report.yml`** — Skill names in the Agent Diagnostic guidance and checklist must exist.
-2. **`feature_request.yml`** — Skill names in the Agent Investigation guidance must exist.
+1. **`bug_report.yml`** — Must collect a User Story, Problem Statement, Impact / Why This Matters, Acceptance Criteria, Reproduction Steps, and Environment. Logs are optional and bug-specific; reporter diagnostics must not be required.
+2. **`feature_request.yml`** — Must collect a User Story, Problem Statement, Impact / Why This Matters, Proposed Design, Acceptance Criteria, and Alternatives Considered. The design describes workflow and observable behavior without prescribing internal implementation; agent investigation is optional.
 3. **`config.yml`** — Skill category descriptions in contact links should be accurate.
 
 ### Issue Triage Workflow
