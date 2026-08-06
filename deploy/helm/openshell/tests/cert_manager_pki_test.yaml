@@ -60,6 +60,7 @@ tests:
       certManager.serverIssuerRef.name: letsencrypt-prod
       certManager.serverIssuerRef.kind: ClusterIssuer
       certManager.clientCaFromServerTlsSecret: false
+      server.tls.clientCaSecretName: openshell-ca-tls
       certManager.serverDnsNames:
         - openshell.example.com
     asserts:
@@ -83,6 +84,7 @@ tests:
       certManager.serverIssuerRef.name: letsencrypt-prod
       certManager.serverIssuerRef.kind: ClusterIssuer
       certManager.clientCaFromServerTlsSecret: false
+      server.tls.clientCaSecretName: openshell-ca-tls
       certManager.serverDnsNames:
         - openshell.example.com
     asserts:
@@ -126,10 +128,20 @@ tests:
       certManager.enabled: true
       certManager.serverIssuerRef.name: letsencrypt-prod
       certManager.clientCaFromServerTlsSecret: false
+      server.tls.clientCaSecretName: openshell-ca-tls
       # serverDnsNames is left at the default which contains "openshell.openshell.svc", "localhost", etc.
     asserts:
       - failedTemplate:
           errorMessage: "certManager.serverIssuerRef.name is set (external issuer) but certManager.serverDnsNames contains \"openshell.openshell.svc\" \u2014 external CAs (e.g. ACME / Let's Encrypt) reject internal-only names per CA/Browser Forum baseline requirements. Override certManager.serverDnsNames with your externally-resolvable hostname(s)."
+
+  - it: fails when clientCaFromServerTlsSecret is false but clientCaSecretName is the default
+    template: templates/cert-manager-pki.yaml
+    set:
+      certManager.enabled: true
+      certManager.clientCaFromServerTlsSecret: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "certManager.clientCaFromServerTlsSecret is false but server.tls.clientCaSecretName is still the default (openshell-server-client-ca), which nothing creates when cert-manager owns TLS. Set server.tls.clientCaSecretName to the secret containing the client CA (e.g. the value of certManager.caSecretName, which defaults to openshell-ca-tls), or set it to empty to disable mTLS client verification."
 
   - it: client Certificate issuerRef is unaffected by serverIssuerRef
     template: templates/cert-manager-pki.yaml
@@ -138,6 +150,7 @@ tests:
       certManager.serverIssuerRef.name: letsencrypt-prod
       certManager.serverIssuerRef.kind: ClusterIssuer
       certManager.clientCaFromServerTlsSecret: false
+      server.tls.clientCaSecretName: openshell-ca-tls
       certManager.serverDnsNames:
         - openshell.example.com
     asserts:
