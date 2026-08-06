@@ -46,6 +46,10 @@ const CNI_REGISTRATION_LABEL: &str = "openshell.ai/cni-registration";
 /// currently enforces on that node, so the gateway can wait for cluster-wide
 /// acknowledgement of its namespace before it serves sandboxes.
 const NODE_COVERAGE_ANNOTATION: &str = "openshell.ai/cni-sandbox-namespaces";
+/// Label selector identifying OpenShell-managed sandbox pods (set by the gateway
+/// driver). Used to keep a namespace enforced while its sandboxes are still
+/// running even after its registration marker is removed (drain-gated prune).
+const SANDBOX_POD_LABEL_SELECTOR: &str = "openshell.ai/managed-by=openshell";
 #[allow(dead_code)]
 const OPENSHELL_TABLE: &str = "openshell_sidecar_bypass";
 #[allow(dead_code)]
@@ -188,6 +192,10 @@ trait PodReader {
 
 trait RuleInstaller {
     fn install(&self, netns: &Path, proxy_uid: u32) -> Result<InstallReport>;
+    /// Read-only validation that the bypass-prevention rules are present. Must NOT
+    /// modify live rules (CNI CHECK runs on a running pod; a destructive reinstall
+    /// that fails would leave it unenforced).
+    fn verify(&self, netns: &Path) -> Result<()>;
     fn cleanup(&self, netns: &Path) -> Result<()>;
 }
 
@@ -254,13 +262,23 @@ pub fn node_ready(args: &[String]) -> Result<()> {
 
 /// Entry point for `openshell-cni list-sandbox-namespaces`.
 ///
-/// Run by the installer reconcile to aggregate every namespace that contains a
-/// Helm-owned registration marker `ConfigMap` (label
-/// `openshell.ai/cni-registration=true`) into the plugin allowlist. Prints one
-/// namespace name per line.
+/// Run by the installer reconcile to compute the enforcement allowlist. Prints,
+/// one per line, the union of:
+///   * namespaces containing a Helm-owned registration marker `ConfigMap`
+///     (`openshell.ai/cni-registration=true`) — active registrations; and
+///   * namespaces that still contain an OpenShell-managed sandbox pod
+///     (`openshell.ai/managed-by=openshell`).
+///
+/// The second set makes the allowlist **monotonic while in use**: removing a
+/// release's marker does not immediately drop enforcement for a namespace whose
+/// sandboxes are still running (which would fail-open their recreated pods). The
+/// namespace is pruned only once it is drained — no marker and no sandbox pods.
 pub fn list_sandbox_namespaces() -> Result<()> {
     let client = KubeApiClient::from_in_cluster()?;
-    let namespaces = client.list_registration_namespaces(CNI_REGISTRATION_LABEL)?;
+    let mut namespaces = client.list_registration_namespaces(CNI_REGISTRATION_LABEL)?;
+    namespaces.extend(client.list_sandbox_pod_namespaces(SANDBOX_POD_LABEL_SELECTOR)?);
+    namespaces.sort();
+    namespaces.dedup();
     for ns in namespaces {
         println!("{ns}");
     }
@@ -467,7 +485,12 @@ fn handle_command(
                 let netns = env.netns.as_deref().ok_or_else(|| {
                     miette::miette!("CNI_NETNS is required for OpenShell CNI CHECK")
                 })?;
-                let report = installer.install(netns, workload.proxy_uid)?;
+                // CHECK is read-only: verify the rules are present without touching
+                // them, so a check never leaves a running pod momentarily unenforced.
+                installer.verify(netns)?;
+                let report = InstallReport {
+                    backend: "verified",
+                };
                 log_cni_info(
                     &config,
                     env,
@@ -594,6 +617,16 @@ struct KubeApiClient {
     client: reqwest::blocking::Client,
 }
 
+/// Blocking HTTP client builder with bounded connect and request deadlines. The
+/// CNI plugin runs synchronously on the CNI ADD path and in the installer's
+/// reconcile/coverage loops; without deadlines an API stall would wedge pod
+/// creation, invalidate the coverage wait's time bound, and stall reconciliation.
+fn kube_client_builder() -> reqwest::blocking::ClientBuilder {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
+}
+
 impl KubeApiClient {
     fn from_kubeconfig(path: &Path) -> Result<Self> {
         let contents = std::fs::read_to_string(path)
@@ -630,7 +663,7 @@ impl KubeApiClient {
                 ));
             }
         };
-        let mut builder = reqwest::blocking::Client::builder();
+        let mut builder = kube_client_builder();
         if let Some(ca) = cluster_certificate_authority(path, &cluster.cluster)? {
             builder = builder.add_root_certificate(ca);
         }
@@ -663,7 +696,7 @@ impl KubeApiClient {
             .into_diagnostic()
             .wrap_err("failed to read in-cluster CA certificate")?;
         let ca = reqwest::Certificate::from_pem(&ca_pem).into_diagnostic()?;
-        let client = reqwest::blocking::Client::builder()
+        let client = kube_client_builder()
             .add_root_certificate(ca)
             .build()
             .into_diagnostic()?;
@@ -744,6 +777,39 @@ impl KubeApiClient {
         if !response.status().is_success() {
             return Err(miette::miette!(
                 "Kubernetes API returned {} while listing ConfigMaps",
+                response.status()
+            ));
+        }
+        let list = response.json::<Value>().into_diagnostic()?;
+        let mut namespaces: Vec<String> = list["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["metadata"]["namespace"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        namespaces.sort();
+        namespaces.dedup();
+        Ok(namespaces)
+    }
+
+    /// Returns the distinct namespaces of all pods matching `selector`
+    /// cluster-wide (used to keep enforcement for namespaces with live sandboxes).
+    fn list_sandbox_pod_namespaces(&self, selector: &str) -> Result<Vec<String>> {
+        let url = format!("{}/api/v1/pods", self.server);
+        let response = self
+            .client
+            .get(url)
+            .query(&[("labelSelector", selector)])
+            .bearer_auth(&self.token)
+            .send()
+            .into_diagnostic()
+            .wrap_err("failed to list sandbox pods")?;
+        if !response.status().is_success() {
+            return Err(miette::miette!(
+                "Kubernetes API returned {} while listing sandbox pods",
                 response.status()
             ));
         }
@@ -965,6 +1031,10 @@ impl RuleInstaller for Runtime {
         install_rules(netns, proxy_uid)
     }
 
+    fn verify(&self, netns: &Path) -> Result<()> {
+        verify_rules(netns)
+    }
+
     fn cleanup(&self, netns: &Path) -> Result<()> {
         cleanup_rules(netns)
     }
@@ -1044,9 +1114,48 @@ fn install_rules(netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
 
 #[cfg(target_os = "linux")]
 fn install_nft_rules(netns: &Path, proxy_uid: u32, nft: &str) -> Result<()> {
-    let _ = run_nft_args_in_netns(netns, &nft, &["delete", "table", "inet", OPENSHELL_TABLE]);
-    let ruleset = generate_sidecar_bypass_ruleset(proxy_uid, Some("openshell:cni-sidecar:"));
+    // Atomic replace: ensure-exists, delete, recreate in a SINGLE `nft -f`
+    // transaction. nft applies the whole file atomically, so a failure never
+    // leaves the pod with the table deleted-but-not-recreated (unenforced). The
+    // leading `table {}` makes the subsequent `delete table` safe on first apply.
+    let body = generate_sidecar_bypass_ruleset(proxy_uid, Some("openshell:cni-sidecar:"));
+    let ruleset =
+        format!("table inet {OPENSHELL_TABLE} {{}}\ndelete table inet {OPENSHELL_TABLE}\n{body}");
     run_nft_ruleset_in_netns(netns, &nft, &ruleset)
+}
+
+/// Read-only check that the bypass-prevention rules are present in the netns.
+/// Never modifies live rules. Prefers nft (the table), falls back to the iptables
+/// chain; errors when neither is present so CNI CHECK surfaces the gap.
+#[cfg(target_os = "linux")]
+fn verify_rules(netns: &Path) -> Result<()> {
+    if let Some(nft) = find_nft() {
+        if run_nft_args_in_netns(netns, &nft, &["list", "table", "inet", OPENSHELL_TABLE]).is_ok() {
+            return Ok(());
+        }
+    }
+    if let Some(iptables) = find_iptables() {
+        if run_command_in_netns(
+            netns,
+            &iptables.ipv4,
+            &["-w", "-t", "filter", "-n", "-L", OPENSHELL_IPTABLES_CHAIN],
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err(miette::miette!(
+        "OpenShell CNI bypass-prevention rules are not present in the pod network namespace"
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_rules(netns: &Path) -> Result<()> {
+    let _ = netns;
+    Err(miette::miette!(
+        "OpenShell CNI rule verification is supported only on Linux nodes"
+    ))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1387,6 +1496,7 @@ mod tests {
     #[derive(Default)]
     struct TestInstaller {
         installed: std::sync::Mutex<Vec<u32>>,
+        verified: std::sync::Mutex<u32>,
         cleaned: std::sync::Mutex<u32>,
     }
 
@@ -1394,6 +1504,11 @@ mod tests {
         fn install(&self, _netns: &Path, proxy_uid: u32) -> Result<InstallReport> {
             self.installed.lock().unwrap().push(proxy_uid);
             Ok(InstallReport { backend: "test" })
+        }
+
+        fn verify(&self, _netns: &Path) -> Result<()> {
+            *self.verified.lock().unwrap() += 1;
+            Ok(())
         }
 
         fn cleanup(&self, _netns: &Path) -> Result<()> {
@@ -1500,6 +1615,19 @@ mod tests {
             .unwrap();
         assert_eq!(output["interfaces"], serde_json::json!([]));
         assert_eq!(*installer.installed.lock().unwrap(), vec![1337]);
+    }
+
+    #[test]
+    fn check_verifies_without_reinstalling() {
+        let pods = TestPods {
+            annotations: openshell_annotations(),
+        };
+        let installer = TestInstaller::default();
+        handle_command(&cni_input(), &env("CHECK"), &pods, &installer).unwrap();
+        // CHECK must be read-only: verify, never install (a destructive reinstall
+        // that failed would leave the running pod unenforced).
+        assert_eq!(*installer.verified.lock().unwrap(), 1);
+        assert!(installer.installed.lock().unwrap().is_empty());
     }
 
     #[test]

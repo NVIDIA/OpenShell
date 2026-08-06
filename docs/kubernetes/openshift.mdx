@@ -196,7 +196,10 @@ Helm-owned marker ConfigMap (`openshell.ai/cni-registration=true`) in its sandbo
 namespace, and the singleton discovers every marker's namespace and adds it to the
 enforcement allowlist — no manual edit of the singleton owner is required. Because
 the marker is a normal Helm resource, uninstalling the release (or changing its
-`sandboxNamespace`) removes the registration automatically. The gateway does not
+`sandboxNamespace`) removes it — but deregistration is drain-gated: the singleton
+keeps a namespace enforced while it still has running sandbox pods
+(`openshell.ai/managed-by=openshell`) and only prunes it once drained, so a
+surviving sandbox is never left unenforced. The gateway does not
 serve until enforcement is acknowledged: a `wait-cni-coverage` init container
 blocks the gateway pod until every enforcement-ready node reports the namespace,
 so an additional release never creates sandboxes during the discovery window.

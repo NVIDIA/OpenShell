@@ -31,6 +31,9 @@ rules:
       - pods
     verbs:
       - get
+      # list sandbox pods (openshell.ai/managed-by=openshell) to keep a namespace
+      # enforced while its sandboxes are still running (drain-gated prune).
+      - list
   # list registration marker ConfigMaps (openshell.ai/cni-registration=true) to
   # aggregate their namespaces into the plugin allowlist (automatic multi-release
   # discovery with Helm-owned lifecycle).
