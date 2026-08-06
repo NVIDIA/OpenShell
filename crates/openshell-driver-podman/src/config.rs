@@ -126,6 +126,18 @@ pub struct PodmanComputeConfig {
     /// `template.driver_config`.
     #[serde(default)]
     pub enable_bind_mounts: bool,
+    /// Allow sandboxes to select a user namespace mode via `userns_mode` in
+    /// per-sandbox driver config.
+    ///
+    /// When `false` (the default), any non-empty `userns_mode` in a sandbox
+    /// request is rejected. When `true`, sandboxes may request the following
+    /// safe modes: `keep-id`, `auto`, and `nomap`. Escape modes (`host`,
+    /// `ns:`, etc.) are always rejected regardless of this setting.
+    ///
+    /// Analogous to [`enable_bind_mounts`][Self::enable_bind_mounts]: the
+    /// operator explicitly opts in to tenant-controlled namespace selection.
+    #[serde(default)]
+    pub allow_userns: bool,
     /// Health check interval in seconds for sandbox containers.
     ///
     /// Podman runs the health check command at this interval to determine
@@ -374,6 +386,7 @@ impl Default for PodmanComputeConfig {
             guest_tls_key: None,
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
             enable_bind_mounts: false,
+            allow_userns: false,
             health_check_interval_secs: DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
             https_proxy: None,
             no_proxy: None,
@@ -402,6 +415,7 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("guest_tls_key", &self.guest_tls_key)
             .field("sandbox_pids_limit", &self.sandbox_pids_limit)
             .field("enable_bind_mounts", &self.enable_bind_mounts)
+            .field("allow_userns", &self.allow_userns)
             .field(
                 "health_check_interval_secs",
                 &self.health_check_interval_secs,
