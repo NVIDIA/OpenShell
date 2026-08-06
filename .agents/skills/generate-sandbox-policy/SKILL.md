@@ -379,6 +379,7 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 - [ ] Every middleware config has a non-empty `middleware` name and non-empty `endpoints.include`
 - [ ] Middleware `order` values are unique and no selected chain exceeds 10 stages
 - [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint
+- [ ] Endpoints contributed by a credentialed provider are not L4-only or `tls: skip` unless `allow_uninspected_credentials: true` explicitly records the exception
 
 ### Schema Warnings (log-only, but should be fixed)
 
@@ -410,6 +411,7 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 | **Broad CIDR** in `allowed_ips` (e.g., `10.0.0.0/8`) | "This `allowed_ips` entry covers a very broad range. Consider narrowing to a specific subnet (e.g., `10.0.5.0/24`) to minimize exposure." |
 | **`on_error: fail_open`** | "This middleware can be bypassed when it is unavailable, rejects configuration, returns an invalid result, or exceeds its body limit. Use `fail_closed` unless availability is more important than this control." |
 | **Broad middleware host selector** | "This middleware applies independently of the admitting network rule to every matching HTTP destination. Narrow `endpoints.include` or add exclusions if the stage is not required for every matching host." |
+| **`allow_uninspected_credentials: true`** | "This endpoint may carry provider credentials on traffic OpenShell cannot inspect or rewrite. Prefer an inspected protocol and credential rewrite; keep this exception only when raw traffic is required." |
 
 Format breadth warnings clearly in the output, e.g.:
 

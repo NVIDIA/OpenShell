@@ -868,6 +868,25 @@ matched_endpoint_config := _matching_endpoint_configs[0] if {
 	count(_matching_endpoint_configs) > 0
 }
 
+# --- Credential provenance view (credential gating only) ---
+# Deliberately separate from `_matching_endpoint_configs`. The credential guard
+# must also see L4-only endpoints, which carry no extended config. Widening
+# `endpoint_has_extended_config` instead would let such an endpoint become
+# element [0] of the shared list and shadow the TLS mode, SSRF allowlist, and
+# L7 protocol of an inspected endpoint on the same host:port.
+_policy_credential_guards(policy) := [ep |
+	some ep
+	ep := policy.endpoints[_]
+	endpoint_matches_request(ep, input.network)
+]
+
+endpoint_credential_guards := [cfg |
+	some pname
+	_matching_policy_names[pname]
+	cfgs := _policy_credential_guards(data.network_policies[pname])
+	cfg := cfgs[_]
+]
+
 # Expose middleware policy data to Rust. Selection and validation stay in Rust;
 # Rego does not evaluate middleware selectors.
 network_middlewares := object.get(data, "network_middlewares", {})
