@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+project: openshell
+
+backends:
+    garden:
+        type: adhoc
+        allocate: |
+            if [ -n "${SPREAD_HOST_PATH-}" ]; then
+                PATH="${SPREAD_HOST_PATH}"
+            fi
+            exec image-garden allocate --spread "$SPREAD_SYSTEM"."$(uname -m)"
+        discard: |
+            if [ -n "${SPREAD_HOST_PATH-}" ]; then
+                PATH="${SPREAD_HOST_PATH}"
+            fi
+            image-garden discard "$SPREAD_SYSTEM_ADDRESS"
+        systems:
+            - ubuntu-cloud-24.04:
+                  username: ubuntu
+                  password: ubuntu
+            - ubuntu-cloud-26.04:
+                  username: ubuntu
+                  password: ubuntu
+            - debian-cloud-13:
+                  username: debian
+                  password: debian
+            - fedora-cloud-44:
+                  username: fedora
+                  password: fedora
+
+exclude:
+    - ".cache/*"
+    - ".image-garden/*"
+    - "target/*"
+
+path: /root/openshell
+
+prepare: |
+    # Install the openshell snap that was copied into the test environment.
+    snap install $(ls ./openshell_*.snap | sort -r | head -n 1) --dangerous
+
+    # Connect snap interfaces. When installing from the store this
+    # is auto-connected by the snap declaration assertion, but locally
+    # we need to do it manually.
+    snap connect openshell:docker docker:docker-daemon
+    snap connect openshell:log-observe
+    snap connect openshell:system-observe
+    snap connect openshell:ssh-keys
+
+    # Add the local gateway to user configuration.
+    openshell gateway add http://127.0.0.1:17670 --local --name snap-docker
+    openshell gateway select snap-docker
+    openshell status
+
+debug-each: |
+    echo "Kernel and architecture:"
+    uname -a
+
+    echo "OS release info:"
+    cat /etc/os-release
+
+    echo "Installed snaps:"
+    snap list
+
+    set +e
+
+    echo "Snap connections of the openshell snap:"
+    snap connections openshell
+
+    echo "Openshell version:"
+    snap run openshell --version
+
+suites:
+    tests/:
+        summary: Smoke tests for OpenShell snap
