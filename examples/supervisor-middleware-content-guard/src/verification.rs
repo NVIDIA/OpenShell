@@ -12,10 +12,31 @@ use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header,
     jwk::{AlgorithmParameters, EllipticCurve, JwkSet, PublicKeyUse},
 };
-use openshell_extension_core::{ExtensionCallerKind, ExtensionJwtClaims, MAX_EXTENSION_TOKEN_TTL};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const CLOCK_SKEW_SECS: i64 = 30;
+const MAX_TOKEN_TTL_SECS: i64 = 3_600;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionCallerKind {
+    Gateway,
+    Supervisor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionJwtClaims {
+    pub iss: String,
+    pub aud: String,
+    pub sub: String,
+    pub iat: i64,
+    pub exp: i64,
+    pub jti: String,
+    pub caller_kind: ExtensionCallerKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_id: Option<String>,
+}
 
 /// Verifies gateway-minted JWTs presented to this middleware service.
 ///
@@ -129,7 +150,7 @@ fn validate_claim_shape(claims: &ExtensionJwtClaims) -> Result<(), VerificationE
         ));
     }
     let lifetime = claims.exp.saturating_sub(claims.iat);
-    if lifetime > i64::try_from(MAX_EXTENSION_TOKEN_TTL.as_secs()).unwrap_or(i64::MAX) {
+    if lifetime > MAX_TOKEN_TTL_SECS {
         return Err(VerificationError::InvalidClaims(
             "token lifetime exceeds the extension maximum",
         ));
