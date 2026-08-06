@@ -510,4 +510,256 @@ mod tests {
         let scopes = claims.extract_scopes("scope");
         assert!(scopes.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // RS256 verification through the real JWKS path
+    //
+    // The tests above only cover claim extraction from an already-trusted
+    // payload. These sign real RS256 tokens and push them through
+    // `JwksCache::new` + `validate_token`, so the JWKS `n`/`e` decoding and the
+    // RSA signature check are exercised against whichever crypto backend
+    // `jsonwebtoken` is built with — a backend swap is otherwise invisible to
+    // the test suite.
+    // -----------------------------------------------------------------------
+
+    const TEST_KID: &str = "test-signing-key";
+    const TEST_AUDIENCE: &str = "openshell-cli";
+
+    /// One RSA key per test binary. Key generation dominates the runtime of
+    /// these tests and the key carries no meaning beyond being valid.
+    static TEST_RSA_KEY: std::sync::LazyLock<TestRsaKey> =
+        std::sync::LazyLock::new(TestRsaKey::generate);
+
+    struct TestRsaKey {
+        private_pem: String,
+        modulus_b64: String,
+        exponent_b64: String,
+    }
+
+    impl TestRsaKey {
+        fn generate() -> Self {
+            use base64::Engine as _;
+            use rsa::pkcs1::EncodeRsaPrivateKey as _;
+            use rsa::traits::PublicKeyParts as _;
+
+            let private = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048)
+                .expect("generate RSA test key");
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            Self {
+                private_pem: private
+                    .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+                    .expect("encode RSA private key as PEM")
+                    .to_string(),
+                modulus_b64: b64.encode(private.n().to_bytes_be()),
+                exponent_b64: b64.encode(private.e().to_bytes_be()),
+            }
+        }
+    }
+
+    fn now_secs() -> i64 {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the unix epoch")
+                .as_secs(),
+        )
+        .expect("current time fits in i64")
+    }
+
+    /// Sign `claims` with the test key, tagging the header with `kid`.
+    fn mint_rs256(claims: &serde_json::Value, kid: &str) -> String {
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_owned());
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_KEY.private_pem.as_bytes())
+            .expect("load RSA signing key");
+        jsonwebtoken::encode(&header, claims, &key).expect("sign RS256 token")
+    }
+
+    fn claims_for(issuer: &str, audience: &str, exp: i64) -> serde_json::Value {
+        serde_json::json!({
+            "sub": "user-42",
+            "preferred_username": "ada",
+            "iss": issuer,
+            "aud": audience,
+            "exp": exp,
+            "scope": "openid profile sandbox:write",
+            "realm_access": { "roles": ["openshell-user"] },
+        })
+    }
+
+    /// Serve an OIDC discovery document and a JWKS carrying the test key, then
+    /// build a cache against them the same way production does.
+    async fn cache_with_mock_issuer(server: &wiremock::MockServer) -> JwksCache {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [{
+                    "kid": TEST_KID,
+                    "kty": "RSA",
+                    "n": TEST_RSA_KEY.modulus_b64,
+                    "e": TEST_RSA_KEY.exponent_b64,
+                }],
+            })))
+            .mount(server)
+            .await;
+
+        JwksCache::new(&OidcConfig {
+            issuer,
+            audience: TEST_AUDIENCE.to_owned(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "realm_access.roles".to_owned(),
+            admin_role: "openshell-admin".to_owned(),
+            user_role: "openshell-user".to_owned(),
+            scopes_claim: "scope".to_owned(),
+        })
+        .await
+        .expect("cache should build from the mock issuer")
+    }
+
+    #[tokio::test]
+    async fn rs256_token_signed_by_jwks_key_is_accepted() {
+        let server = wiremock::MockServer::start().await;
+        let cache = cache_with_mock_issuer(&server).await;
+
+        let token = mint_rs256(
+            &claims_for(&server.uri(), TEST_AUDIENCE, now_secs() + 3600),
+            TEST_KID,
+        );
+        let identity = cache
+            .validate_token(&token)
+            .await
+            .expect("a correctly signed token must be accepted");
+
+        assert_eq!(identity.subject, "user-42");
+        assert_eq!(identity.display_name.as_deref(), Some("ada"));
+        assert_eq!(identity.roles, vec!["openshell-user".to_owned()]);
+        assert_eq!(identity.scopes, vec!["sandbox:write".to_owned()]);
+        assert_eq!(identity.provider, IdentityProvider::Oidc);
+    }
+
+    #[tokio::test]
+    async fn rs256_token_with_tampered_payload_is_rejected() {
+        let server = wiremock::MockServer::start().await;
+        let cache = cache_with_mock_issuer(&server).await;
+
+        let exp = now_secs() + 3600;
+        let token = mint_rs256(&claims_for(&server.uri(), TEST_AUDIENCE, exp), TEST_KID);
+
+        // Keep the header and signature but swap in a payload that escalates
+        // the subject: only the RSA check stands between this and an identity.
+        let segments: Vec<&str> = token.split('.').collect();
+        assert_eq!(segments.len(), 3, "a JWT has three segments");
+        let mut forged_claims = claims_for(&server.uri(), TEST_AUDIENCE, exp);
+        forged_claims["sub"] = serde_json::json!("root");
+        let forged_payload = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&forged_claims).expect("serialize forged claims"))
+        };
+        let forged = format!("{}.{forged_payload}.{}", segments[0], segments[2]);
+
+        cache
+            .validate_token(&forged)
+            .await
+            .expect_err("a swapped payload must fail the signature check");
+    }
+
+    #[tokio::test]
+    async fn rs256_token_signed_by_unrelated_key_is_rejected() {
+        let server = wiremock::MockServer::start().await;
+        let cache = cache_with_mock_issuer(&server).await;
+
+        let other = TestRsaKey::generate();
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some(TEST_KID.to_owned());
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims_for(&server.uri(), TEST_AUDIENCE, now_secs() + 3600),
+            &jsonwebtoken::EncodingKey::from_rsa_pem(other.private_pem.as_bytes())
+                .expect("load unrelated signing key"),
+        )
+        .expect("sign with unrelated key");
+
+        cache
+            .validate_token(&token)
+            .await
+            .expect_err("a token signed by a key outside the JWKS must be rejected");
+    }
+
+    #[tokio::test]
+    async fn rs256_expired_token_is_rejected() {
+        let server = wiremock::MockServer::start().await;
+        let cache = cache_with_mock_issuer(&server).await;
+
+        // Beyond the 60s default leeway.
+        let token = mint_rs256(
+            &claims_for(&server.uri(), TEST_AUDIENCE, now_secs() - 3600),
+            TEST_KID,
+        );
+
+        cache
+            .validate_token(&token)
+            .await
+            .expect_err("an expired token must be rejected");
+    }
+
+    #[tokio::test]
+    async fn rs256_token_from_other_issuer_is_rejected() {
+        let server = wiremock::MockServer::start().await;
+        let cache = cache_with_mock_issuer(&server).await;
+
+        let token = mint_rs256(
+            &claims_for("https://evil.example.com", TEST_AUDIENCE, now_secs() + 3600),
+            TEST_KID,
+        );
+
+        cache
+            .validate_token(&token)
+            .await
+            .expect_err("a token from another issuer must be rejected");
+    }
+
+    #[tokio::test]
+    async fn rs256_token_for_other_audience_is_rejected() {
+        let server = wiremock::MockServer::start().await;
+        let cache = cache_with_mock_issuer(&server).await;
+
+        let token = mint_rs256(
+            &claims_for(&server.uri(), "some-other-client", now_secs() + 3600),
+            TEST_KID,
+        );
+
+        cache
+            .validate_token(&token)
+            .await
+            .expect_err("a token minted for another audience must be rejected");
+    }
+
+    #[tokio::test]
+    async fn rs256_token_with_unknown_kid_is_rejected() {
+        let server = wiremock::MockServer::start().await;
+        let cache = cache_with_mock_issuer(&server).await;
+
+        let token = mint_rs256(
+            &claims_for(&server.uri(), TEST_AUDIENCE, now_secs() + 3600),
+            "rotated-away-key",
+        );
+
+        cache
+            .validate_token(&token)
+            .await
+            .expect_err("a token naming a kid absent from the JWKS must be rejected");
+    }
 }

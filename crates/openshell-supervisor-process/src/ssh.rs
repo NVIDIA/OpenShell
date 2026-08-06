@@ -20,9 +20,9 @@ use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, SeverityId, SshActivityBuilder, StatusId, ocsf_emit,
 };
-use russh::ChannelId;
 use russh::keys::{Algorithm, PrivateKey};
-use russh::server::{Auth, Handle, Session};
+use russh::server::{Auth, ChannelOpenHandle, Handle, Session};
+use russh::{ChannelId, ChannelOpenFailure};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -297,10 +297,12 @@ impl russh::server::Handler for SshHandler {
     async fn channel_open_session(
         &mut self,
         channel: russh::Channel<russh::server::Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.channels.insert(channel.id(), ChannelState::default());
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     /// Clean up per-channel state when the channel is closed.
@@ -324,8 +326,9 @@ impl russh::server::Handler for SshHandler {
         port_to_connect: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         // Validate port range before truncating u32 -> u16.  The SSH protocol
         // uses u32 for ports, but valid TCP ports are 0-65535.  Without this
         // check, port 65537 truncates to port 1 (privileged).
@@ -339,7 +342,10 @@ impl russh::server::Handler for SshHandler {
                     "direct-tcpip rejected: port {port_to_connect} exceeds valid TCP range for host {host_to_connect}"
                 ))
                 .build());
-            return Ok(false);
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         }
 
         // Only allow forwarding to loopback destinations to prevent the
@@ -354,7 +360,10 @@ impl russh::server::Handler for SshHandler {
                     "direct-tcpip rejected: non-loopback destination {host_to_connect}:{port_to_connect}"
                 ))
                 .build());
-            return Ok(false);
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         }
 
         let host = host_to_connect.to_string();
@@ -362,6 +371,10 @@ impl russh::server::Handler for SshHandler {
         // saturate as a guard for malformed clients.
         let port = u16::try_from(port_to_connect).unwrap_or(u16::MAX);
         let netns_fd = self.netns_fd;
+
+        // Confirm the channel before spawning: the task below writes to it, and
+        // the peer must see the open-confirmation first.
+        reply.accept().await;
 
         tokio::spawn(async move {
             let addr = format!("{host}:{port}");
@@ -387,7 +400,7 @@ impl russh::server::Handler for SshHandler {
             let _ = tokio::io::copy_bidirectional(&mut channel_stream, &mut tcp_stream).await;
         });
 
-        Ok(true)
+        Ok(())
     }
 
     async fn pty_request(
@@ -1950,5 +1963,179 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             "resolved-identity-ok"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // direct-tcpip authorization wiring (SEC-007)
+    //
+    // The `loopback_host_*` tests above cover the predicate in isolation.
+    // These drive the real `russh::server::Handler` over an in-memory duplex
+    // so the deny path itself is covered: channel-open authorization travels
+    // through a reply handle rather than the handler's return value, so a
+    // handler that never rejects anything still type-checks and still passes
+    // every predicate test.
+    // -----------------------------------------------------------------------
+
+    struct AcceptAnyServerKey;
+
+    impl russh::client::Handler for AcceptAnyServerKey {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &russh::keys::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    fn forwarding_test_policy() -> SandboxPolicy {
+        use openshell_core::policy::{
+            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
+        };
+
+        SandboxPolicy {
+            version: 0,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: None,
+                run_as_group: None,
+            },
+        }
+    }
+
+    /// Serve `SshHandler` on one end of an in-memory duplex and return an
+    /// authenticated client handle for the other end.
+    ///
+    /// The handler gets `netns_fd: None` so `connect_in_netns` performs a plain
+    /// TCP connect, making the forwarding path reachable without a network
+    /// namespace.
+    async fn authenticated_test_client() -> russh::client::Handle<AcceptAnyServerKey> {
+        // Scoped so the `!Send` ThreadRng is dropped before the first await.
+        let host_key = {
+            let mut rng = rand::rng();
+            PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("host key")
+        };
+        let mut server_config = russh::server::Config {
+            auth_rejection_time: Duration::from_millis(1),
+            ..Default::default()
+        };
+        server_config.keys.push(host_key);
+
+        let handler = SshHandler::new(
+            forwarding_test_policy(),
+            ResolvedWorkspace::default(),
+            None,
+            None,
+            None,
+            ProviderCredentialState::from_child_env_snapshot(0, HashMap::new()),
+            HashMap::new(),
+            ResolvedProcessIdentity::default(),
+            ProcessEnforcementMode::NetworkOnly,
+        );
+
+        let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(session) =
+                russh::server::run_stream(Arc::new(server_config), server_stream, handler).await
+            {
+                let _ = session.await;
+            }
+        });
+
+        let mut client = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_stream,
+            AcceptAnyServerKey,
+        )
+        .await
+        .expect("SSH handshake should complete over the duplex");
+
+        let auth = client
+            .authenticate_none("sandbox")
+            .await
+            .expect("auth_none should not error");
+        assert!(
+            matches!(auth, russh::client::AuthResult::Success),
+            "sandbox SSH server accepts the none auth method"
+        );
+
+        client
+    }
+
+    #[tokio::test]
+    async fn direct_tcpip_rejects_non_loopback_destination() {
+        let client = authenticated_test_client().await;
+
+        let err = client
+            .channel_open_direct_tcpip("10.0.0.1", 80, "127.0.0.1", 0)
+            .await
+            .expect_err("forwarding to a non-loopback host must be refused");
+
+        assert!(
+            matches!(
+                err,
+                russh::Error::ChannelOpenFailure(ChannelOpenFailure::AdministrativelyProhibited)
+            ),
+            "expected AdministrativelyProhibited, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_tcpip_rejects_port_above_tcp_range() {
+        let client = authenticated_test_client().await;
+
+        // 65_537 truncates to port 1 when cast to u16, so the guard has to
+        // reject it before the cast rather than forward to a privileged port.
+        let err = client
+            .channel_open_direct_tcpip("127.0.0.1", 65_537, "127.0.0.1", 0)
+            .await
+            .expect_err("a port outside the TCP range must be refused");
+
+        assert!(
+            matches!(
+                err,
+                russh::Error::ChannelOpenFailure(ChannelOpenFailure::AdministrativelyProhibited)
+            ),
+            "expected AdministrativelyProhibited, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_tcpip_forwards_to_loopback_listener() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback echo listener");
+        let port = listener.local_addr().expect("listener address").port();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = socket.read(&mut buf).await
+                    && n > 0
+                {
+                    let _ = socket.write_all(&buf[..n]).await;
+                }
+            }
+        });
+
+        let client = authenticated_test_client().await;
+        let channel = client
+            .channel_open_direct_tcpip("127.0.0.1", u32::from(port), "127.0.0.1", 0)
+            .await
+            .expect("forwarding to a loopback listener must be allowed");
+
+        let mut stream = channel.into_stream();
+        stream.write_all(b"ping").await.expect("write to channel");
+
+        let mut echoed = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut echoed))
+            .await
+            .expect("relayed response should arrive before the timeout")
+            .expect("read from channel");
+        assert_eq!(&echoed, b"ping", "bytes round-trip through the tunnel");
     }
 }
