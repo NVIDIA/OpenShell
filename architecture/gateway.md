@@ -606,6 +606,15 @@ Driver implementation settings live in the TOML driver tables. See
 `docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
 0003 for the full schema.
 
+Each installation has an operator-assigned gateway name. Configure it with
+`[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`.
+The built-in default is `openshell`; the Helm chart defaults it to the chart
+fullname so every replica in one installation reports the same identity.
+Operators must set a globally distinct name when one telemetry collector serves
+installations in multiple Kubernetes namespaces or clusters.
+The name identifies the gateway installation independently of client-side
+aliases, network names, and the sandbox JWT issuer.
+
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).
 

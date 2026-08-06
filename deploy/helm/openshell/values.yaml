@@ -162,6 +162,10 @@ affinity: {}
 
 # Server configuration
 server:
+  # -- Operator-facing gateway name. Defaults to the chart fullname so all
+  # replicas in one installation share an identity. Set explicitly when one
+  # telemetry collector receives spans from multiple namespaces or clusters.
+  name: ""
   # -- Gateway log level.
   logLevel: info
   # -- Namespace where sandbox pods are created. Defaults to the Helm release

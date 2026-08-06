@@ -18,6 +18,8 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 `database_url` is env-only. The loader rejects it when it appears in the file. When `OPENSHELL_DB_URL` is unset, the gateway stores its SQLite database under `$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 
+`name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
+
 ## Package-Managed Locations
 
 Package-managed gateways do not require a TOML file. Create one at the package's optional config location when you need to override built-in defaults. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.
@@ -69,6 +71,7 @@ A complete gateway configuration covering every section. Trim to the fields you 
 version = 1
 
 [openshell.gateway]
+name                  = "production-us-west"
 bind_address          = "0.0.0.0:8080"
 health_bind_address   = "0.0.0.0:8081"
 metrics_bind_address  = "0.0.0.0:9090"

@@ -7,7 +7,7 @@ use clap::parser::ValueSource;
 use clap::{ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::ComputeDriverKind;
-use openshell_core::config::DEFAULT_SERVER_PORT;
+use openshell_core::config::{DEFAULT_GATEWAY_NAME, DEFAULT_SERVER_PORT};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
@@ -51,6 +51,14 @@ struct RunArgs {
     /// variables continue to take precedence over gateway file values.
     #[arg(long, env = "OPENSHELL_GATEWAY_CONFIG")]
     config: Option<PathBuf>,
+
+    /// Operator-assigned name for this gateway installation.
+    #[arg(
+        long = "name",
+        default_value = DEFAULT_GATEWAY_NAME,
+        env = "OPENSHELL_GATEWAY_NAME"
+    )]
+    name: String,
 
     /// IP address to bind the server, health, and metrics listeners to.
     #[arg(long, default_value = "127.0.0.1", env = "OPENSHELL_BIND_ADDRESS")]
@@ -307,7 +315,13 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
         .clone()
         .expect("runtime defaults populate db_url");
 
+    let name = args.name.trim();
+    if name.is_empty() {
+        return Err(miette::miette!("gateway name must not be empty"));
+    }
+
     let mut config = openshell_core::Config::new(tls)
+        .with_name(name)
         .with_bind_address(bind)
         .with_log_level(&args.log_level);
     if let Some(auth) = file.as_ref().and_then(|f| f.openshell.gateway.auth.clone()) {
@@ -615,6 +629,11 @@ fn resolve_aux_listener(
 /// The function intentionally does not touch `database_url` — that secret is
 /// env-only and the loader already rejected it when it appears in the file.
 fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: &ArgMatches) {
+    if let Some(name) = &file.name
+        && arg_defaulted(matches, "name")
+    {
+        args.name.clone_from(name);
+    }
     if let Some(addr) = file.bind_address {
         if arg_defaulted(matches, "bind_address") {
             args.bind_address = addr.ip();
@@ -1344,12 +1363,14 @@ enabled = false
         let _g1 = EnvVarGuard::remove("OPENSHELL_BIND_ADDRESS");
         let _g2 = EnvVarGuard::remove("OPENSHELL_SERVER_PORT");
         let _g3 = EnvVarGuard::remove("OPENSHELL_LOG_LEVEL");
+        let _g4 = EnvVarGuard::remove("OPENSHELL_GATEWAY_NAME");
 
         let (mut args, matches) =
             parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
         let file = config_file_from_toml(
             r#"
 [openshell.gateway]
+name = "production-us-west"
 bind_address = "0.0.0.0:9090"
 log_level = "debug"
 "#,
@@ -1359,6 +1380,7 @@ log_level = "debug"
         assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(args.port, 9090);
         assert_eq!(args.log_level, "debug");
+        assert_eq!(args.name, "production-us-west");
     }
 
     #[test]
@@ -1368,6 +1390,7 @@ log_level = "debug"
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _g1 = EnvVarGuard::remove("OPENSHELL_BIND_ADDRESS");
         let _g2 = EnvVarGuard::remove("OPENSHELL_LOG_LEVEL");
+        let _g3 = EnvVarGuard::remove("OPENSHELL_GATEWAY_NAME");
 
         let (mut args, matches) = parse_with_args(&[
             "openshell-gateway",
@@ -1375,16 +1398,20 @@ log_level = "debug"
             "sqlite::memory:",
             "--log-level",
             "warn",
+            "--name",
+            "cli-gateway",
         ]);
         let file = config_file_from_toml(
             r#"
 [openshell.gateway]
+name = "file-gateway"
 log_level = "debug"
 "#,
         );
         merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
 
         assert_eq!(args.log_level, "warn", "CLI flag must win over file");
+        assert_eq!(args.name, "cli-gateway");
     }
 
     #[test]
@@ -1393,18 +1420,21 @@ log_level = "debug"
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _g = EnvVarGuard::set("OPENSHELL_LOG_LEVEL", "trace");
+        let _g2 = EnvVarGuard::set("OPENSHELL_GATEWAY_NAME", "env-gateway");
 
         let (mut args, matches) =
             parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
         let file = config_file_from_toml(
             r#"
 [openshell.gateway]
+name = "file-gateway"
 log_level = "debug"
 "#,
         );
         merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
 
         assert_eq!(args.log_level, "trace", "env var must win over file");
+        assert_eq!(args.name, "env-gateway");
     }
 
     #[test]
