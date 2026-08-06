@@ -196,14 +196,9 @@ The high-level CI model:
 5. Gate jobs verify that the mirror branch matches the PR head, or that the merge-group workflow ran for the queued SHA, and that the expected non-gate workflow actually ran.
 6. Release workflows rebuild and publish binaries, wheels, images, and docs.
 
-Repository CI keeps telemetry compiled into release-parity artifacts. The
-shared E2E harness defaults `OPENSHELL_TELEMETRY_ENABLED` to `false`, while
-allowing telemetry-specific tests to override it, and the `test:rust` task sets
-the same environment variable for Rust tests. The Kubernetes E2E wrapper maps
-that setting to `server.telemetryEnabled`. Package canaries pass the setting
-through their service managers, and the Helm release canary sets the chart
-value so gateways and sandbox supervisors launched by CI do not contribute to
-product usage metrics.
+Repository CI keeps telemetry compiled into release-parity artifacts but
+disables emission for Rust tests, E2E runs, and release canaries. This prevents
+synthetic activity from contributing to product usage metrics.
 
 See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 
