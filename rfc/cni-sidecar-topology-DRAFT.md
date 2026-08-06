@@ -425,9 +425,13 @@ behavior is behind a default-off value.
   Helm-owned marker ConfigMap (`openshell.ai/cni-registration=true`) in its sandbox
   namespace, and the installer's reconcile aggregates every marker's namespace
   (unioned with the optional static `cni.sandboxNamespaces`) into the config. As a
-  Helm resource the marker is removed on uninstall / sandboxNamespace change, so
-  registrations have proper lifecycle. An additional `cni.external` release is
-  discovered within one reconcile with no manual allowlist edit. To close the
+  Helm resource the marker is removed on uninstall / sandboxNamespace change.
+  Deregistration is drain-gated and monotonic: the reconcile also unions in every
+  namespace that still has an OpenShell-managed sandbox pod
+  (`openshell.ai/managed-by=openshell`), so a removed marker never drops
+  enforcement while sandboxes run; the namespace is pruned only once drained. An
+  additional `cni.external` release is discovered within one reconcile with no
+  manual allowlist edit. To close the
   discovery-window race, the installer publishes per-node coverage
   (`openshell.ai/cni-sandbox-namespaces` annotation) and every gateway runs a
   `wait-coverage` init container that blocks serving until every enforcement-ready
@@ -456,6 +460,12 @@ behavior is behind a default-off value.
 - **SCC drift / cluster policy.** A cluster that further restricts SCC or blocks
   custom SCCs could reject the sandbox pod. Mitigation: the SCC is minimal and
   documented; the lower-privilege endpoint/L7 mode admits under `restricted-v2`.
+- **Non-destructive rule maintenance.** CNI `CHECK` is read-only (verifies the
+  rules without reinstalling), and `ADD` applies the nft ruleset in a single
+  atomic transaction (ensure→delete→recreate), so a failed apply/check never
+  leaves a running pod with the table deleted-but-not-recreated. All Kubernetes
+  API calls from the plugin/installer use bounded connect/request timeouts so an
+  API stall cannot wedge CNI `ADD`, the coverage wait, or reconciliation.
 
 ## Alternatives
 

@@ -45,6 +45,7 @@ tests:
               - pods
             verbs:
               - get
+              - list
       # configmaps list: aggregate registration-marker namespaces into the allowlist.
       - documentIndex: 1
         contains:
