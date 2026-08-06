@@ -2858,6 +2858,43 @@ mod tests {
     }
 
     #[test]
+    fn expand_access_presets_skips_non_object_endpoint_and_expands_valid() {
+        let mut data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [
+                        "not-an-object",
+                        {
+                            "host": "api.example.com",
+                            "port": 80,
+                            "protocol": "rest",
+                            "access": "read-only"
+                        },
+                    ],
+                    "binaries": []
+                }
+            }
+        });
+        let warnings = expand_access_presets(&mut data);
+        let endpoints = data["network_policies"]["test"]["endpoints"]
+            .as_array()
+            .unwrap();
+        // Invalid entry is left untouched.
+        assert_eq!(endpoints[0], serde_json::json!("not-an-object"));
+        // Valid preset endpoint is expanded.
+        let rules = endpoints[1]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 3);
+        let methods: Vec<&str> = rules
+            .iter()
+            .map(|r| r["allow"]["method"].as_str().unwrap())
+            .collect();
+        assert!(methods.contains(&"GET"));
+        assert!(methods.contains(&"HEAD"));
+        assert!(methods.contains(&"OPTIONS"));
+        assert!(warnings.is_empty(), "expected no warnings: {warnings:?}");
+    }
+
+    #[test]
     fn expand_graphql_readonly_preset() {
         let mut data = serde_json::json!({
             "network_policies": {
