@@ -111,11 +111,13 @@ fi
 TMPDIR="$(mktemp -d)"
 LOG_DIR="$TMPDIR/logs"
 JWT_DIR="$TMPDIR/jwt"
+TLS_DIR="$TMPDIR/tls"
 GATEWAY_CONFIG="$TMPDIR/gateway.toml"
 SETUP_LOG="$LOG_DIR/setup.log"
 GATEWAY_LOG="$LOG_DIR/gateway.log"
 MIDDLEWARE_LOG="$LOG_DIR/middleware.log"
 RUN_ID="content-guard-smoke-$$-$RANDOM"
+MIDDLEWARE_AUDIENCE="urn:openshell:extension:middleware:content-guard-example"
 # Sandbox names are capped at 19 characters. Use a short prefix with
 # the PID for uniqueness; keep the full RUN_ID for gateway identity.
 SANDBOX_NAME="cg-$$-$RANDOM"
@@ -213,7 +215,9 @@ ttl_secs = 0
 
 [[openshell.supervisor.middleware]]
 name = "content-guard-example"
-grpc_endpoint = "http://$SERVICE_HOST:$MIDDLEWARE_PORT"
+grpc_endpoint = "https://$SERVICE_HOST:$MIDDLEWARE_PORT"
+tls_ca_cert_path = "$TLS_DIR/ca.crt"
+audience = "$MIDDLEWARE_AUDIENCE"
 max_body_bytes = 262144
 timeout = "500ms"
 EOF
@@ -235,6 +239,40 @@ generate_gateway_jwt_bundle() {
   openssl genpkey -algorithm ed25519 -out "$JWT_DIR/signing.pem" >/dev/null 2>&1
   openssl pkey -in "$JWT_DIR/signing.pem" -pubout -out "$JWT_DIR/public.pem" >/dev/null 2>&1
   printf '%s\n' "$RUN_ID" >"$JWT_DIR/kid"
+
+  local public_x
+  public_x="$(openssl pkey -pubin -in "$JWT_DIR/public.pem" -outform DER 2>/dev/null \
+    | tail -c 32 \
+    | openssl base64 -A \
+    | tr '+/' '-_' \
+    | tr -d '=')"
+  jq -n \
+    --arg kid "$RUN_ID" \
+    --arg x "$public_x" \
+    '{keys: [{kty: "OKP", use: "sig", crv: "Ed25519", alg: "EdDSA", kid: $kid, x: $x}]}' \
+    >"$JWT_DIR/jwks.json"
+}
+
+generate_middleware_tls_bundle() {
+  mkdir -p "$TLS_DIR"
+  openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout "$TLS_DIR/ca.key" \
+    -out "$TLS_DIR/ca.crt" \
+    -days 1 \
+    -subj "/CN=OpenShell content guard smoke CA" >/dev/null 2>&1
+  openssl req -newkey rsa:2048 -nodes \
+    -keyout "$TLS_DIR/server.key" \
+    -out "$TLS_DIR/server.csr" \
+    -subj "/CN=$SERVICE_HOST" >/dev/null 2>&1
+  printf 'subjectAltName=IP:%s\nextendedKeyUsage=serverAuth\n' "$SERVICE_HOST" >"$TLS_DIR/server.ext"
+  openssl x509 -req \
+    -in "$TLS_DIR/server.csr" \
+    -CA "$TLS_DIR/ca.crt" \
+    -CAkey "$TLS_DIR/ca.key" \
+    -CAcreateserial \
+    -out "$TLS_DIR/server.crt" \
+    -days 1 \
+    -extfile "$TLS_DIR/server.ext" >/dev/null 2>&1
 }
 
 dump_logs() {
@@ -289,7 +327,12 @@ cargo_target_dir() {
 start_middleware() {
   printf 'INFO starting content guard service at %s:%s\n' "$SERVICE_HOST" "$MIDDLEWARE_PORT"
   "$MIDDLEWARE_BIN" \
-    --bind "0.0.0.0:$MIDDLEWARE_PORT" >"$MIDDLEWARE_LOG" 2>&1 &
+    --bind "0.0.0.0:$MIDDLEWARE_PORT" \
+    --tls-cert "$TLS_DIR/server.crt" \
+    --tls-key "$TLS_DIR/server.key" \
+    --gateway-jwks "$JWT_DIR/jwks.json" \
+    --gateway-issuer "openshell-gateway:$RUN_ID" \
+    --audience "$MIDDLEWARE_AUDIENCE" >"$MIDDLEWARE_LOG" 2>&1 &
   MIDDLEWARE_PID=$!
 }
 
@@ -405,7 +448,7 @@ print_ready() {
 READY supervisor middleware content guard
 
 Gateway endpoint:   $GATEWAY_ENDPOINT
-Middleware endpoint: http://$SERVICE_HOST:$MIDDLEWARE_PORT
+Middleware endpoint: https://$SERVICE_HOST:$MIDDLEWARE_PORT
 Sandbox:            $SANDBOX_NAME
 Gateway config:     $GATEWAY_CONFIG
 Setup log:          $SETUP_LOG
@@ -445,9 +488,11 @@ GATEWAY_BIN="$ROOT_TARGET_DIR/debug/openshell-gateway"
 CLI_BIN="$ROOT_TARGET_DIR/debug/openshell"
 MIDDLEWARE_BIN="$EXAMPLE_TARGET_DIR/debug/supervisor-middleware-content-guard"
 run_setup_step "building gateway" cargo build --quiet -p openshell-server --bin openshell-gateway
+run_setup_step "building supervisor" cargo build --quiet -p openshell-sandbox --bin openshell-sandbox
 run_setup_step "building content guard" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
 run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell
 generate_gateway_jwt_bundle
+generate_middleware_tls_bundle
 start_middleware
 wait_for_middleware
 start_gateway

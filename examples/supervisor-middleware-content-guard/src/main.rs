@@ -4,6 +4,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
@@ -14,9 +16,10 @@ use openshell_core::proto::{
     MiddlewareManifest, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
     ValidateConfigRequest, ValidateConfigResponse,
 };
+use openshell_extension_core::{ExtensionCallerKind, ExtensionJwtClaims, ExtensionJwtVerifier};
 use prost_types::Struct;
 use prost_types::value::Kind;
-use tonic::transport::Server;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
 const MANIFEST_NAME: &str = "example/content-guard-service";
@@ -28,9 +31,29 @@ const DEFAULT_REPLACEMENT: &str = "[REDACTED]";
 #[derive(Debug, Parser)]
 #[command(about = "Run the example OpenShell supervisor middleware service")]
 struct Cli {
-    /// Address on which to serve plaintext gRPC.
+    /// Address on which to serve HTTPS gRPC.
     #[arg(long, default_value = "127.0.0.1:50051")]
     bind: SocketAddr,
+
+    /// PEM certificate chain presented by the middleware service.
+    #[arg(long)]
+    tls_cert: PathBuf,
+
+    /// PEM private key for the middleware service certificate.
+    #[arg(long)]
+    tls_key: PathBuf,
+
+    /// Trusted gateway JWKS document provisioned by the operator.
+    #[arg(long)]
+    gateway_jwks: PathBuf,
+
+    /// Exact gateway JWT issuer, normally openshell-gateway:<gateway-id>.
+    #[arg(long)]
+    gateway_issuer: String,
+
+    /// Exact JWT audience configured for this middleware registration.
+    #[arg(long)]
+    audience: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,15 +133,59 @@ fn optional_string_field<'a>(config: &'a Struct, name: &str) -> Result<Option<&'
     }
 }
 
-#[derive(Debug, Default)]
-struct ContentGuard;
+#[derive(Debug)]
+struct ContentGuard {
+    verifier: Arc<ExtensionJwtVerifier>,
+}
+
+impl ContentGuard {
+    fn authenticate<T>(
+        &self,
+        request: &Request<T>,
+        allowed_callers: &[ExtensionCallerKind],
+    ) -> Result<ExtensionJwtClaims, Status> {
+        let authorization = request
+            .metadata()
+            .get("authorization")
+            .ok_or_else(|| Status::unauthenticated("missing authorization metadata"))?
+            .to_str()
+            .map_err(|_| Status::unauthenticated("invalid authorization metadata"))?;
+        let token = authorization
+            .strip_prefix("Bearer ")
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| Status::unauthenticated("expected a bearer token"))?;
+        let claims = self.verifier.verify(token).map_err(|error| {
+            eprintln!("extension token verification failed: {error}");
+            Status::unauthenticated("invalid extension token")
+        })?;
+        authorize_caller(claims.caller_kind, allowed_callers)?;
+        Ok(claims)
+    }
+}
+
+fn authorize_caller(
+    caller: ExtensionCallerKind,
+    allowed_callers: &[ExtensionCallerKind],
+) -> Result<(), Status> {
+    if allowed_callers.contains(&caller) {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(
+            "caller kind is not authorized for this RPC",
+        ))
+    }
+}
 
 #[tonic::async_trait]
 impl SupervisorMiddleware for ContentGuard {
-    async fn describe(
-        &self,
-        _request: Request<()>,
-    ) -> Result<Response<MiddlewareManifest>, Status> {
+    async fn describe(&self, request: Request<()>) -> Result<Response<MiddlewareManifest>, Status> {
+        self.authenticate(
+            &request,
+            &[
+                ExtensionCallerKind::Gateway,
+                ExtensionCallerKind::Supervisor,
+            ],
+        )?;
         Ok(Response::new(MiddlewareManifest {
             name: MANIFEST_NAME.into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
@@ -135,6 +202,7 @@ impl SupervisorMiddleware for ContentGuard {
         &self,
         request: Request<ValidateConfigRequest>,
     ) -> Result<Response<ValidateConfigResponse>, Status> {
+        self.authenticate(&request, &[ExtensionCallerKind::Gateway])?;
         let request = request.into_inner();
         let validation = GuardConfig::parse(request.config.as_ref());
         Ok(Response::new(match validation {
@@ -153,6 +221,7 @@ impl SupervisorMiddleware for ContentGuard {
         &self,
         request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status> {
+        self.authenticate(&request, &[ExtensionCallerKind::Supervisor])?;
         let request = request.into_inner();
         validate_phase(request.phase).map_err(Status::invalid_argument)?;
         let config =
@@ -293,9 +362,20 @@ fn allow_result() -> HttpRequestResult {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    println!("serving {MANIFEST_NAME} on http://{}", cli.bind);
+    let tls_cert = tokio::fs::read(&cli.tls_cert).await?;
+    let tls_key = tokio::fs::read(&cli.tls_key).await?;
+    let gateway_jwks = tokio::fs::read(&cli.gateway_jwks).await?;
+    let verifier = Arc::new(ExtensionJwtVerifier::from_jwks(
+        &gateway_jwks,
+        cli.gateway_issuer,
+        cli.audience,
+    )?);
+    let tls = ServerTlsConfig::new().identity(Identity::from_pem(tls_cert, tls_key));
+
+    println!("serving {MANIFEST_NAME} on https://{}", cli.bind);
     Server::builder()
-        .add_service(SupervisorMiddlewareServer::new(ContentGuard))
+        .tls_config(tls)?
+        .add_service(SupervisorMiddlewareServer::new(ContentGuard { verifier }))
         .serve(cli.bind)
         .await?;
     Ok(())
@@ -458,5 +538,25 @@ mod tests {
 
         assert_eq!(parsed.mode, Mode::Redact);
         assert_eq!(parsed.replacement, DEFAULT_REPLACEMENT);
+    }
+
+    #[test]
+    fn rpc_authorization_rejects_the_wrong_caller_kind() {
+        assert!(
+            authorize_caller(
+                ExtensionCallerKind::Gateway,
+                &[ExtensionCallerKind::Gateway]
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            authorize_caller(
+                ExtensionCallerKind::Supervisor,
+                &[ExtensionCallerKind::Gateway]
+            )
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
     }
 }
