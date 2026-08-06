@@ -16,11 +16,15 @@ use openshell_core::proto::{
     MiddlewareManifest, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
     ValidateConfigRequest, ValidateConfigResponse,
 };
-use openshell_extension_core::{ExtensionCallerKind, ExtensionJwtClaims, ExtensionJwtVerifier};
+use openshell_extension_core::{ExtensionCallerKind, ExtensionJwtClaims};
 use prost_types::Struct;
 use prost_types::value::Kind;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
+
+mod verification;
+
+use verification::ExtensionJwtVerifier;
 
 const MANIFEST_NAME: &str = "example/content-guard-service";
 const OPERATION: SupervisorMiddlewareOperation = SupervisorMiddlewareOperation::HttpRequest;

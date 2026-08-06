@@ -957,9 +957,7 @@ name = "openshell-extension-core"
 version = "0.0.0"
 dependencies = [
  "hyper-util",
- "jsonwebtoken",
  "serde",
- "serde_json",
  "thiserror",
  "tokio",
  "tonic",
@@ -971,9 +969,12 @@ name = "openshell-supervisor-middleware-content-guard"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "jsonwebtoken",
  "openshell-core",
  "openshell-extension-core",
  "prost-types",
+ "serde_json",
+ "thiserror",
  "tokio",
  "tonic",
 ]
