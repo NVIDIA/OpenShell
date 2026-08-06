@@ -430,13 +430,13 @@ Review the proposed scope and prover findings before approval. Treat `rule appro
 
 Build a custom container image and run it as a sandbox.
 
-### Create a sandbox from a Dockerfile
+### Create a sandbox from a build file
 
 ```bash
 openshell sandbox create --from ./Dockerfile --name my-app
 ```
 
-The `--from` flag accepts a Dockerfile path, a directory containing a Dockerfile, a full image reference such as `myregistry.com/img:tag`, or a community sandbox name such as `ollama`.
+The `--from` flag accepts an existing container build file (for example `Dockerfile`, `Containerfile`, or another valid build file), a directory containing a `Dockerfile` or `Containerfile`, a full image reference such as `myregistry.com/image:tag`, or a community sandbox name such as `ollama`.
 
 Local Dockerfile and directory builds require a local gateway because the CLI builds through the local Docker daemon. Use a registry image reference for remote gateways. Bare community names resolve under `ghcr.io/nvidia/openshell-community/sandboxes` unless `OPENSHELL_COMMUNITY_REGISTRY` overrides the prefix.
 
@@ -666,7 +666,7 @@ $ openshell sandbox upload --help
 | Policy revision history | `openshell policy list <name>` |
 | View global policy | `openshell policy get --global --full` |
 | Review proposed rules | `openshell rule get <name> --status pending` |
-| Create sandbox from Dockerfile | `openshell sandbox create --from ./Dockerfile` |
+| Create sandbox from build file | `openshell sandbox create --from ./Dockerfile` |
 | Forward a port | `openshell forward start <port> <name> -d` |
 | Expose an HTTP service | `openshell service expose <name> <port> [service]` |
 | Upload files to sandbox | `openshell sandbox upload <name> <path>` |
