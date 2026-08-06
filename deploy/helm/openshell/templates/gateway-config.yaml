@@ -35,6 +35,7 @@ data:
     version = 1
 
     [openshell.gateway]
+    name                  = {{ .Values.server.name | default (include "openshell.fullname" .) | quote }}
     bind_address          = "0.0.0.0:{{ .Values.service.port }}"
     {{- if .Values.service.healthPort }}
     health_bind_address   = "0.0.0.0:{{ .Values.service.healthPort }}"
