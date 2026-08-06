@@ -43,10 +43,10 @@ use openshell_core::proto::compute::v1::{
     DriverSandboxTemplate as SandboxTemplate, GetCapabilitiesRequest, GetCapabilitiesResponse,
     GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
     GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
-    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    ResumeSandboxRequest, ResumeSandboxResponse, StopSandboxRequest, StopSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
+    WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -166,6 +166,7 @@ const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";
 const OVERLAY_TEMPLATE_CACHE_LAYOUT_VERSION: &str = "sandbox-overlay-ext4-v1";
 const SANDBOX_OVERLAY_IMAGE: &str = "overlay.ext4";
 const SANDBOX_REQUEST_FILE: &str = "sandbox.pb";
+const SANDBOX_SUSPENDED_FILE: &str = "suspended";
 const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
@@ -1058,6 +1059,132 @@ impl VmDriver {
         Ok(())
     }
 
+    pub async fn stop_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
+        if !sandbox_id.is_empty() {
+            validate_sandbox_id(sandbox_id)?;
+        }
+        let record_id = {
+            let registry = self.registry.lock().await;
+            if registry.contains_key(sandbox_id) {
+                Some(sandbox_id.to_string())
+            } else {
+                registry
+                    .iter()
+                    .find(|(_, record)| record.snapshot.name == sandbox_name)
+                    .map(|(id, _)| id.clone())
+            }
+        }
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+        let state_dir = {
+            let registry = self.registry.lock().await;
+            registry
+                .get(&record_id)
+                .ok_or_else(|| Status::not_found("sandbox not found"))?
+                .state_dir
+                .clone()
+        };
+
+        // Persist intent before detaching process handles or releasing host
+        // allocations. If this write fails, the live record remains intact.
+        tokio::fs::write(state_dir.join(SANDBOX_SUSPENDED_FILE), b"suspended\n")
+            .await
+            .map_err(|err| Status::internal(format!("persist suspension marker failed: {err}")))?;
+
+        let (process, provisioning_task, has_gpu, has_qemu_network, snapshot) = {
+            let mut registry = self.registry.lock().await;
+            let record = registry
+                .get_mut(&record_id)
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            (
+                record.process.take(),
+                record.provisioning_task.take(),
+                record.gpu_bdf.take().is_some(),
+                std::mem::take(&mut record.qemu_network_allocated),
+                record.snapshot.clone(),
+            )
+        };
+
+        if let Some(task) = provisioning_task {
+            task.abort();
+        }
+        if let Some(process) = process {
+            let mut process = process.lock().await;
+            process.deleting = true;
+            terminate_vm_process(&mut process.child)
+                .await
+                .map_err(|err| Status::internal(format!("failed to stop vm: {err}")))?;
+        }
+        self.lifecycle_extensions
+            .after_launch_failed(&snapshot, &state_dir, LaunchAbortReason::Suspended)
+            .await;
+        self.release_allocations(&record_id, has_gpu, has_qemu_network);
+
+        if let Some(snapshot) = self
+            .set_snapshot_condition(&record_id, suspended_condition(), false)
+            .await
+        {
+            self.publish_snapshot(snapshot);
+        }
+        self.publish_platform_event(
+            record_id,
+            platform_event(
+                "vm",
+                "Normal",
+                "Suspended",
+                "VM sandbox suspended".to_string(),
+            ),
+        );
+        Ok(())
+    }
+
+    pub async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
+        if !sandbox_id.is_empty() {
+            validate_sandbox_id(sandbox_id)?;
+        }
+        let (record_id, state_dir, already_running) = {
+            let registry = self.registry.lock().await;
+            let (id, record) = if let Some(entry) = registry.get_key_value(sandbox_id) {
+                entry
+            } else {
+                registry
+                    .iter()
+                    .find(|(_, record)| record.snapshot.name == sandbox_name)
+                    .ok_or_else(|| Status::not_found("sandbox not found"))?
+            };
+            (
+                id.clone(),
+                record.state_dir.clone(),
+                record.process.is_some() || record.provisioning_task.is_some(),
+            )
+        };
+        if already_running {
+            return Ok(());
+        }
+
+        let sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+            .await
+            .map_err(|err| {
+                Status::internal(format!("read sandbox resume metadata failed: {err}"))
+            })?;
+        match tokio::fs::remove_file(state_dir.join(SANDBOX_SUSPENDED_FILE)).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(Status::internal(format!(
+                    "remove suspension marker failed: {err}"
+                )));
+            }
+        }
+        self.registry.lock().await.remove(&record_id);
+        self.restore_persisted_sandbox(sandbox, state_dir, &tracing::Span::current())
+            .await;
+        if !self.registry.lock().await.contains_key(&record_id) {
+            return Err(Status::internal("failed to resume persisted VM sandbox"));
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(
         name = "vm.delete",
         skip(self),
@@ -1261,6 +1388,27 @@ impl VmDriver {
                     error = %status.message(),
                     "vm driver: ignoring invalid persisted sandbox state"
                 );
+                continue;
+            }
+
+            if tokio::fs::metadata(state_dir.join(SANDBOX_SUSPENDED_FILE))
+                .await
+                .is_ok()
+            {
+                let snapshot = sandbox_snapshot(&sandbox, suspended_condition(), false);
+                let mut registry = self.registry.lock().await;
+                registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
+                    snapshot: snapshot.clone(),
+                    state_dir: state_dir.clone(),
+                    process: None,
+                    provisioning_task: None,
+                    gpu_bdf: None,
+                    qemu_network_allocated: false,
+                    deleting: false,
+                });
+                drop(registry);
+                self.publish_snapshot(snapshot);
+                info!(sandbox_id = %sandbox.id, "vm driver: restored suspended sandbox without launching compute");
                 continue;
             }
 
@@ -3179,11 +3327,22 @@ impl ComputeDriver for VmDriver {
 
     async fn stop_sandbox(
         &self,
-        _request: Request<StopSandboxRequest>,
+        request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
-        Err(Status::unimplemented(
-            "stop sandbox is not implemented by the vm compute driver",
-        ))
+        let request = request.into_inner();
+        self.stop_sandbox(&request.sandbox_id, &request.sandbox_name)
+            .await?;
+        Ok(Response::new(StopSandboxResponse {}))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        request: Request<ResumeSandboxRequest>,
+    ) -> Result<Response<ResumeSandboxResponse>, Status> {
+        let request = request.into_inner();
+        self.resume_sandbox(&request.sandbox_id, &request.sandbox_name)
+            .await?;
+        Ok(Response::new(ResumeSandboxResponse {}))
     }
 
     async fn delete_sandbox(
@@ -5180,6 +5339,16 @@ fn deleting_condition() -> SandboxCondition {
         status: "False".to_string(),
         reason: "Deleting".to_string(),
         message: "Sandbox is being deleted".to_string(),
+        last_transition_time: String::new(),
+    }
+}
+
+fn suspended_condition() -> SandboxCondition {
+    SandboxCondition {
+        r#type: "Suspended".to_string(),
+        status: "True".to_string(),
+        reason: "ComputeStopped".to_string(),
+        message: "VM compute is stopped and persistent state is retained".to_string(),
         last_transition_time: String::new(),
     }
 }

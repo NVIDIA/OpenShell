@@ -31,6 +31,8 @@ struct MockState {
     last_create: Mutex<Option<proto::CreateSandboxRequest>>,
     last_delete_name: Mutex<Option<String>>,
     last_delete_workspace: Mutex<Option<String>>,
+    last_suspend: Mutex<Option<proto::SuspendSandboxRequest>>,
+    last_resume: Mutex<Option<proto::ResumeSandboxRequest>>,
     last_list_request: Mutex<Option<proto::ListSandboxesRequest>>,
     last_exec_request: Mutex<Option<proto::ExecSandboxRequest>>,
     last_workspace_request: Mutex<Option<String>>,
@@ -158,6 +160,38 @@ impl OpenShell for TestOpenShell {
         *self.state.last_create.lock().await = Some(req);
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox_with_phase(&name, proto::SandboxPhase::Provisioning)),
+        }))
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        request: tonic::Request<proto::SuspendSandboxRequest>,
+    ) -> Result<Response<proto::SandboxResponse>, Status> {
+        let request = request.into_inner();
+        let sandbox = sandbox_with_phase_ws(
+            &request.name,
+            proto::SandboxPhase::Suspended,
+            &request.workspace,
+        );
+        *self.state.last_suspend.lock().await = Some(request);
+        Ok(Response::new(proto::SandboxResponse {
+            sandbox: Some(sandbox),
+        }))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        request: tonic::Request<proto::ResumeSandboxRequest>,
+    ) -> Result<Response<proto::SandboxResponse>, Status> {
+        let request = request.into_inner();
+        let sandbox = sandbox_with_phase_ws(
+            &request.name,
+            proto::SandboxPhase::Resuming,
+            &request.workspace,
+        );
+        *self.state.last_resume.lock().await = Some(request);
+        Ok(Response::new(proto::SandboxResponse {
+            sandbox: Some(sandbox),
         }))
     }
 
@@ -814,6 +848,29 @@ async fn delete_sandbox_returns_server_ack() {
 
     let observed = state.last_delete_name.lock().await.clone();
     assert_eq!(observed.as_deref(), Some("doomed"));
+}
+
+#[tokio::test]
+async fn suspend_and_resume_map_requests_and_phases() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let suspended = client.suspend_sandbox("sleepy").await.unwrap();
+    assert_eq!(suspended.phase, SandboxPhase::Suspended);
+    let suspend = state.last_suspend.lock().await.clone().unwrap();
+    assert_eq!(suspend.name, "sleepy");
+    assert!(suspend.workspace.is_empty());
+
+    let resumed = client
+        .workspace("team-a")
+        .resume_sandbox("sleepy")
+        .await
+        .unwrap();
+    assert_eq!(resumed.phase, SandboxPhase::Resuming);
+    let resume = state.last_resume.lock().await.clone().unwrap();
+    assert_eq!(resume.name, "sleepy");
+    assert_eq!(resume.workspace, "team-a");
 }
 
 #[tokio::test]

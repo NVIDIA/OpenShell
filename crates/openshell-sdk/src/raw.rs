@@ -24,9 +24,9 @@ pub use openshell_core::proto::open_shell_client::OpenShellClient as GrpcClient;
 pub use openshell_core::proto::{
     CreateSandboxRequest, CreateWorkspaceRequest, DeleteSandboxRequest, DeleteWorkspaceRequest,
     ExecSandboxRequest, GetSandboxRequest, GetWorkspaceRequest, HealthRequest,
-    ListProvidersRequest, ListSandboxesRequest, ListWorkspacesRequest, Sandbox,
-    SandboxPhase as ProtoSandboxPhase, SandboxSpec as ProtoSandboxSpec, SandboxTemplate,
-    ServiceStatus as ProtoServiceStatus, Workspace,
+    ListProvidersRequest, ListSandboxesRequest, ListWorkspacesRequest, ResumeSandboxRequest,
+    Sandbox, SandboxPhase as ProtoSandboxPhase, SandboxSpec as ProtoSandboxSpec, SandboxTemplate,
+    ServiceStatus as ProtoServiceStatus, SuspendSandboxRequest, Workspace,
 };
 
 /// Type alias for the gRPC client wrapped in the SDK's auth interceptor.

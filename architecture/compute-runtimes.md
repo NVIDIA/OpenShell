@@ -1,6 +1,6 @@
 # Compute Runtimes
 
-Compute runtimes create, stop, delete, and watch sandbox workloads for the
+Compute runtimes create, suspend, resume, delete, and watch sandbox workloads for the
 gateway. They do not replace sandbox policy enforcement. Every runtime starts a
 workload that runs the `openshell-sandbox` supervisor, and the supervisor
 enforces the sandbox contract locally.
@@ -84,19 +84,42 @@ The gateway records driver identity and version from the startup capability
 response. Elevated gateway info reports that initialized driver snapshot instead
 of re-querying drivers on each request.
 
+## Suspend and Resume Lifecycle
+
+The gateway persists lifecycle intent before mutating compute:
+
+```text
+Ready -> Suspending -> Suspended -> Resuming -> Ready
+```
+
+`StopSandbox` and `ResumeSandbox` are idempotent driver operations. Suspension
+retains the driver resource and its persistent workspace boundary while making
+exec, SSH, forwarding, and exposed services unavailable. Resume reactivates the
+same resource. The gateway requires a fresh supervisor session before a
+resuming sandbox returns to `Ready`; stale driver snapshots and supervisor
+sessions cannot promote a `Suspended` row.
+
+Persisted `Suspending` and `Resuming` rows are retried at startup. Stable
+`Suspended` rows remain stopped. Docker and Podman retain the stopped container
+and attached storage, Kubernetes retains the Sandbox CR and PVC while scaling
+compute to zero, and VM retains its launch request and writable overlay beside
+a suspension marker. Delete remains a separate operation that removes these
+resources.
+
 ## Deletion Lifecycle
 
-Delete requests use per-sandbox gates to serialize delete attempts. A request
+Lifecycle requests use per-sandbox gates to serialize suspend, resume, and
+delete attempts. A delete request
 resolves the name once and remains bound to that stable ID. The only
-combined lock order is delete gate, then the gateway-wide state guard; external
+combined lock order is lifecycle gate, then the gateway-wide state guard; external
 driver calls run without the global guard.
 
-Delete gates are process-local and do not coordinate gateway replicas. They
+Lifecycle gates are process-local and do not coordinate gateway replicas. They
 serialize attempts rather than share results: if one attempt fails and recovery
 restores a deletable state, a request waiting on the gate may retry the driver.
 Persisted resource-version checks remain the cross-replica safety boundary.
 
-Watcher events do not acquire delete gates. Exact resource-version checks allow
+Watcher events do not acquire lifecycle gates. Exact resource-version checks allow
 them to interleave safely: status snapshots are no-ops for `Deleting` rows,
 deleted events are idempotent, and snapshots for absent rows are ignored.
 

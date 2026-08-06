@@ -1524,6 +1524,22 @@ enum SandboxCommands {
         all: bool,
     },
 
+    /// Suspend a sandbox while preserving its workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Suspend {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Resume a suspended sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Resume {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
     /// Execute a command in a running sandbox.
     ///
     /// Runs a command inside an existing sandbox using the gRPC exec endpoint.
@@ -3163,6 +3179,14 @@ async fn run_async() -> Result<()> {
                             )
                             .await?;
                         }
+                        SandboxCommands::Suspend { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_suspend(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
+                        SandboxCommands::Resume { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_resume(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             if let Some(editor) = editor.map(Into::into) {
@@ -4459,6 +4483,27 @@ mod tests {
                     output: OutputFormat::Table,
                     ..
                 })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_suspend_and_resume_accept_optional_names() {
+        let suspend = Cli::try_parse_from(["openshell", "sandbox", "suspend", "demo"])
+            .expect("suspend command should parse");
+        assert!(matches!(
+            suspend.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Suspend { name: Some(ref name) }),
+            }) if name == "demo"
+        ));
+
+        let resume = Cli::try_parse_from(["openshell", "sandbox", "resume"])
+            .expect("resume command should parse");
+        assert!(matches!(
+            resume.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Resume { name: None }),
             })
         ));
     }
