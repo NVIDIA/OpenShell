@@ -1025,6 +1025,45 @@ impl ComputeRuntime {
         self.sandbox_watch_bus.notify(&sandbox_id);
         drop(global_guard);
 
+        // Once the durable transition is committed, request cancellation must
+        // not cancel the driver operation and strand the sandbox in
+        // `Suspending`. Keep the lifecycle gate in an owned worker, matching
+        // the delete path's cancellation semantics.
+        let runtime = self.clone();
+        let workspace = workspace.to_string();
+        let request_span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                runtime
+                    .complete_sandbox_suspend(
+                        workspace,
+                        sandbox_id,
+                        sandbox_name,
+                        previous,
+                        suspending,
+                        lifecycle_guard,
+                    )
+                    .await
+            }
+            .instrument(request_span),
+        )
+        .await
+        .map_err(|err| {
+            Status::internal(format!(
+                "sandbox suspend worker terminated unexpectedly: {err}"
+            ))
+        })?
+    }
+
+    async fn complete_sandbox_suspend(
+        &self,
+        workspace: String,
+        sandbox_id: String,
+        sandbox_name: String,
+        previous: Sandbox,
+        suspending: Sandbox,
+        lifecycle_guard: SandboxLifecycleGuard,
+    ) -> Result<Sandbox, Status> {
         let result = self
             .driver
             .call("driver.stop_sandbox", Some(&sandbox_id), |driver| {
@@ -1066,7 +1105,7 @@ impl ComputeRuntime {
                         "sandbox lifecycle changed while suspension completed",
                     ));
                 };
-                self.cleanup_sandbox_ssh_sessions(&sandbox_id, workspace)
+                self.cleanup_sandbox_ssh_sessions(&sandbox_id, &workspace)
                     .await
                     .map_err(Status::internal)?;
                 self.supervisor_sessions.disconnect(&sandbox_id);
@@ -1138,6 +1177,40 @@ impl ComputeRuntime {
         self.sandbox_watch_bus.notify(&sandbox_id);
         drop(global_guard);
 
+        // The durable `Resuming` transition commits the operation. Let an
+        // owned worker finish it even if the initiating RPC is canceled.
+        let runtime = self.clone();
+        let request_span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                runtime
+                    .complete_sandbox_resume(
+                        sandbox_id,
+                        sandbox_name,
+                        previous,
+                        resuming,
+                        lifecycle_guard,
+                    )
+                    .await
+            }
+            .instrument(request_span),
+        )
+        .await
+        .map_err(|err| {
+            Status::internal(format!(
+                "sandbox resume worker terminated unexpectedly: {err}"
+            ))
+        })?
+    }
+
+    async fn complete_sandbox_resume(
+        &self,
+        sandbox_id: String,
+        sandbox_name: String,
+        previous: Sandbox,
+        resuming: Sandbox,
+        lifecycle_guard: SandboxLifecycleGuard,
+    ) -> Result<Sandbox, Status> {
         let result = self
             .driver
             .call("driver.resume_sandbox", Some(&sandbox_id), |driver| {
@@ -3942,7 +4015,15 @@ mod tests {
         delete_blocked: AtomicBool,
         delete_calls: AtomicUsize,
         delete_outcome: TestMutex<ControlledDeleteOutcome>,
+        stop_started: Notify,
+        stop_finished: Notify,
+        stop_release: Semaphore,
+        stop_blocked: AtomicBool,
         stop_calls: AtomicUsize,
+        resume_started: Notify,
+        resume_finished: Notify,
+        resume_release: Semaphore,
+        resume_blocked: AtomicBool,
         resume_calls: AtomicUsize,
         get_started: Notify,
         get_release: Semaphore,
@@ -3962,7 +4043,15 @@ mod tests {
                 delete_blocked: AtomicBool::new(false),
                 delete_calls: AtomicUsize::new(0),
                 delete_outcome: TestMutex::new(ControlledDeleteOutcome::Ok(true)),
+                stop_started: Notify::new(),
+                stop_finished: Notify::new(),
+                stop_release: Semaphore::new(0),
+                stop_blocked: AtomicBool::new(false),
                 stop_calls: AtomicUsize::new(0),
+                resume_started: Notify::new(),
+                resume_finished: Notify::new(),
+                resume_release: Semaphore::new(0),
+                resume_blocked: AtomicBool::new(false),
                 resume_calls: AtomicUsize::new(0),
                 get_started: Notify::new(),
                 get_release: Semaphore::new(0),
@@ -3977,6 +4066,22 @@ mod tests {
 
         fn release_delete(&self) {
             self.delete_release.add_permits(1);
+        }
+
+        fn block_stop(&self) {
+            self.stop_blocked.store(true, Ordering::SeqCst);
+        }
+
+        fn release_stop(&self) {
+            self.stop_release.add_permits(1);
+        }
+
+        fn block_resume(&self) {
+            self.resume_blocked.store(true, Ordering::SeqCst);
+        }
+
+        fn release_resume(&self) {
+            self.resume_release.add_permits(1);
         }
 
         fn block_get(&self) {
@@ -4102,6 +4207,15 @@ mod tests {
             _request: Request<StopSandboxRequest>,
         ) -> Result<tonic::Response<StopSandboxResponse>, Status> {
             self.stop_calls.fetch_add(1, Ordering::SeqCst);
+            self.stop_started.notify_one();
+            if self.stop_blocked.load(Ordering::SeqCst) {
+                self.stop_release
+                    .acquire()
+                    .await
+                    .expect("stop release semaphore closed")
+                    .forget();
+            }
+            self.stop_finished.notify_one();
             Ok(tonic::Response::new(StopSandboxResponse {}))
         }
 
@@ -4110,6 +4224,15 @@ mod tests {
             _request: Request<ResumeSandboxRequest>,
         ) -> Result<tonic::Response<ResumeSandboxResponse>, Status> {
             self.resume_calls.fetch_add(1, Ordering::SeqCst);
+            self.resume_started.notify_one();
+            if self.resume_blocked.load(Ordering::SeqCst) {
+                self.resume_release
+                    .acquire()
+                    .await
+                    .expect("resume release semaphore closed")
+                    .forget();
+            }
+            self.resume_finished.notify_one();
             Ok(tonic::Response::new(ResumeSandboxResponse {}))
         }
 
@@ -5014,6 +5137,86 @@ mod tests {
             .unwrap();
         assert_eq!(ready.phase(), SandboxPhase::Ready as i32);
         assert_eq!(driver.resume_calls(), 1, "ready resume is idempotent");
+    }
+
+    #[tokio::test]
+    async fn request_cancellation_does_not_cancel_suspend_worker() {
+        let driver = ControlledDriver::new();
+        driver.block_stop();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-suspend", "sandbox-suspend", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let request_runtime = runtime.clone();
+        let request = tokio::spawn(async move {
+            request_runtime
+                .suspend_sandbox("default", "sandbox-suspend")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), driver.stop_started.notified())
+            .await
+            .expect("suspend did not reach the driver");
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        driver.release_stop();
+        tokio::time::timeout(Duration::from_secs(1), driver.stop_finished.notified())
+            .await
+            .expect("detached suspend worker did not finish the driver call");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let stored = runtime
+                    .store
+                    .get_message::<Sandbox>(sandbox.object_id())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if stored.phase() == SandboxPhase::Suspended as i32 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached suspend worker did not persist Suspended");
+        assert_eq!(driver.stop_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_cancellation_does_not_cancel_resume_worker() {
+        let driver = ControlledDriver::new();
+        driver.block_resume();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-resume", "sandbox-resume", SandboxPhase::Suspended);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let request_runtime = runtime.clone();
+        let request = tokio::spawn(async move {
+            request_runtime
+                .resume_sandbox("default", "sandbox-resume")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), driver.resume_started.notified())
+            .await
+            .expect("resume did not reach the driver");
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        driver.release_resume();
+        tokio::time::timeout(Duration::from_secs(1), driver.resume_finished.notified())
+            .await
+            .expect("detached resume worker did not finish the driver call");
+
+        let resuming = tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.resume_sandbox("default", sandbox.object_name()),
+        )
+        .await
+        .expect("detached resume worker did not release the lifecycle gate")
+        .unwrap();
+        assert_eq!(resuming.phase(), SandboxPhase::Resuming as i32);
+        assert_eq!(driver.resume_calls(), 1);
     }
 
     #[tokio::test]
