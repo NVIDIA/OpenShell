@@ -5,6 +5,7 @@
 
 pub mod driver_config;
 pub mod lease;
+#[cfg(not(target_os = "windows"))]
 pub mod vm;
 
 #[cfg(not(target_os = "windows"))]
@@ -13,6 +14,7 @@ pub use openshell_driver_docker::DockerComputeConfig;
 pub use openshell_driver_kubernetes::KubernetesComputeConfig;
 #[cfg(not(target_os = "windows"))]
 pub use openshell_driver_podman::PodmanComputeConfig;
+#[cfg(not(target_os = "windows"))]
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;

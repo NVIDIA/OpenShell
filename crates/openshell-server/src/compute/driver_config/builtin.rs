@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Configuration construction for in-process compute drivers.
+//! Configuration construction for built-in compute drivers.
 
 use super::{
-    DriverStartupContext, apply_guest_tls_defaults_to_split_fields, driver_config_from_context,
-    driver_config_from_file,
+    DriverStartupContext, GuestTlsPaths, driver_config_from_context, driver_config_from_file,
 };
+use crate::compute::VmComputeConfig;
 use crate::config_file;
 use openshell_core::{ComputeDriverKind, Error, Result};
 use openshell_driver_docker::DockerComputeConfig;
@@ -57,6 +57,13 @@ pub fn docker_config_from_context(
     Ok(cfg)
 }
 
+/// Build the selected VM config from TOML plus runtime defaults.
+pub fn vm_config_from_context(context: DriverStartupContext<'_>) -> Result<VmComputeConfig> {
+    let mut cfg = driver_config_from_context(context, ComputeDriverKind::Vm.as_str())?;
+    apply_vm_runtime_defaults(&mut cfg, context);
+    Ok(cfg)
+}
+
 fn apply_kubernetes_runtime_defaults(k8s: &mut KubernetesComputeConfig) {
     if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
         k8s.workspace_default_storage_size = size;
@@ -87,6 +94,46 @@ fn apply_docker_runtime_defaults(cfg: &mut DockerComputeConfig, context: DriverS
         &mut cfg.guest_tls_key,
         context.guest_tls,
     );
+}
+
+fn apply_vm_runtime_defaults(cfg: &mut VmComputeConfig, context: DriverStartupContext<'_>) {
+    if cfg.state_dir.as_os_str().is_empty() {
+        cfg.state_dir = VmComputeConfig::default_state_dir();
+    }
+    if cfg.grpc_endpoint.trim().is_empty()
+        && (!context.gateway_tls_enabled || context.guest_tls.is_some())
+    {
+        let scheme = if context.gateway_tls_enabled {
+            "https"
+        } else {
+            "http"
+        };
+        cfg.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", context.gateway_port);
+    }
+
+    apply_guest_tls_defaults_to_split_fields(
+        &mut cfg.guest_tls_ca,
+        &mut cfg.guest_tls_cert,
+        &mut cfg.guest_tls_key,
+        context.guest_tls,
+    );
+}
+
+fn apply_guest_tls_defaults_to_split_fields(
+    ca: &mut Option<PathBuf>,
+    cert: &mut Option<PathBuf>,
+    key: &mut Option<PathBuf>,
+    defaults: Option<&GuestTlsPaths>,
+) {
+    if ca.is_none()
+        && cert.is_none()
+        && key.is_none()
+        && let Some(paths) = defaults
+    {
+        *ca = Some(paths.ca.clone());
+        *cert = Some(paths.cert.clone());
+        *key = Some(paths.key.clone());
+    }
 }
 
 fn apply_podman_env_overrides(podman: &mut PodmanComputeConfig) {
@@ -204,6 +251,24 @@ unknown_docker_key = true
         assert!(
             err.to_string()
                 .contains("invalid [openshell.drivers.docker] table")
+        );
+    }
+
+    #[test]
+    fn vm_config_reports_selected_invalid_driver_table() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.drivers.vm]
+mem_mib = "not-a-number"
+"#,
+        )
+        .expect("valid config");
+
+        let err = vm_config_from_context(test_context(Some(&file))).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("invalid [openshell.drivers.vm] table")
         );
     }
 }

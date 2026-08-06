@@ -8,16 +8,14 @@
 //! It does not acquire, connect to, or start compute drivers.
 
 #[cfg(not(target_os = "windows"))]
-pub mod in_process;
+pub mod builtin;
 
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;
-use openshell_core::{ComputeDriverKind, Error, Result};
+use openshell_core::{Error, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-
-use super::VmComputeConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestTlsPaths {
@@ -43,13 +41,6 @@ pub struct DriverStartupContext<'a> {
     pub gateway_port: u16,
     pub gateway_tls_enabled: bool,
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
-}
-
-/// Build the selected VM config from TOML plus runtime defaults.
-pub fn vm_config_from_context(context: DriverStartupContext<'_>) -> Result<VmComputeConfig> {
-    let mut cfg = driver_config_from_context(context, ComputeDriverKind::Vm.as_str())?;
-    apply_vm_runtime_defaults(&mut cfg, context);
-    Ok(cfg)
 }
 
 pub fn remote_driver_config_from_context(
@@ -98,29 +89,6 @@ where
     })
 }
 
-fn apply_vm_runtime_defaults(cfg: &mut VmComputeConfig, context: DriverStartupContext<'_>) {
-    if cfg.state_dir.as_os_str().is_empty() {
-        cfg.state_dir = VmComputeConfig::default_state_dir();
-    }
-    if cfg.grpc_endpoint.trim().is_empty()
-        && (!context.gateway_tls_enabled || context.guest_tls.is_some())
-    {
-        let scheme = if context.gateway_tls_enabled {
-            "https"
-        } else {
-            "http"
-        };
-        cfg.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", context.gateway_port);
-    }
-
-    apply_guest_tls_defaults_to_split_fields(
-        &mut cfg.guest_tls_ca,
-        &mut cfg.guest_tls_cert,
-        &mut cfg.guest_tls_key,
-        context.guest_tls,
-    );
-}
-
 fn apply_remote_driver_overrides(
     cfg: &mut RemoteDriverConfig,
     context: DriverStartupContext<'_>,
@@ -138,23 +106,6 @@ fn validate_remote_driver_config(cfg: &RemoteDriverConfig, name: &str) -> Result
     Err(Error::config(format!(
         "remote compute driver '{name}' requires socket_path"
     )))
-}
-
-fn apply_guest_tls_defaults_to_split_fields(
-    ca: &mut Option<PathBuf>,
-    cert: &mut Option<PathBuf>,
-    key: &mut Option<PathBuf>,
-    defaults: Option<&GuestTlsPaths>,
-) {
-    if ca.is_none()
-        && cert.is_none()
-        && key.is_none()
-        && let Some(paths) = defaults
-    {
-        *ca = Some(paths.ca.clone());
-        *cert = Some(paths.cert.clone());
-        *key = Some(paths.key.clone());
-    }
 }
 
 #[cfg(test)]
@@ -239,24 +190,6 @@ socket_path = "/run/openshell/kyma.sock"
         assert!(
             err.to_string()
                 .contains("remote compute driver 'kyma' requires socket_path")
-        );
-    }
-
-    #[test]
-    fn vm_config_reports_selected_invalid_driver_table() {
-        let file: config_file::ConfigFile = toml::from_str(
-            r#"
-[openshell.drivers.vm]
-mem_mib = "not-a-number"
-"#,
-        )
-        .expect("valid config");
-
-        let err = vm_config_from_context(test_context(Some(&file))).unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("invalid [openshell.drivers.vm] table")
         );
     }
 }

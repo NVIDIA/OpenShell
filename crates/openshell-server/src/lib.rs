@@ -454,7 +454,7 @@ pub(crate) async fn run_server(
         // Pod lookups and TokenReview identity checks must match the sandbox
         // namespace and service account used by the Kubernetes driver.
         let kubernetes_config =
-            compute::driver_config::in_process::kubernetes_config_for_k8s_sa_bootstrap(
+            compute::driver_config::builtin::kubernetes_config_for_k8s_sa_bootstrap(
                 config_file.as_ref(),
             )?;
         let sandbox_namespace = kubernetes_config.namespace;
@@ -870,7 +870,7 @@ async fn build_compute_runtime(
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Kubernetes) => {
             warn_if_kubernetes_sandbox_jwt_expiry_disabled(config);
             let k8s_config =
-                compute::driver_config::in_process::kubernetes_config_from_context(driver_startup)?;
+                compute::driver_config::builtin::kubernetes_config_from_context(driver_startup)?;
             ComputeRuntime::new_kubernetes(
                 k8s_config,
                 store,
@@ -884,7 +884,7 @@ async fn build_compute_runtime(
         #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Docker) => {
             let docker_config =
-                compute::driver_config::in_process::docker_config_from_context(driver_startup)?;
+                compute::driver_config::builtin::docker_config_from_context(driver_startup)?;
             ComputeRuntime::new_docker(
                 config.clone(),
                 docker_config,
@@ -899,7 +899,7 @@ async fn build_compute_runtime(
         #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Podman) => {
             let podman_config =
-                compute::driver_config::in_process::podman_config_from_context(driver_startup)?;
+                compute::driver_config::builtin::podman_config_from_context(driver_startup)?;
             ComputeRuntime::new_podman(
                 podman_config,
                 store,
@@ -912,7 +912,8 @@ async fn build_compute_runtime(
         }
         #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Vm) => {
-            let vm_config = compute::driver_config::vm_config_from_context(driver_startup)?;
+            let vm_config =
+                compute::driver_config::builtin::vm_config_from_context(driver_startup)?;
             let otlp_config = driver_startup
                 .file
                 .and_then(|file| file.openshell.gateway.otlp.as_ref());
