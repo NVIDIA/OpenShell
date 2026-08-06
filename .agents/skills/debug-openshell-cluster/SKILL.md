@@ -233,6 +233,18 @@ release. Look for failed installs, unexpected values, missing namespace, wrong
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
+If telemetry enablement is in question, compare the Helm value with the
+gateway pod environment:
+
+```bash
+helm -n openshell get values openshell | grep telemetryEnabled
+kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="OPENSHELL_TELEMETRY_ENABLED")].value}{"\n"}'
+```
+
+Use the existing workload-kind guidance above when the release renders a
+Deployment instead of a StatefulSet. The gateway propagates its effective
+telemetry setting to sandbox supervisors.
+
 When no external credential driver is enabled, the Helm chart uses the
 gateway's default encrypted database credential storage. The chart creates a
 retained Kubernetes Secret for the shared KEK, injects it into gateway pods, and

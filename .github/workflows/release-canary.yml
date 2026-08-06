@@ -14,6 +14,9 @@ defaults:
   run:
     shell: bash
 
+env:
+  OPENSHELL_TELEMETRY_ENABLED: "false"
+
 jobs:
   macos:
     name: macOS Homebrew
@@ -24,6 +27,7 @@ jobs:
       - name: Ensure VM driver
         run: |
           launchctl setenv OPENSHELL_DRIVERS vm
+          launchctl setenv OPENSHELL_TELEMETRY_ENABLED "$OPENSHELL_TELEMETRY_ENABLED"
 
       - name: Install and check status
         run: |
@@ -44,7 +48,8 @@ jobs:
           fi
           sudo systemctl start docker || sudo service docker start
           mkdir -p "${HOME}/.config/openshell"
-          printf 'OPENSHELL_DRIVERS=docker\n' > "${HOME}/.config/openshell/gateway.env"
+          printf 'OPENSHELL_DRIVERS=docker\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
+            "$OPENSHELL_TELEMETRY_ENABLED" > "${HOME}/.config/openshell/gateway.env"
           docker info
 
       - name: Install and check status
@@ -130,11 +135,13 @@ jobs:
             HOME=/root \
             XDG_RUNTIME_DIR=/run/user/0 \
             DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
+            OPENSHELL_TELEMETRY_ENABLED="$OPENSHELL_TELEMETRY_ENABLED" \
             INSTALL_SH_URL="https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh" \
             bash -s <<'EOF'
           set -euo pipefail
           mkdir -p "${HOME}/.config/openshell"
-          printf 'OPENSHELL_DRIVERS=podman\n' > "${HOME}/.config/openshell/gateway.env"
+          printf 'OPENSHELL_DRIVERS=podman\nOPENSHELL_TELEMETRY_ENABLED=%s\n' \
+            "$OPENSHELL_TELEMETRY_ENABLED" > "${HOME}/.config/openshell/gateway.env"
           podman info
           curl -LsSf "${INSTALL_SH_URL}" | sh
           openshell status
@@ -177,6 +184,8 @@ jobs:
       - name: Install snap (dangerous — from release, not store)
         run: |
           set -euo pipefail
+          sudo systemctl set-environment \
+            "OPENSHELL_TELEMETRY_ENABLED=${OPENSHELL_TELEMETRY_ENABLED}"
           sudo snap install ./release/*.snap --dangerous
 
       - name: Connect interfaces
@@ -222,6 +231,7 @@ jobs:
             --version 0.0.0-dev \
             --namespace "$RELEASE_NAMESPACE" --create-namespace \
             --set server.disableTls=true \
+            --set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}" \
             --wait --timeout 5m
 
       - name: Verify gateway pod is Ready

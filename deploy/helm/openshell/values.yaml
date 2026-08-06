@@ -164,6 +164,9 @@ affinity: {}
 server:
   # -- Gateway log level.
   logLevel: info
+  # -- Enable anonymous OpenShell telemetry from the gateway and the sandbox
+  # supervisors it launches.
+  telemetryEnabled: true
   # -- Namespace where sandbox pods are created. Defaults to the Helm release
   # namespace (.Release.Namespace) when left empty.
   sandboxNamespace: ""
