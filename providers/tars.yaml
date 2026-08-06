@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: tars
+display_name: Tetrate Agent Router Service
+description: Tetrate Agent Router Service (TARS) LLM traffic router
+category: inference
+inference_capable: true
+credentials:
+  - name: api_key
+    description: TARS inference API key
+    env_vars: [TARS_API_KEY, AGENTROUTER_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  # Tetrate-hosted SaaS gateway. Enterprise deployments use a
+  # customer-specific hostname: override the provider base URL with
+  # `TARS_BASE_URL` and add the gateway host to the sandbox policy.
+  - host: api.router.tetrate.ai
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/bin/curl, /usr/local/bin/curl]

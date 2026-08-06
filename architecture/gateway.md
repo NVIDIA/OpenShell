@@ -440,7 +440,7 @@ Cluster inference routes store only `provider_name`, `model_id`, and optional
 timeout. The gateway resolves endpoint URLs, protocols, credentials, auth
 style, and route-shaping metadata from the provider record when supervisors call
 `GetInferenceBundle`. Supported provider types for cluster inference are
-`openai`, `anthropic`, `nvidia`, `deepinfra`, and `google-vertex-ai`.
+`openai`, `anthropic`, `nvidia`, `deepinfra`, `tars`, and `google-vertex-ai`.
 
 The bundle carries enough information for sandbox-local routers to construct
 upstream URLs without re-deriving provider-specific routing logic. Each resolved
