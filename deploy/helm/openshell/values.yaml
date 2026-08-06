@@ -62,6 +62,23 @@ supervisor:
     # policy.binaries.
     processBinaryAwareNetworkPolicy: true
 
+# -- Operator-owned corporate forward proxy for policy-approved TLS egress
+# from Kubernetes sandboxes. The workload cannot select or override it.
+upstreamProxy:
+  # -- HTTP proxy URL in http://host:port form. HTTPS-to-proxy is not supported.
+  url: ""
+  # -- Comma-separated destinations that bypass only the corporate proxy.
+  noProxy: ""
+  authSecret:
+    # -- Existing Secret in the sandbox namespace containing a user:pass value.
+    name: ""
+    # -- Secret key containing the proxy credential.
+    key: ""
+  # -- Required when authSecret is configured because Basic auth to an HTTP proxy is cleartext.
+  authAllowInsecure: false
+  # -- Last-resort option for hostname-filtering proxy ACLs. It lets the proxy resolve CONNECT targets.
+  connectByHostname: false
+
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []
 # -- Override the chart name used in generated resource names.

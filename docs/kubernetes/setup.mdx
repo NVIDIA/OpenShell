@@ -163,6 +163,7 @@ The most commonly changed values are:
 | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect based on cluster version: clusters running Kubernetes 1.35 or later use `image-volume` (ImageVolume GA in 1.36); older clusters use `init-container`. Set explicitly to `image-volume` on Kubernetes 1.33 or 1.34 with the ImageVolume feature gate enabled, or to `init-container` to force the legacy path on any version. |
 | `supervisor.topology` | Sandbox pod topology. Refer to [Topology](/kubernetes/topology). |
 | `supervisor.sidecar.proxyUid` | Non-root UID used when sidecar process/binary-aware network policy is disabled. The default binary-aware sidecar runs as UID 0 instead. The configured UID must not match the sandbox UID. |
+| `upstreamProxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
 
 Use a values file for repeatable deployments:
 
@@ -197,6 +198,36 @@ server:
   sandboxImagePullSecrets:
     - name: regcred
 ```
+
+## Configure a Corporate Upstream Proxy
+
+Configure a corporate forward proxy when sandbox TLS egress cannot dial the Internet directly. OpenShell evaluates policy and SSRF checks before it opens an HTTP CONNECT tunnel through the proxy. The proxy URL is operator-owned configuration. Sandbox environment variables cannot select, replace, or bypass it.
+
+Create the credential Secret in the sandbox namespace when the proxy requires Basic authentication. The Secret value uses the `user:pass` form.
+
+```shell
+kubectl -n openshell create secret generic corporate-proxy-auth \
+  --from-literal=credentials="$PROXY_USER:$PROXY_PASSWORD"
+```
+
+Add the proxy settings to your Helm values file. Replace the DNS suffixes and CIDRs in `noProxy` with values for your cluster. `noProxy` bypasses only the corporate proxy. OpenShell policy evaluation still applies.
+
+```yaml
+upstreamProxy:
+  url: http://proxy.corp.example:8080
+  noProxy: .svc,.svc.cluster.local,10.96.0.0/12,10.244.0.0/16
+  authSecret:
+    name: corporate-proxy-auth
+    key: credentials
+  authAllowInsecure: true
+
+supervisor:
+  topology: sidecar
+```
+
+Use `authAllowInsecure: true` only when you accept that Basic authentication is cleartext on the connection to an `http://` proxy. The initial release supports `http://` proxy endpoints and TLS CONNECT egress. It does not support HTTPS-to-proxy, custom corporate CA bundles, or forwarding plain HTTP egress through the proxy.
+
+Proxy credentials require `sidecar` topology. It mounts the credential only into the dedicated network supervisor container. OpenShell rejects credential Secrets with `combined` topology because Kubernetes `fsGroup` volume permission handling can make a shared credential mount readable by the sandbox group.
 
 ## RBAC
 

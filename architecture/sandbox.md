@@ -190,6 +190,14 @@ file and builds the `Proxy-Authorization: Basic` header; a credential that is
 empty, contains control characters, or is not in `user:pass` form is fatal on
 both sides.
 
+For Kubernetes sandboxes, the operator configures a Secret name and key rather
+than a gateway-host file path. Kubernetes projects that Secret only into the
+container that runs network supervision. Proxy credential Secrets require the
+sidecar topology, which gives them a separate container boundary from the
+workload. Combined topology is rejected because Kubernetes `fsGroup` volume
+permission handling can make a shared credential mount readable by the sandbox
+group.
+
 The Basic header travels over the plain-TCP connection to the `http://` proxy,
 so it is readable on the network path between sandbox host and proxy.
 Configuring `proxy_auth_file` therefore requires the explicit opt-in
