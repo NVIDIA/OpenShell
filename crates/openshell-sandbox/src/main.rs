@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//! `OpenShell` Sandbox - process sandbox and monitor.
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
