@@ -386,10 +386,16 @@ export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
 
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
-KERNEL_NAME=$(uname -s)
-PRIMARY_BIND_IP=$(e2e_podman_primary_bind_ip "${KERNEL_NAME}")
-CLI_ENDPOINT_HOST=$(e2e_podman_cli_endpoint_host "${KERNEL_NAME}")
-HEALTH_ENDPOINT_HOST=$(e2e_url_host_for_ip "${PRIMARY_BIND_IP}")
+if [ "$(uname -s)" = "Darwin" ]; then
+  # Podman Machine reserves IPv4 loopback for its callback-only listener.
+  PRIMARY_BIND_IP="::1"
+  CLI_ENDPOINT_HOST="localhost"
+  HEALTH_ENDPOINT_HOST="[::1]"
+else
+  PRIMARY_BIND_IP="127.0.0.1"
+  CLI_ENDPOINT_HOST="127.0.0.1"
+  HEALTH_ENDPOINT_HOST="127.0.0.1"
+fi
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
 export XDG_STATE_HOME="${STATE_DIR}"
@@ -529,7 +535,7 @@ while [ "${elapsed}" -lt "${timeout}" ]; do
     echo "ERROR: openshell-gateway exited before becoming healthy"
     exit 1
   fi
-  if curl --noproxy '*' -sf "http://${HEALTH_ENDPOINT_HOST}:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
+  if curl -sf "http://${HEALTH_ENDPOINT_HOST}:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
     echo "Gateway healthy after ${elapsed}s."
     break
   fi
