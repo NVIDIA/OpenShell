@@ -48,6 +48,10 @@ creating misleading Windows driver artifacts.
 
 ## Mise Lane
 
+The GitHub Actions workflow is manually dispatched while the clean Windows job
+takes roughly 80 minutes. It should not run for every pull request or merge to
+`main` until the lane has an effective Cargo/native-dependency cache.
+
 Windows validation is exposed through `tasks/windows.toml`:
 
 | Task | Purpose |

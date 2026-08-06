@@ -1,8 +1,6 @@
 name: Windows MSVC (build-only)
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 jobs:
   x64:
     runs-on: windows-2025
