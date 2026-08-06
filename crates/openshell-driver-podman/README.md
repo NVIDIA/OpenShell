@@ -393,11 +393,14 @@ resolution, making the proxy's ACLs the effective egress control.
 The Podman driver is designed for rootless operation. The following adaptations
 matter compared to cluster or rootful runtimes:
 
-1. subuid/subgid preflight check: on non-macOS hosts, `check_subuid_range()` in
-   `driver.rs` warns operators if `/etc/subuid` or `/etc/subgid` entries are
-   missing for the current user. This is not a hard error because some systems
-   use LDAP or other mechanisms. macOS skips the check because `podman machine`
-   runs the Podman service inside a Linux VM.
+1. subuid/subgid preflight check: on non-macOS, non-root hosts,
+   `check_subuid_range()` in `driver.rs` warns operators if `/etc/subuid` or
+   `/etc/subgid` entries are missing for the current user. This is not a hard
+   error because some systems use LDAP or other mechanisms. The check is
+   skipped when the gateway itself runs in a container because those files do
+   not describe the Podman host. For containerized gateways using a mounted
+   rootless Podman socket, run the gateway container with `--userns=keep-id` so
+   its UID matches the host user that owns the socket.
 2. cgroups v2 requirement: the driver refuses to start if cgroups v1 is
    detected. Rootless Podman requires the unified cgroup hierarchy.
 3. `nsenter` for namespace operations: `openshell-sandbox` uses

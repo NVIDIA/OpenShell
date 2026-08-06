@@ -290,6 +290,7 @@ impl PodmanComputeDriver {
                 Ok(()) => break,
                 Err(e) if attempts < MAX_PING_RETRIES => {
                     attempts += 1;
+                    let e = enrich_socket_connection_error(e, running_inside_container());
                     warn!(
                         attempt = attempts,
                         max_retries = MAX_PING_RETRIES,
@@ -298,7 +299,12 @@ impl PodmanComputeDriver {
                     );
                     tokio::time::sleep(PING_RETRY_DELAY).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    return Err(enrich_socket_connection_error(
+                        e,
+                        running_inside_container(),
+                    ));
+                }
             }
         }
 
@@ -332,7 +338,11 @@ impl PodmanComputeDriver {
         // Rootless pre-flight: warn if subuid/subgid ranges look missing.
         // Not a hard error because some systems configure these via LDAP or
         // other mechanisms that /etc/subuid does not reflect.
-        if !cfg!(target_os = "macos") && rustix::process::getuid().as_raw() != 0 {
+        if should_check_subuid_range(
+            cfg!(target_os = "macos"),
+            rustix::process::getuid().as_raw() == 0,
+            running_inside_container(),
+        ) {
             check_subuid_range();
         }
 
@@ -1028,6 +1038,35 @@ fn supervisor_image_pull_policy(image: &str) -> &'static str {
     }
 }
 
+fn running_inside_container() -> bool {
+    Path::new("/run/.containerenv").exists() || Path::new("/.dockerenv").exists()
+}
+
+fn enrich_socket_connection_error(
+    err: PodmanApiError,
+    is_containerized_gateway: bool,
+) -> PodmanApiError {
+    match err {
+        // PodmanClient has already flattened io::Error into this connection message.
+        PodmanApiError::Connection(message)
+            if is_containerized_gateway && message.contains("Permission denied") =>
+        {
+            PodmanApiError::Connection(format!(
+                "{message}. Gateway is running inside a container and cannot access the mounted Podman socket; for rootless Podman socket deployments run the gateway container with --userns=keep-id so the container UID matches the host user that owns the socket"
+            ))
+        }
+        other => other,
+    }
+}
+
+fn should_check_subuid_range(
+    is_macos: bool,
+    is_root: bool,
+    is_containerized_gateway: bool,
+) -> bool {
+    !is_macos && !is_root && !is_containerized_gateway
+}
+
 /// Check whether the current user has subuid/subgid ranges configured.
 ///
 /// Rootless Podman requires entries in `/etc/subuid` and `/etc/subgid` for
@@ -1173,6 +1212,53 @@ mod tests {
     fn podman_driver_error_from_not_found() {
         let err = ComputeDriverError::from(PodmanApiError::NotFound("gone".into()));
         assert!(matches!(err, ComputeDriverError::Message(_)));
+    }
+
+    #[test]
+    fn socket_permission_error_in_container_includes_keep_id_guidance() {
+        let err = enrich_socket_connection_error(
+            PodmanApiError::Connection("Permission denied".into()),
+            true,
+        );
+
+        assert!(err.to_string().contains("Permission denied"));
+        assert!(err.to_string().contains("--userns=keep-id"));
+    }
+
+    #[test]
+    fn socket_permission_error_on_host_is_unchanged() {
+        let err = enrich_socket_connection_error(
+            PodmanApiError::Connection("Permission denied".into()),
+            false,
+        );
+
+        assert_eq!(err.to_string(), "connection error: Permission denied");
+    }
+
+    #[test]
+    fn unrelated_socket_error_in_container_is_unchanged() {
+        let err = enrich_socket_connection_error(
+            PodmanApiError::Connection("Connection refused".into()),
+            true,
+        );
+
+        assert_eq!(err.to_string(), "connection error: Connection refused");
+    }
+
+    #[test]
+    fn subuid_preflight_skips_containerized_gateway() {
+        assert!(!should_check_subuid_range(false, false, true));
+    }
+
+    #[test]
+    fn subuid_preflight_runs_for_non_root_linux_host() {
+        assert!(should_check_subuid_range(false, false, false));
+    }
+
+    #[test]
+    fn subuid_preflight_skips_root_and_macos() {
+        assert!(!should_check_subuid_range(false, true, false));
+        assert!(!should_check_subuid_range(true, false, false));
     }
 
     #[test]
