@@ -535,7 +535,8 @@ while [ "${elapsed}" -lt "${timeout}" ]; do
     echo "ERROR: openshell-gateway exited before becoming healthy"
     exit 1
   fi
-  if curl -sf "http://${HEALTH_ENDPOINT_HOST}:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
+  # Keep this loopback probe direct even when ::1 is absent from NO_PROXY.
+  if curl --noproxy '*' -sf "http://${HEALTH_ENDPOINT_HOST}:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
     echo "Gateway healthy after ${elapsed}s."
     break
   fi
