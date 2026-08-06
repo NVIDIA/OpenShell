@@ -243,12 +243,14 @@ release ships a Helm-owned marker ConfigMap (`openshell.ai/cni-registration=true
 in its sandbox namespace and the singleton aggregates every marker's namespace
 each reconcile — so enable the installer (`cni.enabled=true`) in exactly one
 release per cluster, and additional releases (`cni.enabled=false`,
-`cni.external=true`) are discovered automatically, with registration removed by
-Helm on uninstall. Each gateway waits (via a `wait-cni-coverage` init container)
-until every enforcement-ready node acknowledges its namespace before serving, so
-there is no discovery-window bypass. `cni.sandboxNamespaces` is an optional static
-addition. The installer treats any `openshell-cni` chained entry as its own and
-upgrades it in place.
+`cni.external=true`) are discovered automatically. Removing a marker (uninstall /
+namespace change) deregisters drain-gated: the singleton keeps a namespace
+enforced while it still has running sandbox pods and prunes it only once drained.
+Each gateway waits (via a `wait-cni-coverage` init container) until every
+enforcement-ready node acknowledges its namespace before serving, so there is no
+discovery-window bypass. `cni.sandboxNamespaces` is an optional static addition.
+The installer treats any `openshell-cni` chained entry as its own and upgrades it
+in place.
 </Note>
 
 ## Credential Exposure

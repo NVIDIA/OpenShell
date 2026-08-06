@@ -353,7 +353,12 @@ sandbox namespace, and the installer's reconcile aggregates every marker's
 namespace (via `list-sandbox-namespaces`) — unioned with the optional static
 `cni.sandboxNamespaces` — into the plugin config. Because the marker is a normal
 Helm resource, uninstalling a release or changing its `sandboxNamespace` removes
-the registration (no orphaned allowlist entries). An additional `cni.external`
+the marker. Deregistration is **drain-gated and monotonic**: the reconcile also
+unions in every namespace that still contains an OpenShell-managed sandbox pod
+(`openshell.ai/managed-by=openshell`), so removing a marker does not drop
+enforcement while sandboxes are still running (which would fail-open their
+recreated pods) — the namespace is pruned only once it is drained (no marker and
+no sandbox pods). An additional `cni.external`
 release is discovered within one reconcile, with no manual allowlist edit. To
 eliminate the discovery-window race, the installer publishes on each node the CSV
 of namespaces it currently enforces (`openshell.ai/cni-sandbox-namespaces`
