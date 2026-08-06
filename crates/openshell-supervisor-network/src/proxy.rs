@@ -11537,7 +11537,9 @@ network_policies:
             join,
             exited_rx: Some(rx),
         };
-        let mut taken = handle.take_exit_receiver().expect("first take should return Some");
+        let mut taken = handle
+            .take_exit_receiver()
+            .expect("first take should return Some");
         assert!(taken.try_recv().is_err());
         drop(tx);
         assert!(taken.await.is_err());
