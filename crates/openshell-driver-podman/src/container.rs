@@ -1419,6 +1419,25 @@ mod tests {
     }
 
     #[test]
+    fn build_env_strips_gateway_tls_server_name() {
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        let spec = sandbox.spec.get_or_insert_default();
+        spec.environment.insert(
+            openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
+            "evil.attacker.example.com".to_string(),
+        );
+
+        let container = build_container_spec(&sandbox, &test_config());
+
+        assert_eq!(
+            container["env"]
+                .get(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME),
+            None,
+            "GATEWAY_TLS_SERVER_NAME must be stripped from the supervisor environment"
+        );
+    }
+
+    #[test]
     fn volume_name_uses_id() {
         assert_eq!(
             volume_name("abc-123"),

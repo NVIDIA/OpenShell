@@ -43,6 +43,9 @@ spec:
     secretName: {{ .Values.certManager.caSecretName | quote }}
 ---
 {{- $externalServerIssuer := .Values.certManager.serverIssuerRef.name }}
+{{- if and (not .Values.certManager.clientCaFromServerTlsSecret) (eq .Values.server.tls.clientCaSecretName "openshell-server-client-ca") }}
+{{- fail "certManager.clientCaFromServerTlsSecret is false but server.tls.clientCaSecretName is still the default (openshell-server-client-ca), which nothing creates when cert-manager owns TLS. Set server.tls.clientCaSecretName to the secret containing the client CA (e.g. the value of certManager.caSecretName, which defaults to openshell-ca-tls), or set it to empty to disable mTLS client verification." }}
+{{- end }}
 {{- if and $externalServerIssuer .Values.certManager.clientCaFromServerTlsSecret }}
 {{- fail "certManager.serverIssuerRef.name is set but certManager.clientCaFromServerTlsSecret is still true \u2014 the server cert Secret's ca.crt comes from the external issuer, not the CA that signs the client (mTLS) certificate. Set certManager.clientCaFromServerTlsSecret=false and set server.tls.clientCaSecretName to the secret containing the client CA (e.g. the value of certManager.caSecretName, which defaults to openshell-ca-tls)." }}
 {{- end }}
