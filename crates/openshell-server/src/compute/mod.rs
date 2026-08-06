@@ -1280,8 +1280,18 @@ impl ComputeRuntime {
                 let observed_stopped = backend_phase == SandboxPhase::Suspended
                     || driver_snapshot_confirms_stopped(&snapshot);
                 if backend_phase == SandboxPhase::Error || observed_stopped == expected_stopped {
-                    self.reconcile_lifecycle_snapshot(transition, &snapshot)
-                        .await;
+                    if let Some(reconciled) = self
+                        .reconcile_lifecycle_snapshot(transition, &snapshot)
+                        .await
+                        && reconciled.phase() == SandboxPhase::Suspended as i32
+                        && let Err(err) = self.cleanup_suspended_sandbox_sessions(&reconciled).await
+                    {
+                        warn!(
+                            sandbox_id,
+                            error = %err,
+                            "Failed to clean up sessions after reconciling suspended sandbox"
+                        );
+                    }
                 } else {
                     self.restore_lifecycle_snapshot(transition, previous).await;
                 }
@@ -1299,7 +1309,11 @@ impl ComputeRuntime {
         }
     }
 
-    async fn reconcile_lifecycle_snapshot(&self, transition: &Sandbox, snapshot: &DriverSandbox) {
+    async fn reconcile_lifecycle_snapshot(
+        &self,
+        transition: &Sandbox,
+        snapshot: &DriverSandbox,
+    ) -> Option<Sandbox> {
         let sandbox_id = transition.object_id().to_string();
         let expected_resource_version = sandbox_resource_version(transition);
         let session_connected = self.supervisor_sessions.has_session(&sandbox_id);
@@ -1313,6 +1327,7 @@ impl ComputeRuntime {
             Ok(reconciled) => {
                 self.sandbox_index.update_from_sandbox(&reconciled);
                 self.sandbox_watch_bus.notify(&sandbox_id);
+                Some(reconciled)
             }
             Err(err) => {
                 debug!(
@@ -1320,6 +1335,7 @@ impl ComputeRuntime {
                     error = %err,
                     "Skipped lifecycle reconciliation after concurrent change"
                 );
+                None
             }
         }
     }
@@ -5490,6 +5506,9 @@ mod tests {
         driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(stopped)));
         let runtime = test_runtime(driver).await;
         runtime.store.put_message(&sandbox).await.unwrap();
+        let session = ssh_session_record("lost-response-session", sandbox.object_id());
+        runtime.store.put_message(&session).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
 
         let err = runtime
             .suspend_sandbox("default", sandbox.object_name())
@@ -5504,6 +5523,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.phase(), SandboxPhase::Suspended as i32);
+        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "reconciled suspension revokes ephemeral SSH sessions"
+        );
     }
 
     #[tokio::test]
