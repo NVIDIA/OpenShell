@@ -1167,19 +1167,21 @@ impl VmDriver {
             .map_err(|err| {
                 Status::internal(format!("read sandbox resume metadata failed: {err}"))
             })?;
-        match tokio::fs::remove_file(state_dir.join(SANDBOX_SUSPENDED_FILE)).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(Status::internal(format!(
-                    "remove suspension marker failed: {err}"
-                )));
-            }
-        }
-        self.registry.lock().await.remove(&record_id);
-        self.restore_persisted_sandbox(sandbox, state_dir, &tracing::Span::current())
+        let suspended_record = self
+            .registry
+            .lock()
+            .await
+            .remove(&record_id)
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let restored = self
+            .restore_persisted_sandbox(sandbox, state_dir, true, &tracing::Span::current())
             .await;
-        if !self.registry.lock().await.contains_key(&record_id) {
+        if !restored {
+            self.registry
+                .lock()
+                .await
+                .entry(record_id)
+                .or_insert(suspended_record);
             return Err(Status::internal("failed to resume persisted VM sandbox"));
         }
         Ok(())
@@ -1412,24 +1414,29 @@ impl VmDriver {
                 continue;
             }
 
-            self.restore_persisted_sandbox(sandbox, state_dir, &tracing::Span::current())
+            self.restore_persisted_sandbox(sandbox, state_dir, false, &tracing::Span::current())
                 .await;
         }
     }
 
+    /// Restore a persisted sandbox and report whether the driver accepted it.
+    /// For explicit resume, the suspension marker is cleared only after all
+    /// restore preflight checks pass and the replacement registry record is
+    /// installed. A failed restore therefore remains durably suspended.
     async fn restore_persisted_sandbox(
         &self,
         sandbox: Sandbox,
         state_dir: PathBuf,
+        clear_suspension_marker: bool,
         reconciliation_span: &tracing::Span,
-    ) {
+    ) -> bool {
         let Some(image_ref) = self.resolved_sandbox_image(&sandbox) else {
             warn!(
                 sandbox_id = %sandbox.id,
                 sandbox_name = %sandbox.name,
                 "vm driver: cannot restore persisted sandbox without image"
             );
-            return;
+            return false;
         };
         let tls_paths = match self.config.tls_paths() {
             Ok(paths) => paths,
@@ -1440,7 +1447,7 @@ impl VmDriver {
                     error = %err,
                     "vm driver: cannot restore persisted sandbox TLS configuration"
                 );
-                return;
+                return false;
             }
         };
 
@@ -1452,7 +1459,7 @@ impl VmDriver {
                 error = %err.message(),
                 "vm driver: cannot restore persisted sandbox extension state"
             );
-            return;
+            return false;
         }
 
         let persisted = RestoreContext {
@@ -1467,14 +1474,14 @@ impl VmDriver {
                 error = %err,
                 "vm driver: lifecycle extension rejected persisted sandbox restore"
             );
-            return;
+            return false;
         }
 
         let snapshot = sandbox_snapshot(&sandbox, provisioning_condition(), false);
         {
             let mut registry = self.registry.lock().await;
             if registry.contains_key(&sandbox.id) {
-                return;
+                return false;
             }
             registry.insert(
                 sandbox.id.clone(),
@@ -1488,6 +1495,23 @@ impl VmDriver {
                     deleting: false,
                 },
             );
+        }
+
+        if clear_suspension_marker {
+            match tokio::fs::remove_file(state_dir.join(SANDBOX_SUSPENDED_FILE)).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    self.registry.lock().await.remove(&sandbox.id);
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        state_dir = %state_dir.display(),
+                        error = %err,
+                        "vm driver: cannot clear suspension marker for persisted sandbox restore"
+                    );
+                    return false;
+                }
+            }
         }
 
         self.publish_platform_event(
@@ -1540,6 +1564,7 @@ impl VmDriver {
         } else {
             task.abort();
         }
+        true
     }
 
     fn release_gpu(&self, sandbox_id: &str) {
@@ -6562,6 +6587,62 @@ mod tests {
             .expect("restored state should validate");
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn failed_resume_preserves_suspended_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let sandbox = Sandbox {
+            id: "sandbox-suspended".to_string(),
+            name: "suspended".to_string(),
+            ..Default::default()
+        };
+        let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
+        create_private_dir_all(&state_dir).await.unwrap();
+        write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        tokio::fs::write(state_dir.join(SANDBOX_SUSPENDED_FILE), b"suspended\n")
+            .await
+            .unwrap();
+        let snapshot = sandbox_snapshot(&sandbox, suspended_condition(), false);
+        driver.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxRecord {
+                snapshot,
+                state_dir: state_dir.clone(),
+                process: None,
+                provisioning_task: None,
+                gpu_bdf: None,
+                qemu_network_allocated: false,
+                deleting: false,
+            },
+        );
+
+        let err = driver
+            .resume_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .expect_err("resume without an image should fail");
+
+        assert_eq!(err.code(), Code::Internal);
+        assert!(
+            tokio::fs::metadata(state_dir.join(SANDBOX_SUSPENDED_FILE))
+                .await
+                .is_ok(),
+            "failed resume must retain its durable suspension marker"
+        );
+        let restored = driver
+            .get_sandbox(&sandbox.id, &sandbox.name)
+            .await
+            .unwrap()
+            .expect("failed resume must retain its suspended registry record");
+        let condition = restored
+            .status
+            .as_ref()
+            .and_then(|status| status.conditions.first())
+            .expect("suspended condition");
+        assert_eq!(condition.r#type, "Suspended");
+        assert_eq!(condition.status, "True");
     }
 
     #[test]
