@@ -1019,6 +1019,9 @@ impl ComputeRuntime {
 
         let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
         if phase == SandboxPhase::Suspended {
+            self.cleanup_suspended_sandbox_sessions(&current)
+                .await
+                .map_err(Status::internal)?;
             return Ok(current);
         }
         if phase == SandboxPhase::Suspending {
@@ -1048,13 +1051,11 @@ impl ComputeRuntime {
         // `Suspending`. Keep the lifecycle gate in an owned worker, matching
         // the delete path's cancellation semantics.
         let runtime = self.clone();
-        let workspace = workspace.to_string();
         let request_span = tracing::Span::current();
         tokio::spawn(
             async move {
                 runtime
                     .complete_sandbox_suspend(
-                        workspace,
                         sandbox_id,
                         sandbox_name,
                         previous,
@@ -1075,7 +1076,6 @@ impl ComputeRuntime {
 
     async fn complete_sandbox_suspend(
         &self,
-        workspace: String,
         sandbox_id: String,
         sandbox_name: String,
         previous: Sandbox,
@@ -1123,10 +1123,9 @@ impl ComputeRuntime {
                         "sandbox lifecycle changed while suspension completed",
                     ));
                 };
-                self.cleanup_sandbox_ssh_sessions(&sandbox_id, &workspace)
+                self.cleanup_suspended_sandbox_sessions(&suspended)
                     .await
                     .map_err(Status::internal)?;
-                self.supervisor_sessions.disconnect(&sandbox_id);
                 self.sandbox_index.update_from_sandbox(&suspended);
                 self.sandbox_watch_bus.notify(&sandbox_id);
                 Ok(suspended)
@@ -2116,6 +2115,11 @@ impl ComputeRuntime {
             };
             let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
             match phase {
+                SandboxPhase::Suspended => {
+                    if let Err(err) = self.cleanup_suspended_sandbox_sessions(&sandbox).await {
+                        warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to complete recovered sandbox session cleanup");
+                    }
+                }
                 SandboxPhase::Suspending => {
                     let sandbox_id = sandbox.object_id().to_string();
                     let sandbox_name = sandbox.object_name().to_string();
@@ -2148,6 +2152,11 @@ impl ComputeRuntime {
                             Ok(updated) => {
                                 self.sandbox_index.update_from_sandbox(&updated);
                                 self.sandbox_watch_bus.notify(updated.object_id());
+                                if let Err(err) =
+                                    self.cleanup_suspended_sandbox_sessions(&updated).await
+                                {
+                                    warn!(sandbox_id = %updated.object_id(), error = %err, "Failed to complete recovered sandbox session cleanup");
+                                }
                             }
                             Err(err) => {
                                 warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to persist recovered suspension");
@@ -2758,6 +2767,16 @@ impl ComputeRuntime {
         }
 
         Ok(())
+    }
+
+    async fn cleanup_suspended_sandbox_sessions(&self, sandbox: &Sandbox) -> Result<(), String> {
+        // Disconnect first so a store failure cannot leave the stopped
+        // sandbox reachable through an existing supervisor stream. Both
+        // operations are idempotent and are retried for durable Suspended
+        // records during explicit suspend requests and startup recovery.
+        self.supervisor_sessions.disconnect(sandbox.object_id());
+        self.cleanup_sandbox_ssh_sessions(sandbox.object_id(), sandbox.object_workspace())
+            .await
     }
 
     // TODO: introduce a per-sandbox cap on service endpoints and paginate
@@ -5266,6 +5285,81 @@ mod tests {
             .unwrap();
         assert_eq!(ready.phase(), SandboxPhase::Ready as i32);
         assert_eq!(driver.resume_calls(), 1, "ready resume is idempotent");
+    }
+
+    #[tokio::test]
+    async fn repeated_suspend_completes_session_cleanup() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-suspended", "sandbox-suspended", SandboxPhase::Suspended);
+        let session = ssh_session_record("stale-session", sandbox.object_id());
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime.store.put_message(&session).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+
+        let suspended = runtime
+            .suspend_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+
+        assert_eq!(suspended.phase(), SandboxPhase::Suspended as i32);
+        assert_eq!(driver.stop_calls(), 0);
+        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_completes_suspended_session_cleanup() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let suspended =
+            sandbox_record("sb-suspended", "sandbox-suspended", SandboxPhase::Suspended);
+        let suspending = sandbox_record(
+            "sb-suspending",
+            "sandbox-suspending",
+            SandboxPhase::Suspending,
+        );
+        let suspended_session = ssh_session_record("suspended-session", suspended.object_id());
+        let suspending_session = ssh_session_record("suspending-session", suspending.object_id());
+        for sandbox in [&suspended, &suspending] {
+            runtime.store.put_message(sandbox).await.unwrap();
+            register_test_supervisor_session(&runtime, sandbox.object_id());
+        }
+        for session in [&suspended_session, &suspending_session] {
+            runtime.store.put_message(session).await.unwrap();
+        }
+
+        runtime.resume_persisted_sandboxes().await.unwrap();
+
+        assert_eq!(driver.stop_calls(), 1);
+        for (sandbox, session) in [
+            (&suspended, &suspended_session),
+            (&suspending, &suspending_session),
+        ] {
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.phase(), SandboxPhase::Suspended as i32);
+            assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+            assert!(
+                runtime
+                    .store
+                    .get_message::<SshSession>(session.object_id())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]
