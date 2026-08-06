@@ -1024,26 +1024,30 @@ impl ComputeRuntime {
                 .map_err(Status::internal)?;
             return Ok(current);
         }
-        if phase == SandboxPhase::Suspending {
-            return Ok(current);
-        }
         if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Suspending) {
             return Err(Status::failed_precondition(format!(
                 "sandbox must be Ready to suspend (current phase: {phase:?})"
             )));
         }
 
-        let previous = current.clone();
-        let suspending = self
-            .write_lifecycle_phase(
-                &current,
-                SandboxPhase::Suspending,
-                "Suspending",
-                "Sandbox suspension requested",
-            )
-            .await?;
-        self.sandbox_index.update_from_sandbox(&suspending);
-        self.sandbox_watch_bus.notify(&sandbox_id);
+        let (previous, suspending) = if phase == SandboxPhase::Suspending {
+            // Acquiring the lifecycle gate proves that no local worker still
+            // owns this transition. Retry the idempotent driver operation.
+            (current.clone(), current)
+        } else {
+            let previous = current.clone();
+            let suspending = self
+                .write_lifecycle_phase(
+                    &current,
+                    SandboxPhase::Suspending,
+                    "Suspending",
+                    "Sandbox suspension requested",
+                )
+                .await?;
+            self.sandbox_index.update_from_sandbox(&suspending);
+            self.sandbox_watch_bus.notify(&sandbox_id);
+            (previous, suspending)
+        };
         drop(global_guard);
 
         // Once the durable transition is committed, request cancellation must
@@ -1172,26 +1176,30 @@ impl ComputeRuntime {
         if phase == SandboxPhase::Ready {
             return Ok(current);
         }
-        if phase == SandboxPhase::Resuming {
-            return Ok(current);
-        }
         if !matches!(phase, SandboxPhase::Suspended | SandboxPhase::Resuming) {
             return Err(Status::failed_precondition(format!(
                 "sandbox must be Suspended to resume (current phase: {phase:?})"
             )));
         }
 
-        let previous = current.clone();
-        let resuming = self
-            .write_lifecycle_phase(
-                &current,
-                SandboxPhase::Resuming,
-                "Resuming",
-                "Sandbox resume requested",
-            )
-            .await?;
-        self.sandbox_index.update_from_sandbox(&resuming);
-        self.sandbox_watch_bus.notify(&sandbox_id);
+        let (previous, resuming) = if phase == SandboxPhase::Resuming {
+            // Acquiring the lifecycle gate proves that no local worker still
+            // owns this transition. Retry the idempotent driver operation.
+            (current.clone(), current)
+        } else {
+            let previous = current.clone();
+            let resuming = self
+                .write_lifecycle_phase(
+                    &current,
+                    SandboxPhase::Resuming,
+                    "Resuming",
+                    "Sandbox resume requested",
+                )
+                .await?;
+            self.sandbox_index.update_from_sandbox(&resuming);
+            self.sandbox_watch_bus.notify(&sandbox_id);
+            (previous, resuming)
+        };
         drop(global_guard);
 
         // The durable `Resuming` transition commits the operation. Let an
@@ -5269,7 +5277,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resuming_again.phase(), SandboxPhase::Resuming as i32);
-        assert_eq!(driver.resume_calls(), 1, "in-flight resume is idempotent");
+        assert_eq!(
+            driver.resume_calls(),
+            2,
+            "explicit retry reissues the idempotent resume"
+        );
 
         register_test_supervisor_session(&runtime, sandbox.object_id());
         runtime
@@ -5284,7 +5296,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ready.phase(), SandboxPhase::Ready as i32);
-        assert_eq!(driver.resume_calls(), 1, "ready resume is idempotent");
+        assert_eq!(driver.resume_calls(), 2, "ready resume is idempotent");
+    }
+
+    #[tokio::test]
+    async fn retained_suspending_transition_retries_driver_operation() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record(
+            "sb-retained-suspend",
+            "sandbox-retained-suspend",
+            SandboxPhase::Suspending,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let suspended = runtime
+            .suspend_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+
+        assert_eq!(suspended.phase(), SandboxPhase::Suspended as i32);
+        assert_eq!(driver.stop_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn retained_resuming_transition_retries_driver_operation() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record(
+            "sb-retained-resume",
+            "sandbox-retained-resume",
+            SandboxPhase::Resuming,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let resuming = runtime
+            .resume_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+
+        assert_eq!(resuming.phase(), SandboxPhase::Resuming as i32);
+        assert_eq!(driver.resume_calls(), 1);
     }
 
     #[tokio::test]
@@ -5431,6 +5483,7 @@ mod tests {
             .await
             .expect("detached resume worker did not finish the driver call");
 
+        driver.release_resume();
         let resuming = tokio::time::timeout(
             Duration::from_secs(1),
             runtime.resume_sandbox("default", sandbox.object_name()),
@@ -5439,7 +5492,7 @@ mod tests {
         .expect("detached resume worker did not release the lifecycle gate")
         .unwrap();
         assert_eq!(resuming.phase(), SandboxPhase::Resuming as i32);
-        assert_eq!(driver.resume_calls(), 1);
+        assert_eq!(driver.resume_calls(), 2);
     }
 
     #[tokio::test]
