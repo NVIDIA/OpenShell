@@ -13,7 +13,9 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
     Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Volume, VolumeMount,
 };
-use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams, Preconditions};
+use kube::api::{
+    Api, ApiResource, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions,
+};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
@@ -925,6 +927,102 @@ impl KubernetesComputeDriver {
                 )))
             }
         }
+    }
+
+    pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
+        let (agent_sandbox_api, kube_name) = self
+            .patch_sandbox_operating_state(sandbox_id, false)
+            .await?;
+
+        let deadline = tokio::time::Instant::now() + KUBE_API_TIMEOUT;
+        loop {
+            let object = agent_sandbox_api
+                .api
+                .get(&kube_name)
+                .await
+                .map_err(|err| err.to_string())?;
+            if kubernetes_sandbox_is_suspended(&object) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes sandbox to suspend",
+                    KUBE_API_TIMEOUT.as_secs()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    pub async fn resume_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
+        self.patch_sandbox_operating_state(sandbox_id, true)
+            .await
+            .map(|_| ())
+    }
+
+    async fn patch_sandbox_operating_state(
+        &self,
+        sandbox_id: &str,
+        running: bool,
+    ) -> Result<(AgentSandboxApi, String), String> {
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
+            .await?;
+        let selector =
+            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id}");
+        let list = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api
+                .api
+                .list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|err| err.to_string())?;
+        let object = list
+            .items
+            .into_iter()
+            .next()
+            .ok_or_else(|| "sandbox not found".to_string())?;
+        let kube_name = object
+            .metadata
+            .name
+            .ok_or_else(|| "sandbox resource has no name".to_string())?;
+        let resource_version = object.metadata.resource_version.unwrap_or_default();
+        let desired = sandbox_operating_state_patch(
+            &agent_sandbox_api.resource.version,
+            &resource_version,
+            running,
+        );
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api.api.patch(
+                &kube_name,
+                &PatchParams::default(),
+                &Patch::Merge(&desired),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|err| err.to_string())?;
+
+        info!(
+            sandbox_id,
+            sandbox_api_version = %agent_sandbox_api.resource.version,
+            running,
+            "Updated Kubernetes sandbox operating state"
+        );
+        Ok((agent_sandbox_api, kube_name))
     }
 
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
@@ -3121,6 +3219,46 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
     })
 }
 
+fn kubernetes_sandbox_is_suspended(obj: &DynamicObject) -> bool {
+    obj.data
+        .get("status")
+        .and_then(|status| status.get("conditions"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|conditions| {
+            conditions.iter().any(|condition| {
+                condition.get("type").and_then(serde_json::Value::as_str) == Some("Suspended")
+                    && condition
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|status| status.eq_ignore_ascii_case("true"))
+            })
+        })
+        || obj
+            .data
+            .get("status")
+            .and_then(|status| status.get("replicas"))
+            .and_then(serde_json::Value::as_i64)
+            == Some(0)
+}
+
+fn sandbox_operating_state_patch(
+    api_version: &str,
+    resource_version: &str,
+    running: bool,
+) -> serde_json::Value {
+    if api_version == SANDBOX_VERSION_V1BETA1 {
+        serde_json::json!({
+            "metadata": {"resourceVersion": resource_version},
+            "spec": {"operatingMode": if running { "Running" } else { "Suspended" }}
+        })
+    } else {
+        serde_json::json!({
+            "metadata": {"resourceVersion": resource_version},
+            "spec": {"replicas": i32::from(running)}
+        })
+    }
+}
+
 fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
     let obj = value.as_object()?;
     Some(SandboxCondition {
@@ -3192,6 +3330,19 @@ mod tests {
 
         let raw = kube_api_error(404, "404 page not found\n");
         assert!(should_try_next_sandbox_api_version(&raw));
+    }
+
+    #[test]
+    fn lifecycle_patch_uses_version_specific_operating_state() {
+        let beta_suspend = sandbox_operating_state_patch(SANDBOX_VERSION_V1BETA1, "42", false);
+        assert_eq!(beta_suspend["metadata"]["resourceVersion"], "42");
+        assert_eq!(beta_suspend["spec"]["operatingMode"], "Suspended");
+        assert!(beta_suspend["spec"].get("replicas").is_none());
+
+        let alpha_resume = sandbox_operating_state_patch(SANDBOX_VERSION_V1ALPHA1, "43", true);
+        assert_eq!(alpha_resume["metadata"]["resourceVersion"], "43");
+        assert_eq!(alpha_resume["spec"]["replicas"], 1);
+        assert!(alpha_resume["spec"].get("operatingMode").is_none());
     }
 
     #[test]

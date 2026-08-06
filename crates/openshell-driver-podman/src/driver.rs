@@ -3,7 +3,7 @@
 
 //! Podman compute driver.
 
-use crate::client::{PodmanApiError, PodmanClient, VolumeInspect};
+use crate::client::{ContainerListEntry, PodmanApiError, PodmanClient, VolumeInspect};
 use crate::config::PodmanComputeConfig;
 use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, PodmanSandboxDriverConfig};
 use crate::watcher::{
@@ -36,7 +36,7 @@ impl From<PodmanApiError> for ComputeDriverError {
     fn from(value: PodmanApiError) -> Self {
         match value {
             PodmanApiError::Conflict(_) => Self::AlreadyExists,
-            PodmanApiError::NotFound(msg) => Self::Message(format!("not found: {msg}")),
+            PodmanApiError::NotFound(_) => Self::NotFound,
             other => Self::Message(other.to_string()),
         }
     }
@@ -815,24 +815,54 @@ impl PodmanComputeDriver {
         &self,
         sandbox_id: &str,
     ) -> Result<Option<String>, ComputeDriverError> {
+        Ok(self.find_container(sandbox_id).await?.map(|entry| entry.id))
+    }
+
+    async fn find_container(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<ContainerListEntry>, ComputeDriverError> {
         let id_filter = format!("{LABEL_SANDBOX_ID}={sandbox_id}");
         let entries = self
             .client
             .list_containers(&[LABEL_MANAGED_FILTER, &id_filter])
             .await
             .map_err(ComputeDriverError::from)?;
-        Ok(entries.first().map(|e| e.id.clone()))
+        Ok(entries.into_iter().next())
     }
 
     /// Stop a sandbox container without deleting it.
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
-        let container_id = self.find_container_id(sandbox_id).await?.ok_or_else(|| {
-            ComputeDriverError::Precondition("sandbox container not found".into())
-        })?;
+        let container = self
+            .find_container(sandbox_id)
+            .await?
+            .ok_or(ComputeDriverError::NotFound)?;
+        if container.state != "running" {
+            return Ok(());
+        }
+        let container_id = container.id;
         info!(sandbox_id = %sandbox_id, container = %container_id, "Stopping sandbox container");
 
         self.client
             .stop_container(&container_id, self.config.stop_timeout_secs)
+            .await
+            .map_err(ComputeDriverError::from)
+    }
+
+    /// Resume a previously stopped sandbox container.
+    pub async fn resume_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
+        let container = self
+            .find_container(sandbox_id)
+            .await?
+            .ok_or(ComputeDriverError::NotFound)?;
+        if container.state == "running" {
+            return Ok(());
+        }
+        let container_id = container.id;
+        info!(sandbox_id = %sandbox_id, container = %container_id, "Resuming sandbox container");
+
+        self.client
+            .start_container(&container_id)
             .await
             .map_err(ComputeDriverError::from)
     }
@@ -1172,7 +1202,54 @@ mod tests {
     #[test]
     fn podman_driver_error_from_not_found() {
         let err = ComputeDriverError::from(PodmanApiError::NotFound("gone".into()));
-        assert!(matches!(err, ComputeDriverError::Message(_)));
+        assert!(matches!(err, ComputeDriverError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn stop_and_resume_target_the_existing_container() {
+        let (stop_socket, stop_requests, stop_handle) = spawn_podman_stub(
+            "lifecycle-stop",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"running"}]"#),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+            ],
+        );
+        test_driver(stop_socket.clone())
+            .stop_sandbox("sandbox-1")
+            .await
+            .expect("stop should succeed");
+        stop_handle.await.expect("stop stub should finish");
+        assert_eq!(
+            stop_requests
+                .lock()
+                .expect("request log lock should not be poisoned")[1],
+            format!(
+                "POST {}",
+                api_path("/libpod/containers/ctr-1/stop?timeout=10")
+            )
+        );
+
+        let (start_socket, start_requests, start_handle) = spawn_podman_stub(
+            "lifecycle-start",
+            vec![
+                StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"stopped"}]"#),
+                StubResponse::new(StatusCode::NO_CONTENT, ""),
+            ],
+        );
+        test_driver(start_socket.clone())
+            .resume_sandbox("sandbox-1")
+            .await
+            .expect("resume should succeed");
+        start_handle.await.expect("start stub should finish");
+        assert_eq!(
+            start_requests
+                .lock()
+                .expect("request log lock should not be poisoned")[1],
+            format!("POST {}", api_path("/libpod/containers/ctr-1/start"))
+        );
+
+        let _ = fs::remove_file(stop_socket);
+        let _ = fs::remove_file(start_socket);
     }
 
     #[test]

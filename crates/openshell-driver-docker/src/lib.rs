@@ -42,11 +42,12 @@ use openshell_core::proto::compute::v1::{
     DriverSandboxTemplate, GatewayListenerRequirement, GetCapabilitiesRequest,
     GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
-    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
-    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
-    WatchSandboxesRequest, WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
-    gateway_listener_requirement::Selector, watch_sandboxes_event,
+    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, ResumeSandboxRequest,
+    ResumeSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
+    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -1479,7 +1480,23 @@ impl ComputeDriver for DockerComputeDriver {
 
         self.stop_sandbox_inner(&request.sandbox_id, &request.sandbox_name)
             .await?;
+        self.publish_container_snapshot(&request.sandbox_id, &request.sandbox_name)
+            .await?;
         Ok(Response::new(StopSandboxResponse {}))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        request: Request<ResumeSandboxRequest>,
+    ) -> Result<Response<ResumeSandboxResponse>, Status> {
+        let request = request.into_inner();
+        require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
+        if !Self::resume_sandbox(self, &request.sandbox_id, &request.sandbox_name).await? {
+            return Err(Status::not_found("sandbox not found"));
+        }
+        self.publish_container_snapshot(&request.sandbox_id, &request.sandbox_name)
+            .await?;
+        Ok(Response::new(ResumeSandboxResponse {}))
     }
 
     async fn delete_sandbox(

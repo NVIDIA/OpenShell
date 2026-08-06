@@ -59,6 +59,9 @@ pub fn phase_name(phase: i32) -> &'static str {
         Ok(SandboxPhase::Ready) => "Ready",
         Ok(SandboxPhase::Error) => "Error",
         Ok(SandboxPhase::Deleting) => "Deleting",
+        Ok(SandboxPhase::Suspending) => "Suspending",
+        Ok(SandboxPhase::Suspended) => "Suspended",
+        Ok(SandboxPhase::Resuming) => "Resuming",
         Ok(SandboxPhase::Unknown) | Err(_) => "Unknown",
     }
 }

@@ -125,6 +125,28 @@ func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandb
 	return &pb.DeleteSandboxResponse{Deleted: true}, nil
 }
 
+func (s *mockSandboxServer) SuspendSandbox(_ context.Context, req *pb.SuspendSandboxRequest) (*pb.SandboxResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sb, ok := s.sandboxes[req.GetName()]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetName())
+	}
+	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_SUSPENDED
+	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
+}
+
+func (s *mockSandboxServer) ResumeSandbox(_ context.Context, req *pb.ResumeSandboxRequest) (*pb.SandboxResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sb, ok := s.sandboxes[req.GetName()]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", req.GetName())
+	}
+	sb.Status.Phase = pb.SandboxPhase_SANDBOX_PHASE_RESUMING
+	return &pb.SandboxResponse{Sandbox: proto.Clone(sb).(*pb.Sandbox)}, nil
+}
+
 func (s *mockSandboxServer) AttachSandboxProvider(_ context.Context, req *pb.AttachSandboxProviderRequest) (*pb.AttachSandboxProviderResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -358,6 +380,24 @@ func TestSandboxDelete_NotFound(t *testing.T) {
 	assert.True(t, IsNotFound(err))
 }
 
+func TestSandboxSuspendAndResume(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["lifecycle"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Name: "lifecycle", Workspace: "team-a"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_READY},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	suspended, err := client.Suspend(context.Background(), "team-a", "lifecycle")
+	require.NoError(t, err)
+	assert.Equal(t, SandboxSuspended, suspended.Status.Phase)
+
+	resuming, err := client.Resume(context.Background(), "team-a", "lifecycle")
+	require.NoError(t, err)
+	assert.Equal(t, SandboxResuming, resuming.Status.Phase)
+}
+
 // --- T030: AttachProvider, DetachProvider, ListProviders tests ---
 
 func TestSandboxAttachProvider(t *testing.T) {
@@ -471,6 +511,20 @@ func TestSandboxListProviders_Error(t *testing.T) {
 }
 
 // --- T031: WaitReady tests ---
+
+func TestSandboxWaitSuspended_AlreadySuspended(t *testing.T) {
+	mock := newMockSandboxServer()
+	mock.sandboxes["sleeping"] = &pb.Sandbox{
+		Metadata: &dm.ObjectMeta{Name: "sleeping"},
+		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_SUSPENDED},
+	}
+	client, cleanup := setupSandboxTest(t, mock)
+	defer cleanup()
+
+	result, err := client.WaitSuspended(context.Background(), "default", "sleeping")
+	require.NoError(t, err)
+	assert.Equal(t, SandboxSuspended, result.Status.Phase)
+}
 
 func TestSandboxWaitReady_AlreadyReady(t *testing.T) {
 	mock := newMockSandboxServer()

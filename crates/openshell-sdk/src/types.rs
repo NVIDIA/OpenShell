@@ -62,6 +62,9 @@ pub enum SandboxPhase {
     Error,
     Deleting,
     Unknown,
+    Suspending,
+    Suspended,
+    Resuming,
 }
 
 impl From<proto::SandboxPhase> for SandboxPhase {
@@ -73,6 +76,9 @@ impl From<proto::SandboxPhase> for SandboxPhase {
             proto::SandboxPhase::Error => Self::Error,
             proto::SandboxPhase::Deleting => Self::Deleting,
             proto::SandboxPhase::Unknown => Self::Unknown,
+            proto::SandboxPhase::Suspending => Self::Suspending,
+            proto::SandboxPhase::Suspended => Self::Suspended,
+            proto::SandboxPhase::Resuming => Self::Resuming,
         }
     }
 }
