@@ -273,9 +273,12 @@ The framework uses one protobuf/gRPC service contract. Gateway interceptor
 endpoints connect over gRPC, either to a remote endpoint or over a Unix domain
 socket.
 
-All gateway interceptor connections require authentication. The exact
-authentication model is out of scope for this RFC, but implementations should
-support mTLS and bearer-token authentication.
+Gateway interceptor connections use short-lived, exact-audience bearer JWTs
+minted by the gateway's existing Ed25519 signing authority. Integrations verify
+the gateway key through its JWKS or an operator-provisioned public key and
+validate issuer, audience, expiry, and `caller_kind: gateway`. HTTPS supports
+an operator-provided CA with hostname verification. mTLS and overlapping key
+rotation remain deferred hardening.
 
 ### Selection and ordering
 

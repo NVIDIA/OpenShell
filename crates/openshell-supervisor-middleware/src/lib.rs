@@ -6,9 +6,7 @@
 mod headers;
 mod remote;
 
-#[cfg(test)]
-use std::collections::HashMap;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -671,6 +669,25 @@ impl MiddlewareRegistry {
         in_process_services: Vec<Arc<dyn SupervisorMiddleware>>,
         registrations: Vec<SupervisorMiddlewareService>,
     ) -> Result<Self> {
+        Self::connect_services_inner(in_process_services, registrations, None).await
+    }
+
+    /// Connect services with optional refreshable credentials keyed by
+    /// operator registration name. A configured credential is shared by all
+    /// generated client clones and can rotate without rebuilding the registry.
+    pub async fn connect_services_authenticated(
+        in_process_services: Vec<Arc<dyn SupervisorMiddleware>>,
+        registrations: Vec<SupervisorMiddlewareService>,
+        credentials: &HashMap<String, openshell_extension_core::BearerTokenSlot>,
+    ) -> Result<Self> {
+        Self::connect_services_inner(in_process_services, registrations, Some(credentials)).await
+    }
+
+    async fn connect_services_inner(
+        in_process_services: Vec<Arc<dyn SupervisorMiddleware>>,
+        registrations: Vec<SupervisorMiddlewareService>,
+        credentials: Option<&HashMap<String, openshell_extension_core::BearerTokenSlot>>,
+    ) -> Result<Self> {
         let mut services = Vec::with_capacity(in_process_services.len() + registrations.len());
         let mut registered_services = Vec::with_capacity(registrations.len());
         let mut middleware_names = HashSet::new();
@@ -737,10 +754,22 @@ impl MiddlewareRegistry {
                         registration.name
                     )
                 })?;
+            let bearer = credentials
+                .map(|credentials| {
+                    credentials.get(&registration.name).cloned().ok_or_else(|| {
+                        miette!(
+                            "middleware registration '{}' is missing its extension credential",
+                            registration.name
+                        )
+                    })
+                })
+                .transpose()?;
             let service = Arc::new(
                 remote::RemoteMiddlewareService::connect(
                     &registration.name,
                     &registration.grpc_endpoint,
+                    &registration.tls_ca_cert_pem,
+                    bearer,
                 )
                 .await?,
             );

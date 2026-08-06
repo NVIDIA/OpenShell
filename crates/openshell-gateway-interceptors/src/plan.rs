@@ -4,10 +4,8 @@
 //! Interceptor configuration and immutable execution planning.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
 use std::time::Duration;
 
-use hyper_util::rt::TokioIo;
 use openshell_core::config::{
     GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
     GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig,
@@ -16,16 +14,15 @@ use openshell_core::proto::gateway_interceptor::v1::{
     DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorSelector,
     gateway_interceptor_client::GatewayInterceptorClient,
 };
-use tokio::net::UnixStream;
+use openshell_extension_core::{
+    BearerTokenInterceptor, BearerTokenSlot, ExtensionChannelConfig, connect_channel,
+};
 use tonic::Request;
-use tonic::codegen::http::Uri;
-use tonic::transport::{Channel, Endpoint};
-use tower::service_fn;
 use tracing::{info, warn};
 
 use crate::profile_source::GatewayInterceptorProfileSource;
 use crate::routes::OpenShellRouteIndex;
-use crate::{InterceptorError, Result};
+use crate::{ExtensionChannel, InterceptorError, Result};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(500);
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 1_048_576;
@@ -137,7 +134,7 @@ pub struct BindingPlan {
     pub(crate) timeout: Duration,
     pub(crate) max_response_bytes: usize,
     pub(crate) max_patches: usize,
-    pub(crate) client: GatewayInterceptorClient<Channel>,
+    pub(crate) client: GatewayInterceptorClient<ExtensionChannel>,
 }
 
 impl std::fmt::Debug for BindingPlan {
@@ -175,15 +172,30 @@ impl ExecutionPlan {
     pub(crate) async fn load(
         mut configs: Vec<GatewayInterceptorConfig>,
         routes: OpenShellRouteIndex,
+        token_slots: Option<BTreeMap<String, BearerTokenSlot>>,
     ) -> Result<Self> {
         validate_interceptor_configs(&configs)?;
+        validate_authenticated_slots(&configs, token_slots.as_ref())?;
         configs.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)));
 
         let mut bindings: BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>> = BTreeMap::new();
         let mut profile_sources = BTreeMap::new();
 
         for config in configs {
-            let channel = connect_endpoint(&config.grpc_endpoint).await?;
+            let channel = connect_endpoint(&config).await?;
+            let interceptor = match token_slots.as_ref() {
+                Some(slots) => slots
+                    .get(&config.name)
+                    .ok_or_else(|| {
+                        InterceptorError::Config(format!(
+                            "authenticated interceptor '{}' is missing a bearer-token slot",
+                            config.name
+                        ))
+                    })?
+                    .interceptor(),
+                None => BearerTokenInterceptor::disabled(),
+            };
+            let channel = ExtensionChannel::new(channel, interceptor);
             let timeout = match config.timeout.as_deref() {
                 Some(timeout) => parse_duration(timeout)?,
                 None => DEFAULT_TIMEOUT,
@@ -346,6 +358,24 @@ impl ExecutionPlan {
     pub(crate) fn has_binding(&self, selector: &RpcSelector, phase: Phase) -> bool {
         self.bindings.contains_key(&(selector.clone(), phase))
     }
+}
+
+fn validate_authenticated_slots(
+    configs: &[GatewayInterceptorConfig],
+    token_slots: Option<&BTreeMap<String, BearerTokenSlot>>,
+) -> Result<()> {
+    let Some(token_slots) = token_slots else {
+        return Ok(());
+    };
+    for config in configs {
+        if !token_slots.contains_key(&config.name) {
+            return Err(InterceptorError::Config(format!(
+                "authenticated interceptor '{}' is missing a bearer-token slot",
+                config.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -857,42 +887,31 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
     )))
 }
 
-async fn connect_endpoint(endpoint: &str) -> Result<Channel> {
-    let endpoint = endpoint.trim();
-    if let Some(path) = endpoint.strip_prefix("unix://") {
-        return connect_unix_endpoint(PathBuf::from(path)).await;
+async fn connect_endpoint(config: &GatewayInterceptorConfig) -> Result<tonic::transport::Channel> {
+    let endpoint = config.grpc_endpoint.trim();
+    let mut channel_config = ExtensionChannelConfig::new(endpoint);
+    if let Some(path) = &config.tls_ca_cert_path {
+        let pem = tokio::fs::read(path).await.map_err(|error| {
+            InterceptorError::Config(format!(
+                "failed to read TLS CA certificate for interceptor '{}' from {}: {error}",
+                config.name,
+                path.display()
+            ))
+        })?;
+        channel_config = channel_config.with_custom_ca_pem(pem);
     }
-    Endpoint::from_shared(endpoint.to_string())
-        .map_err(|e| {
-            InterceptorError::Config(format!("invalid interceptor endpoint '{endpoint}': {e}"))
-        })?
-        .connect()
-        .await
-        .map_err(|e| InterceptorError::Transport(format!("connect {endpoint}: {e}")))
-}
-
-#[cfg(unix)]
-async fn connect_unix_endpoint(path: PathBuf) -> Result<Channel> {
-    let display = path.display().to_string();
-    Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let path = path.clone();
-            async move { UnixStream::connect(path).await.map(TokioIo::new) }
-        }))
-        .await
-        .map_err(|e| InterceptorError::Transport(format!("connect unix://{display}: {e}")))
-}
-
-#[cfg(not(unix))]
-async fn connect_unix_endpoint(path: PathBuf) -> Result<Channel> {
-    Err(InterceptorError::Config(format!(
-        "unix interceptor endpoints are not supported on this platform: {}",
-        path.display()
-    )))
+    connect_channel(&channel_config).await.map_err(|error| {
+        InterceptorError::Transport(format!(
+            "connect interceptor '{}' at {endpoint}: {error}",
+            config.name
+        ))
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use openshell_core::config::{
         GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy,
         GatewayInterceptorConfig, GatewayInterceptorPhaseConfig,
@@ -961,6 +980,41 @@ mod tests {
             err.to_string(),
             "invalid interceptor config: duplicate interceptor instance name 'governance'"
         );
+    }
+
+    #[test]
+    fn authenticated_interceptors_require_a_token_slot_per_registration() {
+        let config = GatewayInterceptorConfig {
+            name: "governance".to_string(),
+            grpc_endpoint: "http://127.0.0.1:18081".to_string(),
+            ..GatewayInterceptorConfig::default()
+        };
+        let error =
+            validate_authenticated_slots(std::slice::from_ref(&config), Some(&BTreeMap::new()))
+                .expect_err("missing token slot must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "invalid interceptor config: authenticated interceptor 'governance' is missing a bearer-token slot"
+        );
+
+        let slots = BTreeMap::from([(config.name.clone(), BearerTokenSlot::empty())]);
+        validate_authenticated_slots(&[config], Some(&slots)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_ca_read_failure_names_interceptor_without_certificate_contents() {
+        let config = GatewayInterceptorConfig {
+            name: "governance".to_string(),
+            grpc_endpoint: "https://governance.example".to_string(),
+            tls_ca_cert_path: Some(PathBuf::from("/definitely/missing/openshell-ca.pem")),
+            ..GatewayInterceptorConfig::default()
+        };
+        let error = connect_endpoint(&config)
+            .await
+            .expect_err("missing CA must prevent connection");
+        let message = error.to_string();
+        assert!(message.contains("governance"));
+        assert!(message.contains("/definitely/missing/openshell-ca.pem"));
     }
 
     #[test]

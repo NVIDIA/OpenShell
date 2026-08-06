@@ -74,6 +74,13 @@ until deliberately added to this allowlist. Interception remains centralized:
 allowlisting a unary RPC does not require method-specific gateway
 instrumentation.
 
+Remote extension clients share `openshell-extension-core` transport and bearer
+primitives. When gateway JWT signing is configured, the gateway mints
+short-lived, exact-audience EdDSA credentials for middleware and interceptors,
+rotates their in-memory slots without rebuilding clients, and publishes the
+public verification key at `/.well-known/jwks.json`. HTTPS extensions can pin
+an operator-provided CA while retaining endpoint-hostname verification.
+
 Each configured interceptor selects a binding policy. `dynamic` accepts valid
 manifest declarations and preserves the compatibility behavior. `allowlist`
 enables only operator-configured RPCs and phases, while `exact` requires the

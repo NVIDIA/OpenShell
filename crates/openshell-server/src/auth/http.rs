@@ -59,7 +59,26 @@ pub fn router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/auth/connect", get(auth_connect))
         .route("/auth/oidc-config", get(oidc_config_handler))
+        .route("/.well-known/jwks.json", get(gateway_jwks_handler))
         .with_state(state)
+}
+
+/// Publish the gateway's JWT verification key for extension services.
+///
+/// Public keys are not secret. The HTTPS connection authenticates the
+/// gateway from which an integration bootstraps this document; integrations
+/// then cache keys by `kid` and refresh when an unfamiliar `kid` appears.
+async fn gateway_jwks_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    gateway_jwks_response(state.sandbox_jwt_authenticator.as_deref())
+}
+
+fn gateway_jwks_response(
+    authenticator: Option<&crate::auth::sandbox_jwt::SandboxJwtAuthenticator>,
+) -> axum::response::Response {
+    authenticator.map_or_else(
+        || StatusCode::NOT_FOUND.into_response(),
+        |authenticator| Json(authenticator.jwks()).into_response(),
+    )
 }
 
 /// OIDC configuration discovery endpoint.
@@ -474,6 +493,7 @@ fn render_waiting_page(callback_port: u16, code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_bootstrap::jwt::generate_jwt_key;
 
     #[test]
     fn extract_cookie_finds_value() {
@@ -585,5 +605,30 @@ mod tests {
         assert_eq!(html_escape("a&b"), "a&amp;b");
         assert_eq!(html_escape("a\"b"), "a&quot;b");
         assert_eq!(html_escape("a'b"), "a&#x27;b");
+    }
+
+    #[test]
+    fn jwks_response_publishes_configured_gateway_key() {
+        let material = generate_jwt_key().expect("key");
+        let authenticator = crate::auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(
+            material.public_key_pem.as_bytes(),
+            material.kid.clone(),
+            "gateway-a",
+        )
+        .expect("authenticator");
+
+        let response = gateway_jwks_response(Some(&authenticator));
+        assert_eq!(response.status(), StatusCode::OK);
+        let key = &authenticator.jwks().keys[0];
+        assert_eq!(key.kid, material.kid);
+        assert_eq!(key.kty, "OKP");
+        assert_eq!(key.crv, "Ed25519");
+        assert_eq!(key.alg, "EdDSA");
+        assert_eq!(key.key_use, "sig");
+    }
+
+    #[test]
+    fn jwks_response_is_not_found_without_gateway_key() {
+        assert_eq!(gateway_jwks_response(None).status(), StatusCode::NOT_FOUND);
     }
 }

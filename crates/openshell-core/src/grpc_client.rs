@@ -32,6 +32,7 @@ use crate::proto::{
 };
 use crate::sandbox_env;
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_extension_core::BearerTokenSlot;
 use tonic::Status;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::InterceptedService;
@@ -68,6 +69,10 @@ static TOKEN_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 
 /// One-shot guard so the renewal loop spawns at most once per process.
 static REFRESH_SPAWNED: OnceLock<()> = OnceLock::new();
+
+/// Process-wide extension credential slots keyed by operator registration
+/// name. Middleware clients retain clones so refresh never rebuilds channels.
+static EXTENSION_TOKEN_SLOTS: OnceLock<RwLock<HashMap<String, BearerTokenSlot>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 enum RefreshMode {
@@ -338,7 +343,9 @@ async fn refresh_token_loop(
         let sleep = compute_refresh_delay(&slot);
         tokio::time::sleep(sleep).await;
         match client
-            .refresh_sandbox_token(RefreshSandboxTokenRequest {})
+            .refresh_sandbox_token(RefreshSandboxTokenRequest {
+                extension_service_names: Vec::new(),
+            })
             .await
         {
             Ok(resp) => {
@@ -403,6 +410,154 @@ async fn refresh_token_loop(
     }
 }
 
+fn extension_token_slots() -> &'static RwLock<HashMap<String, BearerTokenSlot>> {
+    EXTENSION_TOKEN_SLOTS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn compute_extension_credential_refresh_delay(
+    expiries_ms: impl Iterator<Item = i64>,
+    fallback: Duration,
+    now_ms: i64,
+) -> Duration {
+    let Some(earliest_expiry_ms) = expiries_ms.min() else {
+        return fallback;
+    };
+    let remaining_ms = earliest_expiry_ms.saturating_sub(now_ms);
+    let refresh_ms = if remaining_ms <= 0 {
+        1_000
+    } else {
+        u64::try_from(remaining_ms)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(4)
+            .checked_div(5)
+            .unwrap_or(100)
+            .max(100)
+    };
+    fallback.min(Duration::from_millis(refresh_ms))
+}
+
+/// Bound a caller's normal wait by 80% of the earliest installed extension
+/// credential lifetime. Expired slots produce a short retry delay.
+pub fn extension_credential_refresh_delay(fallback: Duration) -> Duration {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        });
+    let slots = extension_token_slots()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    compute_extension_credential_refresh_delay(
+        slots.values().filter_map(BearerTokenSlot::expires_at_ms),
+        fallback,
+        now_ms,
+    )
+}
+
+async fn refresh_extension_credentials_with_client(
+    client: &mut OpenShellClient<AuthedChannel>,
+    services: &[crate::proto::SupervisorMiddlewareService],
+) -> Result<HashMap<String, BearerTokenSlot>> {
+    let names = services
+        .iter()
+        .map(|service| service.name.clone())
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let response = client
+        .refresh_sandbox_token(RefreshSandboxTokenRequest {
+            extension_service_names: names.clone(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to refresh extension service credentials")?
+        .into_inner();
+
+    // The same refresh response renews the gateway credential. Install it
+    // before returning so all process-wide gateway clients stay current.
+    install_token_slot(&response.token)?;
+
+    let expected = names
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let mut validated = HashMap::with_capacity(response.extension_credentials.len());
+    for credential in response.extension_credentials {
+        if !expected.contains(credential.service_name.as_str())
+            || validated.contains_key(&credential.service_name)
+        {
+            return Err(miette::miette!(
+                "gateway returned an unexpected or duplicate extension credential"
+            ));
+        }
+        let slot = BearerTokenSlot::new(&credential.token, credential.expires_at_ms)
+            .into_diagnostic()
+            .wrap_err("gateway returned an invalid extension credential")?;
+        validated.insert(
+            credential.service_name,
+            (credential.token, credential.expires_at_ms, slot),
+        );
+    }
+    if validated.len() != expected.len() {
+        return Err(miette::miette!(
+            "gateway omitted one or more requested extension credentials"
+        ));
+    }
+
+    let mut slots = extension_token_slots()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut selected = HashMap::with_capacity(validated.len());
+    for (name, (token, expires_at_ms, new_slot)) in validated {
+        let slot = if let Some(existing) = slots.get(&name) {
+            existing
+                .update(&token, expires_at_ms)
+                .into_diagnostic()
+                .wrap_err("failed to update extension credential")?;
+            existing.clone()
+        } else {
+            slots.insert(name.clone(), new_slot.clone());
+            new_slot
+        };
+        selected.insert(name, slot);
+    }
+    Ok(selected)
+}
+
+/// Clear credentials that are no longer part of the successfully installed
+/// middleware registry.
+///
+/// Call this only after the registry swap succeeds so a failed candidate
+/// cannot invalidate the last-known-good clients.
+pub fn retain_extension_credentials(services: &[crate::proto::SupervisorMiddlewareService]) {
+    let retained = services
+        .iter()
+        .map(|service| service.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut slots = extension_token_slots()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    slots.retain(|name, slot| {
+        let keep = retained.contains(name.as_str());
+        if !keep {
+            slot.clear();
+        }
+        keep
+    });
+}
+
+/// Acquire or rotate credentials for the delivered middleware registrations.
+/// Returned slots remain shared with subsequent refreshes in this process.
+pub async fn refresh_extension_credentials(
+    endpoint: &str,
+    services: &[crate::proto::SupervisorMiddlewareService],
+) -> Result<HashMap<String, BearerTokenSlot>> {
+    let mut client = connect(endpoint).await?;
+    refresh_extension_credentials_with_client(&mut client, services).await
+}
+
 /// Compute the next refresh delay: 80 % of the time remaining until the
 /// current token's `exp`, plus up to 10 % jitter, with a small lower bound
 /// for already-expired tokens and capped at 12 h. If the token can't be parsed
@@ -450,6 +605,55 @@ fn parse_jwt_exp_ms(jwt: &str) -> Option<i64> {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
+    use tonic::service::Interceptor;
+
+    #[test]
+    fn clearing_extension_slots_invalidates_detached_credentials() {
+        retain_extension_credentials(&[]);
+        let slot = BearerTokenSlot::new("detached-secret", i64::MAX).unwrap();
+        extension_token_slots()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("detached-service".to_string(), slot.clone());
+
+        retain_extension_credentials(&[]);
+
+        assert!(
+            extension_token_slots()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+        assert_eq!(
+            slot.interceptor()
+                .call(tonic::Request::new(()))
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    #[test]
+    fn extension_refresh_delay_tracks_earliest_expiry() {
+        let delay = compute_extension_credential_refresh_delay(
+            [20_000, 10_000].into_iter(),
+            Duration::from_secs(60),
+            0,
+        );
+        assert_eq!(delay, Duration::from_secs(8));
+        assert_eq!(
+            compute_extension_credential_refresh_delay(
+                std::iter::empty(),
+                Duration::from_secs(60),
+                0,
+            ),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            compute_extension_credential_refresh_delay([1].into_iter(), Duration::from_secs(60), 2,),
+            Duration::from_secs(1)
+        );
+    }
 
     #[test]
     fn parse_jwt_exp_reads_unsigned_payload() {
@@ -871,6 +1075,36 @@ impl CachedOpenShellClient {
         let result = settings_poll_result(response.into_inner());
         let _ = self.workspace.set(result.workspace.clone());
         Ok(result)
+    }
+
+    /// Acquire or rotate extension credentials over this cached gateway
+    /// connection and return the shared slots for the requested services.
+    pub async fn refresh_extension_credentials(
+        &self,
+        services: &[crate::proto::SupervisorMiddlewareService],
+    ) -> Result<HashMap<String, BearerTokenSlot>> {
+        let mut client = self.client.clone();
+        refresh_extension_credentials_with_client(&mut client, services).await
+    }
+
+    /// Rotate every credential currently retained by the installed registry.
+    /// This remains available when configuration polling fails independently.
+    pub async fn refresh_installed_extension_credentials(&self) -> Result<()> {
+        let services = extension_token_slots()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .map(|name| crate::proto::SupervisorMiddlewareService {
+                name: name.clone(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        if services.is_empty() {
+            return Ok(());
+        }
+        self.refresh_extension_credentials(&services)
+            .await
+            .map(drop)
     }
 
     /// Returns the workspace learned from the server, or empty if not yet polled.

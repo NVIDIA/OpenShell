@@ -101,6 +101,13 @@ generation and preserves the last-known-good generation if preparation fails.
 Policy-only updates reuse the connected registry, so an external middleware
 outage cannot block unrelated policy changes.
 
+For authenticated operator middleware, the supervisor requests credentials by
+registration name through `RefreshSandboxToken`. The gateway resolves names
+against the effective policy and mints exact-audience credentials. The
+supervisor keeps them in refreshable in-memory slots outside stable middleware
+configuration, so rotation neither changes `config_revision` nor reconnects
+the registry. Public custom-CA PEM travels with the stable registration.
+
 Middleware cannot observe injected credentials or mutate supervisor-owned
 credential, routing, or framing headers. Body transformations are re-evaluated
 against body-aware L7 policy before later stages or the upstream can observe

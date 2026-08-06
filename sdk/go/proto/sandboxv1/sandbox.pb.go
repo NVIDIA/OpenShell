@@ -1866,7 +1866,14 @@ type SupervisorMiddlewareService struct {
 	// Default RPC timeout for this service. Empty uses the platform default of
 	// 500ms. Values use an integer with an `ms` or `s` suffix and must be
 	// between 10ms and 30s.
-	Timeout       string `protobuf:"bytes,4,opt,name=timeout,proto3" json:"timeout,omitempty"`
+	Timeout string `protobuf:"bytes,4,opt,name=timeout,proto3" json:"timeout,omitempty"`
+	// PEM-encoded trust roots loaded by the gateway from the operator-configured
+	// tls_ca_cert_path. Empty uses the platform trust store.
+	TlsCaCertPem []byte `protobuf:"bytes,5,opt,name=tls_ca_cert_pem,json=tlsCaCertPem,proto3" json:"tls_ca_cert_pem,omitempty"`
+	// Exact JWT audience for this service. The gateway resolves an omitted
+	// operator value to a kind-scoped audience derived from the registration
+	// name before sending sandbox config.
+	Audience      string `protobuf:"bytes,6,opt,name=audience,proto3" json:"audience,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1925,6 +1932,20 @@ func (x *SupervisorMiddlewareService) GetMaxBodyBytes() uint64 {
 func (x *SupervisorMiddlewareService) GetTimeout() string {
 	if x != nil {
 		return x.Timeout
+	}
+	return ""
+}
+
+func (x *SupervisorMiddlewareService) GetTlsCaCertPem() []byte {
+	if x != nil {
+		return x.TlsCaCertPem
+	}
+	return nil
+}
+
+func (x *SupervisorMiddlewareService) GetAudience() string {
+	if x != nil {
+		return x.Audience
 	}
 	return ""
 }
@@ -2094,12 +2115,14 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x1epolicy_validation_failure_mode\x18\v \x01(\tR\x1bpolicyValidationFailureMode\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
-	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\x96\x01\n" +
+	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\xd9\x01\n" +
 	"\x1bSupervisorMiddlewareService\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12#\n" +
 	"\rgrpc_endpoint\x18\x02 \x01(\tR\fgrpcEndpoint\x12$\n" +
 	"\x0emax_body_bytes\x18\x03 \x01(\x04R\fmaxBodyBytes\x12\x18\n" +
-	"\atimeout\x18\x04 \x01(\tR\atimeout*b\n" +
+	"\atimeout\x18\x04 \x01(\tR\atimeout\x12%\n" +
+	"\x0ftls_ca_cert_pem\x18\x05 \x01(\fR\ftlsCaCertPem\x12\x1a\n" +
+	"\baudience\x18\x06 \x01(\tR\baudience*b\n" +
 	"\fSettingScope\x12\x1d\n" +
 	"\x19SETTING_SCOPE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15SETTING_SCOPE_SANDBOX\x10\x01\x12\x18\n" +

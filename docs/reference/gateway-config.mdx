@@ -130,7 +130,9 @@ provider_profile_sources = [
 # both the gateway and sandbox supervisors.
 [[openshell.supervisor.middleware]]
 name = "local-content-guard"
-grpc_endpoint = "http://host.openshell.internal:50051"
+grpc_endpoint = "https://host.openshell.internal:50051"
+tls_ca_cert_path = "/etc/openshell/certs/content-guard-ca.pem"
+audience = "urn:openshell:middleware:local-content-guard"
 max_body_bytes = 262144
 timeout = "500ms"
 
@@ -172,6 +174,7 @@ scopes_claim  = ""
 [[openshell.gateway.interceptors]]
 name               = "quota"
 grpc_endpoint      = "unix:///run/openshell/interceptors/quota.sock"
+audience           = "urn:openshell:interceptor:quota"
 order              = 10
 failure_policy     = "fail_closed"
 binding_policy     = "allowlist"
@@ -255,7 +258,9 @@ Register operator-run supervisor middleware services with one or more `[[openshe
 ```toml
 [[openshell.supervisor.middleware]]
 name = "local-content-guard"
-grpc_endpoint = "http://host.openshell.internal:50051"
+grpc_endpoint = "https://host.openshell.internal:50051"
+tls_ca_cert_path = "/etc/openshell/certs/content-guard-ca.pem"
+audience = "urn:openshell:middleware:local-content-guard"
 max_body_bytes = 262144
 timeout = "500ms"
 ```
@@ -268,13 +273,15 @@ The gateway connects to every registered service and validates `Describe` before
 
 `timeout` is the operator-configured service-wide RPC timeout. It accepts the same compact duration syntax as gateway interceptors: an integer followed by `ms` or `s`, such as `500ms` or `2s`. Values must be between `10ms` and `30s`, inclusive. Omit the field to use the 500 ms platform default. A binding may advertise a shorter `timeout` in the `Describe` manifest, but it cannot extend the operator-configured deadline; OpenShell uses the smaller value. OpenShell validates both levels before accepting the service. The effective timeout covers `ValidateConfig` and `EvaluateHttpRequest`; `Describe` uses the service timeout because binding metadata is not available yet.
 
-The service `grpc_endpoint` currently supports plaintext `http://` and TLS `https://` using the platform trust store. Custom trust roots, client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
+The service `grpc_endpoint` supports plaintext `http://` on legacy gateways without JWT signing and TLS `https://` for authenticated extensions. HTTPS uses the platform trust store unless `tls_ca_cert_path` names a certificate-only PEM bundle. OpenShell rejects bundles containing private keys, loads the certificates at gateway startup, and distributes only public certificates to sandbox supervisors; normal TLS hostname verification still applies. `audience` sets the exact audience for gateway-minted service tokens and defaults to `urn:openshell:extension:middleware:<name>`. When `gateway_jwt` is configured, OpenShell requires HTTPS and attaches short-lived bearer credentials to gateway and supervisor calls. mTLS client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
 
 See [Supervisor Middleware](/extensibility/supervisor-middleware) for selection, failure, body-limit, and operational guidance.
 
 ## Gateway Interceptors
 
 `[[openshell.gateway.interceptors]]` configures gateway-side interceptor services. The gateway calls each service's `Describe` RPC at startup, validates its declared OpenShell RPC bindings against the compiled service descriptor, and applies matching phases from a central gRPC middleware path. Interceptors can target only methods in the gateway's built-in allowlist of unary mutation RPCs. New RPCs are non-interceptable until they are deliberately added to that allowlist; adding one does not require handler-specific interceptor code. Request bodies are exposed as protobuf JSON objects. Fields marked secret in the protobuf schema are recursively omitted from requests and post-commit responses. Interceptors cannot patch an omitted field or a containing object.
+
+HTTPS interceptor endpoints use the platform trust store by default. Set `tls_ca_cert_path` to a PEM certificate bundle for a private CA; normal TLS hostname verification still applies. `audience` sets the exact audience for gateway-minted service tokens and defaults to `urn:openshell:extension:interceptor:<name>`. When `gateway_jwt` is configured, network interceptors must use HTTPS and receive short-lived gateway-caller bearer credentials; local Unix sockets are also supported.
 
 `binding_policy` controls how the manifest and operator binding configuration combine:
 

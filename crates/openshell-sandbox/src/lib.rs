@@ -2068,10 +2068,20 @@ async fn load_policy(
         let middleware_registry_status = if middleware_services.is_empty() {
             MiddlewareRegistryStatus::Synchronized
         } else if let Err(error) = grpc_retry("Middleware connect", || {
-            openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
-                openshell_supervisor_middleware_builtins::services(),
-                middleware_services.clone(),
-            )
+            let middleware_services = middleware_services.clone();
+            async move {
+                let credentials = openshell_core::grpc_client::refresh_extension_credentials(
+                    endpoint,
+                    &middleware_services,
+                )
+                .await?;
+                openshell_supervisor_middleware::MiddlewareRegistry::connect_services_authenticated(
+                    openshell_supervisor_middleware_builtins::services(),
+                    middleware_services,
+                    &credentials,
+                )
+                .await
+            }
         })
         .await
         .and_then(|registry| engine.replace_middleware_registry(registry))
@@ -2282,13 +2292,18 @@ async fn reload_gateway_policy_runtime(
     policy: Option<&openshell_core::proto::SandboxPolicy>,
     entrypoint_pid: u32,
     desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    middleware_credentials: &std::collections::HashMap<
+        String,
+        openshell_extension_core::BearerTokenSlot,
+    >,
     middleware_registry_changed: bool,
 ) -> std::result::Result<(), GatewayRuntimeReloadError> {
     match policy {
         Some(policy) if middleware_registry_changed => {
-            let registry = connect_middleware_registry(desired_services)
-                .await
-                .map_err(GatewayRuntimeReloadError::MiddlewareRegistry)?;
+            let registry =
+                connect_middleware_registry_authenticated(desired_services, middleware_credentials)
+                    .await
+                    .map_err(GatewayRuntimeReloadError::MiddlewareRegistry)?;
             engine
                 .reload_policy_and_middleware_from_proto_with_pid(policy, entrypoint_pid, registry)
                 .map_err(GatewayRuntimeReloadError::PolicyValidation)
@@ -2641,12 +2656,25 @@ struct PolicyPollLoopContext {
     workspace_tx: tokio::sync::watch::Sender<String>,
 }
 
+#[cfg(test)]
 async fn connect_middleware_registry(
     services: &[openshell_core::proto::SupervisorMiddlewareService],
 ) -> Result<openshell_supervisor_middleware::MiddlewareRegistry> {
     openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
         openshell_supervisor_middleware_builtins::services(),
         services.to_vec(),
+    )
+    .await
+}
+
+async fn connect_middleware_registry_authenticated(
+    services: &[openshell_core::proto::SupervisorMiddlewareService],
+    credentials: &std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>,
+) -> Result<openshell_supervisor_middleware::MiddlewareRegistry> {
+    openshell_supervisor_middleware::MiddlewareRegistry::connect_services_authenticated(
+        openshell_supervisor_middleware_builtins::services(),
+        services.to_vec(),
+        credentials,
     )
     .await
 }
@@ -2663,6 +2691,7 @@ async fn install_builtin_middleware_registry(opa_engine: &OpaEngine) -> Result<(
 async fn reconcile_middleware_registry(
     opa_engine: &OpaEngine,
     desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    credentials: &std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>,
     current_services: &mut Vec<openshell_core::proto::SupervisorMiddlewareService>,
     status: &mut MiddlewareRegistryStatus,
 ) {
@@ -2672,11 +2701,12 @@ async fn reconcile_middleware_registry(
         return;
     }
 
-    match connect_middleware_registry(desired_services)
+    match connect_middleware_registry_authenticated(desired_services, credentials)
         .await
         .and_then(|registry| opa_engine.replace_middleware_registry(registry))
     {
         Ok(()) => {
+            openshell_core::grpc_client::retain_extension_credentials(desired_services);
             current_services.clear();
             current_services.extend_from_slice(desired_services);
             *status = MiddlewareRegistryStatus::Synchronized;
@@ -2991,7 +3021,10 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         let result = if let Some(result) = pending_result.take() {
             result
         } else {
-            tokio::time::sleep(interval).await;
+            tokio::time::sleep(
+                openshell_core::grpc_client::extension_credential_refresh_delay(interval),
+            )
+            .await;
             match client.poll_settings(&ctx.sandbox_id).await {
                 Ok(result) => {
                     let _ = ctx.workspace_tx.send(client.workspace());
@@ -2999,8 +3032,30 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                 }
                 Err(e) => {
                     debug!(error = %e, "Settings poll: server unreachable, will retry");
+                    if let Err(refresh_error) =
+                        client.refresh_installed_extension_credentials().await
+                    {
+                        warn!(
+                            error = %refresh_error,
+                            "Settings poll: extension credential refresh failed while configuration was unavailable"
+                        );
+                    }
                     continue;
                 }
+            }
+        };
+
+        // Refresh per-service credentials on the existing gateway channel.
+        // Existing middleware clients retain the same slots, so successful
+        // rotation is independent of config revision and registry equality.
+        let middleware_credentials = match client
+            .refresh_extension_credentials(&result.supervisor_middleware_services)
+            .await
+        {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                warn!(error = %error, "Settings poll: extension credential refresh failed");
+                std::collections::HashMap::new()
             }
         };
 
@@ -3038,6 +3093,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             reconcile_middleware_registry(
                 &ctx.opa_engine,
                 &result.supervisor_middleware_services,
+                &middleware_credentials,
                 &mut current_middleware_services,
                 &mut middleware_registry_status,
             )
@@ -3147,6 +3203,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                 result.policy.as_ref(),
                 pid,
                 &result.supervisor_middleware_services,
+                &middleware_credentials,
                 middleware_registry_changed,
             )
             .await;
@@ -3243,6 +3300,9 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 
                     current_policy_hash.clone_from(&result.policy_hash);
                     current_middleware_services.clone_from(&result.supervisor_middleware_services);
+                    openshell_core::grpc_client::retain_extension_credentials(
+                        &result.supervisor_middleware_services,
+                    );
                     middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
                     last_failed_runtime_revision = None;
                 }
@@ -3884,6 +3944,7 @@ filesystem_policy:
             Some(&proto_policy_fixture()),
             0,
             &[unavailable_service],
+            &std::collections::HashMap::new(),
             true,
         )
         .await
