@@ -9,8 +9,10 @@ mod auth;
 mod identity;
 mod jwt;
 mod transport;
+mod verification;
 
 pub use auth::{BearerTokenInterceptor, BearerTokenSlot, TokenSlotError};
 pub use identity::{ExtensionAudience, ExtensionIdentity, ExtensionKind, IdentityError};
 pub use jwt::{ExtensionCallerKind, ExtensionJwtClaims, MAX_EXTENSION_TOKEN_TTL};
 pub use transport::{ExtensionChannelConfig, TransportError, connect_channel};
+pub use verification::{ExtensionJwtVerifier, JwtVerificationError};

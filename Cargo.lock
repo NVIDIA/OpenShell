@@ -3927,6 +3927,7 @@ version = "0.0.0"
 dependencies = [
  "http 1.4.0",
  "hyper-util",
+ "jsonwebtoken 9.3.1",
  "rcgen",
  "rustls 0.23.38",
  "serde",
