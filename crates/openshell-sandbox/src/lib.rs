@@ -63,6 +63,7 @@ use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPol
 use openshell_core::proposals::AgentProposals;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_network::opa::OpaEngine;
+use openshell_supervisor_network::proxy::ProxyHandle;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
@@ -664,7 +665,7 @@ pub async fn run_sandbox(
     let proxy_exited: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(rx) = networking
         .as_mut()
         .and_then(|n| n.proxy.as_mut())
-        .and_then(|p| p.take_exit_receiver())
+        .and_then(ProxyHandle::take_exit_receiver)
     {
         Box::pin(async {
             let _ = rx.await;
@@ -755,7 +756,7 @@ pub async fn run_sandbox(
                         "authoritative network-sidecar control channel closed"
                     ));
                 }
-                _ = &mut proxy_exited => {
+                () = &mut proxy_exited => {
                     ocsf_emit!(
                         AppLifecycleBuilder::new(ocsf_ctx())
                             .activity(ActivityId::Fail)
@@ -774,7 +775,7 @@ pub async fn run_sandbox(
         } else {
             tokio::select! {
                 result = process => result?,
-                _ = &mut proxy_exited => {
+                () = &mut proxy_exited => {
                     ocsf_emit!(
                         AppLifecycleBuilder::new(ocsf_ctx())
                             .activity(ActivityId::Fail)
@@ -805,7 +806,7 @@ pub async fn run_sandbox(
                     warn!(?result, "Authoritative sidecar control channel exited; restarting sidecar");
                     1
                 }
-                _ = &mut proxy_exited => {
+                () = &mut proxy_exited => {
                     ocsf_emit!(
                         AppLifecycleBuilder::new(ocsf_ctx())
                             .activity(ActivityId::Fail)
@@ -824,7 +825,7 @@ pub async fn run_sandbox(
         } else {
             tokio::select! {
                 () = wait_for_shutdown_signal() => 0,
-                _ = &mut proxy_exited => {
+                () = &mut proxy_exited => {
                     ocsf_emit!(
                         AppLifecycleBuilder::new(ocsf_ctx())
                             .activity(ActivityId::Fail)
@@ -845,7 +846,7 @@ pub async fn run_sandbox(
         {
             tokio::select! {
                 () = wait_for_shutdown_signal() => 0,
-                _ = &mut proxy_exited => {
+                () = &mut proxy_exited => {
                     ocsf_emit!(
                         AppLifecycleBuilder::new(ocsf_ctx())
                             .activity(ActivityId::Fail)
