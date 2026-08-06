@@ -1,50 +1,52 @@
 name: Bug Report
-description: Report a bug. Your agent should investigate first — see CONTRIBUTING.md.
+description: Tell us about a workflow that does not work as you need it to.
 type: Bug
 body:
   - type: markdown
     attributes:
       value: |
-        ## Agent-First Troubleshooting
+        ## Tell us what you need
 
-        OpenShell is an agent-first project. Before filing this bug, point your coding agent at the repo and have it investigate using the available skills (`debug-openshell-cluster`, `debug-inference`, `openshell-cli`, etc.). See [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md) for the full skills table.
+        Describe the problem as a user story: what persona is affected, what workflow that persona needs, and why it matters. Describe the desired workflow at the user level, but do not diagnose the cause or design OpenShell's internal implementation. You do not need to include output from an agent. Maintainers and implementers will investigate at the appropriate stage.
 
-        Please also check the latest OpenShell release and search existing issues for possible duplicates before filing. If you cannot upgrade, retest, or search existing issues, explain why in the diagnostic.
+        Search existing issues before filing. Do not report security vulnerabilities here; follow [SECURITY.md](https://github.com/NVIDIA/OpenShell/blob/main/SECURITY.md) instead.
 
-  - type: textarea
-    id: agent-diagnostic
+  - type: input
+    id: persona
     attributes:
-      label: Agent Diagnostic
-      description: |
-        Paste the output from your agent's investigation of this bug. What skills did it load? What did it find? What did it try? Which OpenShell version did it test, and did it check the latest release, known fixes, and possible duplicates?
-      placeholder: |
-        Example:
-        - Loaded `debug-inference` skill
-        - Tested OpenShell v0.x.x
-        - Checked latest release / known fixes: no matching fix found
-        - Searched existing issues for duplicates: no matching issue found
-        - Ran `openshell inference get` and `openshell provider get ollama`
-        - Found `OPENAI_BASE_URL=http://127.0.0.1:11434/v1`, which is unreachable from the gateway
-        - Updated the provider to use `host.openshell.internal`, but the issue persists because the gateway is remote
+      label: What persona does this impact?
+      description: Describe the affected role in the workflow, such as an operator, sandbox creator, or agent.
+      placeholder: A gateway operator running OpenShell on Kubernetes
     validations:
       required: true
 
   - type: textarea
-    id: description
+    id: goal
     attributes:
-      label: Description
-      description: What happened? What did you expect to happen?
+      label: What does this persona need to be able to do?
+      description: Describe the user-facing workflow, capability, or outcome this persona needs, without prescribing OpenShell's internal implementation.
+      placeholder: I want running sandboxes to resume after Kubernetes reschedules them during an upgrade.
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Why does this matter to the persona?
+      description: Describe what happens today and how it affects the persona's work.
+      placeholder: Currently, when a node is rolled, its sandboxes are reset and in-progress agent work is lost.
     validations:
       required: true
 
   - type: textarea
     id: reproduction
     attributes:
-      label: Reproduction Steps
-      description: Minimal steps to reproduce the issue.
+      label: What workflow exposes the problem?
+      description: Show the shortest sequence of actions or commands that demonstrates the blocked workflow.
       placeholder: |
-        1. Run `openshell sandbox create -- claude`
-        2. ...
+        1. Start a long-running task in a sandbox.
+        2. Drain the Kubernetes node running the sandbox.
+        3. Observe the replacement sandbox after it is scheduled.
     validations:
       required: true
 
@@ -52,39 +54,21 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: OS, Docker version, OpenShell version tested, whether the latest release and existing issues were checked, and any other relevant details.
+      description: Include the OpenShell version and the platform, deployment mode, runtime, or integration relevant to this workflow.
       placeholder: |
-        - OS: macOS 15.2 / Ubuntu 24.04 / Windows 11 + WSL2
-        - Docker: Docker Desktop 4.x / Docker Engine 27.x
-        - OpenShell: v0.x.x (output of `openshell --version`)
-        - Latest release checked: yes / no, because ...
-        - Possible duplicates checked: yes / no, because ...
+        - OpenShell: v0.x.x
+        - Platform: Kubernetes v1.x
+        - Deployment: Helm with the Kubernetes compute driver
     validations:
       required: true
 
   - type: textarea
     id: logs
     attributes:
-      label: Logs
+      label: Relevant logs
       description: |
-        Relevant log output, error messages, or stack traces.
-        Redact credentials, API keys, and tokens before pasting — verbose error output from some frameworks includes the full request config.
+        Optional. Include only the smallest excerpt that shows the problem.
+        Remove credentials, API keys, tokens, and query parameters before pasting.
       render: shell
     validations:
       required: false
-
-  - type: checkboxes
-    id: checklist
-    attributes:
-      label: Agent-First Checklist
-      options:
-        - label: I pointed my agent at the repo and had it investigate this issue
-          required: true
-        - label: I loaded relevant skills (e.g., `debug-openshell-cluster`, `debug-inference`, `openshell-cli`)
-          required: true
-        - label: I checked the latest OpenShell release and either reproduced the issue there or explained why I cannot upgrade/test it
-          required: true
-        - label: I searched existing issues for possible duplicates or explained why I could not
-          required: true
-        - label: My agent could not resolve this — the diagnostic above explains why
-          required: true
