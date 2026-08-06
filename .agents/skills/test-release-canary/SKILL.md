@@ -33,7 +33,11 @@ on:
 - **Automatic.** Every successful `Release Dev` run (on `main` or a manual dispatch of Release Dev) fires the canary. Each job gates on `github.event.workflow_run.conclusion == 'success'` so a failed Release Dev does not run the canary.
 - **Manual.** `workflow_dispatch` lets you run the canary on demand against any branch's workflow definition.
 
-When dispatched manually, `github.event.workflow_run.head_sha` is empty and the workflow falls back to `github.sha` (the branch tip) for the `install.sh` URL.
+Stable installs use `STABLE_INSTALL_SH_URL`, which always points at
+`main/install.sh`. Dev installs use `DEV_INSTALL_SH_URL`: automatic runs point
+at the moving `dev` tag so the installer matches the published development
+release, while manual dispatches use the dispatched ref name so branch changes
+to the canary or dev installer can still be exercised.
 
 ## Manual dispatch
 
@@ -59,9 +63,12 @@ gh run view <run-id> --log-failed
 
 ## Iterating on the canary itself
 
-When you change `release-canary.yml` on a branch, a manual dispatch on that branch tests *your branch's workflow logic* against *main's published artifacts* (`0.0.0-dev` chart, `:dev` images, latest tagged install.sh assets). This is what you want for iterating on the canary — you're validating that the canary still works against known-good artifacts.
+When you change `release-canary.yml` on a branch, a manual dispatch on that branch tests *your branch's workflow logic* against *main's published stable artifacts* and the current published dev artifacts (`0.0.0-dev` chart, `:dev` images). This is what you want for iterating on the canary — you're validating that the canary still works against known-good artifacts.
 
-Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${head_sha}/install.sh`, so changes to `install.sh` on your branch *are* exercised even though the binaries it downloads are from the latest public tag.
+Note stable package installs always pull `install.sh` from `main`, while dev
+package installs pull `install.sh` from the dispatched branch ref for manual
+runs. Changes to dev installer behavior on your branch are exercised without
+using that new installer to install an older stable release.
 
 ## Testing artifacts from a specific SHA
 
