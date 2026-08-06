@@ -328,11 +328,11 @@ xcode-select --install
 
 ### Z3 installation
 
-The `openshell-prover` crate links against the system Z3 library via pkg-config.
+The `openshell-prover` crate links against the system Z3 library via `pkg-config`.
 
 ```bash
 # macOS
-brew install z3
+brew install z3 pkg-config
 
 # Ubuntu / Debian
 sudo apt install libz3-dev
