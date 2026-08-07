@@ -32,10 +32,10 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesRequest, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest,
     GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
-    ResourceRequirements as DriverSandboxResourceRequirements, ValidateSandboxCreateRequest,
-    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
-    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
-    watch_sandboxes_event,
+    ResourceRequirements as DriverSandboxResourceRequirements, ResumeSandboxRequest,
+    StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
+    gateway_listener_requirement::Selector, watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -168,20 +168,20 @@ impl GatewayListenerRequirement {
     }
 }
 
-/// Serializes request-side deletes for the same stable sandbox ID.
+/// Serializes request-side lifecycle mutations for the same stable sandbox ID.
 ///
 /// Watch events deliberately do not use these gates, so a slow driver delete
 /// cannot block the sequential watch loop. Weak values let entries disappear
 /// after the last request using a sandbox's gate completes.
 #[derive(Debug, Default)]
-struct DeleteGateRegistry {
+struct LifecycleGateRegistry {
     gates: StdMutex<HashMap<String, Weak<Mutex<()>>>>,
 }
 
-impl DeleteGateRegistry {
-    async fn lock_for(&self, sandbox_id: &str) -> SandboxDeleteGuard {
+impl LifecycleGateRegistry {
+    async fn lock_for(&self, sandbox_id: &str) -> SandboxLifecycleGuard {
         let gate = self.gate_for(sandbox_id);
-        SandboxDeleteGuard {
+        SandboxLifecycleGuard {
             _guard: gate.lock_owned().await,
         }
     }
@@ -190,7 +190,7 @@ impl DeleteGateRegistry {
         let mut gates = self
             .gates
             .lock()
-            .expect("sandbox delete gate registry lock poisoned");
+            .expect("sandbox lifecycle gate registry lock poisoned");
         gates.retain(|_, gate| gate.strong_count() > 0);
 
         if let Some(gate) = gates.get(sandbox_id).and_then(Weak::upgrade) {
@@ -206,18 +206,18 @@ impl DeleteGateRegistry {
     fn entry_count(&self) -> usize {
         self.gates
             .lock()
-            .expect("sandbox delete gate registry lock poisoned")
+            .expect("sandbox lifecycle gate registry lock poisoned")
             .len()
     }
 }
 
-/// Proof that the current delete operation holds its sandbox-ID gate.
+/// Proof that the current operation holds its sandbox-ID lifecycle gate.
 ///
-/// Delete code must acquire this guard before taking `ComputeRuntime::sync_lock`.
-/// Passing it to `lock_global_for_delete` makes that ordering visible at every
-/// global-lock acquisition in the delete path.
+/// Lifecycle code must acquire this guard before taking `ComputeRuntime::sync_lock`.
+/// Passing it to `lock_global_for_lifecycle` makes that ordering visible at
+/// every global-lock acquisition in a lifecycle path.
 #[derive(Debug)]
-struct SandboxDeleteGuard {
+struct SandboxLifecycleGuard {
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -517,11 +517,20 @@ impl ComputeDriver for RemoteComputeDriver {
 
     async fn stop_sandbox(
         &self,
-        request: Request<openshell_core::proto::compute::v1::StopSandboxRequest>,
+        request: Request<StopSandboxRequest>,
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::StopSandboxResponse>, Status>
     {
         let mut client = self.client();
         client.stop_sandbox(request).await
+    }
+
+    async fn resume_sandbox(
+        &self,
+        request: Request<ResumeSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::ResumeSandboxResponse>, Status>
+    {
+        let mut client = self.client();
+        client.resume_sandbox(request).await
     }
 
     async fn delete_sandbox(
@@ -558,7 +567,7 @@ pub struct ComputeRuntime {
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
     sync_lock: Arc<Mutex<()>>,
-    delete_gates: Arc<DeleteGateRegistry>,
+    lifecycle_gates: Arc<LifecycleGateRegistry>,
     gateway_listener_requirements: Vec<GatewayListenerRequirement>,
     replica_id: String,
 }
@@ -679,7 +688,7 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
             sync_lock: Arc::new(Mutex::new(())),
-            delete_gates: Arc::new(DeleteGateRegistry::default()),
+            lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements,
             replica_id: lease::replica_id(),
         })
@@ -696,18 +705,18 @@ impl ComputeRuntime {
     }
 
     /// Acquires the process-wide lock for code that already holds the
-    /// sandbox-ID delete gate. The guard parameter documents and enforces that
-    /// delete-path callers acquire locks in delete-gate -> global-lock order.
-    async fn lock_global_for_delete(
+    /// sandbox-ID lifecycle gate. The guard parameter documents and enforces
+    /// that callers acquire locks in lifecycle-gate -> global-lock order.
+    async fn lock_global_for_lifecycle(
         &self,
-        _delete_guard: &SandboxDeleteGuard,
+        _lifecycle_guard: &SandboxLifecycleGuard,
     ) -> tokio::sync::OwnedMutexGuard<()> {
         self.sync_lock.clone().lock_owned().await
     }
 
     #[cfg(test)]
-    pub(crate) fn delete_gate_entry_count(&self) -> usize {
-        self.delete_gates.entry_count()
+    pub(crate) fn lifecycle_gate_entry_count(&self) -> usize {
+        self.lifecycle_gates.entry_count()
     }
 
     pub async fn new_docker(
@@ -963,6 +972,431 @@ impl ComputeRuntime {
         }
     }
 
+    pub(crate) async fn suspend_sandbox(
+        &self,
+        workspace: &str,
+        name: &str,
+    ) -> Result<Sandbox, Status> {
+        let candidate = self
+            .store
+            .get_message_by_name::<Sandbox>(workspace, name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let sandbox_id = candidate.object_id().to_string();
+        let sandbox_name = candidate.object_name().to_string();
+        let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
+        let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+        let current = self
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        if current.object_name() != sandbox_name {
+            return Err(Status::aborted(
+                "sandbox name changed while the suspend request was waiting; retry explicitly",
+            ));
+        }
+
+        let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
+        if phase == SandboxPhase::Suspended {
+            self.cleanup_suspended_sandbox_sessions(&current)
+                .await
+                .map_err(Status::internal)?;
+            return Ok(current);
+        }
+        if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Suspending) {
+            return Err(Status::failed_precondition(format!(
+                "sandbox must be Ready to suspend (current phase: {phase:?})"
+            )));
+        }
+
+        let (previous, suspending) = if phase == SandboxPhase::Suspending {
+            // Acquiring the lifecycle gate proves that no local worker still
+            // owns this transition. Retry the idempotent driver operation.
+            (current.clone(), current)
+        } else {
+            let previous = current.clone();
+            let suspending = self
+                .write_lifecycle_phase(
+                    &current,
+                    SandboxPhase::Suspending,
+                    "Suspending",
+                    "Sandbox suspension requested",
+                )
+                .await?;
+            self.sandbox_index.update_from_sandbox(&suspending);
+            self.sandbox_watch_bus.notify(&sandbox_id);
+            (previous, suspending)
+        };
+        drop(global_guard);
+
+        // Once the durable transition is committed, request cancellation must
+        // not cancel the driver operation and strand the sandbox in
+        // `Suspending`. Keep the lifecycle gate in an owned worker, matching
+        // the delete path's cancellation semantics.
+        let runtime = self.clone();
+        let request_span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                runtime
+                    .complete_sandbox_suspend(
+                        sandbox_id,
+                        sandbox_name,
+                        previous,
+                        suspending,
+                        lifecycle_guard,
+                    )
+                    .await
+            }
+            .instrument(request_span),
+        )
+        .await
+        .map_err(|err| {
+            Status::internal(format!(
+                "sandbox suspend worker terminated unexpectedly: {err}"
+            ))
+        })?
+    }
+
+    async fn complete_sandbox_suspend(
+        &self,
+        sandbox_id: String,
+        sandbox_name: String,
+        previous: Sandbox,
+        suspending: Sandbox,
+        lifecycle_guard: SandboxLifecycleGuard,
+    ) -> Result<Sandbox, Status> {
+        let result = self
+            .driver
+            .call("driver.stop_sandbox", Some(&sandbox_id), |driver| {
+                let sandbox_id = sandbox_id.clone();
+                let sandbox_name = sandbox_name.clone();
+                async move {
+                    driver
+                        .stop_sandbox(Request::new(StopSandboxRequest {
+                            sandbox_id,
+                            sandbox_name,
+                        }))
+                        .await
+                }
+            })
+            .await;
+
+        match result {
+            Ok(_) => {
+                let _global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+                let latest = self
+                    .store
+                    .get_message::<Sandbox>(&sandbox_id)
+                    .await
+                    .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                    .ok_or_else(|| Status::not_found("sandbox not found"))?;
+                let phase = SandboxPhase::try_from(latest.phase()).unwrap_or(SandboxPhase::Unknown);
+                let suspended = if phase == SandboxPhase::Suspended {
+                    latest
+                } else if phase == SandboxPhase::Suspending {
+                    self.write_lifecycle_phase(
+                        &latest,
+                        SandboxPhase::Suspended,
+                        "Suspended",
+                        "Sandbox compute is stopped",
+                    )
+                    .await?
+                } else {
+                    return Err(Status::aborted(
+                        "sandbox lifecycle changed while suspension completed",
+                    ));
+                };
+                self.cleanup_suspended_sandbox_sessions(&suspended)
+                    .await
+                    .map_err(Status::internal)?;
+                self.sandbox_index.update_from_sandbox(&suspended);
+                self.sandbox_watch_bus.notify(&sandbox_id);
+                Ok(suspended)
+            }
+            Err(err) => {
+                self.recover_failed_lifecycle(&lifecycle_guard, &suspending, &previous, true)
+                    .await;
+                Err(Status::new(
+                    err.code(),
+                    format!("suspend sandbox failed: {}", err.message()),
+                ))
+            }
+        }
+    }
+
+    pub(crate) async fn resume_sandbox(
+        &self,
+        workspace: &str,
+        name: &str,
+    ) -> Result<Sandbox, Status> {
+        let candidate = self
+            .store
+            .get_message_by_name::<Sandbox>(workspace, name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let sandbox_id = candidate.object_id().to_string();
+        let sandbox_name = candidate.object_name().to_string();
+        let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
+        let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+        let current = self
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        if current.object_name() != sandbox_name {
+            return Err(Status::aborted(
+                "sandbox name changed while the resume request was waiting; retry explicitly",
+            ));
+        }
+
+        let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
+        if phase == SandboxPhase::Ready {
+            return Ok(current);
+        }
+        if !matches!(phase, SandboxPhase::Suspended | SandboxPhase::Resuming) {
+            return Err(Status::failed_precondition(format!(
+                "sandbox must be Suspended to resume (current phase: {phase:?})"
+            )));
+        }
+
+        let (previous, resuming) = if phase == SandboxPhase::Resuming {
+            // Acquiring the lifecycle gate proves that no local worker still
+            // owns this transition. Retry the idempotent driver operation.
+            (current.clone(), current)
+        } else {
+            let previous = current.clone();
+            let resuming = self
+                .write_lifecycle_phase(
+                    &current,
+                    SandboxPhase::Resuming,
+                    "Resuming",
+                    "Sandbox resume requested",
+                )
+                .await?;
+            self.sandbox_index.update_from_sandbox(&resuming);
+            self.sandbox_watch_bus.notify(&sandbox_id);
+            (previous, resuming)
+        };
+        drop(global_guard);
+
+        // The durable `Resuming` transition commits the operation. Let an
+        // owned worker finish it even if the initiating RPC is canceled.
+        let runtime = self.clone();
+        let request_span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                runtime
+                    .complete_sandbox_resume(
+                        sandbox_id,
+                        sandbox_name,
+                        previous,
+                        resuming,
+                        lifecycle_guard,
+                    )
+                    .await
+            }
+            .instrument(request_span),
+        )
+        .await
+        .map_err(|err| {
+            Status::internal(format!(
+                "sandbox resume worker terminated unexpectedly: {err}"
+            ))
+        })?
+    }
+
+    async fn complete_sandbox_resume(
+        &self,
+        sandbox_id: String,
+        sandbox_name: String,
+        previous: Sandbox,
+        resuming: Sandbox,
+        lifecycle_guard: SandboxLifecycleGuard,
+    ) -> Result<Sandbox, Status> {
+        let result = self
+            .driver
+            .call("driver.resume_sandbox", Some(&sandbox_id), |driver| {
+                let sandbox_id = sandbox_id.clone();
+                let sandbox_name = sandbox_name.clone();
+                async move {
+                    driver
+                        .resume_sandbox(Request::new(ResumeSandboxRequest {
+                            sandbox_id,
+                            sandbox_name,
+                        }))
+                        .await
+                }
+            })
+            .await;
+
+        match result {
+            Ok(_) => {
+                let _global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+                let latest = self
+                    .store
+                    .get_message::<Sandbox>(&sandbox_id)
+                    .await
+                    .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                    .ok_or_else(|| Status::not_found("sandbox not found"))?;
+                Ok(latest)
+            }
+            Err(err) => {
+                self.recover_failed_lifecycle(&lifecycle_guard, &resuming, &previous, false)
+                    .await;
+                Err(Status::new(
+                    err.code(),
+                    format!("resume sandbox failed: {}", err.message()),
+                ))
+            }
+        }
+    }
+
+    /// Reconcile an ambiguous lifecycle error against the driver's observed
+    /// state before deciding whether the pre-operation snapshot is still true.
+    ///
+    /// A transport error can arrive after the runtime applied stop or start.
+    /// The driver lookup deliberately runs without the process-wide lock; the
+    /// exact transition resource version then fences the recovery write.
+    async fn recover_failed_lifecycle(
+        &self,
+        lifecycle_guard: &SandboxLifecycleGuard,
+        transition: &Sandbox,
+        previous: &Sandbox,
+        expected_stopped: bool,
+    ) {
+        let sandbox_id = transition.object_id();
+        let sandbox_name = transition.object_name();
+        let observed = self.get_driver_sandbox(sandbox_id, sandbox_name).await;
+        let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
+
+        match observed {
+            Ok(Some(snapshot)) if snapshot.id == sandbox_id && snapshot.status.is_some() => {
+                let backend_phase = derive_phase(snapshot.status.as_ref());
+                let observed_stopped = backend_phase == SandboxPhase::Suspended
+                    || driver_snapshot_confirms_stopped(&snapshot);
+                if backend_phase == SandboxPhase::Error || observed_stopped == expected_stopped {
+                    if let Some(reconciled) = self
+                        .reconcile_lifecycle_snapshot(transition, &snapshot)
+                        .await
+                        && reconciled.phase() == SandboxPhase::Suspended as i32
+                        && let Err(err) = self.cleanup_suspended_sandbox_sessions(&reconciled).await
+                    {
+                        warn!(
+                            sandbox_id,
+                            error = %err,
+                            "Failed to clean up sessions after reconciling suspended sandbox"
+                        );
+                    }
+                } else {
+                    self.restore_lifecycle_snapshot(transition, previous).await;
+                }
+            }
+            Ok(Some(_) | None) | Err(_) => {
+                // Without authoritative backend state, retain the durable
+                // transition rather than claiming the old running/stopped
+                // state. Startup recovery can safely retry the idempotent
+                // driver operation.
+                warn!(
+                    sandbox_id,
+                    "Could not resolve ambiguous sandbox lifecycle outcome; retaining transition"
+                );
+            }
+        }
+    }
+
+    async fn reconcile_lifecycle_snapshot(
+        &self,
+        transition: &Sandbox,
+        snapshot: &DriverSandbox,
+    ) -> Option<Sandbox> {
+        let sandbox_id = transition.object_id().to_string();
+        let expected_resource_version = sandbox_resource_version(transition);
+        let session_connected = self.supervisor_sessions.has_session(&sandbox_id);
+        match self
+            .store
+            .update_message_cas::<Sandbox, _>(&sandbox_id, expected_resource_version, |sandbox| {
+                apply_driver_snapshot(sandbox, snapshot, session_connected);
+            })
+            .await
+        {
+            Ok(reconciled) => {
+                self.sandbox_index.update_from_sandbox(&reconciled);
+                self.sandbox_watch_bus.notify(&sandbox_id);
+                Some(reconciled)
+            }
+            Err(err) => {
+                debug!(
+                    sandbox_id,
+                    error = %err,
+                    "Skipped lifecycle reconciliation after concurrent change"
+                );
+                None
+            }
+        }
+    }
+
+    async fn write_lifecycle_phase(
+        &self,
+        sandbox: &Sandbox,
+        phase: SandboxPhase,
+        reason: &str,
+        message: &str,
+    ) -> Result<Sandbox, Status> {
+        let sandbox_id = sandbox.object_id().to_string();
+        let expected_resource_version = sandbox_resource_version(sandbox);
+        let reason = reason.to_string();
+        let message = message.to_string();
+        self.store
+            .update_message_cas::<Sandbox, _>(
+                &sandbox_id,
+                expected_resource_version,
+                move |sandbox| {
+                    sandbox.set_phase(phase as i32);
+                    let name = sandbox.object_name().to_string();
+                    upsert_ready_condition(
+                        &mut sandbox.status,
+                        &name,
+                        SandboxCondition {
+                            r#type: "Ready".to_string(),
+                            status: "False".to_string(),
+                            reason: reason.clone(),
+                            message: message.clone(),
+                            last_transition_time: String::new(),
+                        },
+                    );
+                },
+            )
+            .await
+            .map_err(|e| crate::grpc::persistence_error_to_status(e, "update sandbox lifecycle"))
+    }
+
+    async fn restore_lifecycle_snapshot(&self, owned: &Sandbox, previous: &Sandbox) {
+        let sandbox_id = owned.object_id().to_string();
+        let previous = previous.clone();
+        match self
+            .store
+            .update_message_cas::<Sandbox, _>(
+                &sandbox_id,
+                sandbox_resource_version(owned),
+                move |sandbox| *sandbox = previous.clone(),
+            )
+            .await
+        {
+            Ok(restored) => {
+                self.sandbox_index.update_from_sandbox(&restored);
+                self.sandbox_watch_bus.notify(&sandbox_id);
+            }
+            Err(err) => {
+                debug!(sandbox_id, error = %err, "Skipped lifecycle rollback after concurrent change");
+            }
+        }
+    }
+
     pub(crate) async fn delete_sandbox(
         &self,
         workspace: &str,
@@ -981,8 +1415,8 @@ impl ComputeRuntime {
             sandbox_id: candidate.object_id().to_string(),
             sandbox_name: candidate.object_name().to_string(),
         };
-        let delete_guard = self.delete_gates.lock_for(&target.sandbox_id).await;
-        let global_guard = self.lock_global_for_delete(&delete_guard).await;
+        let delete_guard = self.lifecycle_gates.lock_for(&target.sandbox_id).await;
+        let global_guard = self.lock_global_for_lifecycle(&delete_guard).await;
 
         // There is no await between acquiring the initial guards and spawning
         // the worker. From this commitment point onward, request cancellation
@@ -1010,7 +1444,7 @@ impl ComputeRuntime {
     async fn delete_sandbox_inner(
         &self,
         target: SandboxDeleteTarget,
-        delete_guard: SandboxDeleteGuard,
+        delete_guard: SandboxLifecycleGuard,
         guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<DeleteSandboxResult, Status> {
         let current = self
@@ -1176,10 +1610,10 @@ impl ComputeRuntime {
     /// row leaves `Deleting`; that state belongs to a concurrent writer.
     async fn remove_deleting_sandbox_record(
         &self,
-        delete_guard: &SandboxDeleteGuard,
+        delete_guard: &SandboxLifecycleGuard,
         sandbox_id: &str,
     ) -> bool {
-        let _guard = self.lock_global_for_delete(delete_guard).await;
+        let _guard = self.lock_global_for_lifecycle(delete_guard).await;
         for attempt in 1..=DELETE_PHASE_CAS_RETRY_LIMIT {
             let record = match self.store.get(Sandbox::object_type(), sandbox_id).await {
                 Ok(Some(record)) => record,
@@ -1310,7 +1744,7 @@ impl ComputeRuntime {
     /// backend, or restore the pre-delete snapshot when lookup is inconclusive.
     async fn recover_failed_delete(
         &self,
-        delete_guard: &SandboxDeleteGuard,
+        delete_guard: &SandboxLifecycleGuard,
         transition: &DeleteTransition,
     ) {
         let sandbox_id = transition.deleting.object_id();
@@ -1319,7 +1753,7 @@ impl ComputeRuntime {
 
         // The driver lookup is deliberately outside the process-wide guard.
         let observed = self.get_driver_sandbox(sandbox_id, sandbox_name).await;
-        let _guard = self.lock_global_for_delete(delete_guard).await;
+        let _guard = self.lock_global_for_lifecycle(delete_guard).await;
 
         match observed {
             Ok(Some(snapshot)) if snapshot.id == sandbox_id && snapshot.status.is_some() => {
@@ -1581,6 +2015,7 @@ impl ComputeRuntime {
     /// Should be called once at gateway startup, before watchers spawn,
     /// so the watch loop sees the post-resume state on its first poll.
     pub async fn resume_persisted_sandboxes(&self) -> Result<(), String> {
+        self.recover_persisted_lifecycle_transitions().await?;
         let Some(resume) = &self.startup_resume else {
             return Ok(());
         };
@@ -1666,6 +2101,103 @@ impl ComputeRuntime {
                 failed,
                 "Sandbox resume sweep complete"
             );
+        }
+        Ok(())
+    }
+
+    async fn recover_persisted_lifecycle_transitions(&self) -> Result<(), String> {
+        let records = self
+            .store
+            .list_by_type(Sandbox::object_type(), 1000, 0)
+            .await
+            .map_err(|e| e.to_string())?;
+        for record in records {
+            let sandbox = match Sandbox::decode(record.payload.as_slice()) {
+                Ok(sandbox) => sandbox,
+                Err(err) => {
+                    warn!(error = %err, "Failed to decode sandbox during lifecycle recovery");
+                    continue;
+                }
+            };
+            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+            match phase {
+                SandboxPhase::Suspended => {
+                    if let Err(err) = self.cleanup_suspended_sandbox_sessions(&sandbox).await {
+                        warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to complete recovered sandbox session cleanup");
+                    }
+                }
+                SandboxPhase::Suspending => {
+                    let sandbox_id = sandbox.object_id().to_string();
+                    let sandbox_name = sandbox.object_name().to_string();
+                    let driver_sandbox_id = sandbox_id.clone();
+                    match self
+                        .driver
+                        .call(
+                            "driver.stop_sandbox",
+                            Some(&sandbox_id),
+                            |driver| async move {
+                                driver
+                                    .stop_sandbox(Request::new(StopSandboxRequest {
+                                        sandbox_id: driver_sandbox_id,
+                                        sandbox_name,
+                                    }))
+                                    .await
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) => match self
+                            .write_lifecycle_phase(
+                                &sandbox,
+                                SandboxPhase::Suspended,
+                                "Suspended",
+                                "Sandbox compute is stopped",
+                            )
+                            .await
+                        {
+                            Ok(updated) => {
+                                self.sandbox_index.update_from_sandbox(&updated);
+                                self.sandbox_watch_bus.notify(updated.object_id());
+                                if let Err(err) =
+                                    self.cleanup_suspended_sandbox_sessions(&updated).await
+                                {
+                                    warn!(sandbox_id = %updated.object_id(), error = %err, "Failed to complete recovered sandbox session cleanup");
+                                }
+                            }
+                            Err(err) => {
+                                warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to persist recovered suspension");
+                            }
+                        },
+                        Err(err) => {
+                            warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to recover sandbox suspension");
+                        }
+                    }
+                }
+                SandboxPhase::Resuming => {
+                    let sandbox_id = sandbox.object_id().to_string();
+                    let sandbox_name = sandbox.object_name().to_string();
+                    let driver_sandbox_id = sandbox_id.clone();
+                    if let Err(err) = self
+                        .driver
+                        .call(
+                            "driver.resume_sandbox",
+                            Some(&sandbox_id),
+                            |driver| async move {
+                                driver
+                                    .resume_sandbox(Request::new(ResumeSandboxRequest {
+                                        sandbox_id: driver_sandbox_id,
+                                        sandbox_name,
+                                    }))
+                                    .await
+                            },
+                        )
+                        .await
+                    {
+                        warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to recover sandbox resume");
+                    }
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -2101,7 +2633,13 @@ impl ComputeRuntime {
         };
         let current_phase =
             SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown);
-        if current_phase == SandboxPhase::Deleting || current_phase == SandboxPhase::Error {
+        if matches!(
+            current_phase,
+            SandboxPhase::Deleting
+                | SandboxPhase::Error
+                | SandboxPhase::Suspending
+                | SandboxPhase::Suspended
+        ) {
             return Ok(());
         }
         if !connected && current_phase != SandboxPhase::Ready {
@@ -2237,6 +2775,16 @@ impl ComputeRuntime {
         Ok(())
     }
 
+    async fn cleanup_suspended_sandbox_sessions(&self, sandbox: &Sandbox) -> Result<(), String> {
+        // Disconnect first so a store failure cannot leave the stopped
+        // sandbox reachable through an existing supervisor stream. Both
+        // operations are idempotent and are retried for durable Suspended
+        // records during explicit suspend requests and startup recovery.
+        self.supervisor_sessions.disconnect(sandbox.object_id());
+        self.cleanup_sandbox_ssh_sessions(sandbox.object_id(), sandbox.object_workspace())
+            .await
+    }
+
     // TODO: introduce a per-sandbox cap on service endpoints and paginate
     // this cleanup loop, or query by sandbox label instead of scanning the
     // full workspace. Without a cap the flat 1,000-record page could miss
@@ -2270,10 +2818,10 @@ impl ComputeRuntime {
 
     async fn cleanup_local_state_if_sandbox_absent(
         &self,
-        delete_guard: &SandboxDeleteGuard,
+        delete_guard: &SandboxLifecycleGuard,
         sandbox_id: &str,
     ) -> Result<(), Status> {
-        let _guard = self.lock_global_for_delete(delete_guard).await;
+        let _guard = self.lock_global_for_lifecycle(delete_guard).await;
         let record = self
             .store
             .get(Sandbox::object_type(), sandbox_id)
@@ -2405,6 +2953,45 @@ impl ComputeRuntime {
         }
 
         let sandbox = decode_sandbox_record(&current_record)?;
+        let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+        if matches!(
+            phase,
+            SandboxPhase::Suspending | SandboxPhase::Suspended | SandboxPhase::Resuming
+        ) {
+            let updated = self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    &sandbox_id,
+                    expected_resource_version,
+                    |sandbox| {
+                        sandbox.set_phase(SandboxPhase::Error as i32);
+                        let name = sandbox.object_name().to_string();
+                        upsert_ready_condition(
+                            &mut sandbox.status,
+                            &name,
+                            SandboxCondition {
+                                r#type: "Ready".to_string(),
+                                status: "False".to_string(),
+                                reason: "ComputeResourceMissing".to_string(),
+                                message: "The compute driver could not find the retained sandbox resource; delete the sandbox to clean up its remaining state"
+                                    .to_string(),
+                                last_transition_time: String::new(),
+                            },
+                        );
+                    },
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+            warn!(
+                sandbox_id = %sandbox_id,
+                sandbox_name = %sandbox_name,
+                phase = ?phase,
+                "Retained sandbox resource disappeared from the compute driver"
+            );
+            self.sandbox_index.update_from_sandbox(&updated);
+            self.sandbox_watch_bus.notify(&sandbox_id);
+            return Ok(());
+        }
         info!(
             sandbox_id = %sandbox_id,
             sandbox_name = %sandbox_name,
@@ -2811,7 +3398,7 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
     let sandbox_name = &incoming.name;
 
     let cpv = sandbox.current_policy_version();
-    let (phase, mut status) = incoming.status.as_ref().map_or_else(
+    let (mut phase, mut status) = incoming.status.as_ref().map_or_else(
         || {
             let mut phase = old_phase;
             let supervisor_promoted = session_connected
@@ -2838,6 +3425,24 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
             (composed.phase, status)
         },
     );
+
+    phase = match old_phase {
+        SandboxPhase::Suspending
+            if phase == SandboxPhase::Suspended || driver_snapshot_confirms_stopped(incoming) =>
+        {
+            SandboxPhase::Suspended
+        }
+        SandboxPhase::Suspending if phase != SandboxPhase::Error => SandboxPhase::Suspending,
+        SandboxPhase::Suspended => SandboxPhase::Suspended,
+        SandboxPhase::Resuming if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Error) => {
+            SandboxPhase::Resuming
+        }
+        _ => phase,
+    };
+
+    if let Some(status) = status.as_mut() {
+        status.phase = phase as i32;
+    }
 
     if let Some(status) = status.as_mut()
         && status.sandbox_name.is_empty()
@@ -2882,6 +3487,18 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
     sandbox.set_current_policy_version(cpv);
 }
 
+fn driver_snapshot_confirms_stopped(incoming: &DriverSandbox) -> bool {
+    incoming.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.status.eq_ignore_ascii_case("false")
+                && matches!(
+                    condition.reason.to_ascii_lowercase().as_str(),
+                    "containerexited" | "containerstopped"
+                )
+        })
+    })
+}
+
 fn ensure_supervisor_ready_status(status: &mut Option<SandboxStatus>, sandbox_name: &str) {
     upsert_ready_condition(
         status,
@@ -2916,7 +3533,7 @@ impl ComposedPhase {
         // before this driver snapshot arrived. Keep Ready rather than letting a lagging
         // backend phase overwrite it.
         let phase = match backend_phase {
-            SandboxPhase::Error | SandboxPhase::Deleting => backend_phase,
+            SandboxPhase::Error | SandboxPhase::Deleting | SandboxPhase::Suspended => backend_phase,
             _ if session_connected => SandboxPhase::Ready,
             _ => SandboxPhase::Provisioning,
         };
@@ -3019,6 +3636,13 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
             return SandboxPhase::Deleting;
         }
 
+        if status.conditions.iter().any(|condition| {
+            condition.r#type.eq_ignore_ascii_case("Suspended")
+                && condition.status.eq_ignore_ascii_case("true")
+        }) {
+            return SandboxPhase::Suspended;
+        }
+
         for condition in &status.conditions {
             if condition.r#type == "Ready" {
                 return if condition.status.eq_ignore_ascii_case("true") {
@@ -3072,6 +3696,7 @@ fn sandbox_phase_should_be_running(phase: SandboxPhase) -> bool {
         SandboxPhase::Unspecified
             | SandboxPhase::Provisioning
             | SandboxPhase::Ready
+            | SandboxPhase::Resuming
             | SandboxPhase::Unknown
     )
 }
@@ -3167,11 +3792,21 @@ impl ComputeDriver for NoopTestDriver {
 
     async fn stop_sandbox(
         &self,
-        _request: Request<openshell_core::proto::compute::v1::StopSandboxRequest>,
+        _request: Request<StopSandboxRequest>,
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::StopSandboxResponse>, Status>
     {
         Ok(tonic::Response::new(
             openshell_core::proto::compute::v1::StopSandboxResponse {},
+        ))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        _request: Request<ResumeSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::ResumeSandboxResponse>, Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::ResumeSandboxResponse {},
         ))
     }
 
@@ -3217,7 +3852,7 @@ pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -
         tracing_log_bus: TracingLogBus::new(),
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
         sync_lock: Arc::new(Mutex::new(())),
-        delete_gates: Arc::new(DeleteGateRegistry::default()),
+        lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
         gateway_listener_requirements: Vec::new(),
         replica_id: "test-replica".to_string(),
     }
@@ -3229,8 +3864,8 @@ mod tests {
     use futures::stream;
     use openshell_core::proto::compute::v1::{
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
-        GetSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateResponse,
-        WatchSandboxesDeletedEvent, WatchSandboxesSandboxEvent,
+        GetSandboxResponse, ResumeSandboxResponse, StopSandboxRequest, StopSandboxResponse,
+        ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesSandboxEvent,
     };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3446,6 +4081,13 @@ mod tests {
             Ok(tonic::Response::new(StopSandboxResponse {}))
         }
 
+        async fn resume_sandbox(
+            &self,
+            _request: Request<ResumeSandboxRequest>,
+        ) -> Result<tonic::Response<ResumeSandboxResponse>, Status> {
+            Ok(tonic::Response::new(ResumeSandboxResponse {}))
+        }
+
         async fn delete_sandbox(
             &self,
             _request: Request<DeleteSandboxRequest>,
@@ -3476,6 +4118,12 @@ mod tests {
         Error(&'static str),
     }
 
+    #[derive(Clone)]
+    enum ControlledLifecycleOutcome {
+        Ok,
+        Error(&'static str),
+    }
+
     struct ControlledDriver {
         watch_tx: mpsc::UnboundedSender<Result<WatchSandboxesEvent, Status>>,
         watch_rx: TestMutex<Option<mpsc::UnboundedReceiver<Result<WatchSandboxesEvent, Status>>>>,
@@ -3485,6 +4133,18 @@ mod tests {
         delete_blocked: AtomicBool,
         delete_calls: AtomicUsize,
         delete_outcome: TestMutex<ControlledDeleteOutcome>,
+        stop_started: Notify,
+        stop_finished: Notify,
+        stop_release: Semaphore,
+        stop_blocked: AtomicBool,
+        stop_calls: AtomicUsize,
+        stop_outcome: TestMutex<ControlledLifecycleOutcome>,
+        resume_started: Notify,
+        resume_finished: Notify,
+        resume_release: Semaphore,
+        resume_blocked: AtomicBool,
+        resume_calls: AtomicUsize,
+        resume_outcome: TestMutex<ControlledLifecycleOutcome>,
         get_started: Notify,
         get_release: Semaphore,
         get_blocked: AtomicBool,
@@ -3503,6 +4163,18 @@ mod tests {
                 delete_blocked: AtomicBool::new(false),
                 delete_calls: AtomicUsize::new(0),
                 delete_outcome: TestMutex::new(ControlledDeleteOutcome::Ok(true)),
+                stop_started: Notify::new(),
+                stop_finished: Notify::new(),
+                stop_release: Semaphore::new(0),
+                stop_blocked: AtomicBool::new(false),
+                stop_calls: AtomicUsize::new(0),
+                stop_outcome: TestMutex::new(ControlledLifecycleOutcome::Ok),
+                resume_started: Notify::new(),
+                resume_finished: Notify::new(),
+                resume_release: Semaphore::new(0),
+                resume_blocked: AtomicBool::new(false),
+                resume_calls: AtomicUsize::new(0),
+                resume_outcome: TestMutex::new(ControlledLifecycleOutcome::Ok),
                 get_started: Notify::new(),
                 get_release: Semaphore::new(0),
                 get_blocked: AtomicBool::new(false),
@@ -3516,6 +4188,22 @@ mod tests {
 
         fn release_delete(&self) {
             self.delete_release.add_permits(1);
+        }
+
+        fn block_stop(&self) {
+            self.stop_blocked.store(true, Ordering::SeqCst);
+        }
+
+        fn release_stop(&self) {
+            self.stop_release.add_permits(1);
+        }
+
+        fn block_resume(&self) {
+            self.resume_blocked.store(true, Ordering::SeqCst);
+        }
+
+        fn release_resume(&self) {
+            self.resume_release.add_permits(1);
         }
 
         fn block_get(&self) {
@@ -3533,12 +4221,34 @@ mod tests {
                 .expect("delete outcome lock poisoned") = outcome;
         }
 
+        fn set_stop_outcome(&self, outcome: ControlledLifecycleOutcome) {
+            *self
+                .stop_outcome
+                .lock()
+                .expect("stop outcome lock poisoned") = outcome;
+        }
+
+        fn set_resume_outcome(&self, outcome: ControlledLifecycleOutcome) {
+            *self
+                .resume_outcome
+                .lock()
+                .expect("resume outcome lock poisoned") = outcome;
+        }
+
         fn set_get_outcome(&self, outcome: ControlledGetOutcome) {
             *self.get_outcome.lock().expect("get outcome lock poisoned") = outcome;
         }
 
         fn delete_calls(&self) -> usize {
             self.delete_calls.load(Ordering::SeqCst)
+        }
+
+        fn stop_calls(&self) -> usize {
+            self.stop_calls.load(Ordering::SeqCst)
+        }
+
+        fn resume_calls(&self) -> usize {
+            self.resume_calls.load(Ordering::SeqCst)
         }
 
         fn send_event(&self, event: WatchSandboxesEvent) {
@@ -3632,7 +4342,52 @@ mod tests {
             &self,
             _request: Request<StopSandboxRequest>,
         ) -> Result<tonic::Response<StopSandboxResponse>, Status> {
-            Ok(tonic::Response::new(StopSandboxResponse {}))
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
+            self.stop_started.notify_one();
+            if self.stop_blocked.load(Ordering::SeqCst) {
+                self.stop_release
+                    .acquire()
+                    .await
+                    .expect("stop release semaphore closed")
+                    .forget();
+            }
+            self.stop_finished.notify_one();
+            let outcome = self
+                .stop_outcome
+                .lock()
+                .expect("stop outcome lock poisoned")
+                .clone();
+            match outcome {
+                ControlledLifecycleOutcome::Ok => Ok(tonic::Response::new(StopSandboxResponse {})),
+                ControlledLifecycleOutcome::Error(message) => Err(Status::internal(message)),
+            }
+        }
+
+        async fn resume_sandbox(
+            &self,
+            _request: Request<ResumeSandboxRequest>,
+        ) -> Result<tonic::Response<ResumeSandboxResponse>, Status> {
+            self.resume_calls.fetch_add(1, Ordering::SeqCst);
+            self.resume_started.notify_one();
+            if self.resume_blocked.load(Ordering::SeqCst) {
+                self.resume_release
+                    .acquire()
+                    .await
+                    .expect("resume release semaphore closed")
+                    .forget();
+            }
+            self.resume_finished.notify_one();
+            let outcome = self
+                .resume_outcome
+                .lock()
+                .expect("resume outcome lock poisoned")
+                .clone();
+            match outcome {
+                ControlledLifecycleOutcome::Ok => {
+                    Ok(tonic::Response::new(ResumeSandboxResponse {}))
+                }
+                ControlledLifecycleOutcome::Error(message) => Err(Status::internal(message)),
+            }
         }
 
         async fn delete_sandbox(
@@ -3704,7 +4459,7 @@ mod tests {
             tracing_log_bus: TracingLogBus::new(),
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
             sync_lock: Arc::new(Mutex::new(())),
-            delete_gates: Arc::new(DeleteGateRegistry::default()),
+            lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements: Vec::new(),
             replica_id: "test-replica".to_string(),
         }
@@ -3992,7 +4747,7 @@ mod tests {
 
     #[test]
     fn delete_gate_registry_removes_stale_entries() {
-        let registry = DeleteGateRegistry::default();
+        let registry = LifecycleGateRegistry::default();
         let first = registry.gate_for("sb-1");
         assert_eq!(registry.entry_count(), 1);
         drop(first);
@@ -4422,6 +5177,13 @@ mod tests {
                 self.0.stop_sandbox(request).await
             }
 
+            async fn resume_sandbox(
+                &self,
+                request: Request<ResumeSandboxRequest>,
+            ) -> Result<tonic::Response<ResumeSandboxResponse>, Status> {
+                self.0.resume_sandbox(request).await
+            }
+
             async fn delete_sandbox(
                 &self,
                 request: Request<DeleteSandboxRequest>,
@@ -4465,6 +5227,433 @@ mod tests {
             Some("14"),
             "the gRPC code names the cause without reading the message"
         );
+    }
+
+    #[tokio::test]
+    async fn suspend_and_resume_follow_durable_state_machine() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-lifecycle", "sandbox-lifecycle", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let session = ssh_session_record("lifecycle-session", sandbox.object_id());
+        runtime.store.put_message(&session).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+
+        let suspended = runtime
+            .suspend_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+        assert_eq!(suspended.phase(), SandboxPhase::Suspended as i32);
+        assert_eq!(driver.stop_calls(), 1);
+        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "suspension revokes ephemeral SSH sessions"
+        );
+
+        let suspended_again = runtime
+            .suspend_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+        assert_eq!(suspended_again.phase(), SandboxPhase::Suspended as i32);
+        assert_eq!(driver.stop_calls(), 1, "stable suspension is idempotent");
+
+        let resuming = runtime
+            .resume_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+        assert_eq!(resuming.phase(), SandboxPhase::Resuming as i32);
+        assert_eq!(driver.resume_calls(), 1);
+
+        let resuming_again = runtime
+            .resume_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+        assert_eq!(resuming_again.phase(), SandboxPhase::Resuming as i32);
+        assert_eq!(
+            driver.resume_calls(),
+            2,
+            "explicit retry reissues the idempotent resume"
+        );
+
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+        runtime
+            .apply_sandbox_update(ready_driver_sandbox(
+                sandbox.object_id(),
+                sandbox.object_name(),
+            ))
+            .await
+            .unwrap();
+        let ready = runtime
+            .resume_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+        assert_eq!(ready.phase(), SandboxPhase::Ready as i32);
+        assert_eq!(driver.resume_calls(), 2, "ready resume is idempotent");
+    }
+
+    #[tokio::test]
+    async fn retained_suspending_transition_retries_driver_operation() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record(
+            "sb-retained-suspend",
+            "sandbox-retained-suspend",
+            SandboxPhase::Suspending,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let suspended = runtime
+            .suspend_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+
+        assert_eq!(suspended.phase(), SandboxPhase::Suspended as i32);
+        assert_eq!(driver.stop_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn retained_resuming_transition_retries_driver_operation() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record(
+            "sb-retained-resume",
+            "sandbox-retained-resume",
+            SandboxPhase::Resuming,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let resuming = runtime
+            .resume_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+
+        assert_eq!(resuming.phase(), SandboxPhase::Resuming as i32);
+        assert_eq!(driver.resume_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_suspend_completes_session_cleanup() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-suspended", "sandbox-suspended", SandboxPhase::Suspended);
+        let session = ssh_session_record("stale-session", sandbox.object_id());
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime.store.put_message(&session).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+
+        let suspended = runtime
+            .suspend_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+
+        assert_eq!(suspended.phase(), SandboxPhase::Suspended as i32);
+        assert_eq!(driver.stop_calls(), 0);
+        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_completes_suspended_session_cleanup() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let suspended =
+            sandbox_record("sb-suspended", "sandbox-suspended", SandboxPhase::Suspended);
+        let suspending = sandbox_record(
+            "sb-suspending",
+            "sandbox-suspending",
+            SandboxPhase::Suspending,
+        );
+        let suspended_session = ssh_session_record("suspended-session", suspended.object_id());
+        let suspending_session = ssh_session_record("suspending-session", suspending.object_id());
+        for sandbox in [&suspended, &suspending] {
+            runtime.store.put_message(sandbox).await.unwrap();
+            register_test_supervisor_session(&runtime, sandbox.object_id());
+        }
+        for session in [&suspended_session, &suspending_session] {
+            runtime.store.put_message(session).await.unwrap();
+        }
+
+        runtime.resume_persisted_sandboxes().await.unwrap();
+
+        assert_eq!(driver.stop_calls(), 1);
+        for (sandbox, session) in [
+            (&suspended, &suspended_session),
+            (&suspending, &suspending_session),
+        ] {
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.phase(), SandboxPhase::Suspended as i32);
+            assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+            assert!(
+                runtime
+                    .store
+                    .get_message::<SshSession>(session.object_id())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_cancellation_does_not_cancel_suspend_worker() {
+        let driver = ControlledDriver::new();
+        driver.block_stop();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-suspend", "sandbox-suspend", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let request_runtime = runtime.clone();
+        let request = tokio::spawn(async move {
+            request_runtime
+                .suspend_sandbox("default", "sandbox-suspend")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), driver.stop_started.notified())
+            .await
+            .expect("suspend did not reach the driver");
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        driver.release_stop();
+        tokio::time::timeout(Duration::from_secs(1), driver.stop_finished.notified())
+            .await
+            .expect("detached suspend worker did not finish the driver call");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let stored = runtime
+                    .store
+                    .get_message::<Sandbox>(sandbox.object_id())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if stored.phase() == SandboxPhase::Suspended as i32 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached suspend worker did not persist Suspended");
+        assert_eq!(driver.stop_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_cancellation_does_not_cancel_resume_worker() {
+        let driver = ControlledDriver::new();
+        driver.block_resume();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-resume", "sandbox-resume", SandboxPhase::Suspended);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let request_runtime = runtime.clone();
+        let request = tokio::spawn(async move {
+            request_runtime
+                .resume_sandbox("default", "sandbox-resume")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), driver.resume_started.notified())
+            .await
+            .expect("resume did not reach the driver");
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        driver.release_resume();
+        tokio::time::timeout(Duration::from_secs(1), driver.resume_finished.notified())
+            .await
+            .expect("detached resume worker did not finish the driver call");
+
+        driver.release_resume();
+        let resuming = tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.resume_sandbox("default", sandbox.object_name()),
+        )
+        .await
+        .expect("detached resume worker did not release the lifecycle gate")
+        .unwrap();
+        assert_eq!(resuming.phase(), SandboxPhase::Resuming as i32);
+        assert_eq!(driver.resume_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_suspend_reconciles_backend_that_already_stopped() {
+        let driver = ControlledDriver::new();
+        driver.set_stop_outcome(ControlledLifecycleOutcome::Error("response lost"));
+        let sandbox = sandbox_record("sb-suspend", "sandbox-suspend", SandboxPhase::Ready);
+        let mut stopped = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        stopped.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "container stopped before the response was lost",
+        )));
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(stopped)));
+        let runtime = test_runtime(driver).await;
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let session = ssh_session_record("lost-response-session", sandbox.object_id());
+        runtime.store.put_message(&session).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+
+        let err = runtime
+            .suspend_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap_err();
+        assert!(err.message().contains("response lost"));
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Suspended as i32);
+        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "reconciled suspension revokes ephemeral SSH sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_resume_reconciles_backend_that_already_started() {
+        let driver = ControlledDriver::new();
+        driver.set_resume_outcome(ControlledLifecycleOutcome::Error("response lost"));
+        let sandbox = sandbox_record("sb-resume", "sandbox-resume", SandboxPhase::Suspended);
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+            ready_driver_sandbox(sandbox.object_id(), sandbox.object_name()),
+        )));
+        let runtime = test_runtime(driver).await;
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let err = runtime
+            .resume_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap_err();
+        assert!(err.message().contains("response lost"));
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Resuming as i32);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_operations_reject_invalid_source_phases() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record(
+            "sb-provisioning",
+            "sandbox-provisioning",
+            SandboxPhase::Provisioning,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let suspend = runtime
+            .suspend_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap_err();
+        assert_eq!(suspend.code(), Code::FailedPrecondition);
+
+        let resume = runtime
+            .resume_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap_err();
+        assert_eq!(resume.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn stale_ready_snapshot_cannot_wake_suspended_sandbox() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-sleeping", "sandbox-sleeping", SandboxPhase::Suspended);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+
+        runtime
+            .apply_sandbox_update(ready_driver_sandbox(
+                sandbox.object_id(),
+                sandbox.object_name(),
+            ))
+            .await
+            .unwrap();
+
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.phase(), SandboxPhase::Suspended as i32);
+    }
+
+    #[tokio::test]
+    async fn stopped_container_snapshot_confirms_suspending_sandbox() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record(
+            "sb-suspending",
+            "sandbox-suspending",
+            SandboxPhase::Suspending,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let mut stopped = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        stopped.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "container stopped for suspension",
+        )));
+
+        runtime.apply_sandbox_update(stopped).await.unwrap();
+
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.phase(), SandboxPhase::Suspended as i32);
+    }
+
+    #[tokio::test]
+    async fn stopped_container_snapshot_cannot_error_suspended_sandbox() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-suspended", "sandbox-suspended", SandboxPhase::Suspended);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let mut stopped = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        stopped.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "container is stopped",
+        )));
+
+        runtime.apply_sandbox_update(stopped).await.unwrap();
+
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.phase(), SandboxPhase::Suspended as i32);
     }
 
     #[tokio::test]
@@ -4814,7 +6003,7 @@ mod tests {
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        let delete_gate = runtime.delete_gates.gate_for(sandbox.object_id());
+        let delete_gate = runtime.lifecycle_gates.gate_for(sandbox.object_id());
         let first_runtime = runtime.clone();
         let first =
             tokio::spawn(async move { first_runtime.delete_sandbox("default", "sandbox-a").await });
@@ -4878,7 +6067,7 @@ mod tests {
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        let delete_gate = runtime.delete_gates.gate_for(sandbox.object_id());
+        let delete_gate = runtime.lifecycle_gates.gate_for(sandbox.object_id());
         let first_runtime = runtime.clone();
         let first =
             tokio::spawn(async move { first_runtime.delete_sandbox("default", "sandbox-a").await });
@@ -4937,7 +6126,7 @@ mod tests {
 
         // Hold the original ID's gate so the request resolves the name and
         // then waits before it can revalidate the durable row.
-        let delete_gate = runtime.delete_gates.gate_for(original.object_id());
+        let delete_gate = runtime.lifecycle_gates.gate_for(original.object_id());
         let delete_guard = delete_gate.lock().await;
         let delete_runtime = runtime.clone();
         let delete =

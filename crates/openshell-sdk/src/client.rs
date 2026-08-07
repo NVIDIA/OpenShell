@@ -217,6 +217,34 @@ impl OpenShellClient {
         Ok(response.deleted)
     }
 
+    /// Suspend a sandbox by name.
+    pub async fn suspend_sandbox(&self, name: &str) -> Result<SandboxRef> {
+        let response = self
+            .unary(|mut grpc| {
+                let request = proto::SuspendSandboxRequest {
+                    name: name.to_string(),
+                    workspace: String::new(),
+                };
+                async move { grpc.suspend_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
+    /// Resume a suspended sandbox by name.
+    pub async fn resume_sandbox(&self, name: &str) -> Result<SandboxRef> {
+        let response = self
+            .unary(|mut grpc| {
+                let request = proto::ResumeSandboxRequest {
+                    name: name.to_string(),
+                    workspace: String::new(),
+                };
+                async move { grpc.resume_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
     /// Poll [`OpenShellClient::get_sandbox`] until the sandbox reaches
     /// [`SandboxPhase::Ready`] or the `timeout` elapses.
     ///
@@ -584,6 +612,36 @@ impl WorkspaceScopedClient {
             })
             .await?;
         Ok(response.deleted)
+    }
+
+    /// Suspend a sandbox by name in this workspace.
+    pub async fn suspend_sandbox(&self, name: &str) -> Result<SandboxRef> {
+        let response = self
+            .client
+            .unary(|mut grpc| {
+                let request = proto::SuspendSandboxRequest {
+                    name: name.to_string(),
+                    workspace: self.workspace.clone(),
+                };
+                async move { grpc.suspend_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
+    }
+
+    /// Resume a suspended sandbox by name in this workspace.
+    pub async fn resume_sandbox(&self, name: &str) -> Result<SandboxRef> {
+        let response = self
+            .client
+            .unary(|mut grpc| {
+                let request = proto::ResumeSandboxRequest {
+                    name: name.to_string(),
+                    workspace: self.workspace.clone(),
+                };
+                async move { grpc.resume_sandbox(request).await }
+            })
+            .await?;
+        sandbox_from_response(response.sandbox)
     }
 
     /// Poll until the sandbox reaches [`SandboxPhase::Ready`] or the timeout

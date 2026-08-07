@@ -436,6 +436,26 @@ back to an unfiltered upload and prints a warning. Pass `--no-git-ignore` to
 opt into unfiltered uploads explicitly, upload a path outside the Git work
 tree, or force-add the intended files if they should remain Git-aware.
 
+## Suspend and Resume Sandboxes
+
+Suspend compute when you want to retain a sandbox and its persistent workspace
+without keeping its container, pod, or VM running:
+
+```shell
+openshell sandbox suspend my-sandbox
+openshell sandbox resume my-sandbox
+```
+
+The name is optional and defaults to the last-used sandbox. Suspend stops local
+background forwards and waits for the `Suspended` phase. Resume waits until the
+same sandbox returns to `Ready`. While suspended, you cannot connect, execute
+commands, transfer files, forward ports, or reach exposed services. Policies,
+provider attachments, settings, service definitions, and persistent workspace
+data remain associated with the sandbox.
+
+Suspend and resume are idempotent. Delete a suspended sandbox normally when you
+no longer need its retained state.
+
 ## Delete Sandboxes
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.
@@ -452,6 +472,9 @@ Every sandbox moves through a defined set of phases:
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Provisioning | The runtime is setting up the sandbox environment, or the gateway is waiting for the sandbox supervisor to establish its authenticated control session.       |
 | Ready        | The sandbox is running and its supervisor control session is connected. You can connect, execute commands, sync files, and view logs.                          |
+| Suspending   | The gateway accepted a suspend request and is stopping compute while retaining persistent state.                                                          |
+| Suspended    | Compute is stopped and access is unavailable. The sandbox record and driver-owned persistent workspace remain.                                            |
+| Resuming     | Compute is restarting. The sandbox becomes usable only after a fresh supervisor session connects.                                                        |
 | Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                                           |
 | Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |
 

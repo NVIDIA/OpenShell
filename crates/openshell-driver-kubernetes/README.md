@@ -36,6 +36,13 @@ This is a stopgap persistence model. It preserves user files across pod
 rescheduling but duplicates the base workspace and does not automatically apply
 image updates to existing PVCs. Future snapshotting should replace it.
 
+Suspend preserves the Agent Sandbox resource and workspace PVC while stopping
+its pod. The driver sets `spec.operatingMode: Suspended` for `v1beta1` or
+`spec.replicas: 0` for `v1alpha1`. Resume sets `Running` or one replica for the
+same resource, so the replacement pod mounts the existing claim. Delete is the
+only lifecycle operation that removes the Sandbox resource and its owned
+storage.
+
 The workspace PVC size defaults to `workspace_default_storage_size`. Set
 `workspace_storage_class` to pin the PVC to a specific `StorageClass`; an empty
 value omits `storageClassName` so the cluster's default `StorageClass` applies.

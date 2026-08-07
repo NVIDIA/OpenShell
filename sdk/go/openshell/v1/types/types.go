@@ -15,6 +15,9 @@ const (
 	SandboxError        SandboxPhase = "Error"
 	SandboxDeleting     SandboxPhase = "Deleting"
 	SandboxUnknown      SandboxPhase = "Unknown"
+	SandboxSuspending   SandboxPhase = "Suspending"
+	SandboxSuspended    SandboxPhase = "Suspended"
+	SandboxResuming     SandboxPhase = "Resuming"
 )
 
 // EventType classifies watch events.

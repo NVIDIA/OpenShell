@@ -43,6 +43,12 @@ mod tests {
             "/openshell.v1.OpenShell/DeleteSandbox"
         ));
         assert!(!is_sandbox_callable(
+            "/openshell.v1.OpenShell/SuspendSandbox"
+        ));
+        assert!(!is_sandbox_callable(
+            "/openshell.v1.OpenShell/ResumeSandbox"
+        ));
+        assert!(!is_sandbox_callable(
             "/openshell.v1.OpenShell/CreateProvider"
         ));
         assert!(!is_sandbox_callable(

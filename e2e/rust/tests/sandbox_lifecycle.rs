@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use openshell_e2e::harness::binary::{openshell_cmd, openshell_tty_cmd};
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
+use openshell_e2e::harness::sandbox::SandboxGuard;
 use tokio::time::{Instant, sleep};
 
 const SANDBOX_PRESENCE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -103,6 +104,118 @@ async fn delete_sandbox(name: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let _ = cmd.status().await;
+}
+
+async fn run_sandbox_lifecycle_command(operation: &str, name: &str) -> String {
+    let mut cmd = openshell_cmd();
+    cmd.args(["sandbox", operation, name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd
+        .output()
+        .await
+        .unwrap_or_else(|error| panic!("spawn openshell sandbox {operation}: {error}"));
+    let combined = normalize_output(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ));
+    assert!(
+        output.status.success(),
+        "sandbox {operation} should succeed (exit {:?}):\n{combined}",
+        output.status.code(),
+    );
+    combined
+}
+
+#[tokio::test]
+async fn sandbox_suspend_resume_preserves_workspace() {
+    const SENTINEL: &str = "openshell-suspend-resume-sentinel";
+    const SENTINEL_PATH: &str = "/sandbox/.openshell-suspend-resume-e2e";
+    let write_sentinel = format!("printf '%s\\n' '{SENTINEL}' > '{SENTINEL_PATH}'");
+
+    let mut sandbox = SandboxGuard::create(&["--", "sh", "-lc", &write_sentinel])
+        .await
+        .expect("sandbox create should write the workspace sentinel");
+
+    let suspend_output = run_sandbox_lifecycle_command("suspend", &sandbox.name).await;
+    assert!(
+        suspend_output.contains("Suspended sandbox"),
+        "expected suspend confirmation in:\n{suspend_output}",
+    );
+
+    let mut exec_cmd = openshell_cmd();
+    exec_cmd
+        .args([
+            "sandbox",
+            "exec",
+            "--name",
+            &sandbox.name,
+            "--no-tty",
+            "--",
+            "cat",
+            SENTINEL_PATH,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let suspended_exec = exec_cmd
+        .output()
+        .await
+        .expect("spawn openshell sandbox exec while suspended");
+    assert!(
+        !suspended_exec.status.success(),
+        "sandbox exec should fail while suspended"
+    );
+
+    let resume_output = run_sandbox_lifecycle_command("resume", &sandbox.name).await;
+    assert!(
+        resume_output.contains("Resumed sandbox"),
+        "expected resume confirmation in:\n{resume_output}",
+    );
+
+    let sentinel = sandbox
+        .exec(&["cat", SENTINEL_PATH])
+        .await
+        .expect("sandbox exec should succeed after resume");
+    assert!(
+        sentinel.lines().any(|line| line.trim() == SENTINEL),
+        "workspace sentinel should survive suspend and resume:\n{sentinel}",
+    );
+
+    sandbox.cleanup().await;
+}
+
+#[tokio::test]
+async fn sandbox_can_be_deleted_while_suspended() {
+    let mut sandbox = SandboxGuard::create(&["--", "true"])
+        .await
+        .expect("sandbox create should succeed");
+
+    let suspend_output = run_sandbox_lifecycle_command("suspend", &sandbox.name).await;
+    assert!(
+        suspend_output.contains("Suspended sandbox"),
+        "expected suspend confirmation in:\n{suspend_output}",
+    );
+
+    let delete_output = run_sandbox_lifecycle_command("delete", &sandbox.name).await;
+    assert!(
+        delete_output.contains("Deleted sandbox"),
+        "expected delete confirmation in:\n{delete_output}",
+    );
+
+    if let Err(last_sandbox_list) = assert_sandbox_presence_eventually(&sandbox.name, false).await {
+        sandbox.cleanup().await;
+        panic!(
+            "suspended sandbox {} should be deleted without resuming after \
+             {SANDBOX_PRESENCE_TIMEOUT:?}; last observed sandbox list: {last_sandbox_list:?}",
+            sandbox.name,
+        );
+    }
+
+    // Mark the guard cleaned up. Its idempotent delete is harmless now that
+    // the lifecycle operation above has removed the sandbox.
+    sandbox.cleanup().await;
 }
 
 #[tokio::test]
