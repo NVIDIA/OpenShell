@@ -14,6 +14,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     aliases = aliases(),
     compile_data = glob(["data/**/*"]),
+    crate_features = ["bundled-ca-roots"],
     visibility = ["//visibility:public"],
     deps = all_crate_deps(normal = True),
 )
@@ -22,6 +23,7 @@ rust_test(
     name = "openshell-supervisor-network_test",
     compile_data = glob(["testdata/**/*"]),
     crate = ":openshell-supervisor-network",
+    crate_features = ["bundled-ca-roots"],
     deps = all_crate_deps(normal_dev = True),
 )
 
