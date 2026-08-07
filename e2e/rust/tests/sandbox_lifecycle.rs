@@ -187,6 +187,38 @@ async fn sandbox_suspend_resume_preserves_workspace() {
 }
 
 #[tokio::test]
+async fn sandbox_can_be_deleted_while_suspended() {
+    let mut sandbox = SandboxGuard::create(&["--", "true"])
+        .await
+        .expect("sandbox create should succeed");
+
+    let suspend_output = run_sandbox_lifecycle_command("suspend", &sandbox.name).await;
+    assert!(
+        suspend_output.contains("Suspended sandbox"),
+        "expected suspend confirmation in:\n{suspend_output}",
+    );
+
+    let delete_output = run_sandbox_lifecycle_command("delete", &sandbox.name).await;
+    assert!(
+        delete_output.contains("Deleted sandbox"),
+        "expected delete confirmation in:\n{delete_output}",
+    );
+
+    if let Err(last_sandbox_list) = assert_sandbox_presence_eventually(&sandbox.name, false).await {
+        sandbox.cleanup().await;
+        panic!(
+            "suspended sandbox {} should be deleted without resuming after \
+             {SANDBOX_PRESENCE_TIMEOUT:?}; last observed sandbox list: {last_sandbox_list:?}",
+            sandbox.name,
+        );
+    }
+
+    // Mark the guard cleaned up. Its idempotent delete is harmless now that
+    // the lifecycle operation above has removed the sandbox.
+    sandbox.cleanup().await;
+}
+
+#[tokio::test]
 async fn sandbox_create_keeps_sandbox_after_tty_command_by_default() {
     let mut cmd = openshell_tty_cmd(&["sandbox", "create", "--", "echo", "OK"]);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
