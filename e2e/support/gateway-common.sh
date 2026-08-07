@@ -5,6 +5,10 @@
 # Shared helpers for local gateway-backed e2e wrappers. Driver-specific setup,
 # cleanup, and runtime behavior stay in the Docker/Podman wrapper scripts.
 
+# E2E traffic is synthetic and must not contribute to product usage metrics.
+# Keep an explicit override so telemetry-specific tests can opt back in.
+export OPENSHELL_TELEMETRY_ENABLED="${OPENSHELL_TELEMETRY_ENABLED:-false}"
+
 e2e_cargo_target_dir() {
   local root=$1
   shift

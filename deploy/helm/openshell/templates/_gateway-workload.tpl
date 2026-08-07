@@ -75,6 +75,8 @@ spec:
         - name: SSL_CERT_FILE
           value: /etc/openshell-tls/oidc-ca/ca.crt
         {{- end }}
+        - name: OPENSHELL_TELEMETRY_ENABLED
+          value: {{ .Values.server.telemetryEnabled | quote }}
       volumeMounts:
         {{- if eq (include "openshell.workloadKind" .) "statefulset" }}
         - name: openshell-data

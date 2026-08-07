@@ -151,6 +151,7 @@ The most commonly changed values are:
 | `workload.allowMultiReplicaStatefulSet` | Allow `replicaCount > 1` with `workload.kind=statefulset`. Prefer Deployment for external database-backed multi-replica gateways. |
 | `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
 | `server.externalDbSecret` | Secret containing a PostgreSQL connection URI in the `uri` key. Use when the database is managed outside the chart. |
+| `server.telemetryEnabled` | Enable anonymous OpenShell telemetry from the gateway and its sandbox supervisors. Set to `false` to opt out. |
 | `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |
 | `server.sandboxImagePullSecrets` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
 | `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
