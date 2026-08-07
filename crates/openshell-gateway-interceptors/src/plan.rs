@@ -15,8 +15,7 @@ use openshell_core::proto::gateway_interceptor::v1::{
     gateway_interceptor_client::GatewayInterceptorClient,
 };
 use openshell_extension_core::{
-    BearerTokenInterceptor, BearerTokenSlot, ExtensionChannelConfig, ExtensionServerTrust,
-    connect_channel,
+    BearerTokenInterceptor, BearerTokenSlot, ExtensionChannelConfig, connect_channel,
 };
 use tonic::Request;
 use tracing::{info, warn};
@@ -936,7 +935,7 @@ async fn connect_endpoint(config: &GatewayInterceptorConfig) -> Result<tonic::tr
                 path.display()
             ))
         })?;
-        channel_config = channel_config.with_server_trust(ExtensionServerTrust::CustomCaPem(pem));
+        channel_config = channel_config.with_custom_ca_pem(pem);
     }
     connect_channel(&channel_config).await.map_err(|error| {
         InterceptorError::Transport(format!(

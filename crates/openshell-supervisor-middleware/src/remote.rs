@@ -9,8 +9,7 @@ use openshell_core::proto::{
     ValidateConfigResponse,
 };
 use openshell_extension_core::{
-    BearerTokenInterceptor, BearerTokenSlot, ExtensionChannelConfig, ExtensionServerTrust,
-    connect_channel,
+    BearerTokenInterceptor, BearerTokenSlot, ExtensionChannelConfig, connect_channel,
 };
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -34,8 +33,7 @@ impl RemoteMiddlewareService {
     ) -> Result<Self> {
         let mut config = ExtensionChannelConfig::new(grpc_endpoint);
         if !tls_ca_cert_pem.is_empty() {
-            config = config
-                .with_server_trust(ExtensionServerTrust::CustomCaPem(tls_ca_cert_pem.to_vec()));
+            config = config.with_custom_ca_pem(tls_ca_cert_pem);
         }
         let channel = connect_channel(&config)
             .await

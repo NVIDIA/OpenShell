@@ -17,6 +17,4 @@ pub use jwt::{
     EXTENSION_JWT_TYP, ExtensionCallerKind, ExtensionJwtClaims, MAX_EXTENSION_TOKEN_TTL,
 };
 pub use store::ExtensionCredentialStore;
-pub use transport::{
-    ExtensionChannelConfig, ExtensionServerTrust, TransportError, connect_channel,
-};
+pub use transport::{ExtensionChannelConfig, TransportError, connect_channel};
