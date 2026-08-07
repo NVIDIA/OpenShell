@@ -754,17 +754,17 @@ pub struct ProfileSuggestion {
 
 fn credential_env_matches(env: &HashMap<String, String>) -> Vec<(String, Vec<ProfileSuggestion>)> {
     const SUFFIXES: [&str; 7_usize] = [
-        "_TOKEN",
-        "_SECRET",
-        "_PASSWORD",
-        "_CREDENTIAL",
-        "_ACCESS_KEY",
-        "_SECRET_KEY",
-        "_API_KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "CREDENTIAL",
+        "ACCESS_KEY",
+        "SECRET_KEY",
+        "API_KEY",
     ];
     let looks_like_credential = |key: &str| -> bool {
         let upper = key.to_ascii_uppercase();
-        SUFFIXES.iter().any(|s| upper.ends_with(*s))
+        SUFFIXES.iter().any(|s| upper.contains(*s))
     };
 
     // scan builtin_profiles()
@@ -1074,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn suffix_matche_no_profile() {
+    fn suffix_match_no_profile() {
         let env = env(&[("FOO_TOKEN", "x")]);
         let prof = credential_env_matches(&env);
         assert_eq!(prof.len(), 1_usize);
@@ -1128,13 +1128,13 @@ mod tests {
 
     #[test]
     fn no_value_leak() {
-        let env = env(&[("APP_SECRET", "secret")]);
+        let env = env(&[("APP_SECRET", "secretVALUE42")]);
 
         let prof = credential_env_matches(&env);
         assert_eq!(prof.len(), 1_usize);
 
         let dumped = format!("{prof:?}");
-        assert!(!dumped.contains("secret"), "value leaked: {dumped}");
+        assert!(!dumped.contains("secretVALUE42"), "value leaked: {dumped}");
     }
 
     #[test]
