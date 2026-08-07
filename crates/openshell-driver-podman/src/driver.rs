@@ -906,6 +906,28 @@ impl PodmanComputeDriver {
         Ok(!entries.is_empty())
     }
 
+    /// Resume an exited sandbox container. Returns `Ok(true)` if the
+    /// container exists and was (re)started, `Ok(false)` if it is gone.
+    pub async fn resume_sandbox(&self, sandbox_id: &str) -> Result<bool, ComputeDriverError> {
+        let id_filter = format!("{LABEL_SANDBOX_ID}={sandbox_id}");
+        let entries = self
+            .client
+            .list_containers(&[LABEL_MANAGED_FILTER, &id_filter])
+            .await
+            .map_err(ComputeDriverError::from)?;
+        let Some(entry) = entries.first() else {
+            return Ok(false);
+        };
+        if entry.state == "running" {
+            return Ok(true);
+        }
+        match self.client.start_container(&entry.id).await {
+            Ok(()) => Ok(true),
+            Err(PodmanApiError::NotFound(_)) => Ok(false),
+            Err(e) => Err(ComputeDriverError::from(e)),
+        }
+    }
+
     /// Fetch a single sandbox by ID.
     pub async fn get_sandbox(
         &self,
