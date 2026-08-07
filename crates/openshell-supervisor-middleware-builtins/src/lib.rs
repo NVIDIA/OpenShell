@@ -55,6 +55,7 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
             name: BUILTIN_REGEX.into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: vec![regex::describe()],
+            expected_audience: String::new(),
         }))
     }
 

@@ -151,6 +151,21 @@ pub async fn handle_refresh_sandbox_token(
     let minted = issuer.mint(&sandbox.sandbox_id)?;
     let extension_credentials = if requested_extension_services.is_empty() {
         Vec::new()
+    } else if !state
+        .extension_mint_limiter
+        .try_acquire(&sandbox.sandbox_id)
+    {
+        // Minting resolves the sandbox's effective policy, so an unbounded
+        // caller could impose real gateway cost from inside a sandbox. The
+        // supervisor keeps its last-known-good slots on error and retries at
+        // its normal cadence, so refusing is safe.
+        warn!(
+            sandbox_id = %sandbox.sandbox_id,
+            "extension credential minting rate limit exceeded"
+        );
+        return Err(Status::resource_exhausted(
+            "extension credential minting rate limit exceeded for this sandbox",
+        ));
     } else {
         let mut config_request = Request::new(GetSandboxConfigRequest {
             sandbox_id: sandbox.sandbox_id.clone(),
@@ -229,6 +244,12 @@ fn mint_extension_credentials(
                     "extension service '{name}' is not selected by the sandbox policy"
                 ))
             })?;
+            if service.allow_insecure_transport {
+                return Err(Status::failed_precondition(format!(
+                    "extension service '{name}' opted out of extension authentication; \
+                     no credential is minted for it"
+                )));
+            }
             let audience = ExtensionAudience::new(service.audience.clone())
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
             let minted = issuer.mint_extension_token(
@@ -417,6 +438,42 @@ mod tests {
         )
         .expect_err("unselected name must be rejected");
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn refresh_refuses_extension_credentials_past_the_per_sandbox_bound() {
+        let state = state_with_issuer().await;
+        // The gateway credential path is unaffected; only requests that carry
+        // extension service names consume the bound.
+        for _ in 0..10 {
+            assert!(state.extension_mint_limiter.try_acquire("sandbox-a"));
+        }
+        assert!(!state.extension_mint_limiter.try_acquire("sandbox-a"));
+        assert!(state.extension_mint_limiter.try_acquire("sandbox-b"));
+    }
+
+    #[tokio::test]
+    async fn opted_out_registrations_never_receive_a_minted_credential() {
+        let state = state_with_issuer().await;
+        let issuer = state.sandbox_jwt_issuer.as_deref().expect("issuer");
+        let available = vec![openshell_core::proto::SupervisorMiddlewareService {
+            name: "legacy-guard".to_string(),
+            audience: "urn:example:legacy-guard".to_string(),
+            allow_insecure_transport: true,
+            ..Default::default()
+        }];
+
+        // The registration is policy-selected, so authorization passes; the
+        // opt-out is what withholds the credential. A supervisor must not be
+        // able to obtain a bearer token it would then send over plaintext.
+        let error = mint_extension_credentials(
+            issuer,
+            "sandbox-a",
+            &["legacy-guard".to_string()],
+            &available,
+        )
+        .expect_err("opted-out registration must not mint a credential");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]

@@ -231,6 +231,11 @@ pub struct MiddlewareServiceFileConfig {
     /// derived from the registration name.
     #[serde(default)]
     pub audience: Option<String>,
+    /// Opt out of extension authentication for this registration, permitting a
+    /// plaintext `http://` endpoint with no bearer credential. Development and
+    /// trusted-network deployments only.
+    #[serde(default)]
+    pub allow_insecure_transport: bool,
     /// Operator-owned body limit for every binding exposed by this service.
     pub max_body_bytes: u64,
     /// Default RPC timeout using an integer with an `ms` or `s` suffix.
@@ -269,6 +274,7 @@ impl TryFrom<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
                     || format!("urn:openshell:extension:middleware:{}", config.name),
                     ToString::to_string,
                 ),
+            allow_insecure_transport: config.allow_insecure_transport,
         })
     }
 }
@@ -718,6 +724,7 @@ timeout = "2s"
                 grpc_endpoint: "https://127.0.0.1:50051".into(),
                 tls_ca_cert_path: Some(ca.path().to_path_buf()),
                 audience: Some("urn:openshell:middleware:local-guard".into()),
+                allow_insecure_transport: false,
                 max_body_bytes: 262_144,
                 timeout: Some("2s".into()),
             }]
@@ -743,6 +750,7 @@ timeout = "2s"
             grpc_endpoint: "https://guard.example:50051".into(),
             tls_ca_cert_path: None,
             audience: None,
+            allow_insecure_transport: false,
             max_body_bytes: 262_144,
             timeout: None,
         };
@@ -774,6 +782,7 @@ timeout = "2s"
             grpc_endpoint: "https://guard.example:50051".into(),
             tls_ca_cert_path: Some(ca.path().to_path_buf()),
             audience: None,
+            allow_insecure_transport: false,
             max_body_bytes: 262_144,
             timeout: None,
         };
@@ -805,6 +814,7 @@ timeout = "2s"
             grpc_endpoint: "https://guard.example:50051".into(),
             tls_ca_cert_path: Some(ca.path().to_path_buf()),
             audience: None,
+            allow_insecure_transport: false,
             max_body_bytes: 262_144,
             timeout: None,
         };

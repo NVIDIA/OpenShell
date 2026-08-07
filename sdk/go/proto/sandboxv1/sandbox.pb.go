@@ -1873,9 +1873,14 @@ type SupervisorMiddlewareService struct {
 	// Exact JWT audience for this service. The gateway resolves an omitted
 	// operator value to a kind-scoped audience derived from the registration
 	// name before sending sandbox config.
-	Audience      string `protobuf:"bytes,6,opt,name=audience,proto3" json:"audience,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Audience string `protobuf:"bytes,6,opt,name=audience,proto3" json:"audience,omitempty"`
+	// Operator opt-out from extension authentication for this registration.
+	// When true the service may use a plaintext endpoint and OpenShell attaches
+	// no bearer credential; supervisors must not request one. Intended only for
+	// trusted-network development deployments.
+	AllowInsecureTransport bool `protobuf:"varint,7,opt,name=allow_insecure_transport,json=allowInsecureTransport,proto3" json:"allow_insecure_transport,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *SupervisorMiddlewareService) Reset() {
@@ -1948,6 +1953,13 @@ func (x *SupervisorMiddlewareService) GetAudience() string {
 		return x.Audience
 	}
 	return ""
+}
+
+func (x *SupervisorMiddlewareService) GetAllowInsecureTransport() bool {
+	if x != nil {
+		return x.AllowInsecureTransport
+	}
+	return false
 }
 
 var File_sandbox_proto protoreflect.FileDescriptor
@@ -2115,14 +2127,15 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x1epolicy_validation_failure_mode\x18\v \x01(\tR\x1bpolicyValidationFailureMode\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
-	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\xd9\x01\n" +
+	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\x93\x02\n" +
 	"\x1bSupervisorMiddlewareService\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12#\n" +
 	"\rgrpc_endpoint\x18\x02 \x01(\tR\fgrpcEndpoint\x12$\n" +
 	"\x0emax_body_bytes\x18\x03 \x01(\x04R\fmaxBodyBytes\x12\x18\n" +
 	"\atimeout\x18\x04 \x01(\tR\atimeout\x12%\n" +
 	"\x0ftls_ca_cert_pem\x18\x05 \x01(\fR\ftlsCaCertPem\x12\x1a\n" +
-	"\baudience\x18\x06 \x01(\tR\baudience*b\n" +
+	"\baudience\x18\x06 \x01(\tR\baudience\x128\n" +
+	"\x18allow_insecure_transport\x18\a \x01(\bR\x16allowInsecureTransport*b\n" +
 	"\fSettingScope\x12\x1d\n" +
 	"\x19SETTING_SCOPE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15SETTING_SCOPE_SANDBOX\x10\x01\x12\x18\n" +

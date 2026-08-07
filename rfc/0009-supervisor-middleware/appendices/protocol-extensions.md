@@ -83,4 +83,6 @@ Phase 2 removes plaintext endpoint support and removes `allow_insecure`. Every e
 
 The exact phase 2 mechanism is deferred. Follow-up protocol work should choose and specify mTLS, TLS plus explicit caller authentication, or an equivalent design, including trust roots, client identity, credential delivery, certificate or key rotation, middleware identity binding, and how supervisors receive authentication material.
 
+The alpha mechanism that was subsequently built - TLS with optional operator-provided trust roots plus short-lived, exact-audience gateway-signed JWTs - is recorded in [extension-authentication.md](extension-authentication.md). It supersedes this section's `allow_insecure` design with `allow_insecure_transport` and narrows, but does not close, the phase 2 question: mTLS and overlapping key rotation remain deferred.
+
 Even during the phase 1 plaintext exception, the hook stays before provider credential injection, and OpenShell does not forward original `Authorization`, `Cookie`, or other protected headers to middleware. This preserves the separation between content inspection and upstream credential injection while authenticated transport is completed.

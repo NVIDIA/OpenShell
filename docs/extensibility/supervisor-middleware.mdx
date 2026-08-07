@@ -59,6 +59,7 @@ timeout = "500ms"
 | `grpc_endpoint` | Service address reachable from both the gateway and sandbox supervisors. Authenticated extensions use TLS `https://`. |
 | `tls_ca_cert_path` | Optional PEM trust roots for a private HTTPS service. Custom roots replace platform roots and retain hostname verification. |
 | `audience` | Exact audience expected by the service. Defaults to `urn:openshell:extension:middleware:<name>`. |
+| `allow_insecure_transport` | Opt this registration out of extension authentication, permitting a plaintext `http://` endpoint with no bearer credential. Defaults to `false`. Development and trusted-network deployments only. |
 | `max_body_bytes` | Operator limit applied to every binding exposed by the service, up to the 4 MiB platform maximum. |
 | `timeout` | Optional service-wide RPC timeout using an integer with an `ms` or `s` suffix. Defaults to `500ms`; valid values range from `10ms` through `30s`. |
 
@@ -72,7 +73,26 @@ Registration is static. Restart the gateway after adding, removing, or changing 
 
 When gateway JWT signing is configured, OpenShell attaches a short-lived EdDSA bearer token to every remote middleware RPC. Gateway calls use `caller_kind: gateway`; sandbox supervisor calls use `caller_kind: supervisor` and include the sandbox ID. Supervisors request credentials by registration name through `RefreshSandboxToken`. The gateway derives the audience from operator-owned configuration and authorizes each name against the sandbox's effective policy.
 
-Provision the trusted gateway URL and expected gateway ID separately from token data. The expected issuer is exactly `openshell-gateway:<gateway_id>`; fetching JWKS does not establish that identity by itself. Obtain the public key from `GET /.well-known/jwks.json` over authenticated TLS at the trusted gateway URL, or provision it through the deployment when the service cannot reach the gateway. Cache keys by `kid`. Pin `alg` to `EdDSA` and validate the signature, expected issuer, exact audience, positive expiry, caller kind, and sandbox identity when required. A sandbox-to-gateway JWT is not an extension credential even though both token types use the same signing key.
+Return your expected audience in the `expected_audience` field of your `Describe` manifest. OpenShell compares it against the configured value and refuses to start on a mismatch, so a misconfigured audience fails at startup instead of returning an opaque 401 on every request. Leave the field empty to skip the check.
+
+Provision the trusted gateway URL and expected gateway ID separately from token data. The expected issuer is exactly `openshell-gateway:<gateway_id>`; fetching JWKS does not establish that identity by itself. `GET /.well-known/openid-configuration` returns that issuer alongside `jwks_uri`, so a service configured with only the gateway URL can discover both. The document is OIDC-shaped rather than OIDC-compliant: `issuer` is the gateway identity, not the URL serving the document, so compare `iss` against that value and do not infer trust from the document's location. Fetch it over authenticated TLS at the trusted gateway URL, or provision the public key through the deployment when the service cannot reach the gateway.
+
+Cache keys by `kid`. Validate, at minimum:
+
+- `typ` is exactly `openshell-ext+jwt`. Extension tokens and sandbox-to-gateway bootstrap tokens share a signing key and differ only in audience; this header is a second, independent discriminator.
+- `alg` is pinned to `EdDSA`. Never select the algorithm from the token.
+- Signature, expected issuer, exact audience, and positive expiry.
+- `caller_kind`, and the sandbox identity when your service scopes behavior per sandbox.
+
+A sandbox-to-gateway JWT is not an extension credential even though both token types use the same signing key.
+
+Each token carries a unique `jti`. OpenShell does not track it. If your service needs replay resistance beyond the token lifetime, keep a bounded cache of recently seen `jti` values covering at least the maximum token lifetime of one hour and reject repeats.
+
+### Run Without Extension Authentication
+
+Set `allow_insecure_transport = true` on a registration to keep a plaintext `http://` endpoint working. OpenShell then attaches no credential to that service, supervisors do not request one, and the gateway refuses to mint one if asked. The gateway logs a warning naming the registration at every startup.
+
+The service cannot distinguish OpenShell from any other client that can reach it. Use this only where the network already provides that guarantee, and prefer `https://` everywhere else.
 
 ## Apply Middleware with Policy
 
@@ -185,5 +205,7 @@ See [Logging](/observability/logging) for log access and [OCSF JSON Export](/obs
 - The typed operation and phase are `HTTP_REQUEST/PRE_CREDENTIALS`.
 - Selection uses destination host include and exclude patterns.
 - A fail-closed middleware cannot cover `tls: skip` endpoints because OpenShell cannot inspect that traffic. An all-`fail_open` match may cover the endpoint; OpenShell bypasses the middleware and emits a detection finding.
-- Operator-run services use TLS `https://` when gateway JWT signing is enabled. Certificates must chain to the configured custom CA or platform roots, and the endpoint hostname must match.
+- Operator-run services use TLS `https://` when gateway JWT signing is enabled, unless the registration sets `allow_insecure_transport`. Certificates must chain to the configured custom CA or platform roots, and the endpoint hostname must match.
+- Extension tokens and sandbox-to-gateway tokens are signed by the same key. They are separated by audience and by `typ`, but the extension credential path cannot yet be rotated or revoked independently of sandbox admission.
+- OpenShell does not track `jti`; replay resistance within a token's lifetime is the service's responsibility.
 - mTLS client authentication, health checks, runtime registration, and overlapping signing-key rotation are not available.

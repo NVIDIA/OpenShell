@@ -23,7 +23,8 @@ use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
 };
 pub use openshell_extension_core::{
-    ExtensionAudience, ExtensionCallerKind, ExtensionJwtClaims, MAX_EXTENSION_TOKEN_TTL,
+    EXTENSION_JWT_TYP, ExtensionAudience, ExtensionCallerKind, ExtensionJwtClaims,
+    MAX_EXTENSION_TOKEN_TTL,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -203,6 +204,9 @@ impl SandboxJwtIssuer {
         };
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(self.kid.clone());
+        // Explicit typing so an extension that requires this `typ` cannot be
+        // handed a sandbox-to-gateway bootstrap token signed by the same key.
+        header.typ = Some(EXTENSION_JWT_TYP.to_string());
         let token = encode(&header, &claims, &self.encoding_key).map_err(|e| {
             warn!(error = %e, "failed to mint extension JWT");
             Status::internal("failed to mint extension token")
@@ -257,6 +261,12 @@ impl SandboxJwtAuthenticator {
     #[must_use]
     pub const fn jwks(&self) -> &GatewayJwks {
         &self.jwks
+    }
+
+    /// The exact `iss` claim carried by every token this gateway mints.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.issuer
     }
 
     #[allow(clippy::result_large_err)]
@@ -572,6 +582,40 @@ mod tests {
         assert_eq!(claims.sub, "spiffe://openshell/sandbox/sandbox-a");
         assert_eq!(claims.caller_kind, ExtensionCallerKind::Supervisor);
         assert_eq!(claims.sandbox_id.as_deref(), Some("sandbox-a"));
+    }
+
+    #[test]
+    fn extension_tokens_are_explicitly_typed_and_sandbox_tokens_are_not() {
+        let mat = generate_jwt_key().expect("jwt key");
+        let issuer = SandboxJwtIssuer::from_pem(
+            mat.signing_key_pem.as_bytes(),
+            mat.kid.clone(),
+            "gateway-a",
+            Duration::from_secs(3600),
+        )
+        .expect("issuer");
+
+        let extension = issuer
+            .mint_extension_token(
+                &extension_audience("urn:openshell:extension:middleware:scanner"),
+                ExtensionCallerKind::Gateway,
+                None,
+                Duration::from_secs(300),
+            )
+            .expect("extension token");
+        assert_eq!(
+            decode_header(&extension.token).unwrap().typ.as_deref(),
+            Some(EXTENSION_JWT_TYP)
+        );
+
+        // The discriminator is only useful if the sandbox bootstrap token does
+        // not carry it. A verifier requiring `openshell-ext+jwt` must reject a
+        // gateway admission credential even though both share a signing key.
+        let sandbox = issuer.mint("sandbox-a").expect("sandbox token");
+        assert_ne!(
+            decode_header(&sandbox.token).unwrap().typ.as_deref(),
+            Some(EXTENSION_JWT_TYP)
+        );
     }
 
     #[test]

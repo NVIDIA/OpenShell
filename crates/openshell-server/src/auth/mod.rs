@@ -11,6 +11,7 @@
 pub mod authenticator;
 pub mod authz;
 pub mod descriptor_authz;
+pub mod extension_mint_limit;
 pub mod guard;
 mod http;
 pub mod identity;
