@@ -10,8 +10,8 @@ use std::sync::Arc;
 use miette::{Result, miette};
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse,
+    AgentConversationEvaluation, AgentConversationResult, HttpRequestEvaluation, HttpRequestResult,
+    MiddlewareManifest, ValidateConfigRequest, ValidateConfigResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -85,6 +85,15 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
         evaluate_http_request(&request.into_inner())
             .map(Response::new)
             .map_err(|error| Status::invalid_argument(error.to_string()))
+    }
+
+    async fn evaluate_agent_conversation(
+        &self,
+        _request: Request<AgentConversationEvaluation>,
+    ) -> Result<Response<AgentConversationResult>, Status> {
+        Err(Status::unimplemented(
+            "regex middleware does not inspect agent conversations",
+        ))
     }
 }
 

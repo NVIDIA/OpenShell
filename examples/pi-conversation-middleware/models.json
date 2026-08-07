@@ -1,0 +1,26 @@
+{
+  "providers": {
+    "openai-chat-prototype": {
+      "baseUrl": "https://api.openai.com/v1",
+      "api": "openai-completions",
+      "apiKey": "$OPENAI_API_KEY",
+      "authHeader": true,
+      "models": [
+        {
+          "id": "gpt-4o-mini",
+          "name": "GPT-4o mini (middleware prototype)",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 128000,
+          "maxTokens": 4096,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
+    }
+  }
+}

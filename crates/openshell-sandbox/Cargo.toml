@@ -26,6 +26,9 @@ openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 # Async runtime
 tokio = { workspace = true }
 
+# Stable workload-facing hook bridge
+axum = { workspace = true }
+
 # gRPC (tonic::Status downcast in error mapping)
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 prost-types = { workspace = true }
@@ -46,6 +49,7 @@ rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 prost = { workspace = true }
+uuid = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
@@ -63,10 +67,12 @@ telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
+openshell-pi-conversation-middleware = { path = "../openshell-pi-conversation-middleware" }
 tempfile = "3"
 temp-env = "0.3"
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
+reqwest = { workspace = true }
 
 [lints]
 workspace = true

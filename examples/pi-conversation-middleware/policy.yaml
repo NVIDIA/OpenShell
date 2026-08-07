@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 1
+
+network_middlewares:
+  pi-conversation:
+    name: Pi conversation attestation
+    middleware: pi-conversation-prototype
+    order: 10
+    config:
+      policy_revision: prototype-v1
+    on_error: fail_closed
+    endpoints:
+      include:
+        - api.openai.com
+
+network_policies:
+  openai-chat-completions:
+    name: OpenAI Chat Completions
+    endpoints:
+      - host: api.openai.com
+        port: 443
+        protocol: rest
+        rules:
+          - allow:
+              method: POST
+              path: /v1/chat/completions
+    binaries:
+      - path: /usr/local/bin/node
+      - path: /usr/bin/node

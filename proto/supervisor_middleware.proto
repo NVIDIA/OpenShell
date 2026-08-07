@@ -20,6 +20,10 @@ service SupervisorMiddleware {
   // EvaluateHttpRequest returns an allow, deny, or mutation decision for one
   // buffered HTTP request.
   rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult);
+
+  // EvaluateAgentConversation inspects and optionally replaces one complete
+  // model-visible conversation before an agent harness invokes its provider.
+  rpc EvaluateAgentConversation(AgentConversationEvaluation) returns (AgentConversationResult);
 }
 
 // MiddlewareManifest describes one middleware service and the bindings it
@@ -38,9 +42,9 @@ message MiddlewareManifest {
 
 // MiddlewareBinding declares one operation and phase supported by a service.
 message MiddlewareBinding {
-  // Supported operation. V1 supports HTTP_REQUEST.
+  // Supported operation.
   SupervisorMiddlewareOperation operation = 1;
-  // Supported evaluation phase. V1 supports PRE_CREDENTIALS.
+  // Supported evaluation phase.
   SupervisorMiddlewarePhase phase = 2;
   // Maximum request or replacement body this binding can process.
   uint64 max_body_bytes = 3;
@@ -50,6 +54,15 @@ message MiddlewareBinding {
   // Values use an integer with an `ms` or `s` suffix and must be between
   // 10ms and 30s.
   string timeout = 4;
+  // Agent harness supported by an AGENT_CONVERSATION binding, initially "pi".
+  // Empty for HTTP_REQUEST bindings.
+  string harness = 5;
+  // Harness hook supported by an AGENT_CONVERSATION binding. Empty for
+  // HTTP_REQUEST bindings.
+  string hook = 6;
+  // Version of the hook payload schema, initially "v1". Empty for HTTP_REQUEST
+  // bindings.
+  string schema_version = 7;
 }
 
 // ValidateConfigRequest contains one policy configuration to validate.
@@ -104,12 +117,14 @@ message HttpHeader {
 enum SupervisorMiddlewareOperation {
   SUPERVISOR_MIDDLEWARE_OPERATION_UNSPECIFIED = 0;
   SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST = 1;
+  SUPERVISOR_MIDDLEWARE_OPERATION_AGENT_CONVERSATION = 2;
 }
 
 // Ordered phase within a supervisor operation.
 enum SupervisorMiddlewarePhase {
   SUPERVISOR_MIDDLEWARE_PHASE_UNSPECIFIED = 0;
   SUPERVISOR_MIDDLEWARE_PHASE_PRE_CREDENTIALS = 1;
+  SUPERVISOR_MIDDLEWARE_PHASE_AGENT_CONTEXT = 2;
 }
 
 // RequestContext identifies the sandbox request being evaluated.
@@ -146,6 +161,58 @@ message Process {
   uint32 pid = 2;
   // Executable paths for ancestor processes, nearest parent first.
   repeated string ancestors = 3;
+}
+
+// ConversationRequestV1 is the only model-visible conversation shape supported
+// by the prototype. It represents a narrow OpenAI Chat Completions projection:
+// ordered messages with string content and no tools or multipart values.
+message ConversationRequestV1 {
+  string model = 1;
+  repeated ConversationMessageV1 messages = 2;
+}
+
+message ConversationMessageV1 {
+  string role = 1;
+  string content = 2;
+}
+
+// AgentConversationTarget identifies the harness hook and provider destination
+// for which the replacement conversation will be attested.
+message AgentConversationTarget {
+  string harness = 1;
+  string harness_version = 2;
+  string hook = 3;
+  string schema_version = 4;
+  string scheme = 5;
+  string host = 6;
+  uint32 port = 7;
+  string path = 8;
+}
+
+// AgentConversationEvaluation is stamped by the supervisor bridge. Workload
+// callers do not supply the trusted RequestContext or middleware selection.
+message AgentConversationEvaluation {
+  SupervisorMiddlewarePhase phase = 1;
+  RequestContext context = 2;
+  google.protobuf.Struct config = 3;
+  AgentConversationTarget target = 4;
+  ConversationRequestV1 conversation = 5;
+  string middleware_name = 6;
+  string session_id = 7;
+  string turn_id = 8;
+}
+
+// AgentConversationResult returns the complete replacement conversation and an
+// opaque attestation that the harness attaches to its provider request.
+message AgentConversationResult {
+  Decision decision = 1;
+  string reason = 2;
+  ConversationRequestV1 conversation = 3;
+  bool has_conversation = 4;
+  bytes attestation = 5;
+  repeated Finding findings = 6;
+  map<string, string> metadata = 7;
+  string reason_code = 8;
 }
 
 // Decision controls whether OpenShell continues processing the request.

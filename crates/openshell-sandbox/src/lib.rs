@@ -6,6 +6,7 @@
 //! This crate provides process sandboxing and monitoring capabilities.
 
 mod activity_aggregator;
+mod agent_bridge;
 mod denial_aggregator;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod google_cloud_metadata;
@@ -397,6 +398,78 @@ pub async fn run_sandbox(
     } else {
         None
     };
+
+    // Prototype Pi hook bridge. It binds inside the workload network namespace
+    // and proxies typed hook requests through the supervisor-owned middleware
+    // registry. The operator service must also be selected as network
+    // middleware so it is present in the synchronized registry.
+    if let Ok(middleware_name) = std::env::var(agent_bridge::MIDDLEWARE_ENV) {
+        if middleware_name.trim().is_empty() {
+            return Err(miette::miette!(
+                "{} cannot be empty",
+                agent_bridge::MIDDLEWARE_ENV
+            ));
+        }
+        if sidecar_network_enforcement {
+            return Err(miette::miette!(
+                "Pi conversation bridge is not yet supported in sidecar topology"
+            ));
+        }
+        let engine = opa_engine.as_ref().ok_or_else(|| {
+            miette::miette!("Pi conversation bridge requires a middleware registry")
+        })?;
+        let proto = retained_proto.as_ref().ok_or_else(|| {
+            miette::miette!("Pi conversation bridge requires gateway policy data")
+        })?;
+        let mut matching_configs = proto
+            .network_middlewares
+            .values()
+            .filter(|config| config.middleware == middleware_name);
+        let middleware_config = matching_configs
+            .next()
+            .ok_or_else(|| {
+                miette::miette!(
+                    "Pi conversation middleware '{middleware_name}' must be selected by network policy"
+                )
+            })?
+            .config
+            .clone()
+            .unwrap_or_default();
+        if matching_configs.next().is_some() {
+            return Err(miette::miette!(
+                "Pi conversation prototype requires exactly one network policy config for '{middleware_name}'"
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        let listener = netns
+            .as_ref()
+            .ok_or_else(|| miette::miette!("Pi conversation bridge requires network enforcement"))?
+            .bind_tcp_in_netns(agent_bridge::BRIDGE_ADDR)
+            .await?;
+        #[cfg(not(target_os = "linux"))]
+        let listener = tokio::net::TcpListener::bind(agent_bridge::BRIDGE_ADDR)
+            .await
+            .into_diagnostic()?;
+        agent_bridge::spawn(
+            listener,
+            engine.middleware_runner()?,
+            agent_bridge::BridgeConfig {
+                middleware_name,
+                sandbox_id: sandbox_id.clone().unwrap_or_default(),
+                provider_host: std::env::var(agent_bridge::PROVIDER_HOST_ENV)
+                    .unwrap_or_else(|_| "api.openai.com".into()),
+                middleware_config,
+            },
+        );
+        provider_env.insert(
+            agent_bridge::BRIDGE_URL_ENV.into(),
+            agent_bridge::BRIDGE_URL.into(),
+        );
+        info!(
+            url = agent_bridge::BRIDGE_URL,
+            "Pi conversation bridge ready"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     let sidecar_control_server = if network_enabled && sidecar_network_enforcement {
