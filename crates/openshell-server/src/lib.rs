@@ -454,13 +454,33 @@ pub(crate) async fn run_server(
         // namespace and service account used by the Kubernetes driver.
         let kubernetes_config =
             compute::driver_config::kubernetes_config_for_k8s_sa_bootstrap(config_file.as_ref())?;
-        let sandbox_namespace = kubernetes_config.namespace;
-        let sandbox_service_account = kubernetes_config.service_account_name;
+        let sandbox_namespace = kubernetes_config.namespace.clone();
+        let sandbox_service_account = kubernetes_config.service_account_name.clone();
+        let namespace_validator = match kubernetes_config.workspace_mode {
+            openshell_driver_kubernetes::WorkspaceMode::Shared => {
+                auth::k8s_sa::NamespaceValidator::Exact(kubernetes_config.namespace)
+            }
+            openshell_driver_kubernetes::WorkspaceMode::Managed => {
+                auth::k8s_sa::NamespaceValidator::Prefix(
+                    openshell_driver_kubernetes::managed_namespace_prefix(
+                        &kubernetes_config.gateway_id,
+                    ),
+                )
+            }
+            openshell_driver_kubernetes::WorkspaceMode::Operator => {
+                // The operator allowlist is populated at runtime by the label
+                // watcher and file watcher. An empty initial set is fail-closed
+                // until the watcher populates it.
+                auth::k8s_sa::NamespaceValidator::Allowlist(Arc::new(std::sync::RwLock::new(
+                    std::collections::BTreeSet::new(),
+                )))
+            }
+        };
         match kube::Client::try_default().await {
             Ok(client) => {
                 let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
                     client,
-                    &sandbox_namespace,
+                    namespace_validator,
                     "openshell-gateway".to_string(),
                     sandbox_service_account.clone(),
                 ));

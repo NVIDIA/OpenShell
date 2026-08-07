@@ -7,11 +7,12 @@ use super::AppArmorProfile;
 use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, SupervisorSideloadMethod,
-    SupervisorTopology,
+    SupervisorTopology, WorkspaceMode, managed_namespace,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Volume, VolumeMount,
+    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, ServiceAccount,
+    Volume, VolumeMount,
 };
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams, Preconditions};
 use kube::core::gvk::GroupVersionKind;
@@ -20,8 +21,9 @@ use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
-    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH, openshell_sandbox_label_selector,
+    LABEL_GATEWAY_ID, LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID,
+    LABEL_SANDBOX_NAME, LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH,
+    openshell_sandbox_label_selector,
 };
 use openshell_core::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_core::progress::{
@@ -451,6 +453,9 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 impl KubernetesComputeDriver {
     pub async fn new(config: KubernetesComputeConfig) -> Result<Self, KubernetesDriverError> {
         config
+            .validate_workspace_mode()
+            .map_err(KubernetesDriverError::Precondition)?;
+        config
             .validate_provider_spiffe_workload_api_socket_path()
             .map_err(KubernetesDriverError::Precondition)?;
         config
@@ -508,6 +513,169 @@ impl KubernetesComputeDriver {
         &self.config.ssh_socket_path
     }
 
+    pub fn workspace_mode(&self) -> WorkspaceMode {
+        self.config.workspace_mode
+    }
+
+    /// Ensure the K8s namespace for a workspace exists (managed mode only).
+    ///
+    /// Idempotent: returns the namespace name whether it was just created or
+    /// already existed. Also creates the sandbox `ServiceAccount` in the
+    /// namespace.
+    pub async fn ensure_namespace(&self, workspace: &str) -> Result<String, KubernetesDriverError> {
+        let ns_name = managed_namespace(&self.config.gateway_id, workspace);
+        let ns_api: Api<Namespace> = Api::all(self.client.clone());
+
+        let gateway_ns_api: Api<Namespace> = Api::all(self.client.clone());
+        let gateway_ns_annotations = match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            gateway_ns_api.get(&self.config.namespace),
+        )
+        .await
+        {
+            Ok(Ok(ns)) => ns.metadata.annotations.unwrap_or_default(),
+            _ => BTreeMap::new(),
+        };
+
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            LABEL_MANAGED_BY.to_string(),
+            LABEL_MANAGED_BY_VALUE.to_string(),
+        );
+        labels.insert(LABEL_GATEWAY_ID.to_string(), self.config.gateway_id.clone());
+        labels.insert(LABEL_SANDBOX_WORKSPACE.to_string(), workspace.to_string());
+
+        let mut annotations = BTreeMap::new();
+        for key in [
+            crate::config::ANNOTATION_SCC_UID_RANGE,
+            crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
+        ] {
+            if let Some(val) = gateway_ns_annotations.get(key) {
+                annotations.insert(key.to_string(), val.clone());
+            }
+        }
+
+        let ns = Namespace {
+            metadata: ObjectMeta {
+                name: Some(ns_name.clone()),
+                labels: Some(labels),
+                annotations: if annotations.is_empty() {
+                    None
+                } else {
+                    Some(annotations)
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        match tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.create(&PostParams::default(), &ns))
+            .await
+        {
+            Ok(Ok(_)) => {
+                info!(namespace = %ns_name, workspace = %workspace, "created managed namespace");
+            }
+            Ok(Err(KubeError::Api(api))) if api.code == 409 => {
+                debug!(namespace = %ns_name, "managed namespace already exists");
+            }
+            Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
+            Err(_) => {
+                return Err(KubernetesDriverError::Message(format!(
+                    "timeout creating namespace {ns_name}"
+                )));
+            }
+        }
+
+        self.ensure_service_account(&ns_name).await?;
+
+        Ok(ns_name)
+    }
+
+    async fn ensure_service_account(&self, namespace: &str) -> Result<(), KubernetesDriverError> {
+        let sa_api: Api<ServiceAccount> = Api::namespaced(self.client.clone(), namespace);
+        let sa = ServiceAccount {
+            metadata: ObjectMeta {
+                name: Some(self.config.service_account_name.clone()),
+                labels: Some(BTreeMap::from([(
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string(),
+                )])),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        match tokio::time::timeout(KUBE_API_TIMEOUT, sa_api.create(&PostParams::default(), &sa))
+            .await
+        {
+            Ok(Ok(_)) => {
+                info!(namespace = %namespace, sa = %self.config.service_account_name, "created service account");
+            }
+            Ok(Err(KubeError::Api(api))) if api.code == 409 => {}
+            Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
+            Err(_) => {
+                return Err(KubernetesDriverError::Message(format!(
+                    "timeout creating service account in {namespace}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete the managed namespace if it contains no sandboxes (managed mode
+    /// only). Called after sandbox deletion.
+    pub async fn delete_namespace_if_empty(
+        &self,
+        workspace: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        let ns_name = managed_namespace(&self.config.gateway_id, workspace);
+
+        let sandbox_api_version = self
+            .supported_sandbox_api_version(self.client.clone())
+            .await
+            .map_err(KubernetesDriverError::Message)?;
+        let agent_api = Self::agent_sandbox_api(self.client.clone(), sandbox_api_version, &ns_name);
+
+        let lp = ListParams::default()
+            .labels(&openshell_sandbox_label_selector())
+            .limit(1);
+        let list = tokio::time::timeout(KUBE_API_TIMEOUT, agent_api.api.list(&lp))
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(format!("timeout listing sandboxes in {ns_name}"))
+            })?
+            .map_err(KubernetesDriverError::from_kube)?;
+
+        if !list.items.is_empty() {
+            debug!(namespace = %ns_name, "namespace still has sandboxes, skipping delete");
+            return Ok(());
+        }
+
+        let ns_api: Api<Namespace> = Api::all(self.client.clone());
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            ns_api.delete(&ns_name, &DeleteParams::default()),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                info!(namespace = %ns_name, workspace = %workspace, "deleted empty managed namespace");
+            }
+            Ok(Err(KubeError::Api(api))) if api.code == 404 => {
+                debug!(namespace = %ns_name, "managed namespace already deleted");
+            }
+            Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
+            Err(_) => {
+                return Err(KubernetesDriverError::Message(format!(
+                    "timeout deleting namespace {ns_name}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     fn validate_driver_config_for_sandbox(
         &self,
         sandbox: &Sandbox,
@@ -522,16 +690,70 @@ impl KubernetesComputeDriver {
         )
     }
 
-    fn agent_sandbox_api(&self, client: Client, sandbox_api_version: &str) -> AgentSandboxApi {
+    fn agent_sandbox_api(
+        client: Client,
+        sandbox_api_version: &str,
+        namespace: &str,
+    ) -> AgentSandboxApi {
         let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, sandbox_api_version, SANDBOX_KIND);
         let resource = ApiResource::from_gvk(&gvk);
-        let api = Api::namespaced_with(client, &self.config.namespace, &resource);
+        let api = Api::namespaced_with(client, namespace, &resource);
         AgentSandboxApi { api, resource }
     }
 
-    async fn supported_agent_sandbox_api(&self, client: Client) -> Result<AgentSandboxApi, String> {
+    fn cluster_wide_sandbox_api(client: Client, sandbox_api_version: &str) -> AgentSandboxApi {
+        let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, sandbox_api_version, SANDBOX_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        let api = Api::all_with(client, &resource);
+        AgentSandboxApi { api, resource }
+    }
+
+    async fn supported_agent_sandbox_api(
+        &self,
+        client: Client,
+        namespace: &str,
+    ) -> Result<AgentSandboxApi, String> {
         let sandbox_api_version = self.supported_sandbox_api_version(client.clone()).await?;
-        Ok(self.agent_sandbox_api(client, sandbox_api_version))
+        Ok(Self::agent_sandbox_api(
+            client,
+            sandbox_api_version,
+            namespace,
+        ))
+    }
+
+    async fn supported_sandbox_api_for_lookup(
+        &self,
+        client: Client,
+    ) -> Result<AgentSandboxApi, String> {
+        let sandbox_api_version = self.supported_sandbox_api_version(client.clone()).await?;
+        if self.config.is_multi_namespace() {
+            Ok(Self::cluster_wide_sandbox_api(client, sandbox_api_version))
+        } else {
+            Ok(Self::agent_sandbox_api(
+                client,
+                sandbox_api_version,
+                &self.config.namespace,
+            ))
+        }
+    }
+
+    fn sandbox_lookup_selector(&self, sandbox_id: &str) -> String {
+        let mut selector =
+            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id}");
+        if self.config.workspace_mode == WorkspaceMode::Managed {
+            use std::fmt::Write;
+            write!(selector, ",{LABEL_GATEWAY_ID}={}", self.config.gateway_id).unwrap();
+        }
+        selector
+    }
+
+    fn openshell_sandbox_selector(&self) -> String {
+        let mut selector = openshell_sandbox_label_selector();
+        if self.config.workspace_mode == WorkspaceMode::Managed {
+            use std::fmt::Write;
+            write!(selector, ",{LABEL_GATEWAY_ID}={}", self.config.gateway_id).unwrap();
+        }
+        selector
     }
 
     async fn supported_sandbox_api_version(&self, client: Client) -> Result<&'static str, String> {
@@ -548,7 +770,11 @@ impl KubernetesComputeDriver {
         client: Client,
     ) -> Result<&'static str, String> {
         for sandbox_api_version in SANDBOX_VERSIONS {
-            let agent_sandbox_api = self.agent_sandbox_api(client.clone(), sandbox_api_version);
+            let agent_sandbox_api = Self::agent_sandbox_api(
+                client.clone(),
+                sandbox_api_version,
+                &self.config.namespace,
+            );
             match tokio::time::timeout(
                 KUBE_API_TIMEOUT,
                 agent_sandbox_api.api.list(&ListParams::default().limit(1)),
@@ -586,39 +812,27 @@ impl KubernetesComputeDriver {
         ))
     }
 
-    /// Resolve sandbox UID/GID from config or `OpenShift` SCC namespace annotations.
-    ///
-    /// Returns `(uid, gid, ns_annotations_map)`:
-    /// - If `sandbox_uid` is set in config, returns that (with fallback GID)
-    /// - Otherwise fetches the target namespace and checks for
-    ///   `openshift.io/sa.scc.uid-range` / `openshift.io/sa.scc.supplemental-groups`
-    ///   annotations.
-    /// - If neither config nor `OpenShift` is found, returns `(1000, 1000, {})` as defaults.
-    async fn resolve_sandbox_identity(&self) -> (u32, u32, BTreeMap<String, String>) {
-        // Explicit config takes priority — skip namespace lookup entirely.
+    async fn resolve_sandbox_identity_in_namespace(
+        &self,
+        namespace: &str,
+    ) -> (u32, u32, BTreeMap<String, String>) {
         if self.config.sandbox_uid.is_some() {
             let uid = self.config.resolve_sandbox_uid(None);
             let gid = self.config.resolve_sandbox_gid(uid, None);
             return (uid, gid, BTreeMap::new());
         }
 
-        // Try to read namespace annotations for OpenShift SCC.
-        // Namespace is namespaced so Api::all works (it's cluster-scoped but
-        // can list all namespaces) and we filter by name, or use Api::namespaced.
         let ns_api: Api<Namespace> = Api::all(self.client.clone());
-        match tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.get(self.config.namespace.as_str()))
-            .await
-        {
+        match tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.get(namespace)).await {
             Ok(Ok(ns)) => {
                 let anns = ns.metadata.annotations.unwrap_or_default();
                 tracing::info!(
-                    namespace = %self.config.namespace,
+                    namespace = %namespace,
                     uid_range = ?anns.get(crate::config::ANNOTATION_SCC_UID_RANGE),
                     sup_groups = ?anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS),
                     "Resolved namespace annotations for sandbox identity"
                 );
                 let uid = self.config.resolve_sandbox_uid(Some(&anns));
-                // Explicit sandbox_gid config wins; SCC annotation only applies when not set.
                 let baseline_gid = self.config.resolve_sandbox_gid(uid, None);
                 let gid = self.config.sandbox_gid.map_or_else(
                     || {
@@ -637,7 +851,7 @@ impl KubernetesComputeDriver {
             }
             Ok(Err(e)) => {
                 tracing::warn!(
-                    namespace = %self.config.namespace,
+                    namespace = %namespace,
                     error = %e,
                     "Failed to fetch namespace for SCC annotations, falling back to defaults"
                 );
@@ -647,7 +861,7 @@ impl KubernetesComputeDriver {
             }
             Err(_) => {
                 tracing::warn!(
-                    namespace = %self.config.namespace,
+                    namespace = %namespace,
                     "Namespace fetch timed out, falling back to defaults"
                 );
                 let uid = DEFAULT_SANDBOX_UID;
@@ -672,7 +886,15 @@ impl KubernetesComputeDriver {
         let _ = self
             .validate_driver_config_for_sandbox(sandbox)
             .map_err(tonic::Status::invalid_argument)?;
-        validate_kube_resource_name_length(&sandbox.workspace, &sandbox.name)?;
+        match self.config.workspace_mode {
+            WorkspaceMode::Shared => {
+                validate_kube_resource_name_length(&sandbox.workspace, &sandbox.name)?;
+            }
+            WorkspaceMode::Managed | WorkspaceMode::Operator => {
+                validate_kubernetes_dns1123_label(&sandbox.name, "sandbox name")
+                    .map_err(tonic::Status::invalid_argument)?;
+            }
+        }
         let gpu_requirements = sandbox
             .spec
             .as_ref()
@@ -693,15 +915,14 @@ impl KubernetesComputeDriver {
     pub async fn get_sandbox(&self, sandbox_id: &str) -> Result<Option<Sandbox>, String> {
         info!(
             sandbox_id = %sandbox_id,
-            namespace = %self.config.namespace,
+            workspace_mode = %self.config.workspace_mode,
             "Fetching sandbox from Kubernetes"
         );
 
         let agent_sandbox_api = self
-            .supported_agent_sandbox_api(self.client.clone())
+            .supported_sandbox_api_for_lookup(self.client.clone())
             .await?;
-        let selector =
-            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id}");
+        let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
         match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.list(&lp)).await {
             Ok(Ok(list)) => list.items.into_iter().next().map_or_else(
@@ -710,9 +931,12 @@ impl KubernetesComputeDriver {
                     Ok(None)
                 },
                 |obj| {
-                    Ok(sandbox_from_object(&self.config.namespace, obj)
-                        .ok()
-                        .map(|(_, s)| s))
+                    let ns = obj
+                        .metadata
+                        .namespace
+                        .clone()
+                        .unwrap_or_else(|| self.config.namespace.clone());
+                    Ok(sandbox_from_object(&ns, obj).ok().map(|(_, s)| s))
                 },
             ),
             Ok(Err(err)) => {
@@ -739,18 +963,19 @@ impl KubernetesComputeDriver {
 
     pub async fn list_sandboxes(&self) -> Result<Vec<Sandbox>, String> {
         info!(
-            namespace = %self.config.namespace,
+            workspace_mode = %self.config.workspace_mode,
             "Listing sandboxes from Kubernetes"
         );
 
         let agent_sandbox_api = self
-            .supported_agent_sandbox_api(self.client.clone())
+            .supported_sandbox_api_for_lookup(self.client.clone())
             .await?;
+        let selector = self.openshell_sandbox_selector();
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             agent_sandbox_api
                 .api
-                .list(&ListParams::default().labels(&openshell_sandbox_label_selector())),
+                .list(&ListParams::default().labels(&selector)),
         )
         .await
         {
@@ -760,7 +985,12 @@ impl KubernetesComputeDriver {
                     .into_iter()
                     .filter_map(|obj| {
                         let name = obj.metadata.name.clone().unwrap_or_default();
-                        match sandbox_from_object(&self.config.namespace, obj) {
+                        let ns = obj
+                            .metadata
+                            .namespace
+                            .clone()
+                            .unwrap_or_else(|| self.config.namespace.clone());
+                        match sandbox_from_object(&ns, obj) {
                             Ok((_, s)) => Some(s),
                             Err(err) => {
                                 warn!(object_name = %name, error = %err, "skipping unrecognized Sandbox in list");
@@ -778,7 +1008,6 @@ impl KubernetesComputeDriver {
             }
             Ok(Err(err)) => {
                 warn!(
-                    namespace = %self.config.namespace,
                     error = %err,
                     "Failed to list sandboxes from Kubernetes"
                 );
@@ -786,7 +1015,6 @@ impl KubernetesComputeDriver {
             }
             Err(_elapsed) => {
                 warn!(
-                    namespace = %self.config.namespace,
                     timeout_secs = KUBE_API_TIMEOUT.as_secs(),
                     "Timed out listing sandboxes from Kubernetes"
                 );
@@ -813,21 +1041,32 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::InvalidArgument)?;
 
         let name = sandbox.name.as_str();
+        let workspace = sandbox.workspace.as_str();
+
+        let target_namespace = match self.config.workspace_mode {
+            WorkspaceMode::Shared => self.config.namespace.clone(),
+            WorkspaceMode::Managed => self.ensure_namespace(workspace).await?,
+            WorkspaceMode::Operator => workspace.to_string(),
+        };
+
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %name,
-            namespace = %self.config.namespace,
+            namespace = %target_namespace,
+            workspace = %workspace,
+            workspace_mode = %self.config.workspace_mode,
             "Creating sandbox in Kubernetes"
         );
 
         let agent_sandbox_api = self
-            .supported_agent_sandbox_api(self.client.clone())
+            .supported_agent_sandbox_api(self.client.clone(), &target_namespace)
             .await
             .map_err(KubernetesDriverError::Message)?;
 
         // Resolve sandbox UID/GID from config or OpenShift SCC namespace annotations.
-        let (resolved_user_id, resolved_group_id, ns_annotations) =
-            self.resolve_sandbox_identity().await;
+        let (resolved_user_id, resolved_group_id, ns_annotations) = self
+            .resolve_sandbox_identity_in_namespace(&target_namespace)
+            .await;
 
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
@@ -866,11 +1105,8 @@ impl KubernetesComputeDriver {
 
         let data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
-        let kube_name = kube_resource_name(&sandbox.workspace, name);
+        let kube_name = self.config.kube_resource_name(workspace, name);
         let mut obj = DynamicObject::new(&kube_name, &agent_sandbox_api.resource);
-        // Copy only the SCC-related annotations onto the Sandbox CR for
-        // traceability. Copying the full namespace annotation map exposes
-        // unrelated cluster metadata and can fail with oversized annotations.
         let mut annotations = sandbox_annotations(sandbox);
         for key in [
             crate::config::ANNOTATION_SCC_UID_RANGE,
@@ -882,7 +1118,7 @@ impl KubernetesComputeDriver {
         }
         obj.metadata = ObjectMeta {
             name: Some(kube_name),
-            namespace: Some(self.config.namespace.clone()),
+            namespace: Some(target_namespace),
             labels: Some(sandbox_labels(sandbox)),
             annotations: Some(annotations),
             ..Default::default()
@@ -930,19 +1166,18 @@ impl KubernetesComputeDriver {
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
         info!(
             sandbox_id = %sandbox_id,
-            namespace = %self.config.namespace,
+            workspace_mode = %self.config.workspace_mode,
             "Deleting sandbox from Kubernetes"
         );
 
-        let agent_sandbox_api = self
-            .supported_agent_sandbox_api(self.client.clone())
+        let lookup_api = self
+            .supported_sandbox_api_for_lookup(self.client.clone())
             .await?;
-        let selector =
-            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id}");
+        let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
-        let (kube_name, preconditions) = match tokio::time::timeout(
+        let (kube_name, obj_namespace, workspace, preconditions) = match tokio::time::timeout(
             KUBE_API_TIMEOUT,
-            agent_sandbox_api.api.list(&lp),
+            lookup_api.api.list(&lp),
         )
         .await
         {
@@ -950,11 +1185,22 @@ impl KubernetesComputeDriver {
                 if let Some(obj) = list.items.into_iter().next() {
                     match obj.metadata.name {
                         Some(name) => {
+                            let ns = obj
+                                .metadata
+                                .namespace
+                                .clone()
+                                .unwrap_or_else(|| self.config.namespace.clone());
+                            let ws = obj
+                                .metadata
+                                .labels
+                                .as_ref()
+                                .and_then(|l| l.get(LABEL_SANDBOX_WORKSPACE).cloned())
+                                .unwrap_or_default();
                             let pc = Preconditions {
                                 uid: obj.metadata.uid,
                                 resource_version: obj.metadata.resource_version,
                             };
-                            (name, pc)
+                            (name, ns, ws, pc)
                         }
                         None => return Ok(false),
                     }
@@ -984,15 +1230,22 @@ impl KubernetesComputeDriver {
             }
         };
 
+        let delete_api = self
+            .supported_agent_sandbox_api(self.client.clone(), &obj_namespace)
+            .await?;
         let dp = DeleteParams::default().preconditions(preconditions);
-        match tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            agent_sandbox_api.api.delete(&kube_name, &dp),
-        )
-        .await
-        {
+        match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.delete(&kube_name, &dp)).await {
             Ok(Ok(_response)) => {
-                info!(sandbox_id = %sandbox_id, "Sandbox deleted from Kubernetes");
+                info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Sandbox deleted from Kubernetes");
+                if self.config.workspace_mode == WorkspaceMode::Managed
+                    && let Err(e) = self.delete_namespace_if_empty(&workspace).await
+                {
+                    warn!(
+                        workspace = %workspace,
+                        error = %e,
+                        "Failed to clean up empty managed namespace after sandbox deletion"
+                    );
+                }
                 Ok(true)
             }
             Ok(Err(KubeError::Api(err))) if err.code == 404 || err.code == 409 => {
@@ -1023,10 +1276,9 @@ impl KubernetesComputeDriver {
 
     pub async fn sandbox_exists(&self, sandbox_id: &str) -> Result<bool, String> {
         let agent_sandbox_api = self
-            .supported_agent_sandbox_api(self.client.clone())
+            .supported_sandbox_api_for_lookup(self.client.clone())
             .await?;
-        let selector =
-            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id}");
+        let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
         match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.list(&lp)).await {
             Ok(Ok(list)) => Ok(!list.items.is_empty()),
@@ -1041,9 +1293,17 @@ impl KubernetesComputeDriver {
     // Kept `async` to match the gRPC handler signature in `grpc.rs`, which awaits this method.
     #[allow(clippy::unused_async)]
     pub async fn watch_sandboxes(&self) -> Result<WatchStream, String> {
+        if self.config.is_multi_namespace() {
+            self.watch_sandboxes_cluster_wide().await
+        } else {
+            self.watch_sandboxes_single_namespace().await
+        }
+    }
+
+    async fn watch_sandboxes_single_namespace(&self) -> Result<WatchStream, String> {
         let namespace = self.config.namespace.clone();
         let agent_sandbox_api = self
-            .supported_agent_sandbox_api(self.watch_client.clone())
+            .supported_agent_sandbox_api(self.watch_client.clone(), &self.config.namespace)
             .await?;
         let event_api: Api<KubeEventObj> = Api::namespaced(self.watch_client.clone(), &namespace);
         let watcher_config = watcher::Config::default().labels(&openshell_sandbox_label_selector());
@@ -1151,6 +1411,85 @@ impl KubernetesComputeDriver {
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
+
+    async fn watch_sandboxes_cluster_wide(&self) -> Result<WatchStream, String> {
+        let sandbox_api_version = self
+            .supported_sandbox_api_version(self.watch_client.clone())
+            .await?;
+        let cluster_api =
+            Self::cluster_wide_sandbox_api(self.watch_client.clone(), sandbox_api_version);
+        let selector = self.openshell_sandbox_selector();
+        let watcher_config = watcher::Config::default().labels(&selector);
+        let mut sandbox_stream = watcher::watcher(cluster_api.api, watcher_config).boxed();
+        let (tx, rx) = mpsc::channel(256);
+        let default_namespace = self.config.namespace.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = sandbox_stream.try_next() => match result {
+                        Ok(Some(Event::Applied(obj))) => {
+                            let ns = obj.metadata.namespace.clone()
+                                .unwrap_or_else(|| default_namespace.clone());
+                            if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
+                                let event = WatchSandboxesEvent {
+                                    payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                                        WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
+                                    )),
+                                };
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Some(Event::Deleted(obj))) => {
+                            if is_openshell_managed(&obj)
+                                && let Ok(sandbox_id) = sandbox_id_from_object(&obj)
+                            {
+                                let event = WatchSandboxesEvent {
+                                    payload: Some(watch_sandboxes_event::Payload::Deleted(
+                                        WatchSandboxesDeletedEvent { sandbox_id }
+                                    )),
+                                };
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Some(Event::Restarted(objs))) => {
+                            for obj in objs {
+                                let ns = obj.metadata.namespace.clone()
+                                    .unwrap_or_else(|| default_namespace.clone());
+                                if let Ok((_kube_name, sandbox)) = sandbox_from_object(&ns, obj) {
+                                    let event = WatchSandboxesEvent {
+                                        payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                                            WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
+                                        )),
+                                    };
+                                    if tx.send(Ok(event)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = tx.send(Err(KubernetesDriverError::Message(
+                                "sandbox watcher stream ended unexpectedly".to_string()
+                            ))).await;
+                            break;
+                        }
+                        Err(err) => {
+                            let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
+                            break;
+                        }
+                    },
+                    () = tx.closed() => break,
+                }
+            }
+        });
+
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
 }
 
 fn should_try_next_sandbox_api_version(err: &KubeError) -> bool {
@@ -1167,10 +1506,6 @@ fn validate_gpu_request(
     let _ =
         effective_driver_gpu_count(gpu_requirements).map_err(tonic::Status::invalid_argument)?;
     Ok(())
-}
-
-fn kube_resource_name(workspace: &str, name: &str) -> String {
-    format!("{workspace}--{name}")
 }
 
 const MAX_KUBE_NAME_LEN: usize = 63;
@@ -5850,22 +6185,6 @@ mod tests {
     }
 
     #[test]
-    fn kube_resource_name_qualifies_with_workspace() {
-        assert_eq!(kube_resource_name("alpha", "work"), "alpha--work");
-        assert_eq!(
-            kube_resource_name("default", "my-sandbox"),
-            "default--my-sandbox"
-        );
-    }
-
-    #[test]
-    fn kube_resource_name_different_workspaces_produce_different_names() {
-        let alpha = kube_resource_name("alpha", "work");
-        let beta = kube_resource_name("beta", "work");
-        assert_ne!(alpha, beta);
-    }
-
-    #[test]
     fn kube_resource_name_length_validation_accepts_short_names() {
         validate_kube_resource_name_length("default", "my-sandbox").unwrap();
     }
@@ -5959,6 +6278,37 @@ mod tests {
         let result = sandbox_from_object("default", obj);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not managed by openshell"));
+    }
+
+    #[test]
+    fn sandbox_from_object_uses_object_namespace_over_fallback() {
+        let obj = DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("work".to_string()),
+                namespace: Some("openshell-gw1-team-a".to_string()),
+                annotations: Some(BTreeMap::from([
+                    (LABEL_SANDBOX_ID.to_string(), "uuid-cross".to_string()),
+                    (LABEL_SANDBOX_NAME.to_string(), "work".to_string()),
+                    (LABEL_SANDBOX_WORKSPACE.to_string(), "team-a".to_string()),
+                ])),
+                labels: Some(BTreeMap::from([
+                    (LABEL_SANDBOX_ID.to_string(), "uuid-cross".to_string()),
+                    (LABEL_SANDBOX_NAME.to_string(), "work".to_string()),
+                    (LABEL_SANDBOX_WORKSPACE.to_string(), "team-a".to_string()),
+                    (
+                        LABEL_MANAGED_BY.to_string(),
+                        LABEL_MANAGED_BY_VALUE.to_string(),
+                    ),
+                ])),
+                ..Default::default()
+            },
+            data: serde_json::json!({}),
+        };
+
+        let (_, sandbox) = sandbox_from_object("openshell", obj).unwrap();
+        assert_eq!(sandbox.namespace, "openshell-gw1-team-a");
+        assert_eq!(sandbox.workspace, "team-a");
     }
 
     #[test]
