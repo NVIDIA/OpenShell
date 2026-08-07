@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import json
@@ -18,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Never, SupportsIndex, cast
 from urllib.parse import urlparse
 
 import grpc
+import grpc.aio
 import httpx
 
 from ._proto import (
@@ -40,7 +42,13 @@ class _ClientCallDetails(_ClientCallDetailsBase, grpc.ClientCallDetails):
 
 if TYPE_CHECKING:
     import builtins
-    from collections.abc import Callable, Iterator, Mapping, Sequence
+    from collections.abc import (
+        AsyncIterator,
+        Callable,
+        Iterator,
+        Mapping,
+        Sequence,
+    )
 
 
 @dataclass(frozen=True)
@@ -348,60 +356,19 @@ class SandboxClient:
                 CLI's `--insecure` flag for issuers behind self-signed
                 certs. Off by default.
         """
-        cluster_name = cluster or _resolve_active_cluster()
-        gateway_dir = _xdg_config_home() / "openshell" / "gateways" / cluster_name
-        metadata_path = gateway_dir / "metadata.json"
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            raise SandboxError(f"gateway '{cluster_name}' not found") from None
-        if "gateway_endpoint" not in metadata:
-            raise SandboxError(f"gateway '{cluster_name}' metadata missing endpoint")
-        parsed = urlparse(metadata["gateway_endpoint"])
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        endpoint = f"{host}:{port}"
-
-        # TLS transport. Mirror crates/openshell-tui/src/lib.rs
-        # `build_oidc_channel` — for an https gateway, always build a
-        # secure channel and pick the strongest available trust profile.
-        tls: TlsConfig | None = None
-        if parsed.scheme == "https":
-            mtls_dir = gateway_dir / "mtls"
-            ca = mtls_dir / "ca.crt" if (mtls_dir / "ca.crt").exists() else None
-            cert = mtls_dir / "tls.crt" if (mtls_dir / "tls.crt").exists() else None
-            key = mtls_dir / "tls.key" if (mtls_dir / "tls.key").exists() else None
-            if ca is not None and cert is not None and key is not None:
-                # Full mTLS.
-                tls = TlsConfig(ca_path=ca, cert_path=cert, key_path=key)
-            elif ca is not None:
-                # CA-only trust (no client identity).
-                tls = TlsConfig(ca_path=ca)
-            else:
-                # System roots (e.g. OIDC gateway behind a public CA).
-                tls = TlsConfig()
-
-        # OIDC bearer. Mirror the Rust CLI/TUI: the gateway metadata's
-        # `auth_mode` is authoritative — a stale oidc_token.json next to
-        # a non-OIDC gateway should NOT cause us to attach a bearer.
-        bearer_token: Callable[[], str] | None = None
-        bearer_close: Callable[[], None] | None = None
-        if metadata.get("auth_mode") == "oidc":
-            bearer_token, bearer_close = _make_cluster_bearer_provider(
-                gateway_dir,
-                cluster_name,
-                auto_refresh=auto_refresh,
-                write_back=write_back,
-                insecure=insecure,
-            )
-
+        conn = _resolve_gateway_connection(
+            cluster=cluster,
+            auto_refresh=auto_refresh,
+            write_back=write_back,
+            insecure=insecure,
+        )
         return cls(
-            endpoint,
-            tls=tls,
-            bearer_token=bearer_token,
+            conn.endpoint,
+            tls=conn.tls,
+            bearer_token=conn.bearer_token,
             timeout=timeout,
-            cluster_name=cluster_name,
-            _bearer_close=bearer_close,
+            cluster_name=conn.cluster_name,
+            _bearer_close=conn.bearer_close,
         )
 
     def close(self) -> None:
@@ -1608,3 +1575,934 @@ def _resolve_active_cluster() -> str:
     if value == "":
         raise SandboxError("no active gateway configured")
     return value
+
+
+@dataclass(frozen=True)
+class _GatewayConnection:
+    """Resolved transport + auth material for an active gateway.
+
+    Shared by the sync and async clients' `from_active_cluster` so both
+    derive endpoint, TLS, and OIDC bearer wiring from the identical
+    on-disk gateway state (see `_resolve_gateway_connection`).
+    """
+
+    endpoint: str
+    tls: TlsConfig | None
+    bearer_token: Callable[[], str] | None
+    bearer_close: Callable[[], None] | None
+    cluster_name: str
+
+
+def _resolve_gateway_connection(
+    *,
+    cluster: str | None,
+    auto_refresh: bool,
+    write_back: bool,
+    insecure: bool,
+) -> _GatewayConnection:
+    """Read an active gateway's on-disk state into connection material.
+
+    Factored out of `SandboxClient.from_active_cluster` so the async
+    `AsyncSandboxClient.from_active_cluster` resolves endpoint, TLS
+    trust profile, and OIDC bearer provider from the same gateway
+    directory layout. The OIDC kwargs (`auto_refresh`, `write_back`,
+    `insecure`) carry the semantics documented on
+    `SandboxClient.from_active_cluster`.
+    """
+    cluster_name = cluster or _resolve_active_cluster()
+    gateway_dir = _xdg_config_home() / "openshell" / "gateways" / cluster_name
+    metadata_path = gateway_dir / "metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SandboxError(f"gateway '{cluster_name}' not found") from None
+    if "gateway_endpoint" not in metadata:
+        raise SandboxError(f"gateway '{cluster_name}' metadata missing endpoint")
+    parsed = urlparse(metadata["gateway_endpoint"])
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    endpoint = f"{host}:{port}"
+
+    # TLS transport. Mirror crates/openshell-tui/src/lib.rs
+    # `build_oidc_channel` — for an https gateway, always build a
+    # secure channel and pick the strongest available trust profile.
+    tls: TlsConfig | None = None
+    if parsed.scheme == "https":
+        mtls_dir = gateway_dir / "mtls"
+        ca = mtls_dir / "ca.crt" if (mtls_dir / "ca.crt").exists() else None
+        cert = mtls_dir / "tls.crt" if (mtls_dir / "tls.crt").exists() else None
+        key = mtls_dir / "tls.key" if (mtls_dir / "tls.key").exists() else None
+        if ca is not None and cert is not None and key is not None:
+            # Full mTLS.
+            tls = TlsConfig(ca_path=ca, cert_path=cert, key_path=key)
+        elif ca is not None:
+            # CA-only trust (no client identity).
+            tls = TlsConfig(ca_path=ca)
+        else:
+            # System roots (e.g. OIDC gateway behind a public CA).
+            tls = TlsConfig()
+
+    # OIDC bearer. Mirror the Rust CLI/TUI: the gateway metadata's
+    # `auth_mode` is authoritative — a stale oidc_token.json next to
+    # a non-OIDC gateway should NOT cause us to attach a bearer.
+    bearer_token: Callable[[], str] | None = None
+    bearer_close: Callable[[], None] | None = None
+    if metadata.get("auth_mode") == "oidc":
+        bearer_token, bearer_close = _make_cluster_bearer_provider(
+            gateway_dir,
+            cluster_name,
+            auto_refresh=auto_refresh,
+            write_back=write_back,
+            insecure=insecure,
+        )
+
+    return _GatewayConnection(
+        endpoint=endpoint,
+        tls=tls,
+        bearer_token=bearer_token,
+        bearer_close=bearer_close,
+        cluster_name=cluster_name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Async client (asyncio over grpc.aio)
+#
+# Mirrors the synchronous surface above using `grpc.aio`. The sync client
+# stays the canonical implementation; this async variant reuses the same
+# proto stubs, dataclasses, TLS/bearer plumbing, and on-disk gateway state
+# so the two stay in lockstep. Method names and shapes match their sync
+# counterparts, differing only by `async`/`await` and `async with`.
+# ---------------------------------------------------------------------------
+
+
+class _AsyncBearerAuthMixin:
+    """Shared `authorization: Bearer <token>` attachment for `grpc.aio`.
+
+    Async counterpart of `_BearerAuthInterceptor._attach`. The token
+    provider is the same synchronous per-call callable used by the sync
+    client (see `_normalize_bearer` and `_make_cluster_bearer_provider`),
+    invoked once per RPC so runtime token rotation is picked up
+    identically. A refresh performed by an `_OidcRefresher`-backed
+    provider is synchronous, matching the sync client — it runs inline
+    rather than on the event loop's executor.
+
+    Unlike sync gRPC (where a single `grpc.intercept_channel` interceptor
+    covers every call type), `grpc.aio` sorts interceptors into per-call
+    categories by their interface and stops at the first match. So one
+    interceptor object implementing all four interfaces would only ever
+    fire for unary-unary calls. To attach the bearer to *every* RPC —
+    including the server-streaming `ExecSandbox` — this mixin is combined
+    with exactly one `grpc.aio` interceptor interface per subclass, and
+    `AsyncSandboxClient` registers one instance of each.
+    """
+
+    def __init__(self, token_provider: Callable[[], str]) -> None:
+        self._token_provider = token_provider
+
+    def _attach(
+        self, details: grpc.aio.ClientCallDetails
+    ) -> grpc.aio.ClientCallDetails:
+        metadata = grpc.aio.Metadata()
+        if details.metadata is not None:
+            for key, value in details.metadata:
+                metadata.add(key, value)
+        metadata.add("authorization", f"Bearer {self._token_provider()}")
+        return grpc.aio.ClientCallDetails(
+            method=details.method,
+            timeout=details.timeout,
+            metadata=metadata,
+            credentials=details.credentials,
+            wait_for_ready=details.wait_for_ready,
+        )
+
+
+class _AsyncBearerUnaryUnaryInterceptor(
+    _AsyncBearerAuthMixin, grpc.aio.UnaryUnaryClientInterceptor
+):
+    async def intercept_unary_unary(self, continuation, client_call_details, request):
+        return await continuation(self._attach(client_call_details), request)
+
+
+class _AsyncBearerUnaryStreamInterceptor(
+    _AsyncBearerAuthMixin, grpc.aio.UnaryStreamClientInterceptor
+):
+    async def intercept_unary_stream(self, continuation, client_call_details, request):
+        return await continuation(self._attach(client_call_details), request)
+
+
+class _AsyncBearerStreamUnaryInterceptor(
+    _AsyncBearerAuthMixin, grpc.aio.StreamUnaryClientInterceptor
+):
+    async def intercept_stream_unary(
+        self, continuation, client_call_details, request_iterator
+    ):
+        return await continuation(self._attach(client_call_details), request_iterator)
+
+
+class _AsyncBearerStreamStreamInterceptor(
+    _AsyncBearerAuthMixin, grpc.aio.StreamStreamClientInterceptor
+):
+    async def intercept_stream_stream(
+        self, continuation, client_call_details, request_iterator
+    ):
+        return await continuation(self._attach(client_call_details), request_iterator)
+
+
+def _async_bearer_interceptors(
+    token_provider: Callable[[], str],
+) -> builtins.list[grpc.aio.ClientInterceptor]:
+    """One bearer interceptor per `grpc.aio` call category.
+
+    See `_AsyncBearerAuthMixin` for why every category needs its own
+    instance rather than a single all-interfaces interceptor.
+    """
+    return [
+        _AsyncBearerUnaryUnaryInterceptor(token_provider),
+        _AsyncBearerUnaryStreamInterceptor(token_provider),
+        _AsyncBearerStreamUnaryInterceptor(token_provider),
+        _AsyncBearerStreamStreamInterceptor(token_provider),
+    ]
+
+
+class AsyncSandboxSession:
+    """Async twin of `SandboxSession` bound to one sandbox id."""
+
+    def __init__(self, client: AsyncSandboxClient, sandbox: SandboxRef) -> None:
+        self._client = client
+        self.sandbox = sandbox
+        self._workspace = sandbox.workspace
+
+    @property
+    def id(self) -> str:
+        return self.sandbox.id
+
+    async def exec(
+        self,
+        command: Sequence[str],
+        *,
+        stream_output: bool = False,
+        workdir: str | None = None,
+        env: Mapping[str, str] | None = None,
+        stdin: bytes | None = None,
+        timeout_seconds: int | None = None,
+    ) -> ExecResult:
+        return await self._client.exec(
+            self.sandbox.id,
+            command,
+            stream_output=stream_output,
+            workdir=workdir,
+            env=env,
+            stdin=stdin,
+            timeout_seconds=timeout_seconds,
+        )
+
+    async def exec_python(
+        self,
+        function: Callable[..., object],
+        *,
+        args: Sequence[object] = (),
+        kwargs: Mapping[str, object] | None = None,
+        stream_output: bool = False,
+        workdir: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout_seconds: int | None = None,
+    ) -> ExecResult:
+        return await self._client.exec_python(
+            self.sandbox.id,
+            function,
+            args=args,
+            kwargs=kwargs,
+            stream_output=stream_output,
+            workdir=workdir,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
+
+    async def delete(self) -> bool:
+        return await self._client.delete(self.sandbox.name, workspace=self._workspace)
+
+
+class AsyncSandboxClient:
+    """Async gRPC client for sandbox CRUD and command execution.
+
+    Async twin of `SandboxClient` built on `grpc.aio`. Reuses the same
+    proto stubs, `TlsConfig`, bearer-auth plumbing, and on-disk gateway
+    resolution; the method surface mirrors the sync client with
+    `async`/`await` and `async with` support.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        tls: TlsConfig | None = None,
+        bearer_token: str | Callable[[], str] | None = None,
+        timeout: float = 30.0,
+        cluster_name: str | None = None,
+        _bearer_close: Callable[[], None] | None = None,
+    ) -> None:
+        """Create an AsyncSandboxClient.
+
+        Args mirror `SandboxClient.__init__`. `grpc.aio` accepts client
+        interceptors at channel-construction time, so the bearer
+        interceptor (when a token is supplied) is attached via the
+        channel's `interceptors=` argument rather than by wrapping an
+        existing channel.
+        """
+        self._endpoint = endpoint
+        self._timeout = timeout
+        self._cluster_name = cluster_name
+        self._bearer_close = _bearer_close
+        provider = _normalize_bearer(bearer_token)
+        interceptors: list[grpc.aio.ClientInterceptor] = (
+            _async_bearer_interceptors(provider) if provider is not None else []
+        )
+        if tls is None:
+            self._channel = grpc.aio.insecure_channel(
+                endpoint, interceptors=interceptors
+            )
+        else:
+            # Build credentials from whatever subset of mTLS material the
+            # caller supplied. None for `root_certificates` makes gRPC use
+            # the system trust store, which is what we want for OIDC
+            # gateways behind a public CA.
+            credentials = grpc.ssl_channel_credentials(
+                root_certificates=(tls.ca_path.read_bytes() if tls.ca_path else None),
+                private_key=(tls.key_path.read_bytes() if tls.key_path else None),
+                certificate_chain=(
+                    tls.cert_path.read_bytes() if tls.cert_path else None
+                ),
+            )
+            self._channel = grpc.aio.secure_channel(
+                endpoint, credentials, interceptors=interceptors
+            )
+        self._stub = openshell_pb2_grpc.OpenShellStub(self._channel)
+
+    @classmethod
+    def from_active_cluster(
+        cls,
+        *,
+        cluster: str | None = None,
+        timeout: float = 30.0,
+        auto_refresh: bool = True,
+        write_back: bool = True,
+        insecure: bool = False,
+    ) -> AsyncSandboxClient:
+        """Construct an `AsyncSandboxClient` from the active gateway's state.
+
+        Resolves the same on-disk gateway layout as
+        `SandboxClient.from_active_cluster` (via
+        `_resolve_gateway_connection`); see that method for the full
+        semantics of `cluster`, `timeout`, and the OIDC kwargs
+        (`auto_refresh`, `write_back`, `insecure`). Construction itself
+        performs no network I/O — the `grpc.aio` channel connects lazily
+        on the first RPC.
+        """
+        conn = _resolve_gateway_connection(
+            cluster=cluster,
+            auto_refresh=auto_refresh,
+            write_back=write_back,
+            insecure=insecure,
+        )
+        return cls(
+            conn.endpoint,
+            tls=conn.tls,
+            bearer_token=conn.bearer_token,
+            timeout=timeout,
+            cluster_name=conn.cluster_name,
+            _bearer_close=conn.bearer_close,
+        )
+
+    async def close(self) -> None:
+        """Release the gRPC channel and any bearer-auth resources.
+
+        Idempotent. Mirrors `SandboxClient.close`, awaiting the
+        `grpc.aio` channel's async `close()`. If `from_active_cluster`
+        wired up an OIDC refresher for this client, the refresher's
+        underlying httpx.Client is closed here too.
+        """
+        await self._channel.close()
+        if self._bearer_close is not None:
+            with contextlib.suppress(Exception):
+                self._bearer_close()
+            self._bearer_close = None
+
+    async def __aenter__(self) -> AsyncSandboxClient:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.close()
+
+    async def health(self) -> openshell_pb2.HealthResponse:
+        return await self._stub.Health(
+            openshell_pb2.HealthRequest(), timeout=self._timeout
+        )
+
+    async def create(
+        self,
+        *,
+        workspace: str,
+        spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> SandboxRef:
+        request_spec = spec if spec is not None else _default_spec()
+        response = await self._stub.CreateSandbox(
+            openshell_pb2.CreateSandboxRequest(
+                spec=request_spec,
+                name=name or "",
+                labels=dict(labels) if labels else {},
+                workspace=workspace,
+            ),
+            timeout=self._timeout,
+        )
+        sandbox_ref = _sandbox_ref(response.sandbox)
+        if sandbox_ref.id == "":
+            raise SandboxError("CreateSandbox returned empty sandbox id")
+        return sandbox_ref
+
+    async def create_session(
+        self,
+        *,
+        workspace: str,
+        spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> AsyncSandboxSession:
+        return AsyncSandboxSession(
+            self,
+            await self.create(workspace=workspace, spec=spec, name=name, labels=labels),
+        )
+
+    async def get(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+        response = await self._stub.GetSandbox(
+            openshell_pb2.GetSandboxRequest(name=sandbox_name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return _sandbox_ref(response.sandbox)
+
+    async def get_session(
+        self, sandbox_name: str, *, workspace: str
+    ) -> AsyncSandboxSession:
+        return AsyncSandboxSession(
+            self, await self.get(sandbox_name, workspace=workspace)
+        )
+
+    async def list(
+        self,
+        *,
+        workspace: str,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[SandboxRef]:
+        response = await self._stub.ListSandboxes(
+            openshell_pb2.ListSandboxesRequest(
+                workspace=workspace,
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector or "",
+            ),
+            timeout=self._timeout,
+        )
+        return [_sandbox_ref(item) for item in response.sandboxes]
+
+    async def list_for_all_workspaces(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[SandboxRef]:
+        response = await self._stub.ListSandboxes(
+            openshell_pb2.ListSandboxesRequest(
+                all_workspaces=True,
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector or "",
+            ),
+            timeout=self._timeout,
+        )
+        return [_sandbox_ref(item) for item in response.sandboxes]
+
+    async def list_ids(
+        self,
+        *,
+        workspace: str,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[str]:
+        return [
+            item.id
+            for item in await self.list(
+                workspace=workspace,
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector,
+            )
+        ]
+
+    async def list_ids_for_all_workspaces(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[str]:
+        return [
+            item.id
+            for item in await self.list_for_all_workspaces(
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector,
+            )
+        ]
+
+    async def delete(self, sandbox_name: str, *, workspace: str) -> bool:
+        response = await self._stub.DeleteSandbox(
+            openshell_pb2.DeleteSandboxRequest(name=sandbox_name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return bool(response.deleted)
+
+    async def wait_deleted(
+        self,
+        sandbox_name: str,
+        *,
+        workspace: str,
+        timeout_seconds: float = 60.0,
+    ) -> None:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            try:
+                await self.get(sandbox_name, workspace=workspace)
+            except grpc.aio.AioRpcError as exc:
+                if exc.code() == grpc.StatusCode.NOT_FOUND:
+                    return
+                raise
+            await asyncio.sleep(1)
+        raise SandboxError(f"sandbox {sandbox_name} was not deleted within timeout")
+
+    async def wait_ready(
+        self,
+        sandbox_name: str,
+        *,
+        workspace: str,
+        timeout_seconds: float = 300.0,
+    ) -> SandboxRef:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            sandbox = await self.get(sandbox_name, workspace=workspace)
+            if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_READY:
+                return sandbox
+            if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
+                raise SandboxError(f"sandbox {sandbox_name} entered error phase")
+            await asyncio.sleep(1)
+        raise SandboxError(f"sandbox {sandbox_name} was not ready within timeout")
+
+    async def exec_stream(
+        self,
+        sandbox_id: str,
+        command: Sequence[str],
+        *,
+        workdir: str | None = None,
+        env: Mapping[str, str] | None = None,
+        stdin: bytes | None = None,
+        timeout_seconds: int | None = None,
+    ) -> AsyncIterator[ExecChunk | ExecResult]:
+        if not command:
+            raise SandboxError("command must not be empty")
+
+        request = openshell_pb2.ExecSandboxRequest(
+            sandbox_id=sandbox_id,
+            command=list(command),
+            workdir=workdir or "",
+            environment=dict(env or {}),
+            timeout_seconds=timeout_seconds or 0,
+            stdin=stdin or b"",
+        )
+        # Use whichever is larger: the default client timeout or the command
+        # timeout plus headroom for SSH setup / teardown overhead.
+        grpc_deadline = self._timeout
+        if timeout_seconds and timeout_seconds + 10 > grpc_deadline:
+            grpc_deadline = timeout_seconds + 10
+        stream = self._stub.ExecSandbox(request, timeout=grpc_deadline)
+
+        stdout_parts: list[bytes] = []
+        stderr_parts: list[bytes] = []
+        exit_code: int | None = None
+
+        async for event in stream:
+            payload = event.WhichOneof("payload")
+            if payload == "stdout":
+                data = bytes(event.stdout.data)
+                stdout_parts.append(data)
+                yield ExecChunk(stream="stdout", data=data)
+            elif payload == "stderr":
+                data = bytes(event.stderr.data)
+                stderr_parts.append(data)
+                yield ExecChunk(stream="stderr", data=data)
+            elif payload == "exit":
+                exit_code = int(event.exit.exit_code)
+
+        if exit_code is None:
+            raise SandboxError("ExecSandbox stream ended without an exit event")
+
+        yield ExecResult(
+            exit_code=exit_code,
+            stdout=b"".join(stdout_parts).decode("utf-8", errors="replace"),
+            stderr=b"".join(stderr_parts).decode("utf-8", errors="replace"),
+        )
+
+    async def exec(
+        self,
+        sandbox_id: str,
+        command: Sequence[str],
+        *,
+        stream_output: bool = False,
+        workdir: str | None = None,
+        env: Mapping[str, str] | None = None,
+        stdin: bytes | None = None,
+        timeout_seconds: int | None = None,
+    ) -> ExecResult:
+        result: ExecResult | None = None
+        async for item in self.exec_stream(
+            sandbox_id,
+            command,
+            workdir=workdir,
+            env=env,
+            stdin=stdin,
+            timeout_seconds=timeout_seconds,
+        ):
+            if stream_output and isinstance(item, ExecChunk):
+                if item.stream == "stdout":
+                    sys.stdout.buffer.write(item.data)
+                    sys.stdout.flush()
+                else:
+                    sys.stderr.buffer.write(item.data)
+                    sys.stderr.flush()
+            if isinstance(item, ExecResult):
+                result = item
+        if result is None:
+            raise SandboxError("ExecSandbox did not return a result")
+        return result
+
+    async def exec_python(
+        self,
+        sandbox_id: str,
+        function: Callable[..., object],
+        *,
+        args: Sequence[object] = (),
+        kwargs: Mapping[str, object] | None = None,
+        stream_output: bool = False,
+        workdir: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout_seconds: int | None = None,
+    ) -> ExecResult:
+        exec_env = dict(env or {})
+        exec_env["OPENSHELL_PYFUNC_B64"] = _serialize_python_callable(
+            function,
+            args=args,
+            kwargs=kwargs,
+        )
+        return await self.exec(
+            sandbox_id,
+            [_SANDBOX_PYTHON_BIN, "-c", _PYTHON_CLOUDPICKLE_BOOTSTRAP],
+            stream_output=stream_output,
+            workdir=workdir,
+            env=exec_env,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+class AsyncInferenceRouteClient:
+    """Async twin of `InferenceRouteClient` for workspace inference routes."""
+
+    def __init__(self, channel: grpc.aio.Channel, *, timeout: float = 30.0) -> None:
+        self._stub = inference_pb2_grpc.InferenceStub(channel)
+        self._timeout = timeout
+
+    @classmethod
+    def from_sandbox_client(
+        cls, client: AsyncSandboxClient
+    ) -> AsyncInferenceRouteClient:
+        return cls(client._channel, timeout=client._timeout)
+
+    async def set_route(
+        self,
+        *,
+        workspace: str,
+        provider_name: str,
+        model_id: str,
+        no_verify: bool = False,
+    ) -> InferenceRouteConfig:
+        response = await self._stub.SetInferenceRoute(
+            inference_pb2.SetInferenceRouteRequest(
+                workspace=workspace,
+                provider_name=provider_name,
+                model_id=model_id,
+                no_verify=no_verify,
+            ),
+            timeout=self._timeout,
+        )
+        return InferenceRouteConfig(
+            provider_name=response.provider_name,
+            model_id=response.model_id,
+            version=response.version,
+        )
+
+    async def get_route(self, *, workspace: str) -> InferenceRouteConfig:
+        response = await self._stub.GetInferenceRoute(
+            inference_pb2.GetInferenceRouteRequest(workspace=workspace),
+            timeout=self._timeout,
+        )
+        return InferenceRouteConfig(
+            provider_name=response.provider_name,
+            model_id=response.model_id,
+            version=response.version,
+        )
+
+    async def delete_route(
+        self,
+        *,
+        workspace: str,
+        route_name: str = "",
+    ) -> bool:
+        response = await self._stub.DeleteInferenceRoute(
+            inference_pb2.DeleteInferenceRouteRequest(
+                workspace=workspace,
+                route_name=route_name,
+            ),
+            timeout=self._timeout,
+        )
+        return response.deleted
+
+
+class AsyncWorkspaceClient:
+    """Async twin of `WorkspaceClient` for workspace lifecycle operations."""
+
+    def __init__(self, channel: grpc.aio.Channel, *, timeout: float = 30.0) -> None:
+        self._stub = openshell_pb2_grpc.OpenShellStub(channel)
+        self._timeout = timeout
+
+    @classmethod
+    def from_sandbox_client(cls, client: AsyncSandboxClient) -> AsyncWorkspaceClient:
+        return cls(client._channel, timeout=client._timeout)
+
+    async def create(
+        self,
+        name: str,
+        *,
+        labels: Mapping[str, str] | None = None,
+    ) -> WorkspaceRef:
+        response = await self._stub.CreateWorkspace(
+            openshell_pb2.CreateWorkspaceRequest(
+                name=name,
+                labels=dict(labels) if labels else {},
+            ),
+            timeout=self._timeout,
+        )
+        return _workspace_ref(response.workspace)
+
+    async def get(self, name: str) -> WorkspaceRef:
+        response = await self._stub.GetWorkspace(
+            openshell_pb2.GetWorkspaceRequest(name=name),
+            timeout=self._timeout,
+        )
+        return _workspace_ref(response.workspace)
+
+    async def list(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[WorkspaceRef]:
+        response = await self._stub.ListWorkspaces(
+            openshell_pb2.ListWorkspacesRequest(
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector or "",
+            ),
+            timeout=self._timeout,
+        )
+        return [_workspace_ref(ws) for ws in response.workspaces]
+
+    async def delete(self, name: str) -> bool:
+        response = await self._stub.DeleteWorkspace(
+            openshell_pb2.DeleteWorkspaceRequest(name=name),
+            timeout=self._timeout,
+        )
+        return response.deleted
+
+
+class AsyncSandbox:
+    """Async context-managed sandbox session bound to one sandbox id.
+
+    Async twin of `Sandbox`: use it with `async with`. Constructor
+    arguments and OIDC kwargs mirror `Sandbox` exactly and forward to
+    `AsyncSandboxClient.from_active_cluster`.
+    """
+
+    def __init__(
+        self,
+        *,
+        workspace: str,
+        cluster: str | None = None,
+        sandbox: str | SandboxRef | None = None,
+        delete_on_exit: bool = True,
+        spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        timeout: float = 30.0,
+        ready_timeout_seconds: float = 120.0,
+        auto_refresh: bool = True,
+        write_back: bool = True,
+        insecure: bool = False,
+    ) -> None:
+        """Bind an AsyncSandbox context to the active gateway.
+
+        OIDC kwargs (`auto_refresh`, `write_back`, `insecure`) forward
+        directly to `AsyncSandboxClient.from_active_cluster` and share
+        the same semantics as on `Sandbox`.
+        """
+        self._workspace = workspace
+        self._cluster = cluster
+        self._sandbox_input = sandbox
+        self._delete_on_exit = delete_on_exit
+        self._spec = spec
+        self._name = name
+        # Copy so later caller mutation cannot change what gets sent on enter.
+        self._labels = dict(labels) if labels is not None else None
+        self._timeout = timeout
+        self._ready_timeout_seconds = ready_timeout_seconds
+        self._auto_refresh = auto_refresh
+        self._write_back = write_back
+        self._insecure = insecure
+        self._client: AsyncSandboxClient | None = None
+        self._session: AsyncSandboxSession | None = None
+
+    @property
+    def id(self) -> str:
+        if self._session is None:
+            raise SandboxError("sandbox context has not been entered")
+        return self._session.id
+
+    @property
+    def sandbox(self) -> SandboxRef:
+        if self._session is None:
+            raise SandboxError("sandbox context has not been entered")
+        return self._session.sandbox
+
+    async def __aenter__(self) -> AsyncSandbox:
+        # Creation metadata cannot be applied when attaching to an existing
+        # sandbox; reject it before opening a connection.
+        if self._sandbox_input is not None and (
+            self._name is not None or self._labels is not None
+        ):
+            raise SandboxError(
+                "name and labels cannot be set when attaching to an existing sandbox"
+            )
+
+        client = AsyncSandboxClient.from_active_cluster(
+            cluster=self._cluster,
+            timeout=self._timeout,
+            auto_refresh=self._auto_refresh,
+            write_back=self._write_back,
+            insecure=self._insecure,
+        )
+        self._client = client
+
+        if self._sandbox_input is None:
+            self._session = await client.create_session(
+                workspace=self._workspace,
+                spec=self._spec,
+                name=self._name,
+                labels=self._labels,
+            )
+        elif isinstance(self._sandbox_input, SandboxRef):
+            self._session = AsyncSandboxSession(client, self._sandbox_input)
+        else:
+            self._session = await client.get_session(
+                self._sandbox_input, workspace=self._workspace
+            )
+
+        self._workspace = getattr(self._session, "_workspace", self._workspace)
+
+        ready = await client.wait_ready(
+            self._session.sandbox.name,
+            workspace=self._workspace,
+            timeout_seconds=self._ready_timeout_seconds,
+        )
+        self._session = AsyncSandboxSession(client, ready)
+
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        try:
+            if (
+                self._delete_on_exit
+                and self._session is not None
+                and self._client is not None
+            ):
+                try:
+                    deleted = await self._session.delete()
+                    if deleted:
+                        await self._client.wait_deleted(
+                            self._session.sandbox.name,
+                            workspace=self._workspace,
+                        )
+                except grpc.aio.AioRpcError as exc:
+                    if exc.code() != grpc.StatusCode.NOT_FOUND:
+                        raise
+        finally:
+            if self._client is not None:
+                await self._client.close()
+            self._session = None
+            self._client = None
+
+    async def exec(
+        self,
+        command: Sequence[str],
+        *,
+        stream_output: bool = False,
+        workdir: str | None = None,
+        env: Mapping[str, str] | None = None,
+        stdin: bytes | None = None,
+        timeout_seconds: int | None = None,
+    ) -> ExecResult:
+        if self._session is None:
+            raise SandboxError("sandbox context has not been entered")
+        return await self._session.exec(
+            command,
+            stream_output=stream_output,
+            workdir=workdir,
+            env=env,
+            stdin=stdin,
+            timeout_seconds=timeout_seconds,
+        )
+
+    async def exec_python(
+        self,
+        function: Callable[..., object],
+        *,
+        args: Sequence[object] = (),
+        kwargs: Mapping[str, object] | None = None,
+        stream_output: bool = False,
+        workdir: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout_seconds: int | None = None,
+    ) -> ExecResult:
+        if self._session is None:
+            raise SandboxError("sandbox context has not been entered")
+        return await self._session.exec_python(
+            function,
+            args=args,
+            kwargs=kwargs,
+            stream_output=stream_output,
+            workdir=workdir,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
