@@ -501,7 +501,25 @@ The CLI validates the argument shapes before it sends the request. The gateway t
 - a port is outside `1` through `65535`.
 - `--add-allow` or `--add-deny` points at an endpoint that does not exist.
 - `--add-allow` or `--add-deny` targets an endpoint that is neither REST nor WebSocket.
+- `--add-allow` or `--add-deny` targets a host and port that resolves to more than one endpoint.
 - `--add-deny` targets an endpoint that has no base allow set.
+- an update names an existing rule and adds a binary to it without declaring every endpoint and port that rule already authorizes.
+- an update names an existing rule and adds or changes an endpoint on it without declaring every binary that rule already authorizes.
+- an update widens a rule to any binary without declaring every endpoint that rule already authorizes.
+- an update changes an endpoint without declaring every port that endpoint carries.
+- an update puts an MCP endpoint on the same host and port as a differently inspected endpoint, or gives one host and port two different MCP inspection contracts, including through separate rules or different paths.
+
+A rule authorizes every listed binary to reach every listed endpoint and port, so merging a binary and an endpoint into the same rule authorizes that pair too. The gateway rejects the whole batch rather than granting a pair the update did not ask for. The error names the binary scope and the ports involved, and lists the binaries you still need to declare. An empty binary list means any binary, so widening a rule to any binary is subject to the same requirement.
+
+You can declare the scope across several `--add-endpoint` arguments. The update is complete as long as every binary-to-port pair the merged rule ends up authorizing appears somewhere in the update.
+
+An endpoint's allow rules, deny rules, and allowed IPs apply to every port that endpoint carries, so an update that changes any of them has to name every one of those ports. Declaring `api.example.com:443` alone on an endpoint that also serves `8443` is rejected, because the change would reach `8443` as well. Declaring every existing binary does not lift this requirement; the two are separate axes of the same product.
+
+The sandbox picks the parser for a request by most-specific path, but it authorizes the request against every endpoint that matches it. A broad REST endpoint and a narrower GraphQL endpoint on one host and port share the same method-and-path rule vocabulary, so that combination stays supported. MCP does not: its rules address JSON-RPC methods and tool names, so a plain REST rule on an overlapping path could authorize a tool call the MCP endpoint denies. An MCP endpoint therefore cannot share a host and port with a differently inspected endpoint, and two MCP endpoints there must agree on strict-tool-name, method-profile, and body-limit settings, even under different paths or in separate rules. An update creating either situation is rejected. A policy that already contains one is left alone so unrelated updates still apply, but it should be repaired with full YAML replacement.
+
+To grant one binary access to only part of an existing rule's endpoints, send it under its own `--rule-name`. The gateway normally folds an update into an existing rule that shares an endpoint, but it keeps your rule name whenever folding would grant authorization you did not declare, so the narrow grant lands as its own rule authorizing exactly what you asked for. The update reports that it kept your rule name and names the rule it would otherwise have folded into. An MCP contract conflict is the exception: one host and port carry a single MCP contract regardless of which rule holds them, so a conflicting update is rejected rather than moved to a separate rule.
+
+Once a host and port appears in more than one rule, `--add-allow` and `--add-deny` can no longer target it. They select an endpoint by host and port alone, so they cannot say which rule's binary scope to widen, and the gateway rejects the update rather than guessing. The same applies when one rule carries two endpoints on that host and port under different paths. Use full YAML replacement to change L7 rules on an endpoint that appears more than once.
 
 ## Global Policy Override
 
