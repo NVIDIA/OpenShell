@@ -8,9 +8,13 @@
 mod auth;
 mod identity;
 mod jwt;
+mod store;
 mod transport;
 
 pub use auth::{BearerTokenInterceptor, BearerTokenSlot, TokenSlotError};
 pub use identity::{ExtensionAudience, ExtensionIdentity, ExtensionKind, IdentityError};
-pub use jwt::{ExtensionCallerKind, ExtensionJwtClaims, MAX_EXTENSION_TOKEN_TTL};
+pub use jwt::{
+    EXTENSION_JWT_TYP, ExtensionCallerKind, ExtensionJwtClaims, MAX_EXTENSION_TOKEN_TTL,
+};
+pub use store::ExtensionCredentialStore;
 pub use transport::{ExtensionChannelConfig, TransportError, connect_channel};

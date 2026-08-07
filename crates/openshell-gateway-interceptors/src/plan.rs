@@ -184,6 +184,7 @@ impl ExecutionPlan {
         for config in configs {
             let channel = connect_endpoint(&config).await?;
             let interceptor = match token_slots.as_ref() {
+                Some(_) if config.allow_insecure_transport => BearerTokenInterceptor::disabled(),
                 Some(slots) => slots
                     .get(&config.name)
                     .ok_or_else(|| {
@@ -222,6 +223,11 @@ impl ExecutionPlan {
                         ))
                     })?
                     .into_inner();
+            validate_expected_audience(
+                &config,
+                &manifest.expected_audience,
+                token_slots.is_some(),
+            )?;
             let service_default = match config.binding_policy {
                 GatewayInterceptorBindingPolicy::Dynamic => {
                     let manifest_default = parse_optional_failure_policy(&manifest.failure_policy)?;
@@ -360,6 +366,32 @@ impl ExecutionPlan {
     }
 }
 
+/// Reject an interceptor whose configured audience differs from the one the
+/// service says it verifies.
+///
+/// Without this the two values are configured independently on either side of
+/// the boundary and a mismatch surfaces only as an opaque runtime 401 on every
+/// intercepted call. A service that does not advertise an audience is accepted
+/// unchanged.
+fn validate_expected_audience(
+    config: &GatewayInterceptorConfig,
+    advertised: &str,
+    authenticated: bool,
+) -> Result<()> {
+    if !authenticated || config.allow_insecure_transport || advertised.is_empty() {
+        return Ok(());
+    }
+    let configured = config.resolved_audience();
+    if advertised != configured {
+        return Err(InterceptorError::Config(format!(
+            "interceptor '{}' expects audience '{advertised}' but the gateway \
+             is configured to mint '{configured}'",
+            config.name
+        )));
+    }
+    Ok(())
+}
+
 fn validate_authenticated_slots(
     configs: &[GatewayInterceptorConfig],
     token_slots: Option<&BTreeMap<String, BearerTokenSlot>>,
@@ -368,6 +400,11 @@ fn validate_authenticated_slots(
         return Ok(());
     };
     for config in configs {
+        // Registrations the operator opted out of extension authentication
+        // intentionally have no slot; everything else must fail closed.
+        if config.allow_insecure_transport {
+            continue;
+        }
         if !token_slots.contains_key(&config.name) {
             return Err(InterceptorError::Config(format!(
                 "authenticated interceptor '{}' is missing a bearer-token slot",
@@ -999,6 +1036,56 @@ mod tests {
 
         let slots = BTreeMap::from([(config.name.clone(), BearerTokenSlot::empty())]);
         validate_authenticated_slots(&[config], Some(&slots)).unwrap();
+    }
+
+    #[test]
+    fn advertised_audience_mismatch_fails_at_startup() {
+        let config = GatewayInterceptorConfig {
+            name: "governance".to_string(),
+            grpc_endpoint: "https://governance.example".to_string(),
+            ..GatewayInterceptorConfig::default()
+        };
+
+        // Matching and unadvertised audiences both pass.
+        validate_expected_audience(&config, "", true).expect("unadvertised audience is accepted");
+        validate_expected_audience(
+            &config,
+            "urn:openshell:extension:interceptor:governance",
+            true,
+        )
+        .expect("matching audience is accepted");
+
+        // A mismatch would otherwise surface only as an opaque runtime 401.
+        let error = validate_expected_audience(&config, "urn:example:something-else", true)
+            .expect_err("mismatched audience must fail closed at startup");
+        let message = error.to_string();
+        assert!(message.contains("urn:example:something-else"));
+        assert!(message.contains("urn:openshell:extension:interceptor:governance"));
+
+        // With gateway JWT signing disabled no token is minted at all, so the
+        // advertised audience is not something OpenShell can be wrong about.
+        validate_expected_audience(&config, "urn:example:something-else", false)
+            .expect("unauthenticated gateways skip the handshake");
+
+        // The check likewise does not apply where the registration opted out.
+        let opted_out = GatewayInterceptorConfig {
+            allow_insecure_transport: true,
+            ..config
+        };
+        validate_expected_audience(&opted_out, "urn:example:something-else", true)
+            .expect("opted-out interceptors mint no token to mismatch");
+    }
+
+    #[test]
+    fn opted_out_interceptors_do_not_require_a_token_slot() {
+        let config = GatewayInterceptorConfig {
+            name: "governance".to_string(),
+            grpc_endpoint: "http://127.0.0.1:18081".to_string(),
+            allow_insecure_transport: true,
+            ..GatewayInterceptorConfig::default()
+        };
+        validate_authenticated_slots(&[config], Some(&BTreeMap::new()))
+            .expect("explicit opt-out needs no credential");
     }
 
     #[tokio::test]

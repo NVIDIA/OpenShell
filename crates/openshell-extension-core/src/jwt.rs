@@ -11,6 +11,15 @@ use serde::{Deserialize, Serialize};
 /// short-lived even when legacy sandbox bootstrap credentials do not expire.
 pub const MAX_EXTENSION_TOKEN_TTL: Duration = Duration::from_secs(3_600);
 
+/// Explicit `typ` header value carried by every extension bearer token.
+///
+/// Extension tokens and sandbox-to-gateway bootstrap tokens are signed by the
+/// same key and differ only in their audience. Explicit typing (RFC 8725
+/// section 3.11) gives verifiers a second, independent discriminator: a
+/// service that requires this `typ` cannot accept a sandbox bootstrap
+/// credential even if it forgets to check `aud`.
+pub const EXTENSION_JWT_TYP: &str = "openshell-ext+jwt";
+
 /// `OpenShell` component calling an extension service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

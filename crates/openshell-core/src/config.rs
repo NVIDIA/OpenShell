@@ -639,6 +639,11 @@ pub struct GatewayInterceptorConfig {
     /// is derived from the configured registration name.
     #[serde(default)]
     pub audience: Option<String>,
+    /// Opt out of extension authentication for this interceptor, permitting a
+    /// plaintext `http://` endpoint with no bearer credential. Development and
+    /// trusted-network deployments only.
+    #[serde(default)]
+    pub allow_insecure_transport: bool,
     /// Deterministic service ordering. Lower values run first.
     #[serde(default)]
     pub order: i32,

@@ -155,6 +155,11 @@ pub async fn run_sandbox(
         None
     };
 
+    // Extension credentials are owned by this supervisor and shared by every
+    // gateway connection it opens, so the middleware registry's bearer slots
+    // and the policy poll loop that rotates them stay the same objects.
+    let extension_credentials = openshell_extension_core::ExtensionCredentialStore::new();
+
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
@@ -183,6 +188,7 @@ pub async fn run_sandbox(
             openshell_endpoint.clone(),
             policy_rules,
             policy_data,
+            &extension_credentials,
         )
         .await?
     };
@@ -597,6 +603,7 @@ pub async fn run_sandbox(
             middleware_registry_status,
             sidecar_control_publisher: sidecar_control_publisher.clone(),
             workspace_tx,
+            extension_credentials: extension_credentials.clone(),
         };
 
         tokio::spawn(async move {
@@ -1850,6 +1857,7 @@ async fn load_policy(
     openshell_endpoint: Option<String>,
     policy_rules: Option<String>,
     policy_data: Option<String>,
+    extension_credentials: &openshell_extension_core::ExtensionCredentialStore,
 ) -> Result<(
     SandboxPolicy,
     Option<Arc<OpaEngine>>,
@@ -2069,12 +2077,18 @@ async fn load_policy(
             MiddlewareRegistryStatus::Synchronized
         } else if let Err(error) = grpc_retry("Middleware connect", || {
             let middleware_services = middleware_services.clone();
+            let extension_credentials = extension_credentials.clone();
             async move {
-                let credentials = openshell_core::grpc_client::refresh_extension_credentials(
-                    endpoint,
-                    &middleware_services,
-                )
-                .await?;
+                // Share the supervisor's store so the slots installed here are
+                // the ones the policy poll loop later rotates in place.
+                let credentials =
+                    openshell_core::grpc_client::CachedOpenShellClient::connect_with_credentials(
+                        endpoint,
+                        extension_credentials,
+                    )
+                    .await?
+                    .refresh_extension_credentials(&middleware_services)
+                    .await?;
                 openshell_supervisor_middleware::MiddlewareRegistry::connect_services_authenticated(
                     openshell_supervisor_middleware_builtins::services(),
                     middleware_services,
@@ -2654,6 +2668,7 @@ struct PolicyPollLoopContext {
     middleware_registry_status: MiddlewareRegistryStatus,
     sidecar_control_publisher: Option<sidecar_control::Publisher>,
     workspace_tx: tokio::sync::watch::Sender<String>,
+    extension_credentials: openshell_extension_core::ExtensionCredentialStore,
 }
 
 #[cfg(test)]
@@ -2688,10 +2703,41 @@ async fn install_builtin_middleware_registry(opa_engine: &OpaEngine) -> Result<(
     opa_engine.replace_middleware_registry(registry)
 }
 
+/// Wait the configured poll interval, but never past the point at which an
+/// installed extension credential must be rotated.
+fn next_poll_delay(
+    store: &openshell_extension_core::ExtensionCredentialStore,
+    interval: Duration,
+) -> Duration {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        });
+    store.next_refresh_delay(interval, now_ms)
+}
+
+/// Drop credentials for services no longer in the installed registry.
+///
+/// Call only after a registry swap succeeds, so a failed candidate cannot
+/// invalidate the last-known-good clients.
+fn retain_extension_credentials(
+    store: &openshell_extension_core::ExtensionCredentialStore,
+    installed: &[openshell_core::proto::SupervisorMiddlewareService],
+) {
+    store.retain(
+        &installed
+            .iter()
+            .map(|service| service.name.as_str())
+            .collect(),
+    );
+}
+
 async fn reconcile_middleware_registry(
     opa_engine: &OpaEngine,
     desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
     credentials: &std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>,
+    extension_credentials: &openshell_extension_core::ExtensionCredentialStore,
     current_services: &mut Vec<openshell_core::proto::SupervisorMiddlewareService>,
     status: &mut MiddlewareRegistryStatus,
 ) {
@@ -2706,7 +2752,7 @@ async fn reconcile_middleware_registry(
         .and_then(|registry| opa_engine.replace_middleware_registry(registry))
     {
         Ok(()) => {
-            openshell_core::grpc_client::retain_extension_credentials(desired_services);
+            retain_extension_credentials(extension_credentials, desired_services);
             current_services.clear();
             current_services.extend_from_slice(desired_services);
             *status = MiddlewareRegistryStatus::Synchronized;
@@ -2932,7 +2978,11 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     use openshell_core::proto::PolicySource;
     use std::sync::atomic::Ordering;
 
-    let client = CachedOpenShellClient::connect(&ctx.endpoint).await?;
+    let client = CachedOpenShellClient::connect_with_credentials(
+        &ctx.endpoint,
+        ctx.extension_credentials.clone(),
+    )
+    .await?;
     let (status_sender, status_receiver) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(run_policy_status_reporter(
         client.clone(),
@@ -3021,10 +3071,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         let result = if let Some(result) = pending_result.take() {
             result
         } else {
-            tokio::time::sleep(
-                openshell_core::grpc_client::extension_credential_refresh_delay(interval),
-            )
-            .await;
+            tokio::time::sleep(next_poll_delay(&ctx.extension_credentials, interval)).await;
             match client.poll_settings(&ctx.sandbox_id).await {
                 Ok(result) => {
                     let _ = ctx.workspace_tx.send(client.workspace());
@@ -3045,11 +3092,12 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             }
         };
 
-        // Refresh per-service credentials on the existing gateway channel.
-        // Existing middleware clients retain the same slots, so successful
-        // rotation is independent of config revision and registry equality.
+        // Reuse installed per-service credentials, rotating only when one is
+        // missing or due. Rotation happens on the existing gateway channel and
+        // updates slots in place, so it is independent of config revision and
+        // registry equality.
         let middleware_credentials = match client
-            .refresh_extension_credentials(&result.supervisor_middleware_services)
+            .extension_credentials_for(&result.supervisor_middleware_services)
             .await
         {
             Ok(credentials) => credentials,
@@ -3094,6 +3142,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                 &ctx.opa_engine,
                 &result.supervisor_middleware_services,
                 &middleware_credentials,
+                &ctx.extension_credentials,
                 &mut current_middleware_services,
                 &mut middleware_registry_status,
             )
@@ -3300,7 +3349,8 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 
                     current_policy_hash.clone_from(&result.policy_hash);
                     current_middleware_services.clone_from(&result.supervisor_middleware_services);
-                    openshell_core::grpc_client::retain_extension_credentials(
+                    retain_extension_credentials(
+                        &ctx.extension_credentials,
                         &result.supervisor_middleware_services,
                     );
                     middleware_registry_status = MiddlewareRegistryStatus::Synchronized;

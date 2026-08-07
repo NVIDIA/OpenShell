@@ -1466,6 +1466,7 @@ mod tests {
                     failure_policy: "fail_open".to_string(),
                 }],
                 provider_profiles: false,
+                expected_audience: String::new(),
             }))
         }
 
