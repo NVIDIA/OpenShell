@@ -275,3 +275,16 @@ for path, rules in line_rewrites.items():
 PY
 """
 hide = true
+
+["python:proto:check"]
+description = "Verify committed proto stubs are up to date"
+depends = ["python:proto"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+if ! git diff --exit-code python/openshell/_proto/; then
+  echo "error: proto stubs are stale. Run 'mise run python:proto' and commit the result." >&2
+  exit 1
+fi
+"""
+hide = true

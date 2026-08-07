@@ -200,11 +200,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Install tools
         run: mise install --locked
 
       - name: Install dependencies
         run: uv sync --frozen
+
+      - name: Proto stubs freshness
+        run: mise run python:proto:check
 
       - name: Format
         run: mise run python:format:check
