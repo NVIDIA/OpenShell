@@ -484,9 +484,9 @@ fn build_env(
     env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
     // Prevent user-supplied environment from overriding the TLS server name
-    // the supervisor verifies — with WebPKI roots trusted, a sandbox user who
-    // can redirect the gateway hostname could otherwise present a publicly
-    // valid certificate for a name they control and intercept the sandbox JWT.
+    // the supervisor verifies — a sandbox user who can redirect the gateway
+    // hostname could otherwise present a certificate for a name they control
+    // and intercept the sandbox JWT.
     env.remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
     env.insert(
         openshell_core::sandbox_env::OCI_IMAGE_USER.into(),
