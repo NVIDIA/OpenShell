@@ -296,6 +296,15 @@ remains `Pending`. If the first poll returns a different revision, the superviso
 processes it through the normal reload path instead of treating it as already
 loaded.
 
+A newer sandbox-scoped revision can carry the same non-empty effective policy
+hash as the currently loaded revision, for example when provenance changes
+without changing enforcement content. The supervisor acknowledges that newer
+revision without reloading identical policy. If the revision also requires
+middleware or policy-runtime reconciliation, acknowledgement waits until that
+reconciliation succeeds. Global policies, local overrides, equal or older
+versions, and different hashes do not use this shortcut. Success telemetry is
+emitted only after the gateway accepts the resulting loaded-status report.
+
 Policy status delivery uses a FIFO background worker. Retryable delivery
 failures retain the ordered update and retry with capped exponential backoff;
 terminal errors are logged and discarded. The outbox is nonblocking and does
