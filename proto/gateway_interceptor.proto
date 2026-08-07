@@ -100,6 +100,12 @@ message InterceptorManifest {
   string failure_policy = 3;
   // True when this interceptor implements SnapshotProviderProfiles.
   bool provider_profiles = 4;
+  // Exact JWT audience this service verifies on inbound OpenShell calls.
+  // When set, the gateway refuses to start unless it matches the
+  // operator-configured audience, turning a silent runtime 401 into a startup
+  // failure. Empty means the service does not advertise an audience and the
+  // check is skipped.
+  string expected_audience = 5;
 }
 
 message ProviderProfileSnapshot {

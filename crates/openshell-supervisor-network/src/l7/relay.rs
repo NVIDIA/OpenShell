@@ -3225,6 +3225,7 @@ network_policies:
                         max_body_bytes: 8192,
                         timeout: String::new(),
                     }],
+                    expected_audience: String::new(),
                 },
             ))
         }
@@ -3713,6 +3714,7 @@ network_policies:
                     max_body_bytes: self.max_body_bytes,
                     timeout: String::new(),
                 }],
+                expected_audience: String::new(),
             }))
         }
 
