@@ -936,6 +936,11 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
         };
 
         for (i, ep) in endpoints.iter().enumerate() {
+            let loc = format!("{name}.endpoints[{i}]");
+            if !ep.is_object() {
+                errors.push(format!("{loc}: endpoint entry must be an object"));
+                continue;
+            }
             let protocol = ep.get("protocol").and_then(|v| v.as_str()).unwrap_or("");
             let l7_protocol = L7Protocol::parse(protocol);
             let jsonrpc_family = l7_protocol.is_some_and(L7Protocol::is_jsonrpc_family);
@@ -960,9 +965,13 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                         .into_iter()
                         .collect()
                 },
-                |arr| arr.iter().filter_map(serde_json::Value::as_u64).collect(),
+                |arr| {
+                    arr.iter()
+                        .filter_map(serde_json::Value::as_u64)
+                        .filter(|p| *p > 0)
+                        .collect()
+                },
             );
-            let loc = format!("{name}.endpoints[{i}]");
 
             if protocol == "mcp" {
                 if host.trim().is_empty() {
@@ -1515,7 +1524,13 @@ pub fn expand_access_presets(data: &mut serde_json::Value) -> Vec<String> {
                 && !has_rules
                 && mcp_allow_all_known_mcp_methods
             {
-                ep.as_object_mut().unwrap().insert(
+                let Some(obj) = ep.as_object_mut() else {
+                    warnings.push(format!(
+                        "{name}.endpoints[{i}]: endpoint entry is not an object; skipping access preset expansion"
+                    ));
+                    continue;
+                };
+                obj.insert(
                     "rules".to_string(),
                     serde_json::Value::Array(vec![jsonrpc_rule_json("*")]),
                 );
@@ -1540,9 +1555,13 @@ pub fn expand_access_presets(data: &mut serde_json::Value) -> Vec<String> {
                 continue;
             };
 
-            ep.as_object_mut()
-                .unwrap()
-                .insert("rules".to_string(), serde_json::Value::Array(rules));
+            if let Some(obj) = ep.as_object_mut() {
+                obj.insert("rules".to_string(), serde_json::Value::Array(rules));
+            } else {
+                warnings.push(format!(
+                    "{name}.endpoints[{i}]: endpoint entry is not an object; skipping access preset expansion"
+                ));
+            }
         }
     }
 
@@ -1586,6 +1605,34 @@ fn graphql_rule_json(operation_type: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_l7_policies_rejects_non_object_endpoint() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [
+                        "not-an-object",
+                        {"host": "api.example.com", "port": 443, "protocol": "rest"},
+                        42,
+                    ],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("endpoint entry must be an object")),
+            "expected non-object endpoint error: {errors:?}"
+        );
+        // The valid object endpoint should not produce an error.
+        assert!(
+            !errors.iter().any(|e| e.contains("api.example.com")),
+            "valid endpoint should not be blamed: {errors:?}"
+        );
+    }
 
     #[test]
     fn parse_l7_config_rest_enforce() {
@@ -2806,6 +2853,43 @@ mod tests {
                 "allow-my-service.endpoints[0]: unsupported L7 access preset 'allow' ignored; expected one of: read-only, read-write, full".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn expand_access_presets_skips_non_object_endpoint_and_expands_valid() {
+        let mut data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [
+                        "not-an-object",
+                        {
+                            "host": "api.example.com",
+                            "port": 80,
+                            "protocol": "rest",
+                            "access": "read-only"
+                        },
+                    ],
+                    "binaries": []
+                }
+            }
+        });
+        let warnings = expand_access_presets(&mut data);
+        let endpoints = data["network_policies"]["test"]["endpoints"]
+            .as_array()
+            .unwrap();
+        // Invalid entry is left untouched.
+        assert_eq!(endpoints[0], serde_json::json!("not-an-object"));
+        // Valid preset endpoint is expanded.
+        let rules = endpoints[1]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 3);
+        let methods: Vec<&str> = rules
+            .iter()
+            .map(|r| r["allow"]["method"].as_str().unwrap())
+            .collect();
+        assert!(methods.contains(&"GET"));
+        assert!(methods.contains(&"HEAD"));
+        assert!(methods.contains(&"OPTIONS"));
+        assert!(warnings.is_empty(), "expected no warnings: {warnings:?}");
     }
 
     #[test]
