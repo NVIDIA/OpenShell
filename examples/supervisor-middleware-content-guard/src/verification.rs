@@ -25,8 +25,32 @@ pub enum ExtensionCallerKind {
     Supervisor,
 }
 
+/// Authentication result consumed by extension RPC authorization.
+///
+/// Authentication backends translate their credential format into this
+/// representation so handlers do not depend on gateway JWT claim details.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedCaller {
+    pub kind: ExtensionCallerKind,
+    pub subject: String,
+    pub sandbox_id: Option<String>,
+}
+
+/// Credential backend for an OpenShell extension service.
+///
+/// A future SDK can provide implementations backed by gateway JWKS, SPIFFE
+/// JWT-SVID validation, or another trusted identity system without changing
+/// the middleware RPC implementation.
+#[tonic::async_trait]
+pub trait ExtensionAuthenticator: std::fmt::Debug + Send + Sync {
+    async fn authenticate(
+        &self,
+        bearer_token: &str,
+    ) -> Result<AuthenticatedCaller, AuthenticationError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExtensionJwtClaims {
+struct ExtensionJwtClaims {
     pub iss: String,
     pub aud: String,
     pub sub: String,
@@ -43,15 +67,15 @@ pub struct ExtensionJwtClaims {
 /// The operator must obtain the JWKS document from a trusted gateway URL or
 /// provision it out of band. Constructing this verifier does not establish
 /// trust in the document by itself.
-pub struct ExtensionJwtVerifier {
+pub struct GatewayJwtAuthenticator {
     keys: HashMap<String, DecodingKey>,
     issuer: String,
     audience: String,
 }
 
-impl std::fmt::Debug for ExtensionJwtVerifier {
+impl std::fmt::Debug for GatewayJwtAuthenticator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExtensionJwtVerifier")
+        f.debug_struct("GatewayJwtAuthenticator")
             .field("key_ids", &self.keys.keys())
             .field("issuer", &self.issuer)
             .field("audience", &self.audience)
@@ -59,7 +83,7 @@ impl std::fmt::Debug for ExtensionJwtVerifier {
     }
 }
 
-impl ExtensionJwtVerifier {
+impl GatewayJwtAuthenticator {
     pub fn from_jwks(
         jwks_json: &[u8],
         issuer: impl Into<String>,
@@ -110,7 +134,7 @@ impl ExtensionJwtVerifier {
         })
     }
 
-    pub fn verify(&self, token: &str) -> Result<ExtensionJwtClaims, VerificationError> {
+    fn verify(&self, token: &str) -> Result<ExtensionJwtClaims, VerificationError> {
         let header = decode_header(token).map_err(VerificationError::InvalidToken)?;
         if header.alg != Algorithm::EdDSA {
             return Err(VerificationError::UnexpectedAlgorithm);
@@ -137,6 +161,23 @@ impl ExtensionJwtVerifier {
             .claims;
         validate_claim_shape(&claims)?;
         Ok(claims)
+    }
+}
+
+#[tonic::async_trait]
+impl ExtensionAuthenticator for GatewayJwtAuthenticator {
+    async fn authenticate(
+        &self,
+        bearer_token: &str,
+    ) -> Result<AuthenticatedCaller, AuthenticationError> {
+        let claims = self
+            .verify(bearer_token)
+            .map_err(AuthenticationError::backend)?;
+        Ok(AuthenticatedCaller {
+            kind: claims.caller_kind,
+            subject: claims.sub,
+            sandbox_id: claims.sandbox_id,
+        })
     }
 }
 
@@ -205,6 +246,18 @@ pub enum VerificationError {
     InvalidClaims(&'static str),
 }
 
+#[derive(Debug, Error)]
+#[error(transparent)]
+pub struct AuthenticationError(Box<dyn std::error::Error + Send + Sync>);
+
+impl AuthenticationError {
+    /// Wraps an authentication backend's native error without coupling the
+    /// shared interface to that backend's error taxonomy.
+    pub fn backend(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self(Box::new(error))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use jsonwebtoken::{EncodingKey, Header, encode};
@@ -246,9 +299,9 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn verifies_gateway_and_supervisor_claims() {
-        let verifier = ExtensionJwtVerifier::from_jwks(
+    #[tokio::test]
+    async fn authenticates_gateway_and_supervisor_callers() {
+        let authenticator = GatewayJwtAuthenticator::from_jwks(
             JWKS,
             "openshell-gateway:test",
             "urn:openshell:extension:middleware:test",
@@ -259,19 +312,17 @@ mod tests {
             ExtensionCallerKind::Gateway,
             ExtensionCallerKind::Supervisor,
         ] {
-            assert_eq!(
-                verifier
-                    .verify(&token(&claims(caller_kind)))
-                    .unwrap()
-                    .caller_kind,
-                caller_kind
-            );
+            let expected = claims(caller_kind);
+            let caller = authenticator.authenticate(&token(&expected)).await.unwrap();
+            assert_eq!(caller.kind, caller_kind);
+            assert_eq!(caller.subject, expected.sub);
+            assert_eq!(caller.sandbox_id, expected.sandbox_id);
         }
     }
 
     #[test]
     fn rejects_wrong_audience_and_inconsistent_subject() {
-        let verifier = ExtensionJwtVerifier::from_jwks(
+        let verifier = GatewayJwtAuthenticator::from_jwks(
             JWKS,
             "openshell-gateway:test",
             "urn:openshell:extension:middleware:test",

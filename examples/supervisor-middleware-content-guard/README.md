@@ -88,6 +88,10 @@ The gateway and supervisors verify the middleware certificate against `tls_ca_ce
 
 The service returns `Unauthenticated` for missing or invalid credentials and `PermissionDenied` when a valid caller kind invokes an RPC it is not allowed to use. Unknown `kid` values require replacing the provisioned JWKS document and restarting this alpha example; production integrations should cache keys and refresh from the trusted gateway JWKS URL on an unknown `kid`.
 
+### Authentication backends
+
+The example keeps authentication behind an async `ExtensionAuthenticator` interface. The current `GatewayJwtAuthenticator` validates the gateway-minted bearer token and maps its claims to a normalized caller identity used by RPC authorization. This keeps handlers independent of the credential format and leaves room for a future SDK implementation backed by SPIFFE JWT-SVID validation through the Workload API. SPIFFE X.509-SVID support would integrate separately with the gRPC TLS transport because it authenticates the peer certificate rather than a bearer token.
+
 The service manifest describes its supported operation and phase. The policy attaches the complete service by the operator-owned `content-guard-example` registration name, not by the diagnostic manifest name.
 
 The `network_middlewares` map key `prototype-content-guard` is the stable policy-local identity. The optional `name` field is a human-readable label, and `order` must be unique across every middleware config in the policy.

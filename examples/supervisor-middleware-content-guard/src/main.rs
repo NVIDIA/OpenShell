@@ -23,7 +23,9 @@ use tonic::{Request, Response, Status};
 
 mod verification;
 
-use verification::{ExtensionCallerKind, ExtensionJwtClaims, ExtensionJwtVerifier};
+use verification::{
+    AuthenticatedCaller, ExtensionAuthenticator, ExtensionCallerKind, GatewayJwtAuthenticator,
+};
 
 const MANIFEST_NAME: &str = "example/content-guard-service";
 const OPERATION: SupervisorMiddlewareOperation = SupervisorMiddlewareOperation::HttpRequest;
@@ -138,15 +140,15 @@ fn optional_string_field<'a>(config: &'a Struct, name: &str) -> Result<Option<&'
 
 #[derive(Debug)]
 struct ContentGuard {
-    verifier: Arc<ExtensionJwtVerifier>,
+    authenticator: Arc<dyn ExtensionAuthenticator>,
 }
 
 impl ContentGuard {
-    fn authenticate<T>(
+    async fn authenticate<T>(
         &self,
         request: &Request<T>,
         allowed_callers: &[ExtensionCallerKind],
-    ) -> Result<ExtensionJwtClaims, Status> {
+    ) -> Result<AuthenticatedCaller, Status> {
         let authorization = request
             .metadata()
             .get("authorization")
@@ -157,12 +159,16 @@ impl ContentGuard {
             .strip_prefix("Bearer ")
             .filter(|token| !token.is_empty())
             .ok_or_else(|| Status::unauthenticated("expected a bearer token"))?;
-        let claims = self.verifier.verify(token).map_err(|error| {
-            eprintln!("extension token verification failed: {error}");
-            Status::unauthenticated("invalid extension token")
-        })?;
-        authorize_caller(claims.caller_kind, allowed_callers)?;
-        Ok(claims)
+        let caller = self
+            .authenticator
+            .authenticate(token)
+            .await
+            .map_err(|error| {
+                eprintln!("extension authentication failed: {error}");
+                Status::unauthenticated("invalid extension token")
+            })?;
+        authorize_caller(caller.kind, allowed_callers)?;
+        Ok(caller)
     }
 }
 
@@ -188,7 +194,8 @@ impl SupervisorMiddleware for ContentGuard {
                 ExtensionCallerKind::Gateway,
                 ExtensionCallerKind::Supervisor,
             ],
-        )?;
+        )
+        .await?;
         Ok(Response::new(MiddlewareManifest {
             name: MANIFEST_NAME.into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
@@ -205,7 +212,8 @@ impl SupervisorMiddleware for ContentGuard {
         &self,
         request: Request<ValidateConfigRequest>,
     ) -> Result<Response<ValidateConfigResponse>, Status> {
-        self.authenticate(&request, &[ExtensionCallerKind::Gateway])?;
+        self.authenticate(&request, &[ExtensionCallerKind::Gateway])
+            .await?;
         let request = request.into_inner();
         let validation = GuardConfig::parse(request.config.as_ref());
         Ok(Response::new(match validation {
@@ -224,7 +232,8 @@ impl SupervisorMiddleware for ContentGuard {
         &self,
         request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status> {
-        self.authenticate(&request, &[ExtensionCallerKind::Supervisor])?;
+        self.authenticate(&request, &[ExtensionCallerKind::Supervisor])
+            .await?;
         let request = request.into_inner();
         validate_phase(request.phase).map_err(Status::invalid_argument)?;
         let config =
@@ -368,17 +377,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_cert = tokio::fs::read(&cli.tls_cert).await?;
     let tls_key = tokio::fs::read(&cli.tls_key).await?;
     let gateway_jwks = tokio::fs::read(&cli.gateway_jwks).await?;
-    let verifier = Arc::new(ExtensionJwtVerifier::from_jwks(
-        &gateway_jwks,
-        cli.gateway_issuer,
-        cli.audience,
-    )?);
+    let authenticator: Arc<dyn ExtensionAuthenticator> = Arc::new(
+        GatewayJwtAuthenticator::from_jwks(&gateway_jwks, cli.gateway_issuer, cli.audience)?,
+    );
     let tls = ServerTlsConfig::new().identity(Identity::from_pem(tls_cert, tls_key));
 
     println!("serving {MANIFEST_NAME} on https://{}", cli.bind);
     Server::builder()
         .tls_config(tls)?
-        .add_service(SupervisorMiddlewareServer::new(ContentGuard { verifier }))
+        .add_service(SupervisorMiddlewareServer::new(ContentGuard {
+            authenticator,
+        }))
         .serve(cli.bind)
         .await?;
     Ok(())
