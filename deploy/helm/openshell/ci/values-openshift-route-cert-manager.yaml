@@ -12,7 +12,6 @@
 
 server:
   disableTls: false
-  grpcEndpoint: "https://openshell.example.com:443"
   tls:
     # Must name a secret containing the actual client CA when
     # clientCaFromServerTlsSecret is false — here, the same CA secret

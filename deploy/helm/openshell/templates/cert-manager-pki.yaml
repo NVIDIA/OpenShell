@@ -50,6 +50,9 @@ spec:
 {{- fail "certManager.serverIssuerRef.name is set but certManager.clientCaFromServerTlsSecret is still true \u2014 the server cert Secret's ca.crt comes from the external issuer, not the CA that signs the client (mTLS) certificate. Set certManager.clientCaFromServerTlsSecret=false and set server.tls.clientCaSecretName to the secret containing the client CA (e.g. the value of certManager.caSecretName, which defaults to openshell-ca-tls)." }}
 {{- end }}
 {{- if $externalServerIssuer }}
+{{- if not .Values.certManager.serverDnsNames }}
+{{- fail "certManager.serverIssuerRef.name is set but certManager.serverDnsNames is empty — the external certificate requires at least one externally-resolvable DNS name." }}
+{{- end }}
 {{- range .Values.certManager.serverDnsNames }}
 {{- /* Single-label names (e.g. "openshell") are also rejected by ACME CAs but are intentionally not checked here — the guard targets recognisable internal-network patterns. */ -}}
 {{- if or (eq . "localhost") (hasSuffix ".localhost" .) (hasSuffix ".svc.cluster.local" .) (hasSuffix ".svc" .) (eq . "host.docker.internal") (eq . "host.containers.internal") }}
@@ -57,6 +60,9 @@ spec:
 {{- end }}
 {{- end }}
 {{- end }}
+# Internal server certificate — always issued by the chart’s own CA with
+# internal SANs.  Supervisors connect via internal hostnames and verify
+# this cert against the chart CA they already trust.
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
@@ -68,41 +74,19 @@ spec:
   secretName: {{ .Values.server.tls.certSecretName | quote }}
   duration: {{ .Values.certManager.certificateDuration | quote }}
   renewBefore: {{ .Values.certManager.certificateRenewBefore | quote }}
-  {{- if $externalServerIssuer }}
-  # External issuers (e.g. ACME) reject internal-only names (cluster-local,
-  # localhost, loopback IPs) per CA/Browser Forum baseline requirements, and
-  # require any commonName to also appear in dnsNames. Only request the
-  # externally-resolvable SANs the operator configured — no defaults, no IPs.
-  {{- if .Values.certManager.serverDnsNames }}
-  commonName: {{ first .Values.certManager.serverDnsNames | quote }}
-  {{- end }}
-  dnsNames:
-    {{- range .Values.certManager.serverDnsNames }}
-    - {{ . | quote }}
-    {{- end }}
-  {{- else }}
-  # The chart fullname is always the first entry of defaultServerDnsNames
-  # below, so it's always valid as a commonName.
-  #
-  # Upgrade note: this replaces the previously-hardcoded "openshell-server"
-  # commonName. The ACME commonName-must-be-a-SAN constraint this exists for
-  # only applies to the external-issuer branch above, but this branch was
-  # changed too for consistency. Existing self-signed/internal-CA deployments
-  # will get a new server cert with a different Subject CN on next reissue
-  # after upgrading — SAN-based hostname verification (what TLS clients
-  # actually check) is unaffected.
   commonName: {{ include "openshell.fullname" . }}
   dnsNames:
     {{- range (include "openshell.defaultServerDnsNames" . | fromYamlArray) }}
     - {{ . | quote }}
     {{- end }}
+    {{- if not $externalServerIssuer }}
     {{- range .Values.certManager.serverDnsNames }}
     - {{ . | quote }}
+    {{- end }}
     {{- end }}
   {{- if .Values.certManager.serverIpAddresses }}
   ipAddresses:
     {{- toYaml .Values.certManager.serverIpAddresses | nindent 4 }}
-  {{- end }}
   {{- end }}
   privateKey:
     algorithm: ECDSA
@@ -112,15 +96,44 @@ spec:
     - digital signature
     - key encipherment
   issuerRef:
-    {{- if .Values.certManager.serverIssuerRef.name }}
-    name: {{ .Values.certManager.serverIssuerRef.name }}
-    kind: {{ .Values.certManager.serverIssuerRef.kind | default "Issuer" }}
-    group: {{ .Values.certManager.serverIssuerRef.group | default "cert-manager.io" }}
-    {{- else }}
     name: {{ include "openshell.fullname" . }}-ca-issuer
     kind: Issuer
     group: cert-manager.io
+{{- if $externalServerIssuer }}
+---
+# External server certificate — issued by the operator-configured issuer
+# (e.g. ACME/Let’s Encrypt) with only externally-resolvable SANs.
+# The gateway uses SNI to present this cert for external hostnames.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "openshell.fullname" . }}-server-external
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "openshell.fullname" . }}-server-external-tls
+  duration: {{ .Values.certManager.certificateDuration | quote }}
+  renewBefore: {{ .Values.certManager.certificateRenewBefore | quote }}
+  {{- if .Values.certManager.serverDnsNames }}
+  commonName: {{ first .Values.certManager.serverDnsNames | quote }}
+  {{- end }}
+  dnsNames:
+    {{- range .Values.certManager.serverDnsNames }}
+    - {{ . | quote }}
     {{- end }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  issuerRef:
+    name: {{ .Values.certManager.serverIssuerRef.name }}
+    kind: {{ .Values.certManager.serverIssuerRef.kind | default "Issuer" }}
+    group: {{ .Values.certManager.serverIssuerRef.group | default "cert-manager.io" }}
+{{- end }}
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate

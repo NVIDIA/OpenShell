@@ -14,7 +14,7 @@ repository.workspace = true
 glob = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
-tonic = { workspace = true, features = ["channel", "tls-webpki-roots"] }
+tonic = { workspace = true, features = ["channel"] }
 tonic-prost = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

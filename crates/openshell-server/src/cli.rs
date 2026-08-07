@@ -294,11 +294,27 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
         let key_path = args.tls_key.clone().ok_or_else(|| {
             miette::miette!("--tls-key is required when TLS is enabled (use --disable-tls to skip)")
         })?;
+        // External cert config (SNI-based dual cert) is only configurable
+        // via the TOML file, not CLI flags — it's a deployment-time setting.
+        let (ext_cert, ext_key, ext_names) = file
+            .as_ref()
+            .and_then(|f| f.openshell.gateway.tls.as_ref())
+            .map(|tls| {
+                (
+                    tls.external_cert_path.clone(),
+                    tls.external_key_path.clone(),
+                    tls.external_server_names.clone(),
+                )
+            })
+            .unwrap_or_default();
         Some(openshell_core::TlsConfig {
             cert_path,
             key_path,
             require_client_auth: has_client_ca && !has_oidc,
             client_ca_path: args.tls_client_ca.clone(),
+            external_cert_path: ext_cert,
+            external_key_path: ext_key,
+            external_server_names: ext_names,
         })
     };
 
