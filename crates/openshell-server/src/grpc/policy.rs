@@ -12393,7 +12393,7 @@ mod tests {
         let service = openshell_core::proto::SupervisorMiddlewareService {
             name: "local-guard".into(),
             grpc_endpoint: "http://127.0.0.1:50051".into(),
-            max_body_bytes: 1024,
+            max_payload_bytes: 1024,
             ..Default::default()
         };
 

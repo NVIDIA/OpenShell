@@ -4,11 +4,11 @@
 use std::time::Duration;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_core::middleware::{SupervisorMiddlewareEndpoint, WebSocketResponseStream};
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
-use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
     HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse,
+    ValidateConfigResponse, WebSocketSessionEvent,
 };
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Request, Response, Status};
@@ -67,7 +67,7 @@ impl RemoteMiddlewareService {
 }
 
 #[tonic::async_trait]
-impl SupervisorMiddleware for RemoteMiddlewareService {
+impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
     async fn describe(
         &self,
         request: Request<()>,
@@ -90,5 +90,19 @@ impl SupervisorMiddleware for RemoteMiddlewareService {
     ) -> std::result::Result<Response<HttpRequestResult>, Status> {
         let mut client = self.client.clone();
         client.evaluate_http_request(request).await
+    }
+
+    async fn open_websocket_session(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<WebSocketSessionEvent>,
+    ) -> std::result::Result<WebSocketResponseStream, Status> {
+        let mut client = self.client.clone();
+        let responses = client
+            .evaluate_web_socket_session(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+            .await?
+            .into_inner();
+        Ok(Box::pin(responses))
     }
 }

@@ -8,21 +8,26 @@ mod regex;
 use std::sync::Arc;
 
 use miette::{Result, miette};
+use openshell_core::middleware::{SupervisorMiddlewareEndpoint, WebSocketResponseStream};
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse,
+    HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, SupervisorMiddlewarePhase,
+    ValidateConfigRequest, ValidateConfigResponse, WebSocketMessageType, WebSocketPreflightAction,
+    WebSocketPreflightDecision, WebSocketSessionEvent, WebSocketSessionEventResult,
+    web_socket_session_event, web_socket_session_event_result,
 };
+use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
 pub use regex::{NAME as BUILTIN_REGEX, RegexConfig, RegexMode};
 
 /// Return the first-party services that the gateway and supervisor install.
-pub fn services() -> Vec<Arc<dyn SupervisorMiddleware>> {
+pub fn services() -> Vec<Arc<dyn SupervisorMiddlewareEndpoint>> {
     vec![Arc::new(BuiltinMiddlewareService)]
 }
 
-/// Validate configuration for a first-party binding.
+/// Resolve and validate a first-party config before the supervisor has selected
+/// its service endpoint.
 pub fn validate_config(implementation: &str, config: &prost_types::Struct) -> Result<()> {
     match implementation {
         BUILTIN_REGEX => regex::validate_config(config),
@@ -33,20 +38,147 @@ pub fn validate_config(implementation: &str, config: &prost_types::Struct) -> Re
 }
 
 fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpRequestResult> {
-    match evaluation.middleware_name.as_str() {
-        BUILTIN_REGEX => regex::evaluate_http_request(evaluation),
-        other => Err(miette!(
-            "middleware implementation '{other}' is not a registered OpenShell built-in"
-        )),
-    }
+    regex::evaluate_http_request(evaluation)
 }
 
 /// Built-in regex service exposed through the standard middleware contract.
 #[derive(Debug, Default)]
 pub struct BuiltinMiddlewareService;
 
+impl BuiltinMiddlewareService {
+    fn websocket_stream<S>(mut requests: S) -> WebSocketResponseStream
+    where
+        S: Stream<Item = std::result::Result<WebSocketSessionEvent, Status>>
+            + Send
+            + Unpin
+            + 'static,
+    {
+        let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut config = None;
+            let mut started = false;
+            let mut sequence_lower_bound = Some(1u64);
+
+            while let Some(request) = requests.next().await {
+                let request = match request {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let _ = responses_tx.send(Err(error)).await;
+                        break;
+                    }
+                };
+                let response = match request.event {
+                    Some(web_socket_session_event::Event::Preflight(preflight))
+                        if config.is_none() && !started =>
+                    {
+                        if preflight.phase == SupervisorMiddlewarePhase::PreCredentials as i32 {
+                            let selected_config = preflight.config.unwrap_or_default();
+                            match regex::validate_config(&selected_config) {
+                                Ok(()) => {
+                                    config = Some(selected_config);
+                                    Ok(Some(WebSocketSessionEventResult {
+                                        result: Some(
+                                            web_socket_session_event_result::Result::PreflightDecision(
+                                                WebSocketPreflightDecision {
+                                                    action: WebSocketPreflightAction::Inspect
+                                                        as i32,
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                        ),
+                                    }))
+                                }
+                                Err(error) => Err(Status::invalid_argument(error.to_string())),
+                            }
+                        } else {
+                            Err(Status::invalid_argument(
+                                "unsupported built-in WebSocket binding",
+                            ))
+                        }
+                    }
+                    Some(web_socket_session_event::Event::SessionStart(_))
+                        if config.is_some() && !started =>
+                    {
+                        started = true;
+                        Ok(None)
+                    }
+                    Some(web_socket_session_event::Event::Message(message)) if started => {
+                        if let Err(error) = advance_sequence_lower_bound(
+                            &mut sequence_lower_bound,
+                            message.sequence,
+                        ) {
+                            Err(error)
+                        } else if message.message_type != WebSocketMessageType::Text as i32 {
+                            Err(Status::invalid_argument(
+                                "openshell/regex supports only client-to-upstream WebSocket text messages",
+                            ))
+                        } else {
+                            let selected_config =
+                                config.as_ref().expect("started stream has config");
+                            match regex::evaluate_websocket_text(
+                                message.sequence,
+                                &message.payload,
+                                selected_config,
+                            ) {
+                                Ok(result) => Ok(Some(WebSocketSessionEventResult {
+                                    result: Some(
+                                        web_socket_session_event_result::Result::MessageResult(
+                                            result,
+                                        ),
+                                    ),
+                                })),
+                                Err(error) => Err(Status::invalid_argument(error.to_string())),
+                            }
+                        }
+                    }
+                    Some(web_socket_session_event::Event::SessionEnd(_)) if config.is_some() => {
+                        break;
+                    }
+                    _ => Err(Status::failed_precondition(
+                        "invalid built-in WebSocket session lifecycle",
+                    )),
+                };
+
+                match response {
+                    Ok(Some(response)) => {
+                        if responses_tx.send(Ok(response)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = responses_tx.send(Err(error)).await;
+                        break;
+                    }
+                }
+            }
+        });
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(responses_rx))
+    }
+}
+
+fn advance_sequence_lower_bound(
+    lower_bound: &mut Option<u64>,
+    sequence: u64,
+) -> std::result::Result<(), Status> {
+    let Some(current_lower_bound) = *lower_bound else {
+        return Err(Status::invalid_argument(
+            "WebSocket message sequence must be strictly increasing",
+        ));
+    };
+    if sequence < current_lower_bound {
+        return Err(Status::invalid_argument(
+            "WebSocket message sequence must be strictly increasing",
+        ));
+    }
+    *lower_bound = sequence.checked_add(1);
+    Ok(())
+}
+
 #[tonic::async_trait]
 impl SupervisorMiddleware for BuiltinMiddlewareService {
+    type EvaluateWebSocketSessionStream = WebSocketResponseStream;
+
     async fn describe(
         &self,
         _request: Request<()>,
@@ -54,7 +186,7 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
         Ok(Response::new(MiddlewareManifest {
             name: BUILTIN_REGEX.into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
-            bindings: vec![regex::describe()],
+            bindings: regex::describe(),
         }))
     }
 
@@ -64,18 +196,16 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
     ) -> Result<Response<ValidateConfigResponse>, Status> {
         let request = request.into_inner();
         let config = request.config.unwrap_or_default();
-        Ok(Response::new(
-            match validate_config(&request.middleware_name, &config) {
-                Ok(()) => ValidateConfigResponse {
-                    valid: true,
-                    reason: String::new(),
-                },
-                Err(error) => ValidateConfigResponse {
-                    valid: false,
-                    reason: error.to_string(),
-                },
+        Ok(Response::new(match regex::validate_config(&config) {
+            Ok(()) => ValidateConfigResponse {
+                valid: true,
+                reason: String::new(),
             },
-        ))
+            Err(error) => ValidateConfigResponse {
+                valid: false,
+                reason: error.to_string(),
+            },
+        }))
     }
 
     async fn evaluate_http_request(
@@ -86,13 +216,50 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
             .map(Response::new)
             .map_err(|error| Status::invalid_argument(error.to_string()))
     }
+
+    async fn evaluate_web_socket_session(
+        &self,
+        request: Request<tonic::Streaming<WebSocketSessionEvent>>,
+    ) -> Result<Response<Self::EvaluateWebSocketSessionStream>, Status> {
+        Ok(Response::new(Self::websocket_stream(request.into_inner())))
+    }
+}
+
+#[tonic::async_trait]
+impl SupervisorMiddlewareEndpoint for BuiltinMiddlewareService {
+    async fn describe(&self, request: Request<()>) -> Result<Response<MiddlewareManifest>, Status> {
+        SupervisorMiddleware::describe(self, request).await
+    }
+
+    async fn validate_config(
+        &self,
+        request: Request<ValidateConfigRequest>,
+    ) -> Result<Response<ValidateConfigResponse>, Status> {
+        SupervisorMiddleware::validate_config(self, request).await
+    }
+
+    async fn evaluate_http_request(
+        &self,
+        request: Request<HttpRequestEvaluation>,
+    ) -> Result<Response<HttpRequestResult>, Status> {
+        SupervisorMiddleware::evaluate_http_request(self, request).await
+    }
+
+    async fn open_websocket_session(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<WebSocketSessionEvent>,
+    ) -> Result<WebSocketResponseStream, Status> {
+        Ok(Self::websocket_stream(
+            tokio_stream::wrappers::ReceiverStream::new(receiver).map(Ok),
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use openshell_core::proto::{
-        Decision, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+        Decision, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, WebSocketPreflight,
     };
 
     fn string_config(key: &str, value: &str) -> prost_types::Struct {
@@ -109,12 +276,11 @@ mod tests {
 
     #[tokio::test]
     async fn service_describes_regex_binding() {
-        let manifest = BuiltinMiddlewareService
-            .describe(Request::new(()))
+        let manifest = SupervisorMiddleware::describe(&BuiltinMiddlewareService, Request::new(()))
             .await
             .expect("describe")
             .into_inner();
-        assert_eq!(manifest.bindings.len(), 1);
+        assert_eq!(manifest.bindings.len(), 2);
         assert_eq!(
             manifest.bindings[0].operation,
             SupervisorMiddlewareOperation::HttpRequest as i32
@@ -123,7 +289,16 @@ mod tests {
             manifest.bindings[0].phase,
             SupervisorMiddlewarePhase::PreCredentials as i32
         );
-        assert_eq!(manifest.bindings[0].max_body_bytes, 256 * 1024);
+        assert_eq!(manifest.bindings[0].max_payload_bytes, 256 * 1024);
+        assert_eq!(
+            manifest.bindings[1].operation,
+            SupervisorMiddlewareOperation::WebsocketMessage as i32
+        );
+        assert_eq!(
+            manifest.bindings[1].phase,
+            SupervisorMiddlewarePhase::PreCredentials as i32
+        );
+        assert_eq!(manifest.bindings[1].max_payload_bytes, 256 * 1024);
     }
 
     #[test]
@@ -160,7 +335,7 @@ mod tests {
     #[test]
     fn regex_replacement_evaluates_through_binding() {
         let result = evaluate_http_request(&HttpRequestEvaluation {
-            middleware_name: BUILTIN_REGEX.into(),
+            middleware_name: "operator-assigned-name".into(),
             body: br#"{"password":"top-secret","token":"sk-ABCDEFGHIJKLMNOP"}"#.to_vec(),
             config: Some(prost_types::Struct::default()),
             ..Default::default()
@@ -178,6 +353,49 @@ mod tests {
                 .iter()
                 .all(|finding| finding.r#type != "regex.keyword")
         );
+    }
+
+    #[tokio::test]
+    async fn service_config_validation_does_not_dispatch_on_registration_name() {
+        let response = SupervisorMiddleware::validate_config(
+            &BuiltinMiddlewareService,
+            Request::new(ValidateConfigRequest {
+                config: Some(prost_types::Struct::default()),
+                middleware_name: "operator-assigned-name".into(),
+            }),
+        )
+        .await
+        .expect("validate config")
+        .into_inner();
+
+        assert!(response.valid);
+    }
+
+    #[tokio::test]
+    async fn websocket_preflight_does_not_dispatch_on_registration_name() {
+        let requests = tokio_stream::iter([Ok::<_, Status>(WebSocketSessionEvent {
+            event: Some(web_socket_session_event::Event::Preflight(
+                WebSocketPreflight {
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    middleware_name: "operator-assigned-name".into(),
+                    config: Some(prost_types::Struct::default()),
+                    ..Default::default()
+                },
+            )),
+        })]);
+        let mut responses = BuiltinMiddlewareService::websocket_stream(requests);
+        let response = responses
+            .next()
+            .await
+            .expect("preflight response")
+            .expect("valid preflight");
+
+        assert!(matches!(
+            response.result,
+            Some(web_socket_session_event_result::Result::PreflightDecision(
+                WebSocketPreflightDecision { action, .. }
+            )) if action == WebSocketPreflightAction::Inspect as i32
+        ));
     }
 
     #[test]
@@ -198,5 +416,74 @@ mod tests {
         assert!(!result.has_body);
         assert_eq!(result.body, body.as_bytes());
         assert!(result.findings.is_empty());
+    }
+
+    #[test]
+    fn regex_websocket_text_reuses_findings_and_metadata_semantics() {
+        let payload =
+            br#"{"type":"response.create","input":"sk-ABCDEFGHIJKLMNOP sk-QRSTUVWXYZabcdef"}"#;
+        let result = regex::evaluate_websocket_text(7, payload, &prost_types::Struct::default())
+            .expect("evaluate WebSocket text");
+
+        assert_eq!(result.sequence, 7);
+        assert_eq!(result.decision, Decision::Allow as i32);
+        assert!(result.has_replacement);
+        assert_eq!(
+            String::from_utf8(result.replacement).expect("replacement UTF-8"),
+            r#"{"type":"response.create","input":"[REDACTED] [REDACTED]"}"#
+        );
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].r#type, "regex.openai");
+        assert_eq!(result.findings[0].count, 2);
+        assert_eq!(
+            result.metadata.get("regex_matches_replaced"),
+            Some(&"2".to_string())
+        );
+    }
+
+    #[test]
+    fn regex_websocket_no_match_returns_no_replacement_or_findings() {
+        let result = regex::evaluate_websocket_text(
+            1,
+            br#"{"type":"response.create","input":"public"}"#,
+            &prost_types::Struct::default(),
+        )
+        .expect("evaluate WebSocket text");
+
+        assert!(!result.has_replacement);
+        assert!(result.replacement.is_empty());
+        assert!(result.findings.is_empty());
+        assert!(result.metadata.is_empty());
+    }
+
+    #[test]
+    fn regex_websocket_rejects_invalid_utf8_and_oversize_messages() {
+        assert!(
+            regex::evaluate_websocket_text(1, &[0xff], &prost_types::Struct::default()).is_err()
+        );
+        assert!(
+            regex::evaluate_websocket_text(
+                1,
+                &vec![b'a'; 256 * 1024 + 1],
+                &prost_types::Struct::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn websocket_sequence_lower_bound_accepts_gaps_and_rejects_reuse() {
+        let mut lower_bound = Some(1);
+        advance_sequence_lower_bound(&mut lower_bound, 2).expect("first delivered sequence");
+        assert_eq!(lower_bound, Some(3));
+        assert!(advance_sequence_lower_bound(&mut lower_bound, 2).is_err());
+        assert!(advance_sequence_lower_bound(&mut lower_bound, 1).is_err());
+
+        advance_sequence_lower_bound(&mut lower_bound, 7).expect("forward gap");
+        assert_eq!(lower_bound, Some(8));
+
+        advance_sequence_lower_bound(&mut lower_bound, u64::MAX).expect("last sequence");
+        assert_eq!(lower_bound, None);
+        assert!(advance_sequence_lower_bound(&mut lower_bound, u64::MAX).is_err());
     }
 }
