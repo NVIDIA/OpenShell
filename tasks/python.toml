@@ -4,193 +4,35 @@
 # Python development, build, lint, and format tasks
 
 ["python:dev"]
-description = "Install Python package in development mode (builds CLI binary)"
+description = "Install the Python SDK in development mode"
 depends = ["python:proto"]
-run = "uv sync --group dev && uv pip install ."
+run = "uv sync --group dev"
 hide = true
 
 ["build:python:wheel"]
-description = "Build Python wheel with CLI binary (native)"
+description = "Build the pure-Python SDK wheel"
 depends = ["python:proto"]
-run = "uv run maturin build --release"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+WHEEL_OUTPUT_DIR=${WHEEL_OUTPUT_DIR:-target/wheels}
+rm -rf "$WHEEL_OUTPUT_DIR"
+mkdir -p "$WHEEL_OUTPUT_DIR"
+
+uv build --wheel --out-dir "$WHEEL_OUTPUT_DIR"
+
+VERIFY_ARGS=()
+if [ -n "${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL:-}" ]; then
+  VERIFY_ARGS+=(--expected-version "$SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL")
+fi
+uv run --no-project python tasks/scripts/verify-python-wheel.py "$WHEEL_OUTPUT_DIR" "${VERIFY_ARGS[@]}"
+"""
 hide = true
 
 ["python:build"]
 description = "Alias for build:python:wheel"
 depends = ["build:python:wheel"]
-hide = true
-
-["build:python:wheel:linux"]
-description = "Build a Linux Python wheel natively on the current host"
-depends = ["python:proto"]
-run = '''
-#!/usr/bin/env bash
-set -euo pipefail
-
-WHEEL_OUTPUT_DIR=${WHEEL_OUTPUT_DIR:?Set WHEEL_OUTPUT_DIR to a per-platform wheel output directory}
-EXPECTED_HOST_ARCH=${EXPECTED_HOST_ARCH:?Set EXPECTED_HOST_ARCH to amd64 or arm64}
-ORIGINAL_CARGO_TOML=""
-
-normalize_arch() {
-  case "$1" in
-    x86_64|amd64) echo amd64 ;;
-    aarch64|arm64) echo arm64 ;;
-    *) echo "$1" ;;
-  esac
-}
-
-cleanup() {
-  if [ -n "$ORIGINAL_CARGO_TOML" ] && [ -f "$ORIGINAL_CARGO_TOML" ]; then
-    cp "$ORIGINAL_CARGO_TOML" Cargo.toml
-    rm -f "$ORIGINAL_CARGO_TOML"
-  fi
-}
-
-trap cleanup EXIT
-
-if [ "$(uname -s)" != "Linux" ]; then
-  echo "build:python:wheel:linux requires a Linux host" >&2
-  exit 1
-fi
-
-HOST_ARCH=$(normalize_arch "$(uname -m)")
-EXPECTED_HOST_ARCH=$(normalize_arch "$EXPECTED_HOST_ARCH")
-if [ "$HOST_ARCH" != "$EXPECTED_HOST_ARCH" ]; then
-  echo "build:python:wheel:linux expected ${EXPECTED_HOST_ARCH} host, got ${HOST_ARCH}" >&2
-  exit 1
-fi
-
-# Avoid failures when RUSTC_WRAPPER is set to an unresolved `sccache` binary.
-if command -v sccache >/dev/null 2>&1; then
-  export RUSTC_WRAPPER="$(command -v sccache)"
-else
-  unset RUSTC_WRAPPER || true
-fi
-
-if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then
-  ORIGINAL_CARGO_TOML=$(mktemp)
-  cp Cargo.toml "$ORIGINAL_CARGO_TOML"
-  sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml
-fi
-
-rm -rf "$WHEEL_OUTPUT_DIR"
-mkdir -p "$WHEEL_OUTPUT_DIR"
-
-uv run maturin build --release --out "$WHEEL_OUTPUT_DIR"
-
-ls -la "$WHEEL_OUTPUT_DIR"/*.whl
-'''
-hide = true
-
-["build:python:wheel:linux:amd64"]
-description = "Build Python wheel for Linux amd64 natively"
-depends = ["EXPECTED_HOST_ARCH=amd64 WHEEL_OUTPUT_DIR=target/wheels/linux-amd64 build:python:wheel:linux"]
-hide = true
-
-["python:build:linux:amd64"]
-description = "Alias for build:python:wheel:linux:amd64"
-depends = ["build:python:wheel:linux:amd64"]
-hide = true
-
-["build:python:wheel:linux:arm64"]
-description = "Build Python wheel for Linux arm64 natively"
-depends = ["EXPECTED_HOST_ARCH=arm64 WHEEL_OUTPUT_DIR=target/wheels/linux-arm64 build:python:wheel:linux"]
-hide = true
-
-["python:build:linux:arm64"]
-description = "Alias for build:python:wheel:linux:arm64"
-depends = ["build:python:wheel:linux:arm64"]
-hide = true
-
-["build:python:wheel:macos"]
-description = "Build Python wheel for macOS arm64"
-depends = ["python:proto"]
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [ "$(uname -s)" = "Darwin" ] && [ -z "${OPENSHELL_CARGO_VERSION:-}" ]; then
-  # Avoid failures when RUSTC_WRAPPER is set to an unresolved `sccache` binary.
-  if command -v sccache >/dev/null 2>&1; then
-    export RUSTC_WRAPPER="$(command -v sccache)"
-  else
-    unset RUSTC_WRAPPER || true
-  fi
-
-  mkdir -p target/wheels
-
-  rustup target add aarch64-apple-darwin
-
-  uv run maturin build --release --target aarch64-apple-darwin --out target/wheels
-else
-  echo "Building macOS wheel via Docker cross-toolchain"
-  mise run build:python:wheel:macos:docker
-fi
-
-ls -la target/wheels/*.whl
-"""
-hide = true
-
-["python:build:macos"]
-description = "Alias for build:python:wheel:macos"
-depends = ["build:python:wheel:macos"]
-hide = true
-
-["build:python:wheel:macos:docker"]
-description = "Build Python wheel for macOS arm64 from Docker"
-depends = ["python:proto"]
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-
-source tasks/scripts/container-engine.sh
-
-sha256_16() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print substr($1, 1, 16)}'
-  else
-    shasum -a 256 "$1" | awk '{print substr($1, 1, 16)}'
-  fi
-}
-
-sha256_16_stdin() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum | awk '{print substr($1, 1, 16)}'
-  else
-    shasum -a 256 | awk '{print substr($1, 1, 16)}'
-  fi
-}
-
-CARGO_VERSION=${OPENSHELL_CARGO_VERSION:-}
-OSXCROSS_IMAGE_REF=${OSXCROSS_IMAGE:-crazymax/osxcross:latest}
-if [ -z "$CARGO_VERSION" ] && [ -n "${CI:-}" ]; then
-  CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-fi
-
-LOCK_HASH=$(sha256_16 Cargo.lock)
-RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-rustup-1.95.0}
-CACHE_SCOPE_INPUT="v1|python-wheels-macos|base|${LOCK_HASH}|${RUST_SCOPE}"
-CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "$CACHE_SCOPE_INPUT" | sha256_16_stdin)
-
-mkdir -p target/wheels
-
-ce build \
-  -f deploy/docker/Dockerfile.python-wheels-macos \
-  --target wheels \
-  --build-arg "OSXCROSS_IMAGE=${OSXCROSS_IMAGE_REF}" \
-  --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}" \
-  ${CARGO_VERSION:+--build-arg "OPENSHELL_CARGO_VERSION=${CARGO_VERSION}"} \
-  ${OPENSHELL_IMAGE_TAG:+--build-arg "OPENSHELL_IMAGE_TAG=${OPENSHELL_IMAGE_TAG}"} \
-  --output type=local,dest=target/wheels \
-  .
-
-ls -la target/wheels/*macosx*arm64.whl
-"""
-hide = true
-
-["python:build:macos:docker"]
-description = "Alias for build:python:wheel:macos:docker"
-depends = ["build:python:wheel:macos:docker"]
 hide = true
 
 ["python:lint"]
