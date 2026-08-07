@@ -23,6 +23,8 @@ use std::io::IsTerminal;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+const DOCS_PROVIDERS_URL: &str = "https://docs.nvidia.com/openshell/latest/sandboxes/providers-v2";
+
 // ---------------------------------------------------------------------------
 // View types
 // ---------------------------------------------------------------------------
@@ -744,7 +746,7 @@ pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
 // Parsing utilities
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileSuggestion {
     pub provider_type: String,
     pub credential: String,
@@ -766,7 +768,7 @@ fn credential_env_matches(env: &HashMap<String, String>) -> Vec<(String, Vec<Pro
     };
 
     // scan builtin_profiles()
-    fn profile_suggestions(key: &str) -> Vec<ProfileSuggestion> {
+    let profile_suggestions = |key: &str| -> Vec<ProfileSuggestion> {
         let mut suggestions = Vec::new();
         for profile in builtin_profiles() {
             for cred in &profile.credentials {
@@ -779,7 +781,7 @@ fn credential_env_matches(env: &HashMap<String, String>) -> Vec<(String, Vec<Pro
             }
         }
         suggestions
-    }
+    };
 
     let mut matches = Vec::new();
 
@@ -792,6 +794,42 @@ fn credential_env_matches(env: &HashMap<String, String>) -> Vec<(String, Vec<Pro
 
     matches.sort_by(|a, b| a.0.cmp(&b.0));
     matches
+}
+
+#[allow(clippy::implicit_hasher)]
+pub fn warn_credential_env_vars(env: &HashMap<String, String>, suppress: bool) {
+    if suppress {
+        return;
+    }
+
+    let matches = credential_env_matches(env);
+    if matches.is_empty() {
+        return;
+    }
+
+    for (key, suggestions) in &matches {
+        eprintln!(
+            "{} {key} looks like a credential passed as a plain environment variable.",
+            "⚠".yellow()
+        );
+        eprintln!("  The agent inside the sandbox can read this value directly.");
+        eprintln!();
+
+        if suggestions.is_empty() {
+            eprintln!("  To hide it from the agent, use a provider instead of --env.");
+        } else {
+            eprintln!("  To hide it from the agent, use a provider instead:");
+            for s in suggestions {
+                eprintln!(
+                    "    openshell provider create --name my-{ty} --type {ty} --credential {key}",
+                    ty = s.provider_type
+                );
+            }
+            eprintln!("    openshell sandbox create --provider my-<name> ...");
+        }
+        eprintln!("  See: {DOCS_PROVIDERS_URL}");
+        eprintln!();
+    }
 }
 
 pub fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String, String>> {
@@ -1091,17 +1129,21 @@ mod tests {
     #[test]
     fn no_value_leak() {
         let env = env(&[("APP_SECRET", "secret")]);
-        
+
         let prof = credential_env_matches(&env);
         assert_eq!(prof.len(), 1_usize);
 
-        let dumped = format!("{:?}", prof);
-        assert!(!dumped.contains("secret"), "value leaked: {}", dumped);
+        let dumped = format!("{prof:?}");
+        assert!(!dumped.contains("secret"), "value leaked: {dumped}");
     }
 
     #[test]
     fn deterministic_order() {
-        let env = env(&[("ZED_TOKEN", "a"), ("ABC_SECRET", "b"), ("MID_PASSWORD", "c")]);
+        let env = env(&[
+            ("ZED_TOKEN", "a"),
+            ("ABC_SECRET", "b"),
+            ("MID_PASSWORD", "c"),
+        ]);
 
         let prof = credential_env_matches(&env);
         let keys: Vec<&str> = prof.iter().map(|(k, _)| k.as_str()).collect();
