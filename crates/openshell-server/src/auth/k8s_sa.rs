@@ -26,6 +26,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Error as KubeError;
 use kube::api::{Api, ApiResource, PostParams};
 use kube::core::{DynamicObject, gvk::GroupVersionKind};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tonic::Status;
 use tracing::{debug, info, warn};
@@ -137,6 +138,7 @@ impl Authenticator for K8sServiceAccountAuthenticator {
 
 #[derive(Debug)]
 struct TokenReviewIdentity {
+    namespace: String,
     pod_name: String,
     pod_uid: String,
 }
@@ -151,24 +153,35 @@ struct SandboxOwnerReference {
 /// Resolver backed by the apiserver's `TokenReview` API and `kube::Client`
 /// for the per-pod annotation lookup.
 pub struct LiveK8sResolver {
+    client: kube::Client,
     token_reviews_api: Api<TokenReview>,
-    pods_api: Api<Pod>,
-    sandboxes_api_v1beta1: Api<DynamicObject>,
-    sandboxes_api_v1alpha1: Api<DynamicObject>,
     expected_audience: String,
-    sandbox_namespace: String,
+    sandbox_namespaces: BTreeSet<String>,
     expected_service_account: String,
 }
 
 impl LiveK8sResolver {
     pub fn new(
         client: kube::Client,
-        namespace: &str,
+        namespaces: impl IntoIterator<Item = String>,
         expected_audience: String,
         expected_service_account: String,
     ) -> Self {
         let token_reviews_api: Api<TokenReview> = Api::all(client.clone());
-        let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+        Self {
+            client,
+            token_reviews_api,
+            expected_audience,
+            sandbox_namespaces: namespaces.into_iter().collect(),
+            expected_service_account,
+        }
+    }
+
+    async fn get_sandbox_cr_for_owner(
+        &self,
+        namespace: &str,
+        owner: &SandboxOwnerReference,
+    ) -> Result<Option<DynamicObject>, KubeError> {
         let sandbox_gvk_v1beta1 =
             GroupVersionKind::gvk(SANDBOX_API_GROUP, SANDBOX_API_VERSION_V1BETA1, SANDBOX_KIND);
         let sandbox_resource_v1beta1 = ApiResource::from_gvk(&sandbox_gvk_v1beta1);
@@ -179,28 +192,13 @@ impl LiveK8sResolver {
         );
         let sandbox_resource_v1alpha1 = ApiResource::from_gvk(&sandbox_gvk_v1alpha1);
         let sandboxes_api_v1beta1: Api<DynamicObject> =
-            Api::namespaced_with(client.clone(), namespace, &sandbox_resource_v1beta1);
+            Api::namespaced_with(self.client.clone(), namespace, &sandbox_resource_v1beta1);
         let sandboxes_api_v1alpha1: Api<DynamicObject> =
-            Api::namespaced_with(client, namespace, &sandbox_resource_v1alpha1);
-        Self {
-            token_reviews_api,
-            pods_api,
-            sandboxes_api_v1beta1,
-            sandboxes_api_v1alpha1,
-            expected_audience,
-            sandbox_namespace: namespace.to_string(),
-            expected_service_account,
-        }
-    }
-
-    async fn get_sandbox_cr_for_owner(
-        &self,
-        owner: &SandboxOwnerReference,
-    ) -> Result<Option<DynamicObject>, KubeError> {
+            Api::namespaced_with(self.client.clone(), namespace, &sandbox_resource_v1alpha1);
         let apis = if owner.api_version == SANDBOX_API_VERSION_FULL_V1ALPHA1 {
-            [&self.sandboxes_api_v1alpha1, &self.sandboxes_api_v1beta1]
+            [&sandboxes_api_v1alpha1, &sandboxes_api_v1beta1]
         } else {
-            [&self.sandboxes_api_v1beta1, &self.sandboxes_api_v1alpha1]
+            [&sandboxes_api_v1beta1, &sandboxes_api_v1alpha1]
         };
 
         for api in apis {
@@ -242,7 +240,7 @@ impl K8sIdentityResolver for LiveK8sResolver {
         let Some(identity) = token_review_identity(
             &status,
             &self.expected_audience,
-            &self.sandbox_namespace,
+            &self.sandbox_namespaces,
             &self.expected_service_account,
         )?
         else {
@@ -252,23 +250,21 @@ impl K8sIdentityResolver for LiveK8sResolver {
         info!(
             pod_name = %identity.pod_name,
             pod_uid = %identity.pod_uid,
+            namespace = %identity.namespace,
             service_account = %self.expected_service_account,
             "validated K8s SA token via TokenReview"
         );
 
         // Look up the pod and read its sandbox-id annotation.
-        let pod = self
-            .pods_api
-            .get_opt(&identity.pod_name)
-            .await
-            .map_err(|e| {
-                warn!(
-                    pod = %identity.pod_name,
-                    error = %e,
-                    "failed to fetch sandbox pod for annotation lookup"
-                );
-                Status::internal(format!("pod GET failed: {e}"))
-            })?;
+        let pods_api: Api<Pod> = Api::namespaced(self.client.clone(), &identity.namespace);
+        let pod = pods_api.get_opt(&identity.pod_name).await.map_err(|e| {
+            warn!(
+                pod = %identity.pod_name,
+                error = %e,
+                "failed to fetch sandbox pod for annotation lookup"
+            );
+            Status::internal(format!("pod GET failed: {e}"))
+        })?;
         let Some(pod) = pod else {
             warn!(
                 pod = %identity.pod_name,
@@ -294,16 +290,20 @@ impl K8sIdentityResolver for LiveK8sResolver {
         let sandbox_id = pod_sandbox_id(&pod)?;
 
         let owner = sandbox_owner_reference(&pod)?;
-        let sandbox_cr = self.get_sandbox_cr_for_owner(&owner).await.map_err(|e| {
-            warn!(
-                pod = %identity.pod_name,
-                sandbox_owner = %owner.name,
-                sandbox_owner_api_version = %owner.api_version,
-                error = %e,
-                "failed to fetch owning Sandbox CR for pod identity validation"
-            );
-            Status::internal(format!("sandbox GET failed: {e}"))
-        })?;
+        let sandbox_cr = self
+            .get_sandbox_cr_for_owner(&identity.namespace, &owner)
+            .await
+            .map_err(|e| {
+                warn!(
+                    pod = %identity.pod_name,
+                    namespace = %identity.namespace,
+                    sandbox_owner = %owner.name,
+                    sandbox_owner_api_version = %owner.api_version,
+                    error = %e,
+                    "failed to fetch owning Sandbox CR for pod identity validation"
+                );
+                Status::internal(format!("sandbox GET failed: {e}"))
+            })?;
         let Some(sandbox_cr) = sandbox_cr else {
             warn!(
                 pod = %identity.pod_name,
@@ -327,7 +327,7 @@ impl K8sIdentityResolver for LiveK8sResolver {
 fn token_review_identity(
     status: &TokenReviewStatus,
     expected_audience: &str,
-    sandbox_namespace: &str,
+    sandbox_namespaces: &BTreeSet<String>,
     expected_service_account: &str,
 ) -> Result<Option<TokenReviewIdentity>, Status> {
     if status.authenticated != Some(true) {
@@ -356,12 +356,20 @@ fn token_review_identity(
         .username
         .as_deref()
         .ok_or_else(|| Status::permission_denied("TokenReview response missing username"))?;
-    let expected_username =
-        format!("system:serviceaccount:{sandbox_namespace}:{expected_service_account}");
-    if username != expected_username {
+    let Some(service_account_identity) = username.strip_prefix("system:serviceaccount:") else {
+        return Err(Status::permission_denied(
+            "SA token is not from a Kubernetes service account",
+        ));
+    };
+    let Some((namespace, service_account)) = service_account_identity.split_once(':') else {
+        return Err(Status::permission_denied(
+            "SA token has an invalid Kubernetes service account principal",
+        ));
+    };
+    if service_account != expected_service_account || !sandbox_namespaces.contains(namespace) {
         warn!(
             username = %username,
-            sandbox_namespace = %sandbox_namespace,
+            sandbox_namespaces = ?sandbox_namespaces,
             service_account = %expected_service_account,
             "K8s TokenReview principal is not the configured sandbox service account"
         );
@@ -372,7 +380,11 @@ fn token_review_identity(
 
     let pod_name = user_extra_one(user, POD_NAME_EXTRA)?;
     let pod_uid = user_extra_one(user, POD_UID_EXTRA)?;
-    Ok(Some(TokenReviewIdentity { pod_name, pod_uid }))
+    Ok(Some(TokenReviewIdentity {
+        namespace: namespace.to_string(),
+        pod_name,
+        pod_uid,
+    }))
 }
 
 #[allow(clippy::result_large_err)]
@@ -547,7 +559,14 @@ mod tests {
     use super::test_support::FakeResolver;
     use super::*;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn sandbox_namespaces(namespaces: &[&str]) -> BTreeSet<String> {
+        namespaces
+            .iter()
+            .map(|namespace| (*namespace).to_string())
+            .collect()
+    }
 
     fn bearer_headers(token: &str) -> http::HeaderMap {
         let mut h = http::HeaderMap::new();
@@ -676,10 +695,16 @@ mod tests {
             ],
         );
 
-        let identity = token_review_identity(&status, "openshell-gateway", "openshell", "default")
-            .unwrap()
-            .expect("authenticated token should resolve");
+        let identity = token_review_identity(
+            &status,
+            "openshell-gateway",
+            &sandbox_namespaces(&["openshell"]),
+            "default",
+        )
+        .unwrap()
+        .expect("authenticated token should resolve");
 
+        assert_eq!(identity.namespace, "openshell");
         assert_eq!(identity.pod_name, "openshell-sandbox-a");
         assert_eq!(identity.pod_uid, "uid-a");
     }
@@ -693,9 +718,14 @@ mod tests {
         };
 
         assert!(
-            token_review_identity(&status, "openshell-gateway", "openshell", "default")
-                .unwrap()
-                .is_none()
+            token_review_identity(
+                &status,
+                "openshell-gateway",
+                &sandbox_namespaces(&["openshell"]),
+                "default",
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -711,8 +741,13 @@ mod tests {
             ],
         );
 
-        let err = token_review_identity(&status, "openshell-gateway", "openshell", "default")
-            .expect_err("wrong audience must fail closed");
+        let err = token_review_identity(
+            &status,
+            "openshell-gateway",
+            &sandbox_namespaces(&["openshell"]),
+            "default",
+        )
+        .expect_err("wrong audience must fail closed");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
@@ -728,8 +763,13 @@ mod tests {
             ],
         );
 
-        let err = token_review_identity(&status, "openshell-gateway", "openshell", "default")
-            .expect_err("other namespace must be rejected");
+        let err = token_review_identity(
+            &status,
+            "openshell-gateway",
+            &sandbox_namespaces(&["openshell"]),
+            "default",
+        )
+        .expect_err("other namespace must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
@@ -745,8 +785,13 @@ mod tests {
             ],
         );
 
-        let err = token_review_identity(&status, "openshell-gateway", "openshell", "default")
-            .expect_err("other service account must be rejected");
+        let err = token_review_identity(
+            &status,
+            "openshell-gateway",
+            &sandbox_namespaces(&["openshell"]),
+            "default",
+        )
+        .expect_err("other service account must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
@@ -759,9 +804,37 @@ mod tests {
             vec![],
         );
 
-        let err = token_review_identity(&status, "openshell-gateway", "openshell", "default")
-            .expect_err("non pod-bound tokens must be rejected");
+        let err = token_review_identity(
+            &status,
+            "openshell-gateway",
+            &sandbox_namespaces(&["openshell"]),
+            "default",
+        )
+        .expect_err("non pod-bound tokens must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn token_review_identity_accepts_any_configured_workspace_namespace() {
+        let status = token_review_status(
+            true,
+            vec!["openshell-gateway"],
+            "system:serviceaccount:app-b:default",
+            vec![
+                (POD_NAME_EXTRA, "openshell-sandbox-b"),
+                (POD_UID_EXTRA, "uid-b"),
+            ],
+        );
+
+        let identity = token_review_identity(
+            &status,
+            "openshell-gateway",
+            &sandbox_namespaces(&["app-a", "app-b"]),
+            "default",
+        )
+        .unwrap()
+        .expect("configured namespace should authenticate");
+        assert_eq!(identity.namespace, "app-b");
     }
 
     #[test]

@@ -3,8 +3,10 @@
 Kubernetes-backed compute driver for OpenShell cluster deployments.
 
 The driver uses the Kubernetes API to create, delete, fetch, and watch sandbox
-custom resources in the configured namespace. It runs in-process with the
-gateway server.
+custom resources. By default it uses one configured namespace. Operators can
+instead configure `workspace_namespaces` to map logical OpenShell workspaces to
+pre-provisioned Kubernetes namespaces. It runs in-process with the gateway
+server.
 
 ## Runtime Model
 
@@ -25,6 +27,18 @@ by the gateway.
 
 Kubernetes API calls use explicit timeouts so gRPC handlers do not block
 indefinitely when the API server is slow or unavailable.
+
+## Workspace Namespace Mapping
+
+An empty `workspace_namespaces` map preserves legacy behavior and routes every
+sandbox to `namespace`. A non-empty map is an allowlist: sandbox creation fails
+when its logical workspace is not mapped. Get, list, delete, existence checks,
+Sandbox watches, Event watches, OpenShift SCC discovery, and ServiceAccount
+bootstrap authentication operate across only the distinct mapped namespaces.
+
+The driver does not create namespaces or RBAC. Operators must install the
+sandbox ServiceAccount, Secrets, Role, and gateway RoleBinding in every mapped
+namespace. Mapping changes require a gateway restart.
 
 ## Workspace Persistence
 

@@ -3,6 +3,7 @@
 
 use openshell_core::config;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -233,6 +234,11 @@ where
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
     pub namespace: String,
+    /// Optional mapping from logical `OpenShell` workspace names to
+    /// pre-provisioned Kubernetes namespaces. When empty, all sandboxes use
+    /// `namespace` for backward compatibility. When non-empty, sandbox
+    /// creation fails closed for an unmapped workspace.
+    pub workspace_namespaces: BTreeMap<String, String>,
     /// Kubernetes `ServiceAccount` assigned to sandbox pods and accepted by
     /// the gateway's `TokenReview` bootstrap authenticator.
     pub service_account_name: String,
@@ -333,6 +339,7 @@ impl Default for KubernetesComputeConfig {
     fn default() -> Self {
         Self {
             namespace: DEFAULT_K8S_NAMESPACE.to_string(),
+            workspace_namespaces: BTreeMap::new(),
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME.to_string(),
             default_image: openshell_core::image::default_sandbox_image(),
             // Default empty so the gateway omits `imagePullPolicy` from pod
@@ -364,6 +371,55 @@ impl Default for KubernetesComputeConfig {
 }
 
 impl KubernetesComputeConfig {
+    /// Resolve the Kubernetes namespace for a logical workspace.
+    ///
+    /// An empty mapping retains the legacy single-namespace behavior. Once a
+    /// mapping is configured, every workspace must be explicitly present.
+    pub fn namespace_for_workspace(&self, workspace: &str) -> Result<&str, String> {
+        if self.workspace_namespaces.is_empty() {
+            return Ok(&self.namespace);
+        }
+        self.workspace_namespaces
+            .get(workspace)
+            .map(String::as_str)
+            .ok_or_else(|| {
+                format!("workspace '{workspace}' is not mapped to a Kubernetes namespace")
+            })
+    }
+
+    /// Namespaces the driver is allowed to manage, in deterministic order.
+    #[must_use]
+    pub fn sandbox_namespaces(&self) -> Vec<&str> {
+        if self.workspace_namespaces.is_empty() {
+            return vec![self.namespace.as_str()];
+        }
+        self.workspace_namespaces
+            .values()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Validate the legacy namespace and every configured workspace mapping.
+    pub fn validate_workspace_namespaces(&self) -> Result<(), String> {
+        validate_kubernetes_namespace_name(&self.namespace)?;
+        for (workspace, namespace) in &self.workspace_namespaces {
+            if workspace.trim().is_empty() {
+                return Err("workspace_namespaces keys must not be empty".to_string());
+            }
+            if workspace.trim() != workspace {
+                return Err(format!(
+                    "workspace_namespaces key '{workspace}' must not contain leading or trailing whitespace"
+                ));
+            }
+            validate_kubernetes_namespace_name(namespace).map_err(|err| {
+                format!("invalid namespace mapped from workspace '{workspace}': {err}")
+            })?;
+        }
+        Ok(())
+    }
+
     /// Clamp `sa_token_ttl_secs` into the `[MIN_SA_TOKEN_TTL_SECS,
     /// MAX_SA_TOKEN_TTL_SECS]` range used by the projected-volume spec.
     /// Invalid (≤0) values fall back to the default 3600.
@@ -405,7 +461,7 @@ impl KubernetesComputeConfig {
     /// 3. Fallback defaults: UID=`1000`, GID=UID
     pub fn resolve_sandbox_uid(
         &self,
-        namespace_annotations: Option<&std::collections::BTreeMap<String, String>>,
+        namespace_annotations: Option<&BTreeMap<String, String>>,
     ) -> u32 {
         if let Some(uid) = self.sandbox_uid {
             return uid;
@@ -423,7 +479,7 @@ impl KubernetesComputeConfig {
     pub fn resolve_sandbox_gid(
         &self,
         resolved_uid: u32,
-        _namespace_annotations: Option<&std::collections::BTreeMap<String, String>>,
+        _namespace_annotations: Option<&BTreeMap<String, String>>,
     ) -> u32 {
         self.sandbox_gid
             .or(self.sandbox_uid)
@@ -472,6 +528,24 @@ impl KubernetesComputeConfig {
             ));
         }
         Ok(())
+    }
+}
+
+fn validate_kubernetes_namespace_name(namespace: &str) -> Result<(), String> {
+    let bytes = namespace.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "Kubernetes namespace '{namespace}' must be a lowercase DNS-1123 label of at most 63 characters"
+        ))
     }
 }
 
@@ -525,6 +599,61 @@ mod tests {
     fn default_workspace_storage_class_is_empty() {
         let cfg = KubernetesComputeConfig::default();
         assert!(cfg.workspace_storage_class.is_empty());
+    }
+
+    #[test]
+    fn empty_workspace_mapping_preserves_legacy_namespace() {
+        let cfg = KubernetesComputeConfig {
+            namespace: "shared".to_string(),
+            ..KubernetesComputeConfig::default()
+        };
+        assert_eq!(cfg.namespace_for_workspace("default").unwrap(), "shared");
+        assert_eq!(cfg.sandbox_namespaces(), vec!["shared"]);
+    }
+
+    #[test]
+    fn workspace_mapping_resolves_and_fails_closed() {
+        let cfg = KubernetesComputeConfig {
+            workspace_namespaces: BTreeMap::from([
+                ("team-a".to_string(), "app-a".to_string()),
+                ("team-b".to_string(), "app-b".to_string()),
+            ]),
+            ..KubernetesComputeConfig::default()
+        };
+        cfg.validate_workspace_namespaces().unwrap();
+        assert_eq!(cfg.namespace_for_workspace("team-a").unwrap(), "app-a");
+        assert!(
+            cfg.namespace_for_workspace("unmapped")
+                .unwrap_err()
+                .contains("not mapped")
+        );
+        assert_eq!(cfg.sandbox_namespaces(), vec!["app-a", "app-b"]);
+    }
+
+    #[test]
+    fn workspace_mapping_deduplicates_shared_target_namespaces() {
+        let cfg = KubernetesComputeConfig {
+            workspace_namespaces: BTreeMap::from([
+                ("team-a".to_string(), "shared-app".to_string()),
+                ("team-b".to_string(), "shared-app".to_string()),
+            ]),
+            ..KubernetesComputeConfig::default()
+        };
+        assert_eq!(cfg.sandbox_namespaces(), vec!["shared-app"]);
+    }
+
+    #[test]
+    fn workspace_mapping_rejects_invalid_namespaces_and_keys() {
+        for workspace_namespaces in [
+            BTreeMap::from([(String::new(), "app-a".to_string())]),
+            BTreeMap::from([("team-a".to_string(), "Invalid_Namespace".to_string())]),
+        ] {
+            let cfg = KubernetesComputeConfig {
+                workspace_namespaces,
+                ..KubernetesComputeConfig::default()
+            };
+            assert!(cfg.validate_workspace_namespaces().is_err());
+        }
     }
 
     #[test]

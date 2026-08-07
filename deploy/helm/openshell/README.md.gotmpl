@@ -9,6 +9,11 @@ Edit README.md.gotmpl and values.yaml, then run `mise run helm:docs`.
 
 This chart deploys the OpenShell gateway into a Kubernetes cluster. It is published as an OCI artifact to GHCR at `oci://ghcr.io/nvidia/openshell/helm-chart`.
 
+To route logical workspaces to pre-provisioned namespaces, set
+`server.workspaceNamespaces`. The gateway fails closed for unmapped workspaces
+and requires its namespaced RBAC, sandbox ServiceAccount, and referenced
+Secrets in every mapped namespace.
+
 ## Prerequisites
 
 The Kubernetes Agent Sandbox CRDs and controller must be installed on the cluster before deploying OpenShell. Install them with:

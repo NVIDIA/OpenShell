@@ -167,6 +167,11 @@ server:
   # -- Namespace where sandbox pods are created. Defaults to the Helm release
   # namespace (.Release.Namespace) when left empty.
   sandboxNamespace: ""
+  # -- Optional map from logical OpenShell workspace names to pre-provisioned
+  # Kubernetes namespaces. When non-empty, sandbox creation fails for an
+  # unmapped workspace and lifecycle operations are limited to these
+  # namespaces. Empty preserves server.sandboxNamespace behavior.
+  workspaceNamespaces: {}
   # -- Gateway database URL (used for the default SQLite backend).
   dbUrl: "sqlite:/var/openshell/openshell.db"
   # -- Name of a pre-existing Opaque Secret containing a PostgreSQL
