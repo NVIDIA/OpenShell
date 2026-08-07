@@ -1,0 +1,72 @@
+load("//bazel:vm_runtime.bzl", "vm_runtime_bundle")
+
+config_setting(
+    name = "darwin_aarch64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:osx",
+    ],
+)
+
+config_setting(
+    name = "linux_aarch64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+)
+
+config_setting(
+    name = "linux_x86_64",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
+vm_runtime_bundle(
+    name = "runtime",
+    gvproxy = select({
+        ":darwin_aarch64": "@vm_runtime_darwin_aarch64//:gvproxy",
+        ":linux_aarch64": "@vm_runtime_linux_aarch64//:gvproxy",
+        ":linux_x86_64": "@vm_runtime_linux_x86_64//:gvproxy",
+    }),
+    libkrun = select({
+        ":darwin_aarch64": "@vm_runtime_darwin_aarch64//:libkrun.dylib",
+        ":linux_aarch64": "@vm_runtime_linux_aarch64//:libkrun.so",
+        ":linux_x86_64": "@vm_runtime_linux_x86_64//:libkrun.so",
+    }),
+    libkrun_name = select({
+        ":darwin_aarch64": "libkrun.dylib",
+        ":linux_aarch64": "libkrun.so",
+        ":linux_x86_64": "libkrun.so",
+    }),
+    libkrunfw = select({
+        ":darwin_aarch64": "@vm_runtime_darwin_aarch64//:libkrunfw.5.dylib",
+        ":linux_aarch64": "@vm_runtime_linux_aarch64//:libkrunfw.so.5",
+        ":linux_x86_64": "@vm_runtime_linux_x86_64//:libkrunfw.so.5",
+    }),
+    libkrunfw_name = select({
+        ":darwin_aarch64": "libkrunfw.5.dylib",
+        ":linux_aarch64": "libkrunfw.so.5",
+        ":linux_x86_64": "libkrunfw.so.5",
+    }),
+    supervisor = select({
+        ":darwin_aarch64": "//bazel/releases:openshell_sandbox_linux_aarch64",
+        ":linux_aarch64": "//bazel/releases:openshell_sandbox_linux_aarch64",
+        ":linux_x86_64": "//bazel/releases:openshell_sandbox_linux_x86_64",
+    }),
+    tags = ["manual"],
+    target_compatible_with = select({
+        ":darwin_aarch64": [],
+        ":linux_aarch64": [],
+        ":linux_x86_64": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    umoci = select({
+        ":darwin_aarch64": "@vm_runtime_darwin_aarch64//:umoci",
+        ":linux_aarch64": "@vm_runtime_linux_aarch64//:umoci",
+        ":linux_x86_64": "@vm_runtime_linux_x86_64//:umoci",
+    }),
+    visibility = ["//visibility:public"],
+)

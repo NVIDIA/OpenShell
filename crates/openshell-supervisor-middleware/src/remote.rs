@@ -16,6 +16,8 @@ use tonic::{Request, Response, Status};
 use crate::MIDDLEWARE_GRPC_MESSAGE_BYTES;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone)]
 pub struct RemoteMiddlewareService {
@@ -30,7 +32,12 @@ impl RemoteMiddlewareService {
                 format!(
                     "middleware registration '{registration_name}' has an invalid grpc_endpoint"
                 )
-            })?;
+            })?
+            .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+            .keep_alive_while_idle(true)
+            .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+            .http2_adaptive_window(true);
+
         if grpc_endpoint.starts_with("https://") {
             endpoint = endpoint
                 .tls_config(ClientTlsConfig::new().with_enabled_roots())
@@ -39,6 +46,7 @@ impl RemoteMiddlewareService {
                     format!("middleware registration '{registration_name}' could not configure TLS")
                 })?;
         }
+
         let channel = endpoint
             .connect_timeout(CONNECT_TIMEOUT)
             .connect()
@@ -49,6 +57,7 @@ impl RemoteMiddlewareService {
                     "middleware registration '{registration_name}' could not connect to {grpc_endpoint}"
                 )
             })?;
+
         Ok(Self {
             client: SupervisorMiddlewareClient::new(channel)
                 .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)

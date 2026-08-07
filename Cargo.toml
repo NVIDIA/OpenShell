@@ -102,7 +102,7 @@ base64 = "0.22"
 # Crypto / Auth
 sha2 = "0.10"
 rand = "0.9"
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 getrandom = "0.3"
 ring = "0.17"
 spiffe = { version = "0.15", default-features = false, features = ["workload-api-jwt", "tracing"] }

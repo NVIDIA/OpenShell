@@ -1,0 +1,163 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Go SDK development, build, lint, and format tasks
+
+["go:test"]
+description = "Run Go SDK unit tests with coverage"
+dir = "sdk/go"
+run = "go test -coverprofile=coverage.out -coverpkg=./openshell/... -race ./..."
+hide = true
+
+["go:test:integration"]
+description = "Run Go SDK integration tests"
+dir = "sdk/go"
+run = "go test -tags=integration -race ./..."
+hide = true
+
+["go:lint"]
+description = "Run Go SDK linter"
+dir = "sdk/go"
+run = "golangci-lint run ./..."
+hide = true
+
+["go:fmt"]
+description = "Format Go SDK code"
+dir = "sdk/go"
+run = "goimports -w . && go fmt ./..."
+hide = true
+
+["go:build"]
+description = "Build Go SDK packages"
+dir = "sdk/go"
+run = "go build ./..."
+hide = true
+
+["go:format:check"]
+description = "Verify Go SDK code is gofmt-formatted"
+dir = "sdk/go"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+UNFORMATTED=$(gofmt -l . 2>/dev/null || true)
+if [ -n "$UNFORMATTED" ]; then
+  echo "ERROR: The following files are not gofmt-formatted:"
+  echo "$UNFORMATTED"
+  exit 1
+fi
+"""
+hide = true
+
+["go:ci"]
+description = "Run Go SDK full CI pipeline"
+depends = ["go:format:check", "go:lint", "go:build", "go:test", "go:proto:check", "go:docs:check"]
+
+["go:docs:check"]
+description = "Verify every public Go SDK package has a docs page"
+dir = "sdk/go"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOCS_DIR="docs/src/api"
+SUMMARY="docs/src/SUMMARY.md"
+MISSING=0
+
+# Find all public packages with a doc.go (excluding internal, proto, types)
+for docfile in openshell/v1/*/doc.go; do
+  pkg=$(basename "$(dirname "$docfile")")
+
+  # Skip internal packages and types (no user-facing docs needed)
+  case "$pkg" in
+    internal|types) continue ;;
+  esac
+
+  # Check for matching docs page
+  if [ ! -f "$DOCS_DIR/$pkg.md" ]; then
+    echo "MISSING: $DOCS_DIR/$pkg.md (package openshell/v1/$pkg has doc.go but no docs page)"
+    MISSING=$((MISSING + 1))
+  fi
+
+  # Check for SUMMARY.md entry
+  if ! grep -q "api/$pkg.md" "$SUMMARY" 2>/dev/null; then
+    echo "MISSING: SUMMARY.md entry for api/$pkg.md"
+    MISSING=$((MISSING + 1))
+  fi
+done
+
+if [ "$MISSING" -gt 0 ]; then
+  echo ""
+  echo "ERROR: $MISSING documentation gaps found."
+  echo "Every public package with doc.go needs a docs/src/api/<pkg>.md page"
+  echo "and a SUMMARY.md entry. See Constitution XIII."
+  exit 1
+fi
+
+echo "Docs check passed: all public packages have documentation."
+"""
+hide = true
+
+["go:proto:gen"]
+description = "Generate Go bindings from proto files using buf"
+dir = "sdk/go"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+for tool in buf protoc-gen-go protoc-gen-go-grpc; do
+  if ! command -v "$tool" &>/dev/null; then
+    echo "ERROR: $tool not found. Run 'mise install' to install it."
+    exit 1
+  fi
+done
+
+# Clean previous output before regeneration
+find proto -name '*.pb.go' -delete 2>/dev/null || true
+
+buf generate
+
+echo "Proto generation complete."
+echo "Generated packages:"
+for pkg in openshellv1 datamodelv1 sandboxv1 optionsv1; do
+  count=$(find "proto/$pkg" -name '*.go' 2>/dev/null | wc -l | tr -d ' ')
+  echo "  proto/$pkg/: $count files"
+done
+"""
+hide = true
+
+["go:proto:check"]
+description = "Verify generated Go SDK proto files are up to date"
+dir = "sdk/go"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+for tool in buf protoc-gen-go protoc-gen-go-grpc; do
+  if ! command -v "$tool" &>/dev/null; then
+    echo "ERROR: $tool not found. Run 'mise install' to install it."
+    exit 1
+  fi
+done
+
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+# Generate to temp directory with adjusted output path
+sed "s|out: \\.|out: $WORK_DIR|" buf.gen.yaml > "$WORK_DIR/buf.gen.yaml"
+buf generate --template "$WORK_DIR/buf.gen.yaml"
+
+DIFF_OUTPUT=$(diff -r "$WORK_DIR/proto" "proto" \
+  --exclude="*.proto" \
+  2>&1) || true
+
+if [ -n "$DIFF_OUTPUT" ]; then
+  echo "ERROR: Generated proto files are out of date."
+  echo "Run 'mise run go:proto:gen' to regenerate."
+  echo ""
+  echo "$DIFF_OUTPUT"
+  exit 1
+fi
+
+echo "Proto check passed: generated files are up to date."
+"""
+hide = true

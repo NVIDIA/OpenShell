@@ -1,0 +1,41 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rustfmt_test")
+
+rust_library(
+    name = "openshell-driver-vault",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    aliases = aliases(),
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "openshell-driver-vault_bin",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    binary_name = "openshell-driver-vault",
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True) + [":openshell-driver-vault"],
+)
+
+rust_test(
+    name = "openshell-driver-vault_test",
+    crate = ":openshell-driver-vault",
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rustfmt_test(
+    name = "rustfmt_test",
+    targets = [
+        ":openshell-driver-vault",
+        ":openshell-driver-vault_bin",
+        ":openshell-driver-vault_test",
+    ],
+    visibility = ["//crates:__pkg__"],
+)
