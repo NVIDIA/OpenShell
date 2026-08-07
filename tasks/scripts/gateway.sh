@@ -356,8 +356,14 @@ signing_key_path = "${TLS_DIR}/jwt/signing.pem"
 public_key_path = "${TLS_DIR}/jwt/public.pem"
 kid_path = "${TLS_DIR}/jwt/kid"
 gateway_id = "${GATEWAY_NAME}"
-ttl_secs = 3600
 EOF
+
+# Kubernetes is a shared deployment, so its sandbox JWTs must expire. Local
+# drivers omit ttl_secs and inherit the gateway's non-expiring default, so a
+# sandbox restarted while the gateway is down can still reconnect.
+if [[ "${DRIVER}" == "kubernetes" ]]; then
+  printf 'ttl_secs = 3600\n' >>"${CONFIG_PATH}"
+fi
 
 case "${DRIVER}" in
   kubernetes)
