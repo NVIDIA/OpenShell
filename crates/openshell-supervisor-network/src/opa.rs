@@ -1118,6 +1118,11 @@ fn normalize_endpoint_ports(data: &mut serde_json::Value) {
                 continue;
             };
 
+            // A present "ports" array takes precedence over scalar "port".
+            // Record whether it existed before filtering so an all-zero array
+            // does not silently fall back to the scalar.
+            let ports_was_present = ep_obj.contains_key("ports");
+
             // If "ports" already exists, filter out numeric zero values so
             // OPA never sees a zero port. Non-numeric entries are left intact
             // so downstream validation can fail closed on malformed input
@@ -1131,8 +1136,9 @@ fn normalize_endpoint_ports(data: &mut serde_json::Value) {
                 .and_then(|v| v.as_array())
                 .is_some_and(|a| !a.is_empty());
 
-            if !has_ports {
-                // Promote scalar "port" to "ports" array.
+            if !ports_was_present && !has_ports {
+                // Promote scalar "port" to "ports" array only when no
+                // "ports" key was originally present.
                 let port = ep_obj
                     .get("port")
                     .and_then(serde_json::Value::as_u64)
@@ -7786,8 +7792,9 @@ network_policies:
         let endpoints = data["network_policies"]["p"]["endpoints"]
             .as_array()
             .unwrap();
-        // Zero-only ports array becomes empty; scalar port is promoted.
-        assert_eq!(endpoints[0]["ports"], serde_json::json!([8080]));
+        // A present "ports" array takes precedence over scalar "port", even
+        // when filtering leaves the array empty.
+        assert_eq!(endpoints[0]["ports"], serde_json::json!([]));
         assert!(endpoints[0].get("port").is_none());
     }
 
