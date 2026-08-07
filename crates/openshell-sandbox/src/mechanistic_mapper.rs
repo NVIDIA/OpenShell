@@ -308,7 +308,8 @@ fn generate_security_notes(host: &str, port: u16, is_ssrf: bool) -> String {
     }
 
     // High port numbers may indicate ephemeral services.
-    if port > 49152 {
+    // The IANA dynamic/private (ephemeral) range is 49152-65535 inclusive.
+    if port >= 49152 {
         notes.push(format!(
             "Port {port} is in the ephemeral range — \
              this may be a temporary service."
@@ -470,6 +471,15 @@ mod tests {
     fn test_security_notes_ssrf() {
         let notes = generate_security_notes("169.254.169.254", 80, true);
         assert!(notes.contains("SSRF"));
+    }
+
+    #[test]
+    fn test_security_notes_ephemeral_range_inclusive_boundary() {
+        // 49151 is just below the IANA ephemeral range; 49152 is the first
+        // ephemeral port and must be flagged.
+        assert!(!generate_security_notes("api.example.com", 49151, false).contains("ephemeral"));
+        assert!(generate_security_notes("api.example.com", 49152, false).contains("ephemeral"));
+        assert!(generate_security_notes("api.example.com", 65535, false).contains("ephemeral"));
     }
 
     #[test]
