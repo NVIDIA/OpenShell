@@ -167,23 +167,19 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read client key from {key_path}"))?;
 
-        // Trust the configured CA (self-signed deployments sign the gateway's
-        // cert with it) *in addition to* the compiled-in WebPKI roots — this
-        // covers deployments where the gateway's server cert comes from a
-        // public CA (e.g. an ACME issuer) instead of the same private CA that
-        // signs this client's identity.
+        // Trust only the configured CA — this is the chart's internal CA
+        // that signs both the gateway's internal server certificate and
+        // this client's identity certificate.  The gateway uses SNI-based
+        // certificate selection to present this internal cert to supervisor
+        // connections, so no public root trust is needed here.
         //
-        // Do NOT add `.with_native_roots()` here: the supervisor runs inside
-        // the user-selected sandbox image (Docker/Podman drivers), so the
-        // image's CA bundle is not operator-controlled.  An attacker who can
-        // influence the image and DNS/routing could install their own CA and
-        // intercept the supervisor→gateway TLS connection.  Additionally,
-        // tonic returns NativeCertsNotFound when the native store is empty,
-        // which would break minimal BYOC images even though OPENSHELL_TLS_CA
-        // is valid.
+        // Do NOT add `.with_native_roots()` or `.with_webpki_roots()` here:
+        // the supervisor runs inside the user-selected sandbox image
+        // (Docker/Podman drivers), and broadening the trust store would let
+        // an attacker who controls the image + DNS present a publicly valid
+        // certificate and intercept the supervisor→gateway TLS connection.
         let mut tls_config = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(ca_pem))
-            .with_webpki_roots()
             .identity(Identity::from_pem(cert_pem, key_pem));
         if let Ok(server_name) = std::env::var(sandbox_env::GATEWAY_TLS_SERVER_NAME)
             && !server_name.is_empty()

@@ -53,7 +53,7 @@ tests:
           value: 127.0.0.1
         documentIndex: 3
 
-  - it: overrides the server Certificate issuerRef when serverIssuerRef is set
+  - it: internal server cert keeps chart CA issuer and internal SANs when serverIssuerRef is set
     template: templates/cert-manager-pki.yaml
     set:
       certManager.enabled: true
@@ -64,20 +64,35 @@ tests:
       certManager.serverDnsNames:
         - openshell.example.com
     asserts:
+      # Internal cert (doc 3) stays on chart CA
       - equal:
           path: spec.issuerRef.name
-          value: letsencrypt-prod
+          value: openshell-ca-issuer
         documentIndex: 3
       - equal:
           path: spec.issuerRef.kind
-          value: ClusterIssuer
+          value: Issuer
         documentIndex: 3
+      # Internal cert has internal SANs
       - equal:
-          path: spec.issuerRef.group
-          value: cert-manager.io
+          path: spec.commonName
+          value: openshell
+        documentIndex: 3
+      - contains:
+          path: spec.dnsNames
+          content: openshell.my-namespace.svc.cluster.local
+        documentIndex: 3
+      - contains:
+          path: spec.dnsNames
+          content: localhost
+        documentIndex: 3
+      # Internal cert does NOT include external-only hostnames
+      - notContains:
+          path: spec.dnsNames
+          content: openshell.example.com
         documentIndex: 3
 
-  - it: scopes server Certificate SANs to only the configured external hostnames when serverIssuerRef is set
+  - it: creates external server Certificate from serverIssuerRef with external SANs only
     template: templates/cert-manager-pki.yaml
     set:
       certManager.enabled: true
@@ -88,26 +103,38 @@ tests:
       certManager.serverDnsNames:
         - openshell.example.com
     asserts:
+      # External cert (doc 4) uses the external issuer
+      - equal:
+          path: spec.issuerRef.name
+          value: letsencrypt-prod
+        documentIndex: 4
+      - equal:
+          path: spec.issuerRef.kind
+          value: ClusterIssuer
+        documentIndex: 4
+      - equal:
+          path: spec.issuerRef.group
+          value: cert-manager.io
+        documentIndex: 4
+      # External cert has only external SANs
       - equal:
           path: spec.commonName
           value: openshell.example.com
-        documentIndex: 3
+        documentIndex: 4
       - equal:
           path: spec.dnsNames
           value:
             - openshell.example.com
-        documentIndex: 3
+        documentIndex: 4
+      # External cert has no IP addresses
       - notExists:
           path: spec.ipAddresses
-        documentIndex: 3
+        documentIndex: 4
+      # External cert has no internal names
       - notContains:
           path: spec.dnsNames
           content: localhost
-        documentIndex: 3
-      - notContains:
-          path: spec.dnsNames
-          content: openshell.my-namespace.svc.cluster.local
-        documentIndex: 3
+        documentIndex: 4
 
   - it: fails when serverIssuerRef is set but clientCaFromServerTlsSecret is true
     template: templates/cert-manager-pki.yaml
@@ -154,11 +181,12 @@ tests:
       certManager.serverDnsNames:
         - openshell.example.com
     asserts:
+      # Client cert is now doc 5 (after internal + external server certs)
       - equal:
           path: spec.issuerRef.name
           value: openshell-ca-issuer
-        documentIndex: 4
+        documentIndex: 5
       - equal:
           path: spec.issuerRef.kind
           value: Issuer
-        documentIndex: 4
+        documentIndex: 5

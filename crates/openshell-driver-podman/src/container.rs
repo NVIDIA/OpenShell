@@ -1430,8 +1430,7 @@ mod tests {
         let container = build_container_spec(&sandbox, &test_config());
 
         assert_eq!(
-            container["env"]
-                .get(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME),
+            container["env"].get(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME),
             None,
             "GATEWAY_TLS_SERVER_NAME must be stripped from the supervisor environment"
         );

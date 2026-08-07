@@ -547,6 +547,24 @@ pub struct TlsConfig {
     /// When `false`, client certificates are accepted but not required.
     #[serde(default)]
     pub require_client_auth: bool,
+
+    /// Path to an external TLS certificate file (e.g. ACME/publicly-trusted).
+    /// When set, the server uses SNI-based certificate selection: connections
+    /// whose SNI hostname matches `external_server_names` receive this cert,
+    /// all others receive the primary (internal) cert.
+    #[serde(default)]
+    pub external_cert_path: Option<PathBuf>,
+
+    /// Path to the private key for the external TLS certificate.
+    #[serde(default)]
+    pub external_key_path: Option<PathBuf>,
+
+    /// Hostnames that should be served with the external certificate.
+    /// Connections whose SNI matches one of these names receive the external
+    /// cert; all other connections (including those with no SNI) receive the
+    /// primary (internal) cert.
+    #[serde(default)]
+    pub external_server_names: Vec<String>,
 }
 
 /// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
