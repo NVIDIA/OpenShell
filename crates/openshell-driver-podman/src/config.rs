@@ -185,9 +185,56 @@ pub struct PodmanComputeConfig {
     /// pointing the gateway host at the corporate resolver so validated-IP
     /// CONNECT works in split-horizon networks.
     pub proxy_connect_by_hostname: Option<bool>,
+    /// User namespace mode for sandbox containers (e.g. `auto`, `private`).
+    /// When unset, containers use the default user namespace.
+    pub userns: Option<String>,
+    /// Explicit UID mappings for `userns = "private"`.
+    /// Each entry is `"container_id:host_id:size"`.
+    #[serde(default)]
+    pub uidmap: Vec<String>,
+    /// Explicit GID mappings for `userns = "private"`.
+    /// Each entry is `"container_id:host_id:size"`.
+    #[serde(default)]
+    pub gidmap: Vec<String>,
 }
 
 pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 10;
+
+/// Parse a single `"container_id:host_id:size"` mapping entry.
+///
+/// Returns `(container_id, host_id, size)` on success.
+pub fn parse_id_map_entry(
+    field: &str,
+    entry: &str,
+) -> Result<(u32, u32, u32), crate::client::PodmanApiError> {
+    let parts: Vec<&str> = entry.split(':').collect();
+    if parts.len() != 3 {
+        return Err(crate::client::PodmanApiError::InvalidInput(format!(
+            "{field} entry '{entry}' must be 'container_id:host_id:size'",
+        )));
+    }
+    let container_id: u32 = parts[0].parse().map_err(|_| {
+        crate::client::PodmanApiError::InvalidInput(format!(
+            "{field} entry '{entry}': container_id must be a non-negative integer",
+        ))
+    })?;
+    let host_id: u32 = parts[1].parse().map_err(|_| {
+        crate::client::PodmanApiError::InvalidInput(format!(
+            "{field} entry '{entry}': host_id must be a non-negative integer",
+        ))
+    })?;
+    let size: u32 = parts[2].parse().map_err(|_| {
+        crate::client::PodmanApiError::InvalidInput(format!(
+            "{field} entry '{entry}': size must be a non-negative integer",
+        ))
+    })?;
+    if size == 0 {
+        return Err(crate::client::PodmanApiError::InvalidInput(format!(
+            "{field} entry '{entry}': size must be greater than 0",
+        )));
+    }
+    Ok((container_id, host_id, size))
+}
 
 impl PodmanComputeConfig {
     /// Returns `true` when all three TLS paths are configured.
@@ -328,6 +375,88 @@ impl PodmanComputeConfig {
         Ok(())
     }
 
+    /// Validate and canonicalize the optional `userns` mode.
+    ///
+    /// Supported modes: `auto` (with optional params, e.g. `auto:size=65536`),
+    /// `host`, `keep-id` (with optional params), `no-map` (alias `nomap`),
+    /// and `private` (requires explicit `uidmap`/`gidmap`).
+    /// Modes that don't accept parameters (`host`, `no-map`, `private`) are
+    /// rejected when a colon-separated suffix is present.
+    ///
+    /// On success, `self.userns` is rewritten with the canonical lowercase
+    /// mode string so downstream code can rely on exact matches.
+    pub fn canonicalize_userns(&mut self) -> Result<(), crate::client::PodmanApiError> {
+        let Some(mode) = self.userns.as_deref() else {
+            return Ok(());
+        };
+        let (base, has_params) = mode
+            .split_once(':')
+            .map_or((mode, false), |(b, _)| (b, true));
+        let canonical = match base.to_ascii_lowercase().as_str() {
+            "auto" => "auto",
+            "host" => "host",
+            "keep-id" => "keep-id",
+            "nomap" | "no-map" => "no-map",
+            "private" => "private",
+            _ => {
+                return Err(crate::client::PodmanApiError::InvalidInput(format!(
+                    "unsupported userns mode '{mode}'; \
+                     supported modes: auto, host, keep-id, no-map, private",
+                )));
+            }
+        };
+        if has_params {
+            match canonical {
+                "auto" | "keep-id" => {}
+                _ => {
+                    return Err(crate::client::PodmanApiError::InvalidInput(format!(
+                        "userns mode '{canonical}' does not accept parameters",
+                    )));
+                }
+            }
+        }
+        self.userns = Some(if has_params {
+            let params = mode.split_once(':').unwrap().1;
+            format!("{canonical}:{params}")
+        } else {
+            canonical.to_string()
+        });
+        Ok(())
+    }
+
+    /// Validate `uidmap`/`gidmap` consistency with the userns mode.
+    ///
+    /// `private` requires at least one entry in both `uidmap` and `gidmap`;
+    /// other modes (or no userns) reject non-empty mappings. Each entry must
+    /// be `"container_id:host_id:size"` with `size > 0`.
+    pub fn validate_userns_mappings(&self) -> Result<(), crate::client::PodmanApiError> {
+        let is_private = self
+            .userns
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case("private"));
+
+        if is_private {
+            if self.uidmap.is_empty() || self.gidmap.is_empty() {
+                return Err(crate::client::PodmanApiError::InvalidInput(
+                    "userns mode 'private' requires at least one entry in both \
+                     uidmap and gidmap"
+                        .to_string(),
+                ));
+            }
+        } else if !self.uidmap.is_empty() || !self.gidmap.is_empty() {
+            return Err(crate::client::PodmanApiError::InvalidInput(
+                "uidmap/gidmap are only valid with userns = \"private\"".to_string(),
+            ));
+        }
+
+        for (field, entries) in [("uidmap", &self.uidmap), ("gidmap", &self.gidmap)] {
+            for entry in entries {
+                parse_id_map_entry(field, entry)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Validate optional host gateway override.
     pub fn validate_host_gateway_ip(&self) -> Result<(), crate::client::PodmanApiError> {
         let trimmed = self.host_gateway_ip.trim();
@@ -380,6 +509,9 @@ impl Default for PodmanComputeConfig {
             proxy_auth_file: None,
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
+            userns: None,
+            uidmap: Vec::new(),
+            gidmap: Vec::new(),
         }
     }
 }
@@ -412,6 +544,9 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("proxy_auth_file", &self.proxy_auth_file.is_some())
             .field("proxy_auth_allow_insecure", &self.proxy_auth_allow_insecure)
             .field("proxy_connect_by_hostname", &self.proxy_connect_by_hostname)
+            .field("userns", &self.userns)
+            .field("uidmap", &self.uidmap)
+            .field("gidmap", &self.gidmap)
             .finish()
     }
 }
@@ -793,5 +928,175 @@ mod tests {
         assert!(msg.contains("OPENSHELL_PODMAN_TLS_CA"), "{msg}");
         assert!(!msg.contains("OPENSHELL_PODMAN_TLS_CERT"), "{msg}");
         assert!(!msg.contains("OPENSHELL_PODMAN_TLS_KEY"), "{msg}");
+    }
+
+    #[test]
+    fn canonicalize_userns_accepts_supported_modes() {
+        for mode in [
+            "auto",
+            "host",
+            "keep-id",
+            "no-map",
+            "private",
+            "auto:size=65536",
+            "keep-id:uid=1000,gid=1000",
+        ] {
+            let mut cfg = PodmanComputeConfig {
+                userns: Some(mode.to_string()),
+                ..PodmanComputeConfig::default()
+            };
+            cfg.canonicalize_userns()
+                .unwrap_or_else(|_| panic!("mode '{mode}' should be accepted"));
+        }
+    }
+
+    #[test]
+    fn canonicalize_userns_normalizes_case_and_aliases() {
+        let cases = [
+            ("Auto", "auto"),
+            ("HOST", "host"),
+            ("KEEP-ID:uid=1000", "keep-id:uid=1000"),
+            ("nomap", "no-map"),
+            ("no-map", "no-map"),
+            ("Private", "private"),
+            ("auto:SIZE=65536", "auto:SIZE=65536"),
+        ];
+        for (input, expected) in cases {
+            let mut cfg = PodmanComputeConfig {
+                userns: Some(input.to_string()),
+                ..PodmanComputeConfig::default()
+            };
+            cfg.canonicalize_userns()
+                .unwrap_or_else(|_| panic!("mode '{input}' should be accepted"));
+            assert_eq!(
+                cfg.userns.as_deref(),
+                Some(expected),
+                "input '{input}' should canonicalize to '{expected}'"
+            );
+        }
+    }
+
+    #[test]
+    fn canonicalize_userns_rejects_unsupported_modes() {
+        for mode in ["container:foo", "ns:/proc/1/ns/user", "4000:5000"] {
+            let mut cfg = PodmanComputeConfig {
+                userns: Some(mode.to_string()),
+                ..PodmanComputeConfig::default()
+            };
+            let err = cfg
+                .canonicalize_userns()
+                .expect_err(&format!("mode '{mode}' should be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains("unsupported userns mode"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn canonicalize_userns_rejects_params_on_non_parameterizable_modes() {
+        for mode in ["host:foo", "no-map:x=1", "private:x=1"] {
+            let mut cfg = PodmanComputeConfig {
+                userns: Some(mode.to_string()),
+                ..PodmanComputeConfig::default()
+            };
+            let err = cfg
+                .canonicalize_userns()
+                .expect_err(&format!("mode '{mode}' should be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains("does not accept parameters"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn canonicalize_userns_accepts_none() {
+        let mut cfg = PodmanComputeConfig::default();
+        cfg.canonicalize_userns().expect("None should be accepted");
+    }
+
+    // ── Userns mapping validation ────────────────────────────────────
+
+    #[test]
+    fn validate_userns_mappings_accepts_private_with_maps() {
+        let cfg = PodmanComputeConfig {
+            userns: Some("private".to_string()),
+            uidmap: vec!["0:1000:1".to_string(), "1:100000:65536".to_string()],
+            gidmap: vec!["0:1000:1".to_string(), "1:100000:65536".to_string()],
+            ..PodmanComputeConfig::default()
+        };
+        cfg.validate_userns_mappings()
+            .expect("private with mappings should be accepted");
+    }
+
+    #[test]
+    fn validate_userns_mappings_rejects_private_without_uidmap() {
+        let cfg = PodmanComputeConfig {
+            userns: Some("private".to_string()),
+            gidmap: vec!["0:1000:1".to_string()],
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg
+            .validate_userns_mappings()
+            .expect_err("private without uidmap should be rejected");
+        assert!(err.to_string().contains("uidmap"), "{err}");
+    }
+
+    #[test]
+    fn validate_userns_mappings_rejects_private_without_gidmap() {
+        let cfg = PodmanComputeConfig {
+            userns: Some("private".to_string()),
+            uidmap: vec!["0:1000:1".to_string()],
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg
+            .validate_userns_mappings()
+            .expect_err("private without gidmap should be rejected");
+        assert!(err.to_string().contains("gidmap"), "{err}");
+    }
+
+    #[test]
+    fn validate_userns_mappings_rejects_maps_without_private() {
+        for mode in [Some("auto"), Some("host"), Some("keep-id"), None] {
+            let cfg = PodmanComputeConfig {
+                userns: mode.map(ToString::to_string),
+                uidmap: vec!["0:1000:1".to_string()],
+                gidmap: vec!["0:1000:1".to_string()],
+                ..PodmanComputeConfig::default()
+            };
+            let err = cfg.validate_userns_mappings().expect_err(&format!(
+                "mappings without private should be rejected (mode={mode:?})"
+            ));
+            assert!(
+                err.to_string().contains("only valid with"),
+                "{mode:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_userns_mappings_rejects_malformed_entries() {
+        let cases = [
+            ("0:1000", "too few fields"),
+            ("0:1000:1:extra", "too many fields"),
+            ("abc:1000:1", "non-numeric container_id"),
+            ("0:abc:1", "non-numeric host_id"),
+            ("0:1000:abc", "non-numeric size"),
+            ("0:1000:0", "zero size"),
+        ];
+        for (entry, desc) in cases {
+            let cfg = PodmanComputeConfig {
+                userns: Some("private".to_string()),
+                uidmap: vec![entry.to_string()],
+                gidmap: vec!["0:1000:1".to_string()],
+                ..PodmanComputeConfig::default()
+            };
+            cfg.validate_userns_mappings()
+                .expect_err(&format!("{desc}: '{entry}' should be rejected"));
+        }
+    }
+
+    #[test]
+    fn validate_userns_mappings_accepts_no_userns_no_maps() {
+        let cfg = PodmanComputeConfig::default();
+        cfg.validate_userns_mappings()
+            .expect("no userns and no maps should be accepted");
     }
 }

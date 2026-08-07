@@ -5,7 +5,7 @@ use super::*;
 use openshell_core::config::DEFAULT_SERVER_PORT;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE,
+    LABEL_SANDBOX_NAMESPACE, supervisor_cache_path_with_base,
 };
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
@@ -2380,8 +2380,11 @@ fn docker_supervisor_image_refreshes_mutable_tags_only() {
 #[test]
 fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
     let base = PathBuf::from("/var/cache/share");
-    let path =
-        supervisor_cache_path_with_base(&base, "sha256:abc123deadbeef0123456789cafe0123456789fe");
+    let path = supervisor_cache_path_with_base(
+        &base,
+        "docker-supervisor",
+        "sha256:abc123deadbeef0123456789cafe0123456789fe",
+    );
 
     assert_eq!(
         path,
@@ -2394,8 +2397,8 @@ fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
 #[test]
 fn supervisor_cache_path_isolates_different_digests() {
     let base = PathBuf::from("/data");
-    let left = supervisor_cache_path_with_base(&base, "sha256:aaaaaaaa");
-    let right = supervisor_cache_path_with_base(&base, "sha256:bbbbbbbb");
+    let left = supervisor_cache_path_with_base(&base, "docker-supervisor", "sha256:aaaaaaaa");
+    let right = supervisor_cache_path_with_base(&base, "docker-supervisor", "sha256:bbbbbbbb");
     assert_ne!(
         left.parent().unwrap(),
         right.parent().unwrap(),
