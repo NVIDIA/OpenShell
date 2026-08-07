@@ -1929,7 +1929,7 @@ fn evaluate_l7_request_once(
         ));
     }
 
-    let input_json = serde_json::json!({
+    let input = serde_json::json!({
         "network": {
             "host": ctx.host,
             "port": ctx.port,
@@ -1953,9 +1953,10 @@ fn evaluate_l7_request_once(
         .lock()
         .map_err(|_| miette!("OPA engine lock poisoned"))?;
 
-    engine
-        .set_input_json(&input_json.to_string())
-        .map_err(|e| miette!("{e}"))?;
+    // Regorus's infallible `From<serde_json::Value>` maps conversion errors to `Undefined`.
+    // Convert fallibly so failures remain evaluator errors instead of becoming policy input.
+    let input = serde_json::from_value::<regorus::Value>(input).map_err(|e| miette!("{e}"))?;
+    engine.set_input(input);
 
     let allowed = engine
         .eval_rule("data.openshell.sandbox.allow_request".into())
