@@ -90,7 +90,7 @@ spec:
         - name: tls-cert
           mountPath: /etc/openshell-tls/server
           readOnly: true
-        {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+        {{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" }}
         - name: tls-client-ca
           mountPath: /etc/openshell-tls/client-ca
           readOnly: true
@@ -150,7 +150,7 @@ spec:
     - name: tls-cert
       secret:
         secretName: {{ .Values.server.tls.certSecretName }}
-    {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+    {{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" }}
     - name: tls-client-ca
       secret:
         {{- if or (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
