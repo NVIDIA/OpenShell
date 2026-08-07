@@ -6,6 +6,56 @@ bazel_dep(name = "rules_cc", version = "0.2.20")
 bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "protobuf", version = "34.0.bcr.1")
 
+bazel_lib_toolchains = use_extension("@bazel_lib//lib:extensions.bzl", "toolchains")
+bazel_lib_toolchains.zstd()
+use_repo(bazel_lib_toolchains, "zstd_toolchains")
+
+register_toolchains("@zstd_toolchains//:all")
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "vm_runtime_darwin_aarch64",
+    build_file_content = """
+exports_files([
+    "gvproxy",
+    "libkrun.dylib",
+    "libkrunfw.5.dylib",
+    "umoci",
+])
+""",
+    integrity = "sha256-KSAKryBFZiytwYwXB0CR++u4tGlA5ficf7X/nen7qQE=",
+    urls = ["https://github.com/NVIDIA/OpenShell/releases/download/vm-runtime/vm-runtime-darwin-aarch64.tar.zst"],
+)
+
+http_archive(
+    name = "vm_runtime_linux_aarch64",
+    build_file_content = """
+exports_files([
+    "gvproxy",
+    "libkrun.so",
+    "libkrunfw.so.5",
+    "umoci",
+])
+""",
+    integrity = "sha256-zn0P4NtEKp7Euy44HfQ3YoBNijF2VWFTaLLsase+Y1A=",
+    urls = ["https://github.com/NVIDIA/OpenShell/releases/download/vm-runtime/vm-runtime-linux-aarch64.tar.zst"],
+)
+
+http_archive(
+    name = "vm_runtime_linux_x86_64",
+    build_file_content = """
+exports_files([
+    "gvproxy",
+    "libkrun.so",
+    "libkrunfw.so.5",
+    "umoci",
+])
+""",
+    integrity = "sha256-urdMjarDN5WJ6eCmpddlcnEn2v3qp28D7+e6PtyhPr0=",
+    urls = ["https://github.com/NVIDIA/OpenShell/releases/download/vm-runtime/vm-runtime-linux-x86_64.tar.zst"],
+)
+
 include("//bazel/annotations:aws-lc-sys.MODULE.bazel")
 include("//bazel/annotations:z3-sys.MODULE.bazel")
 include("//bazel/annotations:zstd-sys.MODULE.bazel")

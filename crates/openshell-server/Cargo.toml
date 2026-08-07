@@ -106,7 +106,7 @@ async-trait = "0.1"
 url = { workspace = true }
 glob = { workspace = true }
 hex = "0.4"
-russh = "0.61"
+russh = "0.62"
 rand = { workspace = true }
 petname = "2"
 ipnet = "2"
@@ -128,6 +128,8 @@ test-support = []
 [dev-dependencies]
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring"] }
 rcgen = { version = "0.13", features = ["crypto", "pem"] }
+rsa = { version = "0.9", features = ["pem"] }
+base64 = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 wiremock = "0.6"

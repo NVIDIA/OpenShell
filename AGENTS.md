@@ -204,6 +204,15 @@ ocsf_emit!(event);
 - `mise run e2e` — End-to-end tests against a running gateway. Run for infrastructure, sandbox, or policy changes.
 - `mise run ci` — Full local CI (lint + compile/type checks + tests). Run before opening a PR.
 
+## Go SDK (`sdk/go/`)
+
+- The Go SDK lives in `sdk/go/` with module path `github.com/NVIDIA/OpenShell/sdk/go`.
+- Run `mise run go:ci` for the full SDK CI pipeline (lint, build, test, proto-check, docs-check).
+- Proto bindings are generated with `mise run go:proto:gen` from the `.proto` files in `proto/`.
+- Domain types in `sdk/go/openshell/v1/types/` must not import proto packages.
+- Converters in `sdk/go/openshell/v1/internal/converter/` deep-copy slices and maps at boundaries.
+- Tests use bufconn for in-process gRPC and testify for assertions.
+
 ## Python
 
 - Always use `uv` for Python commands (e.g., `uv pip install`, `uv run`, `uv venv`)

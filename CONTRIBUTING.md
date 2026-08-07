@@ -434,6 +434,7 @@ Bazel does not yet cover `mise run gateway`, `mise run sandbox`, `mise run e2e`,
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
 | `python/`       | Python SDK and bindings                       |
+| `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |
 | `proto/`        | Protocol buffer definitions                   |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |

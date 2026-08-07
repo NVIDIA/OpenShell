@@ -386,6 +386,16 @@ export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
 
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
+if [ "$(uname -s)" = "Darwin" ]; then
+  # Podman Machine reserves IPv4 loopback for its callback-only listener.
+  PRIMARY_BIND_IP="::1"
+  CLI_ENDPOINT_HOST="localhost"
+  HEALTH_ENDPOINT_HOST="[::1]"
+else
+  PRIMARY_BIND_IP="127.0.0.1"
+  CLI_ENDPOINT_HOST="127.0.0.1"
+  HEALTH_ENDPOINT_HOST="127.0.0.1"
+fi
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
 export XDG_STATE_HOME="${STATE_DIR}"
@@ -415,11 +425,11 @@ toml_string() {
 
 GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 
-# Start from the RPM default template so this e2e test exercises the same
-# TOML config path that RPM users get on first start. The template leaves
-# bind_address unset and sets compute_drivers = ["podman"], so this test
-# exercises the built-in loopback listener plus the callback listener
-# requested by the Podman driver.
+# Start from the RPM default template so this e2e test exercises the same TOML
+# config path that RPM users get on first start. The template leaves
+# bind_address unset and sets compute_drivers = ["podman"]. On Podman Machine,
+# the driver reserves IPv4 loopback for its callback-only listener, so the
+# primary listener uses IPv6 loopback. Native Linux keeps the IPv4 default.
 #
 # We append the driver-specific table and override the port via CLI flag
 # (CLI > TOML in the merge precedence) so the test can use an ephemeral port.
@@ -458,8 +468,9 @@ cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"
-  # compute_drivers comes from the RPM template, while bind_address uses the
-  # built-in loopback default. Override only the port for ephemeral selection.
+  # compute_drivers comes from the RPM template. Override the loopback address
+  # and port so Podman Machine can keep its IPv4 callback listener distinct.
+  --bind-address "${PRIMARY_BIND_IP}"
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
   --tls-cert "${PKI_DIR}/server/tls.crt"
@@ -495,10 +506,10 @@ printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"
 
 GATEWAY_NAME="openshell-e2e-podman-${HOST_PORT}"
 if [ "${OIDC_MODE}" = "1" ]; then
-  CLI_GATEWAY_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
+  CLI_GATEWAY_ENDPOINT="https://${CLI_ENDPOINT_HOST}:${HOST_PORT}"
   export OPENSHELL_E2E_OIDC_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
 else
-  CLI_GATEWAY_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
+  CLI_GATEWAY_ENDPOINT="https://${CLI_ENDPOINT_HOST}:${HOST_PORT}"
   e2e_register_mtls_gateway \
     "${XDG_CONFIG_HOME}" \
     "${GATEWAY_NAME}" \
@@ -524,7 +535,8 @@ while [ "${elapsed}" -lt "${timeout}" ]; do
     echo "ERROR: openshell-gateway exited before becoming healthy"
     exit 1
   fi
-  if curl -sf "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
+  # Keep this loopback probe direct even when ::1 is absent from NO_PROXY.
+  if curl --noproxy '*' -sf "http://${HEALTH_ENDPOINT_HOST}:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
     echo "Gateway healthy after ${elapsed}s."
     break
   fi

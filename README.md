@@ -1,4 +1,12 @@
-# ![OpenShell](docs/brand/assets/openshell-lockup-horizontal.svg)
+<!-- markdownlint-disable MD033 MD041 -->
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/assets/openshell-banner-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/brand/assets/openshell-banner-light.png">
+  <img alt="OpenShell" src="docs/brand/assets/openshell-banner-light.png" width="430">
+</picture>
+
+<!-- markdownlint-enable MD033 MD041 -->
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
