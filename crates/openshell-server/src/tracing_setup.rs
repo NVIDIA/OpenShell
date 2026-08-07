@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 use crate::config_file::OtlpConfig;
-use crate::otel_tracing::SetupError;
+use crate::otel_tracing::{GatewayResourceAttributes, SetupError};
 use crate::tracing_bus::TracingLogBus;
 
 pub struct TracingHandle {
@@ -33,8 +33,9 @@ pub fn install(
     env_filter: EnvFilter,
     tracing_log_bus: &TracingLogBus,
     otlp_config: Option<&OtlpConfig>,
+    gateway: GatewayResourceAttributes<'_>,
 ) -> (TracingHandle, Option<SetupError>) {
-    let (tracer_provider, setup_error) = crate::otel_tracing::provider_for(otlp_config);
+    let (tracer_provider, setup_error) = crate::otel_tracing::provider_for(otlp_config, gateway);
 
     tracing_subscriber::registry()
         .with(env_filter)

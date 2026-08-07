@@ -80,14 +80,28 @@ fn compute_driver_rpc_operation(path: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// Build a tracer provider for the configured OTLP/gRPC endpoint.
+/// Build a tracer provider for the configured OTLP/gRPC endpoint and gateway.
 #[must_use]
-pub fn provider_for(endpoint: Option<&str>) -> (Option<SdkTracerProvider>, Option<SetupError>) {
-    openshell_otel::provider_for(endpoint.map(|endpoint| OtlpTraceConfig {
-        endpoint,
-        service_name: ServiceName::Fixed(SERVICE_NAME),
-        service_version: Some(openshell_core::VERSION),
-        resource_attributes: Vec::new(),
+pub fn provider_for(
+    endpoint: Option<&str>,
+    gateway_name: Option<&str>,
+) -> (Option<SdkTracerProvider>, Option<SetupError>) {
+    openshell_otel::provider_for(endpoint.map(|endpoint| {
+        OtlpTraceConfig {
+            endpoint,
+            service_name: ServiceName::Fixed(SERVICE_NAME),
+            service_version: Some(openshell_core::VERSION),
+            resource_attributes: gateway_name
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| {
+                    vec![opentelemetry::KeyValue::new(
+                        "openshell.gateway.name",
+                        name.to_string(),
+                    )]
+                })
+                .unwrap_or_default(),
+        }
     }))
 }
 
@@ -114,6 +128,7 @@ mod tests {
     struct Received {
         spans: Vec<Span>,
         service_names: Vec<String>,
+        gateway_names: Vec<String>,
     }
 
     #[derive(Clone)]
@@ -132,18 +147,19 @@ mod tests {
                 let mut received = self.received.lock().unwrap();
                 for resource_span in request.into_inner().resource_spans {
                     if let Some(resource) = resource_span.resource {
-                        received.service_names.extend(
-                            resource
-                                .attributes
-                                .into_iter()
-                                .filter(|attribute| attribute.key == "service.name")
-                                .filter_map(|attribute| attribute.value)
-                                .filter_map(|value| value.value)
-                                .filter_map(|value| match value {
-                                    opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(value) => Some(value),
-                                    _ => None,
-                                }),
-                        );
+                        for attribute in resource.attributes {
+                            let Some(value) = attribute.value.and_then(|value| value.value) else {
+                                continue;
+                            };
+                            let opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(value) = value else {
+                                continue;
+                            };
+                            match attribute.key.as_str() {
+                                "service.name" => received.service_names.push(value),
+                                "openshell.gateway.name" => received.gateway_names.push(value),
+                                _ => {}
+                            }
+                        }
                     }
                     for scope_span in resource_span.scope_spans {
                         received.spans.extend(scope_span.spans);
@@ -202,7 +218,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn vm_driver_spans_reach_otlp_collector_with_distinct_service_name() {
+    async fn vm_driver_spans_reach_otlp_collector_with_resource_identity() {
         let received = Arc::new(Mutex::new(Received::default()));
         let exported = Arc::new(tokio::sync::Notify::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -224,7 +240,10 @@ mod tests {
                 .await
         });
 
-        let (provider, error) = super::provider_for(Some(&format!("http://{address}")));
+        let (provider, error) = super::provider_for(
+            Some(&format!("http://{address}")),
+            Some("production-us-west"),
+        );
         assert!(error.is_none(), "valid OTLP endpoint should configure");
         let provider = provider.expect("provider");
         let subscriber = tracing_subscriber::registry().with(super::layer(&provider));
@@ -263,5 +282,6 @@ mod tests {
             "VM spans should use a distinct service name, got {:?}",
             received.service_names
         );
+        assert_eq!(received.gateway_names, ["production-us-west"]);
     }
 }

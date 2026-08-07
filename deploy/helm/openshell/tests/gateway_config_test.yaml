@@ -11,6 +11,22 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: identifies the gateway by chart fullname by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^name\s*=\s*"openshell"$'
+
+  - it: renders an explicit gateway name
+    template: templates/gateway-config.yaml
+    set:
+      server.name: production-us-west
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^name\s*=\s*"production-us-west"$'
+
   # Regression for Drew's P2: a ConfigMap-only mutation in `helm upgrade`
   # must roll the StatefulSet, otherwise pods keep running with stale config.
   - it: annotates the StatefulSet pod template with a ConfigMap checksum
