@@ -375,23 +375,27 @@ openshell sandbox create -- codex
 
 Mise preserves an existing `SCCACHE_DIR` so each environment can choose where
 to store compiler cache entries. When `SCCACHE_DIR` is unset, OpenShell uses
-the worktree-local `.cache/sccache` directory. To make cache entries available
-to multiple worktrees on a workstation, set the variable to a user-level
-directory before activating mise. For example:
+the user-level `openshell/sccache` directory under the platform cache directory.
+All worktrees therefore share compiler outputs while retaining separate Cargo
+artifacts in each worktree's `target/` directory.
+
+The sccache daemon retains the environment with which it started. After changing
+`SCCACHE_DIR` or other sccache settings, inspect the requested and active
+configuration:
 
 ```shell
-export SCCACHE_DIR="$HOME/.cache/openshell/sccache"
+mise run rust:cache:status
+```
+
+If the requested and active settings differ, refresh the daemon when no other
+builds are running:
+
+```shell
+mise run rust:cache:refresh
 ```
 
 CI can select a different directory or configure a remote sccache backend
-without changing the workstation setting. Cargo output remains in each
-worktree's `target/` directory.
-
-OpenShell does not set `SCCACHE_BASEDIRS`. Sccache loads base directories when
-its machine-local daemon starts, but the correct workspace root differs for
-each worktree. Cache reuse therefore depends on the compiler inputs: outputs
-that embed absolute paths, including Rust dependencies in some builds, can
-still miss across worktrees.
+without changing the workstation defaults.
 
 ## Main Tasks
 
