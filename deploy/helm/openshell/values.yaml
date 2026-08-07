@@ -243,6 +243,20 @@ server:
   # the field, "RuntimeDefault" to force the runtime default profile, or
   # "Localhost/profile-name" for an operator-managed localhost profile.
   appArmorProfile: "Unconfined"
+  # Kubernetes compute driver settings.
+  drivers:
+    kubernetes:
+      # -- How workspaces map to Kubernetes namespaces.
+      # "shared" (default): all sandboxes in a single namespace.
+      # "managed": auto-creates per-workspace namespaces.
+      # "operator": uses pre-provisioned namespaces.
+      workspaceMode: "shared"
+      # -- (operator mode) K8s label selector for namespace discovery.
+      # The driver watches namespaces matching this label.
+      operatorNamespaceLabel: ""
+      # -- (operator mode) Path to a drop-in JSON file mapping workspace
+      # names to namespace names. Hot-reloaded on change.
+      operatorNamespaceFile: ""
   # -- Disable TLS entirely - the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
   disableTls: false

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+{{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -25,9 +26,60 @@ rules:
       - list
       - watch
   # Read namespace annotations for OpenShift SCC UID/GID range resolution.
+  # Managed/operator modes additionally need list+watch for cluster-wide
+  # namespace discovery. Managed mode needs create+delete for namespace
+  # lifecycle.
   - apiGroups:
       - ""
     resources:
       - namespaces
     verbs:
       - get
+      {{- if ne $workspaceMode "shared" }}
+      - list
+      - watch
+      {{- end }}
+      {{- if eq $workspaceMode "managed" }}
+      - create
+      - delete
+      {{- end }}
+  {{- if ne $workspaceMode "shared" }}
+  # Cluster-wide sandbox CRD access for managed/operator workspace modes.
+  - apiGroups:
+      - agents.x-k8s.io
+    resources:
+      - sandboxes
+      - sandboxes/status
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+  {{- end }}
+  {{- if eq $workspaceMode "managed" }}
+  # ServiceAccount creation in managed namespaces.
+  - apiGroups:
+      - ""
+    resources:
+      - serviceaccounts
+    verbs:
+      - create
+      - get
+  {{- end }}

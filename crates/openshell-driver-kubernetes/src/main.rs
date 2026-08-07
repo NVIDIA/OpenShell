@@ -10,9 +10,9 @@ use tracing_subscriber::EnvFilter;
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
-    AppArmorProfile, ComputeDriverService, DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
-    KubernetesComputeConfig, KubernetesComputeDriver, KubernetesSidecarConfig,
-    SupervisorSideloadMethod, SupervisorTopology,
+    AppArmorProfile, ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID,
+    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
+    KubernetesSidecarConfig, SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -30,8 +30,24 @@ struct Args {
     #[arg(long, env = "OPENSHELL_LOG_LEVEL", default_value = "info")]
     log_level: String,
 
+    #[arg(long, env = "OPENSHELL_WORKSPACE_MODE", default_value = "shared")]
+    workspace_mode: WorkspaceMode,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_GATEWAY_ID",
+        default_value = DEFAULT_GATEWAY_ID
+    )]
+    gateway_id: String,
+
     #[arg(long, env = "OPENSHELL_SANDBOX_NAMESPACE", default_value = "default")]
     sandbox_namespace: String,
+
+    #[arg(long, env = "OPENSHELL_OPERATOR_NAMESPACE_LABEL")]
+    operator_namespace_label: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_OPERATOR_NAMESPACE_FILE")]
+    operator_namespace_file: Option<String>,
 
     #[arg(
         long,
@@ -158,7 +174,11 @@ async fn main() -> Result<()> {
         .init();
 
     let driver = KubernetesComputeDriver::new(KubernetesComputeConfig {
+        workspace_mode: args.workspace_mode,
+        gateway_id: args.gateway_id,
         namespace: args.sandbox_namespace,
+        operator_namespace_label: args.operator_namespace_label,
+        operator_namespace_file: args.operator_namespace_file,
         service_account_name: args.sandbox_service_account,
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),

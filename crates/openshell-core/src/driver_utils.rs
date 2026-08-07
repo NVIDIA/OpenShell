@@ -35,6 +35,9 @@ pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.ai/sandbox-namespace";
 /// Container/pod label carrying the sandbox workspace.
 pub const LABEL_SANDBOX_WORKSPACE: &str = "openshell.ai/sandbox-workspace";
 
+/// Label carrying the gateway identity on managed namespaces.
+pub const LABEL_GATEWAY_ID: &str = "openshell.ai/gateway-id";
+
 /// Label selector that matches all OpenShell-managed resources which carry a
 /// sandbox ID label.  Used by list and watch operations to exclude foreign
 /// resources from the same namespace.

@@ -3,8 +3,13 @@
 
 use openshell_core::config;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::{Arc, RwLock};
+
+/// Default gateway identity used in managed-mode namespace naming.
+pub const DEFAULT_GATEWAY_ID: &str = "openshell";
 
 /// Default Kubernetes namespace for sandbox resources.
 pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
@@ -84,6 +89,48 @@ impl FromStr for SupervisorTopology {
             "combined" => Ok(Self::Combined),
             "sidecar" => Ok(Self::Sidecar),
             other => Err(format!("unknown topology '{other}'")),
+        }
+    }
+}
+
+/// How workspaces map to Kubernetes namespaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceMode {
+    /// All sandboxes render into a single statically-configured namespace.
+    /// Resource names use `{workspace}--{name}` for collision avoidance.
+    #[default]
+    Shared,
+    /// The driver creates and deletes K8s namespaces on demand using the
+    /// convention `openshell-{gateway_id}-{workspace_name}`.
+    Managed,
+    /// Sandboxes render into pre-existing K8s namespaces. The driver has no
+    /// namespace create/delete permissions. Platform teams manage namespaces
+    /// via their existing tooling.
+    Operator,
+}
+
+impl std::fmt::Display for WorkspaceMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shared => f.write_str("shared"),
+            Self::Managed => f.write_str("managed"),
+            Self::Operator => f.write_str("operator"),
+        }
+    }
+}
+
+impl FromStr for WorkspaceMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "shared" => Ok(Self::Shared),
+            "managed" => Ok(Self::Managed),
+            "operator" => Ok(Self::Operator),
+            other => Err(format!(
+                "unknown workspace mode '{other}'; expected 'shared', 'managed', or 'operator'"
+            )),
         }
     }
 }
@@ -232,7 +279,24 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
+    /// How workspaces map to Kubernetes namespaces. `"shared"` (default)
+    /// renders all sandboxes into `namespace`; `"managed"` creates per-workspace
+    /// namespaces on demand; `"operator"` uses pre-provisioned namespaces.
+    pub workspace_mode: WorkspaceMode,
+    /// Stable gateway identity used in managed-mode namespace naming
+    /// (`openshell-{gateway_id}-{workspace}`). Propagated from
+    /// `gateway_jwt.gateway_id`.
+    pub gateway_id: String,
     pub namespace: String,
+    /// K8s label selector for operator-mode namespace discovery (e.g.,
+    /// `"openshell.ai/workspace=true"`). The driver watches namespaces matching
+    /// this label and builds the allowlist dynamically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_namespace_label: Option<String>,
+    /// Path to a drop-in JSON file mapping workspace names to namespace names.
+    /// Hot-reloaded on change. Delivered via `ConfigMap` volume mount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_namespace_file: Option<String>,
     /// Kubernetes `ServiceAccount` assigned to sandbox pods and accepted by
     /// the gateway's `TokenReview` bootstrap authenticator.
     pub service_account_name: String,
@@ -351,7 +415,11 @@ pub const ANNOTATION_SCC_SUPPLEMENTAL_GROUPS: &str = "openshift.io/sa.scc.supple
 impl Default for KubernetesComputeConfig {
     fn default() -> Self {
         Self {
+            workspace_mode: WorkspaceMode::default(),
+            gateway_id: DEFAULT_GATEWAY_ID.to_string(),
             namespace: DEFAULT_K8S_NAMESPACE.to_string(),
+            operator_namespace_label: None,
+            operator_namespace_file: None,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME.to_string(),
             default_image: openshell_core::image::default_sandbox_image(),
             // Default empty so the gateway omits `imagePullPolicy` from pod
@@ -592,6 +660,214 @@ impl KubernetesComputeConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Resolve the K8s namespace for a workspace.
+    ///
+    /// - **Shared:** returns the static `namespace` config field.
+    /// - **Managed:** computes `openshell-{gateway_id}-{workspace_name}`.
+    /// - **Operator:** looks up `workspace` in the dynamic allowlist. Fails
+    ///   closed if the workspace is not found.
+    pub fn namespace_for_workspace(
+        &self,
+        workspace: &str,
+        operator_allowlist: Option<&OperatorNamespaceAllowlist>,
+    ) -> Result<String, String> {
+        match self.workspace_mode {
+            WorkspaceMode::Shared => Ok(self.namespace.clone()),
+            WorkspaceMode::Managed => Ok(managed_namespace(&self.gateway_id, workspace)),
+            WorkspaceMode::Operator => {
+                let allowlist =
+                    operator_allowlist.ok_or("operator mode requires a namespace allowlist")?;
+                let namespaces = allowlist.read();
+                if namespaces.contains(workspace) {
+                    Ok(workspace.to_string())
+                } else {
+                    Err(format!(
+                        "workspace '{workspace}' is not in the operator namespace allowlist"
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Whether the driver operates across multiple namespaces.
+    #[must_use]
+    pub fn is_multi_namespace(&self) -> bool {
+        !matches!(self.workspace_mode, WorkspaceMode::Shared)
+    }
+
+    /// Compute the K8s resource name for a sandbox.
+    ///
+    /// - **Shared:** `{workspace}--{name}` (namespace doesn't provide isolation).
+    /// - **Managed/Operator:** bare sandbox name (namespace provides isolation).
+    #[must_use]
+    pub fn kube_resource_name(&self, workspace: &str, name: &str) -> String {
+        match self.workspace_mode {
+            WorkspaceMode::Shared => format!("{workspace}--{name}"),
+            WorkspaceMode::Managed | WorkspaceMode::Operator => name.to_string(),
+        }
+    }
+
+    /// Validate workspace-mode-specific configuration at startup.
+    pub fn validate_workspace_mode(&self) -> Result<(), String> {
+        match self.workspace_mode {
+            WorkspaceMode::Shared => Ok(()),
+            WorkspaceMode::Managed => {
+                if self.gateway_id.is_empty() {
+                    return Err("managed workspace mode requires a non-empty gateway_id".into());
+                }
+                if !is_dns_1123_label(&self.gateway_id) {
+                    return Err(format!(
+                        "gateway_id '{}' is not a valid DNS-1123 label",
+                        self.gateway_id
+                    ));
+                }
+                // Workspace names can be up to 19 chars (MAX_ROUTABLE_NAME_LEN
+                // in the server crate). The managed namespace prefix +
+                // workspace must fit within 63 chars.
+                let prefix = managed_namespace_prefix(&self.gateway_id);
+                if prefix.len() + 19 > 63 {
+                    return Err(format!(
+                        "gateway_id '{}' is too long for managed mode; \
+                         the namespace prefix '{}' ({} chars) plus the \
+                         maximum workspace name (19 chars) exceeds the \
+                         63-char K8s namespace limit",
+                        self.gateway_id,
+                        prefix,
+                        prefix.len()
+                    ));
+                }
+                Ok(())
+            }
+            WorkspaceMode::Operator => {
+                if self.operator_namespace_label.is_none() && self.operator_namespace_file.is_none()
+                {
+                    return Err("operator workspace mode requires at least one of \
+                         operator_namespace_label or operator_namespace_file"
+                        .into());
+                }
+                if let Some(ref label) = self.operator_namespace_label
+                    && label.is_empty()
+                {
+                    return Err("operator_namespace_label must not be empty when set".into());
+                }
+                if let Some(ref file) = self.operator_namespace_file
+                    && file.is_empty()
+                {
+                    return Err("operator_namespace_file must not be empty when set".into());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Compute the managed-mode namespace name for a workspace.
+#[must_use]
+pub fn managed_namespace(gateway_id: &str, workspace: &str) -> String {
+    format!("openshell-{gateway_id}-{workspace}")
+}
+
+/// The managed-mode namespace prefix used for SA token validation.
+#[must_use]
+pub fn managed_namespace_prefix(gateway_id: &str) -> String {
+    format!("openshell-{gateway_id}-")
+}
+
+/// Check whether a string is a valid DNS-1123 label (lowercase alphanumeric
+/// and hyphens, 1-63 chars, must start and end with alphanumeric).
+#[must_use]
+pub fn is_dns_1123_label(s: &str) -> bool {
+    let len = s.len();
+    if len == 0 || len > 63 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return false;
+    }
+    if !bytes[len - 1].is_ascii_lowercase() && !bytes[len - 1].is_ascii_digit() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Validate that a workspace name produces a valid K8s namespace name in
+/// managed mode (combined length <= 63, DNS-1123 compliant).
+pub fn validate_managed_namespace_name(gateway_id: &str, workspace: &str) -> Result<(), String> {
+    let ns = managed_namespace(gateway_id, workspace);
+    if !is_dns_1123_label(&ns) {
+        return Err(format!(
+            "managed namespace '{ns}' (from workspace '{workspace}') is not a valid DNS-1123 label"
+        ));
+    }
+    Ok(())
+}
+
+/// Thread-safe dynamic allowlist of valid operator-mode namespaces.
+///
+/// Backed by an `Arc<RwLock<BTreeSet<String>>>` that is updated by background
+/// tasks (label selector watcher, drop-in file watcher) and read by the SA
+/// authenticator and namespace resolver.
+#[derive(Debug, Clone)]
+pub struct OperatorNamespaceAllowlist {
+    inner: Arc<RwLock<BTreeSet<String>>>,
+}
+
+impl OperatorNamespaceAllowlist {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(BTreeSet::new())),
+        }
+    }
+
+    #[must_use]
+    pub fn from_set(set: BTreeSet<String>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(set)),
+        }
+    }
+
+    /// Replace the entire allowlist (used by background watchers on refresh).
+    pub fn replace(&self, new_set: BTreeSet<String>) {
+        let mut guard = self.inner.write().expect("allowlist lock poisoned");
+        *guard = new_set;
+    }
+
+    /// Merge additional namespaces into the allowlist.
+    pub fn merge(&self, additional: &BTreeSet<String>) {
+        let mut guard = self.inner.write().expect("allowlist lock poisoned");
+        guard.extend(additional.iter().cloned());
+    }
+
+    /// Read the current allowlist snapshot.
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeSet<String>> {
+        self.inner.read().expect("allowlist lock poisoned")
+    }
+
+    /// Check whether a namespace is in the allowlist.
+    #[must_use]
+    pub fn contains(&self, namespace: &str) -> bool {
+        self.inner
+            .read()
+            .expect("allowlist lock poisoned")
+            .contains(namespace)
+    }
+
+    /// Return a clone of the inner `Arc` for sharing with background tasks.
+    #[must_use]
+    pub fn shared(&self) -> Arc<RwLock<BTreeSet<String>>> {
+        Arc::clone(&self.inner)
+    }
+}
+
+impl Default for OperatorNamespaceAllowlist {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1176,6 +1452,46 @@ mod tests {
         }
     }
 
+    // -- WorkspaceMode tests --
+
+    #[test]
+    fn default_workspace_mode_is_shared() {
+        let cfg = KubernetesComputeConfig::default();
+        assert_eq!(cfg.workspace_mode, WorkspaceMode::Shared);
+    }
+
+    #[test]
+    fn serde_override_workspace_mode_managed() {
+        let json = serde_json::json!({ "workspace_mode": "managed" });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.workspace_mode, WorkspaceMode::Managed);
+    }
+
+    #[test]
+    fn serde_override_workspace_mode_operator() {
+        let json = serde_json::json!({ "workspace_mode": "operator" });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.workspace_mode, WorkspaceMode::Operator);
+    }
+
+    #[test]
+    fn serde_rejects_invalid_workspace_mode() {
+        let json = serde_json::json!({ "workspace_mode": "invalid" });
+        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn workspace_mode_display_roundtrips() {
+        for mode in [
+            WorkspaceMode::Shared,
+            WorkspaceMode::Managed,
+            WorkspaceMode::Operator,
+        ] {
+            assert_eq!(mode.to_string().parse::<WorkspaceMode>().unwrap(), mode);
+        }
+    }
+
     #[test]
     fn upstream_proxy_config_rejects_unsupported_proxy_scheme() {
         let cfg = KubernetesComputeConfig {
@@ -1260,5 +1576,228 @@ mod tests {
             ..KubernetesComputeConfig::default()
         };
         assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn namespace_for_workspace_shared() {
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Shared,
+            namespace: "sandbox-ns".to_string(),
+            ..KubernetesComputeConfig::default()
+        };
+        assert_eq!(
+            cfg.namespace_for_workspace("team-a", None).unwrap(),
+            "sandbox-ns"
+        );
+        assert_eq!(
+            cfg.namespace_for_workspace("team-b", None).unwrap(),
+            "sandbox-ns"
+        );
+    }
+
+    #[test]
+    fn namespace_for_workspace_managed() {
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Managed,
+            gateway_id: "gw1".to_string(),
+            ..KubernetesComputeConfig::default()
+        };
+        assert_eq!(
+            cfg.namespace_for_workspace("team-a", None).unwrap(),
+            "openshell-gw1-team-a"
+        );
+    }
+
+    #[test]
+    fn namespace_for_workspace_operator() {
+        let allowlist = OperatorNamespaceAllowlist::from_set(BTreeSet::from(["prod".to_string()]));
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Operator,
+            operator_namespace_label: Some("openshell.ai/workspace=true".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        assert_eq!(
+            cfg.namespace_for_workspace("prod", Some(&allowlist))
+                .unwrap(),
+            "prod"
+        );
+        assert!(
+            cfg.namespace_for_workspace("unknown", Some(&allowlist))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn kube_resource_name_shared_prefixes_workspace() {
+        let cfg = KubernetesComputeConfig::default();
+        assert_eq!(cfg.kube_resource_name("ws", "box1"), "ws--box1");
+    }
+
+    #[test]
+    fn kube_resource_name_managed_uses_bare_name() {
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Managed,
+            ..KubernetesComputeConfig::default()
+        };
+        assert_eq!(cfg.kube_resource_name("ws", "box1"), "box1");
+    }
+
+    #[test]
+    fn kube_resource_name_operator_uses_bare_name() {
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Operator,
+            operator_namespace_label: Some("x=y".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        assert_eq!(cfg.kube_resource_name("ws", "box1"), "box1");
+    }
+
+    #[test]
+    fn is_multi_namespace() {
+        assert!(!KubernetesComputeConfig::default().is_multi_namespace());
+        assert!(
+            KubernetesComputeConfig {
+                workspace_mode: WorkspaceMode::Managed,
+                ..KubernetesComputeConfig::default()
+            }
+            .is_multi_namespace()
+        );
+        assert!(
+            KubernetesComputeConfig {
+                workspace_mode: WorkspaceMode::Operator,
+                operator_namespace_label: Some("x=y".to_string()),
+                ..KubernetesComputeConfig::default()
+            }
+            .is_multi_namespace()
+        );
+    }
+
+    #[test]
+    fn validate_workspace_mode_shared_always_ok() {
+        let cfg = KubernetesComputeConfig::default();
+        cfg.validate_workspace_mode().unwrap();
+    }
+
+    #[test]
+    fn validate_workspace_mode_managed_requires_gateway_id() {
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Managed,
+            gateway_id: String::new(),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_workspace_mode().is_err());
+    }
+
+    #[test]
+    fn validate_workspace_mode_managed_rejects_invalid_gateway_id() {
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Managed,
+            gateway_id: "INVALID".to_string(),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_workspace_mode().is_err());
+    }
+
+    #[test]
+    fn validate_workspace_mode_managed_rejects_long_gateway_id() {
+        // prefix = "openshell-{id}-" = 11 + id.len()
+        // 11 + 34 + 19 = 64 > 63 → rejected
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Managed,
+            gateway_id: "a".repeat(34),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_workspace_mode().unwrap_err();
+        assert!(err.contains("too long for managed mode"), "{err}");
+    }
+
+    #[test]
+    fn validate_workspace_mode_managed_accepts_max_gateway_id() {
+        // 11 + 33 + 19 = 63 → accepted
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Managed,
+            gateway_id: "a".repeat(33),
+            ..KubernetesComputeConfig::default()
+        };
+        cfg.validate_workspace_mode().unwrap();
+    }
+
+    #[test]
+    fn validate_workspace_mode_operator_requires_discovery() {
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Operator,
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_workspace_mode().is_err());
+    }
+
+    #[test]
+    fn validate_workspace_mode_operator_accepts_label_only() {
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Operator,
+            operator_namespace_label: Some("openshell.ai/workspace=true".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        cfg.validate_workspace_mode().unwrap();
+    }
+
+    #[test]
+    fn validate_workspace_mode_operator_accepts_file_only() {
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Operator,
+            operator_namespace_file: Some("/etc/openshell/namespaces.json".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        cfg.validate_workspace_mode().unwrap();
+    }
+
+    #[test]
+    fn dns_1123_label_validation() {
+        assert!(is_dns_1123_label("openshell"));
+        assert!(is_dns_1123_label("my-gateway-1"));
+        assert!(is_dns_1123_label("a"));
+        assert!(!is_dns_1123_label(""));
+        assert!(!is_dns_1123_label("UPPER"));
+        assert!(!is_dns_1123_label("-starts-with-dash"));
+        assert!(!is_dns_1123_label("ends-with-dash-"));
+        assert!(!is_dns_1123_label("has_underscore"));
+        assert!(!is_dns_1123_label(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn managed_namespace_naming() {
+        assert_eq!(
+            managed_namespace("openshell", "default"),
+            "openshell-openshell-default"
+        );
+        assert_eq!(managed_namespace("gw1", "team-a"), "openshell-gw1-team-a");
+    }
+
+    #[test]
+    fn validate_managed_namespace_name_accepts_valid() {
+        validate_managed_namespace_name("gw1", "team-a").unwrap();
+    }
+
+    #[test]
+    fn validate_managed_namespace_name_rejects_too_long() {
+        let long_workspace = "a".repeat(50);
+        assert!(validate_managed_namespace_name("openshell", &long_workspace).is_err());
+    }
+
+    #[test]
+    fn operator_allowlist_operations() {
+        let al = OperatorNamespaceAllowlist::new();
+        assert!(!al.contains("ns1"));
+
+        al.replace(BTreeSet::from(["ns1".to_string(), "ns2".to_string()]));
+        assert!(al.contains("ns1"));
+        assert!(al.contains("ns2"));
+        assert!(!al.contains("ns3"));
+
+        al.merge(&BTreeSet::from(["ns3".to_string()]));
+        assert!(al.contains("ns3"));
+
+        al.replace(BTreeSet::new());
+        assert!(!al.contains("ns1"));
     }
 }
