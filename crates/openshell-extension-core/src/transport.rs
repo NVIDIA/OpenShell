@@ -18,35 +18,72 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Trust policy used to authenticate a remote extension service.
+///
+/// This enum is intentionally independent of middleware and interceptor
+/// protocols. Future transport identities, such as SPIFFE X.509-SVIDs or
+/// pinned public keys, can be added here without changing either caller.
+#[derive(Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ExtensionServerTrust {
+    /// Authenticate the HTTPS service with the platform trust store and the
+    /// endpoint's DNS name.
+    #[default]
+    PlatformRoots,
+    /// Authenticate the HTTPS service with only this PEM CA bundle and the
+    /// endpoint's DNS name.
+    CustomCaPem(Vec<u8>),
+}
+
+impl std::fmt::Debug for ExtensionServerTrust {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PlatformRoots => formatter.write_str("PlatformRoots"),
+            Self::CustomCaPem(_) => formatter.write_str("CustomCaPem(<redacted>)"),
+        }
+    }
+}
+
 /// Configuration for an outbound extension gRPC channel.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ExtensionChannelConfig {
     endpoint: String,
-    custom_ca_pem: Option<Vec<u8>>,
+    server_trust: ExtensionServerTrust,
 }
 
 impl ExtensionChannelConfig {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
-            custom_ca_pem: None,
+            server_trust: ExtensionServerTrust::default(),
         }
+    }
+
+    /// Select how the remote extension service is authenticated.
+    #[must_use]
+    pub fn with_server_trust(mut self, server_trust: ExtensionServerTrust) -> Self {
+        self.server_trust = server_trust;
+        self
     }
 
     /// Pin HTTPS verification to this CA bundle instead of platform roots.
     /// Normal TLS hostname verification remains enabled.
     #[must_use]
-    pub fn with_custom_ca_pem(mut self, custom_ca_pem: impl Into<Vec<u8>>) -> Self {
-        self.custom_ca_pem = Some(custom_ca_pem.into());
-        self
+    pub fn with_custom_ca_pem(self, custom_ca_pem: impl Into<Vec<u8>>) -> Self {
+        self.with_server_trust(ExtensionServerTrust::CustomCaPem(custom_ca_pem.into()))
     }
 
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
+    pub fn server_trust(&self) -> &ExtensionServerTrust {
+        &self.server_trust
+    }
+
+    /// Returns whether HTTPS verification uses an operator-provided CA bundle.
     pub fn has_custom_ca(&self) -> bool {
-        self.custom_ca_pem.is_some()
+        matches!(&self.server_trust, ExtensionServerTrust::CustomCaPem(_))
     }
 }
 
@@ -55,7 +92,7 @@ impl std::fmt::Debug for ExtensionChannelConfig {
         formatter
             .debug_struct("ExtensionChannelConfig")
             .field("endpoint", &self.endpoint)
-            .field("has_custom_ca", &self.has_custom_ca())
+            .field("server_trust", &self.server_trust)
             .finish()
     }
 }
@@ -88,10 +125,12 @@ pub async fn connect_channel(config: &ExtensionChannelConfig) -> Result<Channel,
 
     let mut endpoint = standard_endpoint(&config.endpoint)?;
     if config.endpoint.starts_with("https://") {
-        let tls = config.custom_ca_pem.as_ref().map_or_else(
-            || ClientTlsConfig::new().with_enabled_roots(),
-            |pem| ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem)),
-        );
+        let tls = match &config.server_trust {
+            ExtensionServerTrust::PlatformRoots => ClientTlsConfig::new().with_enabled_roots(),
+            ExtensionServerTrust::CustomCaPem(pem) => {
+                ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem))
+            }
+        };
         endpoint = endpoint.tls_config(tls).map_err(TransportError::Tls)?;
     }
     endpoint.connect().await.map_err(TransportError::Connect)
@@ -107,7 +146,7 @@ fn validate_config(config: &ExtensionChannelConfig) -> Result<(), TransportError
     if !is_https && !is_http && !is_unix {
         return Err(TransportError::UnsupportedScheme);
     }
-    if config.custom_ca_pem.is_some() && !is_https {
+    if !matches!(&config.server_trust, ExtensionServerTrust::PlatformRoots) && !is_https {
         return Err(TransportError::CustomCaRequiresHttps);
     }
     if let Some(path) = config.endpoint.strip_prefix("unix://")
@@ -193,6 +232,22 @@ mod tests {
         ] {
             validate_config(&ExtensionChannelConfig::new(endpoint)).unwrap();
         }
+    }
+
+    #[test]
+    fn server_trust_is_an_explicit_shared_policy() {
+        let default = ExtensionChannelConfig::new("https://middleware.example");
+        assert!(matches!(
+            default.server_trust(),
+            ExtensionServerTrust::PlatformRoots
+        ));
+
+        let custom =
+            default.with_server_trust(ExtensionServerTrust::CustomCaPem(b"test CA".to_vec()));
+        assert!(matches!(
+            custom.server_trust(),
+            ExtensionServerTrust::CustomCaPem(pem) if pem == b"test CA"
+        ));
     }
 
     #[test]
