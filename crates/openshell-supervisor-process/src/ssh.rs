@@ -717,8 +717,8 @@ impl Default for PtyRequest {
 /// (or defaults to `/home/{user}`).
 ///
 /// For numeric UIDs, there is no passwd entry, so the default remains
-/// `("{uid}", "/sandbox")`. Docker replaces that default with its resolved
-/// image workspace.
+/// `("{uid}", "/sandbox")`. Docker and Podman replace that default with their
+/// resolved image workspace.
 fn session_user_and_home(policy: &SandboxPolicy, workdir_home: Option<&str>) -> (String, String) {
     let (user, default_home) = match policy.process.run_as_user.as_deref() {
         Some(user) if !user.is_empty() => {

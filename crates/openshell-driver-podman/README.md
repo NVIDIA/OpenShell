@@ -8,14 +8,27 @@ isolation enforcement to the `openshell-sandbox` supervisor binary, which is
 sideloaded into each container via an OCI image volume mount.
 
 Before creating the container, the driver inspects the final sandbox image and
-captures its immutable image ID and raw OCI `Config.User`. Container creation
-uses that image ID with pulling disabled, preventing a mutable tag from changing
-between inspection and launch. The supervisor runs as root, resolves omitted
-policy identity fields from the image declaration, and drops only agent
-children to the completed identity. Named OCI components remain names after
-validation; a missing group is filled with the user's numeric primary GID. Explicit
-`process.run_as_user` and `process.run_as_group` values take precedence
-independently.
+captures its immutable image ID, raw OCI `Config.User`, and OCI
+`Config.WorkingDir`. Container creation uses that image ID with pulling
+disabled, preventing a mutable tag from changing between inspection and launch.
+The supervisor runs as root, resolves omitted policy identity fields from the
+image declaration, and drops only agent children to the completed identity.
+Named OCI components remain names after validation; a missing group is filled
+with the user's numeric primary GID. Explicit `process.run_as_user` and
+`process.run_as_group` values take precedence independently.
+
+An absolute OCI working directory becomes the agent workspace. An empty,
+root (`/`), or explicit `/sandbox` declaration uses `/sandbox`, which OpenShell
+creates and owns as a compatibility workspace. For any other workdir, a
+resource-limited, networkless probe verifies the original pinned image before
+Podman covers the path with the managed workspace volume. The completed process
+identity must already be able to traverse every parent and write and enter the
+directory, without symlink components or OpenShell control-path collisions.
+The gateway supplies the identity source from the effective global-or-sandbox
+policy, or requests image-policy discovery when neither exists. The final
+supervisor must match the probe's normalized identity before preparing the
+volume. See [Compute runtimes](../../architecture/compute-runtimes.md#process-identity)
+for the invariant and probe lifecycle.
 
 For a rootless networking deep dive, see [NETWORKING.md](NETWORKING.md).
 
@@ -87,9 +100,11 @@ optional `selinux_label` of `shared` (applies `:z`) or `private` (applies
 read-only by default; set `read_only: false` to make them writable. Podman
 image and volume mounts do not support `subpath` in OpenShell driver config.
 Mount `source` and `target` values must not contain surrounding whitespace.
-Mount targets must be absolute container paths and must not replace
-the workspace root (`/sandbox`) or overlap OpenShell supervisor files,
-`/etc/openshell`, `/etc/openshell-tls`, or `/run/netns`.
+Mount targets must be absolute container paths and must not replace the
+resolved workspace root or any of its parents. Nested workspace mounts remain
+valid. Mounts also must not contain or be contained by concrete OpenShell
+control targets such as the supervisor mount, TLS and token files, runtime
+socket, or `/run/netns`.
 
 Example named-volume usage:
 
@@ -291,6 +306,13 @@ sequenceDiagram
 
     D->>P: pull_image(supervisor, "missing")
     D->>P: pull_image(sandbox_image, policy)
+    D->>P: inspect_image(sandbox_image)
+
+    opt Non-default OCI workdir
+        D->>P: create + start validation probe
+        D->>P: wait + read bounded logs
+        D->>P: force-remove exact probe name
+    end
 
     D->>P: create_volume(workspace)
     Note over D: On failure below, rollback volume

@@ -189,8 +189,8 @@ pub async fn run_sandbox(
 
     // Normalize the active driver's identity contract once, while both the
     // policy and launched image filesystem are available. Kubernetes and
-    // OpenShift retain their authoritative numeric pair; Docker fills only
-    // omitted policy fields from OCI Config.User.
+    // OpenShift retain their authoritative numeric pair; Docker and Podman
+    // fill only omitted policy fields from OCI Config.User.
     #[cfg(unix)]
     let (resolved_process_identity, workspace) = {
         let driver_identity = openshell_supervisor_process::identity::DriverIdentity::from_env()?;
@@ -202,18 +202,47 @@ pub async fn run_sandbox(
             &mut policy,
             &driver_identity,
         )?;
+        let workspace_attestation = if matches!(
+            &driver_identity,
+            openshell_supervisor_process::identity::DriverIdentity::OciUser { .. }
+        ) {
+            match std::env::var_os(openshell_core::sandbox_env::OCI_WORKSPACE_IDENTITY) {
+                Some(value) if !value.is_empty() => Some(value.into_string().map_err(|_| {
+                    miette::miette!("Podman workspace identity attestation is not valid UTF-8")
+                })?),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(expected) = workspace_attestation.as_deref() {
+            let actual =
+                openshell_supervisor_process::process::resolved_workspace_identity_attestation(
+                    &policy, resolved,
+                )?;
+            if expected != actual {
+                return Err(miette::miette!(
+                    "process identity changed after OCI workspace validation"
+                ));
+            }
+        }
         (
             resolved,
             openshell_supervisor_process::process::ResolvedWorkspace::new(
                 workdir.clone(),
                 use_workdir_as_home,
+                workspace_attestation.is_some(),
             ),
         )
     };
     #[cfg(not(unix))]
     let (resolved_process_identity, workspace) = (
         openshell_supervisor_process::process::ResolvedProcessIdentity::default(),
-        openshell_supervisor_process::process::ResolvedWorkspace::new(workdir.clone(), false),
+        openshell_supervisor_process::process::ResolvedWorkspace::new(
+            workdir.clone(),
+            false,
+            false,
+        ),
     );
 
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
@@ -2154,6 +2183,18 @@ fn discover_policy_from_disk_or_default() -> openshell_core::proto::SandboxPolic
         return discover_policy_from_path(legacy);
     }
     discover_policy_from_path(primary)
+}
+
+/// Discover only the process identity portion of the immutable image policy.
+///
+/// The Podman workspace probe uses this when no policy existed at create time,
+/// matching the final supervisor's disk-policy discovery before the gateway
+/// backfills that policy.
+pub fn discover_process_policy_from_disk_or_default() -> openshell_core::policy::ProcessPolicy {
+    discover_policy_from_disk_or_default()
+        .process
+        .map(Into::into)
+        .unwrap_or_default()
 }
 
 /// Try to read a sandbox policy YAML from `path`, falling back to the

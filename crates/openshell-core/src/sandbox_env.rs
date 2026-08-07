@@ -126,6 +126,13 @@ pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
 /// OCI only for the former contract.
 pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 
+/// Normalized UID/GID/supplementary-group identity attested by the Podman
+/// immutable-image workspace probe.
+///
+/// A non-empty value also asserts that the
+/// original workspace was validated before Podman's managed volume covered it.
+pub const OCI_WORKSPACE_IDENTITY: &str = "OPENSHELL_OCI_WORKSPACE_IDENTITY";
+
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the
