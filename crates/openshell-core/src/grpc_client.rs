@@ -167,6 +167,17 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read client key from {key_path}"))?;
 
+        // Trust only the configured CA — this is the chart's internal CA
+        // that signs both the gateway's internal server certificate and
+        // this client's identity certificate.  The gateway uses SNI-based
+        // certificate selection to present this internal cert to supervisor
+        // connections, so no public root trust is needed here.
+        //
+        // Do NOT add `.with_native_roots()` or `.with_webpki_roots()` here:
+        // the supervisor runs inside the user-selected sandbox image
+        // (Docker/Podman drivers), and broadening the trust store would let
+        // an attacker who controls the image + DNS present a publicly valid
+        // certificate and intercept the supervisor→gateway TLS connection.
         let mut tls_config = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(ca_pem))
             .identity(Identity::from_pem(cert_pem, key_pem));

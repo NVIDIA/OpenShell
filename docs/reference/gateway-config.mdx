@@ -140,6 +140,10 @@ cert_path             = "/etc/openshell/certs/gateway.pem"
 key_path              = "/etc/openshell/certs/gateway-key.pem"
 client_ca_path        = "/etc/openshell/certs/client-ca.pem"
 require_client_auth   = false
+# Optional: SNI-based dual certificate for external (e.g. ACME) TLS.
+# external_cert_path    = "/etc/openshell/certs/external.pem"
+# external_key_path     = "/etc/openshell/certs/external-key.pem"
+# external_server_names = ["gateway.example.com"]
 
 [openshell.gateway.gateway_jwt]
 signing_key_path = "/etc/openshell/jwt/signing.pem"
@@ -194,6 +198,8 @@ allow_reference_namespace = false
 ```
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
+
+`[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
 
 `[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup always fails closed when no previous valid generation exists. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
 
@@ -411,6 +417,10 @@ compute_drivers       = ["kubernetes"]
 cert_path      = "/etc/openshell-tls/server/tls.crt"
 key_path       = "/etc/openshell-tls/server/tls.key"
 client_ca_path = "/etc/openshell-tls/client-ca/ca.crt"
+# When cert-manager serverIssuerRef is configured, these are populated by Helm:
+# external_cert_path    = "/etc/openshell-tls/server-external/tls.crt"
+# external_key_path     = "/etc/openshell-tls/server-external/tls.key"
+# external_server_names = ["gateway.example.com"]
 
 [openshell.drivers.kubernetes]
 namespace                      = "agents"
