@@ -114,8 +114,10 @@ reflection, inference-route management, and HTTP requests. A
 is expected for those requests. The gateway fails startup if a callback
 requirement resolves to the exact primary listener address because one socket
 cannot preserve both authorization scopes. For the IPv4-loopback callback used
-by Podman Machine, bind the primary listener to a distinct address such as
-`[::1]:17670`.
+by Podman Machine, set `bind_address = "[::1]:17670"` for the primary listener
+and register `https://localhost:17670` as the CLI endpoint. The hostname matches
+the generated certificate and avoids the TLS transport error produced by a raw
+IPv6-literal endpoint. Do not broaden the primary listener to `0.0.0.0`.
 
 ## Docker Driver
 
