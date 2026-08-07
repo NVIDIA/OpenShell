@@ -286,10 +286,25 @@ struct DualCertResolver {
     external_names: Vec<String>,
 }
 
+/// Check whether `sni` matches a configured external name.
+///
+/// Supports exact matches and single-level wildcard matches per RFC 6125:
+/// `*.example.com` matches `foo.example.com` but not `bar.foo.example.com`
+/// or `example.com` itself.
+fn sni_matches(pattern: &str, sni: &str) -> bool {
+    pattern.strip_prefix("*.").map_or(pattern == sni, |suffix| {
+        // Wildcard: SNI must have exactly one label before the suffix.
+        // e.g. "foo." for "foo.example.com" against "*.example.com"
+        sni.strip_suffix(suffix).is_some_and(|prefix| {
+            prefix.ends_with('.') && !prefix[..prefix.len() - 1].contains('.')
+        })
+    })
+}
+
 impl ResolvesServerCert for DualCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         if let Some(name) = client_hello.server_name()
-            && self.external_names.iter().any(|n| n == name)
+            && self.external_names.iter().any(|n| sni_matches(n, name))
         {
             return Some(self.external.clone());
         }
@@ -1072,6 +1087,25 @@ mod tests {
             .expect("failed to sign cert");
         write_test_file(dir, cert_file, cert.pem().as_bytes());
         write_test_file(dir, key_file, key.serialize_pem().as_bytes());
+    }
+
+    #[test]
+    fn test_sni_matches_exact() {
+        assert!(sni_matches("example.com", "example.com"));
+        assert!(!sni_matches("example.com", "other.com"));
+        assert!(!sni_matches("example.com", "sub.example.com"));
+    }
+
+    #[test]
+    fn test_sni_matches_wildcard() {
+        assert!(sni_matches("*.example.com", "foo.example.com"));
+        assert!(sni_matches("*.example.com", "bar.example.com"));
+        // Must not match bare domain.
+        assert!(!sni_matches("*.example.com", "example.com"));
+        // Must not match nested subdomains (RFC 6125).
+        assert!(!sni_matches("*.example.com", "sub.foo.example.com"));
+        // Must not match unrelated domain with same suffix.
+        assert!(!sni_matches("*.example.com", "notexample.com"));
     }
 
     #[test]
