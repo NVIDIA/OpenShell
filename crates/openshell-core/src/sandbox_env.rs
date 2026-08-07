@@ -126,6 +126,16 @@ pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
 /// OCI only for the former contract.
 pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 
+/// Opt-in toggle to reconcile ownership of existing sandbox-writable paths.
+///
+/// The default (unset) preserves the create-only chown contract: an existing
+/// `read_write` path is never re-owned. When set to `"1"` or `"true"`, the
+/// supervisor recursively repairs a persisted state tree whose host-side
+/// ownership no longer matches the configured sandbox identity — for example
+/// after a host reboot shifted the rootless user-namespace subuid base and left
+/// the sandbox unable to read its own state. See NVIDIA/OpenShell#2336.
+pub const RECONCILE_SANDBOX_OWNERSHIP: &str = "OPENSHELL_RECONCILE_SANDBOX_OWNERSHIP";
+
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the
