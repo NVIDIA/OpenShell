@@ -79,8 +79,9 @@ Out of scope:
   asks for it.
 - Use `mise run --skip-tools windows:*` for Windows validation. The Windows
   toolchain is rustup plus Visual Studio Build Tools, not mise-provisioned Rust.
-- Keep Unix `run` bodies unchanged when adding `run_windows` behavior to shared
-  pre-commit tasks.
+- Prefer one cross-platform `run` command when the underlying tool supports it
+  (for example, `npm --prefix`). Add `run_windows` only when the Windows shell
+  or validation contract genuinely differs.
 
 ## Recommended Checkout Flow
 
@@ -245,13 +246,12 @@ Windows must continue to reject unsupported compute drivers clearly.
 | Docker | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
 | Kubernetes | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
 | Podman | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
-| VM | Driver crate excluded from workspace validation. | VM spawn returns unsupported. |
+| VM | Driver crate excluded from workspace validation. | Gateway construction returns unsupported. |
 
 The focused contract tasks for either native architecture run:
 
 ```text
-windows_compute_driver_stubs_report_unsupported
-windows_spawn_reports_unsupported
+windows_builtin_compute_drivers_report_unsupported
 ```
 
 These tests are also included in the full x64 workspace test run; the focused
@@ -265,7 +265,7 @@ When reporting `windows:ci`, distinguish these categories:
 - Passed tests from the full x64 workspace test log.
 - Passed tests from the full ARM64 workspace test log when run on a native
   ARM64 host.
-- The two focused unsupported-contract re-runs.
+- The focused unsupported-contract re-run.
 - Explicit Cargo ignored tests, usually ignored doc examples.
 - Tests hidden by `#[cfg(not(target_os = "windows"))]`; these often appear as
   `running 0 tests`, not as ignored tests.

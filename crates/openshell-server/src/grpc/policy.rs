@@ -56,12 +56,10 @@ use openshell_core::{
 use openshell_ocsf::{
     ConfigStateChangeBuilder, OCSF_TARGET, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
 };
-#[cfg(not(target_os = "windows"))]
-use openshell_policy::serialize_sandbox_policy;
 use openshell_policy::{
     PolicyMergeOp, ProviderPolicyLayer, compose_effective_policy, merge_policy,
+    serialize_sandbox_policy,
 };
-#[cfg(not(target_os = "windows"))]
 use openshell_prover::{
     credentials::{Credential, CredentialSet},
     finding::{Finding, FindingPath},
@@ -74,9 +72,7 @@ use openshell_prover::{
 use openshell_providers::normalize_provider_type;
 use prost::Message;
 use sha2::{Digest, Sha256};
-#[cfg(not(target_os = "windows"))]
-use std::collections::HashSet;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -448,7 +444,6 @@ fn summarize_draft_chunk_rule(chunk: &DraftChunkRecord) -> Result<String, Status
 /// - `validation unavailable` — gateway-side infrastructure failure (registry
 ///   load, YAML serialize/parse). Internal error detail is logged via
 ///   `warn!`, never exposed to the reviewer.
-#[cfg(not(target_os = "windows"))]
 fn validation_result_for_agent_proposal(
     current_policy: ProtoSandboxPolicy,
     rule_name: &str,
@@ -503,33 +498,12 @@ fn validation_result_for_agent_proposal(
     out
 }
 
-#[cfg(target_os = "windows")]
-fn validation_result_for_agent_proposal(
-    current_policy: ProtoSandboxPolicy,
-    rule_name: &str,
-    proposed_rule: &NetworkPolicyRule,
-) -> String {
-    let merge_op = PolicyMergeOp::AddRule {
-        rule_name: rule_name.to_string(),
-        rule: proposed_rule.clone(),
-    };
-    let merged = match merge_policy(current_policy, &[merge_op]) {
-        Ok(result) => result.policy,
-        Err(error) => return format!("merge failed: {}", one_line(&error.to_string())),
-    };
-    if let Err(error) = validate_policy_safety(&merged) {
-        return format!("policy invalid: {}", one_line(&error.to_string()));
-    }
-    "validation unavailable".to_string()
-}
-
 /// Run the prover end-to-end against a single policy with the given
 /// credential set. Returns the raw finding list, or a short error string
 /// identifying which infrastructure step failed.
 ///
 /// The credential set is passed in because it's stable across all chunks in
 /// one `SubmitPolicyAnalysis` batch — the caller builds it once and shares.
-#[cfg(not(target_os = "windows"))]
 fn run_prover_findings(
     policy: &ProtoSandboxPolicy,
     credentials: &CredentialSet,
@@ -552,7 +526,6 @@ fn run_prover_findings(
 /// a `warn!` — the merged policy already excludes them at compose time, so
 /// silently treating them as absent here keeps the credential set consistent
 /// with the merged policy the prover validates against.
-#[cfg(not(target_os = "windows"))]
 async fn build_credential_set_for_sandbox_with_catalog(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
@@ -617,7 +590,6 @@ async fn build_credential_set_for_sandbox_with_catalog(
 /// the same security gap whether they live in rule `foo` or rule `bar`. This
 /// keeps the delta from spuriously surfacing baseline gaps just because the
 /// proposal added a new rule name that produces the same gap shape.
-#[cfg(not(target_os = "windows"))]
 fn finding_path_key(path: &FindingPath) -> String {
     let FindingPath::Exfil(p) = path;
     // Include the category and (for capability_expansion) the method so
@@ -639,7 +611,6 @@ fn finding_path_key(path: &FindingPath) -> String {
 /// are suppressed. A brand-new credentialed reach is described by the
 /// reach-expansion finding alone; we don't double-report by also
 /// flagging every method as a separate `capability_expansion`.
-#[cfg(not(target_os = "windows"))]
 fn finding_delta(base: &[Finding], merged: &[Finding]) -> Vec<Finding> {
     use openshell_prover::finding::category;
 
@@ -945,7 +916,6 @@ struct AutoApproveChunkContext<'a> {
     source: &'a str,
     resolved_from: &'a str,
     current_policy: &'a ProtoSandboxPolicy,
-    #[cfg(not(target_os = "windows"))]
     credential_set: &'a CredentialSet,
 }
 
@@ -984,18 +954,11 @@ async fn auto_approve_chunk(
     // stored rule instead of trusting the incoming proposal's verdict.
     let rule = decode_draft_chunk_rule(&chunk)?
         .ok_or_else(|| Status::failed_precondition("draft chunk has no proposed rule"))?;
-    #[cfg(not(target_os = "windows"))]
     let validation_result = validation_result_for_agent_proposal(
         context.current_policy.clone(),
         &chunk.rule_name,
         &rule,
         context.credential_set,
-    );
-    #[cfg(target_os = "windows")]
-    let validation_result = validation_result_for_agent_proposal(
-        context.current_policy.clone(),
-        &chunk.rule_name,
-        &rule,
     );
     if validation_result != "prover: no new findings" {
         info!(
@@ -1318,7 +1281,7 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
     }
 }
 
-#[cfg(all(test, not(target_os = "windows")))]
+#[cfg(test)]
 fn is_sandbox_caller<T>(request: &Request<T>) -> bool {
     matches!(
         request.extensions().get::<Principal>(),
@@ -2940,21 +2903,18 @@ pub(super) async fn handle_submit_policy_analysis(
     // it once. v1 captures presence only — no scope modeling — so the prover
     // can answer "is there a credential in scope for this host?" but not
     // "what action class does that credential authorize?"
-    #[cfg(not(target_os = "windows"))]
-    let credential_set = {
-        let provider_names_for_creds: Vec<String> = sandbox
-            .spec
-            .as_ref()
-            .map(|spec| spec.providers.clone())
-            .unwrap_or_default();
-        build_credential_set_for_sandbox_with_catalog(
-            state.store.as_ref(),
-            &provider_profile_catalog,
-            &workspace,
-            &provider_names_for_creds,
-        )
-        .await?
-    };
+    let provider_names_for_creds: Vec<String> = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.clone())
+        .unwrap_or_default();
+    let credential_set = build_credential_set_for_sandbox_with_catalog(
+        state.store.as_ref(),
+        &provider_profile_catalog,
+        &workspace,
+        &provider_names_for_creds,
+    )
+    .await?;
 
     let current_version = state
         .store
@@ -3018,18 +2978,11 @@ pub(super) async fn handle_submit_policy_analysis(
         // Source provenance (mechanistic vs agent_authored) is preserved in
         // OCSF audit fields, but the safety decision is grounded in the
         // merged-policy consequence, not the author — proposer-agnostic.
-        #[cfg(not(target_os = "windows"))]
         let validation_result = validation_result_for_agent_proposal(
             current_policy.clone(),
             &chunk.rule_name,
             rule_ref,
             &credential_set,
-        );
-        #[cfg(target_os = "windows")]
-        let validation_result = validation_result_for_agent_proposal(
-            current_policy.clone(),
-            &chunk.rule_name,
-            chunk.proposed_rule.as_ref().expect("checked above"),
         );
 
         let record = DraftChunkRecord {
@@ -3132,7 +3085,6 @@ pub(super) async fn handle_submit_policy_analysis(
                     source: &req.analysis_mode,
                     resolved_from,
                     current_policy: &current_policy,
-                    #[cfg(not(target_os = "windows"))]
                     credential_set: &credential_set,
                 },
             )
@@ -4945,7 +4897,7 @@ fn materialize_global_settings(
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(all(test, not(target_os = "windows")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::identity::{Identity, IdentityProvider};

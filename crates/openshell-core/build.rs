@@ -35,11 +35,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let proto_root = manifest_dir.join(PROTO_REL);
-    #[cfg(target_os = "windows")]
-    let proto_includes = proto_include_dirs(&proto_root)?;
-    #[cfg(not(target_os = "windows"))]
-    let proto_includes = vec![proto_root.clone()];
-
     let mut proto_files = Vec::new();
     collect_proto_files(&proto_root, &mut proto_files)?;
     proto_files.sort();
@@ -55,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Emit a binary FileDescriptorSet so the server can enumerate every
         // RPC at runtime (used by the per-handler auth exhaustiveness test).
         .file_descriptor_set_path(&descriptor_path)
-        .compile_protos(&proto_files, &proto_includes)?;
+        .compile_protos(&proto_files, &[proto_root])?;
 
     println!(
         "cargo:rustc-env=OPENSHELL_DESCRIPTOR_PATH={}",
@@ -63,13 +58,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn proto_include_dirs(proto_root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
-    let mut includes = vec![proto_root.to_path_buf()];
-    includes.push(protoc_bin_vendored::include_path()?);
-    Ok(includes)
 }
 
 fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {

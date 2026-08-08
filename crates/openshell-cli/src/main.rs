@@ -2146,7 +2146,7 @@ enum WorkspaceMemberCommands {
     },
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 fn main() -> Result<()> {
     std::thread::Builder::new()
         .name("openshell-main".to_string())
@@ -2157,11 +2157,13 @@ fn main() -> Result<()> {
         .map_err(|_| miette::miette!("OpenShell main thread panicked"))?
 }
 
-#[cfg(not(windows))]
-fn main() -> Result<()> {
-    run_main()
+#[cfg(not(target_os = "windows"))]
+#[tokio::main]
+async fn main() -> Result<()> {
+    run_async().await
 }
 
+#[cfg(target_os = "windows")]
 fn run_main() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

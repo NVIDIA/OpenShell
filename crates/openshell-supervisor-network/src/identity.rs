@@ -21,8 +21,10 @@ use tracing::debug;
 #[derive(Clone)]
 struct FileFingerprint {
     len: u64,
-    mtime: Option<(i64, i64)>,
-    ctime: Option<(i64, i64)>,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    ctime_sec: i64,
+    ctime_nsec: i64,
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
@@ -31,20 +33,12 @@ struct FileFingerprint {
 
 impl FileFingerprint {
     fn from_metadata(metadata: &Metadata) -> Self {
-        #[cfg(unix)]
-        let (mtime, ctime) = (
-            Some((metadata.mtime(), metadata.mtime_nsec())),
-            Some((metadata.ctime(), metadata.ctime_nsec())),
-        );
-        #[cfg(not(unix))]
-        let (mtime, ctime) = (
-            metadata.modified().ok().and_then(system_time_parts),
-            metadata.created().ok().and_then(system_time_parts),
-        );
         Self {
             len: metadata.len(),
-            mtime,
-            ctime,
+            mtime_sec: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime_sec: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
             #[cfg(unix)]
             dev: metadata.dev(),
             #[cfg(unix)]
@@ -53,22 +47,13 @@ impl FileFingerprint {
     }
 }
 
-#[cfg(not(unix))]
-fn system_time_parts(time: std::time::SystemTime) -> Option<(i64, i64)> {
-    let duration = time.duration_since(std::time::UNIX_EPOCH).ok()?;
-    let seconds = i64::try_from(duration.as_secs()).ok()?;
-    Some((seconds, i64::from(duration.subsec_nanos())))
-}
-
 impl PartialEq for FileFingerprint {
     fn eq(&self, other: &Self) -> bool {
         self.len == other.len
-            && self.mtime.is_some()
-            && other.mtime.is_some()
-            && self.mtime == other.mtime
-            && self.ctime.is_some()
-            && other.ctime.is_some()
-            && self.ctime == other.ctime
+            && self.mtime_sec == other.mtime_sec
+            && self.mtime_nsec == other.mtime_nsec
+            && self.ctime_sec == other.ctime_sec
+            && self.ctime_nsec == other.ctime_nsec
             && {
                 #[cfg(unix)]
                 {

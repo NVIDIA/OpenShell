@@ -6352,7 +6352,7 @@ mod tests {
     async fn sandbox_request_metadata_round_trips_for_resume() {
         let base = unique_temp_dir();
         let state_dir = base.join("sandboxes").join("sandbox-123");
-        fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             name: "resume-sandbox".to_string(),
@@ -6380,8 +6380,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt as _;
 
-            let dir_mode = fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777;
-            let file_mode = fs::metadata(state_dir.join(SANDBOX_REQUEST_FILE))
+            let dir_mode = std::fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777;
+            let file_mode = std::fs::metadata(state_dir.join(SANDBOX_REQUEST_FILE))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -6392,17 +6392,17 @@ mod tests {
         validate_restored_sandbox_state(&base, &state_dir, &restored)
             .expect("restored state should validate");
 
-        let _ = fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
     fn prepare_sandbox_overlay_preserves_existing_overlay_on_resume() {
         let base = unique_temp_dir();
-        fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
         let template = base.join("template.ext4");
         let overlay = base.join("overlay.ext4");
-        fs::write(&template, b"fresh-overlay").unwrap();
-        fs::write(&overlay, b"saved-overlay").unwrap();
+        std::fs::write(&template, b"fresh-overlay").unwrap();
+        std::fs::write(&overlay, b"saved-overlay").unwrap();
 
         prepare_sandbox_overlay_image(
             &template,
@@ -6414,18 +6414,18 @@ mod tests {
         )
         .expect("preserve existing overlay");
 
-        assert_eq!(fs::read(&overlay).unwrap(), b"saved-overlay");
+        assert_eq!(std::fs::read(&overlay).unwrap(), b"saved-overlay");
 
-        let _ = fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
     fn prepare_sandbox_overlay_creates_missing_overlay_on_resume() {
         let base = unique_temp_dir();
-        fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
         let template = base.join("template.ext4");
         let overlay = base.join("overlay.ext4");
-        fs::write(&template, b"fresh-overlay").unwrap();
+        std::fs::write(&template, b"fresh-overlay").unwrap();
 
         prepare_sandbox_overlay_image(
             &template,
@@ -6437,9 +6437,9 @@ mod tests {
         )
         .expect("create missing overlay");
 
-        assert_eq!(fs::read(&overlay).unwrap(), b"fresh-overlay");
+        assert_eq!(std::fs::read(&overlay).unwrap(), b"fresh-overlay");
 
-        let _ = fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -7021,8 +7021,8 @@ mod tests {
         };
 
         let state_file = sandbox_state_dir(&driver_state, "sandbox-123").unwrap();
-        fs::create_dir_all(state_file.parent().unwrap()).unwrap();
-        fs::write(&state_file, "not a directory").unwrap();
+        std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        std::fs::write(&state_file, "not a directory").unwrap();
 
         insert_test_record(
             &driver,
@@ -7039,9 +7039,9 @@ mod tests {
         assert!(err.message().contains("not a directory"));
         assert!(driver.registry.lock().await.contains_key("sandbox-123"));
 
-        fs::remove_file(&state_file).unwrap();
+        std::fs::remove_file(&state_file).unwrap();
         let retry_state_dir = sandbox_state_dir(&driver_state, "sandbox-123").unwrap();
-        fs::create_dir_all(&retry_state_dir).unwrap();
+        std::fs::create_dir_all(&retry_state_dir).unwrap();
         {
             let mut registry = driver.registry.lock().await;
             let record = registry.get_mut("sandbox-123").unwrap();
@@ -7059,7 +7059,7 @@ mod tests {
         assert!(response.deleted);
         assert!(!driver.registry.lock().await.contains_key("sandbox-123"));
 
-        let _ = fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
@@ -7085,7 +7085,7 @@ mod tests {
         };
 
         let state_dir = sandbox_state_dir(&driver_state, "sandbox-123").unwrap();
-        fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
         {
             let mut registry = driver.registry.lock().await;
             registry.insert(
@@ -7114,7 +7114,7 @@ mod tests {
         assert!(!driver.registry.lock().await.contains_key("sandbox-123"));
         assert!(!state_dir.exists());
 
-        let _ = fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
@@ -7141,8 +7141,8 @@ mod tests {
         };
 
         let state_dir = sandbox_state_dir(&driver_state, "sandbox-123").unwrap();
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(state_dir.join("overlay.ext4"), b"live overlay").unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("overlay.ext4"), b"live overlay").unwrap();
         {
             let mut registry = driver.registry.lock().await;
             registry.insert(
@@ -7177,7 +7177,7 @@ mod tests {
         assert!(state_dir.join("overlay.ext4").exists());
         assert!(driver.registry.lock().await.contains_key("sandbox-123"));
 
-        let _ = fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
@@ -7185,14 +7185,14 @@ mod tests {
         let base = unique_temp_dir();
         let state_root = base.join("driver-state");
         let outside = base.join("outside");
-        fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
 
         let err = remove_sandbox_state_dir(&state_root, &outside)
             .await
             .expect_err("outside state paths should be rejected");
         assert!(err.message().contains("outside vm state root"));
 
-        let _ = fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[cfg(unix)]
@@ -7202,8 +7202,8 @@ mod tests {
         let state_root = base.join("driver-state");
         let target = base.join("target");
         let state_dir = sandbox_state_dir(&state_root, "sandbox-123").unwrap();
-        fs::create_dir_all(&target).unwrap();
-        fs::create_dir_all(state_dir.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(state_dir.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&target, &state_dir).unwrap();
 
         let err = remove_sandbox_state_dir(&state_root, &state_dir)
@@ -7211,7 +7211,7 @@ mod tests {
             .expect_err("symlinked state dir should be rejected");
         assert!(err.message().contains("symlinked sandbox state dir"));
 
-        let _ = fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -7311,7 +7311,7 @@ mod tests {
             "blob"
         );
 
-        let _ = fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -7377,7 +7377,7 @@ mod tests {
 
         assert!(err.contains("ca.crt"));
 
-        let _ = fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[cfg(unix)]
@@ -7419,7 +7419,7 @@ mod tests {
             0o600
         );
 
-        let _ = fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -7673,13 +7673,13 @@ mod tests {
         assert!(err.message().contains("external kernel images"));
 
         let base = unique_temp_dir();
-        fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
         let kernel = base.join("vmlinux");
-        fs::write(&kernel, b"kernel").unwrap();
+        std::fs::write(&kernel, b"kernel").unwrap();
         plan.backend = VmBackend::Qemu;
         plan.kernel_image = Some(kernel);
         VmDriver::validate_launch_plan_backend(true, &plan).expect("existing kernel is accepted");
-        let _ = fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

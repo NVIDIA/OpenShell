@@ -589,7 +589,7 @@ function Assert-GatewayExcludesUnsupportedDriverCrates([string] $RustTarget) {
     $logPath = Join-Path $LogDir $logName
     $unexpected = @(Select-String `
         -Path $logPath `
-        -Pattern '^openshell-driver-(docker|kubernetes|podman)\s')
+        -Pattern '^openshell-driver-(docker|kubernetes|podman|vm)\s')
     if ($unexpected.Count -gt 0) {
         $packages = ($unexpected.Line | Sort-Object -Unique) -join ", "
         throw "Unsupported driver crates entered the Windows gateway dependency graph: $packages"
