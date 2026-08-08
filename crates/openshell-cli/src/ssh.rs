@@ -2300,7 +2300,9 @@ mod tests {
     #[derive(Debug)]
     struct UploadArchiveEntry {
         path: String,
+        #[cfg_attr(not(unix), allow(dead_code))]
         entry_type: tar::EntryType,
+        #[cfg_attr(not(unix), allow(dead_code))]
         link_name: Option<String>,
     }
 

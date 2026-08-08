@@ -16,7 +16,7 @@ experimental = true
 python.precompiled_flavor = "install_only_stripped"
 
 lockfile = true
-lockfile_platforms = ["linux-x64", "linux-arm64", "macos-arm64"]
+lockfile_platforms = ["linux-x64", "linux-arm64", "macos-arm64", "windows-x64"]
 
 [tools]
 python = "3.14.5"
@@ -33,7 +33,7 @@ go = "1.26"
 buf = "1.72.0"
 helm = "4.2.0"
 helm-docs = "1.14.2"
-skaffold = "2.20.0"
+skaffold = { version = "2.20.0", os = ["linux", "macos"] }
 # Keep k3d out of Linux CI images until upstream ships a release rebuilt with
 # patched Go/container dependencies. Linux Kubernetes E2E uses kind or an
 # externally provided cluster context.

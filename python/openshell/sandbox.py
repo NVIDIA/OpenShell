@@ -1531,7 +1531,17 @@ class _OidcRefresher:
                 f.write(payload)
             with contextlib.suppress(OSError):
                 tmp_path.chmod(0o600)
-            tmp_path.replace(path)
+            for attempt in range(20):
+                try:
+                    tmp_path.replace(path)
+                    break
+                except PermissionError:
+                    # Concurrent MoveFileExW calls can briefly lock the
+                    # destination on Windows. Retry that transient sharing
+                    # violation while preserving POSIX rename behavior.
+                    if os.name != "nt" or attempt == 19:
+                        raise
+                    time.sleep(0.01)
         except BaseException:
             # Clean up our tmp on failure so we don't leave orphaned
             # `.oidc_token.<rand>.tmp` files lying around. The replace

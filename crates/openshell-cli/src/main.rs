@@ -2146,9 +2146,34 @@ enum WorkspaceMemberCommands {
     },
 }
 
+#[cfg(target_os = "windows")]
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("openshell-main".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_main)
+        .map_err(|err| miette::miette!("failed to start OpenShell main thread: {err}"))?
+        .join()
+        .map_err(|_| miette::miette!("OpenShell main thread panicked"))?
+}
+
+#[cfg(not(target_os = "windows"))]
 #[tokio::main]
-#[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; OK at top level.
 async fn main() -> Result<()> {
+    run_async().await
+}
+
+#[cfg(target_os = "windows")]
+fn run_main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| miette::miette!("failed to build Tokio runtime: {err}"))?
+        .block_on(run_async())
+}
+
+#[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; run on an expanded Windows stack.
+async fn run_async() -> Result<()> {
     // Install the rustls crypto provider before completion runs — completers may
     // establish TLS connections to the gateway.
     rustls::crypto::ring::default_provider()

@@ -391,12 +391,6 @@ fn current_uid() -> u32 {
 }
 
 #[cfg(not(unix))]
-fn is_unix_socket(path: &Path) -> bool {
-    let _ = path;
-    false
-}
-
-#[cfg(not(unix))]
 fn podman_socket_responds(path: &Path) -> bool {
     let _ = path;
     false
@@ -1044,16 +1038,16 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::is_reachable_unix_socket;
     use super::{
         ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
         GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
         GatewayProviderProfileSourceConfig, PolicyValidationFailureMode,
         detect_docker_socket_from_candidates, detect_driver, detect_podman_socket_from_candidates,
-        docker_host_unix_socket_path, docker_socket_responds, is_unix_socket,
-        normalize_compute_driver_name, podman_socket_candidates_from_env, podman_socket_responds,
+        docker_host_unix_socket_path, docker_socket_responds, normalize_compute_driver_name,
+        podman_socket_candidates_from_env, podman_socket_responds,
     };
+    #[cfg(unix)]
+    use super::{is_reachable_unix_socket, is_unix_socket};
     #[cfg(unix)]
     use std::io::{Read as _, Write as _};
     use std::net::SocketAddr;

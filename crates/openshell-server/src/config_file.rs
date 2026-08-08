@@ -277,6 +277,7 @@ pub enum ConfigFileError {
 ///
 /// Returns `Ok(ConfigFile::default())` for an empty file (the gateway then
 /// falls back entirely to CLI/env/built-in defaults).
+#[cfg_attr(target_os = "windows", allow(clippy::result_large_err))]
 pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
     let contents = std::fs::read_to_string(path).map_err(|source| ConfigFileError::Io {
         path: path.to_path_buf(),
