@@ -2751,7 +2751,7 @@ fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
             ));
         }
         return millicores.checked_mul(1_000_000).map(Some).ok_or_else(|| {
-            Status::failed_precondition(format!("docker cpu_limit '{value}' is too large",))
+            Status::failed_precondition(format!("docker cpu_limit '{value}' is too large"))
         });
     }
 
