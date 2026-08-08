@@ -7,8 +7,8 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse,
+    AgentConversationEvaluation, AgentConversationResult, HttpRequestEvaluation, HttpRequestResult,
+    MiddlewareManifest, ValidateConfigRequest, ValidateConfigResponse,
 };
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Request, Response, Status};
@@ -90,5 +90,13 @@ impl SupervisorMiddleware for RemoteMiddlewareService {
     ) -> std::result::Result<Response<HttpRequestResult>, Status> {
         let mut client = self.client.clone();
         client.evaluate_http_request(request).await
+    }
+
+    async fn evaluate_agent_conversation(
+        &self,
+        request: Request<AgentConversationEvaluation>,
+    ) -> std::result::Result<Response<AgentConversationResult>, Status> {
+        let mut client = self.client.clone();
+        client.evaluate_agent_conversation(request).await
     }
 }

@@ -18,7 +18,8 @@ use prost::Message;
 
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestTarget,
+    AgentConversationEvaluation, AgentConversationResult, AgentConversationTarget, Decision,
+    Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestTarget,
     MiddlewareBinding, MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
     ValidateConfigRequest,
@@ -55,6 +56,8 @@ pub const MAX_MIDDLEWARE_FINDING_BYTES: usize = 4 * 1024;
 pub const MAX_MIDDLEWARE_METADATA_ENTRIES: usize = 64;
 /// Largest combined metadata key/value payload accepted from one middleware stage.
 pub const MAX_MIDDLEWARE_METADATA_BYTES: usize = 32 * 1024;
+/// Largest opaque agent attestation accepted from one middleware result.
+pub const MAX_AGENT_ATTESTATION_BYTES: usize = 8 * 1024;
 
 const MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES: usize = 64 * 1024;
 const MAX_MIDDLEWARE_PROTOBUF_OVERHEAD_BYTES: usize = 64 * 1024;
@@ -83,6 +86,9 @@ pub const MIDDLEWARE_GRPC_MESSAGE_BYTES: usize =
 const HTTP_REQUEST_OPERATION: SupervisorMiddlewareOperation =
     SupervisorMiddlewareOperation::HttpRequest;
 const PRE_CREDENTIALS_PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::PreCredentials;
+const AGENT_CONVERSATION_OPERATION: SupervisorMiddlewareOperation =
+    SupervisorMiddlewareOperation::AgentConversation;
+const AGENT_CONTEXT_PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::AgentContext;
 const MAX_STABLE_IDENTIFIER_BYTES: usize = 128;
 const EXTERNAL_FINDING_LABEL: &str = "External middleware finding";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -501,17 +507,42 @@ fn validate_manifest_bindings(
 
     let mut described_pairs = HashSet::with_capacity(manifest.bindings.len());
     for binding in &manifest.bindings {
-        if binding.operation != HTTP_REQUEST_OPERATION as i32
-            || binding.phase != PRE_CREDENTIALS_PHASE as i32
+        let is_http = binding.operation == HTTP_REQUEST_OPERATION as i32
+            && binding.phase == PRE_CREDENTIALS_PHASE as i32;
+        let is_agent = binding.operation == AGENT_CONVERSATION_OPERATION as i32
+            && binding.phase == AGENT_CONTEXT_PHASE as i32;
+        if !is_http && !is_agent {
+            return Err(miette!("{source} describes an unsupported operation/phase"));
+        }
+        if is_http
+            && (!binding.harness.is_empty()
+                || !binding.hook.is_empty()
+                || !binding.schema_version.is_empty())
         {
             return Err(miette!(
-                "{source} must support HTTP_REQUEST/PRE_CREDENTIALS"
+                "{source} HTTP_REQUEST binding cannot declare agent hook fields"
             ));
         }
-        if !described_pairs.insert((binding.operation, binding.phase)) {
+        if is_agent
+            && (binding.harness != "pi"
+                || !matches!(
+                    binding.hook.as_str(),
+                    "input" | "before_agent_start" | "message_end" | "context"
+                )
+                || binding.schema_version != "v1")
+        {
             return Err(miette!(
-                "{source} describes more than one binding for HTTP_REQUEST/PRE_CREDENTIALS"
+                "{source} describes an unsupported Pi agent hook binding"
             ));
+        }
+        if !described_pairs.insert((
+            binding.operation,
+            binding.phase,
+            binding.harness.as_str(),
+            binding.hook.as_str(),
+            binding.schema_version.as_str(),
+        )) {
+            return Err(miette!("{source} describes a duplicate middleware binding"));
         }
         let advertised = validate_body_limit(source, binding)?;
         if !binding.timeout.trim().is_empty() {
@@ -910,6 +941,177 @@ impl ChainRunner {
             binding.operation == HTTP_REQUEST_OPERATION as i32
                 && binding.phase == PRE_CREDENTIALS_PHASE as i32
         })
+    }
+
+    fn agent_context_binding<'a>(
+        manifest: &'a MiddlewareManifest,
+        target: &AgentConversationTarget,
+    ) -> Option<&'a MiddlewareBinding> {
+        manifest.bindings.iter().find(|binding| {
+            binding.operation == AGENT_CONVERSATION_OPERATION as i32
+                && binding.phase == AGENT_CONTEXT_PHASE as i32
+                && binding.harness == target.harness
+                && binding.hook == target.hook
+                && binding.schema_version == target.schema_version
+        })
+    }
+
+    /// Return attachment names that advertise every requested agent hook for
+    /// one harness/schema pair. Supervisors use this to discover hook bridges
+    /// from the validated registry instead of accepting workload environment
+    /// variables that name privileged middleware.
+    pub async fn agent_conversation_middleware_names(
+        &self,
+        harness: &str,
+        schema_version: &str,
+        hooks: &[&str],
+    ) -> Result<Vec<String>> {
+        let manifests = self.manifests().await?;
+        Ok(manifests
+            .iter()
+            .filter(|(_, manifest)| {
+                hooks.iter().all(|hook| {
+                    manifest.bindings.iter().any(|binding| {
+                        binding.operation == AGENT_CONVERSATION_OPERATION as i32
+                            && binding.phase == AGENT_CONTEXT_PHASE as i32
+                            && binding.harness == harness
+                            && binding.hook == *hook
+                            && binding.schema_version == schema_version
+                    })
+                })
+            })
+            .map(|(state, manifest)| Self::attachment_name(state, manifest).to_string())
+            .collect())
+    }
+
+    /// Evaluate one complete Pi conversation through the named registered
+    /// middleware. The caller supplies supervisor-stamped identity and target
+    /// fields; failures are returned so the local bridge can fail closed.
+    pub async fn evaluate_agent_conversation(
+        &self,
+        mut evaluation: AgentConversationEvaluation,
+    ) -> Result<AgentConversationResult> {
+        let middleware_name = evaluation.middleware_name.clone();
+        if middleware_name.is_empty() {
+            return Err(miette!(
+                "agent conversation middleware name cannot be empty"
+            ));
+        }
+        let target = evaluation
+            .target
+            .as_ref()
+            .ok_or_else(|| miette!("agent conversation target is required"))?;
+        let manifests = self.manifests().await?;
+        let Some((state, binding)) = manifests.iter().find_map(|(state, manifest)| {
+            (Self::attachment_name(state, manifest) == middleware_name)
+                .then(|| Self::agent_context_binding(manifest, target))
+                .flatten()
+                .map(|binding| (state, binding))
+        }) else {
+            return Err(miette!(
+                "middleware '{middleware_name}' has no matching agent hook binding"
+            ));
+        };
+        if evaluation.phase != AGENT_CONTEXT_PHASE as i32 {
+            return Err(miette!("agent conversation phase must be AGENT_CONTEXT"));
+        }
+        if target.harness != binding.harness
+            || target.hook != binding.hook
+            || target.schema_version != binding.schema_version
+        {
+            return Err(miette!("agent conversation target does not match binding"));
+        }
+        if evaluation
+            .context
+            .as_ref()
+            .is_none_or(|context| context.sandbox_id.is_empty())
+        {
+            return Err(miette!("trusted sandbox context is required"));
+        }
+        let conversation = evaluation
+            .conversation
+            .as_ref()
+            .ok_or_else(|| miette!("agent conversation payload is required"))?;
+        let max_body_bytes = validate_body_limit("agent conversation binding", binding)?;
+        if conversation.encoded_len() > max_body_bytes {
+            return Err(miette!(
+                "agent conversation payload exceeds binding capacity"
+            ));
+        }
+        if evaluation
+            .config
+            .as_ref()
+            .is_some_and(|config| config.encoded_len() > MAX_MIDDLEWARE_CONFIG_BYTES)
+        {
+            return Err(miette!(
+                "agent conversation config exceeds platform capacity"
+            ));
+        }
+        evaluation.middleware_name = middleware_name.clone();
+        let mut result = call_with_timeout(
+            state.timeout_for_binding(binding)?,
+            "EvaluateAgentConversation",
+            state
+                .service
+                .evaluate_agent_conversation(Request::new(evaluation)),
+        )
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|error| {
+            miette!(
+                "middleware EvaluateAgentConversation failed: {}",
+                safe_reason(&error.to_string())
+            )
+        })?;
+        let decision = Decision::try_from(result.decision).unwrap_or(Decision::Unspecified);
+        if decision == Decision::Unspecified {
+            return Err(miette!(
+                "agent conversation response has unspecified decision"
+            ));
+        }
+        if result.reason_code.len() > MAX_MIDDLEWARE_REASON_CODE_BYTES
+            || (!result.reason_code.is_empty() && !is_stable_reason_code(&result.reason_code))
+        {
+            return Err(miette!(
+                "agent conversation response reason code is invalid"
+            ));
+        }
+        if result.attestation.len() > MAX_AGENT_ATTESTATION_BYTES {
+            return Err(miette!(
+                "agent conversation attestation exceeds platform capacity"
+            ));
+        }
+        if decision == Decision::Allow {
+            if !result.has_conversation || result.conversation.is_none() {
+                return Err(miette!(
+                    "allowed agent response must replace the conversation"
+                ));
+            }
+            if result.attestation.is_empty() {
+                return Err(miette!(
+                    "allowed agent response must include an attestation"
+                ));
+            }
+            if result
+                .conversation
+                .as_ref()
+                .is_some_and(|conversation| conversation.encoded_len() > max_body_bytes)
+            {
+                return Err(miette!(
+                    "agent replacement conversation exceeds binding capacity"
+                ));
+            }
+        }
+        if state.diagnostic_policy == MiddlewareDiagnosticPolicy::Normalize {
+            result.reason.clear();
+            result.metadata.clear();
+            for finding in &mut result.findings {
+                finding.r#type = format!("{middleware_name}.finding");
+                finding.label = EXTERNAL_FINDING_LABEL.into();
+                finding.confidence.clear();
+            }
+        }
+        Ok(result)
     }
 
     pub async fn describe_chain(&self, entries: &[ChainEntry]) -> Result<Vec<DescribedChainEntry>> {
@@ -1688,6 +1890,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: self.max_body_bytes,
                     timeout: String::new(),
+                    ..Default::default()
                 }],
             }))
         }
@@ -1716,6 +1919,15 @@ mod tests {
         > {
             Ok(tonic::Response::new(self.result.clone()))
         }
+
+        async fn evaluate_agent_conversation(
+            &self,
+            _request: Request<AgentConversationEvaluation>,
+        ) -> std::result::Result<tonic::Response<AgentConversationResult>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "test service has no agent conversation binding",
+            ))
+        }
     }
 
     struct SlowService {
@@ -1737,6 +1949,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: 4096,
                     timeout: self.binding_timeout.clone(),
+                    ..Default::default()
                 }],
             }))
         }
@@ -1767,6 +1980,15 @@ mod tests {
             tokio::time::sleep(self.delay).await;
             Ok(tonic::Response::new(allow_result()))
         }
+
+        async fn evaluate_agent_conversation(
+            &self,
+            _request: Request<AgentConversationEvaluation>,
+        ) -> std::result::Result<tonic::Response<AgentConversationResult>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "test service has no agent conversation binding",
+            ))
+        }
     }
 
     /// A middleware attached twice for exercising per-stage validation. The
@@ -1790,6 +2012,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: 256 * 1024,
                     timeout: String::new(),
+                    ..Default::default()
                 }],
             }))
         }
@@ -1833,6 +2056,15 @@ mod tests {
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
             Ok(tonic::Response::new(result))
+        }
+
+        async fn evaluate_agent_conversation(
+            &self,
+            _request: Request<AgentConversationEvaluation>,
+        ) -> std::result::Result<tonic::Response<AgentConversationResult>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "test service has no agent conversation binding",
+            ))
         }
     }
 
@@ -2054,6 +2286,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: 4096,
                     timeout: String::new(),
+                    ..Default::default()
                 }],
             }))
         }
@@ -2090,6 +2323,15 @@ mod tests {
                 .push(request.into_inner());
             Ok(tonic::Response::new(allow_result()))
         }
+
+        async fn evaluate_agent_conversation(
+            &self,
+            _request: Request<AgentConversationEvaluation>,
+        ) -> std::result::Result<tonic::Response<AgentConversationResult>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "test service has no agent conversation binding",
+            ))
+        }
     }
 
     /// Three-stage service used to verify that each stage observes the header
@@ -2113,6 +2355,7 @@ mod tests {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: 4096,
                     timeout: String::new(),
+                    ..Default::default()
                 }],
             }))
         }
@@ -2161,6 +2404,15 @@ mod tests {
                 ));
             }
             Ok(tonic::Response::new(result))
+        }
+
+        async fn evaluate_agent_conversation(
+            &self,
+            _request: Request<AgentConversationEvaluation>,
+        ) -> std::result::Result<tonic::Response<AgentConversationResult>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "test service has no agent conversation binding",
+            ))
         }
     }
 
@@ -2528,6 +2780,7 @@ mod tests {
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_body_bytes: 4096,
                 timeout: String::new(),
+                ..Default::default()
             }],
         };
         let error = validate_external_manifest(&registration, &manifest, 4097)
@@ -2554,6 +2807,7 @@ mod tests {
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_body_bytes: u64::MAX,
                 timeout: String::new(),
+                ..Default::default()
             }],
         };
         let error = validate_external_manifest(&registration, &manifest, 4096)
@@ -2569,6 +2823,7 @@ mod tests {
             phase: PRE_CREDENTIALS_PHASE as i32,
             max_body_bytes: 4096,
             timeout: String::new(),
+            ..Default::default()
         };
         let manifest = MiddlewareManifest {
             name: "example/service".into(),
@@ -2578,11 +2833,7 @@ mod tests {
 
         let error = validate_external_manifest(&registration, &manifest, 4096)
             .expect_err("one service cannot advertise two bindings for the same pair");
-        assert!(
-            error
-                .to_string()
-                .contains("more than one binding for HTTP_REQUEST/PRE_CREDENTIALS")
-        );
+        assert!(error.to_string().contains("duplicate middleware binding"));
     }
 
     #[test]
@@ -2650,6 +2901,7 @@ mod tests {
                     phase: PRE_CREDENTIALS_PHASE as i32,
                     max_body_bytes: 4096,
                     timeout: timeout.into(),
+                    ..Default::default()
                 }],
             };
             let error = validate_external_manifest(&registration, &manifest, 4096)

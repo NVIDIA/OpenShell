@@ -208,7 +208,15 @@ build_component_for_arch() {
     if [[ -n "${OPENSHELL_CARGO_VERSION:-}" ]]; then
       export GIT_DIR=/nonexistent
     fi
-    CARGO_INCREMENTAL=0 mise x -- "${cargo_subcommand[@]}" "${args[@]}"
+    if [[ "${cargo_subcommand[*]}" == "cargo zigbuild" ]]; then
+      # mise.toml sets RUSTC_WRAPPER=sccache, so unset it inside `mise x` after
+      # mise has loaded the project environment. sccache cannot reliably wrap
+      # cargo-zigbuild's generated C compiler wrappers (used by crates such as
+      # aws-lc-sys), which otherwise makes the cross-compile fail before rustc.
+      CARGO_INCREMENTAL=0 mise x -- env -u RUSTC_WRAPPER "${cargo_subcommand[@]}" "${args[@]}"
+    else
+      CARGO_INCREMENTAL=0 mise x -- "${cargo_subcommand[@]}" "${args[@]}"
+    fi
   )
 
   binary_path="${ROOT}/target/${target}/release/${binary}"
