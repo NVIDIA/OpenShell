@@ -277,6 +277,22 @@ cleanup() {
       --ignore-not-found >/dev/null 2>&1 || true
   fi
 
+  # Sweep managed-mode and operator-mode workspace namespaces before
+  # uninstalling the Helm release (ClusterRole still needed for deletion).
+  if command -v kubectl >/dev/null 2>&1 && [ -n "${KUBE_CONTEXT}" ]; then
+    for label in "openshell.ai/managed-by=openshell" \
+                 "openshell.ai/e2e-operator-workspace=true"; do
+      ns_list="$(kctl get namespaces -l "${label}" -o name 2>/dev/null || true)"
+      if [ -n "${ns_list}" ]; then
+        echo "Cleaning up namespaces with label ${label}..."
+        echo "${ns_list}" | while read -r ns_ref; do
+          kctl delete "${ns_ref}" --wait=false --ignore-not-found \
+            2>/dev/null || true
+        done
+      fi
+    done
+  fi
+
   if [ "${HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
     if command -v helm >/dev/null 2>&1; then
       helmctl uninstall "${RELEASE_NAME}" --namespace "${NAMESPACE}" --wait \
