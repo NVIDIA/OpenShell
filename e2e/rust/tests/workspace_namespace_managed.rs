@@ -163,20 +163,9 @@ async fn managed_creates_namespace_with_labels() {
     assert!(ok, "ServiceAccount openshell-sandbox should exist in {ns}");
 
     // Verify sandbox CR is in the managed namespace (not the gateway namespace).
-    let (ok, out) = kubectl(&[
-        "get",
-        "sandbox.agents.x-k8s.io",
-        "-n",
-        &ns,
-        "-o",
-        "name",
-    ])
-    .await;
+    let (ok, out) = kubectl(&["get", "sandbox.agents.x-k8s.io", "-n", &ns, "-o", "name"]).await;
     assert!(ok, "sandbox CR should exist in namespace {ns}: {out}");
-    assert!(
-        out.contains("mgd-sb"),
-        "sandbox CR name mismatch: {out}"
-    );
+    assert!(out.contains("mgd-sb"), "sandbox CR name mismatch: {out}");
 }
 
 #[tokio::test]
@@ -193,13 +182,29 @@ async fn managed_namespace_survives_with_remaining_sandboxes() {
 
     // Create two sandboxes.
     let (ok, out) = run_cli(&[
-        "sandbox", "create", "--workspace", &ws, "--name", "sb-a", "--", "echo", "a",
+        "sandbox",
+        "create",
+        "--workspace",
+        &ws,
+        "--name",
+        "sb-a",
+        "--",
+        "echo",
+        "a",
     ])
     .await;
     assert!(ok, "sandbox sb-a create failed: {out}");
 
     let (ok, out) = run_cli(&[
-        "sandbox", "create", "--workspace", &ws, "--name", "sb-b", "--", "echo", "b",
+        "sandbox",
+        "create",
+        "--workspace",
+        &ws,
+        "--name",
+        "sb-b",
+        "--",
+        "echo",
+        "b",
     ])
     .await;
     assert!(ok, "sandbox sb-b create failed: {out}");
@@ -215,15 +220,7 @@ async fn managed_namespace_survives_with_remaining_sandboxes() {
     assert!(ok, "managed namespace {ns} should still exist with sb-b");
 
     // Verify sb-b's CR is still in the managed namespace.
-    let (ok, out) = kubectl(&[
-        "get",
-        "sandbox.agents.x-k8s.io",
-        "-n",
-        &ns,
-        "-o",
-        "name",
-    ])
-    .await;
+    let (ok, out) = kubectl(&["get", "sandbox.agents.x-k8s.io", "-n", &ns, "-o", "name"]).await;
     assert!(ok, "sandbox CRs should still exist in {ns}: {out}");
     assert!(
         out.contains("sb-b"),
@@ -253,13 +250,29 @@ async fn managed_isolates_workspaces_into_separate_namespaces() {
     assert!(ok, "workspace B create failed: {out}");
 
     let (ok, out) = run_cli(&[
-        "sandbox", "create", "--workspace", &ws_a, "--name", "sb-iso-a", "--", "echo", "a",
+        "sandbox",
+        "create",
+        "--workspace",
+        &ws_a,
+        "--name",
+        "sb-iso-a",
+        "--",
+        "echo",
+        "a",
     ])
     .await;
     assert!(ok, "sandbox A create failed: {out}");
 
     let (ok, out) = run_cli(&[
-        "sandbox", "create", "--workspace", &ws_b, "--name", "sb-iso-b", "--", "echo", "b",
+        "sandbox",
+        "create",
+        "--workspace",
+        &ws_b,
+        "--name",
+        "sb-iso-b",
+        "--",
+        "echo",
+        "b",
     ])
     .await;
     assert!(ok, "sandbox B create failed: {out}");
@@ -273,29 +286,19 @@ async fn managed_isolates_workspaces_into_separate_namespaces() {
     assert!(ok, "namespace {ns_b} should exist");
 
     // Verify sandbox CRs are in the correct namespaces (no cross-contamination).
-    let (ok, out) = kubectl(&[
-        "get",
-        "sandbox.agents.x-k8s.io",
-        "-n",
-        &ns_a,
-        "-o",
-        "name",
-    ])
-    .await;
+    let (ok, out) = kubectl(&["get", "sandbox.agents.x-k8s.io", "-n", &ns_a, "-o", "name"]).await;
     assert!(ok, "failed to list CRs in {ns_a}: {out}");
     assert!(out.contains("sb-iso-a"), "sb-iso-a should be in {ns_a}");
-    assert!(!out.contains("sb-iso-b"), "sb-iso-b should NOT be in {ns_a}");
+    assert!(
+        !out.contains("sb-iso-b"),
+        "sb-iso-b should NOT be in {ns_a}"
+    );
 
-    let (ok, out) = kubectl(&[
-        "get",
-        "sandbox.agents.x-k8s.io",
-        "-n",
-        &ns_b,
-        "-o",
-        "name",
-    ])
-    .await;
+    let (ok, out) = kubectl(&["get", "sandbox.agents.x-k8s.io", "-n", &ns_b, "-o", "name"]).await;
     assert!(ok, "failed to list CRs in {ns_b}: {out}");
     assert!(out.contains("sb-iso-b"), "sb-iso-b should be in {ns_b}");
-    assert!(!out.contains("sb-iso-a"), "sb-iso-a should NOT be in {ns_b}");
+    assert!(
+        !out.contains("sb-iso-a"),
+        "sb-iso-a should NOT be in {ns_b}"
+    );
 }

@@ -53,6 +53,7 @@ use openshell_driver_docker::DockerComputeDriver;
 #[cfg(not(target_os = "windows"))]
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
+    OperatorNamespaceAllowlist,
 };
 #[cfg(not(target_os = "windows"))]
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
@@ -775,12 +776,21 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
-    ) -> Result<Self, ComputeError> {
+    ) -> Result<
+        (
+            Self,
+            Option<Arc<std::sync::RwLock<std::collections::BTreeSet<String>>>>,
+        ),
+        ComputeError,
+    > {
         let driver = KubernetesComputeDriver::new(config)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
+        let operator_allowlist_arc = driver
+            .operator_allowlist()
+            .map(OperatorNamespaceAllowlist::shared);
         let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new(driver));
-        Self::from_driver(
+        let runtime = Self::from_driver(
             ComputeDriverKind::Kubernetes.as_str().to_string(),
             driver,
             None,
@@ -792,7 +802,8 @@ impl ComputeRuntime {
             tracing_log_bus,
             supervisor_sessions,
         )
-        .await
+        .await?;
+        Ok((runtime, operator_allowlist_arc))
     }
 
     pub(crate) async fn new_remote_driver(

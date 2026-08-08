@@ -349,7 +349,7 @@ pub(crate) async fn run_server(
         gateway_tls_enabled: config.tls.is_some(),
         endpoint_overrides: &config.compute_driver_endpoints,
     };
-    let compute = build_compute_runtime(
+    let (compute, operator_allowlist) = build_compute_runtime(
         &config,
         driver_startup,
         store.clone(),
@@ -471,12 +471,12 @@ pub(crate) async fn run_server(
                 )
             }
             openshell_driver_kubernetes::WorkspaceMode::Operator => {
-                // The operator allowlist is populated at runtime by the label
-                // watcher and file watcher. An empty initial set is fail-closed
-                // until the watcher populates it.
-                auth::k8s_sa::NamespaceValidator::Allowlist(Arc::new(std::sync::RwLock::new(
-                    std::collections::BTreeSet::new(),
-                )))
+                // Share the driver's allowlist Arc so the SA authenticator and
+                // the driver's namespace label watcher use the same set.
+                let allowlist = operator_allowlist.clone().unwrap_or_else(|| {
+                    Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new()))
+                });
+                auth::k8s_sa::NamespaceValidator::Allowlist(allowlist)
             }
         };
         match kube::Client::try_default().await {
@@ -874,6 +874,8 @@ fn unsupported_builtin_compute_driver(driver: ComputeDriverKind) -> compute::Com
 // Internal wiring helper: each argument is a distinct piece of runtime state
 // that must be passed through, so the count is justified.
 #[allow(clippy::too_many_arguments)]
+type OperatorAllowlistArc = Option<Arc<std::sync::RwLock<std::collections::BTreeSet<String>>>>;
+
 async fn build_compute_runtime(
     config: &Config,
     driver_startup: compute::driver_config::DriverStartupContext<'_>,
@@ -882,19 +884,23 @@ async fn build_compute_runtime(
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
-) -> Result<ComputeRuntime> {
+) -> Result<(ComputeRuntime, OperatorAllowlistArc)> {
     let driver = configured_compute_driver(config, driver_startup)?;
     info!(driver = %driver.name(), "Using compute driver");
 
-    let runtime = match driver {
+    let (runtime, operator_allowlist) = match driver {
         #[cfg(target_os = "windows")]
-        ConfiguredComputeDriver::Builtin(driver) => Err(unsupported_builtin_compute_driver(driver)),
+        ConfiguredComputeDriver::Builtin(driver) => {
+            return Err(Error::execution(
+                unsupported_builtin_compute_driver(driver).to_string(),
+            ));
+        }
         #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Kubernetes) => {
             warn_if_kubernetes_sandbox_jwt_expiry_disabled(config);
             let k8s_config =
                 compute::driver_config::builtin::kubernetes_config_from_context(driver_startup)?;
-            ComputeRuntime::new_kubernetes(
+            let (rt, allowlist) = ComputeRuntime::new_kubernetes(
                 k8s_config,
                 store,
                 sandbox_index,
@@ -903,12 +909,14 @@ async fn build_compute_runtime(
                 supervisor_sessions.clone(),
             )
             .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            (rt, allowlist)
         }
         #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Docker) => {
             let docker_config =
                 compute::driver_config::builtin::docker_config_from_context(driver_startup)?;
-            ComputeRuntime::new_docker(
+            let rt = ComputeRuntime::new_docker(
                 config.clone(),
                 docker_config,
                 store,
@@ -918,12 +926,14 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            (rt, None)
         }
         #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Podman) => {
             let podman_config =
                 compute::driver_config::builtin::podman_config_from_context(driver_startup)?;
-            ComputeRuntime::new_podman(
+            let rt = ComputeRuntime::new_podman(
                 podman_config,
                 store,
                 sandbox_index,
@@ -932,6 +942,8 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            (rt, None)
         }
         #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Vm) => {
@@ -941,7 +953,7 @@ async fn build_compute_runtime(
                 .file
                 .and_then(|file| file.openshell.gateway.otlp.as_ref());
             let endpoint = compute::vm::spawn(config, &vm_config, otlp_config).await?;
-            ComputeRuntime::new_remote_driver(
+            let rt = ComputeRuntime::new_remote_driver(
                 endpoint,
                 store,
                 sandbox_index,
@@ -950,6 +962,8 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            (rt, None)
         }
         ConfiguredComputeDriver::Remote { name } => {
             let remote_config =
@@ -962,7 +976,7 @@ async fn build_compute_runtime(
             let endpoint = compute::connect_remote_compute_driver(name, &remote_config.socket_path)
                 .await
                 .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
-            ComputeRuntime::new_remote_driver(
+            let rt = ComputeRuntime::new_remote_driver(
                 endpoint,
                 store,
                 sandbox_index,
@@ -971,10 +985,12 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            (rt, None)
         }
     };
 
-    runtime.map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+    Ok((runtime, operator_allowlist))
 }
 
 #[derive(Debug, Clone)]

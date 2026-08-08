@@ -6,8 +6,8 @@
 use super::AppArmorProfile;
 use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
-    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, SupervisorSideloadMethod,
-    SupervisorTopology, WorkspaceMode, managed_namespace,
+    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, OperatorNamespaceAllowlist,
+    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode, managed_namespace,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
@@ -451,6 +451,7 @@ pub struct KubernetesComputeDriver {
     watch_client: Client,
     sandbox_api_version: Arc<OnceCell<&'static str>>,
     config: KubernetesComputeConfig,
+    operator_allowlist: Option<OperatorNamespaceAllowlist>,
 }
 
 impl std::fmt::Debug for KubernetesComputeDriver {
@@ -501,11 +502,26 @@ impl KubernetesComputeDriver {
         let watch_client =
             Client::try_from(watch_kube_config).map_err(KubernetesDriverError::from_kube)?;
 
+        let operator_allowlist = if matches!(config.workspace_mode, WorkspaceMode::Operator) {
+            config.operator_namespace_label.as_ref().map(|label| {
+                let allowlist = OperatorNamespaceAllowlist::new();
+                spawn_namespace_label_watcher(
+                    watch_client.clone(),
+                    label.clone(),
+                    allowlist.clone(),
+                );
+                allowlist
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             client,
             watch_client,
             sandbox_api_version: Arc::new(OnceCell::new()),
             config,
+            operator_allowlist,
         })
     }
 
@@ -515,6 +531,10 @@ impl KubernetesComputeDriver {
             openshell_core::VERSION,
             &self.config.default_image,
         ))
+    }
+
+    pub fn operator_allowlist(&self) -> Option<&OperatorNamespaceAllowlist> {
+        self.operator_allowlist.as_ref()
     }
 
     pub fn default_image(&self) -> &str {
@@ -1062,7 +1082,16 @@ impl KubernetesComputeDriver {
         let target_namespace = match self.config.workspace_mode {
             WorkspaceMode::Shared => self.config.namespace.clone(),
             WorkspaceMode::Managed => self.ensure_namespace(workspace).await?,
-            WorkspaceMode::Operator => workspace.to_string(),
+            WorkspaceMode::Operator => {
+                if let Some(ref allowlist) = self.operator_allowlist
+                    && !allowlist.contains(workspace)
+                {
+                    return Err(KubernetesDriverError::InvalidArgument(format!(
+                        "workspace '{workspace}' is not in the operator namespace allowlist"
+                    )));
+                }
+                workspace.to_string()
+            }
         };
 
         info!(
@@ -3861,6 +3890,83 @@ fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
             .unwrap_or_default()
             .to_string(),
     })
+}
+
+fn spawn_namespace_label_watcher(
+    client: Client,
+    label_selector: String,
+    allowlist: OperatorNamespaceAllowlist,
+) {
+    let ns_api: Api<Namespace> = Api::all(client);
+    let watcher_config = watcher::Config::default().labels(&label_selector);
+
+    tokio::spawn(async move {
+        loop {
+            let mut stream = watcher::watcher(ns_api.clone(), watcher_config.clone()).boxed();
+
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(Event::Applied(ns))) => {
+                        if let Some(name) = ns.metadata.name.as_deref() {
+                            let inner = allowlist.shared();
+                            let mut guard = inner.write().expect("allowlist lock poisoned");
+                            if guard.insert(name.to_string()) {
+                                let count = guard.len();
+                                drop(guard);
+                                info!(
+                                    namespace = name,
+                                    total = count,
+                                    "operator namespace added to allowlist"
+                                );
+                            }
+                        }
+                    }
+                    Ok(Some(Event::Deleted(ns))) => {
+                        if let Some(name) = ns.metadata.name.as_deref() {
+                            let inner = allowlist.shared();
+                            let mut guard = inner.write().expect("allowlist lock poisoned");
+                            if guard.remove(name) {
+                                let count = guard.len();
+                                drop(guard);
+                                info!(
+                                    namespace = name,
+                                    total = count,
+                                    "operator namespace removed from allowlist"
+                                );
+                            }
+                        }
+                    }
+                    Ok(Some(Event::Restarted(namespaces))) => {
+                        let names: std::collections::BTreeSet<String> = namespaces
+                            .into_iter()
+                            .filter_map(|ns| ns.metadata.name)
+                            .collect();
+                        let count = names.len();
+                        allowlist.replace(names);
+                        info!(
+                            total = count,
+                            "operator namespace allowlist replaced from full relist"
+                        );
+                    }
+                    Ok(None) => {
+                        warn!("operator namespace watcher stream ended unexpectedly");
+                        break;
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "operator namespace watcher stream error");
+                        break;
+                    }
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+
+    info!(
+        label_selector = %label_selector,
+        "operator namespace label watcher started"
+    );
 }
 
 #[cfg(test)]
