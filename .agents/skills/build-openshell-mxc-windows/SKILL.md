@@ -28,7 +28,7 @@ The Windows build lane is implemented by these tracked files:
 | `tasks/windows.toml` | Mise task entry points for `windows:*` commands. |
 | `tasks/rust.toml`, `tasks/test.toml`, and `tasks/markdown.toml` | Windows routing for compiler-bearing checks, explicit Unix-only test skips, and Markdown dependency setup. |
 | `tasks/scripts/windows-msvc.ps1` | PowerShell wrapper that enters the Visual Studio developer environment and invokes Cargo. |
-| `.github/workflows/windows-msvc.yml` | GitHub Actions scaffold for x64 and future ARM64 Windows validation. |
+| `.github/workflows/windows-msvc.yml` | Manually dispatched GitHub Actions jobs with architecture-specific Rust caches for x64 and future ARM64 Windows validation. |
 | `architecture/windows-msvc-build.md` | Design notes and validation contract. |
 | `.agents/skills/build-openshell-mxc-windows/` | This skill and companion reference material. |
 
@@ -185,6 +185,11 @@ order:
 5. Native x64 workspace tests.
 6. Focused unsupported-driver contract tests.
 7. Artifact reporting.
+
+The GitHub Actions jobs use architecture-specific `Swatinem/rust-cache`
+entries for the Cargo registry and dependency target artifacts. Failed runs
+also save their usable dependency artifacts. The workflow remains manually
+dispatched until cache-hit runtimes justify restoring automatic triggers.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the

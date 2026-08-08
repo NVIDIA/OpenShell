@@ -48,9 +48,11 @@ creating misleading Windows driver artifacts.
 
 ## Mise Lane
 
-The GitHub Actions workflow is manually dispatched while the clean Windows job
-takes roughly 80 minutes. It should not run for every pull request or merge to
-`main` until the lane has an effective Cargo/native-dependency cache.
+The GitHub Actions workflow is manually dispatched. Each architecture restores
+and saves a dedicated Rust cache containing the Cargo registry and dependency
+build artifacts, including artifacts from failed runs. Keep the workflow manual
+until cache-hit runtimes demonstrate that it is suitable for pull requests and
+merges to `main`.
 
 Windows validation is exposed through `tasks/windows.toml`:
 
@@ -132,8 +134,14 @@ mise run --skip-tools windows:test:x64
 mise run --skip-tools windows:test:unsupported:x64
 ```
 
-The ARM64 check and release build in this x64 job are cross-builds. Native
-ARM64 tests remain exclusive to an ARM64 runner.
+The cache is partitioned by architecture so incompatible x64 and ARM64 target
+artifacts cannot collide. It does not cache Cargo-installed binaries, which
+also keeps the disabled self-hosted ARM64 scaffold from modifying persistent
+runner tooling.
+
+The local aggregate `windows:ci` task cross-builds ARM64 on an x64 host. The
+GitHub x64 job currently runs only the x64 tasks, and native ARM64 tests remain
+exclusive to an ARM64 runner.
 
 The ARM64 job is scaffolded but disabled until a Windows ARM64 runner is
 available. Once enabled, it should run check, release build, native workspace
