@@ -61,7 +61,9 @@ pub(crate) use openshell_ocsf::ctx::ctx as ocsf_ctx;
 use openshell_core::denial::DenialEvent;
 use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use openshell_core::proposals::AgentProposals;
+use openshell_core::proto::NetworkMiddlewareConfig;
 use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_supervisor_middleware::ChainRunner;
 use openshell_supervisor_network::opa::OpaEngine;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
@@ -76,6 +78,49 @@ const SIDECAR_CA_CERT: &str = "openshell-ca.pem";
 const SIDECAR_CA_BUNDLE: &str = "ca-bundle.pem";
 const SIDECAR_PROCESS_PROXY_ADDR: &str = "127.0.0.1:3128";
 const SIDECAR_READY_TIMEOUT_SECS: u64 = 120;
+
+const PI_AGENT_HOOKS: &[&str] = &["input", "before_agent_start", "message_end", "context"];
+
+struct PiConversationBridgeSelection {
+    middleware_name: String,
+    provider_host: String,
+    middleware_config: prost_types::Struct,
+}
+
+async fn select_pi_conversation_bridge(
+    runner: &ChainRunner,
+    configs: &std::collections::HashMap<String, NetworkMiddlewareConfig>,
+) -> Result<Option<PiConversationBridgeSelection>> {
+    let agent_middlewares = runner
+        .agent_conversation_middleware_names("pi", "v1", PI_AGENT_HOOKS)
+        .await?;
+    let mut matching_configs = configs
+        .iter()
+        .filter(|(_, config)| agent_middlewares.contains(&config.middleware));
+    let Some((config_name, config)) = matching_configs.next() else {
+        return Ok(None);
+    };
+    if matching_configs.next().is_some() {
+        return Err(miette::miette!(
+            "Pi conversation prototype requires exactly one network middleware config with Pi agent hook bindings"
+        ));
+    }
+    let endpoints = config.endpoints.as_ref().ok_or_else(|| {
+        miette::miette!(
+            "Pi conversation middleware config '{config_name}' requires an endpoint selector"
+        )
+    })?;
+    if endpoints.include.len() != 1 || endpoints.include[0].contains('*') {
+        return Err(miette::miette!(
+            "Pi conversation middleware config '{config_name}' must include exactly one non-wildcard provider host"
+        ));
+    }
+    Ok(Some(PiConversationBridgeSelection {
+        middleware_name: config.middleware.clone(),
+        provider_host: endpoints.include[0].clone(),
+        middleware_config: config.config.clone().unwrap_or_default(),
+    }))
+}
 
 /// Run a command in the sandbox.
 ///
@@ -399,45 +444,23 @@ pub async fn run_sandbox(
         None
     };
 
-    // Prototype Pi hook bridge. It binds inside the workload network namespace
-    // and proxies typed hook requests through the supervisor-owned middleware
-    // registry. The operator service must also be selected as network
-    // middleware so it is present in the synchronized registry.
-    if let Ok(middleware_name) = std::env::var(agent_bridge::MIDDLEWARE_ENV) {
-        if middleware_name.trim().is_empty() {
-            return Err(miette::miette!(
-                "{} cannot be empty",
-                agent_bridge::MIDDLEWARE_ENV
-            ));
+    // Prototype Pi hook bridge. Discover it from the supervisor-owned registry
+    // and effective middleware policy rather than accepting reserved workload
+    // environment variables. The selected policy config supplies the sole
+    // exact provider host used in the signed conversation target.
+    let pi_bridge = match (opa_engine.as_ref(), retained_proto.as_ref()) {
+        (Some(engine), Some(proto)) => {
+            let runner = engine.middleware_runner()?;
+            select_pi_conversation_bridge(&runner, &proto.network_middlewares)
+                .await?
+                .map(|selection| (selection, runner))
         }
+        _ => None,
+    };
+    if let Some((selection, runner)) = pi_bridge {
         if sidecar_network_enforcement {
             return Err(miette::miette!(
                 "Pi conversation bridge is not yet supported in sidecar topology"
-            ));
-        }
-        let engine = opa_engine.as_ref().ok_or_else(|| {
-            miette::miette!("Pi conversation bridge requires a middleware registry")
-        })?;
-        let proto = retained_proto.as_ref().ok_or_else(|| {
-            miette::miette!("Pi conversation bridge requires gateway policy data")
-        })?;
-        let mut matching_configs = proto
-            .network_middlewares
-            .values()
-            .filter(|config| config.middleware == middleware_name);
-        let middleware_config = matching_configs
-            .next()
-            .ok_or_else(|| {
-                miette::miette!(
-                    "Pi conversation middleware '{middleware_name}' must be selected by network policy"
-                )
-            })?
-            .config
-            .clone()
-            .unwrap_or_default();
-        if matching_configs.next().is_some() {
-            return Err(miette::miette!(
-                "Pi conversation prototype requires exactly one network policy config for '{middleware_name}'"
             ));
         }
         #[cfg(target_os = "linux")]
@@ -445,20 +468,21 @@ pub async fn run_sandbox(
             .as_ref()
             .ok_or_else(|| miette::miette!("Pi conversation bridge requires network enforcement"))?
             .bind_tcp_in_netns(agent_bridge::BRIDGE_ADDR)
-            .await?;
+            .await
+            .into_diagnostic()
+            .wrap_err("failed to bind Pi conversation bridge listener")?;
         #[cfg(not(target_os = "linux"))]
         let listener = tokio::net::TcpListener::bind(agent_bridge::BRIDGE_ADDR)
             .await
             .into_diagnostic()?;
         agent_bridge::spawn(
             listener,
-            engine.middleware_runner()?,
+            runner,
             agent_bridge::BridgeConfig {
-                middleware_name,
+                middleware_name: selection.middleware_name,
                 sandbox_id: sandbox_id.clone().unwrap_or_default(),
-                provider_host: std::env::var(agent_bridge::PROVIDER_HOST_ENV)
-                    .unwrap_or_else(|_| "api.openai.com".into()),
-                middleware_config,
+                provider_host: selection.provider_host,
+                middleware_config: selection.middleware_config,
             },
         );
         provider_env.insert(
@@ -3592,6 +3616,35 @@ mod tests {
             }),
             scope: openshell_core::proto::SettingScope::Global.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn pi_bridge_selection_comes_from_bindings_and_policy_host() {
+        let runner = ChainRunner::new(Arc::new(
+            openshell_pi_conversation_middleware::PrototypeService::new(),
+        ));
+        let configs = std::collections::HashMap::from([(
+            "pi-conversation".to_string(),
+            NetworkMiddlewareConfig {
+                middleware: openshell_pi_conversation_middleware::SERVICE_NAME.to_string(),
+                endpoints: Some(openshell_core::proto::MiddlewareEndpointSelector {
+                    include: vec!["inference-api.nvidia.com".to_string()],
+                    exclude: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        )]);
+
+        let selection = select_pi_conversation_bridge(&runner, &configs)
+            .await
+            .expect("select Pi bridge")
+            .expect("Pi bridge should be selected");
+
+        assert_eq!(
+            selection.middleware_name,
+            openshell_pi_conversation_middleware::SERVICE_NAME
+        );
+        assert_eq!(selection.provider_host, "inference-api.nvidia.com");
     }
 
     #[test]

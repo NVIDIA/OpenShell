@@ -22,8 +22,6 @@ pub const BRIDGE_ADDR: &str = "127.0.0.1:8193";
 pub const BRIDGE_PATH: &str = "/v1/agent/conversation";
 pub const BRIDGE_URL: &str = "http://127.0.0.1:8193/v1/agent/conversation";
 pub const BRIDGE_URL_ENV: &str = "OPENSHELL_PI_CONVERSATION_URL";
-pub const MIDDLEWARE_ENV: &str = "OPENSHELL_PI_CONVERSATION_MIDDLEWARE";
-pub const PROVIDER_HOST_ENV: &str = "OPENSHELL_PI_CONVERSATION_PROVIDER_HOST";
 
 const MAX_BRIDGE_BODY_BYTES: usize = 256 * 1024;
 

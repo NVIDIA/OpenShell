@@ -9,6 +9,9 @@ agent operation replaces every exact, case-sensitive `sandbox` substring with
 denies requests with missing, invalid, expired, or mismatched attestations and
 removes the internal attestation header from allowed requests.
 
+For the demo, each mutation is logged at `INFO` as pretty JSON containing the
+complete original and replacement conversations.
+
 Run the service on an address reachable from the gateway and sandbox
 supervisors:
 
@@ -21,26 +24,30 @@ Register it in the gateway TOML before starting the gateway:
 ```toml
 [[openshell.supervisor.middleware]]
 name = "pi-conversation-prototype"
-grpc_endpoint = "http://host.openshell.internal:50061"
+grpc_endpoint = "http://<host-address-reachable-from-gateway-and-sandboxes>:50061"
 max_body_bytes = 262144
 timeout = "5s"
 ```
 
-The same registered service must be selected as fail-closed network middleware
-for the protected provider host. The supervisor prototype bridge is enabled by
-setting these variables in the sandbox supervisor environment:
+The gateway calls `Describe` during startup, and sandbox supervisors later use
+the same endpoint. On Docker Desktop for macOS, use the Mac's active LAN IPv4
+address; `host.openshell.internal` resolves inside Docker sandboxes but not in
+the host-side gateway process.
 
-```shell
-OPENSHELL_PI_CONVERSATION_MIDDLEWARE=pi-conversation-prototype
-OPENSHELL_PI_CONVERSATION_PROVIDER_HOST=api.openai.com
-```
+The same registered service must be selected as fail-closed network middleware
+for exactly one non-wildcard provider host. The supervisor discovers the Pi
+bridge from the service's complete Pi agent-hook bindings and the effective
+middleware policy; no user-supplied `OPENSHELL_*` variables are required or
+accepted.
 
 The bridge reuses the selected network middleware's validated `config` for hook
 evaluation, so signing and egress verification use the same policy revision.
 
-When enabled, the supervisor injects the stable
-`OPENSHELL_PI_CONVERSATION_URL=http://127.0.0.1:8193/v1/agent/conversation`
-address into the workload environment. Load
+The prototype extension defaults to the stable
+`http://127.0.0.1:8193/v1/agent/conversation` address. The supervisor may also
+inject that address as `OPENSHELL_PI_CONVERSATION_URL`, but the extension does
+not require it. This matters for SSH sessions, which construct a fresh workload
+environment rather than inheriting the entrypoint environment. Load
 `examples/pi-conversation-middleware/pi-extension.ts` as a Pi extension.
 
 ## Prototype limitations

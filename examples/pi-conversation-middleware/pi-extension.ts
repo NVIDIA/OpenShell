@@ -4,13 +4,10 @@
 const ATTESTATION_HEADER = "x-openshell-agent-attestation";
 const HARNESS_VERSION = "prototype-v1";
 const REQUEST_TIMEOUT_MS = 5_000;
+const DEFAULT_BRIDGE_URL = "http://127.0.0.1:8193/v1/agent/conversation";
 
 function bridgeUrl() {
-  const value = process.env.OPENSHELL_PI_CONVERSATION_URL;
-  if (!value) {
-    throw new Error("OPENSHELL_PI_CONVERSATION_URL is not set");
-  }
-  return value;
+  return process.env.OPENSHELL_PI_CONVERSATION_URL || DEFAULT_BRIDGE_URL;
 }
 
 function modelId(ctx) {

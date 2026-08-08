@@ -956,6 +956,34 @@ impl ChainRunner {
         })
     }
 
+    /// Return attachment names that advertise every requested agent hook for
+    /// one harness/schema pair. Supervisors use this to discover hook bridges
+    /// from the validated registry instead of accepting workload environment
+    /// variables that name privileged middleware.
+    pub async fn agent_conversation_middleware_names(
+        &self,
+        harness: &str,
+        schema_version: &str,
+        hooks: &[&str],
+    ) -> Result<Vec<String>> {
+        let manifests = self.manifests().await?;
+        Ok(manifests
+            .iter()
+            .filter(|(_, manifest)| {
+                hooks.iter().all(|hook| {
+                    manifest.bindings.iter().any(|binding| {
+                        binding.operation == AGENT_CONVERSATION_OPERATION as i32
+                            && binding.phase == AGENT_CONTEXT_PHASE as i32
+                            && binding.harness == harness
+                            && binding.hook == *hook
+                            && binding.schema_version == schema_version
+                    })
+                })
+            })
+            .map(|(state, manifest)| Self::attachment_name(state, manifest).to_string())
+            .collect())
+    }
+
     /// Evaluate one complete Pi conversation through the named registered
     /// middleware. The caller supplies supervisor-stamped identity and target
     /// fields; failures are returned so the local bridge can fail closed.

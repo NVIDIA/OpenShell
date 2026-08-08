@@ -155,6 +155,26 @@ struct ChatMessageBody {
     content: String,
 }
 
+fn conversation_json(conversation: &ConversationRequestV1) -> serde_json::Value {
+    serde_json::json!({
+        "model": conversation.model,
+        "messages": conversation.messages.iter().map(|message| serde_json::json!({
+            "role": message.role,
+            "content": message.content,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn redact_conversation(conversation: &mut ConversationRequestV1) -> u32 {
+    let mut replacements = 0u32;
+    for message in &mut conversation.messages {
+        let count = message.content.matches("sandbox").count();
+        replacements = replacements.saturating_add(u32::try_from(count).unwrap_or(u32::MAX));
+        message.content = message.content.replace("sandbox", "REDACTED");
+    }
+    replacements
+}
+
 fn validate_conversation(conversation: &ConversationRequestV1) -> Result<(), &'static str> {
     if conversation.model.is_empty() || conversation.messages.is_empty() {
         return Err("model and messages must be non-empty");
@@ -336,11 +356,19 @@ impl SupervisorMiddleware for PrototypeService {
             return Ok(Response::new(deny_agent("unsupported_conversation_shape")));
         }
 
-        let mut replacements = 0u32;
-        for message in &mut conversation.messages {
-            let count = message.content.matches("sandbox").count();
-            replacements = replacements.saturating_add(u32::try_from(count).unwrap_or(u32::MAX));
-            message.content = message.content.replace("sandbox", "REDACTED");
+        let original = conversation_json(&conversation);
+        let replacements = redact_conversation(&mut conversation);
+        if replacements > 0 {
+            let formatted = serde_json::to_string_pretty(&serde_json::json!({
+                "hook": target.hook,
+                "original": original,
+                "replacement": conversation_json(&conversation),
+            }))
+            .map_err(|error| Status::internal(error.to_string()))?;
+            tracing::info!(
+                replacement_count = replacements,
+                "Pi conversation mutation\n{formatted}"
+            );
         }
         let issued_at = self.now();
         let claims = AttestationClaims {

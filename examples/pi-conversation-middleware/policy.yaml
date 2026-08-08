@@ -3,6 +3,20 @@
 
 version: 1
 
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /etc
+    - /var/log
+    - /opt/pi-conversation
+  read_write:
+    - /tmp
+    - /dev/null
+
 network_middlewares:
   pi-conversation:
     name: Pi conversation attestation
@@ -13,13 +27,13 @@ network_middlewares:
     on_error: fail_closed
     endpoints:
       include:
-        - api.openai.com
+        - inference-api.nvidia.com
 
 network_policies:
-  openai-chat-completions:
-    name: OpenAI Chat Completions
+  nvidia-inference-chat-completions:
+    name: NVIDIA Inference API Chat Completions
     endpoints:
-      - host: api.openai.com
+      - host: inference-api.nvidia.com
         port: 443
         protocol: rest
         rules:
