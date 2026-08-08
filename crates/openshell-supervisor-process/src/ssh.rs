@@ -7,8 +7,8 @@ use crate::child_env;
 #[cfg(target_os = "linux")]
 use crate::managed_children;
 use crate::process::{
-    ProcessEnforcementMode, ResolvedProcessIdentity, ResolvedWorkspace,
-    drop_privileges_with_identity, is_supervisor_only_env_var,
+    PreparedPrivilegeDrop, ProcessEnforcementMode, ResolvedProcessIdentity, ResolvedWorkspace,
+    apply_prepared_privilege_drop, is_supervisor_only_env_var, prepare_privilege_drop,
 };
 use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
@@ -1138,8 +1138,8 @@ mod unsafe_pty {
     #[cfg(not(target_os = "linux"))]
     use super::sandbox;
     use super::{
-        Command, ProcessEnforcementMode, RawFd, ResolvedProcessIdentity, SandboxPolicy, Winsize,
-        drop_privileges_with_identity, setsid,
+        Command, PreparedPrivilegeDrop, ProcessEnforcementMode, RawFd, ResolvedProcessIdentity,
+        SandboxPolicy, Winsize, apply_prepared_privilege_drop, prepare_privilege_drop, setsid,
     };
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
@@ -1196,6 +1196,14 @@ mod unsafe_pty {
         } else {
             None
         };
+        let prepared_privilege_drop = if enforcement_mode.uses_privileged_process_setup() {
+            Some(
+                prepare_privilege_drop(&policy, resolved_identity)
+                    .map_err(|err| anyhow::anyhow!("failed to prepare privilege drop: {err}"))?,
+            )
+        } else {
+            None
+        };
         unsafe {
             cmd.pre_exec(move || {
                 setsid().map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -1204,10 +1212,10 @@ mod unsafe_pty {
                 enter_netns_and_sandbox(
                     netns_fd,
                     &policy,
-                    resolved_identity,
                     enforcement_mode,
                     #[cfg(target_os = "linux")]
                     supervisor_identity_mount,
+                    prepared_privilege_drop.as_ref(),
                     #[cfg(target_os = "linux")]
                     prepared.take(),
                 )
@@ -1246,15 +1254,23 @@ mod unsafe_pty {
         } else {
             None
         };
+        let prepared_privilege_drop = if enforcement_mode.uses_privileged_process_setup() {
+            Some(
+                prepare_privilege_drop(&policy, resolved_identity)
+                    .map_err(|err| anyhow::anyhow!("failed to prepare privilege drop: {err}"))?,
+            )
+        } else {
+            None
+        };
         unsafe {
             cmd.pre_exec(move || {
                 enter_netns_and_sandbox(
                     netns_fd,
                     &policy,
-                    resolved_identity,
                     enforcement_mode,
                     #[cfg(target_os = "linux")]
                     supervisor_identity_mount,
+                    prepared_privilege_drop.as_ref(),
                     #[cfg(target_os = "linux")]
                     prepared.take(),
                 )
@@ -1265,12 +1281,12 @@ mod unsafe_pty {
 
     fn enter_netns_and_sandbox(
         netns_fd: Option<RawFd>,
-        policy: &SandboxPolicy,
-        resolved_identity: ResolvedProcessIdentity,
-        enforcement_mode: ProcessEnforcementMode,
+        _policy: &SandboxPolicy,
+        _enforcement_mode: ProcessEnforcementMode,
         #[cfg(target_os = "linux")] supervisor_identity_mount: Option<
             &crate::process::SupervisorIdentityMountNamespace,
         >,
+        prepared_privilege_drop: Option<&PreparedPrivilegeDrop>,
         #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
     ) -> std::io::Result<()> {
         // Enter network namespace before dropping privileges.
@@ -1294,26 +1310,28 @@ mod unsafe_pty {
             mount.enter_for_child()?;
         }
 
-        // Drop privileges. initgroups/setgid/setuid need /etc/group and
-        // /etc/passwd which would be blocked if Landlock were already enforced.
-        if enforcement_mode.uses_privileged_process_setup() {
-            drop_privileges_with_identity(policy, resolved_identity)
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
+        // NSS and supplementary-group resolution ran in the parent. Only
+        // numeric credential syscalls execute in this post-fork hook.
+        if let Some(prepared_privilege_drop) = prepared_privilege_drop {
+            apply_prepared_privilege_drop(prepared_privilege_drop)?;
         }
-        crate::process::harden_child_process()
-            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        crate::process::harden_child_process()?;
 
         // Phase 2: Enforce the prepared Landlock ruleset + seccomp.
         // restrict_self() does not require root.
         #[cfg(target_os = "linux")]
         if let Some(prepared) = prepared {
-            crate::sandbox::linux::enforce(prepared)
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            crate::sandbox::linux::enforce(prepared).map_err(|_| {
+                crate::process::write_pre_exec_error(
+                    b"openshell pre_exec: sandbox enforcement failed\n",
+                );
+                std::io::Error::from_raw_os_error(libc::EINVAL)
+            })?;
         }
 
         #[cfg(not(target_os = "linux"))]
-        if enforcement_mode.enforces_child_sandbox() {
-            sandbox::apply(policy, None).map_err(|err| std::io::Error::other(err.to_string()))?;
+        if _enforcement_mode.enforces_child_sandbox() {
+            sandbox::apply(_policy, None).map_err(|err| std::io::Error::other(err.to_string()))?;
         }
 
         Ok(())
@@ -1906,6 +1924,48 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("drop-privileges-ok"),
             "echo output should contain 'drop-privileges-ok'"
+        );
+    }
+
+    /// Named-account resolution must fail while installing the hook, before
+    /// `Command::spawn` forks a child. Running NSS from the hook can deadlock a
+    /// multithreaded supervisor and was the root cause of VM startup hangs.
+    #[cfg(unix)]
+    #[test]
+    fn pre_exec_resolves_named_identity_before_spawn() {
+        use openshell_core::policy::{
+            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
+        };
+
+        let policy = SandboxPolicy {
+            version: 0,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: Some("__openshell_missing_pre_exec_user__".into()),
+                run_as_group: Some("__openshell_missing_pre_exec_group__".into()),
+            },
+        };
+        let mut cmd = Command::new("echo");
+
+        let error = unsafe_pty::install_pre_exec_no_pty(
+            &mut cmd,
+            policy,
+            None,
+            None,
+            ResolvedProcessIdentity::default(),
+            ProcessEnforcementMode::Full,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+        .expect_err("missing named identity must fail before Command::spawn");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to prepare privilege drop"),
+            "unexpected error: {error}"
         );
     }
 

@@ -14,6 +14,7 @@ const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sa
 const UMOCI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/umoci.zst"));
 const ROOTFS_VARIANT_MARKER: &str = ".openshell-rootfs-variant";
 const SANDBOX_GUEST_INIT_PATH: &str = "/srv/openshell-vm-sandbox-init.sh";
+const SANDBOX_GUEST_INIT_SCRIPT: &str = include_str!("../scripts/openshell-vm-sandbox-init.sh");
 const SANDBOX_SUPERVISOR_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
 const SANDBOX_UMOCI_PATH: &str = openshell_core::container_paths::VM_UMOCI_PATH;
 const SANDBOX_OWNER_NORMALIZED_MARKER: &str =
@@ -362,11 +363,8 @@ fn prepare_sandbox_rootfs(rootfs: &Path, sandbox_uid: u32, sandbox_gid: u32) -> 
     if let Some(parent) = init_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    fs::write(
-        &init_path,
-        include_str!("../scripts/openshell-vm-sandbox-init.sh"),
-    )
-    .map_err(|e| format!("write {}: {e}", init_path.display()))?;
+    fs::write(&init_path, SANDBOX_GUEST_INIT_SCRIPT)
+        .map_err(|e| format!("write {}: {e}", init_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -947,6 +945,25 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn guest_init_preserves_lower_root_metadata_before_overlay_mount() {
+        let chown = SANDBOX_GUEST_INIT_SCRIPT
+            .find("chown --reference=\"$lower_root\" /overlay/upper")
+            .expect("guest init must preserve the lower root owner");
+        let chmod = SANDBOX_GUEST_INIT_SCRIPT
+            .find("chmod --reference=\"$lower_root\" /overlay/upper")
+            .expect("guest init must preserve the lower root mode");
+        let mount = SANDBOX_GUEST_INIT_SCRIPT
+            .find("mount -t overlay overlay")
+            .expect("guest init must mount the overlay");
+
+        assert!(
+            chown < mount,
+            "upper root ownership must be fixed before mount"
+        );
+        assert!(chmod < mount, "upper root mode must be fixed before mount");
+    }
 
     #[test]
     fn prepare_sandbox_rootfs_rewrites_guest_layout() {

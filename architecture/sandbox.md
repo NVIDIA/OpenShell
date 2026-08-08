@@ -21,6 +21,20 @@ container-granted capabilities. This is fail-closed: the supervisor retains
 aborts unless the bounding set ends up empty. A `setpcap` `EPERM` is tolerated
 only when the set is already empty; any other outcome fails the spawn.
 
+Before it forks, the supervisor resolves the executable path, named users,
+groups, supplementary memberships, Landlock path handles, and runtime seccomp
+programs. Entrypoint and SSH child hooks receive only prepared values. The
+post-fork child performs the unavoidable namespace, credential, hardening,
+Landlock, seccomp-install, and exec syscalls; it does not perform name-service
+lookups, PATH search, filter compilation, tracing, or successful-path heap
+cleanup. Both launch paths therefore have the same identity and enforcement
+semantics without invoking process-global runtime services after fork.
+
+The VM driver also mirrors the selected lower root filesystem's owner and mode
+onto the overlay upper root before mounting it. This prevents the host process
+umask or host UID from making the merged guest root untraversable by the sandbox
+identity.
+
 ## Startup Flow
 
 1. The compute runtime starts the workload with sandbox identity, callback

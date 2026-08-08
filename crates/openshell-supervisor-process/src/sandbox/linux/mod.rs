@@ -15,7 +15,7 @@ use std::sync::Once;
 /// Holds the Landlock ruleset with `PathFds` opened before child exec.
 pub struct PreparedSandbox {
     landlock: Option<landlock::PreparedRuleset>,
-    policy: SandboxPolicy,
+    seccomp: seccomp::PreparedFilters,
 }
 
 /// Phase 1: Prepare sandbox restrictions **as root** (before `drop_privileges`).
@@ -24,10 +24,8 @@ pub struct PreparedSandbox {
 /// ensuring paths like mode-700 directories are accessible.
 pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<PreparedSandbox> {
     let landlock = landlock::prepare(policy, workdir)?;
-    Ok(PreparedSandbox {
-        landlock,
-        policy: policy.clone(),
-    })
+    let seccomp = seccomp::prepare(policy)?;
+    Ok(PreparedSandbox { landlock, seccomp })
 }
 
 /// Phase 1 for already-unprivileged workloads.
@@ -39,10 +37,8 @@ pub fn prepare_current_user(
     workdir: Option<&str>,
 ) -> Result<PreparedSandbox> {
     let landlock = landlock::prepare_current_user(policy, workdir)?;
-    Ok(PreparedSandbox {
-        landlock,
-        policy: policy.clone(),
-    })
+    let seccomp = seccomp::prepare(policy)?;
+    Ok(PreparedSandbox { landlock, seccomp })
 }
 
 /// Phase 2: Enforce prepared sandbox restrictions (after `drop_privileges`).
@@ -50,10 +46,27 @@ pub fn prepare_current_user(
 /// Calls `restrict_self()` for Landlock and applies seccomp filters.
 /// Neither operation requires root privileges.
 pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
-    if let Some(ruleset) = prepared.landlock {
-        landlock::enforce(ruleset)?;
+    let mut prepared = prepared;
+
+    // `PreparedFilters` owns heap-backed BPF programs. This function runs from
+    // `Command::pre_exec`, where dropping those buffers could enter an
+    // allocator whose lock was inherited from another parent thread. Apply
+    // the filters, then deliberately leave the prepared value for `exec` (or
+    // `_exit` on error) to discard without running destructors.
+    let landlock_result = prepared.landlock.take().map(landlock::enforce);
+    let seccomp_result = if landlock_result.as_ref().is_none_or(Result::is_ok) {
+        Some(seccomp::apply_prepared(&prepared.seccomp))
+    } else {
+        None
+    };
+    std::mem::forget(prepared);
+
+    if let Some(result) = landlock_result {
+        result?;
     }
-    seccomp::apply(&prepared.policy)?;
+    if let Some(result) = seccomp_result {
+        result?;
+    }
     Ok(())
 }
 

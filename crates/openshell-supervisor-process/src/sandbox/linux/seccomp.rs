@@ -43,6 +43,15 @@ use std::collections::BTreeMap;
 use std::convert::TryInto;
 use tracing::debug;
 
+/// Seccomp programs compiled before `fork()` and installed by the child.
+///
+/// Building the rule maps and BPF programs allocates and emits debug tracing,
+/// so it is not safe to do from a multithreaded process's `pre_exec` hook.
+pub(super) struct PreparedFilters {
+    main: seccompiler::BpfProgram,
+    clone3: seccompiler::BpfProgram,
+}
+
 /// Value of `SECCOMP_SET_MODE_FILTER` (linux/seccomp.h).
 const SECCOMP_SET_MODE_FILTER: u64 = 1;
 
@@ -69,15 +78,24 @@ pub fn apply_supervisor_prelude() -> Result<()> {
     Ok(())
 }
 
-pub fn apply(policy: &SandboxPolicy) -> Result<()> {
+pub(super) fn prepare(policy: &SandboxPolicy) -> Result<PreparedFilters> {
     let allow_inet = matches!(policy.network.mode, NetworkMode::Proxy | NetworkMode::Allow);
-    let main_filter = build_filter(allow_inet)?;
-    let clone3_filter = build_clone3_filter()?;
+    Ok(PreparedFilters {
+        main: build_filter(allow_inet)?,
+        clone3: build_clone3_filter()?,
+    })
+}
 
+pub(super) fn apply_prepared(filters: &PreparedFilters) -> Result<()> {
     set_no_new_privs()?;
-    apply_runtime_filters(&main_filter, &clone3_filter)?;
+    apply_runtime_filters(&filters.main, &filters.clone3)?;
 
     Ok(())
+}
+
+pub fn apply(policy: &SandboxPolicy) -> Result<()> {
+    let filters = prepare(policy)?;
+    apply_prepared(&filters)
 }
 
 fn build_filter(allow_inet: bool) -> Result<seccompiler::BpfProgram> {

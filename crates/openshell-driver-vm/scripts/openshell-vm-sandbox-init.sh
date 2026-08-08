@@ -270,6 +270,14 @@ setup_overlay_root() {
         fi
     fi
 
+    # Overlayfs exposes the upperdir root inode as the merged mount's root.
+    # The host creates the overlay template under a restrictive umask, so its
+    # upperdir may otherwise be 0700 and owned by the host UID. Mirror the
+    # selected lower root before mounting so named sandbox users can traverse
+    # `/` and the workload cannot own the sandbox filesystem root.
+    chown --reference="$lower_root" /overlay/upper
+    chmod --reference="$lower_root" /overlay/upper
+
     mount -t overlay overlay \
         -o lowerdir="$lower_root",upperdir=/overlay/upper,workdir=/overlay/work \
         /newroot

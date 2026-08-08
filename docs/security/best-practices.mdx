@@ -208,7 +208,7 @@ The sandbox process runs as a non-root user after explicit privilege dropping.
 
 ### Seccomp Filters
 
-OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude runs before CLI parsing and async runtime initialization, then the child process receives the broader runtime seccomp filter after privilege drop.
+OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude runs before CLI parsing and async runtime initialization. The parent compiles the broader runtime filter before forking, and the child installs that prepared filter after privilege drop.
 
 | Aspect | Detail |
 |---|---|
@@ -223,15 +223,16 @@ OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude run
 ### Enforcement Application Order
 
 The sandbox supervisor applies enforcement in a specific order during process startup.
-This ordering is intentional: named network-namespace setup still relies on privileged helpers, and privilege dropping still needs `/etc/group` and `/etc/passwd`, which Landlock subsequently restricts.
+This ordering is intentional: named network-namespace setup still relies on privileged helpers, and the supervisor must resolve named identities from `/etc/group` and `/etc/passwd` before Landlock restricts child access.
 
 1. Privileged supervisor bootstrap helpers, including network-namespace setup, provider-token SPIFFE child mount-namespace setup, and optional `nft` probes.
 2. Supervisor startup prelude seccomp (`PR_SET_NO_NEW_PRIVS` plus the early syscall denylist) synchronized across runtime threads.
-3. Network and child-only mount namespace entry (`setns`) in child `pre_exec`.
-4. Privilege drop (`initgroups` + `setgid` + `setuid`).
-5. Core-dump hardening (`RLIMIT_CORE=0`, plus `PR_SET_DUMPABLE=0` on Linux).
-6. Landlock filesystem restrictions.
-7. Runtime seccomp socket domain and syscall filters.
+3. Parent-side child preparation, including executable PATH resolution, named user, group, and supplementary membership resolution, Landlock path handles, and compiled runtime seccomp programs.
+4. Network and child-only mount namespace entry (`setns`) in child `pre_exec`.
+5. Prepared numeric privilege drop (`setgroups` + `setgid` + `setuid`).
+6. Core-dump hardening (`RLIMIT_CORE=0`, plus `PR_SET_DUMPABLE=0` on Linux).
+7. Landlock filesystem restrictions.
+8. Prepared runtime seccomp socket domain and syscall filter installation.
 
 ## Inference Controls
 

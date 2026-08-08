@@ -16,6 +16,8 @@ use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
+use std::ffi::OsStr;
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
@@ -28,7 +30,7 @@ use std::process::Stdio;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use tokio::process::{Child, Command};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 /// Process/filesystem enforcement performed by the process supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,8 +174,43 @@ fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>
     }
 }
 
+/// Resolve a bare executable name before `fork()` so the child does not run
+/// `execvp`'s PATH search from a multithreaded parent snapshot.
+#[cfg(target_os = "linux")]
+fn resolve_child_executable(program: &str, path_override: Option<&OsStr>) -> Result<PathBuf> {
+    let inherited_path;
+    let path = if let Some(path) = path_override {
+        path
+    } else {
+        inherited_path = std::env::var_os("PATH").unwrap_or_else(|| "/bin:/usr/bin".into());
+        &inherited_path
+    };
+    resolve_child_executable_in_path(program, path)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_child_executable_in_path(program: &str, path: &OsStr) -> Result<PathBuf> {
+    if program.as_bytes().contains(&b'/') {
+        return Ok(PathBuf::from(program));
+    }
+
+    for directory in std::env::split_paths(path) {
+        let candidate = directory.join(program);
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            return candidate.canonicalize().into_diagnostic();
+        }
+    }
+
+    Err(miette::miette!(
+        "Sandbox executable '{program}' was not found in PATH"
+    ))
+}
+
 #[cfg(unix)]
-pub fn harden_child_process() -> Result<()> {
+pub fn harden_child_process() -> std::io::Result<()> {
     use rustix::process::{Resource, Rlimit, setrlimit};
 
     setrlimit(
@@ -183,16 +220,30 @@ pub fn harden_child_process() -> Result<()> {
             maximum: Some(0),
         },
     )
-    .map_err(|e| miette::miette!("Failed to disable core dumps: {e}"))?;
+    .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))?;
 
     #[cfg(target_os = "linux")]
     {
         use rustix::process::{DumpableBehavior, set_dumpable_behavior};
         set_dumpable_behavior(DumpableBehavior::NotDumpable)
-            .map_err(|e| miette::miette!("Failed to set PR_SET_DUMPABLE=0: {e}"))?;
+            .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))?;
     }
 
     Ok(())
+}
+
+/// Emit a static pre-exec failure marker without allocation or tracing.
+///
+/// This runs only on an error path after `fork()`, where the tracing subscriber
+/// and allocator may hold locks inherited from other parent threads.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn write_pre_exec_error(message: &'static [u8]) {
+    // SAFETY: `message` is static and `write(2)` is async-signal-safe. Ignore
+    // short writes because this is best-effort diagnostic output.
+    unsafe {
+        libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -274,18 +325,22 @@ fn parse_pids_max(contents: &str) -> RuntimePidLimitStatus {
 }
 
 #[cfg(target_os = "linux")]
-fn drop_capability_bounding_set() -> Result<()> {
+fn drop_capability_bounding_set() -> std::io::Result<()> {
     let clear_result = capctl::caps::bounding::clear();
     let remaining = capctl::caps::bounding::probe();
 
-    validate_capability_bounding_set_clear(
-        clear_result,
-        remaining,
-        capctl::caps::bounding::clear_unknown,
-    )
+    match clear_result {
+        Ok(()) if remaining.is_empty() => Ok(()),
+        Ok(()) => Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        Err(err) if err.code() == libc::EPERM && remaining.is_empty() => {
+            capctl::caps::bounding::clear_unknown()
+                .map_err(|err| std::io::Error::from_raw_os_error(err.code()))
+        }
+        Err(err) => Err(std::io::Error::from_raw_os_error(err.code())),
+    }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn validate_capability_bounding_set_clear(
     clear_result: capctl::Result<()>,
     remaining: capctl::caps::CapSet,
@@ -626,7 +681,18 @@ impl ProcessHandle {
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
-        let mut cmd = Command::new(program);
+        let resolved_program = resolve_child_executable(
+            program,
+            provider_env
+                .get("PATH")
+                .map(|path| OsStr::new(path.as_str())),
+        )?;
+        debug!(
+            program,
+            executable = %resolved_program.display(),
+            "Resolved sandbox executable before fork"
+        );
+        let mut cmd = Command::new(&resolved_program);
         cmd.args(args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
@@ -704,6 +770,11 @@ impl ProcessHandle {
         } else {
             None
         };
+        let prepared_privilege_drop = if enforcement_mode.uses_privileged_process_setup() {
+            Some(prepare_privilege_drop(policy, resolved_identity)?)
+        } else {
+            None
+        };
 
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
@@ -711,7 +782,6 @@ impl ProcessHandle {
         // SAFETY: pre_exec runs after fork but before exec in the child process.
         // setpgid and setns are async-signal-safe and safe to call in this context.
         {
-            let policy = policy.clone();
             // Wrap in Option so we can .take() it out of the FnMut closure.
             // pre_exec is only called once (after fork, before exec).
             #[cfg(target_os = "linux")]
@@ -737,23 +807,25 @@ impl ProcessHandle {
                         mount.enter_for_child()?;
                     }
 
-                    // Drop privileges. initgroups/setgid/setuid need access to
-                    // /etc/group and /etc/passwd which would be blocked if
-                    // Landlock were already enforced.
-                    if enforcement_mode.uses_privileged_process_setup() {
-                        drop_privileges_with_identity(&policy, resolved_identity)
-                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    // All NSS/group-list resolution ran in the parent. The
+                    // post-fork hook applies only the prepared numeric values.
+                    if let Some(prepared) = prepared_privilege_drop.as_ref() {
+                        apply_prepared_privilege_drop(prepared)?;
                     }
 
-                    harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
+                    harden_child_process()?;
 
                     // Phase 2 (as unprivileged user): Enforce the prepared
                     // Landlock ruleset via restrict_self() + apply seccomp.
                     // restrict_self() does not require root.
                     #[cfg(target_os = "linux")]
                     if let Some(prepared) = prepared_sandbox.take() {
-                        sandbox::linux::enforce(prepared)
-                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                        sandbox::linux::enforce(prepared).map_err(|_| {
+                            write_pre_exec_error(
+                                b"openshell pre_exec: sandbox enforcement failed\n",
+                            );
+                            std::io::Error::from_raw_os_error(libc::EINVAL)
+                        })?;
                     }
 
                     Ok(())
@@ -761,7 +833,17 @@ impl ProcessHandle {
             }
         }
 
-        let child = cmd.spawn().into_diagnostic()?;
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                error!(
+                    "Failed to spawn sandbox process {program}: {err} \
+                     (raw_os_error={:?})",
+                    err.raw_os_error()
+                );
+                return Err(err).into_diagnostic();
+            }
+        };
         let pid = child.id().unwrap_or(0);
         managed_children::register(pid);
 
@@ -834,6 +916,11 @@ impl ProcessHandle {
         {
             let policy = policy.clone();
             let workdir = workspace.owned_root();
+            let prepared_privilege_drop = if enforcement_mode.uses_privileged_process_setup() {
+                Some(prepare_privilege_drop(&policy, resolved_identity)?)
+            } else {
+                None
+            };
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
@@ -842,15 +929,12 @@ impl ProcessHandle {
                         libc::setpgid(0, 0);
                     }
 
-                    // Drop privileges before applying sandbox restrictions.
-                    // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
-                    // which may be blocked by Landlock.
-                    if enforcement_mode.uses_privileged_process_setup() {
-                        drop_privileges_with_identity(&policy, resolved_identity)
-                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    // Account and group resolution ran before fork.
+                    if let Some(prepared) = prepared_privilege_drop.as_ref() {
+                        apply_prepared_privilege_drop(prepared)?;
                     }
 
-                    harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
+                    harden_child_process()?;
 
                     if enforcement_mode.enforces_child_sandbox() {
                         sandbox::apply(&policy, workdir.as_deref())
@@ -1342,10 +1426,7 @@ fn validate_oci_workspace_in_subprocess(
     let (uid, gid, supplementary_gids) = resolve_filesystem_identity(policy, resolved_identity)?;
     let uid = uid.ok_or_else(|| miette::miette!("workspace validator UID is unresolved"))?;
     let gid = gid.ok_or_else(|| miette::miette!("workspace validator GID is unresolved"))?;
-    let groups = supplementary_gids
-        .iter()
-        .map(|group| group.as_raw())
-        .collect::<Vec<_>>();
+    let groups = supplementary_gids;
     let executable = std::env::current_exe().into_diagnostic()?;
     let mut command = std::process::Command::new(executable);
     command
@@ -1361,17 +1442,15 @@ fn validate_oci_workspace_in_subprocess(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    // `pre_exec` runs after fork and before exec. These direct credential
-    // syscalls are async-signal-safe and affect only the one-shot child.
+    // `pre_exec` runs after fork and before exec. On Linux these helpers issue
+    // raw syscalls so glibc does not attempt its multi-thread setxid protocol
+    // from the one-shot child.
     #[allow(unsafe_code)]
     unsafe {
         command.pre_exec(move || {
-            if libc::setgroups(groups.len(), groups.as_ptr()) != 0
-                || libc::setgid(gid.as_raw()) != 0
-                || libc::setuid(uid.as_raw()) != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
+            setgroups_in_child(&groups)?;
+            setgid_in_child(gid)?;
+            setuid_in_child(uid)?;
             Ok(())
         });
     }
@@ -1959,12 +2038,119 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
     drop_privileges_with_identity(policy, ResolvedProcessIdentity::default())
 }
 
+/// Numeric credential changes prepared before `fork()`.
+///
+/// Resolving account names and supplementary groups may call into NSS. Those
+/// operations are not async-signal-safe, so they must never run from a
+/// `Command::pre_exec` hook in the multithreaded supervisor. The hook receives
+/// this owned, numeric representation and performs credential syscalls only.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedPrivilegeDrop {
+    target_uid: Uid,
+    target_gid: Gid,
+    supplementary_gids: Option<Vec<Gid>>,
+    set_user: bool,
+    noop: bool,
+}
+
+#[cfg(unix)]
+impl PreparedPrivilegeDrop {
+    fn noop() -> Self {
+        Self {
+            target_uid: nix::unistd::geteuid(),
+            target_gid: nix::unistd::getegid(),
+            supplementary_gids: None,
+            set_user: false,
+            noop: true,
+        }
+    }
+}
+
+/// Set supplementary groups in a post-fork Linux child without entering
+/// glibc's process-wide setxid coordination path.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn setgroups_in_child(groups: &[Gid]) -> std::io::Result<()> {
+    // SAFETY: Gid is transparent over gid_t on supported Linux targets and
+    // the slice remains live for the duration of the syscall.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_setgroups,
+            groups.len(),
+            groups.as_ptr().cast::<libc::gid_t>(),
+        )
+    };
+    if result == -1 {
+        write_pre_exec_error(b"openshell pre_exec: setgroups failed\n");
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Set the primary group in a post-fork Linux child without glibc setxid
+/// coordination.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn setgid_in_child(gid: Gid) -> std::io::Result<()> {
+    // Set all three IDs explicitly so no saved privileged GID survives exec.
+    // SAFETY: SYS_setresgid accepts three gid_t values and affects only this child.
+    let raw = gid.as_raw();
+    let result = unsafe { libc::syscall(libc::SYS_setresgid, raw, raw, raw) };
+    if result == -1 {
+        write_pre_exec_error(b"openshell pre_exec: setgid failed\n");
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Set the user in a post-fork Linux child without glibc setxid coordination.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn setuid_in_child(uid: Uid) -> std::io::Result<()> {
+    // Set all three IDs explicitly so no saved privileged UID survives exec.
+    // SAFETY: SYS_setresuid accepts three uid_t values and affects only this child.
+    let raw = uid.as_raw();
+    let result = unsafe { libc::syscall(libc::SYS_setresuid, raw, raw, raw) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn geteuid_in_child() -> Uid {
+    // SAFETY: SYS_geteuid has no arguments and cannot fail.
+    Uid::from_raw(unsafe { libc::syscall(libc::SYS_geteuid) as libc::uid_t })
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn getegid_in_child() -> Gid {
+    // SAFETY: SYS_getegid has no arguments and cannot fail.
+    Gid::from_raw(unsafe { libc::syscall(libc::SYS_getegid) as libc::gid_t })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn setgid_in_child(gid: Gid) -> std::io::Result<()> {
+    nix::unistd::setgid(gid).map_err(Into::into)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn setuid_in_child(uid: Uid) -> std::io::Result<()> {
+    nix::unistd::setuid(uid).map_err(Into::into)
+}
+
+/// Resolve all NSS-backed privilege-drop inputs in the parent process.
 #[cfg(unix)]
 #[allow(clippy::similar_names)]
-pub fn drop_privileges_with_identity(
+pub(crate) fn prepare_privilege_drop(
     policy: &SandboxPolicy,
     resolved_identity: ResolvedProcessIdentity,
-) -> Result<()> {
+) -> Result<PreparedPrivilegeDrop> {
     let user_name = match policy.process.run_as_user.as_deref() {
         Some(name) if !name.is_empty() => Some(name),
         _ => None,
@@ -1975,17 +2161,16 @@ pub fn drop_privileges_with_identity(
     };
 
     // If no user/group is configured and we are running as root, fall back to
-    // "sandbox:sandbox" instead of silently keeping root.  This covers the
-    // local/dev-mode path for drivers that provide no identity metadata.
-    // For non-root runtimes, the no-op is safe -- we are already unprivileged.
+    // "sandbox:sandbox" instead of silently keeping root. For non-root
+    // runtimes, the no-op is safe -- they are already unprivileged.
     if user_name.is_none() && group_name.is_none() {
         if nix::unistd::geteuid().is_root() {
             let mut fallback = policy.clone();
             fallback.process.run_as_user = Some("sandbox".into());
             fallback.process.run_as_group = Some("sandbox".into());
-            return drop_privileges_with_identity(&fallback, resolved_identity);
+            return prepare_privilege_drop(&fallback, resolved_identity);
         }
-        return Ok(());
+        return Ok(PreparedPrivilegeDrop::noop());
     }
 
     // Resolve UID: numeric values are used directly; names resolve via passwd.
@@ -2006,7 +2191,7 @@ pub fn drop_privileges_with_identity(
     };
 
     // Resolve group: if a numeric GID is configured use it directly.
-    // Otherwise try name resolution, then fall back to current user's primary group.
+    // Otherwise try name resolution, then fall back to the user's primary group.
     let target_gid = match resolved_identity.gid() {
         Some(gid) => Gid::from_raw(gid),
         None => match group_name {
@@ -2030,116 +2215,139 @@ pub fn drop_privileges_with_identity(
                         .gid,
                 )
                 .into_diagnostic()?
-                .map_or_else(nix::unistd::getegid, |g| g.gid),
+                .map_or_else(nix::unistd::getegid, |group| group.gid),
             },
         },
     };
 
-    // Resolve the name for initgroups only for the existing explicit-policy
-    // path. OCI-derived users carry a numeric UID from the bounded parser and
-    // must not be looked up again through NSS.
-    let user_name_is_numeric = user_name.is_some_and(|n| n.parse::<u32>().is_ok());
-    let initgroups_name =
-        if user_name.is_some() && !user_name_is_numeric && resolved_identity.uid().is_none() {
-            Some(
-                User::from_uid(target_uid)
-                    .into_diagnostic()?
-                    .ok_or_else(|| {
-                        miette::miette!("Failed to resolve user record for UID {target_uid}")
-                    })?
-                    .name,
-            )
-        } else {
-            None
-        };
-
-    if target_uid != nix::unistd::geteuid() {
-        if resolved_identity.uses_oci_user_fallback() {
-            // OCI named users use the bounded /etc/group parser shared with
-            // workspace validation. Numeric OCI users resolve to an empty
-            // list. Never retain the root supervisor's inherited groups.
-            #[cfg(not(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "haiku",
-                target_os = "redox"
-            )))]
-            {
-                let (_, _, supplementary_gids) =
-                    resolve_filesystem_identity(policy, resolved_identity)?;
-                nix::unistd::setgroups(&supplementary_gids).into_diagnostic()?;
-            }
-        } else if let Some(ref user_name) = initgroups_name {
-            let user_cstr = CString::new(user_name.as_str())
-                .map_err(|_| miette::miette!("Invalid user name"))?;
-            #[cfg(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "haiku",
-                target_os = "redox"
-            ))]
-            {
-                let _ = user_cstr;
-            }
-            #[cfg(not(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "haiku",
-                target_os = "redox"
-            )))]
-            {
-                nix::unistd::initgroups(user_cstr.as_c_str(), target_gid).into_diagnostic()?;
-            }
-        }
-    }
-
-    if target_gid != nix::unistd::getegid() {
-        nix::unistd::setgid(target_gid).into_diagnostic()?;
-    }
-
-    // Verify effective GID actually changed (defense-in-depth, CWE-250 / CERT POS37-C)
-    let effective_gid = nix::unistd::getegid();
-    if effective_gid != target_gid {
-        return Err(miette::miette!(
-            "Privilege drop verification failed: expected effective GID {}, got {}",
+    // Match initgroups(3) semantics in the parent, then carry the numeric
+    // result across fork. OCI-derived identities use the bounded account-file
+    // parser so their preserved declaration is never re-resolved through NSS.
+    let supplementary_gids = if target_uid == nix::unistd::geteuid() {
+        None
+    } else if resolved_identity.uses_oci_user_fallback() {
+        let (_, _, groups) = resolve_filesystem_identity(policy, resolved_identity)?;
+        Some(groups)
+    } else if user_name.is_some_and(|name| name.parse::<u32>().is_err()) {
+        let canonical_user = User::from_uid(target_uid)
+            .into_diagnostic()?
+            .ok_or_else(|| miette::miette!("Failed to resolve user record for UID {target_uid}"))?;
+        Some(named_user_supplementary_groups(
+            &canonical_user.name,
             target_gid,
-            effective_gid
-        ));
+        )?)
+    } else {
+        None
+    };
+
+    Ok(PreparedPrivilegeDrop {
+        target_uid,
+        target_gid,
+        supplementary_gids,
+        set_user: user_name.is_some(),
+        noop: false,
+    })
+}
+
+/// Apply a pre-resolved privilege drop.
+///
+/// This function is called after `fork()` from `Command::pre_exec`; keep the
+/// successful path limited to credential and capability syscalls.
+#[cfg(unix)]
+#[allow(clippy::similar_names)]
+pub(crate) fn apply_prepared_privilege_drop(
+    prepared: &PreparedPrivilegeDrop,
+) -> std::io::Result<()> {
+    if prepared.noop {
+        return Ok(());
+    }
+
+    if let Some(groups) = prepared.supplementary_gids.as_deref() {
+        #[cfg(target_os = "linux")]
+        setgroups_in_child(groups)?;
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "haiku",
+            target_os = "redox"
+        )))]
+        nix::unistd::setgroups(groups).map_err(std::io::Error::from)?;
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "haiku",
+            target_os = "redox"
+        ))]
+        let _ = groups;
     }
 
     #[cfg(target_os = "linux")]
-    if nix::unistd::geteuid().is_root() {
-        drop_capability_bounding_set()?;
+    let effective_gid = getegid_in_child();
+    #[cfg(not(target_os = "linux"))]
+    let effective_gid = nix::unistd::getegid();
+    if prepared.target_gid != effective_gid {
+        setgid_in_child(prepared.target_gid)?;
     }
 
-    if user_name.is_some() {
-        if target_uid != nix::unistd::geteuid() {
-            nix::unistd::setuid(target_uid).into_diagnostic()?;
+    // Verify effective GID actually changed (defense-in-depth, CWE-250 / CERT POS37-C).
+    #[cfg(target_os = "linux")]
+    let effective_gid = getegid_in_child();
+    #[cfg(not(target_os = "linux"))]
+    let effective_gid = nix::unistd::getegid();
+    if effective_gid != prepared.target_gid {
+        write_pre_exec_error(b"openshell pre_exec: gid verification failed\n");
+        return Err(std::io::Error::from_raw_os_error(libc::EBADE));
+    }
+
+    #[cfg(target_os = "linux")]
+    if geteuid_in_child().is_root()
+        && let Err(err) = drop_capability_bounding_set()
+    {
+        write_pre_exec_error(b"openshell pre_exec: capability drop failed\n");
+        return Err(err);
+    }
+
+    if prepared.set_user {
+        #[cfg(target_os = "linux")]
+        let effective_uid = geteuid_in_child();
+        #[cfg(not(target_os = "linux"))]
+        let effective_uid = nix::unistd::geteuid();
+        if prepared.target_uid != effective_uid
+            && let Err(err) = setuid_in_child(prepared.target_uid)
+        {
+            write_pre_exec_error(b"openshell pre_exec: setuid failed\n");
+            return Err(err);
         }
 
-        // Verify effective UID actually changed (defense-in-depth, CWE-250 / CERT POS37-C)
+        // Verify effective UID actually changed (defense-in-depth, CWE-250 / CERT POS37-C).
+        #[cfg(target_os = "linux")]
+        let effective_uid = geteuid_in_child();
+        #[cfg(not(target_os = "linux"))]
         let effective_uid = nix::unistd::geteuid();
-        if effective_uid != target_uid {
-            return Err(miette::miette!(
-                "Privilege drop verification failed: expected effective UID {}, got {}",
-                target_uid,
-                effective_uid
-            ));
+        if effective_uid != prepared.target_uid {
+            write_pre_exec_error(b"openshell pre_exec: uid verification failed\n");
+            return Err(std::io::Error::from_raw_os_error(libc::EBADE));
         }
 
         // Verify root cannot be re-acquired (CERT POS37-C hardening).
-        // If we dropped from root, setuid(0) must fail; success means privileges
-        // were not fully relinquished.
-        if nix::unistd::setuid(Uid::from_raw(0)).is_ok() && target_uid.as_raw() != 0 {
-            return Err(miette::miette!(
-                "Privilege drop verification failed: process can still re-acquire root (UID 0) \
-                 after switching to UID {}",
-                target_uid
-            ));
+        if setuid_in_child(Uid::from_raw(0)).is_ok() && prepared.target_uid.as_raw() != 0 {
+            write_pre_exec_error(b"openshell pre_exec: root reacquisition succeeded\n");
+            return Err(std::io::Error::from_raw_os_error(libc::EPERM));
         }
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+#[allow(clippy::similar_names)]
+pub fn drop_privileges_with_identity(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+) -> Result<()> {
+    let prepared = prepare_privilege_drop(policy, resolved_identity)?;
+    apply_prepared_privilege_drop(&prepared).into_diagnostic()
 }
 
 /// Process exit status.
@@ -2205,6 +2413,44 @@ mod tests {
     #[cfg(unix)]
     use std::mem::size_of;
     use std::process::Stdio as StdStdio;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn child_executable_with_path_separator_is_already_resolved() {
+        assert_eq!(
+            resolve_child_executable("./agent", Some(OsStr::new("/unused")))
+                .expect("relative executable with a separator should be preserved"),
+            PathBuf::from("./agent")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn child_executable_is_resolved_in_parent() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let executable = dir.path().join("agent");
+        std::fs::write(&executable, b"#!/bin/sh\n").expect("write executable");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("make executable");
+
+        let resolved = resolve_child_executable("agent", Some(dir.path().as_os_str()))
+            .expect("resolve executable");
+
+        assert_eq!(resolved, executable.canonicalize().expect("canonical path"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn child_executable_resolution_skips_non_executable_files() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        std::fs::write(dir.path().join("agent"), b"not executable")
+            .expect("write non-executable file");
+
+        let error = resolve_child_executable_in_path("agent", dir.path().as_os_str())
+            .expect_err("non-executable file must not resolve");
+
+        assert!(error.to_string().contains("was not found in PATH"));
+    }
 
     /// Helper to create a minimal `SandboxPolicy` with the given process policy.
     fn policy_with_process(process: ProcessPolicy) -> SandboxPolicy {
@@ -2431,6 +2677,75 @@ mod tests {
         } else {
             assert!(drop_privileges(&policy).is_ok());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_privilege_drop_resolves_numeric_identity_without_nss() {
+        let uid = nix::unistd::geteuid().as_raw().saturating_add(10_000);
+        let gid = nix::unistd::getegid().as_raw().saturating_add(10_000);
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(uid.to_string()),
+            run_as_group: Some(gid.to_string()),
+        });
+
+        let prepared = prepare_privilege_drop(&policy, ResolvedProcessIdentity::default())
+            .expect("numeric identity should prepare without account records");
+
+        assert_eq!(prepared.target_uid.as_raw(), uid);
+        assert_eq!(prepared.target_gid.as_raw(), gid);
+        assert_eq!(prepared.supplementary_gids, None);
+        assert!(prepared.set_user);
+        assert!(!prepared.noop);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_privilege_drop_resolves_named_user_and_groups_in_parent() {
+        let current_uid = nix::unistd::geteuid();
+        let candidate = ["root", "nobody"].into_iter().find_map(|name| {
+            User::from_name(name)
+                .ok()
+                .flatten()
+                .filter(|user| user.uid != current_uid)
+        });
+        let Some(user) = candidate else {
+            return;
+        };
+        let group = Group::from_gid(user.gid)
+            .expect("resolve named user's primary group")
+            .expect("named user's primary group exists");
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(user.name.clone()),
+            run_as_group: Some(group.name),
+        });
+
+        let prepared = prepare_privilege_drop(&policy, ResolvedProcessIdentity::default())
+            .expect("named identity should resolve before fork");
+
+        assert_eq!(prepared.target_uid, user.uid);
+        assert_eq!(prepared.target_gid, user.gid);
+        assert!(
+            prepared
+                .supplementary_gids
+                .as_ref()
+                .is_some_and(|groups| groups.contains(&user.gid)),
+            "prepared groups should preserve initgroups primary-group semantics"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_privilege_drop_rejects_unknown_name_before_fork() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("__openshell_missing_pre_exec_user__".into()),
+            run_as_group: None,
+        });
+
+        let error = prepare_privilege_drop(&policy, ResolvedProcessIdentity::default())
+            .expect_err("unknown user must fail during parent-side preparation");
+
+        assert_unknown_identity_lookup_failed(&error.to_string());
     }
 
     #[test]
