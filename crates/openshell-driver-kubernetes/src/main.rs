@@ -18,6 +18,7 @@ use openshell_driver_kubernetes::{
 #[derive(Parser, Debug)]
 #[command(name = "openshell-driver-kubernetes")]
 #[command(version = VERSION)]
+#[allow(clippy::struct_excessive_bools)]
 struct Args {
     #[arg(
         long,
@@ -100,6 +101,30 @@ struct Args {
     )]
     sidecar_process_binary_aware_network_policy: bool,
 
+    /// Corporate HTTP forward proxy for policy-approved TLS CONNECT egress.
+    #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY")]
+    https_proxy: Option<String>,
+
+    /// Comma-separated destinations that bypass the corporate proxy.
+    #[arg(long, env = "OPENSHELL_UPSTREAM_NO_PROXY")]
+    no_proxy: Option<String>,
+
+    /// Kubernetes Secret name containing the upstream proxy credential.
+    #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_AUTH_SECRET_NAME")]
+    proxy_auth_secret_name: Option<String>,
+
+    /// Kubernetes Secret key containing the upstream proxy credential.
+    #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_AUTH_SECRET_KEY")]
+    proxy_auth_secret_key: Option<String>,
+
+    /// Acknowledge cleartext Basic auth to an http:// upstream proxy.
+    #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_AUTH_ALLOW_INSECURE", action = ArgAction::SetTrue)]
+    proxy_auth_allow_insecure: bool,
+
+    /// Send destination hostnames rather than validated IPs in CONNECT.
+    #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME", action = ArgAction::SetTrue)]
+    proxy_connect_by_hostname: bool,
+
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
@@ -148,6 +173,12 @@ async fn main() -> Result<()> {
             proxy_uid: args.sidecar_proxy_uid,
             process_binary_aware_network_policy: args.sidecar_process_binary_aware_network_policy,
         },
+        https_proxy: args.https_proxy,
+        no_proxy: args.no_proxy,
+        proxy_auth_secret_name: args.proxy_auth_secret_name,
+        proxy_auth_secret_key: args.proxy_auth_secret_key,
+        proxy_auth_allow_insecure: args.proxy_auth_allow_insecure.then_some(true),
+        proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         ssh_socket_path: args.sandbox_ssh_socket_path,
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
