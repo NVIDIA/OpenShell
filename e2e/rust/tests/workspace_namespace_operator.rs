@@ -139,30 +139,39 @@ async fn operator_sandbox_in_labeled_namespace() {
     // Pre-provision the namespace with the operator label and ServiceAccount.
     provision_operator_namespace(&ns).await;
 
-    // Wait for the gateway's namespace watcher to discover it.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
     // Create a workspace matching the namespace name (operator mode: 1:1 mapping).
     let (ok, out) = run_cli(&["workspace", "create", "--name", &ns]).await;
     assert!(ok, "workspace create failed: {out}");
 
-    // Create a sandbox in the workspace.
-    let (ok, out) = run_cli(&[
-        "sandbox",
-        "create",
-        "--workspace",
-        &ns,
-        "--name",
-        "op-sb",
-        "--",
-        "echo",
-        "operator-ok",
-    ])
-    .await;
-    assert!(ok, "sandbox create failed: {out}");
+    // Poll until the gateway's namespace watcher discovers the labeled namespace
+    // and sandbox creation succeeds (up to 30s).
+    let mut sandbox_out = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (ok, out) = run_cli(&[
+            "sandbox",
+            "create",
+            "--workspace",
+            &ns,
+            "--name",
+            "op-sb",
+            "--",
+            "echo",
+            "operator-ok",
+        ])
+        .await;
+        if ok {
+            sandbox_out = out;
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("sandbox create did not succeed within 30s: {out}");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
     assert!(
-        out.contains("operator-ok"),
-        "sandbox output missing expected string: {out}"
+        sandbox_out.contains("operator-ok"),
+        "sandbox output missing expected string: {sandbox_out}"
     );
 
     // Verify the sandbox CR lives in the pre-provisioned namespace.

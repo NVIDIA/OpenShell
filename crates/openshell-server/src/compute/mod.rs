@@ -776,19 +776,11 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
-    ) -> Result<
-        (
-            Self,
-            Option<Arc<std::sync::RwLock<std::collections::BTreeSet<String>>>>,
-        ),
-        ComputeError,
-    > {
+    ) -> Result<(Self, Option<OperatorNamespaceAllowlist>), ComputeError> {
         let driver = KubernetesComputeDriver::new(config)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let operator_allowlist_arc = driver
-            .operator_allowlist()
-            .map(OperatorNamespaceAllowlist::shared);
+        let operator_allowlist_arc = driver.operator_allowlist().cloned();
         let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new(driver));
         let runtime = Self::from_driver(
             ComputeDriverKind::Kubernetes.as_str().to_string(),

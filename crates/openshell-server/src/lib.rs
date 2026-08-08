@@ -471,11 +471,7 @@ pub(crate) async fn run_server(
                 )
             }
             openshell_driver_kubernetes::WorkspaceMode::Operator => {
-                // Share the driver's allowlist Arc so the SA authenticator and
-                // the driver's namespace label watcher use the same set.
-                let allowlist = operator_allowlist.clone().unwrap_or_else(|| {
-                    Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new()))
-                });
+                let allowlist = operator_allowlist.clone().unwrap_or_default();
                 auth::k8s_sa::NamespaceValidator::Allowlist(allowlist)
             }
         };
@@ -874,7 +870,7 @@ fn unsupported_builtin_compute_driver(driver: ComputeDriverKind) -> compute::Com
 // Internal wiring helper: each argument is a distinct piece of runtime state
 // that must be passed through, so the count is justified.
 #[allow(clippy::too_many_arguments)]
-type OperatorAllowlistArc = Option<Arc<std::sync::RwLock<std::collections::BTreeSet<String>>>>;
+type OperatorAllowlistArc = Option<openshell_driver_kubernetes::OperatorNamespaceAllowlist>;
 
 async fn build_compute_runtime(
     config: &Config,

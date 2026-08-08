@@ -43,7 +43,7 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -503,15 +503,21 @@ impl KubernetesComputeDriver {
             Client::try_from(watch_kube_config).map_err(KubernetesDriverError::from_kube)?;
 
         let operator_allowlist = if matches!(config.workspace_mode, WorkspaceMode::Operator) {
-            config.operator_namespace_label.as_ref().map(|label| {
-                let allowlist = OperatorNamespaceAllowlist::new();
+            let allowlist = OperatorNamespaceAllowlist::new();
+
+            if let Some(ref label) = config.operator_namespace_label {
                 spawn_namespace_label_watcher(
                     watch_client.clone(),
                     label.clone(),
                     allowlist.clone(),
                 );
-                allowlist
-            })
+            }
+
+            if let Some(ref path) = config.operator_namespace_file {
+                spawn_namespace_file_watcher(path.into(), allowlist.clone());
+            }
+
+            Some(allowlist)
         } else {
             None
         };
@@ -689,6 +695,36 @@ impl KubernetesComputeDriver {
         }
 
         let ns_api: Api<Namespace> = Api::all(self.client.clone());
+
+        let ns = match tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.get(&ns_name)).await {
+            Ok(Ok(ns)) => ns,
+            Ok(Err(KubeError::Api(api))) if api.code == 404 => {
+                debug!(namespace = %ns_name, "managed namespace already deleted");
+                return Ok(());
+            }
+            Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
+            Err(_) => {
+                return Err(KubernetesDriverError::Message(format!(
+                    "timeout getting namespace {ns_name}"
+                )));
+            }
+        };
+
+        let labels = ns.metadata.labels.as_ref();
+        let is_owned = labels
+            .and_then(|l| l.get(LABEL_MANAGED_BY))
+            .is_some_and(|v| v == LABEL_MANAGED_BY_VALUE)
+            && labels
+                .and_then(|l| l.get(LABEL_GATEWAY_ID))
+                .is_some_and(|v| v == &self.config.gateway_id);
+        if !is_owned {
+            debug!(
+                namespace = %ns_name,
+                "namespace not owned by this gateway, skipping delete"
+            );
+            return Ok(());
+        }
+
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             ns_api.delete(&ns_name, &DeleteParams::default()),
@@ -1086,7 +1122,7 @@ impl KubernetesComputeDriver {
                 if let Some(ref allowlist) = self.operator_allowlist
                     && !allowlist.contains(workspace)
                 {
-                    return Err(KubernetesDriverError::InvalidArgument(format!(
+                    return Err(KubernetesDriverError::Precondition(format!(
                         "workspace '{workspace}' is not in the operator namespace allowlist"
                     )));
                 }
@@ -3907,33 +3943,20 @@ fn spawn_namespace_label_watcher(
             loop {
                 match stream.try_next().await {
                     Ok(Some(Event::Applied(ns))) => {
-                        if let Some(name) = ns.metadata.name.as_deref() {
-                            let inner = allowlist.shared();
-                            let mut guard = inner.write().expect("allowlist lock poisoned");
-                            if guard.insert(name.to_string()) {
-                                let count = guard.len();
-                                drop(guard);
-                                info!(
-                                    namespace = name,
-                                    total = count,
-                                    "operator namespace added to allowlist"
-                                );
-                            }
+                        if let Some(name) = ns.metadata.name.as_deref()
+                            && allowlist.insert(name.to_string())
+                        {
+                            info!(namespace = name, "operator namespace added to allowlist");
                         }
                     }
                     Ok(Some(Event::Deleted(ns))) => {
-                        if let Some(name) = ns.metadata.name.as_deref() {
-                            let inner = allowlist.shared();
-                            let mut guard = inner.write().expect("allowlist lock poisoned");
-                            if guard.remove(name) {
-                                let count = guard.len();
-                                drop(guard);
-                                info!(
-                                    namespace = name,
-                                    total = count,
-                                    "operator namespace removed from allowlist"
-                                );
-                            }
+                        if let Some(name) = ns.metadata.name.as_deref()
+                            && allowlist.remove(name)
+                        {
+                            info!(
+                                namespace = name,
+                                "operator namespace removed from allowlist"
+                            );
                         }
                     }
                     Ok(Some(Event::Restarted(namespaces))) => {
@@ -3965,8 +3988,124 @@ fn spawn_namespace_label_watcher(
 
     info!(
         label_selector = %label_selector,
-        "operator namespace label watcher started"
+        "operator namespace label watcher spawned"
     );
+}
+
+fn load_namespace_file(path: &Path) -> Result<std::collections::BTreeSet<String>, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let names: Vec<String> = serde_json::from_str(&contents)
+        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    Ok(names.into_iter().collect())
+}
+
+fn spawn_namespace_file_watcher(path: PathBuf, allowlist: OperatorNamespaceAllowlist) {
+    match load_namespace_file(&path) {
+        Ok(names) => {
+            let count = names.len();
+            allowlist.replace(names);
+            info!(
+                path = %path.display(),
+                total = count,
+                "operator namespace allowlist loaded from file"
+            );
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to load initial operator namespace file, allowlist empty"
+            );
+        }
+    }
+
+    let watch_dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let debounce = Duration::from_secs(1);
+
+    tokio::spawn(async move {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let mut watcher =
+            match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res
+                    && matches!(
+                        event.kind,
+                        notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+                    )
+                {
+                    let _ = tx.send(());
+                }
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "failed to start operator namespace file watcher, hot-reload disabled"
+                    );
+                    return;
+                }
+            };
+
+        if let Err(e) = notify::Watcher::watch(
+            &mut watcher,
+            &watch_dir,
+            notify::RecursiveMode::NonRecursive,
+        ) {
+            warn!(
+                error = %e,
+                dir = %watch_dir.display(),
+                "failed to watch operator namespace file directory, hot-reload disabled"
+            );
+            return;
+        }
+
+        info!(
+            path = %path.display(),
+            "operator namespace file watcher started"
+        );
+
+        loop {
+            let got_event = rx.recv().await.is_some();
+            if !got_event {
+                warn!("operator namespace file watcher disconnected");
+                break;
+            }
+
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(debounce) => {
+                        match load_namespace_file(&path) {
+                            Ok(names) => {
+                                let count = names.len();
+                                allowlist.replace(names);
+                                info!(
+                                    total = count,
+                                    "operator namespace allowlist reloaded from file"
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    error = %err,
+                                    "failed to reload operator namespace file, keeping existing allowlist"
+                                );
+                            }
+                        }
+                        break;
+                    }
+                    r = rx.recv() => {
+                        if r.is_some() {
+                            continue;
+                        }
+                        warn!("operator namespace file watcher disconnected");
+                        return;
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]

@@ -26,8 +26,8 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Error as KubeError;
 use kube::api::{Api, ApiResource, PostParams};
 use kube::core::{DynamicObject, gvk::GroupVersionKind};
-use std::collections::BTreeSet;
-use std::sync::{Arc, RwLock};
+use openshell_driver_kubernetes::OperatorNamespaceAllowlist;
+use std::sync::Arc;
 use tonic::Status;
 use tracing::{debug, info, warn};
 
@@ -146,7 +146,7 @@ pub enum NamespaceValidator {
     /// (`openshell-{gateway_id}-`).
     Prefix(String),
     /// Operator mode: accept namespaces in the dynamic allowlist.
-    Allowlist(Arc<RwLock<BTreeSet<String>>>),
+    Allowlist(OperatorNamespaceAllowlist),
 }
 
 impl NamespaceValidator {
@@ -154,7 +154,7 @@ impl NamespaceValidator {
         match self {
             Self::Exact(expected) => namespace == expected,
             Self::Prefix(prefix) => namespace.starts_with(prefix.as_str()),
-            Self::Allowlist(set) => set.read().is_ok_and(|s| s.contains(namespace)),
+            Self::Allowlist(al) => al.contains(namespace),
         }
     }
 }
@@ -842,11 +842,11 @@ mod tests {
 
     #[test]
     fn namespace_validator_allowlist_accepts_known_namespaces() {
-        let set = Arc::new(RwLock::new(BTreeSet::from([
+        let al = OperatorNamespaceAllowlist::from_set(std::collections::BTreeSet::from([
             "ns-a".to_string(),
             "ns-b".to_string(),
-        ])));
-        let v = NamespaceValidator::Allowlist(set);
+        ]));
+        let v = NamespaceValidator::Allowlist(al);
         assert!(v.accepts("ns-a"));
         assert!(v.accepts("ns-b"));
         assert!(!v.accepts("ns-c"));

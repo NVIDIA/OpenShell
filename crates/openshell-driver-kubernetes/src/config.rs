@@ -293,8 +293,8 @@ pub struct KubernetesComputeConfig {
     /// this label and builds the allowlist dynamically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_namespace_label: Option<String>,
-    /// Path to a drop-in JSON file mapping workspace names to namespace names.
-    /// Hot-reloaded on change. Delivered via `ConfigMap` volume mount.
+    /// Path to a JSON file containing an array of namespace names allowed in
+    /// operator mode. Hot-reloaded on change. Delivered via `ConfigMap` volume mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_namespace_file: Option<String>,
     /// Kubernetes `ServiceAccount` assigned to sandbox pods and accepted by
@@ -743,8 +743,14 @@ impl KubernetesComputeConfig {
             WorkspaceMode::Operator => {
                 if self.operator_namespace_label.is_none() && self.operator_namespace_file.is_none()
                 {
-                    return Err("operator workspace mode requires at least one of \
+                    return Err("operator workspace mode requires exactly one of \
                          operator_namespace_label or operator_namespace_file"
+                        .into());
+                }
+                if self.operator_namespace_label.is_some() && self.operator_namespace_file.is_some()
+                {
+                    return Err("operator workspace mode requires exactly one of \
+                         operator_namespace_label or operator_namespace_file, not both"
                         .into());
                 }
                 if let Some(ref label) = self.operator_namespace_label
@@ -856,6 +862,22 @@ impl OperatorNamespaceAllowlist {
             .read()
             .expect("allowlist lock poisoned")
             .contains(namespace)
+    }
+
+    /// Insert a namespace into the allowlist. Returns `true` if it was new.
+    pub fn insert(&self, name: String) -> bool {
+        self.inner
+            .write()
+            .expect("allowlist lock poisoned")
+            .insert(name)
+    }
+
+    /// Remove a namespace from the allowlist. Returns `true` if it was present.
+    pub fn remove(&self, name: &str) -> bool {
+        self.inner
+            .write()
+            .expect("allowlist lock poisoned")
+            .remove(name)
     }
 
     /// Return a clone of the inner `Arc` for sharing with background tasks.

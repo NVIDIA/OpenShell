@@ -251,11 +251,11 @@ server:
       # "managed": auto-creates per-workspace namespaces.
       # "operator": uses pre-provisioned namespaces.
       workspaceMode: "shared"
-      # -- (operator mode) K8s label selector for namespace discovery.
+      # -- K8s label selector for namespace discovery in operator mode.
       # The driver watches namespaces matching this label.
       operatorNamespaceLabel: ""
-      # -- (operator mode) Path to a drop-in JSON file mapping workspace
-      # names to namespace names. Hot-reloaded on change.
+      # -- Path to a JSON file containing an array of namespace names
+      # allowed in operator mode. Hot-reloaded on change.
       operatorNamespaceFile: ""
   # -- Disable TLS entirely - the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
