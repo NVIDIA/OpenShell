@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1.4
+
+# Multi-stage gateway build for OpenShift BuildConfig.
+# Compiles openshell-gateway from source with bundled Z3.
+
+FROM registry.access.redhat.com/ubi9/ubi:latest AS builder
+
+RUN dnf install -y --setopt=tsflags=nodocs \
+    gcc-toolset-15-gcc gcc-toolset-15-gcc-c++ gcc-toolset-15-libstdc++-devel \
+    gcc-toolset-15-libatomic-devel gcc-toolset-15-binutils \
+    make cmake openssl-devel pkg-config perl-FindBin perl-File-Compare \
+    clang-libs clang-devel llvm-devel \
+    && dnf clean all
+
+ENV PATH="/opt/rh/gcc-toolset-15/root/usr/bin:${PATH}" \
+    CC=gcc CXX=g++ \
+    LD_LIBRARY_PATH="/opt/rh/gcc-toolset-15/root/usr/lib64"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --default-toolchain 1.95.0 --profile minimal
+ENV PATH="/root/.cargo/bin:/opt/rh/gcc-toolset-15/root/usr/bin:${PATH}"
+
+WORKDIR /build
+COPY . .
+
+RUN cargo build --release -p openshell-server --features bundled-z3 \
+    && strip target/release/openshell-gateway
+
+# --- runtime ---
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+
+COPY --from=builder /build/target/release/openshell-gateway /usr/local/bin/openshell-gateway
+
+USER 1000:1000
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/openshell-gateway"]
+CMD ["--bind-address", "0.0.0.0", "--port", "8080"]

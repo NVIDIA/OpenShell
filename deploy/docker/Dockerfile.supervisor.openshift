@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1.4
+
+# Multi-stage supervisor build for OpenShift BuildConfig.
+# Compiles a static musl binary of openshell-sandbox.
+
+FROM registry.access.redhat.com/ubi9/ubi:latest AS builder
+
+RUN dnf install -y --setopt=tsflags=nodocs \
+    gcc gcc-c++ make openssl-devel pkg-config \
+    perl-FindBin perl-File-Compare \
+    && dnf clean all
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --default-toolchain 1.95.0 --profile minimal \
+    && /root/.cargo/bin/rustup target add x86_64-unknown-linux-musl
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install musl-gcc (not in UBI repos, build from source)
+RUN curl -fsSL https://musl.libc.org/releases/musl-1.2.5.tar.gz | tar xz \
+    && cd musl-1.2.5 \
+    && ./configure --prefix=/usr/local/musl --disable-shared \
+    && make -j$(nproc) && make install \
+    && cd .. && rm -rf musl-1.2.5 \
+    && ln -s /usr/local/musl/bin/musl-gcc /usr/local/bin/musl-gcc
+
+ENV CC_x86_64_unknown_linux_musl=musl-gcc
+
+WORKDIR /build
+COPY . .
+
+RUN cargo build --release -p openshell-sandbox \
+    --target x86_64-unknown-linux-musl \
+    && strip target/x86_64-unknown-linux-musl/release/openshell-sandbox
+
+# --- runtime ---
+FROM scratch
+
+COPY --chmod=0550 --from=builder \
+    /build/target/x86_64-unknown-linux-musl/release/openshell-sandbox \
+    /openshell-sandbox
+
+ENTRYPOINT ["/openshell-sandbox"]
