@@ -726,6 +726,9 @@ pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
     let num: i64 = num_str
         .parse()
         .map_err(|_| miette::miette!("invalid duration: {s} (expected e.g. 5m, 1h, 30s)"))?;
+    if num < 0 {
+        return Err(miette::miette!("duration must not be negative: {s}"));
+    }
     let multiplier = match unit {
         "s" => 1_000,
         "m" => 60_000,
@@ -736,7 +739,8 @@ pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
             ));
         }
     };
-    Ok(num * multiplier)
+    num.checked_mul(multiplier)
+        .ok_or_else(|| miette::miette!("duration value is too large: {s}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -974,5 +978,25 @@ mod tests {
 
         let err = parse_duration_to_ms("\u{20ac}").expect_err("missing number should error");
         assert!(err.to_string().contains("invalid duration"));
+    }
+
+    #[test]
+    fn parse_duration_to_ms_rejects_overflow() {
+        let err = parse_duration_to_ms("100000000000000h").expect_err("overflow should error");
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn parse_duration_to_ms_rejects_negative() {
+        let err = parse_duration_to_ms("-5m").expect_err("negative duration should error");
+        assert!(err.to_string().contains("negative"));
+    }
+
+    #[test]
+    fn parse_duration_to_ms_accepts_zero_and_valid() {
+        assert_eq!(parse_duration_to_ms("0s").unwrap(), 0);
+        assert_eq!(parse_duration_to_ms("30s").unwrap(), 30_000);
+        assert_eq!(parse_duration_to_ms("5m").unwrap(), 300_000);
+        assert_eq!(parse_duration_to_ms("2h").unwrap(), 7_200_000);
     }
 }
