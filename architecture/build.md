@@ -68,6 +68,31 @@ The gateway bundles z3 into the release binary so Linux packages, standalone
 tarballs, and gateway images do not depend on distro-specific z3 shared-library
 SONAMEs.
 
+The supervisor is the one binary whose libc is selectable, because it is the one
+binary executed inside a userland OpenShell does not control. `SUPERVISOR_LIBC`
+chooses between `musl` (default) and `glibc-static`. Both produce a fully static
+binary; the choice does not change the runtime layout or the supervisor image base.
+Static linkage is a hard requirement rather than a preference, so both variants
+are verified by `tasks/scripts/verify-static-binary.sh`, which fails the build on
+any `PT_INTERP` or `DT_NEEDED` entry.
+
+The two variants differ only in build-time constraints:
+
+| | `musl` (default) | `glibc-static` |
+|---|---|---|
+| Cross-compiles | yes, via `cargo zigbuild` | no — must build natively per architecture |
+| Host requirement | zig + cargo-zigbuild | glibc static libraries (`glibc-static` on Fedora/RHEL, `libc6-dev` on Debian/Ubuntu) |
+| libc license | MIT | LGPL-2.1-or-later, statically linked |
+
+`cargo zigbuild` cannot produce the `glibc-static` variant: `zig cc` accepts
+`-static` for `*-linux-gnu` targets and emits a dynamically linked binary
+anyway. The staging script therefore refuses to cross-compile that variant
+instead of silently degrading linkage.
+
+Selecting `glibc-static` statically links LGPL glibc into a redistributed
+binary, which carries relinking obligations that musl (MIT) does not. Treat the
+default as the shipping configuration unless that has been reviewed.
+
 ## Container Builds
 
 The Docker image pipeline is a two-step flow: build the Rust binary natively
@@ -91,9 +116,11 @@ package-managed VM support does not raise the package runtime requirement.
 Gateway staging and release workflows set up the Zig C/C++ wrapper before
 bundled Z3 builds and verify the maximum referenced `GLIBC_*` symbol version
 before publishing or copying artifacts.
-Supervisor binaries remain static musl and use `cargo zigbuild` when available,
-including native CPU architectures, so C dependencies are compiled for the musl
-target instead of the host GNU libc target. Local Docker image tasks infer the
+Supervisor binaries are static in every configuration. The default `musl`
+variant uses `cargo zigbuild` when available, including native CPU
+architectures, so C dependencies are compiled for the musl target instead of the
+host GNU libc target. The `glibc-static` variant uses plain `cargo build` with
+`+crt-static` and requires a native per-architecture build. Local Docker image tasks infer the
 target architecture from `DOCKER_PLATFORM` when set. Otherwise, they require
 valid container engine host metadata and fail when the engine query is
 unavailable or reports an unsupported architecture, avoiding host-kernel
@@ -114,11 +141,15 @@ Runtime layout:
   as a release artifact. Linux GNU VM driver binaries must not reference
   `GLIBC_*` symbols newer than `GLIBC_2.28`; release workflows verify this
   before publishing artifacts.
-- **Supervisor**: Alpine base with `nftables`, static musl binary at
-  `/openshell-sandbox`. Static linkage keeps the binary usable when the image
-  is mounted/extracted into sandbox environments (Docker extraction, Podman
-  image volumes, Kubernetes init-container copy-self), while `nftables` supports
-  Kubernetes supervisor sidecar egress enforcement.
+- **Supervisor**: Alpine base with `nftables`, static binary at
+  `/openshell-sandbox` (musl by default; see `SUPERVISOR_LIBC` above). Static
+  linkage keeps the binary usable when the image is mounted/extracted into
+  sandbox environments (Docker extraction, Podman image volumes, Kubernetes
+  init-container copy-self), whose libc and glibc version are not known at build
+  time, while `nftables` supports Kubernetes supervisor sidecar egress
+  enforcement. The VM driver bundles its own supervisor build
+  (`tasks/scripts/vm/build-supervisor-bundle.sh`) and does not read
+  `SUPERVISOR_LIBC`.
 
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.

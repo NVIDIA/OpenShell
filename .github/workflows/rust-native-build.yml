@@ -5,10 +5,14 @@ name: Rust Image Binary Build (openshell-gateway / openshell-sandbox / openshell
 
 # Build Rust binaries per Linux architecture before the Docker image build
 # consumes them as prebuilt artifacts. Gateway images use GNU-linked binaries
-# for the NVIDIA distroless C/C++ runtime; supervisor and cli images use musl/static
+# for the NVIDIA distroless C/C++ runtime; supervisor and cli images use static
 # binaries so the final image can remain scratch. Gateway GNU binaries are
 # built with an explicit glibc 2.28 floor so image, package, and tarball
 # artifacts share the same host portability contract.
+#
+# The supervisor libc is selectable via the `supervisor-libc` input (musl or
+# glibc-static). Both variants are fully static and are verified as such,
+# because the supervisor is executed from inside arbitrary sandbox images.
 
 on:
   workflow_call:
@@ -21,6 +25,11 @@ on:
         description: "Linux architecture to build (amd64 or arm64)"
         required: true
         type: string
+      supervisor-libc:
+        description: "libc variant for the sandbox component (musl or glibc-static)"
+        required: false
+        type: string
+        default: "musl"
       cargo-version:
         description: "Pre-computed cargo version (skips internal git-based computation)"
         required: false
@@ -76,10 +85,12 @@ jobs:
       COMPONENT: ${{ inputs.component }}
       ARCH: ${{ inputs.arch }}
       FEATURES: ${{ inputs.features }}
+      SUPERVISOR_LIBC: ${{ inputs['supervisor-libc'] }}
       # Partition the GHA sccache cache per (component, arch). Without this,
       # concurrent jobs collide on the same cache key and later-starting
-      # writers hit 409 Conflict.
-      SCCACHE_GHA_VERSION: ${{ inputs.component }}-${{ inputs.arch }}
+      # writers hit 409 Conflict. The sandbox component also partitions per
+      # libc variant so musl and glibc-static builds do not evict each other.
+      SCCACHE_GHA_VERSION: ${{ inputs.component }}-${{ inputs.arch }}${{ inputs.component == 'sandbox' && format('-{0}', inputs['supervisor-libc']) || '' }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -132,9 +143,28 @@ jobs:
               ;;
           esac
 
+          # The sandbox binary must stay fully static. musl gets there via the
+          # musl target; glibc-static uses the GNU target with +crt-static and
+          # relies on this job running natively on the target architecture,
+          # because zig cannot statically link glibc.
+          static_libc=musl
+          if [[ "$COMPONENT" == "sandbox" ]]; then
+            case "$SUPERVISOR_LIBC" in
+              musl) static_libc=musl ;;
+              glibc-static) static_libc=gnu ;;
+              *)
+                echo "unsupported supervisor-libc: $SUPERVISOR_LIBC (expected musl or glibc-static)" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
           case "$ARCH" in
             amd64)
-              if [[ "$COMPONENT" == "sandbox" || "$COMPONENT" == "cli" ]]; then
+              if [[ "$COMPONENT" == "sandbox" && "$static_libc" == "gnu" ]]; then
+                target=x86_64-unknown-linux-gnu
+                zig_target=
+              elif [[ "$COMPONENT" == "sandbox" || "$COMPONENT" == "cli" ]]; then
                 target=x86_64-unknown-linux-musl
                 zig_target=x86_64-linux-musl
               else
@@ -143,7 +173,10 @@ jobs:
               fi
               ;;
             arm64)
-              if [[ "$COMPONENT" == "sandbox" || "$COMPONENT" == "cli" ]]; then
+              if [[ "$COMPONENT" == "sandbox" && "$static_libc" == "gnu" ]]; then
+                target=aarch64-unknown-linux-gnu
+                zig_target=
+              elif [[ "$COMPONENT" == "sandbox" || "$COMPONENT" == "cli" ]]; then
                 target=aarch64-unknown-linux-musl
                 zig_target=aarch64-linux-musl
               else
@@ -167,7 +200,7 @@ jobs:
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
-          shared-key: rust-native-${{ inputs.component }}-${{ inputs.arch }}-zig-wrapper-${{ hashFiles('tasks/scripts/setup-zig-cc-wrapper.sh') }}
+          shared-key: rust-native-${{ inputs.component }}-${{ inputs.arch }}${{ inputs.component == 'sandbox' && format('-{0}', inputs['supervisor-libc']) || '' }}-zig-wrapper-${{ hashFiles('tasks/scripts/setup-zig-cc-wrapper.sh') }}
           cache-directories: .cache/sccache
           cache-targets: "true"
 
@@ -239,6 +272,11 @@ jobs:
             cargo_cmd=(cargo zigbuild)
             build_target="${{ steps.target.outputs.zig_target }}"
             args+=(--features bundled-z3)
+          elif [[ "${{ inputs.component }}" == "sandbox" && "$SUPERVISOR_LIBC" == "glibc-static" ]]; then
+            # Static glibc requires the native toolchain's libc.a (build-essential
+            # in the CI image); cargo-zigbuild is not usable here because zig
+            # accepts -static for *-linux-gnu and links dynamically anyway.
+            export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
           fi
           args+=(
             --release
@@ -275,6 +313,13 @@ jobs:
           set -euo pipefail
           BIN="target/${{ steps.target.outputs.target }}/release/${{ steps.target.outputs.binary }}"
           tasks/scripts/verify-glibc-symbols.sh 2.28 "$BIN"
+
+      - name: Verify static linkage
+        if: inputs.component == 'sandbox'
+        run: |
+          set -euo pipefail
+          BIN="target/${{ steps.target.outputs.target }}/release/${{ steps.target.outputs.binary }}"
+          tasks/scripts/verify-static-binary.sh "$BIN"
 
       - name: Stage binary for prebuilt layout
         run: |
