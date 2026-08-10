@@ -11,7 +11,8 @@ use crate::config::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Volume, VolumeMount,
+    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Volume,
+    VolumeMount,
 };
 use kube::api::{
     Api, ApiResource, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions,
@@ -100,6 +101,7 @@ const SANDBOX_VERSION_V1BETA1: &str = "v1beta1";
 const SANDBOX_VERSION_V1ALPHA1: &str = "v1alpha1";
 const SANDBOX_VERSIONS: &[&str] = &[SANDBOX_VERSION_V1BETA1, SANDBOX_VERSION_V1ALPHA1];
 pub const SANDBOX_KIND: &str = "Sandbox";
+const SANDBOX_POD_NAME_ANNOTATION: &str = "agents.x-k8s.io/pod-name";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const SPIFFE_WORKLOAD_API_VOLUME_NAME: &str = "spiffe-workload-api";
@@ -936,9 +938,11 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
-        let (agent_sandbox_api, kube_name, suspend_timeout) = self
+        let (agent_sandbox_api, kube_name, pod_name, suspend_timeout) = self
             .patch_sandbox_operating_state(sandbox_id, false)
             .await?;
+        let legacy_pod_api = (agent_sandbox_api.resource.version == SANDBOX_VERSION_V1ALPHA1)
+            .then(|| Api::<Pod>::namespaced(self.client.clone(), &self.config.namespace));
 
         let deadline = tokio::time::Instant::now() + suspend_timeout;
         let mut poll_interval = SUSPEND_INITIAL_POLL_INTERVAL;
@@ -963,7 +967,12 @@ impl KubernetesComputeDriver {
                     )
                 })?
                 .map_err(|err| err.to_string())?;
-            if kubernetes_sandbox_is_suspended(&object) {
+            if kubernetes_sandbox_has_suspended_condition(&object) {
+                return Ok(());
+            }
+            if let Some(pod_api) = legacy_pod_api.as_ref()
+                && kubernetes_sandbox_pod_is_gone(pod_api, &pod_name, deadline).await?
+            {
                 return Ok(());
             }
             let now = tokio::time::Instant::now();
@@ -988,7 +997,7 @@ impl KubernetesComputeDriver {
         &self,
         sandbox_id: &str,
         running: bool,
-    ) -> Result<(AgentSandboxApi, String, Duration), String> {
+    ) -> Result<(AgentSandboxApi, String, String, Duration), String> {
         let agent_sandbox_api = self
             .supported_agent_sandbox_api(self.client.clone())
             .await?;
@@ -1018,6 +1027,13 @@ impl KubernetesComputeDriver {
             .metadata
             .name
             .ok_or_else(|| "sandbox resource has no name".to_string())?;
+        let pod_name = object
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(SANDBOX_POD_NAME_ANNOTATION))
+            .cloned()
+            .unwrap_or_else(|| kube_name.clone());
         let resource_version = object.metadata.resource_version.unwrap_or_default();
         let desired = sandbox_operating_state_patch(
             &agent_sandbox_api.resource.version,
@@ -1047,7 +1063,7 @@ impl KubernetesComputeDriver {
             running,
             "Updated Kubernetes sandbox operating state"
         );
-        Ok((agent_sandbox_api, kube_name, suspend_timeout))
+        Ok((agent_sandbox_api, kube_name, pod_name, suspend_timeout))
     }
 
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
@@ -3244,7 +3260,7 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
     })
 }
 
-fn kubernetes_sandbox_is_suspended(obj: &DynamicObject) -> bool {
+fn kubernetes_sandbox_has_suspended_condition(obj: &DynamicObject) -> bool {
     obj.data
         .get("status")
         .and_then(|status| status.get("conditions"))
@@ -3258,12 +3274,28 @@ fn kubernetes_sandbox_is_suspended(obj: &DynamicObject) -> bool {
                         .is_some_and(|status| status.eq_ignore_ascii_case("true"))
             })
         })
-        || obj
-            .data
-            .get("status")
-            .and_then(|status| status.get("replicas"))
-            .and_then(serde_json::Value::as_i64)
-            == Some(0)
+}
+
+async fn kubernetes_sandbox_pod_is_gone(
+    pod_api: &Api<Pod>,
+    pod_name: &str,
+    deadline: tokio::time::Instant,
+) -> Result<bool, String> {
+    let request_timeout =
+        KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+    if request_timeout.is_zero() {
+        return Ok(false);
+    }
+
+    match tokio::time::timeout(request_timeout, pod_api.get(pod_name)).await {
+        Ok(Ok(_)) => Ok(false),
+        Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(true),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(format!(
+            "timed out after {}s waiting for Kubernetes API while checking sandbox pod termination",
+            request_timeout.as_secs()
+        )),
+    }
 }
 
 fn kubernetes_sandbox_suspend_timeout(obj: &DynamicObject) -> Duration {
@@ -3432,6 +3464,29 @@ mod tests {
             interval = next_suspend_poll_interval(interval);
             assert_eq!(interval, expected_interval);
         }
+    }
+
+    #[test]
+    fn suspended_status_requires_published_condition() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1ALPHA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.data = serde_json::json!({"status": {"replicas": 0}});
+
+        assert!(
+            !kubernetes_sandbox_has_suspended_condition(&sandbox),
+            "v1alpha1 omits a zero status replica count on the wire; it is not a usable completion signal"
+        );
+
+        sandbox.data = serde_json::json!({
+            "status": {
+                "conditions": [{"type": "Suspended", "status": "True"}]
+            }
+        });
+        assert!(kubernetes_sandbox_has_suspended_condition(&sandbox));
     }
 
     #[test]
