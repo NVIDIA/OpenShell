@@ -301,11 +301,7 @@ brew install bazelisk
 npm install -g @bazel/bazelisk
 ```
 
-Bazel builds Z3 from source, so no system Z3 installation is needed when using Bazel. If you have previously built with Cargo, add Cargo's output directory to `.bazelignore` to prevent conflicts:
-
-```bash
-echo "target" >> .bazelignore
-```
+Bazel builds Z3 from source, so no system Z3 installation is needed when using Bazel. The repository's `.bazelignore` excludes Cargo's `target` directory to prevent conflicts with existing Cargo build output.
 
 ### macOS build tools
 
