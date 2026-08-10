@@ -6,8 +6,9 @@ pub mod driver;
 pub mod grpc;
 
 pub use config::{
-    AppArmorProfile, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
-    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, KubernetesSidecarConfig,
+    AppArmorProfile, DEFAULT_DISRUPTION_PROTECTION_MAX_DURATION, DEFAULT_GATEWAY_ID,
+    DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,
+    KubernetesComputeConfig, KubernetesDisruptionProtectionConfig, KubernetesSidecarConfig,
     ManagedSshIngressConfig, OperatorNamespaceAllowlist, SupervisorSideloadMethod,
     SupervisorTopology, WorkspaceMode, managed_namespace_prefix,
 };

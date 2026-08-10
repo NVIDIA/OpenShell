@@ -20,6 +20,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 E2E_FEATURES="${OPENSHELL_E2E_KUBERNETES_FEATURES:-e2e,e2e-host-gateway,e2e-kubernetes}"
+DISRUPTION_PROTECTION_VALUES="e2e/kubernetes/disruption-protection-values.yaml"
+if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
+  export OPENSHELL_E2E_KUBE_EXTRA_VALUES="${OPENSHELL_E2E_KUBE_EXTRA_VALUES}:${DISRUPTION_PROTECTION_VALUES}"
+else
+  export OPENSHELL_E2E_KUBE_EXTRA_VALUES="${DISRUPTION_PROTECTION_VALUES}"
+fi
 
 # Docker and Podman build their local gateway and CLI together in the shared
 # gateway wrapper. Kubernetes consumes published gateway images, so only its

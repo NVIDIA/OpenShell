@@ -544,6 +544,13 @@ proxy_uid                      = 1337
 # inspection capabilities, and enforce endpoint/L7 policy without matching
 # policy.binaries.
 process_binary_aware_network_policy = true
+
+[openshell.drivers.kubernetes.disruption_protection]
+# Disabled by default. Enabling this permits, but does not automatically add,
+# per-sandbox PodDisruptionBudgets.
+enabled      = false
+# Maximum duration accepted from sandbox Kubernetes driver config.
+max_duration = "24h"
 ```
 
 In managed workspace mode, the Kubernetes driver copies each explicitly named

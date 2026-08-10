@@ -31,6 +31,16 @@ rules:
       - get
       - list
       - watch
+  - apiGroups:
+      - policy
+    resources:
+      - poddisruptionbudgets
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
   # Per-sandbox identity: TokenReview authenticates the projected token from
   # the configured sandbox service account, then the gateway resolves the
   # returned pod name and UID to the pod's `openshell.io/sandbox-id`

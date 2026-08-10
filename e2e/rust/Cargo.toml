@@ -102,6 +102,11 @@ path = "tests/kubernetes_corporate_proxy.rs"
 required-features = ["e2e-kubernetes"]
 
 [[test]]
+name = "kubernetes_disruption_protection"
+path = "tests/kubernetes_disruption_protection.rs"
+required-features = ["e2e-kubernetes"]
+
+[[test]]
 name = "credential_drivers"
 path = "tests/credential_drivers.rs"
 required-features = ["e2e-kubernetes-credential-drivers"]
