@@ -454,20 +454,24 @@ pub(crate) async fn run_server(
         // namespace and service account used by the Kubernetes driver.
         let kubernetes_config =
             compute::driver_config::kubernetes_config_for_k8s_sa_bootstrap(config_file.as_ref())?;
-        let sandbox_namespace = kubernetes_config.namespace;
+        let sandbox_namespaces = kubernetes_config
+            .sandbox_namespaces()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
         let sandbox_service_account = kubernetes_config.service_account_name;
         match kube::Client::try_default().await {
             Ok(client) => {
                 let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
                     client,
-                    &sandbox_namespace,
+                    sandbox_namespaces.clone(),
                     "openshell-gateway".to_string(),
                     sandbox_service_account.clone(),
                 ));
                 let authenticator = auth::k8s_sa::K8sServiceAccountAuthenticator::new(resolver);
                 state.k8s_sa_authenticator = Some(Arc::new(authenticator));
                 info!(
-                    namespace = %sandbox_namespace,
+                    namespaces = ?sandbox_namespaces,
                     service_account = %sandbox_service_account,
                     "K8s ServiceAccount bootstrap authenticator enabled"
                 );

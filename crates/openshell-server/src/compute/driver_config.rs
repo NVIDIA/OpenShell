@@ -67,7 +67,12 @@ pub fn kubernetes_config_for_k8s_sa_bootstrap(
             "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
         ));
     }
-    driver_config_from_file(Some(file), ComputeDriverKind::Kubernetes.as_str())
+    let config: KubernetesComputeConfig =
+        driver_config_from_file(Some(file), ComputeDriverKind::Kubernetes.as_str())?;
+    config
+        .validate_workspace_namespaces()
+        .map_err(Error::config)?;
+    Ok(config)
 }
 
 /// Build the selected Podman config from TOML plus runtime defaults.
@@ -292,6 +297,25 @@ service_account_name = "sandbox-sa"
         let cfg = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap();
         assert_eq!(cfg.namespace, "sandboxes");
         assert_eq!(cfg.service_account_name, "sandbox-sa");
+    }
+
+    #[test]
+    fn k8s_sa_bootstrap_uses_workspace_namespace_allowlist() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.gateway]
+
+[openshell.drivers.kubernetes]
+namespace = "legacy"
+workspace_namespaces = { "team-a" = "app-a", "team-b" = "app-b" }
+service_account_name = "sandbox-sa"
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap();
+        assert_eq!(cfg.namespace_for_workspace("team-a").unwrap(), "app-a");
+        assert_eq!(cfg.sandbox_namespaces(), vec!["app-a", "app-b"]);
     }
 
     #[test]

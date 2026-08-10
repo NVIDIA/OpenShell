@@ -3,7 +3,7 @@
 
 use clap::{ArgAction, Parser};
 use miette::{IntoDiagnostic, Result};
-use std::net::SocketAddr;
+use std::{collections::BTreeMap, net::SocketAddr};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -134,6 +134,7 @@ async fn main() -> Result<()> {
 
     let driver = KubernetesComputeDriver::new(KubernetesComputeConfig {
         namespace: args.sandbox_namespace,
+        workspace_namespaces: BTreeMap::default(),
         service_account_name: args.sandbox_service_account,
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),

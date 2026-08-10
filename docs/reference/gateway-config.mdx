@@ -414,6 +414,9 @@ client_ca_path = "/etc/openshell-tls/client-ca/ca.crt"
 
 [openshell.drivers.kubernetes]
 namespace                      = "agents"
+# Optional logical-workspace routing. When this map is non-empty, every
+# workspace must be listed and `namespace` is used only as the legacy default.
+workspace_namespaces           = { "team-a" = "agents-a", "team-b" = "agents-b" }
 service_account_name           = "openshell-sandbox"
 default_image                  = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy              = "IfNotPresent"

@@ -103,6 +103,24 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"openshell-sandbox"'
 
+  - it: omits workspace namespace mappings by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'workspace_namespaces\s*='
+
+  - it: renders workspace namespace mappings deterministically
+    template: templates/gateway-config.yaml
+    set:
+      server.workspaceNamespaces:
+        team-b: app-b
+        team-a: app-a
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'workspace_namespaces\s*=\s*\{\s*"team-a"\s*=\s*"app-a",\s*"team-b"\s*=\s*"app-b"\s*\}'
+
   - it: renders combined supervisor topology by default under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     asserts:

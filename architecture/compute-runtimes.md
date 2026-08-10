@@ -142,6 +142,14 @@ through the driver configuration. The Helm chart defaults sandbox agents to
 `Unconfined` so runtime/default AppArmor profiles do not block supervisor
 network namespace setup on AppArmor-enabled nodes.
 
+The Kubernetes driver can map logical workspaces to a bounded set of
+pre-provisioned namespaces. Creation resolves the namespace from the workspace;
+all other lifecycle operations reconcile across the distinct configured
+namespace set. Kubernetes ServiceAccount bootstrap authentication uses the same
+allowlist before reading a pod or its owning Sandbox CR. The driver never
+creates or deletes namespaces, and a non-empty mapping rejects unmapped
+workspaces rather than falling back to a shared namespace.
+
 Resource requirements enter the driver layer through `SandboxSpec.resource_requirements`. This includes a set of GPU requirements, where a user
 can request a specific number of GPUs or the driver-specific default behaviour.
 For all in-tree drivers, this is equivalent to selecting a single GPU.
