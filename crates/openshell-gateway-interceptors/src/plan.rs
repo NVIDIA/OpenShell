@@ -19,7 +19,7 @@ use openshell_core::proto::gateway_interceptor::v1::{
 use tokio::net::UnixStream;
 use tonic::Request;
 use tonic::codegen::http::Uri;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tower::service_fn;
 use tracing::{info, warn};
 
@@ -862,11 +862,19 @@ async fn connect_endpoint(endpoint: &str) -> Result<Channel> {
     if let Some(path) = endpoint.strip_prefix("unix://") {
         return connect_unix_endpoint(PathBuf::from(path)).await;
     }
-    Endpoint::from_shared(endpoint.to_string())
-        .map_err(|e| {
-            InterceptorError::Config(format!("invalid interceptor endpoint '{endpoint}': {e}"))
-        })?
-        .connect()
+    let mut ep = Endpoint::from_shared(endpoint.to_string()).map_err(|e| {
+        InterceptorError::Config(format!("invalid interceptor endpoint '{endpoint}': {e}"))
+    })?;
+    if ep.uri().scheme_str() == Some("https") {
+        ep = ep
+            .tls_config(ClientTlsConfig::new().with_enabled_roots())
+            .map_err(|e| {
+                InterceptorError::Config(format!(
+                    "TLS config for interceptor endpoint '{endpoint}': {e}"
+                ))
+            })?;
+    }
+    ep.connect()
         .await
         .map_err(|e| InterceptorError::Transport(format!("connect {endpoint}: {e}")))
 }
