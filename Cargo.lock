@@ -3959,6 +3959,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-pi-conversation-middleware"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "miette",
+ "openshell-core",
+ "prost-types",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "openshell-policy"
 version = "0.0.0"
 dependencies = [
@@ -4019,12 +4039,14 @@ dependencies = [
 name = "openshell-sandbox"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "clap",
  "futures",
  "miette",
  "nix 0.29.0",
  "openshell-core",
  "openshell-ocsf",
+ "openshell-pi-conversation-middleware",
  "openshell-policy",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
@@ -4032,6 +4054,7 @@ dependencies = [
  "openshell-supervisor-process",
  "prost",
  "prost-types",
+ "reqwest 0.12.28",
  "rustls 0.23.38",
  "serde",
  "serde_json",
@@ -4043,6 +4066,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

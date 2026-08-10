@@ -3224,6 +3224,7 @@ network_policies:
                             as i32,
                         max_body_bytes: 8192,
                         timeout: String::new(),
+                        ..Default::default()
                     }],
                 },
             ))
@@ -3258,6 +3259,18 @@ network_policies:
                     has_body: true,
                     ..Default::default()
                 },
+            ))
+        }
+
+        async fn evaluate_agent_conversation(
+            &self,
+            _request: tonic::Request<openshell_core::proto::AgentConversationEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::AgentConversationResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented(
+                "test service has no agent conversation binding",
             ))
         }
     }
@@ -3712,6 +3725,7 @@ network_policies:
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: self.max_body_bytes,
                     timeout: String::new(),
+                    ..Default::default()
                 }],
             }))
         }
@@ -3748,6 +3762,18 @@ network_policies:
                 result.has_body = true;
             }
             Ok(tonic::Response::new(result))
+        }
+
+        async fn evaluate_agent_conversation(
+            &self,
+            _request: tonic::Request<openshell_core::proto::AgentConversationEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::AgentConversationResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented(
+                "test service has no agent conversation binding",
+            ))
         }
     }
 

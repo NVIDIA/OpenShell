@@ -720,7 +720,7 @@ impl OpaEngine {
         Ok(())
     }
 
-    pub(crate) fn middleware_runner(&self) -> Result<ChainRunner> {
+    pub fn middleware_runner(&self) -> Result<ChainRunner> {
         self.middleware_runner
             .read()
             .map(|runner| runner.clone())
