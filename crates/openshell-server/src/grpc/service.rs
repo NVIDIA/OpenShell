@@ -30,7 +30,7 @@ pub(super) async fn handle_expose_service(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::User,
@@ -149,7 +149,7 @@ pub(super) async fn handle_get_service(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::User,
@@ -185,7 +185,7 @@ pub(super) async fn handle_list_services(
 
     let limit = super::clamp_limit(req.limit, 100, super::MAX_PAGE_SIZE);
     let endpoints: Vec<ServiceEndpoint> = if req.all_workspaces {
-        require_platform_admin(&state.admin_role, &principal)?;
+        require_platform_admin(&state.admin_policy, &principal)?;
         if !req.sandbox.is_empty() {
             return Err(Status::invalid_argument(
                 "sandbox filter is not supported with all_workspaces",
@@ -195,7 +195,7 @@ pub(super) async fn handle_list_services(
     } else {
         let authz = authorize_workspace(
             &state.store,
-            &state.admin_role,
+            &state.admin_policy,
             &principal,
             &req.workspace,
             MinWorkspaceRole::User,
@@ -239,7 +239,7 @@ pub(super) async fn handle_delete_service(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::User,
@@ -884,7 +884,7 @@ mod tests {
         }
 
         let mut state = test_server_state().await;
-        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        Arc::get_mut(&mut state).unwrap().admin_policy.admin_role = "openshell-admin".to_string();
 
         let err = handle_expose_service(
             &state,

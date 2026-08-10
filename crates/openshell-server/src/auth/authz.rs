@@ -12,6 +12,8 @@
 //! authentication is handled by explicit application-layer authenticators,
 //! authorization is a gateway concern.
 
+use std::collections::HashSet;
+
 use super::identity::Identity;
 use super::{descriptor_authz, method_authz};
 use tonic::Status;
@@ -35,6 +37,8 @@ pub struct AuthzPolicy {
     pub user_role: String,
     /// When true, enforce scope-based permissions on top of roles.
     pub scopes_enabled: bool,
+    /// OIDC subjects granted Platform Admin regardless of roles.
+    pub admin_subjects: HashSet<String>,
 }
 
 impl AuthzPolicy {
@@ -83,10 +87,12 @@ impl AuthzPolicy {
             && !required.is_empty()
         {
             // Admin role implicitly satisfies user role requirements.
+            // Admin subjects also implicitly satisfy any role requirement.
             let has_role = identity.roles.iter().any(|r| r == required)
                 || (!self.admin_role.is_empty()
                     && required == &self.user_role
-                    && identity.roles.iter().any(|r| r == &self.admin_role));
+                    && identity.roles.iter().any(|r| r == &self.admin_role))
+                || self.admin_subjects.contains(&identity.subject);
 
             if !has_role {
                 debug!(
@@ -152,6 +158,7 @@ mod tests {
             admin_role: "openshell-admin".to_string(),
             user_role: "openshell-user".to_string(),
             scopes_enabled: false,
+            admin_subjects: HashSet::new(),
         }
     }
 
@@ -160,6 +167,7 @@ mod tests {
             admin_role: "openshell-admin".to_string(),
             user_role: "openshell-user".to_string(),
             scopes_enabled: true,
+            admin_subjects: HashSet::new(),
         }
     }
 
@@ -271,6 +279,7 @@ mod tests {
             admin_role: String::new(),
             user_role: String::new(),
             scopes_enabled: false,
+            admin_subjects: HashSet::new(),
         };
         assert!(
             policy
@@ -291,6 +300,7 @@ mod tests {
             admin_role: "OpenShell.Admin".to_string(),
             user_role: "OpenShell.User".to_string(),
             scopes_enabled: false,
+            admin_subjects: HashSet::new(),
         };
         assert!(
             policy
@@ -316,6 +326,7 @@ mod tests {
             admin_role: String::new(),
             user_role: String::new(),
             scopes_enabled: false,
+            admin_subjects: HashSet::new(),
         };
         assert!(policy.validate().is_ok());
     }
@@ -326,6 +337,7 @@ mod tests {
             admin_role: "admin".to_string(),
             user_role: String::new(),
             scopes_enabled: false,
+            admin_subjects: HashSet::new(),
         };
         assert!(policy.validate().is_err());
     }
@@ -336,6 +348,7 @@ mod tests {
             admin_role: String::new(),
             user_role: "user".to_string(),
             scopes_enabled: false,
+            admin_subjects: HashSet::new(),
         };
         assert!(policy.validate().is_err());
     }
@@ -590,6 +603,7 @@ mod tests {
             admin_role: String::new(),
             user_role: String::new(),
             scopes_enabled: true,
+            admin_subjects: HashSet::new(),
         };
         let id_with_scope = identity_with_roles_and_scopes(&[], &["sandbox:read"]);
         assert!(
@@ -601,6 +615,62 @@ mod tests {
         assert!(
             policy
                 .check(&id_without_scope, "/openshell.v1.OpenShell/ListSandboxes")
+                .is_err()
+        );
+    }
+
+    // ---- Admin subjects tests ----
+
+    #[test]
+    fn admin_subject_can_access_platform_admin_methods() {
+        let policy = AuthzPolicy {
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_enabled: false,
+            admin_subjects: HashSet::from(["special-sub".to_string()]),
+        };
+        let id = Identity {
+            subject: "special-sub".to_string(),
+            display_name: None,
+            roles: vec![],
+            scopes: vec![],
+            provider: IdentityProvider::Oidc,
+        };
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/CreateWorkspace")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/GetGatewayInfo")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/ListSandboxes")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn non_admin_subject_still_denied() {
+        let policy = AuthzPolicy {
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_enabled: false,
+            admin_subjects: HashSet::from(["special-sub".to_string()]),
+        };
+        let id = Identity {
+            subject: "other-sub".to_string(),
+            display_name: None,
+            roles: vec![],
+            scopes: vec![],
+            provider: IdentityProvider::Oidc,
+        };
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/ListSandboxes")
                 .is_err()
         );
     }

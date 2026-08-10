@@ -1682,7 +1682,7 @@ async fn handle_update_config_inner(
     let req = request.into_inner();
     validate_annotations(&req.annotations, "annotations")?;
     let workspace = if req.global {
-        require_platform_admin(&state.admin_role, principal)?;
+        require_platform_admin(&state.admin_policy, principal)?;
         String::new()
     } else {
         let min_role = if sandbox_caller {
@@ -1692,7 +1692,7 @@ async fn handle_update_config_inner(
         };
         authorize_sandbox_workspace(
             &state.store,
-            &state.admin_role,
+            &state.admin_policy,
             principal,
             &req.workspace,
             min_role,
@@ -2315,12 +2315,12 @@ pub(super) async fn handle_get_sandbox_policy_status(
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = if req.global {
-        require_platform_admin(&state.admin_role, &principal)?;
+        require_platform_admin(&state.admin_policy, &principal)?;
         String::new()
     } else {
         let authz = authorize_workspace(
             &state.store,
-            &state.admin_role,
+            &state.admin_policy,
             &principal,
             &req.workspace,
             MinWorkspaceRole::User,
@@ -2383,12 +2383,12 @@ pub(super) async fn handle_list_sandbox_policies(
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = if req.global {
-        require_platform_admin(&state.admin_role, &principal)?;
+        require_platform_admin(&state.admin_policy, &principal)?;
         String::new()
     } else {
         let authz = authorize_workspace(
             &state.store,
-            &state.admin_role,
+            &state.admin_policy,
             &principal,
             &req.workspace,
             MinWorkspaceRole::User,
@@ -2930,7 +2930,7 @@ pub(super) async fn handle_get_draft_policy(
     let req = request.into_inner();
     authorize_sandbox_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::User,
@@ -3011,7 +3011,7 @@ async fn handle_approve_draft_chunk_inner(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::Admin,
@@ -3123,7 +3123,7 @@ async fn handle_reject_draft_chunk_inner(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::Admin,
@@ -3233,7 +3233,7 @@ async fn handle_approve_all_draft_chunks_inner(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::Admin,
@@ -3367,7 +3367,7 @@ pub(super) async fn handle_edit_draft_chunk(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::Admin,
@@ -3443,7 +3443,7 @@ async fn handle_undo_draft_chunk_inner(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::Admin,
@@ -3540,7 +3540,7 @@ pub(super) async fn handle_clear_draft_chunks(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::Admin,
@@ -3588,7 +3588,7 @@ pub(super) async fn handle_get_draft_history(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::User,
@@ -4893,7 +4893,7 @@ mod tests {
         use openshell_core::proto::{WorkspaceMember, WorkspaceRole};
 
         let mut state = test_server_state().await;
-        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        Arc::get_mut(&mut state).unwrap().admin_policy.admin_role = "openshell-admin".to_string();
         let sandbox = Sandbox {
             metadata: Some(ObjectMeta {
                 id: "sandbox-b-id".to_string(),
@@ -4949,7 +4949,7 @@ mod tests {
         use openshell_core::proto::{WorkspaceMember, WorkspaceRole};
 
         let mut state = test_server_state().await;
-        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        Arc::get_mut(&mut state).unwrap().admin_policy.admin_role = "openshell-admin".to_string();
         let member = WorkspaceMember {
             metadata: Some(ObjectMeta {
                 id: "default-admin-member-id".to_string(),
@@ -4984,7 +4984,7 @@ mod tests {
     #[tokio::test]
     async fn global_policy_reads_require_platform_admin() {
         let mut state = test_server_state().await;
-        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        Arc::get_mut(&mut state).unwrap().admin_policy.admin_role = "openshell-admin".to_string();
 
         let get_error = handle_get_sandbox_policy_status(
             &state,
@@ -13315,7 +13315,7 @@ mod tests {
     #[tokio::test]
     async fn non_member_gets_permission_denied_not_workspace_oracle() {
         let mut state = test_server_state().await;
-        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        Arc::get_mut(&mut state).unwrap().admin_policy.admin_role = "openshell-admin".to_string();
 
         fn non_member_request<T>(inner: T) -> Request<T> {
             let mut req = Request::new(inner);
@@ -13514,7 +13514,7 @@ mod tests {
     #[tokio::test]
     async fn id_based_policy_handlers_hide_cross_workspace_sandboxes() {
         let mut state = test_server_state().await;
-        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        Arc::get_mut(&mut state).unwrap().admin_policy.admin_role = "openshell-admin".to_string();
 
         fn non_member_request<T>(inner: T) -> Request<T> {
             let mut req = Request::new(inner);
@@ -13574,7 +13574,7 @@ mod tests {
     #[tokio::test]
     async fn get_gateway_config_accessible_without_platform_admin() {
         let mut state = test_server_state().await;
-        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        Arc::get_mut(&mut state).unwrap().admin_policy.admin_role = "openshell-admin".to_string();
 
         let mut req = Request::new(GetGatewayConfigRequest {});
         req.extensions_mut().insert(Principal::User(UserPrincipal {

@@ -751,8 +751,8 @@ pub mod test_support {
     ///
     /// The dev principal matches the unauthenticated dev user: subject
     /// `"dev-user"`, roles `["openshell-admin", "openshell-user"]`.
-    /// Since `test_server_state()` has an empty `admin_role`, `authorize_workspace()`
-    /// treats every authenticated user as Platform Admin.
+    /// Since `test_server_state()` has an empty `admin_policy.admin_role`,
+    /// `authorize_workspace()` treats every authenticated user as Platform Admin.
     pub fn authed_request<T>(inner: T) -> Request<T> {
         let mut req = Request::new(inner);
         req.extensions_mut().insert(Principal::User(UserPrincipal {

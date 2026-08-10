@@ -57,8 +57,9 @@ fn membership_filter_subject<'a>(
     match principal {
         Principal::User(u) => {
             if crate::auth::workspace_authz::is_platform_admin_principal(
+                &u.identity.subject,
                 &u.identity.roles,
-                &state.admin_role,
+                &state.admin_policy,
             ) {
                 Ok(None)
             } else {
@@ -222,7 +223,7 @@ pub(super) async fn handle_get_workspace(
     }
     authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &name,
         MinWorkspaceRole::User,
@@ -447,7 +448,7 @@ pub(super) async fn handle_add_workspace_member(
 
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::Admin,
@@ -553,7 +554,7 @@ pub(super) async fn handle_remove_workspace_member(
 
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::Admin,
@@ -589,7 +590,7 @@ pub(super) async fn handle_list_workspace_members(
 
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::User,
@@ -1472,7 +1473,7 @@ mod tests {
         }
 
         let mut state = test_server_state().await;
-        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        Arc::get_mut(&mut state).unwrap().admin_policy.admin_role = "openshell-admin".to_string();
 
         let err = handle_get_workspace(
             &state,

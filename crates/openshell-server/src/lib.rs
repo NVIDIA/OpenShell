@@ -170,10 +170,9 @@ pub struct ServerState {
     /// on demand when the user source is configured.
     pub(crate) provider_profile_sources: provider_profile_sources::ProviderProfileSources,
 
-    /// OIDC admin role name for workspace-level authorization.
-    /// Empty when OIDC is not configured — `authorize_workspace()` treats
-    /// every authenticated user as Platform Admin in that case.
-    pub admin_role: String,
+    /// Policy for determining Platform Admin status.
+    /// Bundles admin role name and admin subjects for workspace authorization.
+    pub admin_policy: auth::workspace_authz::AdminPolicy,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -202,10 +201,10 @@ impl ServerState {
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
     ) -> Self {
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
-        let admin_role = config
-            .oidc
-            .as_ref()
-            .map_or_else(String::new, |oidc| oidc.admin_role.clone());
+        let admin_policy = config.oidc.as_ref().map_or_else(
+            auth::workspace_authz::AdminPolicy::auth_only,
+            auth::workspace_authz::AdminPolicy::from_oidc,
+        );
         Self {
             config,
             store,
@@ -227,7 +226,7 @@ impl ServerState {
             gateway_interceptors: None,
             provider_profile_sources:
                 provider_profile_sources::ProviderProfileSources::with_default_sources(),
-            admin_role,
+            admin_policy,
         }
     }
 }
@@ -285,6 +284,7 @@ pub(crate) async fn run_server(
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
             scopes_enabled: !oidc.scopes_claim.is_empty(),
+            admin_subjects: oidc.admin_subjects.iter().cloned().collect(),
         };
         policy.validate().map_err(Error::config)?;
 

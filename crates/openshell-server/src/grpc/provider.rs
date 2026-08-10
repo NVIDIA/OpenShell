@@ -1335,7 +1335,7 @@ async fn authorize_and_resolve_profile_workspace(
     min_workspace_role: MinWorkspaceRole,
 ) -> Result<super::workspace::ResolvedWorkspace, Status> {
     if workspace.is_empty() {
-        require_platform_admin(&state.admin_role, principal)?;
+        require_platform_admin(&state.admin_policy, principal)?;
         Ok(super::workspace::ResolvedWorkspace {
             name: String::new(),
             terminating: false,
@@ -1343,7 +1343,7 @@ async fn authorize_and_resolve_profile_workspace(
     } else {
         let authz = authorize_workspace(
             &state.store,
-            &state.admin_role,
+            &state.admin_policy,
             principal,
             workspace,
             min_workspace_role,
@@ -1361,7 +1361,7 @@ pub(super) async fn handle_create_provider(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::Admin,
@@ -1419,7 +1419,7 @@ pub(super) async fn handle_get_provider(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::User,
@@ -1449,7 +1449,7 @@ pub(super) async fn handle_list_providers(
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
 
     let providers = if request.all_workspaces {
-        require_platform_admin(&state.admin_role, &principal)?;
+        require_platform_admin(&state.admin_policy, &principal)?;
         let all: Vec<Provider> = state
             .store
             .list_all_messages(limit, request.offset)
@@ -1459,7 +1459,7 @@ pub(super) async fn handle_list_providers(
     } else {
         let authz = authorize_workspace(
             &state.store,
-            &state.admin_role,
+            &state.admin_policy,
             &principal,
             &request.workspace,
             MinWorkspaceRole::User,
@@ -2411,7 +2411,7 @@ pub(super) async fn handle_update_provider(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::Admin,
@@ -2469,7 +2469,7 @@ pub(super) async fn handle_get_provider_refresh_status(
     let request = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &request.workspace,
         MinWorkspaceRole::User,
@@ -2522,7 +2522,7 @@ pub(super) async fn handle_configure_provider_refresh(
     let request = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &request.workspace,
         MinWorkspaceRole::Admin,
@@ -2820,7 +2820,7 @@ pub(super) async fn handle_rotate_provider_credential(
     let request = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &request.workspace,
         MinWorkspaceRole::Admin,
@@ -2888,7 +2888,7 @@ pub(super) async fn handle_delete_provider_refresh(
     let request = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &request.workspace,
         MinWorkspaceRole::Admin,
@@ -2965,7 +2965,7 @@ pub(super) async fn handle_delete_provider(
     let req = request.into_inner();
     let authz = authorize_workspace(
         &state.store,
-        &state.admin_role,
+        &state.admin_policy,
         &principal,
         &req.workspace,
         MinWorkspaceRole::Admin,
@@ -8873,7 +8873,8 @@ mod tests {
     #[tokio::test]
     async fn platform_provider_profile_operations_require_platform_admin() {
         let mut state = test_server_state().await;
-        Arc::get_mut(&mut state).unwrap().admin_role = "required-platform-admin".to_string();
+        Arc::get_mut(&mut state).unwrap().admin_policy.admin_role =
+            "required-platform-admin".to_string();
 
         let catalog_error = handle_list_provider_profiles(
             &state,
@@ -9666,7 +9667,7 @@ mod tests {
         }
 
         let mut state = test_server_state().await;
-        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+        Arc::get_mut(&mut state).unwrap().admin_policy.admin_role = "openshell-admin".to_string();
 
         // --- Regular provider handlers (9) ---
 

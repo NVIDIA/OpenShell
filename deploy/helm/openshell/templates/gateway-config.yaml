@@ -109,6 +109,9 @@ data:
     {{- if .Values.server.oidc.scopesClaim }}
     scopes_claim  = {{ .Values.server.oidc.scopesClaim | quote }}
     {{- end }}
+    {{- if .Values.server.oidc.adminSubjects }}
+    admin_subjects = [{{ range $i, $s := .Values.server.oidc.adminSubjects }}{{ if $i }}, {{ end }}{{ $s | quote }}{{ end }}]
+    {{- end }}
     {{- end }}
 
     [openshell.drivers.kubernetes]

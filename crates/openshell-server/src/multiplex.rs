@@ -286,6 +286,7 @@ impl MultiplexService {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
             scopes_enabled: !oidc.scopes_claim.is_empty(),
+            admin_subjects: oidc.admin_subjects.iter().cloned().collect(),
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
@@ -2779,6 +2780,7 @@ mod tests {
                 admin_role: "openshell-admin".to_string(),
                 user_role: "openshell-user".to_string(),
                 scopes_enabled: true,
+                admin_subjects: std::collections::HashSet::new(),
             };
 
             for path in [
