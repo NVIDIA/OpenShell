@@ -4397,11 +4397,21 @@ fn validate_merge_operations_for_server(operations: &[PolicyMergeOp]) -> Result<
 fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
     match error {
         openshell_policy::PolicyMergeError::MissingRuleNameForAddRule
+        | openshell_policy::PolicyMergeError::EmptyAddRuleEndpoints { .. }
         | openshell_policy::PolicyMergeError::InvalidEndpointReference { .. }
         | openshell_policy::PolicyMergeError::UnsupportedAccessPreset { .. } => {
             Status::invalid_argument(error.to_string())
         }
-        openshell_policy::PolicyMergeError::EndpointNotFound { .. }
+        openshell_policy::PolicyMergeError::McpContractConflict { .. }
+        | openshell_policy::PolicyMergeError::NewBinaryWouldInheritAuthorization { .. }
+        | openshell_policy::PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
+            ..
+        }
+        | openshell_policy::PolicyMergeError::UndeclaredPortWouldChange { .. }
+        | openshell_policy::PolicyMergeError::ConflictingInspectionContracts { .. }
+        | openshell_policy::PolicyMergeError::AmbiguousEndpointRule { .. }
+        | openshell_policy::PolicyMergeError::CannotRemoveBinaryFromAnyBinaryScope { .. }
+        | openshell_policy::PolicyMergeError::EndpointNotFound { .. }
         | openshell_policy::PolicyMergeError::EndpointHasNoL7Inspection { .. }
         | openshell_policy::PolicyMergeError::UnsupportedEndpointProtocol { .. }
         | openshell_policy::PolicyMergeError::EndpointHasNoAllowBase { .. } => {
@@ -5324,6 +5334,103 @@ mod tests {
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("_provider_work_github"));
         assert!(err.message().contains("reserved '_provider_' prefix"));
+    }
+
+    #[test]
+    fn policy_merge_error_mapping_distinguishes_request_shape_from_state_conflicts() {
+        let empty =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::EmptyAddRuleEndpoints {
+                operation_index: 0,
+                rule_name: "empty".to_string(),
+            });
+        assert_eq!(empty.code(), Code::InvalidArgument);
+
+        let contract =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::McpContractConflict {
+                operation_index: 1,
+                host: "mcp.example.com".to_string(),
+                port: 443,
+                existing: "mcp(max_body_bytes=65536)".to_string(),
+                incoming: "mcp(max_body_bytes=131072)".to_string(),
+            });
+        assert_eq!(contract.code(), Code::FailedPrecondition);
+
+        let inheritance = map_policy_merge_error(
+            openshell_policy::PolicyMergeError::NewBinaryWouldInheritAuthorization {
+                operation_index: 2,
+                rule_name: "existing".to_string(),
+                binary_scope: "binary '/usr/bin/client'".to_string(),
+                host: "mcp.example.com".to_string(),
+                ports: vec![443],
+            },
+        );
+        assert_eq!(inheritance.code(), Code::FailedPrecondition);
+        // The proposer has to know which binary scope triggered the rejection.
+        assert!(inheritance.message().contains("/usr/bin/client"));
+
+        let existing_scope = map_policy_merge_error(
+            openshell_policy::PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
+                operation_index: 3,
+                rule_name: "existing".to_string(),
+                host: "api.example.com".to_string(),
+                ports: vec![443],
+                undeclared_binaries: vec!["/usr/bin/other".to_string()],
+            },
+        );
+        assert_eq!(existing_scope.code(), Code::FailedPrecondition);
+        // The proposer has to know which binaries to add, so the remediation
+        // detail must survive into the status message.
+        assert!(existing_scope.message().contains("/usr/bin/other"));
+
+        // Both of these describe a well-formed request the current policy state
+        // forbids, so they are preconditions rather than argument errors.
+        let ambiguous =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::AmbiguousEndpointRule {
+                host: "api.example.com".to_string(),
+                port: 443,
+                targets: vec!["broad".to_string(), "narrow".to_string()],
+            });
+        assert_eq!(ambiguous.code(), Code::FailedPrecondition);
+        // The operator has to know which rules collide to pick a way forward.
+        assert!(ambiguous.message().contains("broad"));
+        assert!(ambiguous.message().contains("narrow"));
+
+        let undeclared_port = map_policy_merge_error(
+            openshell_policy::PolicyMergeError::UndeclaredPortWouldChange {
+                operation_index: 5,
+                rule_name: "existing".to_string(),
+                host: "api.example.com".to_string(),
+                ports: vec![8443],
+            },
+        );
+        assert_eq!(undeclared_port.code(), Code::FailedPrecondition);
+        // The proposer has to know which port to declare.
+        assert!(undeclared_port.message().contains("8443"));
+
+        let mcp_conflict = map_policy_merge_error(
+            openshell_policy::PolicyMergeError::ConflictingInspectionContracts {
+                host: "mcp.example.com".to_string(),
+                port: 443,
+                contracts: vec![
+                    "mcp(strict_tool_names=true, allow_all_known_mcp_methods=false, max_body_bytes=65536)"
+                        .to_string(),
+                    "mcp(strict_tool_names=true, allow_all_known_mcp_methods=false, max_body_bytes=131072)"
+                        .to_string(),
+                ],
+            },
+        );
+        assert_eq!(mcp_conflict.code(), Code::FailedPrecondition);
+        assert!(mcp_conflict.message().contains("131072"));
+
+        let any_binary = map_policy_merge_error(
+            openshell_policy::PolicyMergeError::CannotRemoveBinaryFromAnyBinaryScope {
+                operation_index: 4,
+                rule_name: "wide".to_string(),
+                binary_path: "/usr/bin/untrusted".to_string(),
+            },
+        );
+        assert_eq!(any_binary.code(), Code::FailedPrecondition);
+        assert!(any_binary.message().contains("/usr/bin/untrusted"));
     }
 
     // ---- Sandbox IDOR guard (issue #1354) ----
