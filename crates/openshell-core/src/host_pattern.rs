@@ -12,13 +12,13 @@ use std::collections::{HashSet, VecDeque};
 /// semantics mirror the Rego endpoint glob matching used for network policy
 /// admission (`glob.match` with a `.` delimiter), so a pattern copied from a
 /// network endpoint selects exactly the hosts that endpoint admits.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct HostPattern {
     source: String,
     labels: Vec<HostLabelPattern>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum HostLabelPattern {
     Recursive,
     Label {
@@ -130,13 +130,18 @@ impl HostPattern {
     #[must_use]
     pub fn matches(&self, host: &str) -> bool {
         let host = host.to_ascii_lowercase();
-        if host.split('.').any(str::is_empty) {
-            return false;
-        }
-        self.matches_labels(&host.split('.').collect::<Vec<_>>())
+        self.matches_normalized_labels(&host.split('.').collect::<Vec<_>>())
     }
 
-    fn matches_labels(&self, host: &[&str]) -> bool {
+    /// Match pre-split lowercase DNS labels.
+    ///
+    /// This avoids repeating request-host normalization when several compiled
+    /// patterns are evaluated against the same destination.
+    #[must_use]
+    pub(crate) fn matches_normalized_labels(&self, host: &[&str]) -> bool {
+        if host.iter().any(|label| label.is_empty()) {
+            return false;
+        }
         let mut pending = vec![(0, 0)];
         let mut visited = HashSet::new();
         while let Some((pattern_idx, host_idx)) = pending.pop() {

@@ -24,6 +24,37 @@ pub(crate) mod websocket;
 pub use openshell_policy::L7Protocol;
 use openshell_policy::{L7EndpointFields, validate_l7_endpoint_semantics};
 
+pub(crate) fn build_credential_endpoint_mismatch_finding(
+    policy_name: &str,
+    host: &str,
+    protocol: Option<&str>,
+    message: &str,
+) -> openshell_ocsf::OcsfEvent {
+    use openshell_ocsf::{
+        ActionId, ActivityId, DetectionFindingBuilder, DispositionId, FindingInfo, SeverityId,
+    };
+
+    let mut evidence = vec![("policy", policy_name), ("host", host)];
+    if let Some(protocol) = protocol {
+        evidence.push(("protocol", protocol));
+    }
+    evidence.push(("disposition", "denied"));
+
+    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .is_alert(true)
+        .finding_info(FindingInfo::new(
+            "openshell.provider_credential.endpoint_mismatch",
+            "Provider credential used at an unauthorized endpoint",
+        ))
+        .evidence_pairs(&evidence)
+        .message(message)
+        .build()
+}
+
 /// TLS handling mode for proxy connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TlsMode {
@@ -256,16 +287,7 @@ impl L7EndpointConfig {
 }
 
 pub fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
-    if pattern.is_empty() || pattern == "**" || pattern == "/**" {
-        return true;
-    }
-    if pattern == path {
-        return true;
-    }
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return path == prefix || path.starts_with(&format!("{prefix}/"));
-    }
-    glob::Pattern::new(pattern).is_ok_and(|glob| glob.matches(path))
+    openshell_core::endpoint_path::matches(pattern, path)
 }
 
 /// Parse the `tls` field from an endpoint config, independent of L7 protocol.

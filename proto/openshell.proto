@@ -1723,6 +1723,26 @@ message DeleteProviderProfileResponse {
 message GetSandboxProviderEnvironmentRequest {
   // The sandbox ID.
   string sandbox_id = 1;
+  // Whether the requesting supervisor enforces endpoint bindings for static
+  // provider credentials. Gateways withhold static credential material when
+  // this capability is absent.
+  bool supports_static_credential_bindings = 2;
+}
+
+// One network endpoint at which a static provider credential may be resolved.
+message StaticCredentialEndpointBinding {
+  string host = 1;
+  uint32 port = 2;
+  string path = 3;
+}
+
+// Endpoint allowlist for one static provider credential environment variable.
+message StaticCredentialBinding {
+  repeated StaticCredentialEndpointBinding endpoints = 1;
+  // Stable identity of the provider credential that produced this binding.
+  // Supervisors use it to retain old revision placeholders only across
+  // rotations of the same provider credential.
+  string credential_identity = 2;
 }
 
 // Get sandbox provider environment response.
@@ -1737,6 +1757,14 @@ message GetSandboxProviderEnvironmentResponse {
   // Maps endpoint-bound provider metadata to credential metadata.
   // Supervisor uses this to inject Authorization headers for token grant credentials.
   map<string, ProviderProfileCredential> dynamic_credentials = 4;
+  // Endpoint allowlists for static credential environment variables. Metadata
+  // can be incomplete when a provider profile is invalid; capable supervisors
+  // reject all static material in that snapshot while preserving independently
+  // endpoint-bound dynamic credentials.
+  map<string, StaticCredentialBinding> static_credential_bindings = 5;
+  // Environment variables that contain provider configuration rather than
+  // credentials and therefore do not require endpoint-scoped resolution.
+  repeated string non_secret_environment_keys = 6;
 }
 
 // ---------------------------------------------------------------------------

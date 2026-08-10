@@ -196,6 +196,10 @@ The high-level CI model:
 5. Gate jobs verify that the mirror branch matches the PR head, or that the merge-group workflow ran for the queued SHA, and that the expected non-gate workflow actually ran.
 6. Release workflows rebuild and publish binaries, wheels, images, and docs.
 
+Repository CI keeps telemetry compiled into release-parity artifacts but
+disables emission for Rust tests, E2E runs, and release canaries. This prevents
+synthetic activity from contributing to product usage metrics.
+
 See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 
 ## Docs Site

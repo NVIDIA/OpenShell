@@ -122,7 +122,22 @@ Bare `KEY` reads the value from the environment variable of that name and avoids
 
 Other credential sources are `--from-gcloud-adc` for compatible profiles and `--runtime-credentials` when the gateway or sandbox resolves the required credentials at runtime.
 
-Profile-backed provider policy and composition are controlled by the gateway-global `providers_v2_enabled` setting:
+Static provider credentials resolve only for hosts, ports, and paths declared by
+the provider profile. Use `provider profile export` to inspect that boundary
+when a placeholder is present but requests receive
+`credential_endpoint_mismatch`. A profileless static provider fails closed
+because the gateway cannot construct a binding.
+
+When an inspected request receives `request_authority_mismatch`, compare its
+HTTP authority with the CONNECT tunnel endpoint. The host and effective port
+must match. For a tunnel to `api.example.com:8443`, send
+`Host: api.example.com:8443`; `Host: api.example.com` omits the non-default
+port and is rejected. An absolute-form request target must use the same
+authority.
+
+Profile-backed provider policy composition is controlled by the gateway-global
+`providers_v2_enabled` setting. Static credential endpoint binding remains
+active even when policy composition is disabled:
 
 ```bash
 openshell settings get --global
@@ -367,7 +382,10 @@ provider-profile policy—before it stores a direct update, incremental merge,
 approved proposal, provider attachment, or profile update that affects attached
 sandboxes. An ambiguity failure returns `FAILED_PRECONDITION`; the rejected
 candidate does not create a policy revision or partially update affected
-sandboxes. Fix the conflicting endpoint selectors and submit again.
+sandboxes. The same fail-closed response applies when `credential_signing`
+does not have an attached AWS profile whose credential boundary covers the
+endpoint, or an explicit binding to an endpointless AWS profile. Fix the
+conflicting endpoint selectors or credential source and submit again.
 
 The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls every second). Exit codes:
 - **0**: Policy loaded successfully
@@ -514,7 +532,22 @@ When denied actions appear:
 1. Prefer incremental updates for additive network changes:
    `openshell policy update work-session --add-endpoint api.github.com:443:read-only:rest:enforce --binary /usr/bin/gh --wait`
    `openshell policy update work-session --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
-2. Use full YAML replacement for broad changes or non-network fields:
+
+   A rule authorizes every binary it lists to reach every endpoint it lists, so
+   an update that adds a binary or an endpoint to an existing rule must declare
+   that rule's whole binary and endpoint scope. The gateway rejects an update
+   that would grant a binary-to-endpoint pair the update never asked for, and
+   the error names the binaries still missing. To grant one binary access to
+   only part of a rule's endpoints, send the narrow authorization under its own
+   `--rule-name`; it stays on its own rule instead of folding into the broader
+   one.
+
+   `--add-allow` and `--add-deny` select an endpoint by host and port alone. If
+   that host and port appears in more than one rule, or twice in one rule under
+   different paths, the update is rejected as ambiguous. Fall back to full YAML
+   replacement for those endpoints.
+2. Use full YAML replacement for broad changes or non-network fields, including
+   any change that would otherwise require restating a large existing scope:
    `openshell policy get work-session --full > policy.yaml`
    Modify the policy with the `generate-sandbox-policy` skill.
    `openshell policy set work-session --policy policy.yaml --wait`

@@ -741,6 +741,7 @@ pub async fn fetch_provider_environment(
     let response = client
         .get_sandbox_provider_environment(GetSandboxProviderEnvironmentRequest {
             sandbox_id: sandbox_id.to_string(),
+            supports_static_credential_bindings: true,
         })
         .await
         .into_diagnostic()?;
@@ -751,6 +752,8 @@ pub async fn fetch_provider_environment(
         provider_env_revision: inner.provider_env_revision,
         credential_expires_at_ms: inner.credential_expires_at_ms,
         dynamic_credentials: inner.dynamic_credentials,
+        static_credential_bindings: inner.static_credential_bindings,
+        non_secret_environment_keys: inner.non_secret_environment_keys,
     })
 }
 
@@ -840,6 +843,8 @@ pub struct ProviderEnvironmentResult {
     pub provider_env_revision: u64,
     pub credential_expires_at_ms: HashMap<String, i64>,
     pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
+    pub static_credential_bindings: HashMap<String, crate::proto::StaticCredentialBinding>,
+    pub non_secret_environment_keys: Vec<String>,
 }
 
 impl CachedOpenShellClient {

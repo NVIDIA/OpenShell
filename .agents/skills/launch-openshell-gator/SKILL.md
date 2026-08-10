@@ -384,6 +384,9 @@ The wrapper intentionally blocks duplicate same-head-SHA gator dispositions. A r
 - The earlier attempt failed before posting.
 - The prior marked disposition was only a reviewer infrastructure failure.
 - The prior marked disposition was only a draft blocker and the PR is now ready for review.
+- A state-specific TTL nudge is due after 48 business hours. The nudge may request
+  the pending human action, but it must not repeat the review disposition or
+  trigger another reviewer run.
 
 Do not bypass with `OPENSHELL_GATOR_ALLOW_SAME_SHA_COMMENT=1` unless the operator explicitly confirms a maintainer override.
 

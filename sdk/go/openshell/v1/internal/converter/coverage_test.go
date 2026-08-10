@@ -119,6 +119,7 @@ func TestConverterCoversAllProtoFields_NetworkEndpoint(t *testing.T) {
 		"signing_region":                  true,
 		"json_rpc_max_body_bytes":         true,
 		"mcp":                             true,
+		"credential_binding":              true,
 	}
 
 	assertAllFieldsCovered(t, (&sandboxpb.NetworkEndpoint{}).ProtoReflect().Descriptor(), handled, nil)

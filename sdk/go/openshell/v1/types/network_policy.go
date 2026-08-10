@@ -40,6 +40,13 @@ type PolicyNetworkEndpoint struct {
 	SigningRegion                string
 	JsonRpcMaxBodyBytes          uint32
 	Mcp                          *McpOptions
+	CredentialBinding            *NetworkCredentialBinding
+}
+
+// NetworkCredentialBinding binds an endpoint to static credentials from an attached provider.
+type NetworkCredentialBinding struct {
+	// Provider is the attached provider whose static credentials may be resolved for the endpoint.
+	Provider string
 }
 
 // PolicyNetworkBinary identifies a binary subject to network policy enforcement.
