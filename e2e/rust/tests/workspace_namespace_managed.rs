@@ -166,6 +166,33 @@ async fn managed_creates_namespace_with_labels() {
     let (ok, out) = kubectl(&["get", "sandbox.agents.x-k8s.io", "-n", &ns, "-o", "name"]).await;
     assert!(ok, "sandbox CR should exist in namespace {ns}: {out}");
     assert!(out.contains("mgd-sb"), "sandbox CR name mismatch: {out}");
+
+    // Verify the sandbox is resolvable through the OpenShell control plane.
+    let (ok, out) = run_cli(&["sandbox", "list", "--workspace", &ws]).await;
+    assert!(ok, "sandbox list failed: {out}");
+    assert!(
+        out.contains("mgd-sb"),
+        "sandbox list should find mgd-sb via control plane: {out}"
+    );
+
+    let (ok, out) = run_cli(&["sandbox", "get", "mgd-sb", "--workspace", &ws]).await;
+    assert!(ok, "sandbox get failed: {out}");
+    assert!(
+        out.contains("mgd-sb"),
+        "sandbox get should resolve mgd-sb via control plane: {out}"
+    );
+
+    // Verify sandbox delete works through the control plane (uses sandbox_lookup_selector).
+    let (ok, out) = run_cli(&["sandbox", "delete", "mgd-sb", "--workspace", &ws]).await;
+    assert!(ok, "sandbox delete failed: {out}");
+
+    // Verify sandbox is gone from the control plane after deletion.
+    let (ok, out) = run_cli(&["sandbox", "list", "--workspace", &ws]).await;
+    assert!(ok, "sandbox list after delete failed: {out}");
+    assert!(
+        !out.contains("mgd-sb"),
+        "sandbox list should NOT find mgd-sb after deletion: {out}"
+    );
 }
 
 #[tokio::test]
@@ -225,6 +252,18 @@ async fn managed_namespace_survives_with_remaining_sandboxes() {
     assert!(
         out.contains("sb-b"),
         "sb-b CR should still be present: {out}"
+    );
+
+    // Verify sb-b is still resolvable through the OpenShell control plane.
+    let (ok, out) = run_cli(&["sandbox", "list", "--workspace", &ws]).await;
+    assert!(ok, "sandbox list failed: {out}");
+    assert!(
+        out.contains("sb-b"),
+        "sandbox list should find sb-b via control plane: {out}"
+    );
+    assert!(
+        !out.contains("sb-a"),
+        "sandbox list should NOT find deleted sb-a: {out}"
     );
 }
 
@@ -300,5 +339,28 @@ async fn managed_isolates_workspaces_into_separate_namespaces() {
     assert!(
         !out.contains("sb-iso-a"),
         "sb-iso-a should NOT be in {ns_b}"
+    );
+
+    // Verify workspace isolation through the OpenShell control plane.
+    let (ok, out) = run_cli(&["sandbox", "list", "--workspace", &ws_a]).await;
+    assert!(ok, "sandbox list ws_a failed: {out}");
+    assert!(
+        out.contains("sb-iso-a"),
+        "sandbox list ws_a should find sb-iso-a: {out}"
+    );
+    assert!(
+        !out.contains("sb-iso-b"),
+        "sandbox list ws_a should NOT find sb-iso-b: {out}"
+    );
+
+    let (ok, out) = run_cli(&["sandbox", "list", "--workspace", &ws_b]).await;
+    assert!(ok, "sandbox list ws_b failed: {out}");
+    assert!(
+        out.contains("sb-iso-b"),
+        "sandbox list ws_b should find sb-iso-b: {out}"
+    );
+    assert!(
+        !out.contains("sb-iso-a"),
+        "sandbox list ws_b should NOT find sb-iso-a: {out}"
     );
 }

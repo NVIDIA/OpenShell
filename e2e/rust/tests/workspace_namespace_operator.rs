@@ -182,9 +182,32 @@ async fn operator_sandbox_in_labeled_namespace() {
         "sandbox CR name should be bare 'op-sb', got: {out}"
     );
 
-    // Clean up.
+    // Verify sandbox is resolvable through the OpenShell control plane.
+    let (ok, out) = run_cli(&["sandbox", "list", "--workspace", &ns]).await;
+    assert!(ok, "sandbox list failed: {out}");
+    assert!(
+        out.contains("op-sb"),
+        "sandbox list should find op-sb via control plane: {out}"
+    );
+
+    let (ok, out) = run_cli(&["sandbox", "get", "op-sb", "--workspace", &ns]).await;
+    assert!(ok, "sandbox get failed: {out}");
+    assert!(
+        out.contains("op-sb"),
+        "sandbox get should resolve op-sb via control plane: {out}"
+    );
+
+    // Verify sandbox delete works through the control plane.
     let (ok, out) = run_cli(&["sandbox", "delete", "op-sb", "--workspace", &ns]).await;
     assert!(ok, "sandbox delete failed: {out}");
+
+    // Verify sandbox is gone after deletion.
+    let (ok, out) = run_cli(&["sandbox", "list", "--workspace", &ns]).await;
+    assert!(ok, "sandbox list after delete failed: {out}");
+    assert!(
+        !out.contains("op-sb"),
+        "sandbox list should NOT find op-sb after deletion: {out}"
+    );
 
     let (ok, out) = run_cli(&["workspace", "delete", &ns]).await;
     assert!(ok, "workspace delete failed: {out}");

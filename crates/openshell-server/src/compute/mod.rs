@@ -32,9 +32,10 @@ use futures::{Stream, StreamExt};
 use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
-    DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
-    DriverSandboxTemplate, GatewayListenerRequirement as ProtoGatewayListenerRequirement,
+    CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
+    DriverCondition, DriverPlatformEvent, DriverResourceRequirements, DriverSandbox,
+    DriverSandboxSpec, DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest,
+    EnsureWorkspaceResponse, GatewayListenerRequirement as ProtoGatewayListenerRequirement,
     GetCapabilitiesRequest, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest,
     GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
@@ -567,6 +568,22 @@ impl ComputeDriver for RemoteComputeDriver {
         let stream = response.into_inner();
         Ok(tonic::Response::new(Box::pin(stream)))
     }
+
+    async fn ensure_workspace(
+        &self,
+        request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<tonic::Response<EnsureWorkspaceResponse>, Status> {
+        let mut client = self.client();
+        client.ensure_workspace(request).await
+    }
+
+    async fn delete_workspace(
+        &self,
+        request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
+        let mut client = self.client();
+        client.delete_workspace(request).await
+    }
 }
 
 #[derive(Clone)]
@@ -868,6 +885,30 @@ impl ComputeRuntime {
     #[must_use]
     pub(crate) fn gateway_listener_requirements(&self) -> &[GatewayListenerRequirement] {
         &self.gateway_listener_requirements
+    }
+
+    pub(crate) async fn ensure_workspace(&self, workspace: &str) -> Result<(), Status> {
+        let workspace = workspace.to_string();
+        self.driver
+            .call("driver.ensure_workspace", None, |driver| async move {
+                driver
+                    .ensure_workspace(Request::new(EnsureWorkspaceRequest { workspace }))
+                    .await
+            })
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn delete_workspace(&self, workspace: &str) -> Result<(), Status> {
+        let workspace = workspace.to_string();
+        self.driver
+            .call("driver.delete_workspace", None, |driver| async move {
+                driver
+                    .delete_workspace(Request::new(DeleteWorkspaceRequest { workspace }))
+                    .await
+            })
+            .await
+            .map(|_| ())
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
@@ -3881,6 +3922,20 @@ impl ComputeDriver for NoopTestDriver {
     ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
         Ok(tonic::Response::new(Box::pin(futures::stream::empty())))
     }
+
+    async fn ensure_workspace(
+        &self,
+        _request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<tonic::Response<EnsureWorkspaceResponse>, Status> {
+        Ok(tonic::Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
+        Ok(tonic::Response::new(DeleteWorkspaceResponse {}))
+    }
 }
 
 #[cfg(test)]
@@ -4157,6 +4212,20 @@ mod tests {
             _request: Request<WatchSandboxesRequest>,
         ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
             Ok(tonic::Response::new(Box::pin(stream::empty())))
+        }
+
+        async fn ensure_workspace(
+            &self,
+            _request: Request<EnsureWorkspaceRequest>,
+        ) -> Result<tonic::Response<EnsureWorkspaceResponse>, Status> {
+            Ok(tonic::Response::new(EnsureWorkspaceResponse {}))
+        }
+
+        async fn delete_workspace(
+            &self,
+            _request: Request<DeleteWorkspaceRequest>,
+        ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
+            Ok(tonic::Response::new(DeleteWorkspaceResponse {}))
         }
     }
 
@@ -4483,6 +4552,20 @@ mod tests {
             Ok(tonic::Response::new(Box::pin(
                 UnboundedReceiverStream::new(receiver),
             )))
+        }
+
+        async fn ensure_workspace(
+            &self,
+            _request: Request<EnsureWorkspaceRequest>,
+        ) -> Result<tonic::Response<EnsureWorkspaceResponse>, Status> {
+            Ok(tonic::Response::new(EnsureWorkspaceResponse {}))
+        }
+
+        async fn delete_workspace(
+            &self,
+            _request: Request<DeleteWorkspaceRequest>,
+        ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
+            Ok(tonic::Response::new(DeleteWorkspaceResponse {}))
         }
     }
 
@@ -5249,6 +5332,20 @@ mod tests {
                 request: Request<WatchSandboxesRequest>,
             ) -> Result<tonic::Response<Self::WatchSandboxesStream>, Status> {
                 self.0.watch_sandboxes(request).await
+            }
+
+            async fn ensure_workspace(
+                &self,
+                request: Request<EnsureWorkspaceRequest>,
+            ) -> Result<tonic::Response<EnsureWorkspaceResponse>, Status> {
+                self.0.ensure_workspace(request).await
+            }
+
+            async fn delete_workspace(
+                &self,
+                request: Request<DeleteWorkspaceRequest>,
+            ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
+                self.0.delete_workspace(request).await
             }
         }
 

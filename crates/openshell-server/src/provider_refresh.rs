@@ -343,6 +343,7 @@ pub async fn refresh_provider_credential(
     store: &Store,
     workspace: &str,
     credentials: Option<&crate::credentials::CredentialRuntime>,
+    compute: Option<&crate::compute::ComputeRuntime>,
     provider_name: &str,
     credential_key: &str,
 ) -> Result<StoredProviderCredentialRefreshState, Status> {
@@ -448,6 +449,7 @@ pub async fn refresh_provider_credential(
                 store,
                 workspace,
                 credentials,
+                compute,
                 &provider,
                 credential_key,
                 &minted,
@@ -511,6 +513,7 @@ async fn apply_minted_credential(
     store: &Store,
     workspace: &str,
     credentials: Option<&crate::credentials::CredentialRuntime>,
+    compute: Option<&crate::compute::ComputeRuntime>,
     provider: &Provider,
     credential_key: &str,
     minted: &MintedCredential,
@@ -520,6 +523,9 @@ async fn apply_minted_credential(
     let staged_handles = if let Some(credentials) = credentials
         && credentials.stores_provider_credentials()
     {
+        if let Some(compute) = compute {
+            compute.ensure_workspace(workspace).await?;
+        }
         let mut creds_to_store =
             HashMap::from([(credential_key.to_string(), minted.access_token.clone())]);
         for (key, value) in &minted.additional_credentials {
@@ -1115,8 +1121,12 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) =
-                run_refresh_worker_tick(state.store.as_ref(), Some(&state.credentials)).await
+            if let Err(err) = run_refresh_worker_tick(
+                state.store.as_ref(),
+                Some(&state.credentials),
+                Some(&state.compute),
+            )
+            .await
             {
                 warn!(error = %err, "provider credential refresh worker tick failed");
             }
@@ -1136,6 +1146,7 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
 async fn run_refresh_worker_tick(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
+    compute: Option<&crate::compute::ComputeRuntime>,
 ) -> Result<(), Status> {
     let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await.inspect_err(|_| {
@@ -1200,6 +1211,7 @@ async fn run_refresh_worker_tick(
             store,
             state.object_workspace(),
             credentials,
+            compute,
             &state.provider_name,
             &state.credential_key,
         )
@@ -1328,6 +1340,7 @@ mod tests {
             &store,
             "default",
             None,
+            None,
             "my-graph",
             "MS_GRAPH_ACCESS_TOKEN",
         )
@@ -1398,6 +1411,7 @@ mod tests {
             &store,
             "default",
             Some(&credentials),
+            None,
             "my-stored-graph",
             "MS_GRAPH_ACCESS_TOKEN",
         )
@@ -1498,6 +1512,7 @@ mod tests {
             &store,
             "default",
             None,
+            None,
             "refreshing-graph",
             "MS_GRAPH_ACCESS_TOKEN",
         )
@@ -1577,6 +1592,7 @@ mod tests {
         let refreshed = refresh_provider_credential(
             &store,
             "default",
+            None,
             None,
             "my-delegated-graph",
             "MS_GRAPH_ACCESS_TOKEN",
@@ -1672,6 +1688,7 @@ mod tests {
             &store,
             "default",
             None,
+            None,
             "my-drive",
             "GOOGLE_DRIVE_ACCESS_TOKEN",
         )
@@ -1715,7 +1732,7 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        run_refresh_worker_tick(&store, None).await.unwrap();
+        run_refresh_worker_tick(&store, None, None).await.unwrap();
 
         let stored_state = get_refresh_state(
             &store,
@@ -1751,7 +1768,7 @@ mod tests {
         let store = test_store().await;
 
         let traced = test_exporter::install_traced();
-        run_refresh_worker_tick(&store, None).await.unwrap();
+        run_refresh_worker_tick(&store, None, None).await.unwrap();
 
         let spans = traced.finished_spans();
         let root = spans
@@ -1873,6 +1890,7 @@ mod tests {
             &store,
             "default",
             None,
+            None,
             "aws-sts-test",
             "AWS_ACCESS_KEY_ID",
         )
@@ -1970,6 +1988,7 @@ mod tests {
             &store,
             "default",
             None,
+            None,
             "aws-sts-custom",
             "AWS_ACCESS_KEY_ID",
         )
@@ -2046,6 +2065,7 @@ mod tests {
             &store,
             "default",
             None,
+            None,
             "aws-sts-partial",
             "AWS_ACCESS_KEY_ID",
         )
@@ -2088,9 +2108,17 @@ mod tests {
             ]),
         };
 
-        apply_minted_credential(&store, "default", None, &prov, "AWS_ACCESS_KEY_ID", &minted)
-            .await
-            .unwrap();
+        apply_minted_credential(
+            &store,
+            "default",
+            None,
+            None,
+            &prov,
+            "AWS_ACCESS_KEY_ID",
+            &minted,
+        )
+        .await
+        .unwrap();
 
         let stored = store
             .get_message_by_name::<Provider>("default", "aws-test")
@@ -2163,6 +2191,7 @@ mod tests {
             &store,
             "default",
             Some(&credentials),
+            None,
             &prov,
             "AWS_ACCESS_KEY_ID",
             &minted,
@@ -2266,6 +2295,7 @@ mod tests {
             &store,
             "default",
             Some(&credentials),
+            None,
             &refreshing_provider,
             "AWS_ACCESS_KEY_ID",
             &minted,
@@ -2376,6 +2406,7 @@ mod tests {
             &store,
             "default",
             None,
+            None,
             "aws-sts-session",
             "AWS_ACCESS_KEY_ID",
         )
@@ -2443,6 +2474,7 @@ mod tests {
         let err = refresh_provider_credential(
             &store,
             "default",
+            None,
             None,
             "aws-sts-lonesession",
             "AWS_ACCESS_KEY_ID",
@@ -2526,8 +2558,14 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let rotate =
-            refresh_provider_credential(&store, "default", None, "aws-race", "AWS_ACCESS_KEY_ID");
+        let rotate = refresh_provider_credential(
+            &store,
+            "default",
+            None,
+            None,
+            "aws-race",
+            "AWS_ACCESS_KEY_ID",
+        );
         let interfere = async {
             // Wait until the rotation is inside the STS call (its state read has
             // already happened), then delete the refresh and release STS.
@@ -2644,6 +2682,7 @@ mod tests {
         let rotate = refresh_provider_credential(
             &store,
             "default",
+            None,
             None,
             "aws-superseded",
             "AWS_ACCESS_KEY_ID",

@@ -11,8 +11,8 @@ use crate::config::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, ServiceAccount,
-    Volume, VolumeMount,
+    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Secret,
+    ServiceAccount, Volume, VolumeMount,
 };
 use kube::api::{
     Api, ApiResource, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions,
@@ -564,6 +564,15 @@ impl KubernetesComputeDriver {
     /// Idempotent: returns the namespace name whether it was just created or
     /// already existed. Also creates the sandbox `ServiceAccount` in the
     /// namespace.
+    ///
+    /// TODO: no `NetworkPolicy` is created here. The Helm-managed namespace gets
+    /// an SSH-isolation policy (port 2222 restricted to the gateway pod), but
+    /// managed-mode namespaces do not. Current risk is low: only sandbox pods
+    /// from the same workspace run in this namespace, so there is no lateral
+    /// movement target. A same-cluster `namespaceSelector` policy would also
+    /// break cross-cluster topologies where the gateway is external. Add a
+    /// configurable `NetworkPolicy` when mixed-workload or cross-cluster managed
+    /// namespaces are supported.
     pub async fn ensure_namespace(&self, workspace: &str) -> Result<String, KubernetesDriverError> {
         let ns_name = managed_namespace(&self.config.gateway_id, workspace);
         let ns_api: Api<Namespace> = Api::all(self.client.clone());
@@ -665,8 +674,108 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
+    /// Ensure the client TLS Secret exists in `namespace` by copying it from
+    /// the gateway's Helm release namespace. Idempotent: creates the Secret on
+    /// first call, updates it on subsequent calls to pick up cert rotations.
+    /// No-op when `client_tls_secret_name` is empty (TLS disabled).
+    async fn ensure_tls_secret(&self, namespace: &str) -> Result<(), KubernetesDriverError> {
+        if self.config.client_tls_secret_name.is_empty() {
+            return Ok(());
+        }
+
+        let source_api: Api<Secret> = Api::namespaced(self.client.clone(), &self.config.namespace);
+        let source = match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            source_api.get(&self.config.client_tls_secret_name),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                warn!(
+                    secret = %self.config.client_tls_secret_name,
+                    source_namespace = %self.config.namespace,
+                    error = %e,
+                    "failed to read source TLS secret"
+                );
+                return Err(KubernetesDriverError::from_kube(e));
+            }
+            Err(_) => {
+                return Err(KubernetesDriverError::Message(format!(
+                    "timeout reading TLS secret {} from {}",
+                    self.config.client_tls_secret_name, self.config.namespace
+                )));
+            }
+        };
+
+        let target_api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let copy = Secret {
+            metadata: ObjectMeta {
+                name: Some(self.config.client_tls_secret_name.clone()),
+                namespace: Some(namespace.to_string()),
+                labels: Some(BTreeMap::from([(
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string(),
+                )])),
+                ..Default::default()
+            },
+            data: source.data,
+            type_: source.type_,
+            ..Default::default()
+        };
+
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            target_api.create(&PostParams::default(), &copy),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                info!(
+                    namespace = %namespace,
+                    secret = %self.config.client_tls_secret_name,
+                    "created TLS secret copy"
+                );
+            }
+            Ok(Err(KubeError::Api(api))) if api.code == 409 => {
+                match tokio::time::timeout(
+                    KUBE_API_TIMEOUT,
+                    target_api.replace(
+                        &self.config.client_tls_secret_name,
+                        &PostParams::default(),
+                        &copy,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        debug!(
+                            namespace = %namespace,
+                            secret = %self.config.client_tls_secret_name,
+                            "updated TLS secret copy"
+                        );
+                    }
+                    Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
+                    Err(_) => {
+                        return Err(KubernetesDriverError::Message(format!(
+                            "timeout updating TLS secret in {namespace}"
+                        )));
+                    }
+                }
+            }
+            Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
+            Err(_) => {
+                return Err(KubernetesDriverError::Message(format!(
+                    "timeout creating TLS secret in {namespace}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Delete the managed namespace if it contains no sandboxes (managed mode
-    /// only). Called after sandbox deletion.
+    /// only). Called via the `DeleteWorkspace` RPC after workspace deletion.
     pub async fn delete_namespace_if_empty(
         &self,
         workspace: &str,
@@ -1130,6 +1239,10 @@ impl KubernetesComputeDriver {
             }
         };
 
+        if self.config.is_multi_namespace() {
+            self.ensure_tls_secret(&target_namespace).await?;
+        }
+
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %name,
@@ -1206,7 +1319,7 @@ impl KubernetesComputeDriver {
         obj.metadata = ObjectMeta {
             name: Some(kube_name),
             namespace: Some(target_namespace),
-            labels: Some(sandbox_labels(sandbox)),
+            labels: Some(sandbox_labels(sandbox, Some(&self.config.gateway_id))),
             annotations: Some(annotations),
             ..Default::default()
         };
@@ -1394,7 +1507,7 @@ impl KubernetesComputeDriver {
             .await?;
         let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
-        let (kube_name, obj_namespace, workspace, preconditions) = match tokio::time::timeout(
+        let (kube_name, obj_namespace, _workspace, preconditions) = match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             lookup_api.api.list(&lp),
         )
@@ -1456,15 +1569,6 @@ impl KubernetesComputeDriver {
         match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.delete(&kube_name, &dp)).await {
             Ok(Ok(_response)) => {
                 info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Sandbox deleted from Kubernetes");
-                if self.config.workspace_mode == WorkspaceMode::Managed
-                    && let Err(e) = self.delete_namespace_if_empty(&workspace).await
-                {
-                    warn!(
-                        workspace = %workspace,
-                        error = %e,
-                        "Failed to clean up empty managed namespace after sandbox deletion"
-                    );
-                }
                 Ok(true)
             }
             Ok(Err(KubeError::Api(err))) if err.code == 404 || err.code == 409 => {
@@ -1740,7 +1844,7 @@ fn validate_kube_resource_name_length(workspace: &str, name: &str) -> Result<(),
     Ok(())
 }
 
-fn sandbox_labels(sandbox: &Sandbox) -> BTreeMap<String, String> {
+fn sandbox_labels(sandbox: &Sandbox, gateway_id: Option<&str>) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_SANDBOX_ID.to_string(), sandbox.id.clone());
     labels.insert(LABEL_SANDBOX_NAME.to_string(), sandbox.name.clone());
@@ -1752,6 +1856,9 @@ fn sandbox_labels(sandbox: &Sandbox) -> BTreeMap<String, String> {
         LABEL_MANAGED_BY.to_string(),
         LABEL_MANAGED_BY_VALUE.to_string(),
     );
+    if let Some(gw_id) = gateway_id {
+        labels.insert(LABEL_GATEWAY_ID.to_string(), gw_id.to_string());
+    }
     labels
 }
 
@@ -7087,7 +7194,7 @@ mod tests {
             workspace: "alpha".to_string(),
             ..Default::default()
         };
-        let labels = sandbox_labels(&sandbox);
+        let labels = sandbox_labels(&sandbox, None);
         assert_eq!(labels.get(LABEL_SANDBOX_ID).unwrap(), "uuid-1");
         assert_eq!(labels.get(LABEL_SANDBOX_NAME).unwrap(), "work");
         assert_eq!(labels.get(LABEL_SANDBOX_WORKSPACE).unwrap(), "alpha");
@@ -7095,6 +7202,19 @@ mod tests {
             labels.get(LABEL_MANAGED_BY).unwrap(),
             LABEL_MANAGED_BY_VALUE
         );
+        assert!(!labels.contains_key(LABEL_GATEWAY_ID));
+    }
+
+    #[test]
+    fn sandbox_labels_includes_gateway_id_when_provided() {
+        let sandbox = Sandbox {
+            id: "uuid-1".to_string(),
+            name: "work".to_string(),
+            workspace: "alpha".to_string(),
+            ..Default::default()
+        };
+        let labels = sandbox_labels(&sandbox, Some("gw-42"));
+        assert_eq!(labels.get(LABEL_GATEWAY_ID).unwrap(), "gw-42");
     }
 
     #[test]

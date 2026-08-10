@@ -51,6 +51,13 @@ service ComputeDriver {
 
   // Stream sandbox observations from the platform.
   rpc WatchSandboxes(WatchSandboxesRequest) returns (stream WatchSandboxesEvent);
+
+  // Ensure platform resources for a workspace exist (e.g. namespace).
+  // Idempotent: succeeds if resources already exist.
+  rpc EnsureWorkspace(EnsureWorkspaceRequest) returns (EnsureWorkspaceResponse);
+
+  // Tear down platform resources for a workspace.
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
 }
 
 message GetCapabilitiesRequest {}
@@ -339,3 +346,17 @@ message WatchSandboxesEvent {
     WatchSandboxesPlatformEvent platform_event = 3;
   }
 }
+
+message EnsureWorkspaceRequest {
+  // Workspace identifier used by the gateway.
+  string workspace = 1;
+}
+
+message EnsureWorkspaceResponse {}
+
+message DeleteWorkspaceRequest {
+  // Workspace identifier used by the gateway.
+  string workspace = 1;
+}
+
+message DeleteWorkspaceResponse {}

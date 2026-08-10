@@ -435,6 +435,10 @@ pub(super) async fn handle_delete_workspace(
             }
         })?;
 
+    if deleted && let Err(e) = state.compute.delete_workspace(&name).await {
+        tracing::warn!(workspace = %name, error = %e, "failed to delete workspace platform resources");
+    }
+
     Ok(Response::new(DeleteWorkspaceResponse { deleted }))
 }
 

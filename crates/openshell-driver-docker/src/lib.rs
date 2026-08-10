@@ -38,8 +38,9 @@ use openshell_core::progress::{
 };
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxStatus,
-    DriverSandboxTemplate, GatewayListenerRequirement, GetCapabilitiesRequest,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent,
+    DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest,
+    EnsureWorkspaceResponse, GatewayListenerRequirement, GetCapabilitiesRequest,
     GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
@@ -1760,6 +1761,20 @@ impl ComputeDriver for DockerComputeDriver {
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
+    }
+
+    async fn ensure_workspace(
+        &self,
+        _request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        Ok(Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        Ok(Response::new(DeleteWorkspaceResponse {}))
     }
 }
 

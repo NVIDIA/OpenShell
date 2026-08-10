@@ -6,9 +6,11 @@
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
-    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
+    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
+    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
     compute_driver_server::ComputeDriver,
@@ -17,6 +19,7 @@ use std::pin::Pin;
 use tonic::{Request, Response, Status};
 
 use crate::KubernetesComputeDriver;
+use crate::WorkspaceMode;
 
 #[derive(Debug, Clone)]
 pub struct ComputeDriverService {
@@ -171,6 +174,40 @@ impl ComputeDriver for ComputeDriverService {
             .map_err(Status::internal)?;
         let stream = stream.map(|item| item.map_err(|err| Status::internal(err.to_string())));
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn ensure_workspace(
+        &self,
+        request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        let workspace = request.into_inner().workspace;
+        if workspace.is_empty() {
+            return Err(Status::invalid_argument("workspace is required"));
+        }
+        if self.driver.workspace_mode() == WorkspaceMode::Managed {
+            self.driver
+                .ensure_namespace(&workspace)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        Ok(Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    async fn delete_workspace(
+        &self,
+        request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        let workspace = request.into_inner().workspace;
+        if workspace.is_empty() {
+            return Err(Status::invalid_argument("workspace is required"));
+        }
+        if self.driver.workspace_mode() == WorkspaceMode::Managed {
+            self.driver
+                .delete_namespace_if_empty(&workspace)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        Ok(Response::new(DeleteWorkspaceResponse {}))
     }
 }
 
