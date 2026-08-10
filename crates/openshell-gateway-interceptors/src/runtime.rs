@@ -44,6 +44,7 @@ pub struct EvaluationContext {
 pub struct InterceptedRequest {
     pub body: Vec<u8>,
     selector: RpcSelector,
+    plan: Arc<ExecutionPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,7 +173,11 @@ impl GatewayInterceptorRuntime {
         .encode()
         .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
-        Ok(InterceptedRequest { body, selector })
+        Ok(InterceptedRequest {
+            body,
+            selector,
+            plan,
+        })
     }
 
     pub async fn evaluate_post_commit(
@@ -181,8 +186,8 @@ impl GatewayInterceptorRuntime {
         response_body: &[u8],
         context: &EvaluationContext,
     ) -> std::result::Result<(), Status> {
-        let plan = self.plan.load_full();
-        let output_type = plan
+        let output_type = intercepted
+            .plan
             .output_type(&intercepted.selector)
             .ok_or_else(|| Status::invalid_argument("unknown OpenShell method"))?;
         let frame = GrpcFrame::decode(response_body)?;
@@ -194,7 +199,7 @@ impl GatewayInterceptorRuntime {
             ValidatedOperation::new(&self.codec, output_type, committed_response)
                 .map_err(|err| Status::invalid_argument(err.to_string()))?;
         self.evaluate_phase_with_plan(
-            &plan,
+            &intercepted.plan,
             &intercepted.selector,
             Phase::PostCommit,
             output_type,
@@ -207,28 +212,29 @@ impl GatewayInterceptorRuntime {
 
     #[must_use]
     pub fn has_post_commit(&self, intercepted: &InterceptedRequest) -> bool {
-        self.plan
-            .load_full()
+        intercepted
+            .plan
             .has_binding(&intercepted.selector, Phase::PostCommit)
     }
 
     pub async fn refresh(&self) -> Result<bool> {
         let current = self.plan.load_full();
         let new_plan = current.refresh().await?;
-        if current.binding_keys() == new_plan.binding_keys()
-            && current.profile_sources_map().keys().collect::<Vec<_>>()
-                == new_plan.profile_sources_map().keys().collect::<Vec<_>>()
-        {
-            return Ok(false);
-        }
+        let bindings_changed = current.binding_keys() != new_plan.binding_keys();
+        let sources_changed = current.profile_sources_map().keys().collect::<Vec<_>>()
+            != new_plan.profile_sources_map().keys().collect::<Vec<_>>();
         let count: usize = new_plan.binding_keys().len();
-        info!(
-            bindings = count,
-            profile_sources = new_plan.profile_sources_map().len(),
-            "gateway interceptor manifest refreshed"
-        );
         self.plan.store(Arc::new(new_plan));
-        Ok(true)
+        let changed = bindings_changed || sources_changed;
+        if changed {
+            info!(
+                bindings = count,
+                bindings_changed,
+                sources_changed,
+                "gateway interceptor manifest refreshed with structural changes"
+            );
+        }
+        Ok(changed)
     }
 
     pub fn profile_sources_map(&self) -> BTreeMap<String, GatewayInterceptorProfileSource> {

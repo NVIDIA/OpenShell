@@ -509,10 +509,14 @@ pub(crate) async fn run_server(
         let refresh_secs = config
             .gateway_interceptor_refresh_interval_secs
             .unwrap_or(10);
-        interceptor_refresh::spawn_interceptor_refresh_worker(
-            state.clone(),
-            Duration::from_secs(refresh_secs),
-        );
+        if refresh_secs > 0 {
+            interceptor_refresh::spawn_interceptor_refresh_worker(
+                state.clone(),
+                Duration::from_secs(refresh_secs),
+            );
+        } else {
+            info!("gateway interceptor manifest refresh disabled (interval = 0)");
+        }
     }
 
     // Create the multiplexed service
