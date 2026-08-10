@@ -41,7 +41,7 @@ on Windows.
 | Docker | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
 | Kubernetes | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
 | Podman | Driver crate excluded; server config contract retained. | Gateway construction returns unsupported. |
-| VM | Driver crate excluded from workspace validation. | VM spawn returns unsupported. |
+| VM | Driver crate excluded from workspace validation. | Gateway construction returns unsupported. |
 
 This keeps Windows behavior explicit without carrying runtime dependencies or
 creating misleading Windows driver artifacts.

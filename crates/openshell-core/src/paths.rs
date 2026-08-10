@@ -166,11 +166,11 @@ pub fn normalize_path(path: &str) -> String {
         }
     }
     let normalized = normalized.to_string_lossy();
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     {
         normalized.replace('\\', "/")
     }
-    #[cfg(not(windows))]
+    #[cfg(not(target_os = "windows"))]
     {
         normalized.into_owned()
     }

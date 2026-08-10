@@ -94,8 +94,7 @@ Rules:
 Current focused unsupported-contract tests:
 
 ```text
-windows_compute_driver_stubs_report_unsupported
-windows_spawn_reports_unsupported
+windows_builtin_compute_drivers_report_unsupported
 ```
 
 Run them with the architecture-specific focused task on the native host.
@@ -113,6 +112,7 @@ top-level workspace targets for check/test:
 --exclude openshell-driver-vault
 --exclude openshell-driver-vm
 --exclude openshell-sandbox
+--exclude openshell-supervisor-network
 --exclude openshell-supervisor-process
 --exclude openshell-vfio
 ```

@@ -29,24 +29,19 @@
 //! trait implementation registering the VM driver against the generic
 //! interface.
 
-#[cfg(not(target_os = "windows"))]
 use super::AcquiredRemoteDriverEndpoint;
 #[cfg(unix)]
 use super::ManagedDriverProcess;
-#[cfg(not(target_os = "windows"))]
 use crate::config_file::OtlpConfig;
 #[cfg(unix)]
 use crate::otel_tracing::TraceContextInterceptor;
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
 #[cfg(unix)]
-use openshell_core::ComputeDriverKind;
-#[cfg(unix)]
 use openshell_core::proto::compute::v1::{
     GetCapabilitiesRequest, compute_driver_client::ComputeDriverClient,
 };
-#[cfg(not(target_os = "windows"))]
-use openshell_core::{Config, Error, Result};
+use openshell_core::{ComputeDriverKind, Config, Error, Result};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
@@ -58,18 +53,14 @@ use std::{io::ErrorKind, process::Stdio, sync::Arc, time::Duration};
 use tokio::net::UnixStream;
 #[cfg(unix)]
 use tokio::process::Command;
-#[cfg(unix)]
 use tonic::transport::Channel;
 #[cfg(unix)]
 use tonic::transport::Endpoint;
 #[cfg(unix)]
 use tower::service_fn;
 
-#[cfg(unix)]
 const DRIVER_BIN_NAME: &str = "openshell-driver-vm";
-#[cfg(unix)]
 const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
-#[cfg(unix)]
 const COMPUTE_DRIVER_SOCKET_NAME: &str = "compute-driver.sock";
 
 /// Configuration for launching and talking to the VM compute driver.
@@ -148,7 +139,6 @@ impl VmComputeConfig {
         4096
     }
 
-    #[cfg(unix)]
     #[must_use]
     fn default_driver_search_dirs(home: Option<PathBuf>) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
@@ -199,7 +189,6 @@ pub struct VmGuestTlsPaths {
 ///    `/usr/local/libexec/openshell`, `/usr/local/libexec`.
 /// 3. Sibling of the gateway's own executable (last-resort fallback so
 ///    local development builds still work out of the box).
-#[cfg(unix)]
 pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf> {
     let mut searched: Vec<PathBuf> = Vec::new();
 
@@ -238,7 +227,6 @@ pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf
     )))
 }
 
-#[cfg(unix)]
 fn resolve_driver_search_dirs(vm_config: &VmComputeConfig) -> Vec<PathBuf> {
     vm_config.driver_dir.clone().map_or_else(
         || {
@@ -260,7 +248,6 @@ fn resolve_driver_search_dirs(vm_config: &VmComputeConfig) -> Vec<PathBuf> {
     )
 }
 
-#[cfg(unix)]
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
@@ -268,7 +255,6 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 /// Path of the Unix domain socket the driver will listen on.
-#[cfg(unix)]
 pub fn compute_driver_socket_path(vm_config: &VmComputeConfig) -> PathBuf {
     vm_config
         .state_dir
@@ -541,7 +527,7 @@ fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>) {
     }
 }
 
-#[cfg(all(not(unix), not(target_os = "windows")))]
+#[cfg(not(unix))]
 pub async fn spawn(
     _config: &Config,
     _vm_config: &VmComputeConfig,

@@ -297,10 +297,13 @@ pub fn read_upstream_proxy_credential_file(path: &str) -> Result<String, String>
     // Preflight the path so every platform reports the intended non-regular
     // file error. The post-open check remains necessary to close the TOCTOU
     // window if the path is replaced between these operations.
-    let path_metadata = std::fs::metadata(path)
-        .map_err(|e| format!("failed to open proxy auth file '{path}': {e}"))?;
-    if !path_metadata.is_file() {
-        return Err(format!("proxy auth file '{path}' is not a regular file"));
+    #[cfg(target_os = "windows")]
+    {
+        let path_metadata = std::fs::metadata(path)
+            .map_err(|e| format!("failed to open proxy auth file '{path}': {e}"))?;
+        if !path_metadata.is_file() {
+            return Err(format!("proxy auth file '{path}' is not a regular file"));
+        }
     }
 
     // On Unix, open non-blocking so a FIFO with no writer does not hang the
