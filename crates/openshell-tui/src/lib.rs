@@ -2687,6 +2687,9 @@ fn phase_label(phase: i32) -> String {
         x if x == SandboxPhase::Ready as i32 => "Ready",
         x if x == SandboxPhase::Error as i32 => "Error",
         x if x == SandboxPhase::Deleting as i32 => "Deleting",
+        x if x == SandboxPhase::Suspending as i32 => "Suspending",
+        x if x == SandboxPhase::Suspended as i32 => "Suspended",
+        x if x == SandboxPhase::Resuming as i32 => "Resuming",
         _ => "Unknown",
     }
     .to_string()
@@ -2713,6 +2716,18 @@ fn format_age(epoch_ms: i64) -> String {
         format!("{}h {}m", diff / 3600, (diff % 3600) / 60)
     } else {
         format!("{}d {}h", diff / 86400, (diff % 86400) / 3600)
+    }
+}
+
+#[cfg(test)]
+mod phase_label_tests {
+    use super::*;
+
+    #[test]
+    fn phase_label_covers_suspend_and_resume_lifecycle() {
+        assert_eq!(phase_label(SandboxPhase::Suspending as i32), "Suspending");
+        assert_eq!(phase_label(SandboxPhase::Suspended as i32), "Suspended");
+        assert_eq!(phase_label(SandboxPhase::Resuming as i32), "Resuming");
     }
 }
 
