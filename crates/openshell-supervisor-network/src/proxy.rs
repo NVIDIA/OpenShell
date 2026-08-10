@@ -5388,62 +5388,39 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
-        for BlockingForwardMiddleware
-    {
-        async fn describe(
-            &self,
-            _request: tonic::Request<()>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::MiddlewareManifest>,
-            tonic::Status,
-        > {
-            Ok(tonic::Response::new(
-                openshell_core::proto::MiddlewareManifest {
-                    name: "test/blocking-forward".into(),
-                    service_version: "test".into(),
-                    bindings: vec![openshell_core::proto::MiddlewareBinding {
-                        operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpRequest
-                            as i32,
-                        phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
-                            as i32,
-                        max_body_bytes: 8192,
-                        timeout: String::new(),
-                    }],
-                },
-            ))
+    impl openshell_core::middleware::InProcessMiddleware for BlockingForwardMiddleware {
+        async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+            openshell_core::proto::MiddlewareManifest {
+                name: "test/blocking-forward".into(),
+                service_version: "test".into(),
+                bindings: vec![openshell_core::proto::MiddlewareBinding {
+                    operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpRequest
+                        as i32,
+                    phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_body_bytes: 8192,
+                    timeout: String::new(),
+                }],
+            }
         }
 
         async fn validate_config(
             &self,
-            _request: tonic::Request<openshell_core::proto::ValidateConfigRequest>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
-            tonic::Status,
-        > {
-            Ok(tonic::Response::new(
-                openshell_core::proto::ValidateConfigResponse {
-                    valid: true,
-                    reason: String::new(),
-                },
-            ))
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
         }
 
         async fn evaluate_http_request(
             &self,
-            _request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::HttpRequestResult>,
-            tonic::Status,
-        > {
+            _request: openshell_core::middleware::HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
             self.entered.notify_one();
             self.release.notified().await;
-            Ok(tonic::Response::new(
-                openshell_core::proto::HttpRequestResult {
-                    decision: openshell_core::proto::Decision::Allow as i32,
-                    ..Default::default()
-                },
-            ))
+            Ok(openshell_core::proto::HttpRequestResult {
+                decision: openshell_core::proto::Decision::Allow as i32,
+                ..Default::default()
+            })
         }
     }
 

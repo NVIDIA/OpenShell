@@ -8,17 +8,13 @@ mod regex;
 use std::sync::Arc;
 
 use miette::{Result, miette};
-use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
-use openshell_core::proto::{
-    HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse,
-};
-use tonic::{Request, Response, Status};
+use openshell_core::middleware::{HttpRequestView, InProcessMiddleware};
+use openshell_core::proto::{HttpRequestResult, MiddlewareManifest};
 
 pub use regex::{NAME as BUILTIN_REGEX, RegexConfig, RegexMode};
 
-/// Return the first-party services that the gateway and supervisor install.
-pub fn services() -> Vec<Arc<dyn SupervisorMiddleware>> {
+/// Return the first-party in-process services installed by the gateway and supervisor.
+pub fn services() -> Vec<Arc<dyn InProcessMiddleware>> {
     vec![Arc::new(BuiltinMiddlewareService)]
 }
 
@@ -32,59 +28,42 @@ pub fn validate_config(implementation: &str, config: &prost_types::Struct) -> Re
     }
 }
 
-fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpRequestResult> {
-    match evaluation.middleware_name.as_str() {
-        BUILTIN_REGEX => regex::evaluate_http_request(evaluation),
+fn evaluate_http_request(request: HttpRequestView<'_>) -> Result<HttpRequestResult> {
+    match request.middleware_name() {
+        BUILTIN_REGEX => regex::evaluate_http_request(request.config(), request.body()),
         other => Err(miette!(
             "middleware implementation '{other}' is not a registered OpenShell built-in"
         )),
     }
 }
 
-/// Built-in regex service exposed through the standard middleware contract.
+/// Aggregate service exposing first-party middleware through the borrowed in-process contract.
 #[derive(Debug, Default)]
 pub struct BuiltinMiddlewareService;
 
-#[tonic::async_trait]
-impl SupervisorMiddleware for BuiltinMiddlewareService {
-    async fn describe(
-        &self,
-        _request: Request<()>,
-    ) -> Result<Response<MiddlewareManifest>, Status> {
-        Ok(Response::new(MiddlewareManifest {
+#[async_trait::async_trait]
+impl InProcessMiddleware for BuiltinMiddlewareService {
+    async fn describe(&self) -> MiddlewareManifest {
+        MiddlewareManifest {
             name: BUILTIN_REGEX.into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: vec![regex::describe()],
-        }))
+        }
     }
 
     async fn validate_config(
         &self,
-        request: Request<ValidateConfigRequest>,
-    ) -> Result<Response<ValidateConfigResponse>, Status> {
-        let request = request.into_inner();
-        let config = request.config.unwrap_or_default();
-        Ok(Response::new(
-            match validate_config(&request.middleware_name, &config) {
-                Ok(()) => ValidateConfigResponse {
-                    valid: true,
-                    reason: String::new(),
-                },
-                Err(error) => ValidateConfigResponse {
-                    valid: false,
-                    reason: error.to_string(),
-                },
-            },
-        ))
+        middleware_name: &str,
+        config: &prost_types::Struct,
+    ) -> Result<()> {
+        validate_config(middleware_name, config)
     }
 
     async fn evaluate_http_request(
         &self,
-        request: Request<HttpRequestEvaluation>,
-    ) -> Result<Response<HttpRequestResult>, Status> {
-        evaluate_http_request(&request.into_inner())
-            .map(Response::new)
-            .map_err(|error| Status::invalid_argument(error.to_string()))
+        request: HttpRequestView<'_>,
+    ) -> Result<HttpRequestResult> {
+        evaluate_http_request(request)
     }
 }
 
@@ -92,7 +71,8 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
 mod tests {
     use super::*;
     use openshell_core::proto::{
-        Decision, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+        Decision, HttpRequestTarget, RequestContext, SupervisorMiddlewareOperation,
+        SupervisorMiddlewarePhase,
     };
 
     fn string_config(key: &str, value: &str) -> prost_types::Struct {
@@ -107,13 +87,23 @@ mod tests {
         }
     }
 
+    fn evaluate_body(body: &[u8], config: &prost_types::Struct) -> Result<HttpRequestResult> {
+        let context = RequestContext::default();
+        let target = HttpRequestTarget::default();
+        evaluate_http_request(HttpRequestView::new(
+            SupervisorMiddlewarePhase::PreCredentials,
+            &context,
+            config,
+            &target,
+            &[],
+            body,
+            BUILTIN_REGEX,
+        ))
+    }
+
     #[tokio::test]
     async fn service_describes_regex_binding() {
-        let manifest = BuiltinMiddlewareService
-            .describe(Request::new(()))
-            .await
-            .expect("describe")
-            .into_inner();
+        let manifest = BuiltinMiddlewareService.describe().await;
         assert_eq!(manifest.bindings.len(), 1);
         assert_eq!(
             manifest.bindings[0].operation,
@@ -158,13 +148,22 @@ mod tests {
     }
 
     #[test]
+    fn registry_rejects_unknown_builtin_name() {
+        let error = validate_config("openshell/unknown", &prost_types::Struct::default())
+            .expect_err("unknown built-in");
+        assert!(
+            error
+                .to_string()
+                .contains("is not a registered OpenShell built-in")
+        );
+    }
+
+    #[test]
     fn regex_replacement_evaluates_through_binding() {
-        let result = evaluate_http_request(&HttpRequestEvaluation {
-            middleware_name: BUILTIN_REGEX.into(),
-            body: br#"{"password":"top-secret","token":"sk-ABCDEFGHIJKLMNOP"}"#.to_vec(),
-            config: Some(prost_types::Struct::default()),
-            ..Default::default()
-        })
+        let result = evaluate_body(
+            br#"{"password":"top-secret","token":"sk-ABCDEFGHIJKLMNOP"}"#,
+            &prost_types::Struct::default(),
+        )
         .expect("evaluate regex binding");
 
         assert_eq!(result.decision, Decision::Allow as i32);
@@ -186,17 +185,19 @@ mod tests {
             r#"{"password":"alpha beta","secret":"alpha,beta","api_key":"alpha\"beta"}"#,
             "\npassword=alpha\nnotpassword=omega"
         );
-        let result = evaluate_http_request(&HttpRequestEvaluation {
-            middleware_name: BUILTIN_REGEX.into(),
-            body: body.as_bytes().to_vec(),
-            config: Some(prost_types::Struct::default()),
-            ..Default::default()
-        })
-        .expect("evaluate regex binding");
+        let result = evaluate_body(body.as_bytes(), &prost_types::Struct::default())
+            .expect("evaluate regex binding");
 
         assert_eq!(result.decision, Decision::Allow as i32);
         assert!(!result.has_body);
-        assert_eq!(result.body, body.as_bytes());
+        assert!(result.body.is_empty());
         assert!(result.findings.is_empty());
+    }
+
+    #[test]
+    fn regex_rejects_non_utf8_borrowed_body() {
+        let error =
+            evaluate_body(&[0xff], &prost_types::Struct::default()).expect_err("non-UTF-8 body");
+        assert!(error.to_string().contains("requires UTF-8 request bodies"));
     }
 }
