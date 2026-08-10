@@ -469,10 +469,11 @@ policy identity. The final supervisor must match the probe's normalized
 identity attestation. Podman captures a bounded, sanitized failure diagnostic,
 removes the exact probe it created, and only then creates the final
 volume-backed sandbox. Probe names are unique to each attempt, so an ambiguous
-create response cannot poison a retry. The resolved workspace is the cwd and
-`HOME` for direct and SSH children. The supervisor itself starts from `/`, so a
-missing or invalid workspace is handled during readiness instead of preventing
-the container runtime from starting it.
+create response cannot poison a retry. After copy-up, the final supervisor
+validates the mounted workdir again and fails rather than repairing it. The
+resolved workspace is the cwd and `HOME` for direct and SSH children. The
+supervisor itself starts from `/`, so a missing or invalid workspace is handled
+during readiness instead of preventing the container runtime from starting it.
 
 Sandbox creation fails before readiness if a required `USER` component is
 missing, malformed, unknown, ambiguous, or resolves to UID/GID 0. An image

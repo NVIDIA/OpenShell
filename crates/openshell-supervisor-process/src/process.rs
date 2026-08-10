@@ -86,17 +86,12 @@ impl ResolvedProcessIdentity {
 pub struct ResolvedWorkspace {
     root: Option<String>,
     use_as_home: bool,
-    prevalidated: bool,
 }
 
 impl ResolvedWorkspace {
     #[must_use]
-    pub fn new(root: Option<String>, use_as_home: bool, prevalidated: bool) -> Self {
-        Self {
-            root,
-            use_as_home,
-            prevalidated,
-        }
+    pub fn new(root: Option<String>, use_as_home: bool) -> Self {
+        Self { root, use_as_home }
     }
 
     #[must_use]
@@ -112,11 +107,6 @@ impl ResolvedWorkspace {
     #[must_use]
     pub fn home(&self) -> Option<&str> {
         self.use_as_home.then(|| self.root()).flatten()
-    }
-
-    #[must_use]
-    pub const fn prevalidated(&self) -> bool {
-        self.prevalidated
     }
 }
 
@@ -1729,10 +1719,8 @@ fn validate_effective_workspace_write(fd: &impl std::os::fd::AsFd, path: &Path) 
 
 /// Prepare only the resolved `OpenShell` workspace directory itself.
 ///
-/// The caller has already selected an OpenShell-managed compatibility path or
-/// validated image authority through the kernel-backed probe. This preserves
-/// path shape without duplicating that authorization check. Image-provided
-/// children retain their declared ownership.
+/// This is reserved for the OpenShell-managed `/sandbox` compatibility path.
+/// It preserves parent permissions and any image-provided child ownership.
 #[cfg(unix)]
 fn prepare_oci_workspace_with(
     root: &Path,
@@ -1936,13 +1924,7 @@ fn chown_recursive(
 /// UIDs/GIDs (passed directly to `chown` without a passwd lookup).
 #[cfg(unix)]
 pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
-    prepare_filesystem_with_identity(
-        policy,
-        ResolvedProcessIdentity::default(),
-        None,
-        false,
-        false,
-    )
+    prepare_filesystem_with_identity(policy, ResolvedProcessIdentity::default(), None, false)
 }
 
 #[cfg(unix)]
@@ -1951,7 +1933,6 @@ pub fn prepare_filesystem_with_identity(
     resolved_identity: ResolvedProcessIdentity,
     workdir: Option<&str>,
     prepare_workspace: bool,
-    workspace_prevalidated: bool,
 ) -> Result<()> {
     use nix::unistd::chown;
 
@@ -1974,23 +1955,22 @@ pub fn prepare_filesystem_with_identity(
     #[cfg(target_os = "linux")]
     let _ = supplementary_gids;
 
-    // Docker and Podman own workspace resolution and must make the selected
-    // root usable by the final effective identity, including when both policy
-    // identity fields were explicit. Validate it before processing any
-    // user-authored read-write paths so an unsafe image path fails first.
-    // Other drivers retain their preparation.
+    // Docker and Podman own workspace resolution. OpenShell prepares only its
+    // explicit /sandbox compatibility workspace. An image-selected workdir is
+    // the image author's responsibility: validate it under the final identity
+    // without creating paths or changing ownership/mode. Podman reaches this
+    // check after its named-volume copy-up; Docker checks the image path
+    // directly.
     if prepare_workspace {
         let workspace = workdir.ok_or_else(|| {
             miette::miette!("local container driver did not supply a workspace workdir")
         })?;
         let workspace = Path::new(workspace);
-        if workspace == Path::new(openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT)
-            || workspace_prevalidated
-        {
+        if workspace == Path::new(openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT) {
             info!(path = %workspace.display(), ?uid, ?gid, "Preparing managed workspace");
             prepare_oci_workspace(workspace, uid, gid)?;
         } else {
-            info!(path = %workspace.display(), ?uid, ?gid, "Validating image workspace authority");
+            info!(path = %workspace.display(), ?uid, ?gid, "Validating workspace authority");
             #[cfg(target_os = "linux")]
             validate_oci_workspace_in_subprocess(policy, resolved_identity, workspace)?;
             #[cfg(not(target_os = "linux"))]
@@ -3467,7 +3447,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn prepare_managed_workspace_does_not_reauthorize_parent() {
+    fn prepare_managed_workspace_does_not_modify_parent_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().canonicalize().unwrap().join("workspace");
         let root = parent.join("project");
@@ -3478,16 +3458,13 @@ mod tests {
         let different_user = Uid::from_raw(metadata.uid().wrapping_add(1));
         let different_group = Gid::from_raw(metadata.gid().wrapping_add(1));
 
-        // The image probe already asked the kernel using the final identity,
-        // including any ACLs. Preparation only needs to preserve path shape
-        // and initialize the managed volume root.
         prepare_oci_workspace_with(
             &root,
             Some(different_user),
             Some(different_group),
             &|_, _, _| Ok(()),
         )
-        .expect("prevalidated parent authority must not be checked again");
+        .expect("managed workspace root should be prepared");
     }
 
     #[cfg(not(any(

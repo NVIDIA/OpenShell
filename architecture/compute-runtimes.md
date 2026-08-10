@@ -218,7 +218,9 @@ adopts the identity source from the effective global-or-sandbox policy, or
 discovers the image policy when neither exists, and emits a normalized
 attestation that the final supervisor must match. This internal Podman-only
 contract is required because the managed volume hides the original image tree
-before the final supervisor starts. The resolved workspace is the child cwd and `HOME`;
+before the final supervisor starts. After copy-up, the final supervisor checks
+the mounted workdir again without changing ownership or mode. The resolved
+workspace is the child cwd and `HOME`;
 when `filesystem.include_workdir` is enabled, it
 becomes the automatic writable policy path. Kubernetes/OpenShift keep their
 `/sandbox` PVC and `fsGroup` behavior, and VM keeps its `/sandbox` guest

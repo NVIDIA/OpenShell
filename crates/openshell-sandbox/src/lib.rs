@@ -231,18 +231,13 @@ pub async fn run_sandbox(
             openshell_supervisor_process::process::ResolvedWorkspace::new(
                 workdir.clone(),
                 use_workdir_as_home,
-                workspace_attestation.is_some(),
             ),
         )
     };
     #[cfg(not(unix))]
     let (resolved_process_identity, workspace) = (
         openshell_supervisor_process::process::ResolvedProcessIdentity::default(),
-        openshell_supervisor_process::process::ResolvedWorkspace::new(
-            workdir.clone(),
-            false,
-            false,
-        ),
+        openshell_supervisor_process::process::ResolvedWorkspace::new(workdir.clone(), false),
     );
 
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]

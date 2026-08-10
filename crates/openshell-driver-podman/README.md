@@ -25,9 +25,9 @@ Podman covers the path with the managed workspace volume. The completed process
 identity must already be able to traverse every parent and write and enter the
 directory, without symlink components or OpenShell control-path collisions.
 The gateway supplies the identity source from the effective global-or-sandbox
-policy, or requests image-policy discovery when neither exists. The final
-supervisor must match the probe's normalized identity before preparing the
-volume. See [Compute runtimes](../../architecture/compute-runtimes.md#process-identity)
+policy, or requests image-policy discovery when neither exists. After copy-up,
+the final supervisor must match the probe identity and revalidate the volume
+without repairing it. See [Compute runtimes](../../architecture/compute-runtimes.md#process-identity)
 for the invariant and probe lifecycle.
 
 For a rootless networking deep dive, see [NETWORKING.md](NETWORKING.md).
