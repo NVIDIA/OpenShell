@@ -22,15 +22,14 @@ pub fn spawn_interceptor_refresh_worker(state: Arc<crate::ServerState>, interval
                 continue;
             };
             match interceptors.refresh().await {
-                Ok(true) => {
+                Ok(structural_change) => {
                     counter!("openshell_gateway_interceptor_refresh_total", "result" => "success")
                         .increment(1);
-                    info!("gateway interceptor manifest refreshed with new bindings");
-                }
-                Ok(false) => {
-                    counter!("openshell_gateway_interceptor_refresh_total", "result" => "unchanged")
-                        .increment(1);
-                    debug!("gateway interceptor manifest unchanged");
+                    if structural_change {
+                        info!("gateway interceptor manifest refreshed with structural changes");
+                    } else {
+                        debug!("gateway interceptor manifest refreshed");
+                    }
                 }
                 Err(err) => {
                     counter!("openshell_gateway_interceptor_refresh_total", "result" => "error")
