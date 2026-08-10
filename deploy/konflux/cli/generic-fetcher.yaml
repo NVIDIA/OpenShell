@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Generic fetcher artifacts for Dockerfile.konflux.cli
+# These are prefetched by Hermeto and mounted at /cachi2/deps/generic/
+# Include in prefetch-input alongside cargo and rpm types.
+#
+# To update hashes: curl -sL <url> | sha256sum
+metadata:
+  version: "1.0"
+artifacts:
+  # musl libc source (arch-independent, built from source in Dockerfile)
+  - download_url: https://musl.libc.org/releases/musl-1.2.5.tar.gz
+    checksum: "sha256:a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4"
+    filename: musl-1.2.5.tar.gz
+
+  # Rust toolchain x86_64
+  - download_url: https://static.rust-lang.org/dist/rust-1.92.0-x86_64-unknown-linux-gnu.tar.xz
+    checksum: "sha256:d2ccef59dd9f7439f2c694948069f789a044dc1addcc0803613232af8f88ee0c"
+    filename: rust-1.92.0-x86_64-unknown-linux-gnu.tar.xz
+
+  # Rust toolchain aarch64
+  - download_url: https://static.rust-lang.org/dist/rust-1.92.0-aarch64-unknown-linux-gnu.tar.xz
+    checksum: "sha256:3e383f8b4fca710d0600d0c1de97b78281672be2cda6575ecbe1c183a12e3822"
+    filename: rust-1.92.0-aarch64-unknown-linux-gnu.tar.xz
+
+  # rust-std for musl target x86_64
+  - download_url: https://static.rust-lang.org/dist/rust-std-1.92.0-x86_64-unknown-linux-musl.tar.xz
+    checksum: "sha256:11f0b7efccdb5e7972e3c0fc23693a487abc28b624675c08161d055a016d527e"
+    filename: rust-std-1.92.0-x86_64-unknown-linux-musl.tar.xz
+
+  # rust-std for musl target aarch64
+  - download_url: https://static.rust-lang.org/dist/rust-std-1.92.0-aarch64-unknown-linux-musl.tar.xz
+    checksum: "sha256:94b9f84f21d29825c55a27fbb6b4b9fb9296a4a841aa54d85b95c42445623363"
+    filename: rust-std-1.92.0-aarch64-unknown-linux-musl.tar.xz

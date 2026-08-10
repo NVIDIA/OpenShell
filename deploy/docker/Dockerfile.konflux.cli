@@ -1,0 +1,118 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CLI image for RHEL/Konflux (hermetic build).
+#
+# Multi-stage build that compiles the openshell CLI from source on UBI9
+# as a fully-static musl binary. musl libc is built from source since
+# UBI9 does not ship it.
+#
+# Requires prefetched dependencies via Hermeto (cargo, rpm, generic).
+# See deploy/konflux/ for prefetch configs.
+#
+# Local build:  ./deploy/konflux/build-local.sh cli
+
+ARG RUST_VERSION=1.92.0
+ARG MUSL_VERSION=1.2.5
+
+# ---------------------------------------------------------------------------
+# Stage 1: build musl libc from source
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi:9.6@sha256:dec374e05cc13ebbc0975c9f521f3db6942d27f8ccdf06b180160490eef8bdbc AS musl-toolchain
+
+ARG MUSL_VERSION
+
+RUN dnf install -y --nodocs gcc make tar gzip \
+    && dnf clean all
+
+WORKDIR /tmp/musl-build
+
+RUN tar xzf /cachi2/output/deps/generic/musl-${MUSL_VERSION}.tar.gz --strip-components=1 \
+    && ./configure --prefix=/usr/local/musl --disable-shared \
+    && make -j"$(nproc)" \
+    && make install
+
+# ---------------------------------------------------------------------------
+# Stage 2: compile CLI (static musl binary)
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi:9.6@sha256:dec374e05cc13ebbc0975c9f521f3db6942d27f8ccdf06b180160490eef8bdbc AS builder
+
+ARG RUST_VERSION
+ARG TARGETARCH
+
+RUN dnf install -y --nodocs \
+        gcc gcc-c++ make cmake \
+        openssl-devel git-core xz \
+    && dnf clean all
+
+# Map TARGETARCH (amd64/arm64) to Rust triple components
+RUN RUST_ARCH=$(case "${TARGETARCH}" in amd64) echo x86_64;; arm64) echo aarch64;; *) echo "${TARGETARCH}";; esac) && \
+    RUST_TRIPLE="${RUST_ARCH}-unknown-linux-gnu" && \
+    MUSL_TRIPLE="${RUST_ARCH}-unknown-linux-musl" && \
+    mkdir -p /tmp/rust-toolchain && \
+    tar xJf /cachi2/output/deps/generic/rust-${RUST_VERSION}-${RUST_TRIPLE}.tar.xz -C /tmp/rust-toolchain --strip-components=1 && \
+    /tmp/rust-toolchain/install.sh --prefix=/usr/local && \
+    rm -rf /tmp/rust-toolchain && \
+    mkdir -p /tmp/musl-std && \
+    tar xJf /cachi2/output/deps/generic/rust-std-${RUST_VERSION}-${MUSL_TRIPLE}.tar.xz -C /tmp/musl-std --strip-components=1 && \
+    /tmp/musl-std/install.sh --prefix=/usr/local && \
+    rm -rf /tmp/musl-std
+
+COPY --from=musl-toolchain /usr/local/musl /usr/local/musl
+
+# CC and target vars use the native arch musl triple
+RUN RUST_ARCH=$(case "${TARGETARCH}" in amd64) echo x86_64;; arm64) echo aarch64;; *) echo "${TARGETARCH}";; esac) && \
+    echo "MUSL_TARGET=${RUST_ARCH}-unknown-linux-musl" > /tmp/build-env
+ENV PATH="/usr/local/musl/bin:${PATH}" \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo/ .cargo/
+COPY crates/ crates/
+COPY proto/ proto/
+COPY providers/ providers/
+
+# Scope workspace to CLI crates only -- avoids pulling in server/sandbox
+# dependencies (aws-lc-sys, russh) that are unnecessary for the CLI.
+RUN sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-cli", "crates/openshell-core", "crates/openshell-bootstrap", "crates/openshell-policy", "crates/openshell-prover", "crates/openshell-providers", "crates/openshell-sdk", "crates/openshell-tui"]|' Cargo.toml
+
+# Version stamped into the binary via openshell-core::VERSION; tag builds
+# pass the git tag with the leading "v" stripped. Empty otherwise.
+ARG OPENSHELL_VERSION=""
+
+RUN . /tmp/build-env && \
+    export CC_${MUSL_TARGET//-/_}=musl-gcc && \
+    VER="${OPENSHELL_VERSION#v}" && \
+    if [ -n "$VER" ]; then export OPENSHELL_GIT_VERSION="$VER"; fi && \
+    cargo build --release \
+        --target "${MUSL_TARGET}" \
+        --package openshell-cli && \
+    mkdir -p /build/output && \
+    cp /build/target/${MUSL_TARGET}/release/openshell /build/output/
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.6@sha256:34880b64c07f28f64d95737f82f891516de9a3b43583f39970f7bf8e4cfa48b7
+
+RUN microdnf install -y --nodocs ca-certificates \
+    && microdnf clean all
+
+COPY --from=builder --chmod=0555 /build/output/openshell /usr/local/bin/openshell
+
+LABEL com.redhat.component="odh-openshell-cli-container" \
+      description="Static musl-linked CLI for OpenShell sandboxed AI agent runtimes" \
+      summary="Static musl-linked CLI for OpenShell sandboxed AI agent runtimes" \
+      name="rhoai/odh-openshell-cli-rhel9" \
+      maintainer="['managed-open-data-hub@redhat.com']" \
+      io.openshift.expose-services="" \
+      io.k8s.display-name="odh-openshell-cli" \
+      io.k8s.description="odh-openshell-cli" \
+      com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
+
+USER 1000:1000
+
+ENTRYPOINT ["/usr/local/bin/openshell"]

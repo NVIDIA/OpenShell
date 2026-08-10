@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# RPM dependencies for Dockerfile.konflux.cli
+# Build + runtime stages combined. Generate lockfile with:
+#   rpm-lockfile-prototype --bare \
+#       --arch x86_64 --arch aarch64 \
+#       --outfile deploy/konflux/cli/rpms.lock.yaml \
+#       deploy/konflux/cli/rpms.in.yaml
+#
+contentOrigin:
+  repofiles:
+    - /etc/yum.repos.d/ubi.repo
+packages:
+  # Build stage: musl toolchain build
+  - gcc
+  - make
+  - tar
+  - gzip
+  - xz
+  # Build stage: Rust compilation (rustup provides rust/cargo)
+  - gcc-c++
+  - cmake
+  - openssl-devel
+  - git-core
+  # Runtime stage
+  - ca-certificates

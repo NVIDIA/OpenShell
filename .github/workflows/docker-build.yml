@@ -97,7 +97,7 @@ jobs:
               binary_component=cli
               binary_name=openshell
               features=""
-              has_image=false
+              has_image=true
               ;;
             *)
               echo "unsupported component: $component" >&2
@@ -271,6 +271,11 @@ jobs:
               output="$(docker run --rm --platform "${{ matrix.platform }}" --entrypoint /openshell-sandbox "$image" --version)"
               echo "$output"
               grep -q '^openshell-sandbox ' <<<"$output"
+              ;;
+            cli)
+              output="$(docker run --rm --platform "${{ matrix.platform }}" "$image" --version)"
+              echo "$output"
+              grep -q '^openshell ' <<<"$output"
               ;;
           esac
 
