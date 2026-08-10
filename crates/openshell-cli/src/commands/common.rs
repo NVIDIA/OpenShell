@@ -753,7 +753,7 @@ pub struct ProfileSuggestion {
 }
 
 fn credential_env_matches(env: &HashMap<String, String>) -> Vec<(String, Vec<ProfileSuggestion>)> {
-    const SUFFIXES: [&str; 7_usize] = [
+    const KEYWORDS: [&str; 7_usize] = [
         "TOKEN",
         "SECRET",
         "PASSWORD",
@@ -764,7 +764,11 @@ fn credential_env_matches(env: &HashMap<String, String>) -> Vec<(String, Vec<Pro
     ];
     let looks_like_credential = |key: &str| -> bool {
         let upper = key.to_ascii_uppercase();
-        SUFFIXES.iter().any(|s| upper.contains(*s))
+        let segs = upper.split('_').collect::<Vec<&str>>();
+        KEYWORDS.iter().any(|kw| {
+            let words = kw.split('_').collect::<Vec<&str>>();
+            segs.windows(words.len()).any(|w| w == words.as_slice())
+        })
     };
 
     // scan builtin_profiles()
@@ -1148,5 +1152,34 @@ mod tests {
         let prof = credential_env_matches(&env);
         let keys: Vec<&str> = prof.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["ABC_SECRET", "MID_PASSWORD", "ZED_TOKEN"]);
+    }
+
+    #[test]
+    fn nonsecrets() {
+        let env = env(&[
+            ("TOKENIZERS_PARALLELISM", "x"),
+            ("PASSWORDLESS_LOGIN", "y"),
+            ("SECRETARY_EMAIL", "z"),
+        ]);
+
+        let prof = credential_env_matches(&env);
+        assert!(prof.is_empty());
+    }
+
+    #[test]
+    fn segment_matches() {
+        let env = env(&[
+            ("DB_TOKEN", "a"),
+            ("MY_ACCESS_KEY", "b"),
+            ("PRIMARY_KEY", "c"),
+        ]);
+
+        let prof = credential_env_matches(&env);
+        assert_eq!(prof.len(), 2_usize);
+
+        let keys = prof.iter().map(|(k, _)| k.as_str()).collect::<Vec<&str>>();
+        assert!(keys.contains(&"DB_TOKEN"));
+        assert!(keys.contains(&"MY_ACCESS_KEY"));
+        assert!(!keys.contains(&"PRIMARY_KEY"));
     }
 }
