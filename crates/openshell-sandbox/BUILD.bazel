@@ -12,7 +12,10 @@ rust_library(
         exclude = ["src/main.rs"],
     ),
     aliases = aliases(),
-    crate_features = ["telemetry"],
+    crate_features = [
+        "bundled-ca-roots",
+        "telemetry",
+    ],
     version = WORKSPACE_VERSION,
     visibility = ["//visibility:public"],
     deps = all_crate_deps(normal = True),
@@ -33,7 +36,10 @@ rust_test(
     name = "openshell-sandbox_lib_test",
     compile_data = ["//crates/openshell-supervisor-network:sandbox-policy-rego"],
     crate = ":openshell-sandbox",
-    crate_features = ["telemetry"],
+    crate_features = [
+        "bundled-ca-roots",
+        "telemetry",
+    ],
     deps = all_crate_deps(normal_dev = True),
 )
 

@@ -597,6 +597,7 @@ pub async fn run_sandbox(
             middleware_registry_status,
             sidecar_control_publisher: sidecar_control_publisher.clone(),
             workspace_tx,
+            middleware_connector: default_middleware_connector(),
         };
 
         tokio::spawn(async move {
@@ -2283,10 +2284,11 @@ async fn reload_gateway_policy_runtime(
     entrypoint_pid: u32,
     desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
     middleware_registry_changed: bool,
+    middleware_connector: &MiddlewareConnector,
 ) -> std::result::Result<(), GatewayRuntimeReloadError> {
     match policy {
         Some(policy) if middleware_registry_changed => {
-            let registry = connect_middleware_registry(desired_services)
+            let registry = middleware_connector(desired_services.to_vec())
                 .await
                 .map_err(GatewayRuntimeReloadError::MiddlewareRegistry)?;
             engine
@@ -2405,7 +2407,13 @@ struct PolicyStatusUpdate {
     version: u32,
     loaded: bool,
     error: String,
-    initial_policy_hash: Option<String>,
+    success_event: Option<PolicyStatusSuccessEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PolicyStatusSuccessEvent {
+    InitialAcknowledgement { policy_hash: String },
+    UnchangedAcknowledgement { policy_hash: String },
 }
 
 impl PolicyStatusUpdate {
@@ -2414,7 +2422,9 @@ impl PolicyStatusUpdate {
             version: ack.version,
             loaded: true,
             error: String::new(),
-            initial_policy_hash: Some(ack.policy_hash.clone()),
+            success_event: Some(PolicyStatusSuccessEvent::InitialAcknowledgement {
+                policy_hash: ack.policy_hash.clone(),
+            }),
         }
     }
 
@@ -2423,7 +2433,16 @@ impl PolicyStatusUpdate {
             version,
             loaded: true,
             error: String::new(),
-            initial_policy_hash: None,
+            success_event: None,
+        }
+    }
+
+    fn unchanged_loaded(version: u32, policy_hash: String) -> Self {
+        Self {
+            version,
+            loaded: true,
+            error: String::new(),
+            success_event: Some(PolicyStatusSuccessEvent::UnchangedAcknowledgement { policy_hash }),
         }
     }
 
@@ -2432,7 +2451,7 @@ impl PolicyStatusUpdate {
             version,
             loaded: false,
             error,
-            initial_policy_hash: None,
+            success_event: None,
         }
     }
 }
@@ -2493,18 +2512,88 @@ fn initial_poll_disposition(
     }
 }
 
+fn unchanged_policy_revision_candidate(
+    reloads_gateway_policy: bool,
+    recovering_rejected_policy: bool,
+    current_policy_version: u32,
+    current_policy_hash: &str,
+    result: &openshell_core::grpc_client::SettingsPollResult,
+) -> Option<u32> {
+    (reloads_gateway_policy
+        && !recovering_rejected_policy
+        && !current_policy_hash.is_empty()
+        && result.policy_source == openshell_core::proto::PolicySource::Sandbox
+        && result.version > current_policy_version
+        && result.policy_hash == current_policy_hash)
+        .then_some(result.version)
+}
+
+fn unchanged_policy_revision_ready_to_ack(
+    candidate: Option<u32>,
+    policy_runtime_changed: bool,
+    policy_runtime_reconciled: bool,
+) -> Option<u32> {
+    candidate.filter(|_| !policy_runtime_changed || policy_runtime_reconciled)
+}
+
 /// Deliver policy status updates independently from policy reconciliation.
 ///
 /// The channel is FIFO, so a delayed older status can never arrive after a
 /// newer status and move the gateway's active version backward. Delivery uses
 /// the existing bounded retry, but failures never delay policy enforcement.
-async fn run_policy_status_reporter(
-    client: openshell_core::grpc_client::CachedOpenShellClient,
+#[tonic::async_trait]
+trait PolicyGatewayClient: Clone + Send + Sync + 'static {
+    async fn poll_settings(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<openshell_core::grpc_client::SettingsPollResult>;
+
+    async fn report_policy_status(
+        &self,
+        sandbox_id: &str,
+        version: u32,
+        loaded: bool,
+        error: &str,
+    ) -> Result<()>;
+
+    fn workspace(&self) -> String;
+}
+
+#[tonic::async_trait]
+impl PolicyGatewayClient for openshell_core::grpc_client::CachedOpenShellClient {
+    async fn poll_settings(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
+        self.poll_settings(sandbox_id).await
+    }
+
+    async fn report_policy_status(
+        &self,
+        sandbox_id: &str,
+        version: u32,
+        loaded: bool,
+        error: &str,
+    ) -> Result<()> {
+        self.report_policy_status(sandbox_id, version, loaded, error)
+            .await
+    }
+
+    fn workspace(&self) -> String {
+        self.workspace()
+    }
+}
+
+async fn run_policy_status_reporter<C: PolicyGatewayClient>(
+    client: C,
     sandbox_id: String,
     mut updates: tokio::sync::mpsc::UnboundedReceiver<PolicyStatusUpdate>,
 ) {
     'updates: while let Some(update) = updates.recv().await {
-        let operation = if update.initial_policy_hash.is_some() {
+        let operation = if matches!(
+            update.success_event,
+            Some(PolicyStatusSuccessEvent::InitialAcknowledgement { .. })
+        ) {
             "Initial policy acknowledgement"
         } else {
             "Policy status report"
@@ -2544,7 +2633,23 @@ async fn run_policy_status_reporter(
             }
         }
 
-        if let Some(policy_hash) = update.initial_policy_hash {
+        if let Some(event) = update.success_event {
+            let (policy_hash, message) = match event {
+                PolicyStatusSuccessEvent::InitialAcknowledgement { policy_hash } => (
+                    policy_hash,
+                    format!(
+                        "Acknowledged initial policy revision as loaded [version:{}]",
+                        update.version
+                    ),
+                ),
+                PolicyStatusSuccessEvent::UnchangedAcknowledgement { policy_hash } => (
+                    policy_hash,
+                    format!(
+                        "Acknowledged unchanged policy revision as loaded [version:{}]",
+                        update.version
+                    ),
+                ),
+            };
             ocsf_emit!(
                 ConfigStateChangeBuilder::new(ocsf_ctx())
                     .severity(SeverityId::Informational)
@@ -2552,10 +2657,7 @@ async fn run_policy_status_reporter(
                     .state(StateId::Enabled, "loaded")
                     .unmapped("version", serde_json::json!(update.version))
                     .unmapped("policy_hash", serde_json::json!(policy_hash))
-                    .message(format!(
-                        "Acknowledged initial policy revision as loaded [version:{}]",
-                        update.version
-                    ))
+                    .message(message)
                     .build()
             );
         }
@@ -2639,6 +2741,24 @@ struct PolicyPollLoopContext {
     middleware_registry_status: MiddlewareRegistryStatus,
     sidecar_control_publisher: Option<sidecar_control::Publisher>,
     workspace_tx: tokio::sync::watch::Sender<String>,
+    middleware_connector: MiddlewareConnector,
+}
+
+type MiddlewareConnector = Arc<
+    dyn Fn(
+            Vec<openshell_core::proto::SupervisorMiddlewareService>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<openshell_supervisor_middleware::MiddlewareRegistry>,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
+fn default_middleware_connector() -> MiddlewareConnector {
+    Arc::new(|services| Box::pin(async move { connect_middleware_registry(&services).await }))
 }
 
 async fn connect_middleware_registry(
@@ -2662,6 +2782,7 @@ async fn install_builtin_middleware_registry(opa_engine: &OpaEngine) -> Result<(
 
 async fn reconcile_middleware_registry(
     opa_engine: &OpaEngine,
+    middleware_connector: &MiddlewareConnector,
     desired_services: &[openshell_core::proto::SupervisorMiddlewareService],
     current_services: &mut Vec<openshell_core::proto::SupervisorMiddlewareService>,
     status: &mut MiddlewareRegistryStatus,
@@ -2672,7 +2793,7 @@ async fn reconcile_middleware_registry(
         return;
     }
 
-    match connect_middleware_registry(desired_services)
+    match middleware_connector(desired_services.to_vec())
         .await
         .and_then(|registry| opa_engine.replace_middleware_registry(registry))
     {
@@ -2898,11 +3019,17 @@ fn emit_policy_validation_failure(
 }
 
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
-    use openshell_core::grpc_client::CachedOpenShellClient;
+    let client = openshell_core::grpc_client::CachedOpenShellClient::connect(&ctx.endpoint).await?;
+    run_policy_poll_loop_with_client(ctx, client).await
+}
+
+async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
+    ctx: PolicyPollLoopContext,
+    client: C,
+) -> Result<()> {
     use openshell_core::proto::PolicySource;
     use std::sync::atomic::Ordering;
 
-    let client = CachedOpenShellClient::connect(&ctx.endpoint).await?;
     let (status_sender, status_receiver) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(run_policy_status_reporter(
         client.clone(),
@@ -2912,6 +3039,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 
     let mut current_config_revision: u64 = 0;
     let mut current_provider_env_revision: u64 = ctx.provider_credentials.snapshot().revision;
+    let mut current_policy_version: u32 = 0;
     let mut current_policy_hash = String::new();
     let mut current_middleware_services = Vec::new();
     let mut middleware_registry_status = ctx.middleware_registry_status;
@@ -2947,6 +3075,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                         skills::install_static_skills,
                     );
                     current_config_revision = candidate.config_revision;
+                    current_policy_version = candidate.version;
                     current_policy_hash.clone_from(&candidate.policy_hash);
                     current_middleware_services = result.supervisor_middleware_services;
                     current_settings = result.settings;
@@ -3029,6 +3158,17 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                 &result.supervisor_middleware_services,
                 middleware_registry_status,
             );
+        // Recovery already has its own acknowledgement path below. Giving it
+        // precedence here prevents a restored last-known-good policy from
+        // also being acknowledged as an ordinary same-hash revision.
+        let unchanged_policy_revision = unchanged_policy_revision_candidate(
+            reloads_gateway_policy,
+            recovering_rejected_policy,
+            current_policy_version,
+            &current_policy_hash,
+            &result,
+        );
+        let mut policy_runtime_reconciled = false;
 
         // A local policy override is not coupled to the gateway policy
         // snapshot, so its service registry can still be reconciled alone.
@@ -3037,6 +3177,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         if !reloads_gateway_policy {
             reconcile_middleware_registry(
                 &ctx.opa_engine,
+                &ctx.middleware_connector,
                 &result.supervisor_middleware_services,
                 &mut current_middleware_services,
                 &mut middleware_registry_status,
@@ -3044,7 +3185,11 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             .await;
         }
 
-        if !config_changed && !provider_env_changed && !policy_runtime_changed {
+        if !config_changed
+            && !provider_env_changed
+            && !policy_runtime_changed
+            && unchanged_policy_revision.is_none()
+        {
             continue;
         }
 
@@ -3148,11 +3293,13 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                 pid,
                 &result.supervisor_middleware_services,
                 middleware_registry_changed,
+                &ctx.middleware_connector,
             )
             .await;
 
             match runtime_result {
                 Ok(()) => {
+                    policy_runtime_reconciled = true;
                     let policy = result
                         .policy
                         .as_ref()
@@ -3202,6 +3349,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                                 &status_sender,
                                 PolicyStatusUpdate::loaded(result.version),
                             );
+                            current_policy_version = result.version;
                         }
                     } else if recovering_rejected_policy
                         && result.version > 0
@@ -3223,6 +3371,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                             &status_sender,
                             PolicyStatusUpdate::loaded(result.version),
                         );
+                        current_policy_version = result.version;
                     }
 
                     if middleware_registry_changed {
@@ -3310,6 +3459,18 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                     // NeedsReconciliation), not by degrading the status here.
                 }
             }
+        }
+
+        if let Some(version) = unchanged_policy_revision_ready_to_ack(
+            unchanged_policy_revision,
+            policy_runtime_changed,
+            policy_runtime_reconciled,
+        ) {
+            enqueue_policy_status(
+                &status_sender,
+                PolicyStatusUpdate::unchanged_loaded(version, result.policy_hash.clone()),
+            );
+            current_policy_version = version;
         }
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
@@ -3843,6 +4004,376 @@ filesystem_policy:
         }
     }
 
+    #[derive(Clone)]
+    struct ScriptedPolicyGateway {
+        polls: Arc<
+            tokio::sync::Mutex<
+                tokio::sync::mpsc::UnboundedReceiver<
+                    openshell_core::grpc_client::SettingsPollResult,
+                >,
+            >,
+        >,
+        reports: UnboundedSender<(u32, bool, String)>,
+    }
+
+    #[tonic::async_trait]
+    impl PolicyGatewayClient for ScriptedPolicyGateway {
+        async fn poll_settings(
+            &self,
+            _sandbox_id: &str,
+        ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
+            self.polls
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| miette::miette!("scripted policy poll channel closed"))
+        }
+
+        async fn report_policy_status(
+            &self,
+            _sandbox_id: &str,
+            version: u32,
+            loaded: bool,
+            error: &str,
+        ) -> Result<()> {
+            self.reports
+                .send((version, loaded, error.to_string()))
+                .map_err(|_| miette::miette!("scripted policy report channel closed"))
+        }
+
+        fn workspace(&self) -> String {
+            "test-workspace".to_string()
+        }
+    }
+
+    fn scripted_policy_gateway() -> (
+        ScriptedPolicyGateway,
+        UnboundedSender<openshell_core::grpc_client::SettingsPollResult>,
+        tokio::sync::mpsc::UnboundedReceiver<(u32, bool, String)>,
+    ) {
+        let (poll_tx, poll_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            ScriptedPolicyGateway {
+                polls: Arc::new(tokio::sync::Mutex::new(poll_rx)),
+                reports: report_tx,
+            },
+            poll_tx,
+            report_rx,
+        )
+    }
+
+    fn policy_poll_test_context(
+        opa_engine: Arc<OpaEngine>,
+        loaded_policy_origin: LoadedPolicyOrigin,
+        middleware_connector: MiddlewareConnector,
+    ) -> PolicyPollLoopContext {
+        let (workspace_tx, _workspace_rx) = tokio::sync::watch::channel(String::new());
+        PolicyPollLoopContext {
+            endpoint: String::new(),
+            sandbox_id: "sandbox-test".to_string(),
+            opa_engine,
+            loaded_policy_origin,
+            entrypoint_pid: Arc::new(AtomicU32::new(0)),
+            interval_secs: 0,
+            ocsf_enabled: Arc::new(AtomicBool::new(false)),
+            provider_credentials: ProviderCredentialState::from_child_env_snapshot(
+                0,
+                std::collections::HashMap::new(),
+            ),
+            policy_local_ctx: None,
+            agent_proposals: AgentProposals::default(),
+            middleware_registry_status: MiddlewareRegistryStatus::Synchronized,
+            sidecar_control_publisher: None,
+            workspace_tx,
+            middleware_connector,
+        }
+    }
+
+    async fn expect_policy_report(
+        reports: &mut tokio::sync::mpsc::UnboundedReceiver<(u32, bool, String)>,
+        version: u32,
+    ) {
+        let report = timeout(Duration::from_secs(1), reports.recv())
+            .await
+            .expect("policy report timed out")
+            .expect("policy reporter stopped");
+        assert_eq!(report, (version, true, String::new()));
+    }
+
+    async fn expect_no_policy_report(
+        reports: &mut tokio::sync::mpsc::UnboundedReceiver<(u32, bool, String)>,
+    ) {
+        assert!(
+            timeout(Duration::from_millis(50), reports.recv())
+                .await
+                .is_err(),
+            "unexpected policy status report"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_hash_poll_revision_is_acknowledged_once_without_opa_reload() {
+        let mut v1 = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        v1.policy_hash = "same-policy".to_string();
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.config_revision = 200;
+
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let loaded_revision = LoadedPolicyRevision::from_snapshot(&v1);
+        let ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_revision),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let (client, polls, mut reports) = scripted_policy_gateway();
+        polls.send(v1).unwrap();
+
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+
+        polls.send(v2.clone()).unwrap();
+        expect_policy_report(&mut reports, 2).await;
+        polls.send(v2).unwrap();
+        expect_no_policy_report(&mut reports).await;
+
+        assert_eq!(
+            engine.current_generation(),
+            0,
+            "same-hash acknowledgement must not reload OPA"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn same_hash_ack_waits_for_failed_middleware_reconciliation_and_retries_once() {
+        let mut v1 = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        v1.policy_hash = "same-policy".to_string();
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.config_revision = 200;
+        v2.supervisor_middleware_services =
+            vec![openshell_core::proto::SupervisorMiddlewareService {
+                name: "scripted-guard".to_string(),
+                grpc_endpoint: "http://scripted.invalid".to_string(),
+                ..Default::default()
+            }];
+
+        let connector_attempts = Arc::new(AtomicUsize::new(0));
+        let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let middleware_connector: MiddlewareConnector = {
+            let connector_attempts = connector_attempts.clone();
+            Arc::new(move |_services| {
+                let attempt = connector_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                attempt_tx.send(attempt).unwrap();
+                Box::pin(async move {
+                    if attempt == 1 {
+                        Err(miette::miette!("scripted middleware connection failure"))
+                    } else {
+                        connect_middleware_registry(&[]).await
+                    }
+                })
+            })
+        };
+
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let loaded_revision = LoadedPolicyRevision::from_snapshot(&v1);
+        let ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_revision),
+                has_last_valid_policy: true,
+            },
+            middleware_connector,
+        );
+        let (client, polls, mut reports) = scripted_policy_gateway();
+        polls.send(v1).unwrap();
+
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+
+        polls.send(v2.clone()).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), attempt_rx.recv())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        expect_no_policy_report(&mut reports).await;
+        assert_eq!(engine.current_generation(), 0);
+
+        polls.send(v2.clone()).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), attempt_rx.recv())
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        expect_policy_report(&mut reports, 2).await;
+        assert_eq!(engine.current_generation(), 1);
+
+        polls.send(v2).unwrap();
+        expect_no_policy_report(&mut reports).await;
+        assert_eq!(connector_attempts.load(Ordering::SeqCst), 2);
+        handle.abort();
+    }
+
+    async fn assert_poll_does_not_use_same_hash_acknowledgement(
+        initial: openshell_core::grpc_client::SettingsPollResult,
+        next: openshell_core::grpc_client::SettingsPollResult,
+        origin: LoadedPolicyOrigin,
+        initial_report: Option<u32>,
+    ) {
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let ctx = policy_poll_test_context(engine.clone(), origin, default_middleware_connector());
+        let (client, polls, mut reports) = scripted_policy_gateway();
+        polls.send(initial).unwrap();
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+
+        if let Some(version) = initial_report {
+            expect_policy_report(&mut reports, version).await;
+        } else {
+            expect_no_policy_report(&mut reports).await;
+        }
+
+        polls.send(next).unwrap();
+        expect_no_policy_report(&mut reports).await;
+        assert_eq!(
+            engine.current_generation(),
+            0,
+            "negative same-hash scope must not reload OPA"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn same_hash_ack_poll_loop_rejects_local_global_empty_equal_and_older_scopes() {
+        let mut sandbox_v1 = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        sandbox_v1.policy_hash = "same-policy".to_string();
+        let loaded_v1 = LoadedPolicyRevision::from_snapshot(&sandbox_v1);
+        let mut sandbox_v2 = sandbox_v1.clone();
+        sandbox_v2.version = 2;
+        sandbox_v2.config_revision = 200;
+
+        assert_poll_does_not_use_same_hash_acknowledgement(
+            sandbox_v1.clone(),
+            sandbox_v2.clone(),
+            LoadedPolicyOrigin::LocalOverride,
+            None,
+        )
+        .await;
+
+        let mut global_v2 = sandbox_v2.clone();
+        global_v2.policy_source = openshell_core::proto::PolicySource::Global;
+        assert_poll_does_not_use_same_hash_acknowledgement(
+            sandbox_v1.clone(),
+            global_v2,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_v1.clone()),
+                has_last_valid_policy: true,
+            },
+            Some(1),
+        )
+        .await;
+
+        let mut empty_v1 = sandbox_v1.clone();
+        empty_v1.policy_hash.clear();
+        let empty_loaded = LoadedPolicyRevision::from_snapshot(&empty_v1);
+        let mut empty_v2 = sandbox_v2.clone();
+        empty_v2.policy_hash.clear();
+        assert_poll_does_not_use_same_hash_acknowledgement(
+            empty_v1,
+            empty_v2,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(empty_loaded),
+                has_last_valid_policy: true,
+            },
+            Some(1),
+        )
+        .await;
+
+        assert_poll_does_not_use_same_hash_acknowledgement(
+            sandbox_v1.clone(),
+            sandbox_v1.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_v1.clone()),
+                has_last_valid_policy: true,
+            },
+            Some(1),
+        )
+        .await;
+
+        let loaded_v2 = LoadedPolicyRevision::from_snapshot(&sandbox_v2);
+        assert_poll_does_not_use_same_hash_acknowledgement(
+            sandbox_v2,
+            sandbox_v1,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_v2),
+                has_last_valid_policy: true,
+            },
+            Some(2),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn changed_hash_poll_uses_normal_opa_reload_and_status_path() {
+        let v1 = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let v2 = settings_poll_result(
+            Some(proto_policy_fixture()),
+            2,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let loaded_revision = LoadedPolicyRevision::from_snapshot(&v1);
+        let engine =
+            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
+        let ctx = policy_poll_test_context(
+            engine.clone(),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(loaded_revision),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let (client, polls, mut reports) = scripted_policy_gateway();
+        polls.send(v1).unwrap();
+        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+
+        expect_policy_report(&mut reports, 1).await;
+        polls.send(v2).unwrap();
+        expect_policy_report(&mut reports, 2).await;
+        assert_eq!(
+            engine.current_generation(),
+            1,
+            "changed policy content must still reload OPA"
+        );
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn failed_external_startup_registry_build_preserves_installed_builtins() {
         let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
@@ -3885,6 +4416,7 @@ filesystem_policy:
             0,
             &[unavailable_service],
             true,
+            &default_middleware_connector(),
         )
         .await
         .expect_err("unavailable middleware must fail candidate preparation");
@@ -4196,6 +4728,86 @@ filesystem_policy:
             InitialPollDisposition::Reconcile
         );
         assert!(origin.allows_gateway_policy_reload());
+    }
+
+    #[test]
+    fn unchanged_sandbox_policy_revision_candidate_is_strictly_scoped() {
+        let sandbox_result = openshell_core::grpc_client::SettingsPollResult {
+            policy_hash: "same-policy".to_string(),
+            ..settings_poll_result(
+                Some(proto_policy_fixture()),
+                2,
+                openshell_core::proto::PolicySource::Sandbox,
+            )
+        };
+
+        assert_eq!(
+            unchanged_policy_revision_candidate(true, false, 1, "same-policy", &sandbox_result),
+            Some(2)
+        );
+        assert_eq!(
+            unchanged_policy_revision_candidate(true, false, 2, "same-policy", &sandbox_result),
+            None
+        );
+        assert_eq!(
+            unchanged_policy_revision_candidate(
+                true,
+                false,
+                1,
+                "different-policy",
+                &sandbox_result,
+            ),
+            None
+        );
+        assert_eq!(
+            unchanged_policy_revision_candidate(false, false, 1, "same-policy", &sandbox_result),
+            None
+        );
+        assert_eq!(
+            unchanged_policy_revision_candidate(true, false, 1, "", &sandbox_result),
+            None
+        );
+        assert_eq!(
+            unchanged_policy_revision_candidate(true, true, 1, "same-policy", &sandbox_result),
+            None
+        );
+
+        let global_result = openshell_core::grpc_client::SettingsPollResult {
+            policy_hash: "same-policy".to_string(),
+            ..settings_poll_result(
+                Some(proto_policy_fixture()),
+                2,
+                openshell_core::proto::PolicySource::Global,
+            )
+        };
+        assert_eq!(
+            unchanged_policy_revision_candidate(true, false, 1, "same-policy", &global_result),
+            None
+        );
+    }
+
+    #[test]
+    fn unchanged_policy_revision_waits_for_required_runtime_reconciliation() {
+        assert_eq!(
+            unchanged_policy_revision_ready_to_ack(Some(2), false, false),
+            Some(2),
+            "a same-hash revision needs no OPA reload"
+        );
+        assert_eq!(
+            unchanged_policy_revision_ready_to_ack(Some(2), true, false),
+            None,
+            "failed runtime reconciliation must keep the revision pending"
+        );
+        assert_eq!(
+            unchanged_policy_revision_ready_to_ack(Some(2), true, true),
+            Some(2),
+            "successful runtime reconciliation permits acknowledgement"
+        );
+        assert_eq!(
+            unchanged_policy_revision_ready_to_ack(None, false, true),
+            None,
+            "runtime success cannot manufacture a revision candidate"
+        );
     }
 
     #[test]

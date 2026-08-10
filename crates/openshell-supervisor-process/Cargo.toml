@@ -21,7 +21,7 @@ hex = "0.4"
 miette = { workspace = true }
 nix = { workspace = true }
 rand = "0.10"
-russh = "0.61"
+russh = "0.62"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
