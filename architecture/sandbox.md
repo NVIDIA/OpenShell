@@ -110,9 +110,12 @@ host selectors choose the chain independently of the network rule that admitted
 the request. Policy-local map keys identify configs, while built-in names or
 operator-owned registration names identify implementations.
 
-Built-ins run in-process; operator services use gRPC. Both implement the same
-transport-neutral endpoint contract, including bidirectional WebSocket
-sessions, so a manifest advertises capabilities independently of transport.
+Built-ins run in-process against a borrowed view of the chain's current HTTP
+request state. Operator services retain the bounded protobuf/gRPC contract, and
+the remote adapter materializes an owned HTTP evaluation only when a request
+crosses that transport boundary. Both paths support bounded bidirectional
+WebSocket sessions, so a manifest advertises capabilities independently of
+transport.
 The runtime keeps three states distinct: host selection attaches policy configs,
 manifest operation and phase bindings select the active chain, and the parsed
 message type determines whether that chain can inspect an individual payload.

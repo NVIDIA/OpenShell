@@ -8,21 +8,19 @@ mod regex;
 use std::sync::Arc;
 
 use miette::{Result, miette};
-use openshell_core::middleware::{SupervisorMiddlewareEndpoint, WebSocketResponseStream};
-use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
+use openshell_core::middleware::{HttpRequestView, InProcessMiddleware, WebSocketResponseStream};
 use openshell_core::proto::{
-    HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, SupervisorMiddlewarePhase,
-    ValidateConfigRequest, ValidateConfigResponse, WebSocketMessageType, WebSocketPreflightAction,
-    WebSocketPreflightDecision, WebSocketSessionEvent, WebSocketSessionEventResult,
-    web_socket_session_event, web_socket_session_event_result,
+    HttpRequestResult, MiddlewareManifest, SupervisorMiddlewarePhase, WebSocketMessageType,
+    WebSocketPreflightAction, WebSocketPreflightDecision, WebSocketSessionEvent,
+    WebSocketSessionEventResult, web_socket_session_event, web_socket_session_event_result,
 };
 use tokio_stream::{Stream, StreamExt};
-use tonic::{Request, Response, Status};
+use tonic::Status;
 
 pub use regex::{NAME as BUILTIN_REGEX, RegexConfig, RegexMode};
 
 /// Return the first-party services that the gateway and supervisor install.
-pub fn services() -> Vec<Arc<dyn SupervisorMiddlewareEndpoint>> {
+pub fn services() -> Vec<Arc<dyn InProcessMiddleware>> {
     vec![Arc::new(BuiltinMiddlewareService)]
 }
 
@@ -37,11 +35,16 @@ pub fn validate_config(implementation: &str, config: &prost_types::Struct) -> Re
     }
 }
 
-fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpRequestResult> {
-    regex::evaluate_http_request(evaluation)
+fn evaluate_http_request(request: HttpRequestView<'_>) -> Result<HttpRequestResult> {
+    match request.middleware_name() {
+        BUILTIN_REGEX => regex::evaluate_http_request(request.config(), request.body()),
+        other => Err(miette!(
+            "middleware implementation '{other}' is not a registered OpenShell built-in"
+        )),
+    }
 }
 
-/// Built-in regex service exposed through the standard middleware contract.
+/// Aggregate service exposing first-party middleware through the borrowed in-process contract.
 #[derive(Debug, Default)]
 pub struct BuiltinMiddlewareService;
 
@@ -176,79 +179,34 @@ fn advance_sequence_lower_bound(
 }
 
 #[tonic::async_trait]
-impl SupervisorMiddleware for BuiltinMiddlewareService {
-    type EvaluateWebSocketSessionStream = WebSocketResponseStream;
-
-    async fn describe(
-        &self,
-        _request: Request<()>,
-    ) -> Result<Response<MiddlewareManifest>, Status> {
-        Ok(Response::new(MiddlewareManifest {
+impl InProcessMiddleware for BuiltinMiddlewareService {
+    async fn describe(&self) -> MiddlewareManifest {
+        MiddlewareManifest {
             name: BUILTIN_REGEX.into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: regex::describe(),
-        }))
+        }
     }
 
     async fn validate_config(
         &self,
-        request: Request<ValidateConfigRequest>,
-    ) -> Result<Response<ValidateConfigResponse>, Status> {
-        let request = request.into_inner();
-        let config = request.config.unwrap_or_default();
-        Ok(Response::new(match regex::validate_config(&config) {
-            Ok(()) => ValidateConfigResponse {
-                valid: true,
-                reason: String::new(),
-            },
-            Err(error) => ValidateConfigResponse {
-                valid: false,
-                reason: error.to_string(),
-            },
-        }))
+        middleware_name: &str,
+        config: &prost_types::Struct,
+    ) -> Result<()> {
+        validate_config(middleware_name, config)
     }
 
     async fn evaluate_http_request(
         &self,
-        request: Request<HttpRequestEvaluation>,
-    ) -> Result<Response<HttpRequestResult>, Status> {
-        evaluate_http_request(&request.into_inner())
-            .map(Response::new)
-            .map_err(|error| Status::invalid_argument(error.to_string()))
-    }
-
-    async fn evaluate_web_socket_session(
-        &self,
-        request: Request<tonic::Streaming<WebSocketSessionEvent>>,
-    ) -> Result<Response<Self::EvaluateWebSocketSessionStream>, Status> {
-        Ok(Response::new(Self::websocket_stream(request.into_inner())))
-    }
-}
-
-#[tonic::async_trait]
-impl SupervisorMiddlewareEndpoint for BuiltinMiddlewareService {
-    async fn describe(&self, request: Request<()>) -> Result<Response<MiddlewareManifest>, Status> {
-        SupervisorMiddleware::describe(self, request).await
-    }
-
-    async fn validate_config(
-        &self,
-        request: Request<ValidateConfigRequest>,
-    ) -> Result<Response<ValidateConfigResponse>, Status> {
-        SupervisorMiddleware::validate_config(self, request).await
-    }
-
-    async fn evaluate_http_request(
-        &self,
-        request: Request<HttpRequestEvaluation>,
-    ) -> Result<Response<HttpRequestResult>, Status> {
-        SupervisorMiddleware::evaluate_http_request(self, request).await
+        request: HttpRequestView<'_>,
+    ) -> Result<HttpRequestResult> {
+        evaluate_http_request(request)
     }
 
     async fn open_websocket_session(
         &self,
         receiver: tokio::sync::mpsc::Receiver<WebSocketSessionEvent>,
-    ) -> Result<WebSocketResponseStream, Status> {
+    ) -> std::result::Result<WebSocketResponseStream, Status> {
         Ok(Self::websocket_stream(
             tokio_stream::wrappers::ReceiverStream::new(receiver).map(Ok),
         ))
@@ -259,7 +217,8 @@ impl SupervisorMiddlewareEndpoint for BuiltinMiddlewareService {
 mod tests {
     use super::*;
     use openshell_core::proto::{
-        Decision, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, WebSocketPreflight,
+        Decision, HttpRequestTarget, RequestContext, SupervisorMiddlewareOperation,
+        SupervisorMiddlewarePhase, WebSocketPreflight,
     };
 
     fn string_config(key: &str, value: &str) -> prost_types::Struct {
@@ -274,12 +233,23 @@ mod tests {
         }
     }
 
+    fn evaluate_body(body: &[u8], config: &prost_types::Struct) -> Result<HttpRequestResult> {
+        let context = RequestContext::default();
+        let target = HttpRequestTarget::default();
+        evaluate_http_request(HttpRequestView::new(
+            SupervisorMiddlewarePhase::PreCredentials,
+            &context,
+            config,
+            &target,
+            &[],
+            body,
+            BUILTIN_REGEX,
+        ))
+    }
+
     #[tokio::test]
     async fn service_describes_regex_binding() {
-        let manifest = SupervisorMiddleware::describe(&BuiltinMiddlewareService, Request::new(()))
-            .await
-            .expect("describe")
-            .into_inner();
+        let manifest = InProcessMiddleware::describe(&BuiltinMiddlewareService).await;
         assert_eq!(manifest.bindings.len(), 2);
         assert_eq!(
             manifest.bindings[0].operation,
@@ -333,13 +303,22 @@ mod tests {
     }
 
     #[test]
+    fn registry_rejects_unknown_builtin_name() {
+        let error = validate_config("openshell/unknown", &prost_types::Struct::default())
+            .expect_err("unknown built-in");
+        assert!(
+            error
+                .to_string()
+                .contains("is not a registered OpenShell built-in")
+        );
+    }
+
+    #[test]
     fn regex_replacement_evaluates_through_binding() {
-        let result = evaluate_http_request(&HttpRequestEvaluation {
-            middleware_name: "operator-assigned-name".into(),
-            body: br#"{"password":"top-secret","token":"sk-ABCDEFGHIJKLMNOP"}"#.to_vec(),
-            config: Some(prost_types::Struct::default()),
-            ..Default::default()
-        })
+        let result = evaluate_body(
+            br#"{"password":"top-secret","token":"sk-ABCDEFGHIJKLMNOP"}"#,
+            &prost_types::Struct::default(),
+        )
         .expect("evaluate regex binding");
 
         assert_eq!(result.decision, Decision::Allow as i32);
@@ -356,19 +335,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_config_validation_does_not_dispatch_on_registration_name() {
-        let response = SupervisorMiddleware::validate_config(
+    async fn service_validates_builtin_config() {
+        InProcessMiddleware::validate_config(
             &BuiltinMiddlewareService,
-            Request::new(ValidateConfigRequest {
-                config: Some(prost_types::Struct::default()),
-                middleware_name: "operator-assigned-name".into(),
-            }),
+            BUILTIN_REGEX,
+            &prost_types::Struct::default(),
         )
         .await
-        .expect("validate config")
-        .into_inner();
-
-        assert!(response.valid);
+        .expect("validate config");
     }
 
     #[tokio::test]
@@ -404,17 +378,12 @@ mod tests {
             r#"{"password":"alpha beta","secret":"alpha,beta","api_key":"alpha\"beta"}"#,
             "\npassword=alpha\nnotpassword=omega"
         );
-        let result = evaluate_http_request(&HttpRequestEvaluation {
-            middleware_name: BUILTIN_REGEX.into(),
-            body: body.as_bytes().to_vec(),
-            config: Some(prost_types::Struct::default()),
-            ..Default::default()
-        })
-        .expect("evaluate regex binding");
+        let result = evaluate_body(body.as_bytes(), &prost_types::Struct::default())
+            .expect("evaluate regex binding");
 
         assert_eq!(result.decision, Decision::Allow as i32);
         assert!(!result.has_body);
-        assert_eq!(result.body, body.as_bytes());
+        assert!(result.body.is_empty());
         assert!(result.findings.is_empty());
     }
 
@@ -485,5 +454,12 @@ mod tests {
         advance_sequence_lower_bound(&mut lower_bound, u64::MAX).expect("last sequence");
         assert_eq!(lower_bound, None);
         assert!(advance_sequence_lower_bound(&mut lower_bound, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn regex_rejects_non_utf8_borrowed_body() {
+        let error =
+            evaluate_body(&[0xff], &prost_types::Struct::default()).expect_err("non-UTF-8 body");
+        assert!(error.to_string().contains("requires UTF-8 request bodies"));
     }
 }

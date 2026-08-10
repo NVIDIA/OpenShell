@@ -237,6 +237,9 @@ release. Look for failed installs, unexpected values, missing namespace, wrong
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
+`server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
+pod, and the gateway propagates the effective value to sandbox supervisors.
+
 When no external credential driver is enabled, the Helm chart uses the
 gateway's default encrypted database credential storage. The chart creates a
 retained Kubernetes Secret for the shared KEK, injects it into gateway pods, and

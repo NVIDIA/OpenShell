@@ -30,7 +30,7 @@ const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
 const MAX_SIGV4_BODY_BYTES: usize = 10 * 1024 * 1024;
 #[cfg(test)]
 async fn max_middleware_body_bytes() -> usize {
-    let chain = openshell_supervisor_middleware::ChainRunner::from_endpoint(
+    let chain = openshell_supervisor_middleware::ChainRunner::new(
         openshell_supervisor_middleware_builtins::services()
             .into_iter()
             .next()

@@ -4,7 +4,6 @@
 //! Forward-direction WebSocket middleware session runner.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{StreamExt, future::join_all};
@@ -901,7 +900,7 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
     let Some(service) = entry.service.as_ref() else {
         return OpenStage::Failed(entry, "binding_not_described".into());
     };
-    let endpoint = Arc::clone(&service.endpoint);
+    let dispatch = service.service.clone();
     let diagnostic_policy = service.diagnostic_policy;
     let preflight = WebSocketPreflight {
         session_id: input.session_id,
@@ -936,7 +935,7 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
             })
             .await
             .map_err(|_| tonic::Status::unavailable("request stream closed"))?;
-        let mut responses = endpoint.open_websocket_session(receiver).await?;
+        let mut responses = dispatch.open_websocket_session(receiver).await?;
         let response = responses.next().await.transpose()?;
         Ok::<_, tonic::Status>((sender, responses, response))
     })

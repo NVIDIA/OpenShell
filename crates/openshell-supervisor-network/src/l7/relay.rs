@@ -3117,14 +3117,12 @@ mod tests {
     }
 
     fn install_builtin_middleware(engine: &OpaEngine) {
-        engine.set_middleware_runner_for_tests(
-            openshell_supervisor_middleware::ChainRunner::from_endpoint(
-                openshell_supervisor_middleware_builtins::services()
-                    .into_iter()
-                    .next()
-                    .expect("built-in middleware service"),
-            ),
-        );
+        engine.set_middleware_runner_for_tests(openshell_supervisor_middleware::ChainRunner::new(
+            openshell_supervisor_middleware_builtins::services()
+                .into_iter()
+                .next()
+                .expect("built-in middleware service"),
+        ));
     }
 
     fn assert_middleware_failure_response(response: &str, policy_name: &str) {
@@ -4994,7 +4992,7 @@ network_policies:
 
         // A single unresolved (0-limit) entry must not drag the chain limit to
         // zero: the buffer limit reflects only the resolved built-in.
-        let mixed = ChainRunner::from_endpoint(
+        let mixed = ChainRunner::new(
             openshell_supervisor_middleware_builtins::services()
                 .into_iter()
                 .next()
@@ -5027,76 +5025,39 @@ network_policies:
     }
 
     #[tonic::async_trait]
-    impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
-        for BlockingAllowService
-    {
-        type EvaluateWebSocketSessionStream =
-            openshell_supervisor_middleware::WebSocketResponseStream;
-
-        async fn evaluate_web_socket_session(
-            &self,
-            _request: tonic::Request<
-                tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>,
-            >,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketSessionStream>, tonic::Status>
-        {
-            Err(tonic::Status::unimplemented(
-                "test service does not inspect WebSocket messages",
-            ))
-        }
-        async fn describe(
-            &self,
-            _request: tonic::Request<()>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::MiddlewareManifest>,
-            tonic::Status,
-        > {
-            Ok(tonic::Response::new(
-                openshell_core::proto::MiddlewareManifest {
-                    name: "test/blocking-allow".into(),
-                    service_version: "test".into(),
-                    bindings: vec![openshell_core::proto::MiddlewareBinding {
-                        operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpRequest
-                            as i32,
-                        phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
-                            as i32,
-                        max_payload_bytes: 8192,
-                        timeout: String::new(),
-                    }],
-                },
-            ))
+    impl openshell_core::middleware::InProcessMiddleware for BlockingAllowService {
+        async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+            openshell_core::proto::MiddlewareManifest {
+                name: "test/blocking-allow".into(),
+                service_version: "test".into(),
+                bindings: vec![openshell_core::proto::MiddlewareBinding {
+                    operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpRequest
+                        as i32,
+                    phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_payload_bytes: 8192,
+                    timeout: String::new(),
+                }],
+            }
         }
 
         async fn validate_config(
             &self,
-            _request: tonic::Request<openshell_core::proto::ValidateConfigRequest>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
-            tonic::Status,
-        > {
-            Ok(tonic::Response::new(
-                openshell_core::proto::ValidateConfigResponse {
-                    valid: true,
-                    reason: String::new(),
-                },
-            ))
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
         }
 
         async fn evaluate_http_request(
             &self,
-            _request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::HttpRequestResult>,
-            tonic::Status,
-        > {
+            _request: openshell_core::middleware::HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
             self.entered.notify_one();
             self.release.notified().await;
-            Ok(tonic::Response::new(
-                openshell_core::proto::HttpRequestResult {
-                    decision: openshell_core::proto::Decision::Allow as i32,
-                    ..Default::default()
-                },
-            ))
+            Ok(openshell_core::proto::HttpRequestResult {
+                decision: openshell_core::proto::Decision::Allow as i32,
+                ..Default::default()
+            })
         }
     }
 
@@ -5209,77 +5170,39 @@ network_policies:
     }
 
     #[tonic::async_trait]
-    impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
-        for BodyReplacingService
-    {
-        type EvaluateWebSocketSessionStream =
-            openshell_supervisor_middleware::WebSocketResponseStream;
-
-        async fn evaluate_web_socket_session(
-            &self,
-            _request: tonic::Request<
-                tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>,
-            >,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketSessionStream>, tonic::Status>
-        {
-            Err(tonic::Status::unimplemented(
-                "test service does not inspect WebSocket messages",
-            ))
-        }
-
-        async fn describe(
-            &self,
-            _request: tonic::Request<()>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::MiddlewareManifest>,
-            tonic::Status,
-        > {
-            Ok(tonic::Response::new(
-                openshell_core::proto::MiddlewareManifest {
-                    name: "test/rewriter".into(),
-                    service_version: "test".into(),
-                    bindings: vec![openshell_core::proto::MiddlewareBinding {
-                        operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpRequest
-                            as i32,
-                        phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
-                            as i32,
-                        max_payload_bytes: 8192,
-                        timeout: String::new(),
-                    }],
-                },
-            ))
+    impl openshell_core::middleware::InProcessMiddleware for BodyReplacingService {
+        async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+            openshell_core::proto::MiddlewareManifest {
+                name: "test/rewriter".into(),
+                service_version: "test".into(),
+                bindings: vec![openshell_core::proto::MiddlewareBinding {
+                    operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpRequest
+                        as i32,
+                    phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_payload_bytes: 8192,
+                    timeout: String::new(),
+                }],
+            }
         }
 
         async fn validate_config(
             &self,
-            _request: tonic::Request<openshell_core::proto::ValidateConfigRequest>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
-            tonic::Status,
-        > {
-            Ok(tonic::Response::new(
-                openshell_core::proto::ValidateConfigResponse {
-                    valid: true,
-                    reason: String::new(),
-                },
-            ))
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
         }
 
         async fn evaluate_http_request(
             &self,
-            _request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::HttpRequestResult>,
-            tonic::Status,
-        > {
-            Ok(tonic::Response::new(
-                openshell_core::proto::HttpRequestResult {
-                    decision: openshell_core::proto::Decision::Allow as i32,
-                    body: self.replacement.to_vec(),
-                    has_body: true,
-                    ..Default::default()
-                },
-            ))
+            _request: openshell_core::middleware::HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            Ok(openshell_core::proto::HttpRequestResult {
+                decision: openshell_core::proto::Decision::Allow as i32,
+                body: self.replacement.to_vec(),
+                has_body: true,
+                ..Default::default()
+            })
         }
     }
 
@@ -5714,36 +5637,13 @@ network_policies:
     }
 
     #[tonic::async_trait]
-    impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
-        for LimitService
-    {
-        type EvaluateWebSocketSessionStream =
-            openshell_supervisor_middleware::WebSocketResponseStream;
-
-        async fn evaluate_web_socket_session(
-            &self,
-            _request: tonic::Request<
-                tonic::Streaming<openshell_core::proto::WebSocketSessionEvent>,
-            >,
-        ) -> std::result::Result<tonic::Response<Self::EvaluateWebSocketSessionStream>, tonic::Status>
-        {
-            Err(tonic::Status::unimplemented(
-                "test service does not inspect WebSocket messages",
-            ))
-        }
-
-        async fn describe(
-            &self,
-            _request: tonic::Request<()>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::MiddlewareManifest>,
-            tonic::Status,
-        > {
+    impl openshell_core::middleware::InProcessMiddleware for LimitService {
+        async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
             use openshell_core::proto::{
                 MiddlewareBinding, MiddlewareManifest, SupervisorMiddlewareOperation,
                 SupervisorMiddlewarePhase,
             };
-            Ok(tonic::Response::new(MiddlewareManifest {
+            MiddlewareManifest {
                 name: self.name.into(),
                 service_version: "test".into(),
                 bindings: vec![MiddlewareBinding {
@@ -5752,32 +5652,21 @@ network_policies:
                     max_payload_bytes: self.max_body_bytes,
                     timeout: String::new(),
                 }],
-            }))
+            }
         }
 
         async fn validate_config(
             &self,
-            _request: tonic::Request<openshell_core::proto::ValidateConfigRequest>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
-            tonic::Status,
-        > {
-            Ok(tonic::Response::new(
-                openshell_core::proto::ValidateConfigResponse {
-                    valid: true,
-                    reason: String::new(),
-                },
-            ))
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
         }
 
         async fn evaluate_http_request(
             &self,
-            request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::HttpRequestResult>,
-            tonic::Status,
-        > {
-            let _evaluation = request.into_inner();
+            _request: openshell_core::middleware::HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
             let mut result = openshell_core::proto::HttpRequestResult {
                 decision: openshell_core::proto::Decision::Allow as i32,
                 ..Default::default()
@@ -5786,7 +5675,7 @@ network_policies:
                 result.body = replacement.to_vec();
                 result.has_body = true;
             }
-            Ok(tonic::Response::new(result))
+            Ok(result)
         }
     }
 
@@ -5803,16 +5692,16 @@ network_policies:
             middleware_relay_context("openshell/regex", "fail_closed");
         let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
             vec![
-                openshell_supervisor_middleware::http_only_endpoint(Arc::new(LimitService {
+                Arc::new(LimitService {
                     name: "test/redactor",
                     max_body_bytes: 8192,
                     replacement: Some(b"[SCRUBBED BY TEST REDACTOR]"),
-                })),
-                openshell_supervisor_middleware::http_only_endpoint(Arc::new(LimitService {
+                }),
+                Arc::new(LimitService {
                     name: "test/guard",
                     max_body_bytes: 16,
                     replacement: None,
-                })),
+                }),
             ],
             Vec::new(),
         )
