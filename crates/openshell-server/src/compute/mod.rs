@@ -1297,7 +1297,17 @@ impl ComputeRuntime {
                 let backend_phase = derive_phase(snapshot.status.as_ref());
                 let observed_stopped = backend_phase == SandboxPhase::Suspended
                     || driver_snapshot_confirms_stopped(&snapshot);
-                if backend_phase == SandboxPhase::Error || observed_stopped == expected_stopped {
+                let suspension_progressing =
+                    expected_stopped && driver_snapshot_confirms_suspending(&snapshot);
+                if suspension_progressing {
+                    // The Kubernetes controller has accepted suspension and
+                    // is waiting for its pod to terminate. Preserve the
+                    // durable transition so a later watch event can complete
+                    // it instead of claiming the sandbox is running again.
+                    debug!(sandbox_id, "Sandbox suspension is still progressing");
+                } else if backend_phase == SandboxPhase::Error
+                    || observed_stopped == expected_stopped
+                {
                     if let Some(reconciled) = self
                         .reconcile_lifecycle_snapshot(transition, &snapshot)
                         .await
@@ -2623,6 +2633,9 @@ impl ComputeRuntime {
 
         self.sandbox_index.update_from_sandbox(&sandbox);
         self.sandbox_watch_bus.notify(sandbox.object_id());
+        if sandbox.phase() == SandboxPhase::Suspended as i32 {
+            self.cleanup_suspended_sandbox_sessions(&sandbox).await?;
+        }
         Ok(())
     }
 
@@ -3450,6 +3463,9 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
         {
             SandboxPhase::Suspended
         }
+        SandboxPhase::Suspending if driver_snapshot_confirms_suspending(incoming) => {
+            SandboxPhase::Suspending
+        }
         SandboxPhase::Suspending if phase != SandboxPhase::Error => SandboxPhase::Suspending,
         SandboxPhase::Suspended => SandboxPhase::Suspended,
         SandboxPhase::Resuming if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Error) => {
@@ -3512,6 +3528,19 @@ fn driver_snapshot_confirms_stopped(incoming: &DriverSandbox) -> bool {
                 && matches!(
                     condition.reason.to_ascii_lowercase().as_str(),
                     "containerexited" | "containerstopped"
+                )
+        })
+    })
+}
+
+fn driver_snapshot_confirms_suspending(incoming: &DriverSandbox) -> bool {
+    incoming.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.r#type.eq_ignore_ascii_case("Suspended")
+                && condition.status.eq_ignore_ascii_case("false")
+                && matches!(
+                    condition.reason.to_ascii_lowercase().as_str(),
+                    "podterminating" | "podnotterminated"
                 )
         })
     })
@@ -5550,6 +5579,76 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "reconciled suspension revokes ephemeral SSH sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_suspend_retains_progress_and_watcher_completes_cleanup() {
+        let driver = ControlledDriver::new();
+        driver.set_stop_outcome(ControlledLifecycleOutcome::Error("suspend timed out"));
+        let sandbox = sandbox_record(
+            "sb-suspend-progressing",
+            "sandbox-suspend-progressing",
+            SandboxPhase::Ready,
+        );
+        let mut progressing = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        progressing.status = Some(DriverSandboxStatus {
+            sandbox_name: sandbox.object_name().to_string(),
+            instance_id: format!("{}-pod", sandbox.object_name()),
+            conditions: vec![
+                DriverCondition {
+                    r#type: "Suspended".to_string(),
+                    status: "False".to_string(),
+                    reason: "PodTerminating".to_string(),
+                    message: "Pod is terminating. Sandbox is suspending".to_string(),
+                    last_transition_time: String::new(),
+                },
+                make_driver_condition("SandboxSuspended", "Sandbox is suspending"),
+            ],
+            ..Default::default()
+        });
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(progressing.clone())));
+        let runtime = test_runtime(driver).await;
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let session = ssh_session_record("progressing-session", sandbox.object_id());
+        runtime.store.put_message(&session).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+
+        let err = runtime
+            .suspend_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap_err();
+        assert!(err.message().contains("suspend timed out"));
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Suspending as i32);
+        assert!(runtime.supervisor_sessions.has_session(sandbox.object_id()));
+
+        progressing.status.as_mut().unwrap().conditions[0].status = "True".to_string();
+        progressing.status.as_mut().unwrap().conditions[0].reason = "PodTerminated".to_string();
+        runtime.apply_sandbox_update(progressing).await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Suspended as i32);
+        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "watcher-driven suspension revokes ephemeral SSH sessions"
         );
     }
 

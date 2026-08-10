@@ -89,6 +89,10 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// API server is unreachable or slow.
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Kubernetes defaults pod termination to 30 seconds when the pod template
+/// omits `terminationGracePeriodSeconds`.
+const DEFAULT_POD_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(30);
+
 const SANDBOX_GROUP: &str = "agents.x-k8s.io";
 const SANDBOX_VERSION_V1BETA1: &str = "v1beta1";
 const SANDBOX_VERSION_V1ALPHA1: &str = "v1alpha1";
@@ -930,11 +934,11 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
-        let (agent_sandbox_api, kube_name) = self
+        let (agent_sandbox_api, kube_name, suspend_timeout) = self
             .patch_sandbox_operating_state(sandbox_id, false)
             .await?;
 
-        let deadline = tokio::time::Instant::now() + KUBE_API_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + suspend_timeout;
         loop {
             let object = agent_sandbox_api
                 .api
@@ -947,7 +951,7 @@ impl KubernetesComputeDriver {
             if tokio::time::Instant::now() >= deadline {
                 return Err(format!(
                     "timed out after {}s waiting for Kubernetes sandbox to suspend",
-                    KUBE_API_TIMEOUT.as_secs()
+                    suspend_timeout.as_secs()
                 ));
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -964,7 +968,7 @@ impl KubernetesComputeDriver {
         &self,
         sandbox_id: &str,
         running: bool,
-    ) -> Result<(AgentSandboxApi, String), String> {
+    ) -> Result<(AgentSandboxApi, String, Duration), String> {
         let agent_sandbox_api = self
             .supported_agent_sandbox_api(self.client.clone())
             .await?;
@@ -989,6 +993,7 @@ impl KubernetesComputeDriver {
             .into_iter()
             .next()
             .ok_or_else(|| "sandbox not found".to_string())?;
+        let suspend_timeout = kubernetes_sandbox_suspend_timeout(&object);
         let kube_name = object
             .metadata
             .name
@@ -1022,7 +1027,7 @@ impl KubernetesComputeDriver {
             running,
             "Updated Kubernetes sandbox operating state"
         );
-        Ok((agent_sandbox_api, kube_name))
+        Ok((agent_sandbox_api, kube_name, suspend_timeout))
     }
 
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
@@ -3241,6 +3246,22 @@ fn kubernetes_sandbox_is_suspended(obj: &DynamicObject) -> bool {
             == Some(0)
 }
 
+fn kubernetes_sandbox_suspend_timeout(obj: &DynamicObject) -> Duration {
+    let termination_grace_period = obj
+        .data
+        .get("spec")
+        .and_then(|spec| spec.get("podTemplate"))
+        .and_then(|template| template.get("spec"))
+        .and_then(|spec| spec.get("terminationGracePeriodSeconds"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or(DEFAULT_POD_TERMINATION_GRACE_PERIOD, Duration::from_secs);
+
+    // The controller must observe the desired state, wait for the pod grace
+    // period and kubelet teardown, then reconcile the deleted pod into the
+    // Sandbox status. Keep one API timeout of headroom around that grace.
+    termination_grace_period.saturating_add(KUBE_API_TIMEOUT)
+}
+
 fn sandbox_operating_state_patch(
     api_version: &str,
     resource_version: &str,
@@ -3343,6 +3364,34 @@ mod tests {
         assert_eq!(alpha_resume["metadata"]["resourceVersion"], "43");
         assert_eq!(alpha_resume["spec"]["replicas"], 1);
         assert!(alpha_resume["spec"].get("operatingMode").is_none());
+    }
+
+    #[test]
+    fn suspend_timeout_includes_pod_grace_period_and_reconcile_headroom() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+
+        assert_eq!(
+            kubernetes_sandbox_suspend_timeout(&sandbox),
+            Duration::from_secs(60),
+            "an omitted grace period uses the Kubernetes 30-second default"
+        );
+
+        sandbox.data = serde_json::json!({
+            "spec": {
+                "podTemplate": {
+                    "spec": {"terminationGracePeriodSeconds": 45}
+                }
+            }
+        });
+        assert_eq!(
+            kubernetes_sandbox_suspend_timeout(&sandbox),
+            Duration::from_secs(75)
+        );
     }
 
     #[test]
