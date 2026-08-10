@@ -70,6 +70,10 @@ const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str =
 const SUPERVISOR_MOUNT_DIR: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
 /// Full path to the supervisor binary inside sandbox containers.
 const SUPERVISOR_BINARY_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
+// Conmon enforces this independently of the gateway. Keep it longer than the
+// driver's 30-second request timeout so normal cleanup wins when the gateway
+// is healthy, while a crashed gateway cannot leave a running probe forever.
+const WORKSPACE_PROBE_RUNTIME_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -308,6 +312,7 @@ pub struct WorkspaceProbeSpec {
     cap_drop: Vec<String>,
     cap_add: Vec<String>,
     image_pull_policy: String,
+    timeout: u64,
     resource_limits: ResourceLimits,
 }
 
@@ -1382,6 +1387,7 @@ pub fn build_workspace_probe_spec(
         cap_drop: vec!["ALL".into()],
         cap_add: vec!["SETUID".into(), "SETGID".into()],
         image_pull_policy: "never".into(),
+        timeout: WORKSPACE_PROBE_RUNTIME_TIMEOUT_SECS,
         resource_limits: build_resource_limits(sandbox, config),
     };
 
@@ -1748,6 +1754,7 @@ mod tests {
         assert_eq!(probe["image_volume_mode"], "ignore");
         assert_eq!(probe["cap_drop"], serde_json::json!(["ALL"]));
         assert_eq!(probe["cap_add"], serde_json::json!(["SETUID", "SETGID"]));
+        assert_eq!(probe["timeout"], WORKSPACE_PROBE_RUNTIME_TIMEOUT_SECS);
         assert!(probe.get("labels").is_none());
         assert_eq!(probe["resource_limits"]["cpu"]["quota"], 75_000);
         assert_eq!(
