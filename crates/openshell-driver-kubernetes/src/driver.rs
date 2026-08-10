@@ -92,6 +92,8 @@ const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 /// Kubernetes defaults pod termination to 30 seconds when the pod template
 /// omits `terminationGracePeriodSeconds`.
 const DEFAULT_POD_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(30);
+const SUSPEND_INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const SUSPEND_MAX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 const SANDBOX_GROUP: &str = "agents.x-k8s.io";
 const SANDBOX_VERSION_V1BETA1: &str = "v1beta1";
@@ -939,22 +941,40 @@ impl KubernetesComputeDriver {
             .await?;
 
         let deadline = tokio::time::Instant::now() + suspend_timeout;
+        let mut poll_interval = SUSPEND_INITIAL_POLL_INTERVAL;
         loop {
-            let object = agent_sandbox_api
-                .api
-                .get(&kube_name)
-                .await
-                .map_err(|err| err.to_string())?;
-            if kubernetes_sandbox_is_suspended(&object) {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
                 return Err(format!(
                     "timed out after {}s waiting for Kubernetes sandbox to suspend",
                     suspend_timeout.as_secs()
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            let request_timeout = KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(now));
+            let object = tokio::time::timeout(
+                request_timeout,
+                agent_sandbox_api.api.get(&kube_name),
+            )
+                .await
+                .map_err(|_| {
+                    format!(
+                        "timed out after {}s waiting for Kubernetes API while checking sandbox suspension",
+                        request_timeout.as_secs()
+                    )
+                })?
+                .map_err(|err| err.to_string())?;
+            if kubernetes_sandbox_is_suspended(&object) {
+                return Ok(());
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes sandbox to suspend",
+                    suspend_timeout.as_secs()
+                ));
+            }
+            tokio::time::sleep(poll_interval.min(deadline.saturating_duration_since(now))).await;
+            poll_interval = next_suspend_poll_interval(poll_interval);
         }
     }
 
@@ -3262,6 +3282,10 @@ fn kubernetes_sandbox_suspend_timeout(obj: &DynamicObject) -> Duration {
     termination_grace_period.saturating_add(KUBE_API_TIMEOUT)
 }
 
+fn next_suspend_poll_interval(current: Duration) -> Duration {
+    current.saturating_mul(2).min(SUSPEND_MAX_POLL_INTERVAL)
+}
+
 fn sandbox_operating_state_patch(
     api_version: &str,
     resource_version: &str,
@@ -3392,6 +3416,22 @@ mod tests {
             kubernetes_sandbox_suspend_timeout(&sandbox),
             Duration::from_secs(75)
         );
+    }
+
+    #[test]
+    fn suspend_poll_interval_backs_off_to_cap() {
+        let mut interval = SUSPEND_INITIAL_POLL_INTERVAL;
+        let expected = [
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        ];
+
+        for expected_interval in expected {
+            interval = next_suspend_poll_interval(interval);
+            assert_eq!(interval, expected_interval);
+        }
     }
 
     #[test]
