@@ -931,6 +931,7 @@ pub(super) async fn resolve_provider_environment_with_catalog(
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn resolve_provider_environment_with_credentials(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
@@ -992,6 +993,7 @@ pub(super) async fn resolve_provider_environment_from_records(
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn resolve_provider_environment_from_records_with_credentials(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
@@ -7958,6 +7960,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_provider_env_binds_endpointless_credential_handle_only_from_policy() {
+        let store = test_store().await;
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap();
+        let mut google_cloud = google_cloud_provider(HashMap::from([(
+            "project_id".to_string(),
+            "sandbox-project".to_string(),
+        )]));
+        google_cloud.credentials = HashMap::from([(
+            "GCP_ADC_ACCESS_TOKEN".to_string(),
+            "google-token".to_string(),
+        )]);
+        create_provider_record_validating(
+            &store,
+            "default",
+            &catalog,
+            google_cloud,
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+
+        let provider_names = ["my-google-cloud".to_string()];
+        let records = load_provider_environment_records(&store, "default", &provider_names)
+            .await
+            .unwrap();
+        assert!(records[0].provider.credentials.is_empty());
+        assert!(
+            records[0]
+                .provider
+                .credential_handles
+                .contains_key("GCP_ADC_ACCESS_TOKEN")
+        );
+
+        let unbound =
+            resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
+                &store,
+                &catalog,
+                &records,
+                &HashMap::new(),
+                &credentials,
+            )
+            .await
+            .unwrap();
+        assert!(!unbound.contains_key("GCP_ADC_ACCESS_TOKEN"));
+        assert!(
+            !unbound
+                .static_credential_bindings
+                .contains_key("GCP_ADC_ACCESS_TOKEN")
+        );
+
+        let policy_bindings = HashMap::from([(
+            "my-google-cloud".to_string(),
+            vec![StaticCredentialEndpointBinding {
+                host: "storage.googleapis.com".to_string(),
+                port: 443,
+                path: "/**".to_string(),
+            }],
+        )]);
+        let bound = resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
+            &store,
+            &catalog,
+            &records,
+            &policy_bindings,
+            &credentials,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bound.get("GCP_ADC_ACCESS_TOKEN"),
+            Some(&"google-token".to_string())
+        );
+        assert_eq!(
+            bound
+                .static_credential_bindings
+                .get("GCP_ADC_ACCESS_TOKEN")
+                .map(|binding| binding.endpoints.as_slice()),
+            Some(policy_bindings["my-google-cloud"].as_slice())
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_provider_env_allows_static_provider_without_profile() {
         let store = test_store().await;
         create_provider_record(
@@ -7991,7 +8079,12 @@ mod tests {
             &store,
             "default",
             &catalog,
-            provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-test"),
+            provider_with_credential_value(
+                "github-local",
+                "github",
+                "GITHUB_TOKEN",
+                "github-token",
+            ),
             Some(&credentials),
         )
         .await
@@ -8003,7 +8096,7 @@ mod tests {
             &store,
             &catalog,
             "default",
-            &["openai-local".to_string()],
+            &["github-local".to_string()],
             &other_credentials,
         )
         .await
@@ -8026,7 +8119,12 @@ mod tests {
             &store,
             "default",
             &catalog,
-            provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-test"),
+            provider_with_credential_value(
+                "github-local",
+                "github",
+                "GITHUB_TOKEN",
+                "github-token",
+            ),
             Some(&credentials),
         )
         .await
@@ -8036,13 +8134,23 @@ mod tests {
             &store,
             &catalog,
             "default",
-            &["openai-local".to_string()],
+            &["github-local".to_string()],
             &credentials,
         )
         .await
         .unwrap();
 
-        assert_eq!(result.get("OPENAI_API_KEY"), Some(&"sk-test".to_string()));
+        assert_eq!(
+            result.get("GITHUB_TOKEN"),
+            Some(&"github-token".to_string())
+        );
+        assert!(result.static_credential_keys.contains("GITHUB_TOKEN"));
+        assert!(
+            result
+                .static_credential_bindings
+                .get("GITHUB_TOKEN")
+                .is_some_and(|binding| !binding.endpoints.is_empty())
+        );
     }
 
     #[tokio::test]
@@ -8849,6 +8957,7 @@ mod tests {
                     .collect(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -8876,6 +8985,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -8927,6 +9037,7 @@ mod tests {
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
                 profile_workspace: "default".to_string(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
