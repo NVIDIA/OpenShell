@@ -57,6 +57,23 @@ tests:
           path: metadata.namespace
           value: other-ns
 
+  - it: grants the gateway access to sandbox PodDisruptionBudgets
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - policy
+            resources:
+              - poddisruptionbudgets
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - patch
+
   - it: uses explicit sandboxNamespace for sandbox RoleBinding
     template: templates/rolebinding.yaml
     set:

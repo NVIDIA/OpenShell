@@ -64,6 +64,32 @@ indefinitely when the API server is slow or unavailable. Resource and Event
 watches recover in place with API-friendly backoff after transient watcher
 errors, avoiding a gateway-side watch restart and its associated watch gap.
 
+## Disruption Protection
+
+The driver can create a time-bounded `policy/v1` `PodDisruptionBudget` for an
+individual sandbox. This capability uses two explicit opt-ins: the operator
+sets `disruption_protection.enabled = true`, and the sandbox requests
+`driver_config.kubernetes.disruption_protection.duration`. The operator's
+`max_duration` limits each request. Durations are positive integer seconds,
+minutes, or hours, such as `30m` or `4h`.
+
+OpenShell calculates an absolute UTC deadline and stores it in the
+`openshell.io/disruption-protected-until` annotation on both the Sandbox and
+PDB. The PDB uses `minAvailable: 1`, selects only the corresponding OpenShell
+sandbox pod, and sets `unhealthyPodEvictionPolicy: AlwaysAllow`. The driver
+creates the PDB before the Sandbox, adds the Sandbox owner reference after the
+CR exists, repairs missing or changed managed PDBs during gateway
+reconciliation, and removes expired PDBs. If all gateways are unavailable at
+the deadline, the PDB remains conservatively active until reconciliation
+resumes.
+
+PDBs constrain voluntary eviction through the Kubernetes Eviction API. They do
+not prevent node failure, preemption, direct pod or Sandbox deletion, or other
+involuntary disruption, and they do not provide sandbox backup or restore.
+The standalone driver accepts the same operator settings through
+`OPENSHELL_K8S_DISRUPTION_PROTECTION_ENABLED` and
+`OPENSHELL_K8S_DISRUPTION_PROTECTION_MAX_DURATION`.
+
 ## Workspace Persistence
 
 Sandbox pods use a PVC-backed `/sandbox` workspace. An init container seeds the
@@ -188,6 +214,7 @@ nested schema and currently accepts:
 - `volumes[].name`
 - `volumes[].persistent_volume_claim.claim_name`
 - `volumes[].persistent_volume_claim.read_only`
+- `disruption_protection.duration`
 
 Nested keys inside the `kubernetes` block use snake_case. The top-level
 `driver_config` envelope is keyed by driver names, so `kubernetes` is not part
@@ -199,6 +226,14 @@ forwards only the `kubernetes` object to this driver:
 ```shell
 openshell sandbox create \
   --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}' \
+  -- claude
+```
+
+When the operator enables disruption protection, request it for one sandbox:
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"kubernetes":{"disruption_protection":{"duration":"4h"}}}' \
   -- claude
 ```
 

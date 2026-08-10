@@ -31,6 +31,7 @@ kube-runtime = { workspace = true }
 k8s-openapi = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
