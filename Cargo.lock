@@ -3912,6 +3912,7 @@ dependencies = [
 name = "openshell-gateway-interceptors"
 version = "0.0.0"
 dependencies = [
+ "arc-swap",
  "hyper-util",
  "json-patch",
  "metrics",
@@ -3923,6 +3924,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tower 0.5.3",
  "tracing",

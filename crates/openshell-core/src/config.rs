@@ -448,6 +448,10 @@ pub struct Config {
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
+    /// Interval in seconds between gateway interceptor manifest refresh polls.
+    /// Defaults to 10 seconds when interceptors are configured.
+    pub gateway_interceptor_refresh_interval_secs: Option<u64>,
+
     /// Ordered provider-profile sources used to build the effective catalog.
     pub provider_profile_sources: Vec<GatewayProviderProfileSourceConfig>,
 
@@ -789,6 +793,7 @@ impl Config {
             oidc: None,
             auth: GatewayAuthConfig::default(),
             gateway_interceptors: Vec::new(),
+            gateway_interceptor_refresh_interval_secs: None,
             provider_profile_sources: vec![
                 GatewayProviderProfileSourceConfig::Builtin,
                 GatewayProviderProfileSourceConfig::User,
@@ -910,6 +915,13 @@ impl Config {
         I: IntoIterator<Item = GatewayInterceptorConfig>,
     {
         self.gateway_interceptors = interceptors.into_iter().collect();
+        self
+    }
+
+    /// Set the gateway interceptor manifest refresh interval.
+    #[must_use]
+    pub fn with_gateway_interceptor_refresh_interval(mut self, secs: Option<u64>) -> Self {
+        self.gateway_interceptor_refresh_interval_secs = secs;
         self
     }
 

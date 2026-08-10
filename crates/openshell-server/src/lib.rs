@@ -34,6 +34,7 @@ mod gateway_listener;
 mod grpc;
 mod http;
 mod inference;
+mod interceptor_refresh;
 mod middleware;
 mod multiplex;
 mod otel_tracing;
@@ -167,7 +168,7 @@ pub struct ServerState {
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
 
-    /// Immutable gateway interceptor execution plan. `None` when disabled.
+    /// Gateway interceptor execution plan with hot-reload. `None` when disabled.
     pub(crate) gateway_interceptors:
         Option<openshell_gateway_interceptors::GatewayInterceptorRuntime>,
 
@@ -504,6 +505,15 @@ pub(crate) async fn run_server(
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_secs(60));
+    if state.gateway_interceptors.is_some() {
+        let refresh_secs = config
+            .gateway_interceptor_refresh_interval_secs
+            .unwrap_or(10);
+        interceptor_refresh::spawn_interceptor_refresh_worker(
+            state.clone(),
+            Duration::from_secs(refresh_secs),
+        );
+    }
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());

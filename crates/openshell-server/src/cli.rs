@@ -377,6 +377,10 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
                 .map(|f| f.openshell.gateway.interceptors.clone())
                 .unwrap_or_default(),
         )
+        .with_gateway_interceptor_refresh_interval(
+            file.as_ref()
+                .and_then(|f| f.openshell.gateway.interceptor_refresh_interval_secs),
+        )
         .with_server_sans(args.server_sans.clone())
         .with_loopback_service_http(args.enable_loopback_service_http);
     if let Some(sources) = file

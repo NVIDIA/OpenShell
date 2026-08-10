@@ -31,6 +31,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
+#[derive(Clone, Debug)]
+pub struct InterceptorHandle {
+    pub config: GatewayInterceptorConfig,
+    pub channel: Channel,
+}
+
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(500);
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 1_048_576;
 pub const DEFAULT_MAX_PATCHES: usize = 32;
@@ -164,6 +170,7 @@ pub struct ExecutionPlan {
     bindings: BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>>,
     profile_sources: BTreeMap<String, GatewayInterceptorProfileSource>,
     routes: OpenShellRouteIndex,
+    handles: Vec<InterceptorHandle>,
 }
 
 impl ExecutionPlan {
@@ -173,6 +180,7 @@ impl ExecutionPlan {
             bindings: BTreeMap::new(),
             profile_sources: BTreeMap::new(),
             routes,
+            handles: Vec::new(),
         }
     }
 
@@ -185,6 +193,7 @@ impl ExecutionPlan {
 
         let mut bindings: BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>> = BTreeMap::new();
         let mut profile_sources = BTreeMap::new();
+        let mut handles = Vec::new();
 
         for config in configs {
             let channel = connect_endpoint(&config.grpc_endpoint).await?;
@@ -299,6 +308,8 @@ impl ExecutionPlan {
                     ),
                 );
             }
+
+            handles.push(InterceptorHandle { config, channel });
         }
 
         let count: usize = bindings.values().map(Vec::len).sum();
@@ -311,6 +322,7 @@ impl ExecutionPlan {
             bindings,
             profile_sources,
             routes,
+            handles,
         })
     }
 
@@ -349,6 +361,140 @@ impl ExecutionPlan {
 
     pub(crate) fn has_binding(&self, selector: &RpcSelector, phase: Phase) -> bool {
         self.bindings.contains_key(&(selector.clone(), phase))
+    }
+
+    pub(crate) fn profile_sources_map(&self) -> &BTreeMap<String, GatewayInterceptorProfileSource> {
+        &self.profile_sources
+    }
+
+    pub(crate) fn binding_keys(&self) -> BTreeSet<(RpcSelector, Phase)> {
+        self.bindings.keys().cloned().collect()
+    }
+
+    pub(crate) async fn refresh(&self) -> Result<Self> {
+        let mut bindings: BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>> = BTreeMap::new();
+        let mut profile_sources = BTreeMap::new();
+        let mut new_handles = Vec::new();
+
+        for handle in &self.handles {
+            let config = &handle.config;
+            let channel = handle.channel.clone();
+            let timeout = match config.timeout.as_deref() {
+                Some(timeout) => parse_duration(timeout)?,
+                None => DEFAULT_TIMEOUT,
+            };
+            let max_response_bytes = config
+                .max_response_bytes
+                .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES);
+            let max_patches = config.max_patches.unwrap_or(DEFAULT_MAX_PATCHES);
+            let mut client = GatewayInterceptorClient::new(channel.clone())
+                .max_decoding_message_size(max_response_bytes);
+            let manifest =
+                tokio::time::timeout(timeout, client.describe(Request::new(DescribeRequest {})))
+                    .await
+                    .map_err(|_| {
+                        InterceptorError::Transport(format!(
+                            "Describe timed out for '{}' during refresh",
+                            config.name
+                        ))
+                    })?
+                    .map_err(|status| {
+                        InterceptorError::Transport(format!(
+                            "Describe failed for '{}' during refresh: {status}",
+                            config.name
+                        ))
+                    })?
+                    .into_inner();
+
+            let service_default = match config.binding_policy {
+                GatewayInterceptorBindingPolicy::Dynamic => {
+                    let manifest_default = parse_optional_failure_policy(&manifest.failure_policy)?;
+                    config
+                        .failure_policy
+                        .map(FailurePolicy::from)
+                        .or(manifest_default)
+                        .unwrap_or(FailurePolicy::FailClosed)
+                }
+                GatewayInterceptorBindingPolicy::Allowlist
+                | GatewayInterceptorBindingPolicy::Exact => config
+                    .failure_policy
+                    .map_or(FailurePolicy::FailClosed, FailurePolicy::from),
+            };
+
+            let normalized_bindings = match config.binding_policy {
+                GatewayInterceptorBindingPolicy::Dynamic => normalize_dynamic_bindings(
+                    &config.name,
+                    &manifest.bindings,
+                    service_default,
+                    &config.bindings,
+                )?,
+                GatewayInterceptorBindingPolicy::Allowlist
+                | GatewayInterceptorBindingPolicy::Exact => normalize_strict_bindings(
+                    &config.name,
+                    &manifest.bindings,
+                    service_default,
+                    &config.bindings,
+                    config.binding_policy,
+                )?,
+            };
+            for normalized in normalized_bindings {
+                if !self
+                    .routes
+                    .is_interceptable(&normalized.selector.service, &normalized.selector.method)
+                {
+                    return Err(InterceptorError::Config(format!(
+                        "interceptor '{}' binding '{}' targets non-interceptable RPC '{}'",
+                        config.name,
+                        normalized.binding_id,
+                        normalized.selector.rpc()
+                    )));
+                }
+                for phase in normalized.phases {
+                    let plan = BindingPlan {
+                        interceptor_name: config.name.clone(),
+                        binding_id: normalized.binding_id.clone(),
+                        selector: normalized.selector.clone(),
+                        phase,
+                        failure_policy: normalized.failure_policy,
+                        timeout,
+                        max_response_bytes,
+                        max_patches,
+                        client: GatewayInterceptorClient::new(channel.clone())
+                            .max_decoding_message_size(max_response_bytes),
+                    };
+                    bindings
+                        .entry((normalized.selector.clone(), phase))
+                        .or_default()
+                        .push(plan);
+                }
+            }
+
+            if manifest.provider_profiles {
+                let source_id = format!("interceptor/{}", config.name);
+                profile_sources.insert(
+                    config.name.clone(),
+                    GatewayInterceptorProfileSource::new(
+                        config.name.clone(),
+                        source_id,
+                        timeout,
+                        GatewayInterceptorClient::new(channel.clone())
+                            .max_decoding_message_size(max_response_bytes),
+                    ),
+                );
+            }
+
+            new_handles.push(InterceptorHandle {
+                config: config.clone(),
+                channel,
+            });
+        }
+
+        Ok(Self {
+            bindings,
+            profile_sources,
+            routes: self.routes.clone(),
+            handles: new_handles,
+        })
     }
 }
 

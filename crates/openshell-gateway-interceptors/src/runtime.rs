@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
+
 use json_patch::{PatchOperation, patch};
 use metrics::{counter, histogram};
 use openshell_core::config::GatewayInterceptorConfig;
@@ -28,7 +30,7 @@ const GRPC_HEADER_LEN: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct GatewayInterceptorRuntime {
-    plan: Arc<ExecutionPlan>,
+    plan: Arc<ArcSwap<ExecutionPlan>>,
     codec: ProtoJsonCodec,
 }
 
@@ -82,7 +84,7 @@ impl GatewayInterceptorRuntime {
         let routes = routes::OpenShellRouteIndex::from_descriptor_pool(codec.descriptor_pool())?;
         let plan = ExecutionPlan::load(configs, routes).await?;
         Ok(Self {
-            plan: Arc::new(plan),
+            plan: Arc::new(ArcSwap::from(Arc::new(plan))),
             codec,
         })
     }
@@ -92,12 +94,12 @@ impl GatewayInterceptorRuntime {
         &self,
         interceptor_name: &str,
     ) -> Option<GatewayInterceptorProfileSource> {
-        self.plan.profile_source(interceptor_name)
+        self.plan.load_full().profile_source(interceptor_name)
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.plan.is_empty()
+        self.plan.load_full().is_empty()
     }
 
     #[must_use]
@@ -105,7 +107,7 @@ impl GatewayInterceptorRuntime {
         let Some(selector) = RpcSelector::from_grpc_path(path) else {
             return false;
         };
-        self.plan.should_intercept(&selector)
+        self.plan.load_full().should_intercept(&selector)
     }
 
     pub async fn evaluate_request(
@@ -114,10 +116,10 @@ impl GatewayInterceptorRuntime {
         body: &[u8],
         context: &EvaluationContext,
     ) -> std::result::Result<InterceptedRequest, Status> {
+        let plan = self.plan.load_full();
         let selector = RpcSelector::from_grpc_path(path)
             .ok_or_else(|| Status::invalid_argument("invalid gRPC method path"))?;
-        let input_type = self
-            .plan
+        let input_type = plan
             .input_type(&selector)
             .ok_or_else(|| Status::invalid_argument("unknown OpenShell method"))?
             .to_string();
@@ -130,7 +132,8 @@ impl GatewayInterceptorRuntime {
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
         operation = self
-            .evaluate_phase(
+            .evaluate_phase_with_plan(
+                &plan,
                 &selector,
                 Phase::ModifyOperation,
                 &input_type,
@@ -139,7 +142,14 @@ impl GatewayInterceptorRuntime {
             )
             .await?;
         operation = self
-            .evaluate_phase(&selector, Phase::Validate, &input_type, operation, context)
+            .evaluate_phase_with_plan(
+                &plan,
+                &selector,
+                Phase::Validate,
+                &input_type,
+                operation,
+                context,
+            )
             .await?;
 
         let encoded_operation = self
@@ -171,8 +181,8 @@ impl GatewayInterceptorRuntime {
         response_body: &[u8],
         context: &EvaluationContext,
     ) -> std::result::Result<(), Status> {
-        let output_type = self
-            .plan
+        let plan = self.plan.load_full();
+        let output_type = plan
             .output_type(&intercepted.selector)
             .ok_or_else(|| Status::invalid_argument("unknown OpenShell method"))?;
         let frame = GrpcFrame::decode(response_body)?;
@@ -183,7 +193,8 @@ impl GatewayInterceptorRuntime {
         let committed_response =
             ValidatedOperation::new(&self.codec, output_type, committed_response)
                 .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        self.evaluate_phase(
+        self.evaluate_phase_with_plan(
+            &plan,
             &intercepted.selector,
             Phase::PostCommit,
             output_type,
@@ -197,18 +208,43 @@ impl GatewayInterceptorRuntime {
     #[must_use]
     pub fn has_post_commit(&self, intercepted: &InterceptedRequest) -> bool {
         self.plan
+            .load_full()
             .has_binding(&intercepted.selector, Phase::PostCommit)
     }
 
-    async fn evaluate_phase(
+    pub async fn refresh(&self) -> Result<bool> {
+        let current = self.plan.load_full();
+        let new_plan = current.refresh().await?;
+        if current.binding_keys() == new_plan.binding_keys()
+            && current.profile_sources_map().keys().collect::<Vec<_>>()
+                == new_plan.profile_sources_map().keys().collect::<Vec<_>>()
+        {
+            return Ok(false);
+        }
+        let count: usize = new_plan.binding_keys().len();
+        info!(
+            bindings = count,
+            profile_sources = new_plan.profile_sources_map().len(),
+            "gateway interceptor manifest refreshed"
+        );
+        self.plan.store(Arc::new(new_plan));
+        Ok(true)
+    }
+
+    pub fn profile_sources_map(&self) -> BTreeMap<String, GatewayInterceptorProfileSource> {
+        self.plan.load_full().profile_sources_map().clone()
+    }
+
+    async fn evaluate_phase_with_plan(
         &self,
+        plan: &ExecutionPlan,
         selector: &RpcSelector,
         phase: Phase,
         operation_type: &str,
         operation: ValidatedOperation,
         context: &EvaluationContext,
     ) -> std::result::Result<ValidatedOperation, Status> {
-        let Some(plans) = self.plan.bindings(selector, phase) else {
+        let Some(plans) = plan.bindings(selector, phase) else {
             return Ok(operation);
         };
 
@@ -962,7 +998,7 @@ mod tests {
             routes::OpenShellRouteIndex::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET)
                 .unwrap();
         let runtime = GatewayInterceptorRuntime {
-            plan: Arc::new(ExecutionPlan::empty(routes)),
+            plan: Arc::new(ArcSwap::from(Arc::new(ExecutionPlan::empty(routes)))),
             codec: codec.clone(),
         };
         let body = GrpcFrame {
@@ -998,7 +1034,7 @@ mod tests {
             routes::OpenShellRouteIndex::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET)
                 .unwrap();
         let runtime = GatewayInterceptorRuntime {
-            plan: Arc::new(ExecutionPlan::empty(routes)),
+            plan: Arc::new(ArcSwap::from(Arc::new(ExecutionPlan::empty(routes)))),
             codec: codec.clone(),
         };
         let request = UpdateConfigRequest {
@@ -1383,5 +1419,257 @@ mod tests {
         assert_eq!(TestRecorder::count(&recorder.patches), 1);
         assert_eq!(TestRecorder::count(&recorder.fail_open), 0);
         assert_eq!(TestRecorder::count(&recorder.fail_closed), 0);
+    }
+
+    mod refresh_tests {
+        use super::*;
+        use openshell_core::config::GatewayInterceptorConfig;
+        use openshell_core::proto::gateway_interceptor::v1::{
+            DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorEvaluation,
+            InterceptorManifest, InterceptorResult, InterceptorSelector, ProviderProfileSnapshot,
+            ProviderProfileSnapshotRequest,
+            gateway_interceptor_server::{GatewayInterceptor, GatewayInterceptorServer},
+        };
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicU32;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        #[derive(Clone)]
+        struct MutableInterceptor {
+            manifest: Arc<Mutex<InterceptorManifest>>,
+        }
+
+        #[tonic::async_trait]
+        impl GatewayInterceptor for MutableInterceptor {
+            async fn describe(
+                &self,
+                _request: Request<DescribeRequest>,
+            ) -> std::result::Result<tonic::Response<InterceptorManifest>, Status> {
+                let manifest = self.manifest.lock().unwrap().clone();
+                Ok(tonic::Response::new(manifest))
+            }
+
+            async fn evaluate(
+                &self,
+                _request: Request<InterceptorEvaluation>,
+            ) -> std::result::Result<tonic::Response<InterceptorResult>, Status> {
+                Ok(tonic::Response::new(InterceptorResult {
+                    allowed: true,
+                    ..InterceptorResult::default()
+                }))
+            }
+
+            async fn snapshot_provider_profiles(
+                &self,
+                _request: Request<ProviderProfileSnapshotRequest>,
+            ) -> std::result::Result<tonic::Response<ProviderProfileSnapshot>, Status> {
+                Err(Status::unimplemented("not supported"))
+            }
+        }
+
+        fn test_manifest(bindings: Vec<InterceptorBinding>) -> InterceptorManifest {
+            InterceptorManifest {
+                name: "test-interceptor".to_string(),
+                failure_policy: "fail_open".to_string(),
+                bindings,
+                provider_profiles: false,
+            }
+        }
+
+        fn test_binding(id: &str, rpc: &str) -> InterceptorBinding {
+            InterceptorBinding {
+                id: id.to_string(),
+                selector: Some(InterceptorSelector {
+                    rpc: rpc.to_string(),
+                    service: String::new(),
+                    method: String::new(),
+                }),
+                phases: vec![GatewayInterceptorPhase::Validate as i32],
+                failure_policy: "fail_open".to_string(),
+            }
+        }
+
+        async fn start_mock_interceptor(
+            manifest: InterceptorManifest,
+        ) -> (
+            Arc<Mutex<InterceptorManifest>>,
+            String,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let manifest = Arc::new(Mutex::new(manifest));
+            let interceptor = MutableInterceptor {
+                manifest: manifest.clone(),
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(GatewayInterceptorServer::new(interceptor))
+                    .serve_with_incoming(TcpListenerStream::new(listener))
+                    .await
+                    .unwrap();
+            });
+            tokio::task::yield_now().await;
+            (manifest, address, task)
+        }
+
+        async fn build_runtime(address: &str) -> GatewayInterceptorRuntime {
+            crate::initialize(vec![GatewayInterceptorConfig {
+                name: "test-interceptor".to_string(),
+                grpc_endpoint: address.to_string(),
+                ..GatewayInterceptorConfig::default()
+            }])
+            .await
+            .unwrap()
+            .expect("runtime should be created")
+        }
+
+        #[tokio::test]
+        async fn refresh_returns_false_when_manifest_unchanged() {
+            let manifest = test_manifest(vec![test_binding(
+                "validate-create",
+                "openshell.v1.OpenShell/CreateSandbox",
+            )]);
+            let (_shared, address, _task) = start_mock_interceptor(manifest).await;
+            let runtime = build_runtime(&address).await;
+
+            let changed = runtime.refresh().await.unwrap();
+            assert!(
+                !changed,
+                "refresh should return false when manifest is unchanged"
+            );
+        }
+
+        #[tokio::test]
+        async fn refresh_returns_true_when_binding_added() {
+            let manifest = test_manifest(vec![test_binding(
+                "validate-create",
+                "openshell.v1.OpenShell/CreateSandbox",
+            )]);
+            let (shared, address, _task) = start_mock_interceptor(manifest).await;
+            let runtime = build_runtime(&address).await;
+
+            assert!(
+                runtime.should_intercept_path("/openshell.v1.OpenShell/CreateSandbox"),
+                "initial binding should be active"
+            );
+            assert!(
+                !runtime.should_intercept_path("/openshell.v1.OpenShell/UpdateConfig"),
+                "UpdateConfig should not be intercepted initially"
+            );
+
+            {
+                let mut manifest = shared.lock().unwrap();
+                manifest.bindings.push(test_binding(
+                    "validate-update",
+                    "openshell.v1.OpenShell/UpdateConfig",
+                ));
+            }
+
+            let changed = runtime.refresh().await.unwrap();
+            assert!(changed, "refresh should detect the new binding");
+            assert!(
+                runtime.should_intercept_path("/openshell.v1.OpenShell/UpdateConfig"),
+                "new binding should be active after refresh"
+            );
+        }
+
+        #[tokio::test]
+        async fn refresh_returns_true_when_binding_removed() {
+            let manifest = test_manifest(vec![
+                test_binding("validate-create", "openshell.v1.OpenShell/CreateSandbox"),
+                test_binding("validate-update", "openshell.v1.OpenShell/UpdateConfig"),
+            ]);
+            let (shared, address, _task) = start_mock_interceptor(manifest).await;
+            let runtime = build_runtime(&address).await;
+
+            assert!(runtime.should_intercept_path("/openshell.v1.OpenShell/UpdateConfig"));
+
+            {
+                let mut manifest = shared.lock().unwrap();
+                manifest.bindings.retain(|b| b.id != "validate-update");
+            }
+
+            let changed = runtime.refresh().await.unwrap();
+            assert!(changed, "refresh should detect the removed binding");
+            assert!(
+                !runtime.should_intercept_path("/openshell.v1.OpenShell/UpdateConfig"),
+                "removed binding should no longer be active"
+            );
+        }
+
+        #[derive(Clone)]
+        struct FailOnRefreshInterceptor {
+            manifest: Arc<Mutex<InterceptorManifest>>,
+            call_count: Arc<AtomicU32>,
+        }
+
+        #[tonic::async_trait]
+        impl GatewayInterceptor for FailOnRefreshInterceptor {
+            async fn describe(
+                &self,
+                _request: Request<DescribeRequest>,
+            ) -> std::result::Result<tonic::Response<InterceptorManifest>, Status> {
+                let count = self.call_count.fetch_add(1, Ordering::Relaxed);
+                if count > 0 {
+                    return Err(Status::unavailable("simulated interceptor outage"));
+                }
+                let manifest = self.manifest.lock().unwrap().clone();
+                Ok(tonic::Response::new(manifest))
+            }
+
+            async fn evaluate(
+                &self,
+                _request: Request<InterceptorEvaluation>,
+            ) -> std::result::Result<tonic::Response<InterceptorResult>, Status> {
+                Ok(tonic::Response::new(InterceptorResult {
+                    allowed: true,
+                    ..InterceptorResult::default()
+                }))
+            }
+
+            async fn snapshot_provider_profiles(
+                &self,
+                _request: Request<ProviderProfileSnapshotRequest>,
+            ) -> std::result::Result<tonic::Response<ProviderProfileSnapshot>, Status> {
+                Err(Status::unimplemented("not supported"))
+            }
+        }
+
+        #[tokio::test]
+        async fn refresh_preserves_old_plan_on_describe_failure() {
+            let manifest = test_manifest(vec![test_binding(
+                "validate-create",
+                "openshell.v1.OpenShell/CreateSandbox",
+            )]);
+            let interceptor = FailOnRefreshInterceptor {
+                manifest: Arc::new(Mutex::new(manifest)),
+                call_count: Arc::new(AtomicU32::new(0)),
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = format!("http://{}", listener.local_addr().unwrap());
+            let _task = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(GatewayInterceptorServer::new(interceptor))
+                    .serve_with_incoming(TcpListenerStream::new(listener))
+                    .await
+                    .unwrap();
+            });
+            tokio::task::yield_now().await;
+
+            let runtime = build_runtime(&address).await;
+            assert!(runtime.should_intercept_path("/openshell.v1.OpenShell/CreateSandbox"));
+
+            let result = runtime.refresh().await;
+            assert!(
+                result.is_err(),
+                "refresh should fail when describe returns error"
+            );
+
+            assert!(
+                runtime.should_intercept_path("/openshell.v1.OpenShell/CreateSandbox"),
+                "old plan should be preserved on refresh failure"
+            );
+        }
     }
 }

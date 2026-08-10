@@ -170,6 +170,8 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub interceptors: Vec<GatewayInterceptorConfig>,
     #[serde(default)]
+    pub interceptor_refresh_interval_secs: Option<u64>,
+    #[serde(default)]
     pub provider_profile_sources: Option<Vec<GatewayProviderProfileSourceConfig>>,
     #[serde(default)]
     pub mtls_auth: Option<MtlsAuthConfig>,
