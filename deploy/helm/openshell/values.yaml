@@ -243,6 +243,58 @@ server:
     # -- gRPC rate-limit window length in seconds. Must be positive (alongside
     # requests) to enable rate limiting; 0 (default) disables it.
     windowSeconds: 0
+  # Default credential storage settings (used when no credential driver is
+  # enabled). The gateway encrypts provider credentials in the database using
+  # AES-256-GCM with a key-encryption key (KEK). By default, the Helm chart
+  # generates and retains a KEK Secret. For GitOps / helm-template workflows
+  # where `lookup` is unavailable, reference a pre-created Secret instead.
+  credentialStorage:
+    # -- Name of a pre-existing Secret containing the key-encryption key.
+    # When set, the chart does NOT generate a new Secret; it references this
+    # one instead. The Secret must contain a key named "key-encryption-key"
+    # with a base64-encoded 32-byte value. Required for GitOps workflows that
+    # render manifests with `helm template` (where `lookup` is unavailable).
+    existingSecret: ""
+  # Provider credential drivers store provider credential secret material in an
+  # external or native backend. When no driver is enabled, the gateway uses its
+  # default encrypted database credential storage with a retained Kubernetes
+  # Secret for the shared key-encryption key.
+  credentialDrivers:
+    kubernetesSecrets:
+      # -- Enable the in-tree Kubernetes Secret credential driver.
+      # WARNING: The RBAC Role grants read/write access to ALL Secrets in the
+      # configured namespace. Use a dedicated namespace to limit blast radius.
+      enabled: false
+      # -- Namespace where OpenShell-managed provider Secret objects are stored.
+      # Empty = Helm release namespace. A dedicated namespace is RECOMMENDED
+      # to isolate OpenShell-managed Secrets from other workloads.
+      namespace: ""
+      # -- Deprecated compatibility field. Credential storage no longer supports user-authored namespace references.
+      allowReferenceNamespace: false
+      rbac:
+        # -- Create a Role/RoleBinding granting the gateway ServiceAccount read/write access to managed provider Secrets.
+        create: true
+    vault:
+      # -- Enable the in-tree Vault credential driver.
+      enabled: false
+      # -- Vault service base URL, for example http://vault.vault.svc.cluster.local:8200.
+      address: ""
+      # -- Default KV mount name.
+      mount: secret
+      # -- Default KV engine version. Use "1" or "2".
+      kvVersion: "2"
+      # -- Authentication method. Use "kubernetes" in-cluster or "token_file" for local/dev validation.
+      authMethod: kubernetes
+      # -- Vault Kubernetes auth role when authMethod is kubernetes.
+      role: ""
+      # -- Vault Kubernetes auth mount.
+      kubernetesAuthMount: kubernetes
+      # -- ServiceAccount token path used for Kubernetes auth.
+      serviceAccountTokenPath: /var/run/secrets/kubernetes.io/serviceaccount/token
+      # -- Mounted token file path when authMethod is token_file.
+      tokenPath: ""
+      # -- HTTP request timeout in seconds. Empty = driver default.
+      timeoutSecs: ""
   auth:
     # -- UNSAFE: accept unauthenticated CLI/user requests as a local developer
     # principal. Intended only for trusted local Skaffold/k3d development or a

@@ -1179,6 +1179,8 @@ fn network_endpoint_from_json(
         credential_signing: String::new(),
         signing_service: String::new(),
         signing_region: String::new(),
+        // policy.local proposals cannot reference a concrete sandbox provider.
+        credential_binding: None,
     })
 }
 

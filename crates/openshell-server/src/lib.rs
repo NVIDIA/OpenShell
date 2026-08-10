@@ -28,6 +28,7 @@ pub mod certgen;
 pub mod cli;
 mod compute;
 pub mod config_file;
+mod credentials;
 mod defaults;
 mod gateway_listener;
 mod grpc;
@@ -106,6 +107,9 @@ pub struct ServerState {
 
     /// Compute orchestration over the configured driver.
     pub compute: ComputeRuntime,
+
+    /// Credential-driver selection and resolution runtime.
+    pub credentials: credentials::CredentialRuntime,
 
     /// In-memory sandbox correlation index.
     pub sandbox_index: SandboxIndex,
@@ -202,6 +206,36 @@ impl ServerState {
         supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
     ) -> Self {
+        let credentials =
+            credentials::CredentialRuntime::from_config_with_store(&config, Arc::clone(&store))
+                .expect("server config should be validated before ServerState::new");
+        Self::new_with_credentials(
+            config,
+            store,
+            compute,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+            oidc_cache,
+            credentials,
+        )
+    }
+
+    /// Create new server state with an already-initialized credential runtime.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_credentials(
+        config: Config,
+        store: Arc<Store>,
+        compute: ComputeRuntime,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
+        oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
+        credentials: credentials::CredentialRuntime,
+    ) -> Self {
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         let admin_role = config
             .oidc
@@ -211,6 +245,7 @@ impl ServerState {
             config,
             store,
             compute,
+            credentials,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
@@ -279,6 +314,12 @@ pub(crate) async fn run_server(
     );
 
     let store = Arc::new(Store::connect(database_url).await?);
+    let credentials = credentials::CredentialRuntime::from_config_file_with_store(
+        &config,
+        config_file.as_ref(),
+        Arc::clone(&store),
+    )
+    .await?;
 
     let oidc_cache = if let Some(ref oidc) = config.oidc {
         // Validate RBAC configuration before starting.
@@ -337,7 +378,7 @@ pub(crate) async fn run_server(
         sources = ?provider_profile_sources.source_ids(),
         "provider profile sources configured"
     );
-    let mut state = ServerState::new(
+    let mut state = ServerState::new_with_credentials(
         config.clone(),
         store.clone(),
         compute,
@@ -346,6 +387,7 @@ pub(crate) async fn run_server(
         tracing_log_bus,
         supervisor_sessions,
         oidc_cache,
+        credentials,
     );
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
@@ -1104,7 +1146,8 @@ mod tests {
                 .with_database_url("sqlite::memory:?cache=shared")
                 .with_bind_address(bind_addr)
                 .with_server_sans(["*.dev.openshell.localhost"])
-                .with_loopback_service_http(enable_loopback_service_http),
+                .with_loopback_service_http(enable_loopback_service_http)
+                .with_credential_drivers(["test-static"]),
             store,
             compute,
             crate::sandbox_index::SandboxIndex::new(),

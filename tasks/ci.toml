@@ -56,7 +56,7 @@ hide = true
 
 [ci]
 description = "Run full checks (lint, compile/type checks, and tests)"
-depends = ["lint", "check", "test"]
+depends = ["lint", "check", "test", "go:ci"]
 
 [all]
 description = "Alias for ci"
@@ -65,5 +65,5 @@ hide = true
 
 ["pre-commit"]
 description = "Run lint, formatting, and license checks"
-depends = ["lint"]
+depends = ["fmt", "lint"]
 hide = true

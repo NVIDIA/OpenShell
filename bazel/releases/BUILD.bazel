@@ -44,6 +44,7 @@ platform_transition_binary(
     binary = "//crates/openshell-sandbox:openshell-sandbox-bin",
     tags = ["manual"],
     target_platform = "@rules_rs//rs/platforms:x86_64-unknown-linux-musl",
+    visibility = ["//visibility:public"],
 )
 
 platform_transition_binary(
@@ -52,6 +53,7 @@ platform_transition_binary(
     binary = "//crates/openshell-sandbox:openshell-sandbox-bin",
     tags = ["manual"],
     target_platform = "@rules_rs//rs/platforms:aarch64-unknown-linux-musl",
+    visibility = ["//visibility:public"],
 )
 
 platform_transition_binary(

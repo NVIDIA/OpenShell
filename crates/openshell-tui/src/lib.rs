@@ -1687,6 +1687,7 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     config: config.clone(),
                     credential_expires_at_ms: HashMap::default(),
                     profile_workspace: workspace.clone(),
+                    credential_handles: HashMap::default(),
                 }),
                 workspace: workspace.clone(),
             };
@@ -1800,6 +1801,7 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                 config,
                 credential_expires_at_ms: HashMap::default(),
                 profile_workspace: String::new(),
+                credential_handles: HashMap::default(),
             }),
             credential_expires_at_ms: HashMap::default(),
             workspace,

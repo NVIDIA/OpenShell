@@ -1,0 +1,27 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rustfmt_test")
+
+rust_library(
+    name = "openshell-driver-db-credstore",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "openshell-driver-db-credstore_test",
+    crate = ":openshell-driver-db-credstore",
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rustfmt_test(
+    name = "rustfmt_test",
+    targets = [
+        ":openshell-driver-db-credstore",
+        ":openshell-driver-db-credstore_test",
+    ],
+    visibility = ["//crates:__pkg__"],
+)

@@ -66,13 +66,13 @@ All comments posted by this skill must begin with this marker:
 > **gator-agent**
 ```
 
-Use one canonical gator disposition per issue or PR head SHA for baseline state summaries. A disposition may be one issue comment or one submitted GitHub review. A submitted review, including its summary body and every inline comment in its `comments` array, counts as one disposition for the head SHA; do not count its inline comments separately.
+Use one canonical gator disposition per issue or PR head SHA for baseline review and status summaries. A disposition may be one issue comment or one submitted GitHub review. A submitted review, including its summary body and every inline comment in its `comments` array, counts as one disposition for the head SHA; do not count its inline comments separately. A rate-limited TTL state nudge is not a disposition: it may be posted on an unchanged SHA to request the already-known next human action, but never to restate findings, report CI, or re-review.
 
 For a PR review with any actionable line-specific finding that can be anchored to the current diff, use one batched GitHub review rather than an issue comment or standalone inline-comment requests. Begin the review summary and every inline comment body with the gator marker. Include the head SHA in the review summary so the wrapper can enforce the one-disposition rule. Do not post line comments individually through `POST /pulls/<pr>/comments`; a partially submitted set is not an acceptable baseline disposition.
 
 Edit a canonical issue comment only for housekeeping updates that do not respond to new human activity. GitHub reviews and their inline comments are immutable after submission; correct them only through a new-head review or an explicit same-SHA maintainer override.
 
-When gator is continuing a conversation after a human comment, review, or requested change, post a new marked comment only if the PR head SHA changed or no marked gator comment/review exists for the current head SHA. If a marked gator comment or PR review already exists for the current head SHA, do not post another public comment; record the state in the supervised result sentinel and wait for a new commit, maintainer override, merge, or closure.
+When gator is continuing a conversation after a human comment, review, or requested change, post a new marked disposition only if the PR head SHA changed or no marked gator disposition exists for the current head SHA. If a marked gator comment or PR review already exists for the current head SHA, do not post another public disposition; record the state in the supervised result sentinel and wait for a new commit, maintainer override, merge, or closure. The sole exception is a state-specific TTL nudge that is due under the watch rules.
 
 ## Human Comment Disposition
 
@@ -659,7 +659,8 @@ rules above. Also check whether gator has already posted for the
 current PR head SHA. Search existing issue comments and PR reviews for the gator
 marker and either `Head SHA: <sha>`, `Head SHA: `<sha>``, or the current
 `headRefOid` anywhere in the body. Gator may post at most one marked public
-disposition for a given head SHA.
+disposition for a given head SHA. A state-specific TTL nudge is separately
+rate-limited and is not a disposition.
 
 The `gh` write wrapper independently re-reads the current head, issue comments,
 and reviews immediately before a marked POST. It fails closed when any lookup
@@ -668,15 +669,15 @@ Gator payload version. Do not bypass guard exits 21 or 22. Return a transient
 `gator_write_guard_failed` result and investigate stale payload or GitHub
 transport state instead.
 
-If the current head SHA already has a marked gator comment or PR review:
+If the current head SHA already has a marked gator disposition:
 
 - Do not run the reviewer sub-agent again for that SHA.
 - Do not post another marked issue comment, `PR Review Status`, `Re-check After ... Update`, CI update, duplicate findings summary, or PR review for that SHA.
 - Reuse the latest gator disposition for that SHA internally to decide whether the PR is still waiting on author action, ready for pipeline watch, or blocked.
-- For any same-SHA status update, including CI completion, failed checks, human replies, label changes, or maintainer/reviewer comments, do not post a public comment. Record the next state only in the supervised result sentinel.
-- Do not post author, maintainer, or blocker nudges for the same SHA. Wait for a new commit, merge, closure, or explicit maintainer override.
+- For any same-SHA status update, including CI completion, failed checks, human replies, label changes, or maintainer/reviewer comments, do not post a public status comment. Record the next state only in the supervised result sentinel.
+- Do post a state-specific TTL nudge when it is due under the watch rules, even on the same SHA. Use only the nudge templates below, name the responsible actor and outstanding action, and respect the 48-business-hour limit for the same state and actor. A nudge neither authorizes another reviewer run nor consumes, replaces, or alters the existing disposition.
 
-Only run a fresh review or post another marked public disposition when the PR head SHA changes, a maintainer explicitly asks gator to re-review or publicly respond on the same SHA, the PR reaches terminal merged/closed cleanup, or the earlier gator attempt failed before posting any marked disposition. A prior marked comment that only says the reviewer sub-agent failed before producing review output is a legacy infrastructure-failure report, not a valid current-head review disposition; ignore it for same-SHA review suppression and run the reviewer again. A prior marked `## Blocked` comment whose only blocker was that the PR was draft is also not a valid code-review disposition after the PR becomes ready for review; ignore it for same-SHA review suppression and run the reviewer once.
+Only run a fresh review or post another marked public disposition when the PR head SHA changes, a maintainer explicitly asks gator to re-review or publicly respond on the same SHA, the PR reaches terminal merged/closed cleanup, or the earlier gator attempt failed before posting any marked disposition. State-specific TTL nudges remain allowed on an unchanged SHA as described above. A prior marked comment that only says the reviewer sub-agent failed before producing review output is a legacy infrastructure-failure report, not a valid current-head review disposition; ignore it for same-SHA review suppression and run the reviewer again. A prior marked `## Blocked` comment whose only blocker was that the PR was draft is also not a valid code-review disposition after the PR becomes ready for review; ignore it for same-SHA review suppression and run the reviewer once.
 
 For PRs authored by `dependabot[bot]`, the primary gator responsibility is dependency-update validation, not normal feature review. Do a quick sanity check for suspicious changes outside expected dependency manifests or lockfiles, then ensure the full required test suite runs, including E2E, and watch for breakages caused by the update.
 
@@ -784,7 +785,8 @@ other dispositions without duplicating them. If the author replied without
 pushing a new commit, do not re-review, repost findings, or post a same-SHA
 disposition; inspect the response internally and wait for a new commit or
 maintainer override. If CI changes state without a new commit, do not post a
-same-SHA CI update.
+same-SHA CI update. A due TTL author nudge remains allowed when the unresolved
+feedback still requires an author action.
 
 If review feedback is waiting on the PR author for more than 48 business hours, post a single author nudge. Use the latest of these timestamps as the TTL start:
 

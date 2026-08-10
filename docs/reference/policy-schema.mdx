@@ -176,6 +176,8 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `credential_signing` | string | No | Proxy-side credential signing mode. When set, the proxy strips the sandbox client's `Authorization` header and re-signs with real provider credentials. Values: `sigv4` (auto-detect payload mode from client headers), `sigv4:body` (buffer and hash body, max 10 MiB), `sigv4:no_body` (unsigned payload, stream body). Mutually exclusive with `request_body_credential_rewrite`. See [AWS SigV4](/providers/aws-sigv4). |
 | `signing_service` | string | No | AWS service name for SigV4 signing (e.g. `bedrock`, `s3`, `sts`). Required when `credential_signing` is set. |
 | `signing_region` | string | No | AWS region override for SigV4 signing (e.g. `us-east-1`). When omitted, the region is extracted from the endpoint hostname. Required for non-standard AWS endpoints where the region cannot be inferred. |
+| `credential_binding` | object | No | Binds static credentials from an attached provider to this endpoint when that provider's profile defines no endpoints. This field is valid only in a sandbox-scoped policy. |
+| `credential_binding.provider` | string | Yes with `credential_binding` | Exact name of the provider instance attached to the sandbox. The referenced provider must have a profile, and that profile must define no endpoints. |
 | `persisted_queries` | string | No | GraphQL hash-only behavior for `protocol: graphql` and GraphQL-over-WebSocket operation policy. Default is `deny`; use `allow_registered` only with `graphql_persisted_queries`. |
 | `graphql_persisted_queries` | map | No | Trusted GraphQL persisted-query registry keyed by hash or saved-query ID. Values contain `operation_type`, optional `operation_name`, and optional root `fields`. |
 | `graphql_max_body_bytes` | integer | No | Maximum GraphQL-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
@@ -196,8 +198,35 @@ Each endpoint defines a reachable destination and optional inspection rules.
 - `rules: []` (empty list) is rejected; use `access: full` or remove `rules`.
 - Non-empty `rules` must contain at least one effective allow clause; rules where every entry lacks an allow are rejected as deny-all.
 - `deny_rules: []` (empty list) is rejected; remove it if no denials are needed.
+- `credential_signing` requires a resolvable AWS credential source before a sandbox policy can activate. Use an attached endpoint-bearing profile that declares `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` and covers the signed endpoint, or bind an attached endpointless profile that declares those keys with `credential_binding.provider`.
 
 Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token provider-shaped aliases such as `provider-OPENSHELL-RESOLVE-ENV-API_TOKEN` when the referenced environment key exists in the configured provider credentials.
+
+Static provider placeholders also require the request host, port, and path to
+match their credential binding. Profile endpoints supply this boundary by
+default. An endpointless profile can instead use a sandbox policy endpoint with
+`credential_binding.provider` set to the exact attached provider name. OpenShell
+rejects unattached providers, profileless providers, endpointful profiles, and
+global policies that use this field. Network policy admission does not expand
+the credential boundary unless the endpoint explicitly supplies this binding.
+OpenShell rejects a request mismatch with HTTP 403 and
+`credential_endpoint_mismatch`. Refer to [Static Credential Endpoint
+Binding](/sandboxes/providers-v2#understand-static-credential-endpoint-binding).
+
+This example allows the sandbox to reach Google Cloud Storage and binds the
+static credentials from the attached `work-gcp` provider to that endpoint:
+
+```yaml showLineNumbers={false}
+network_policies:
+  gcp_storage:
+    endpoints:
+      - host: storage.googleapis.com
+        port: 443
+        protocol: rest
+        access: full
+        credential_binding:
+          provider: work-gcp
+```
 
 #### Access Levels
 

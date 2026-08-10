@@ -19,13 +19,14 @@ use base64::Engine as _;
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use sha1::{Digest, Sha1};
-use tempfile::NamedTempFile;
+use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const PROVIDER_NAME: &str = "e2e-websocket-conformance";
+const PROVIDER_PROFILE_ID: &str = "e2e-websocket-conformance";
 const TEST_SERVER_HOST: &str = "host.openshell.internal";
 const TEST_SECRET: &str = "sk-e2e-websocket-conformance-secret";
 const TOKEN_ENV: &str = "WS_E2E_TOKEN";
@@ -66,7 +67,15 @@ async fn delete_provider(name: &str) {
     let _ = cmd.status().await;
 }
 
-async fn create_generic_provider(name: &str) -> Result<String, String> {
+async fn delete_provider_profile(id: &str) {
+    let mut cmd = openshell_cmd();
+    cmd.args(["provider", "profile", "delete", id])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _ = cmd.status().await;
+}
+
+async fn create_bound_provider(name: &str) -> Result<String, String> {
     let credential = format!("{TOKEN_ENV}={TEST_SECRET}");
     run_cli(&[
         "provider",
@@ -74,11 +83,52 @@ async fn create_generic_provider(name: &str) -> Result<String, String> {
         "--name",
         name,
         "--type",
-        "generic",
+        PROVIDER_PROFILE_ID,
         "--credential",
         &credential,
     ])
     .await
+}
+
+fn write_credential_profile(port: u16) -> Result<NamedTempFile, String> {
+    let mut file = TempFileBuilder::new()
+        .suffix(".yaml")
+        .tempfile()
+        .map_err(|error| format!("create provider profile: {error}"))?;
+    let profile = format!(
+        r#"id: {PROVIDER_PROFILE_ID}
+display_name: E2E WebSocket conformance credentials
+category: other
+credentials:
+  - name: websocket_token
+    env_vars: [{TOKEN_ENV}]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: {TEST_SERVER_HOST}
+    port: {port}
+    path: /ws
+    protocol: websocket
+    enforcement: enforce
+    access: read-write
+    websocket_credential_rewrite: true
+    allowed_ips:
+      - "10.0.0.0/8"
+      - "172.0.0.0/8"
+      - "192.168.0.0/16"
+      - "fc00::/7"
+binaries:
+  - path: /usr/bin/python*
+  - path: /usr/local/bin/python*
+  - path: /sandbox/.uv/python/*/bin/python*
+"#
+    );
+    file.write_all(profile.as_bytes())
+        .map_err(|error| format!("write provider profile: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("flush provider profile: {error}"))?;
+    Ok(file)
 }
 
 struct WebSocketProbeServer {
@@ -435,12 +485,14 @@ async fn websocket_text_placeholder_is_rewritten_through_both_adapters() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     delete_provider(PROVIDER_NAME).await;
-    create_generic_provider(PROVIDER_NAME)
-        .await
-        .expect("create generic provider");
+    delete_provider_profile(PROVIDER_PROFILE_ID).await;
 
     let result = async {
         let server = WebSocketProbeServer::start().await?;
+        let profile = write_credential_profile(server.port)?;
+        let profile_path = profile.path().to_string_lossy().into_owned();
+        run_cli(&["provider", "profile", "import", "--file", &profile_path]).await?;
+        create_bound_provider(PROVIDER_NAME).await?;
         let policy = write_websocket_policy(TEST_SERVER_HOST, server.port)?;
         let policy_path = policy
             .path()
@@ -464,6 +516,7 @@ async fn websocket_text_placeholder_is_rewritten_through_both_adapters() {
     .await;
 
     delete_provider(PROVIDER_NAME).await;
+    delete_provider_profile(PROVIDER_PROFILE_ID).await;
 
     let guard = result.expect("sandbox create");
     assert!(

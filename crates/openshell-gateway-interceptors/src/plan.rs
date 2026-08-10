@@ -19,13 +19,17 @@ use openshell_core::proto::gateway_interceptor::v1::{
 use tokio::net::UnixStream;
 use tonic::Request;
 use tonic::codegen::http::Uri;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tower::service_fn;
 use tracing::{info, warn};
 
 use crate::profile_source::GatewayInterceptorProfileSource;
 use crate::routes::OpenShellRouteIndex;
 use crate::{InterceptorError, Result};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(500);
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 1_048_576;
@@ -857,15 +861,36 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
     )))
 }
 
+/// Repo-standard channel tuning (matches `openshell-core` / `openshell-sdk`):
+/// bounded dial + HTTP/2 keepalive so idle interceptor channels survive
+/// intermediary idle timeouts and dead peers are detected proactively.
+fn tune_endpoint(endpoint: Endpoint) -> Endpoint {
+    endpoint
+        .connect_timeout(CONNECT_TIMEOUT)
+        .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+        .keep_alive_while_idle(true)
+        .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
+        .http2_adaptive_window(true)
+}
+
 async fn connect_endpoint(endpoint: &str) -> Result<Channel> {
     let endpoint = endpoint.trim();
     if let Some(path) = endpoint.strip_prefix("unix://") {
         return connect_unix_endpoint(PathBuf::from(path)).await;
     }
-    Endpoint::from_shared(endpoint.to_string())
-        .map_err(|e| {
-            InterceptorError::Config(format!("invalid interceptor endpoint '{endpoint}': {e}"))
-        })?
+    let mut ep = Endpoint::from_shared(endpoint.to_string()).map_err(|e| {
+        InterceptorError::Config(format!("invalid interceptor endpoint '{endpoint}': {e}"))
+    })?;
+    if ep.uri().scheme_str() == Some("https") {
+        ep = ep
+            .tls_config(ClientTlsConfig::new().with_enabled_roots())
+            .map_err(|e| {
+                InterceptorError::Config(format!(
+                    "TLS config for interceptor endpoint '{endpoint}': {e}"
+                ))
+            })?;
+    }
+    tune_endpoint(ep)
         .connect()
         .await
         .map_err(|e| InterceptorError::Transport(format!("connect {endpoint}: {e}")))
@@ -874,7 +899,7 @@ async fn connect_endpoint(endpoint: &str) -> Result<Channel> {
 #[cfg(unix)]
 async fn connect_unix_endpoint(path: PathBuf) -> Result<Channel> {
     let display = path.display().to_string();
-    Endpoint::from_static("http://[::]:50051")
+    tune_endpoint(Endpoint::from_static("http://[::]:50051"))
         .connect_with_connector(service_fn(move |_: Uri| {
             let path = path.clone();
             async move { UnixStream::connect(path).await.map(TokioIo::new) }

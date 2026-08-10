@@ -42,6 +42,8 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-sdk/` | Shared client SDK | Async Rust gateway client (gRPC transport, TLS, OIDC refresh, edge tunnel); consumed by CLI, TUI, and `@openshell/sdk` |
 | `crates/openshell-providers/` | Provider management | Credential provider backends |
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
+| `crates/openshell-driver-kubernetes-secrets/` | Kubernetes Secrets credential driver | In-process `CredentialDriver` backend for OpenShell-managed K8s Secret storage |
+| `crates/openshell-driver-vault/` | Vault credential driver | In-process `CredentialDriver` backend for Vault-compatible KV storage |
 | `crates/openshell-driver-kubernetes/` | Kubernetes compute driver | In-process `ComputeDriver` backend for K8s sandbox pods |
 | `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
 | `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
@@ -201,6 +203,15 @@ ocsf_emit!(event);
 - `mise run test` — Unit test suite. Run after code changes.
 - `mise run e2e` — End-to-end tests against a running gateway. Run for infrastructure, sandbox, or policy changes.
 - `mise run ci` — Full local CI (lint + compile/type checks + tests). Run before opening a PR.
+
+## Go SDK (`sdk/go/`)
+
+- The Go SDK lives in `sdk/go/` with module path `github.com/NVIDIA/OpenShell/sdk/go`.
+- Run `mise run go:ci` for the full SDK CI pipeline (lint, build, test, proto-check, docs-check).
+- Proto bindings are generated with `mise run go:proto:gen` from the `.proto` files in `proto/`.
+- Domain types in `sdk/go/openshell/v1/types/` must not import proto packages.
+- Converters in `sdk/go/openshell/v1/internal/converter/` deep-copy slices and maps at boundaries.
+- Tests use bufconn for in-process gRPC and testify for assertions.
 
 ## Python
 

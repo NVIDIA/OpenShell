@@ -11,7 +11,8 @@ use crate::l7::{EnforcementMode, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use miette::{IntoDiagnostic, Result, miette};
-use openshell_core::secrets::SecretResolver;
+use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_core::secrets::{SecretResolver, contains_reserved_credential_marker};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SeverityId, StatusId,
     ocsf_emit,
@@ -38,6 +39,7 @@ const OPCODE_BINARY: u8 = 0x2;
 const OPCODE_CLOSE: u8 = 0x8;
 const OPCODE_PING: u8 = 0x9;
 const OPCODE_PONG: u8 = 0xA;
+const CREDENTIAL_ENDPOINT_MISMATCH: &str = "websocket credential endpoint mismatch";
 
 #[derive(Clone, Debug)]
 pub struct WebSocketAssemblyBudget {
@@ -483,6 +485,8 @@ pub(super) struct RelayOptions<'a> {
     pub(super) assembly_budget: WebSocketAssemblyBudget,
     pub(super) resolver: Option<&'a SecretResolver>,
     pub(super) generation_guard: Option<&'a PolicyGenerationGuard>,
+    pub(super) provider_credentials: Option<&'a ProviderCredentialState>,
+    pub(super) target: &'a str,
     pub(super) inspector: Option<InspectionOptions<'a>>,
     pub(super) compression: WebSocketCompression,
     pub(super) middleware_session: Option<openshell_supervisor_middleware::WebSocketSession>,
@@ -545,12 +549,21 @@ where
     if let Err(termination) = &result {
         observe_termination(host, port, options.policy_name, termination);
     }
-    if let Err(termination) = &result
-        && let Some(code) = termination.cause.close_code()
-    {
-        let payload = code.to_be_bytes();
-        let _ = write_masked_close(&mut upstream_write, &payload).await;
-        let _ = write_unmasked_close(&mut client_write, &payload).await;
+    if let Err(termination) = &result {
+        let error = termination.error.to_string();
+        if error.contains(CREDENTIAL_ENDPOINT_MISMATCH) {
+            emit_credential_endpoint_mismatch(host, port, options.policy_name);
+            let _ = write_policy_violation_close(&mut client_write).await;
+        } else if error.contains("credential") {
+            if let Some(code) = termination.cause.close_code() {
+                let payload = code.to_be_bytes();
+                let _ = write_unmasked_close(&mut client_write, &payload).await;
+            }
+        } else if let Some(code) = termination.cause.close_code() {
+            let payload = code.to_be_bytes();
+            let _ = write_masked_close(&mut upstream_write, &payload).await;
+            let _ = write_unmasked_close(&mut client_write, &payload).await;
+        }
     }
     if let Some(session) = options.middleware_session.take() {
         let reason = match &result {
@@ -562,6 +575,41 @@ where
     let _ = upstream_write.shutdown().await;
     let _ = client_write.shutdown().await;
     result.map(|_| ()).map_err(|termination| termination.error)
+}
+
+async fn write_policy_violation_close<W: AsyncWrite + Unpin>(writer: &mut W) -> Result<()> {
+    let reason = b"credential endpoint mismatch";
+    let mut frame = Vec::with_capacity(reason.len() + 4);
+    frame.push(0x80 | OPCODE_CLOSE);
+    frame.push(u8::try_from(reason.len() + 2).expect("close reason fits one-byte length"));
+    frame.extend_from_slice(&1008u16.to_be_bytes());
+    frame.extend_from_slice(reason);
+    writer.write_all(&frame).await.into_diagnostic()?;
+    writer.flush().await.into_diagnostic()
+}
+
+fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
+    ocsf_emit!(
+        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Fail)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain(host, port))
+            .firewall_rule(policy_name, "credential-binding")
+            .message(format!(
+                "WebSocket credential use denied: credential is not authorized for {host}:{port}"
+            ))
+            .status_detail("credential_endpoint_mismatch")
+            .build()
+    );
+    ocsf_emit!(crate::l7::build_credential_endpoint_mismatch_finding(
+        policy_name,
+        host,
+        Some("websocket"),
+        "Provider credential endpoint binding mismatch; WebSocket closed",
+    ));
 }
 
 async fn relay_client_to_server<R, W>(
@@ -1064,7 +1112,7 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &FrameHeader,
     payload: Vec<u8>,
-    _assembly_admission: WebSocketAssemblyAdmission,
+    assembly_admission: WebSocketAssemblyAdmission,
     admission: Option<openshell_supervisor_middleware::MiddlewareWorkAdmission>,
     force_reframe: bool,
     compressed: bool,
@@ -1072,6 +1120,40 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     port: u16,
     options: &mut RelayOptions<'_>,
 ) -> WebSocketRelayResult<()> {
+    relay_text_payload_with_before_credential_write(
+        writer,
+        frame,
+        payload,
+        assembly_admission,
+        admission,
+        force_reframe,
+        compressed,
+        host,
+        port,
+        options,
+        std::future::ready(()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn relay_text_payload_with_before_credential_write<W, F>(
+    writer: &mut W,
+    frame: &FrameHeader,
+    payload: Vec<u8>,
+    _assembly_admission: WebSocketAssemblyAdmission,
+    admission: Option<openshell_supervisor_middleware::MiddlewareWorkAdmission>,
+    force_reframe: bool,
+    compressed: bool,
+    host: &str,
+    port: u16,
+    options: &mut RelayOptions<'_>,
+    before_credential_write: F,
+) -> WebSocketRelayResult<()>
+where
+    W: AsyncWrite + Unpin,
+    F: Future<Output = ()>,
+{
     ensure_generation_current(host, port, options)?;
     let message_payload = if compressed {
         decompress_permessage_deflate(&payload).map_err(|error| match error {
@@ -1148,15 +1230,38 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
     }
     ensure_generation_current(host, port, options)?;
 
-    let replacements = if let Some(resolver) = options.resolver {
+    let live_resolver = options.provider_credentials.map(|credentials| {
+        let (resolver, revision) =
+            credentials.resolver_for_endpoint_with_revision(host, port, options.target);
+        (
+            resolver,
+            crate::l7::rest::CredentialGenerationGuard::new(credentials, revision),
+        )
+    });
+    let resolver = live_resolver
+        .as_ref()
+        .map_or(options.resolver, |(resolver, _)| resolver.as_deref());
+    let replacements = if let Some(resolver) = resolver {
         resolver
             .rewrite_websocket_text_placeholders(&mut text)
-            .map_err(|_| {
-                terminate(
-                    WebSocketTerminationCause::MiddlewareFailure,
-                    miette!("websocket credential placeholder resolution failed"),
-                )
+            .map_err(|error| {
+                if error.is_endpoint_mismatch() {
+                    terminate(
+                        WebSocketTerminationCause::PolicyDenial,
+                        miette!(CREDENTIAL_ENDPOINT_MISMATCH),
+                    )
+                } else {
+                    terminate(
+                        WebSocketTerminationCause::MiddlewareFailure,
+                        miette!("websocket credential placeholder resolution failed"),
+                    )
+                }
             })?
+    } else if contains_reserved_credential_marker(&text) {
+        return Err(terminate(
+            WebSocketTerminationCause::MiddlewareFailure,
+            miette!("websocket credential placeholder resolution failed"),
+        ));
     } else {
         0
     };
@@ -1185,6 +1290,15 @@ async fn relay_text_payload<W: AsyncWrite + Unpin>(
 
     if replacements > 0 {
         emit_rewrite_event(host, port, options.policy_name, replacements);
+    }
+    if replacements > 0 {
+        before_credential_write.await;
+        if let Some((_, guard)) = live_resolver {
+            guard
+                .ensure_current()
+                .map_err(|error| terminate(WebSocketTerminationCause::PolicyDenial, error))?;
+        }
+        ensure_generation_current(host, port, options)?;
     }
     if compressed {
         let compressed_payload = compress_permessage_deflate(text.as_bytes()).map_err(|error| {
@@ -1923,7 +2037,10 @@ fn emit_websocket_l7_event(
             SeverityId::Informational,
         ),
     };
-    let summary = graphql.map(graphql_log_summary).unwrap_or_default();
+    let summary = graphql
+        .map(crate::l7::graphql::log_summary)
+        .map(|summary| format!(" {summary}"))
+        .unwrap_or_default();
     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Other)
         .action(action_id)
@@ -1938,34 +2055,6 @@ fn emit_websocket_l7_event(
         ))
         .build();
     ocsf_emit!(event);
-}
-
-fn graphql_log_summary(info: &crate::l7::graphql::GraphqlRequestInfo) -> String {
-    if let Some(error) = info.error.as_deref() {
-        return format!(" graphql_error={error:?}");
-    }
-    let ops: Vec<String> = info
-        .operations
-        .iter()
-        .map(|op| {
-            let name = op.operation_name.as_deref().unwrap_or("-");
-            let fields = if op.fields.is_empty() {
-                "-".to_string()
-            } else {
-                op.fields.join(",")
-            };
-            let persisted = op
-                .persisted_query_hash
-                .as_deref()
-                .or(op.persisted_query_id.as_deref())
-                .unwrap_or("-");
-            format!(
-                "type={} name={} fields={} persisted={}",
-                op.operation_type, name, fields, persisted
-            )
-        })
-        .collect();
-    format!(" graphql_ops={}", ops.join(";"))
 }
 
 fn observe_termination(
@@ -2046,7 +2135,8 @@ mod tests {
     use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
         SupervisorMiddleware, SupervisorMiddlewareServer,
     };
-
+    use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+    use openshell_core::provider_credentials::ProviderCredentialState;
     use openshell_core::secrets::SecretResolver;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2273,6 +2363,8 @@ network_policies:
             assembly_budget: budget,
             resolver: None,
             generation_guard: None,
+            provider_credentials: None,
+            target: "/",
             inspector: None,
             compression: WebSocketCompression::None,
             middleware_session: None,
@@ -2300,6 +2392,8 @@ network_policies:
             assembly_budget: WebSocketAssemblyBudget::default(),
             resolver: Some(&resolver),
             generation_guard: None,
+            provider_credentials: None,
+            target: "/",
             inspector: None,
             compression: WebSocketCompression::None,
             middleware_session: None,
@@ -2537,6 +2631,179 @@ network_policies:
         );
     }
 
+    fn bound_websocket_provider_state() -> ProviderCredentialState {
+        ProviderCredentialState::from_bound_environment(
+            1,
+            HashMap::from([("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "DISCORD_BOT_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "gateway.example.test".to_string(),
+                        port: 443,
+                        path: "/socket".to_string(),
+                    }],
+                    credential_identity: "provider-a:DISCORD_BOT_TOKEN".to_string(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("bound websocket provider state")
+    }
+
+    async fn relay_frame_after_live_state_change(
+        state: &ProviderCredentialState,
+        fallback: &SecretResolver,
+    ) -> (Result<()>, Vec<u8>) {
+        let placeholder = b"openshell:resolve:env:v1_DISCORD_BOT_TOKEN";
+        let input = masked_frame(true, 0x1, placeholder);
+        let (mut client_write, mut relay_read) = tokio::io::duplex(4096);
+        let (mut relay_write, mut upstream_read) = tokio::io::duplex(4096);
+        client_write.write_all(&input).await.unwrap();
+        drop(client_write);
+
+        let mut options = RelayOptions {
+            policy_name: "test-policy",
+            assembly_budget: WebSocketAssemblyBudget::default(),
+            resolver: Some(fallback),
+            generation_guard: None,
+            provider_credentials: Some(state),
+            target: "/socket",
+            inspector: None,
+            compression: WebSocketCompression::None,
+            middleware_session: None,
+            middleware_context: None,
+        };
+        let result = relay_client_to_server(
+            &mut relay_read,
+            &mut relay_write,
+            "gateway.example.test",
+            443,
+            &mut options,
+        )
+        .await;
+        drop(relay_write);
+        let mut output = Vec::new();
+        upstream_read.read_to_end(&mut output).await.unwrap();
+        (
+            result.map(|_| ()).map_err(|termination| termination.error),
+            output,
+        )
+    }
+
+    #[tokio::test]
+    async fn established_websocket_does_not_restore_resolver_after_detach() {
+        let state = bound_websocket_provider_state();
+        let fallback = state.resolver().expect("upgrade-time resolver");
+        state.revoke_static_provider_environment(2);
+
+        let (result, output) = relay_frame_after_live_state_change(&state, fallback.as_ref()).await;
+        assert!(result.is_err(), "revoked placeholder must close the relay");
+        assert!(
+            output.is_empty(),
+            "revoked WebSocket credential must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn established_websocket_does_not_restore_resolver_after_invalid_refresh() {
+        let state = bound_websocket_provider_state();
+        let fallback = state.resolver().expect("upgrade-time resolver");
+        let refresh = state.install_bound_environment(
+            2,
+            HashMap::from([("DISCORD_BOT_TOKEN".to_string(), "rotated".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+        );
+        assert!(
+            refresh.is_err(),
+            "incomplete bindings must revoke static state"
+        );
+
+        let (result, output) = relay_frame_after_live_state_change(&state, fallback.as_ref()).await;
+        assert!(
+            result.is_err(),
+            "invalid-refresh placeholder must close the relay"
+        );
+        assert!(
+            output.is_empty(),
+            "invalid-refresh credential must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_rewrite_rejects_revocation_before_frame_write() {
+        let state = bound_websocket_provider_state();
+        let fallback = state.resolver().expect("upgrade-time resolver");
+        let placeholder = b"openshell:resolve:env:v1_DISCORD_BOT_TOKEN";
+        let compressed = compress_permessage_deflate(placeholder).expect("compress placeholder");
+        let frame = FrameHeader {
+            fin: true,
+            rsv: 0x40,
+            opcode: OPCODE_TEXT,
+            masked: true,
+            payload_len: compressed.len() as u64,
+            mask_key: Some([0x37, 0xfa, 0x21, 0x3d]),
+            raw_header: Vec::new(),
+        };
+        let mut options = RelayOptions {
+            policy_name: "test-policy",
+            assembly_budget: WebSocketAssemblyBudget::default(),
+            resolver: Some(fallback.as_ref()),
+            generation_guard: None,
+            provider_credentials: Some(&state),
+            target: "/socket",
+            inspector: None,
+            compression: WebSocketCompression::PermessageDeflate,
+            middleware_session: None,
+            middleware_context: None,
+        };
+        let reached_write = tokio::sync::Barrier::new(2);
+        let release_write = tokio::sync::Barrier::new(2);
+        let (mut relay_write, mut upstream_read) = tokio::io::duplex(4096);
+
+        let relay = relay_text_payload_with_before_credential_write(
+            &mut relay_write,
+            &frame,
+            compressed,
+            test_assembly_admission().await,
+            None,
+            false,
+            true,
+            "gateway.example.test",
+            443,
+            &mut options,
+            async {
+                reached_write.wait().await;
+                release_write.wait().await;
+            },
+        );
+        let revoke = async {
+            reached_write.wait().await;
+            state.revoke_static_provider_environment(2);
+            release_write.wait().await;
+        };
+        let (result, ()) = tokio::join!(relay, revoke);
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.error.to_string().contains("generation changed")),
+            "revoked credential generation must fail before the frame write: {result:?}"
+        );
+
+        drop(relay_write);
+        let mut output = Vec::new();
+        upstream_read.read_to_end(&mut output).await.unwrap();
+        assert!(
+            output.is_empty(),
+            "credential revoked before the write guard must not reach upstream"
+        );
+    }
+
     async fn run_client_to_server_with_graphql_policy(
         input: Vec<u8>,
         resolver: Option<&SecretResolver>,
@@ -2579,6 +2846,8 @@ network_policies:
             assembly_budget: WebSocketAssemblyBudget::default(),
             resolver,
             generation_guard: Some(tunnel_engine.generation_guard()),
+            provider_credentials: None,
+            target: "/graphql",
             inspector: Some(InspectionOptions {
                 engine: &tunnel_engine,
                 ctx: &ctx,
@@ -2621,6 +2890,8 @@ network_policies:
             assembly_budget: WebSocketAssemblyBudget::default(),
             resolver: Some(&resolver),
             generation_guard: None,
+            provider_credentials: None,
+            target: "/",
             inspector: None,
             compression: WebSocketCompression::PermessageDeflate,
             middleware_session: None,
@@ -3008,7 +3279,7 @@ network_policies:
                 panic!("expected operation, got {other:?}")
             }
         };
-        let summary = graphql_log_summary(&graphql);
+        let summary = crate::l7::graphql::log_summary(&graphql);
 
         assert!(summary.contains("type=query"));
         assert!(summary.contains("fields=viewer"));
@@ -3060,6 +3331,8 @@ network_policies:
                     assembly_budget: WebSocketAssemblyBudget::default(),
                     resolver: Some(&resolver),
                     generation_guard: None,
+                    provider_credentials: None,
+                    target: "/",
                     inspector: None,
                     compression: WebSocketCompression::None,
                     middleware_session: None,
@@ -3367,6 +3640,8 @@ network_policies:
                     assembly_budget: WebSocketAssemblyBudget::default(),
                     resolver: None,
                     generation_guard: None,
+                    provider_credentials: None,
+                    target: "/",
                     inspector: None,
                     compression: WebSocketCompression::None,
                     middleware_session: Some(session),
@@ -3492,6 +3767,8 @@ network_policies:
                     assembly_budget: WebSocketAssemblyBudget::default(),
                     resolver: None,
                     generation_guard: None,
+                    provider_credentials: None,
+                    target: "/",
                     inspector: None,
                     compression: WebSocketCompression::None,
                     middleware_session: Some(session),
@@ -4091,6 +4368,8 @@ network_policies:
                     assembly_budget: WebSocketAssemblyBudget::default(),
                     resolver: None,
                     generation_guard: Some(tunnel_engine.generation_guard()),
+                    provider_credentials: None,
+                    target: "/graphql",
                     inspector: Some(InspectionOptions {
                         engine: &tunnel_engine,
                         ctx: &ctx,
@@ -4229,6 +4508,8 @@ network_policies:
                     assembly_budget: WebSocketAssemblyBudget::default(),
                     resolver: None,
                     generation_guard: None,
+                    provider_credentials: None,
+                    target: "/",
                     inspector: None,
                     compression: WebSocketCompression::None,
                     middleware_session: Some(session),
@@ -4395,6 +4676,8 @@ network_policies:
                     assembly_budget: WebSocketAssemblyBudget::default(),
                     resolver: None,
                     generation_guard: None,
+                    provider_credentials: None,
+                    target: "/",
                     inspector: None,
                     compression: WebSocketCompression::None,
                     middleware_session: Some(session),
@@ -4487,6 +4770,8 @@ network_policies:
                     assembly_budget: WebSocketAssemblyBudget::default(),
                     resolver: None,
                     generation_guard: None,
+                    provider_credentials: None,
+                    target: "/",
                     inspector: None,
                     compression: WebSocketCompression::None,
                     middleware_session: Some(session),
