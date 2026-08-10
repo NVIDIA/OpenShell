@@ -293,7 +293,14 @@ func TestSandboxRoundTrip(t *testing.T) {
 					"web": {
 						Name: "web",
 						Endpoints: []v1.PolicyNetworkEndpoint{
-							{Host: "api.example.com", Port: 443, Protocol: "rest"},
+							{
+								Host:     "api.example.com",
+								Port:     443,
+								Protocol: "rest",
+								CredentialBinding: &v1.NetworkCredentialBinding{
+									Provider: "api-credentials",
+								},
+							},
 						},
 					},
 				},
@@ -342,6 +349,8 @@ func TestSandboxRoundTrip(t *testing.T) {
 	assert.Equal(t, "web", webRule.Name)
 	require.Len(t, webRule.Endpoints, 1)
 	assert.Equal(t, "api.example.com", webRule.Endpoints[0].Host)
+	require.NotNil(t, webRule.Endpoints[0].CredentialBinding)
+	assert.Equal(t, "api-credentials", webRule.Endpoints[0].CredentialBinding.Provider)
 }
 
 func TestSandboxSpecToProto(t *testing.T) {
