@@ -49,6 +49,10 @@ build_image() {
             dockerfile="deploy/docker/Dockerfile.konflux.supervisor"
             konfig_dir="deploy/konflux/supervisor"
             ;;
+        cli)
+            dockerfile="deploy/docker/Dockerfile.konflux.cli"
+            konfig_dir="deploy/konflux/cli"
+            ;;
         *)
             echo "Unknown component: $component" >&2
             exit 1
@@ -101,6 +105,14 @@ build_image() {
     CLEANUP_PATHS+=("${sm_conf}")
     echo -e "[main]\nenabled=0" > "${sm_conf}"
 
+    # Podman auto-mounts host RHEL subscription secrets into /run/secrets/
+    # via /usr/share/containers/mounts.conf. The redhat.repo there adds
+    # rhel-* repos that can't resolve under --network=none. Mount an empty
+    # directory over /run/secrets to neutralize the injection entirely.
+    local empty_secrets
+    empty_secrets=$(mktemp -d)
+    CLEANUP_PATHS+=("${empty_secrets}")
+
     podman build \
         -f "${hermetic_dockerfile}" \
         --platform "${PLATFORM}" \
@@ -108,6 +120,7 @@ build_image() {
         --volume "$(realpath "${output_dir}/cachi2.env"):/cachi2/cachi2.env:Z" \
         --volume "$(realpath "${repos_dir}"):/etc/yum.repos.d:Z" \
         --volume "${sm_conf}:/etc/dnf/plugins/subscription-manager.conf:Z" \
+        --volume "${empty_secrets}:/run/secrets:Z" \
         --network none \
         -t "openshell-${component}-konflux" \
         "${REPO_ROOT}"
@@ -118,7 +131,7 @@ build_image() {
 }
 
 if [[ $# -eq 0 ]]; then
-    echo "Usage: $0 {gateway|supervisor|all}" >&2
+    echo "Usage: $0 {gateway|supervisor|cli|all}" >&2
     exit 1
 fi
 
@@ -126,6 +139,7 @@ target="$1"
 if [[ "$target" == "all" ]]; then
     build_image gateway
     build_image supervisor
+    build_image cli
 else
     build_image "$target"
 fi

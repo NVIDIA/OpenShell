@@ -46,6 +46,9 @@ required_prebuilt_binaries() {
 		supervisor|supervisor-sideload|supervisor-output)
 			echo "openshell-sandbox"
 			;;
+		cli)
+			echo "openshell"
+			;;
 	esac
 }
 
@@ -118,6 +121,12 @@ case "${TARGET}" in
     IMAGE_NAME="openshell/supervisor"
     DOCKER_TARGET="supervisor"
     DOCKERFILE="deploy/docker/Dockerfile.supervisor"
+    ;;
+  cli)
+    IS_FINAL_IMAGE=1
+    IMAGE_NAME="openshell/cli"
+    DOCKER_TARGET="cli"
+    DOCKERFILE="deploy/docker/Dockerfile.cli"
     ;;
   *)
     echo "Error: unsupported target '${TARGET}'" >&2

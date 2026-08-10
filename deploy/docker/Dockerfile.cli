@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CLI image build.
+#
+# The Rust binary is built natively before this image build runs and staged at:
+#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell
+#
+# Use tasks/scripts/docker-build-image.sh cli (or `mise run build:docker:cli`)
+# to stage the binary and build the image in one step. CI builds the binary
+# per-architecture via the `rust-native-build.yml` workflow (with the musl
+# target) and uploads it as an artifact, which is downloaded into the same
+# staging directory before the image build job runs.
+
+FROM alpine:3.22 AS cli
+
+ARG TARGETARCH
+
+RUN apk add --no-cache ca-certificates
+
+COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell /usr/local/bin/openshell
+
+USER 1000:1000
+
+ENTRYPOINT ["/usr/local/bin/openshell"]
