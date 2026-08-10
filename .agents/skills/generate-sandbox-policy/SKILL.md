@@ -384,6 +384,9 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 
 - [ ] `protocol: rest` on port 443 should have `tls: terminate`
 - [ ] HTTP methods are standard: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, or `*`
+- [ ] Credentialed destinations are also covered by the attached provider
+      profile endpoint; policy admission alone does not authorize credential
+      resolution
 
 ### Structural Checks
 
@@ -443,6 +446,13 @@ The policy needs to go somewhere. Determine which mode applies:
 2. **Check for conflicts**:
    - Does a policy with the same key already exist? If so, ask the user whether to **replace** it, **merge** new endpoints/binaries into it, or use a different key.
    - Does an existing endpoint selector overlap the new selector? Compatible overlaps are allowed and can intentionally aggregate allow and deny rules. Reject or revise equally specific overlaps that disagree on connection or request-processing metadata, including TLS, destination constraints, protocol/parser behavior, enforcement, or credential handling. A more-specific path selector may override broader request-processing metadata.
+   - If the sandbox uses an attached provider credential, confirm the provider
+     profile also declares the intended host, port, and path. A sandbox policy
+     allow cannot expand the profile's static credential binding.
+   - For `credential_signing`, confirm an attached endpoint-bearing profile
+     declares `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` and covers the
+     signed endpoint. For an endpointless AWS profile, add
+     `credential_binding.provider` with the exact attached provider name.
 
 3. **Apply the change**:
    - **Adding a new policy**: Insert the new policy block under `network_policies`, maintaining the file's existing indentation and style.

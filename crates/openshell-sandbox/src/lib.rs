@@ -217,80 +217,112 @@ pub async fn run_sandbox(
     );
 
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let (provider_credentials, mut provider_env) =
-        if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
-            let provider_credentials = ProviderCredentialState::from_child_env_snapshot(
-                bootstrap.provider_env_revision,
-                bootstrap.provider_child_env.clone(),
-            );
-            (provider_credentials, bootstrap.provider_child_env.clone())
-        } else {
-            // Fetch provider environment variables from the server.
-            // This is done after loading the policy so the sandbox can still start
-            // even if provider env fetch fails (graceful degradation).
-            let (
-                provider_env_revision,
-                provider_env,
-                provider_credential_expires_at_ms,
-                dynamic_credentials,
-            ) = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-                match openshell_core::grpc_client::fetch_provider_environment(endpoint, id).await {
-                    Ok(result) => {
-                        ocsf_emit!(
-                            ConfigStateChangeBuilder::new(ocsf_ctx())
-                                .severity(SeverityId::Informational)
-                                .status(StatusId::Success)
-                                .state(StateId::Enabled, "loaded")
-                                .message(format!(
-                                    "Fetched provider environment [env_count:{}]",
-                                    result.environment.len()
-                                ))
-                                .build()
-                        );
-                        (
-                            result.provider_env_revision,
-                            result.environment,
-                            result.credential_expires_at_ms,
-                            result.dynamic_credentials,
-                        )
-                    }
-                    Err(e) => {
-                        ocsf_emit!(
-                            ConfigStateChangeBuilder::new(ocsf_ctx())
-                                .severity(SeverityId::Medium)
-                                .status(StatusId::Failure)
-                                .state(StateId::Other, "degraded")
-                                .message(format!(
-                                    "Failed to fetch provider environment, continuing without: {e}"
-                                ))
-                                .build()
-                        );
-                        (
-                            0,
-                            std::collections::HashMap::new(),
-                            std::collections::HashMap::new(),
-                            std::collections::HashMap::new(),
-                        )
-                    }
+    let (provider_credentials, mut provider_env) = if let Some(bootstrap) =
+        sidecar_bootstrap.as_ref()
+    {
+        let provider_credentials = ProviderCredentialState::from_child_env_snapshot(
+            bootstrap.provider_env_revision,
+            bootstrap.provider_child_env.clone(),
+        );
+        (provider_credentials, bootstrap.provider_child_env.clone())
+    } else {
+        // Fetch provider environment variables from the server.
+        // This is done after loading the policy so the sandbox can still start
+        // even if provider env fetch fails (graceful degradation).
+        let (
+            provider_env_revision,
+            provider_env,
+            provider_credential_expires_at_ms,
+            dynamic_credentials,
+            static_credential_bindings,
+            non_secret_environment_keys,
+        ) = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+            match openshell_core::grpc_client::fetch_provider_environment(endpoint, id).await {
+                Ok(result) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .message(format!(
+                                "Fetched provider environment [env_count:{}]",
+                                result.environment.len()
+                            ))
+                            .build()
+                    );
+                    (
+                        result.provider_env_revision,
+                        result.environment,
+                        result.credential_expires_at_ms,
+                        result.dynamic_credentials,
+                        result.static_credential_bindings,
+                        result.non_secret_environment_keys,
+                    )
                 }
-            } else {
-                (
-                    0,
-                    std::collections::HashMap::new(),
-                    std::collections::HashMap::new(),
-                    std::collections::HashMap::new(),
-                )
-            };
-
-            let provider_credentials = ProviderCredentialState::from_environment(
-                provider_env_revision,
-                provider_env,
-                provider_credential_expires_at_ms,
-                dynamic_credentials,
-            );
-            let provider_env = provider_credentials.child_env_with_gcp_resolved();
-            (provider_credentials, provider_env)
+                Err(e) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .state(StateId::Disabled, "fail_closed")
+                            .message(format!(
+                                "Failed to fetch provider environment; no provider credentials are active: {e}"
+                            ))
+                            .build()
+                    );
+                    (
+                        0,
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                        Vec::new(),
+                    )
+                }
+            }
+        } else {
+            (
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                Vec::new(),
+            )
         };
+
+        let dynamic_credentials_fallback = dynamic_credentials.clone();
+        let provider_credentials = match ProviderCredentialState::from_bound_environment(
+            provider_env_revision,
+            provider_env,
+            provider_credential_expires_at_ms,
+            dynamic_credentials,
+            static_credential_bindings,
+            non_secret_environment_keys,
+        ) {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .state(StateId::Disabled, "fail_closed")
+                            .message(format!(
+                                "Rejected provider environment bindings; static provider credentials were revoked; fetched dynamic token grants remain active: {error}"
+                            ))
+                            .build()
+                    );
+                ProviderCredentialState::from_environment(
+                    provider_env_revision,
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                    dynamic_credentials_fallback,
+                )
+            }
+        };
+        let provider_env = provider_credentials.child_env_with_gcp_resolved();
+        (provider_credentials, provider_env)
+    };
 
     // Shared agent-proposals feature flag. Seed from the same initial settings
     // snapshot that produced the policy so networking and process setup agree
@@ -3244,42 +3276,67 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             .await
             {
                 Ok(env_result) => {
-                    ctx.provider_credentials.install_environment(
-                        env_result.provider_env_revision,
+                    let provider_env_revision = env_result.provider_env_revision;
+                    let install_result = ctx.provider_credentials.install_bound_environment(
+                        provider_env_revision,
                         env_result.environment,
                         env_result.credential_expires_at_ms,
                         env_result.dynamic_credentials,
+                        env_result.static_credential_bindings,
+                        env_result.non_secret_environment_keys,
                     );
-                    let child_env = ctx.provider_credentials.child_env_with_gcp_resolved();
-                    let env_count = child_env.len();
-                    if let Some(publisher) = ctx.sidecar_control_publisher.as_ref() {
-                        publisher.publish_provider_env(
-                            env_result.provider_env_revision,
-                            child_env.clone(),
+                    if let Err(error) = install_result {
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::High)
+                                .status(StatusId::Failure)
+                                .state(StateId::Disabled, "fail_closed")
+                                .message(format!(
+                                    "Rejected provider environment refresh; static provider credentials were revoked; fetched dynamic token grants remain active: {error}"
+                                ))
+                                .build()
+                        );
+                    } else {
+                        let child_env = ctx.provider_credentials.child_env_with_gcp_resolved();
+                        let env_count = child_env.len();
+                        if let Some(publisher) = ctx.sidecar_control_publisher.as_ref() {
+                            publisher
+                                .publish_provider_env(provider_env_revision, child_env.clone());
+                        }
+                        current_provider_env_revision = provider_env_revision;
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Enabled, "loaded")
+                                .unmapped(
+                                    "provider_env_revision",
+                                    serde_json::json!(provider_env_revision)
+                                )
+                                .message(format!(
+                                    "Provider environment refreshed [revision:{provider_env_revision} env_count:{env_count}]"
+                                ))
+                                .build()
                         );
                     }
-                    current_provider_env_revision = env_result.provider_env_revision;
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Informational)
-                            .status(StatusId::Success)
-                            .state(StateId::Enabled, "loaded")
-                            .unmapped(
-                                "provider_env_revision",
-                                serde_json::json!(env_result.provider_env_revision)
-                            )
-                            .message(format!(
-                                "Provider environment refreshed [revision:{} env_count:{env_count}]",
-                                env_result.provider_env_revision
-                            ))
-                            .build()
-                    );
                 }
                 Err(e) => {
+                    ctx.provider_credentials
+                        .revoke_static_provider_environment(result.provider_env_revision);
                     warn!(
                         error = %e,
                         provider_env_revision = result.provider_env_revision,
-                        "Settings poll: failed to refresh provider environment"
+                        "Settings poll: failed to refresh provider environment; static provider credentials were revoked; previous dynamic token grants remain active"
+                    );
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .state(StateId::Disabled, "fail_closed")
+                            .message(
+                                "Provider environment refresh failed; static provider credentials were revoked; previous dynamic token grants remain active"
+                            )
+                            .build()
                     );
                 }
             }

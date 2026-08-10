@@ -329,6 +329,12 @@ Use the `request-body-credential-rewrite` endpoint option with `protocol: rest` 
 
 Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token provider-shaped aliases such as `provider-OPENSHELL-RESOLVE-ENV-API_TOKEN` when the referenced environment key exists in the configured provider credentials.
 
+Static provider placeholders resolve only when the request host, port, and path
+also match an endpoint in the provider profile. A sandbox policy allow does not
+expand that binding. A mismatch returns HTTP 403 with
+`credential_endpoint_mismatch`. Refer to [Static Credential Endpoint
+Binding](/sandboxes/providers-v2#understand-static-credential-endpoint-binding).
+
 For example:
 
 - `api.github.com:443:read-only:rest` is valid.
@@ -557,8 +563,17 @@ When triaging denied requests, check:
 - Destination host and port to confirm which endpoint is missing.
 - Calling binary path to confirm which `binaries` entry needs to be added or adjusted.
 - HTTP method and path for REST endpoints, or `GET` / `WEBSOCKET_TEXT` and the upgraded request path for WebSocket endpoints, to confirm which `rules` entry needs to be added or adjusted.
+- `credential_endpoint_mismatch` in sandbox logs to confirm that policy admitted the request but the attached provider profile did not authorize its credential for that host, port, and path.
+- `request_authority_mismatch` in the response or sandbox logs to confirm that the HTTP request authority differs from the authorized tunnel endpoint. For a CONNECT tunnel to `api.example.com:8443`, send `Host: api.example.com:8443`; omitting the non-default port makes the request authority use the transport default and OpenShell rejects it. Absolute-form request targets must use the same host and port.
 
 Then push the updated policy as described above.
+
+Do not fix `credential_endpoint_mismatch` by widening sandbox policy. Export the
+provider profile with `openshell provider profile export <profile-id> -o yaml`.
+Update the custom provider profile only when the destination is an intended
+credential recipient. Refer to [Static Credential Endpoint
+Binding](/sandboxes/providers-v2#understand-static-credential-endpoint-binding)
+for the complete authorization model.
 
 For small changes, prefer `openshell policy update` over rewriting the full YAML:
 

@@ -44,13 +44,15 @@ use openshell_core::proto::{
 };
 use openshell_core::proto::{
     L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
-    SandboxPolicy as ProtoSandboxPolicy,
+    SandboxPolicy as ProtoSandboxPolicy, StaticCredentialEndpointBinding,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, PolicyDecisionOperation, TelemetryOutcome,
 };
 use openshell_core::{
     VERSION,
+    endpoint_path::EndpointPathPattern,
+    host_pattern::host_matches,
     settings::{self, SettingValueKind},
 };
 use openshell_ocsf::{
@@ -1136,6 +1138,279 @@ pub(super) fn validate_candidate_effective_policy(
     validate_endpoint_ambiguities(&effective_policy)
 }
 
+fn policy_static_credential_endpoint_bindings(
+    policy: Option<&ProtoSandboxPolicy>,
+) -> Result<HashMap<String, Vec<StaticCredentialEndpointBinding>>, Status> {
+    let mut bindings = HashMap::<String, Vec<StaticCredentialEndpointBinding>>::new();
+    let Some(policy) = policy else {
+        return Ok(bindings);
+    };
+
+    for rule in policy.network_policies.values() {
+        for endpoint in &rule.endpoints {
+            let Some(binding) = endpoint.credential_binding.as_ref() else {
+                continue;
+            };
+            let provider = binding.provider.trim();
+            if provider.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "credential_binding.provider is required for endpoint '{}'",
+                    endpoint.host
+                )));
+            }
+            if provider != binding.provider {
+                return Err(Status::invalid_argument(format!(
+                    "credential_binding.provider '{}' must not contain leading or trailing whitespace",
+                    binding.provider
+                )));
+            }
+            if endpoint.host.trim().is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "credential-bound endpoint for provider '{provider}' must define a host"
+                )));
+            }
+            let ports = if endpoint.ports.is_empty() {
+                vec![endpoint.port]
+            } else {
+                endpoint.ports.clone()
+            };
+            if ports
+                .iter()
+                .any(|port| *port == 0 || *port > u32::from(u16::MAX))
+            {
+                return Err(Status::invalid_argument(format!(
+                    "credential-bound endpoint '{}' for provider '{provider}' must define ports in range 1..=65535",
+                    endpoint.host
+                )));
+            }
+            let provider_bindings = bindings.entry(provider.to_string()).or_default();
+            for port in ports {
+                let candidate = StaticCredentialEndpointBinding {
+                    host: endpoint.host.clone(),
+                    port,
+                    path: endpoint.path.clone(),
+                };
+                if !provider_bindings.contains(&candidate) {
+                    provider_bindings.push(candidate);
+                }
+            }
+        }
+    }
+
+    for endpoints in bindings.values_mut() {
+        endpoints.sort_by(|left, right| {
+            (&left.host, left.port, &left.path).cmp(&(&right.host, right.port, &right.path))
+        });
+    }
+    Ok(bindings)
+}
+
+pub(super) fn policy_has_credential_binding_for_provider(
+    policy: &ProtoSandboxPolicy,
+    provider_name: &str,
+) -> bool {
+    policy.network_policies.values().any(|rule| {
+        rule.endpoints.iter().any(|endpoint| {
+            endpoint
+                .credential_binding
+                .as_ref()
+                .is_some_and(|binding| binding.provider == provider_name)
+        })
+    })
+}
+
+fn validate_policy_credential_binding_context(
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[super::provider::ProviderEnvironmentRecord],
+    policy: &ProtoSandboxPolicy,
+    bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+) -> Result<(), Status> {
+    for provider_name in bindings.keys() {
+        let record = records
+            .iter()
+            .find(|record| record.name == *provider_name)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "credential_binding references provider '{provider_name}', but that provider is not attached to the sandbox"
+                ))
+            })?;
+        let profile_id = normalize_provider_type(&record.provider.r#type)
+            .unwrap_or(record.provider.r#type.as_str());
+        let profile = super::provider::get_provider_type_profile_for_scope(
+            catalog,
+            profile_id,
+            &record.provider.profile_workspace,
+        )
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "credential_binding provider '{provider_name}' has no provider profile"
+            ))
+        })?;
+        if !profile.to_proto().endpoints.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "credential_binding provider '{provider_name}' profile already defines endpoints; \
+                 profile endpoints remain the credential boundary"
+            )));
+        }
+    }
+
+    validate_policy_signing_credential_sources(catalog, records, policy)?;
+    Ok(())
+}
+
+const SIGV4_REQUIRED_CREDENTIAL_KEYS: [&str; 2] = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"];
+
+fn validate_policy_signing_credential_sources(
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[super::provider::ProviderEnvironmentRecord],
+    policy: &ProtoSandboxPolicy,
+) -> Result<(), Status> {
+    for rule in policy.network_policies.values() {
+        for endpoint in &rule.endpoints {
+            if endpoint.credential_signing.is_empty() {
+                continue;
+            }
+
+            let source = endpoint.credential_binding.as_ref().map_or_else(
+                || {
+                    records.iter().find_map(|record| {
+                        signing_profile_for_record(catalog, record).filter(|profile| {
+                            profile_declares_sigv4_credentials(profile)
+                                && !profile.endpoints.is_empty()
+                                && signed_endpoint_is_covered(
+                                    endpoint,
+                                    &profile.to_proto().endpoints,
+                                )
+                        })
+                    })
+                },
+                |binding| {
+                    records
+                        .iter()
+                        .find(|record| record.name == binding.provider)
+                        .and_then(|record| signing_profile_for_record(catalog, record))
+                        .filter(|profile| {
+                            profile_declares_sigv4_credentials(profile)
+                                && profile.endpoints.is_empty()
+                        })
+                },
+            );
+
+            if source.is_none() {
+                let selector = format_endpoint_selector(endpoint);
+                return Err(Status::failed_precondition(format!(
+                    "credential_signing endpoint '{selector}' has no resolvable AWS credential source; attach an endpoint-bearing provider profile that declares AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and covers this endpoint, or set credential_binding.provider to an attached endpointless profile that declares those credentials"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn signing_profile_for_record(
+    catalog: &EffectiveProviderProfileCatalog,
+    record: &super::provider::ProviderEnvironmentRecord,
+) -> Option<openshell_providers::ProviderTypeProfile> {
+    let profile_id =
+        normalize_provider_type(&record.provider.r#type).unwrap_or(record.provider.r#type.as_str());
+    super::provider::get_provider_type_profile_for_scope(
+        catalog,
+        profile_id,
+        &record.provider.profile_workspace,
+    )
+}
+
+fn profile_declares_sigv4_credentials(profile: &openshell_providers::ProviderTypeProfile) -> bool {
+    let env_vars = profile.credential_env_vars();
+    SIGV4_REQUIRED_CREDENTIAL_KEYS
+        .iter()
+        .all(|required| env_vars.contains(required))
+}
+
+fn signed_endpoint_is_covered(
+    signed: &NetworkEndpoint,
+    profile_endpoints: &[NetworkEndpoint],
+) -> bool {
+    endpoint_ports_for_validation(signed)
+        .into_iter()
+        .all(|port| {
+            profile_endpoints.iter().any(|profile| {
+                endpoint_ports_for_validation(profile).contains(&port)
+                    && host_pattern_covers(&profile.host, &signed.host)
+                    && path_pattern_covers(&profile.path, &signed.path)
+            })
+        })
+}
+
+fn endpoint_ports_for_validation(endpoint: &NetworkEndpoint) -> Vec<u32> {
+    if endpoint.ports.is_empty() {
+        vec![endpoint.port]
+    } else {
+        endpoint.ports.clone()
+    }
+}
+
+fn host_pattern_covers(binding_pattern: &str, policy_pattern: &str) -> bool {
+    if binding_pattern.eq_ignore_ascii_case(policy_pattern) {
+        return true;
+    }
+    if contains_glob_syntax(policy_pattern) {
+        return false;
+    }
+    host_matches(binding_pattern, policy_pattern).unwrap_or(false)
+}
+
+fn path_pattern_covers(binding_pattern: &str, policy_pattern: &str) -> bool {
+    if binding_pattern == policy_pattern || matches!(binding_pattern, "" | "**" | "/**") {
+        return true;
+    }
+    if contains_glob_syntax(policy_pattern) {
+        return false;
+    }
+    EndpointPathPattern::new(binding_pattern).matches(policy_pattern)
+}
+
+fn contains_glob_syntax(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| matches!(character, '*' | '?' | '['))
+}
+
+fn format_endpoint_selector(endpoint: &NetworkEndpoint) -> String {
+    let ports = endpoint_ports_for_validation(endpoint)
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}:{ports}{}", endpoint.host, endpoint.path)
+}
+
+async fn validate_policy_credential_bindings_for_sandbox(
+    state: &ServerState,
+    catalog: &EffectiveProviderProfileCatalog,
+    workspace: &str,
+    provider_names: &[String],
+    policy: &ProtoSandboxPolicy,
+) -> Result<HashMap<String, Vec<StaticCredentialEndpointBinding>>, Status> {
+    let bindings = policy_static_credential_endpoint_bindings(Some(policy))?;
+    let has_signing = policy.network_policies.values().any(|rule| {
+        rule.endpoints
+            .iter()
+            .any(|endpoint| !endpoint.credential_signing.is_empty())
+    });
+    if bindings.is_empty() && !has_signing {
+        return Ok(bindings);
+    }
+    let records = super::provider::load_provider_environment_records(
+        state.store.as_ref(),
+        workspace,
+        provider_names,
+    )
+    .await?;
+    validate_policy_credential_binding_context(catalog, &records, policy, &bindings)?;
+    Ok(bindings)
+}
+
 async fn provider_policy_layers_for_sandbox(
     state: &ServerState,
     workspace: &str,
@@ -1195,7 +1470,25 @@ pub(super) async fn validate_candidate_provider_attachments(
     let base_policy = current_base_policy_for_sandbox(state.store.as_ref(), sandbox).await?;
     let provider_layers =
         provider_policy_layers_for_sandbox(state, workspace, sandbox, provider_names).await?;
-    validate_candidate_effective_policy(&base_policy, &provider_layers)
+    validate_candidate_effective_policy(&base_policy, &provider_layers)?;
+    let effective_policy = if provider_layers.is_empty() {
+        base_policy
+    } else {
+        compose_effective_policy(&base_policy, &provider_layers)
+    };
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), workspace)
+        .await?;
+    validate_policy_credential_bindings_for_sandbox(
+        state,
+        &catalog,
+        workspace,
+        provider_names,
+        &effective_policy,
+    )
+    .await?;
+    Ok(())
 }
 
 pub(super) async fn provider_policy_composition_enabled(store: &Store) -> Result<bool, Status> {
@@ -1610,11 +1903,23 @@ pub(super) async fn handle_get_sandbox_config(
         &supervisor_middleware_services,
         state.config.policy_validation_failure_mode,
     );
-    let provider_env_revision = compute_provider_env_revision_with_catalog(
+    let policy_credential_bindings = policy_static_credential_endpoint_bindings(policy.as_ref())?;
+    if let Some(policy) = policy.as_ref() {
+        validate_policy_credential_bindings_for_sandbox(
+            state.as_ref(),
+            &provider_profile_catalog,
+            &workspace,
+            &sandbox_provider_names,
+            policy,
+        )
+        .await?;
+    }
+    let provider_env_revision = compute_provider_env_revision_with_catalog_and_policy_bindings(
         state.store.as_ref(),
         &provider_profile_catalog,
         &workspace,
         &sandbox_provider_names,
+        &policy_credential_bindings,
     )
     .await?;
 
@@ -1649,14 +1954,32 @@ async fn compute_provider_env_revision(
     compute_provider_env_revision_with_catalog(store, &catalog, workspace, provider_names).await
 }
 
+#[cfg(test)]
 pub(super) async fn compute_provider_env_revision_with_catalog(
     store: &Store,
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<u64, Status> {
+    compute_provider_env_revision_with_catalog_and_policy_bindings(
+        store,
+        catalog,
+        workspace,
+        provider_names,
+        &HashMap::new(),
+    )
+    .await
+}
+
+async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
+    workspace: &str,
+    provider_names: &[String],
+    policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-provider-env-revision-v1");
+    hasher.update(b"openshell-provider-env-revision-v3");
 
     for provider_name in provider_names {
         hasher.update(provider_name.as_bytes());
@@ -1668,13 +1991,18 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
             })? {
             Some(record) => {
                 hasher.update(record.id.as_bytes());
-                hasher.update(record.updated_at_ms.to_le_bytes());
+                hasher.update(record.resource_version.to_le_bytes());
 
                 let provider = Provider::decode(record.payload.as_slice()).map_err(|e| {
                     Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
                 })?;
                 hasher.update(provider.r#type.as_bytes());
-                hash_provider_profile_revision(catalog, &provider.r#type, &mut hasher);
+                hash_provider_profile_revision(
+                    catalog,
+                    &provider.r#type,
+                    &provider.profile_workspace,
+                    &mut hasher,
+                );
 
                 let mut credential_keys: Vec<_> = provider.credentials.keys().collect();
                 credential_keys.sort();
@@ -1694,19 +2022,97 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
         }
     }
 
+    hash_policy_credential_bindings(policy_bindings, &mut hasher);
+
     let digest = hasher.finalize();
     Ok(u64::from_le_bytes(digest[..8].try_into().map_err(
         |_| Status::internal("provider env revision digest too short"),
     )?))
 }
 
+#[cfg(test)]
+fn compute_provider_env_revision_from_records(
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[super::provider::ProviderEnvironmentRecord],
+) -> Result<u64, Status> {
+    compute_provider_env_revision_from_records_and_policy_bindings(
+        catalog,
+        records,
+        &HashMap::new(),
+    )
+}
+
+fn compute_provider_env_revision_from_records_and_policy_bindings(
+    catalog: &EffectiveProviderProfileCatalog,
+    records: &[super::provider::ProviderEnvironmentRecord],
+    policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+) -> Result<u64, Status> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openshell-provider-env-revision-v3");
+
+    for record in records {
+        hasher.update(record.name.as_bytes());
+        hasher.update(record.object_id.as_bytes());
+        hasher.update(record.resource_version.to_le_bytes());
+
+        let provider = &record.provider;
+        hasher.update(provider.r#type.as_bytes());
+        hash_provider_profile_revision(
+            catalog,
+            &provider.r#type,
+            &provider.profile_workspace,
+            &mut hasher,
+        );
+
+        let mut credential_keys: Vec<_> = provider.credentials.keys().collect();
+        credential_keys.sort();
+        for key in credential_keys {
+            hasher.update(key.as_bytes());
+        }
+        let mut expiry_keys: Vec<_> = provider.credential_expires_at_ms.keys().collect();
+        expiry_keys.sort();
+        for key in expiry_keys {
+            hasher.update(key.as_bytes());
+            hasher.update(provider.credential_expires_at_ms[key].to_le_bytes());
+        }
+    }
+
+    hash_policy_credential_bindings(policy_bindings, &mut hasher);
+
+    let digest = hasher.finalize();
+    Ok(u64::from_le_bytes(digest[..8].try_into().map_err(
+        |_| Status::internal("provider env revision digest too short"),
+    )?))
+}
+
+fn hash_policy_credential_bindings(
+    bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    hasher: &mut Sha256,
+) {
+    let mut provider_names: Vec<_> = bindings.keys().collect();
+    provider_names.sort();
+    for provider_name in provider_names {
+        hasher.update(provider_name.as_bytes());
+        let mut endpoints = bindings[provider_name].clone();
+        endpoints.sort_by(|left, right| {
+            (&left.host, left.port, &left.path).cmp(&(&right.host, right.port, &right.path))
+        });
+        for endpoint in endpoints {
+            hasher.update(endpoint.host.as_bytes());
+            hasher.update(endpoint.port.to_le_bytes());
+            hasher.update(endpoint.path.as_bytes());
+        }
+    }
+}
+
 fn hash_provider_profile_revision(
     catalog: &EffectiveProviderProfileCatalog,
     provider_type: &str,
+    profile_workspace: &str,
     hasher: &mut Sha256,
 ) {
     let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
-    catalog.hash_profile_revision(profile_id, hasher);
+    catalog.hash_type_profile_revision_for_scope(profile_id, profile_workspace, hasher);
 }
 
 #[cfg(test)]
@@ -1788,6 +2194,7 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     request: Request<GetSandboxProviderEnvironmentRequest>,
 ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
     let sandbox_id = request.get_ref().sandbox_id.clone();
+    let supports_static_credential_bindings = request.get_ref().supports_static_credential_bindings;
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     drop(request);
 
@@ -1801,28 +2208,58 @@ pub(super) async fn handle_get_sandbox_provider_environment(
 
     let spec = sandbox
         .spec
+        .as_ref()
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
-    let provider_names = spec.providers;
+    let provider_names = spec.providers.clone();
     let provider_profile_catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
-    let provider_env_revision = compute_provider_env_revision_with_catalog(
+    let provider_records = super::provider::load_provider_environment_records(
         state.store.as_ref(),
-        &provider_profile_catalog,
         &workspace,
         &provider_names,
     )
     .await?;
-    let provider_environment = super::provider::resolve_provider_environment_with_credentials(
-        state.store.as_ref(),
+    let effective_policy = current_effective_policy_for_sandbox(
+        state.as_ref(),
         &provider_profile_catalog,
         &workspace,
-        &provider_names,
-        &state.credentials,
+        &sandbox,
+        &sandbox_id,
     )
     .await?;
+    let policy_credential_bindings =
+        policy_static_credential_endpoint_bindings(Some(&effective_policy))?;
+    validate_policy_credential_binding_context(
+        &provider_profile_catalog,
+        &provider_records,
+        &effective_policy,
+        &policy_credential_bindings,
+    )?;
+    let provider_env_revision = compute_provider_env_revision_from_records_and_policy_bindings(
+        &provider_profile_catalog,
+        &provider_records,
+        &policy_credential_bindings,
+    )?;
+    let mut provider_environment =
+        super::provider::resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
+            state.store.as_ref(),
+            &provider_profile_catalog,
+            &provider_records,
+            &policy_credential_bindings,
+            &state.credentials,
+        )
+        .await?;
+
+    if !supports_static_credential_bindings {
+        for key in &provider_environment.static_credential_keys {
+            provider_environment.environment.remove(key);
+            provider_environment.credential_expires_at_ms.remove(key);
+        }
+        provider_environment.static_credential_bindings.clear();
+    }
 
     info!(
         sandbox_id = %sandbox_id,
@@ -1832,11 +2269,20 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         "GetSandboxProviderEnvironment request completed successfully"
     );
 
+    let non_secret_environment_keys = provider_environment
+        .environment
+        .keys()
+        .filter(|key| !provider_environment.static_credential_keys.contains(*key))
+        .cloned()
+        .collect();
+
     Ok(Response::new(GetSandboxProviderEnvironmentResponse {
         environment: provider_environment.environment,
         provider_env_revision,
         credential_expires_at_ms: provider_environment.credential_expires_at_ms,
         dynamic_credentials: provider_environment.dynamic_credentials,
+        static_credential_bindings: provider_environment.static_credential_bindings,
+        non_secret_environment_keys,
     }))
 }
 
@@ -1947,6 +2393,11 @@ async fn handle_update_config_inner(
             crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy)
                 .await?;
             validate_candidate_effective_policy(&new_policy, &[])?;
+            if !policy_static_credential_endpoint_bindings(Some(&new_policy))?.is_empty() {
+                return Err(Status::failed_precondition(
+                    "credential_binding is sandbox-scoped and cannot be used in a global policy",
+                ));
+            }
 
             let payload = new_policy.encode_to_vec();
             let hash = deterministic_policy_hash(&new_policy);
@@ -2224,6 +2675,20 @@ async fn handle_update_config_inner(
         let provider_layers =
             provider_policy_layers_for_sandbox(state, &workspace, &sandbox, &spec.providers)
                 .await?;
+        let provider_profile_catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), &workspace)
+            .await?;
+        let provider_records = super::provider::load_provider_environment_records(
+            state.store.as_ref(),
+            &workspace,
+            &spec.providers,
+        )
+        .await?;
+        let credential_binding_context = PolicyCredentialBindingValidationContext {
+            catalog: &provider_profile_catalog,
+            records: &provider_records,
+        };
         let atomic_context = AtomicPolicyWriteContext {
             expected_resource_version: req.expected_resource_version,
             provenance: &req.annotations,
@@ -2239,7 +2704,10 @@ async fn handle_update_config_inner(
             &workspace,
             baseline_policy.as_ref(),
             &merge_ops,
-            &provider_layers,
+            PolicyMergeValidationContext {
+                provider_layers: &provider_layers,
+                credential_binding: Some(&credential_binding_context),
+            },
             Some(&atomic_context),
         )
         .await?;
@@ -2346,6 +2814,23 @@ async fn handle_update_config_inner(
     let provider_layers =
         provider_policy_layers_for_sandbox(state, &workspace, &sandbox, &spec.providers).await?;
     validate_candidate_effective_policy(&new_policy, &provider_layers)?;
+    let provider_profile_catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), &workspace)
+        .await?;
+    let effective_policy = if provider_layers.is_empty() {
+        new_policy.clone()
+    } else {
+        compose_effective_policy(&new_policy, &provider_layers)
+    };
+    validate_policy_credential_bindings_for_sandbox(
+        state.as_ref(),
+        &provider_profile_catalog,
+        &workspace,
+        &spec.providers,
+        &effective_policy,
+    )
+    .await?;
 
     let _sandbox_sync_guard = if backfill_policy.is_some() {
         Some(state.compute.sandbox_sync_guard().await)
@@ -4426,15 +4911,26 @@ struct AtomicPolicyWriteContext<'a> {
     annotations: &'a HashMap<String, String>,
 }
 
+struct PolicyCredentialBindingValidationContext<'a> {
+    catalog: &'a EffectiveProviderProfileCatalog,
+    records: &'a [super::provider::ProviderEnvironmentRecord],
+}
+
+struct PolicyMergeValidationContext<'a> {
+    provider_layers: &'a [ProviderPolicyLayer],
+    credential_binding: Option<&'a PolicyCredentialBindingValidationContext<'a>>,
+}
+
 async fn apply_merge_operations_with_retry(
     store: &Store,
     sandbox_id: &str,
     workspace: &str,
     baseline_policy: Option<&ProtoSandboxPolicy>,
     operations: &[PolicyMergeOp],
-    provider_layers: &[ProviderPolicyLayer],
+    validation_context: PolicyMergeValidationContext<'_>,
     atomic_context: Option<&AtomicPolicyWriteContext<'_>>,
 ) -> Result<(i64, String, Option<Sandbox>), Status> {
+    let provider_layers = validation_context.provider_layers;
     for attempt in 1..=MERGE_RETRY_LIMIT {
         let latest = store
             .get_latest_policy(sandbox_id)
@@ -4457,6 +4953,20 @@ async fn apply_merge_operations_with_retry(
         }
         validate_policy_safety(&new_policy)?;
         validate_candidate_effective_policy(&new_policy, provider_layers)?;
+        let effective_policy = if provider_layers.is_empty() {
+            new_policy.clone()
+        } else {
+            compose_effective_policy(&new_policy, provider_layers)
+        };
+        let bindings = policy_static_credential_endpoint_bindings(Some(&effective_policy))?;
+        if let Some(context) = validation_context.credential_binding {
+            validate_policy_credential_binding_context(
+                context.catalog,
+                context.records,
+                &effective_policy,
+                &bindings,
+            )?;
+        }
 
         if let Some(ref current) = latest
             && current.policy_hash == hash
@@ -4567,7 +5077,10 @@ pub(super) async fn merge_chunk_into_policy(
         workspace,
         None,
         &operations,
-        provider_layers,
+        PolicyMergeValidationContext {
+            provider_layers,
+            credential_binding: None,
+        },
         None,
     )
     .await
@@ -4589,7 +5102,10 @@ async fn remove_chunk_from_policy(
             rule_name: chunk.rule_name.clone(),
             binary_path: chunk.binary.clone(),
         }],
-        &[],
+        PolicyMergeValidationContext {
+            provider_layers: &[],
+            credential_binding: None,
+        },
         None,
     )
     .await
@@ -5776,6 +6292,20 @@ mod tests {
         }
     }
 
+    fn test_aws_provider(name: &str, provider_type: &str) -> Provider {
+        let mut provider = test_provider(name, provider_type);
+        provider.credentials = [
+            ("AWS_ACCESS_KEY_ID".to_string(), "AKIATEST".to_string()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "test-secret".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        provider
+    }
+
     fn test_policy_with_rule(rule_name: &str, host: &str) -> ProtoSandboxPolicy {
         ProtoSandboxPolicy {
             network_policies: std::iter::once((
@@ -5793,6 +6323,38 @@ mod tests {
             .collect(),
             ..Default::default()
         }
+    }
+
+    fn test_policy_with_credential_binding(
+        rule_name: &str,
+        host: &str,
+        provider: &str,
+    ) -> ProtoSandboxPolicy {
+        let mut policy = test_policy_with_rule(rule_name, host);
+        policy
+            .network_policies
+            .get_mut(rule_name)
+            .unwrap()
+            .endpoints[0]
+            .credential_binding = Some(openshell_core::proto::NetworkCredentialBinding {
+            provider: provider.to_string(),
+        });
+        policy
+    }
+
+    fn test_sigv4_policy(host: &str, provider: Option<&str>) -> ProtoSandboxPolicy {
+        let mut policy = test_policy_with_rule("aws", host);
+        let endpoint = &mut policy.network_policies.get_mut("aws").unwrap().endpoints[0];
+        endpoint.protocol = "rest".to_string();
+        endpoint.tls = "terminate".to_string();
+        endpoint.access = "full".to_string();
+        endpoint.credential_signing = "sigv4".to_string();
+        endpoint.signing_service = "s3".to_string();
+        endpoint.credential_binding =
+            provider.map(|provider| openshell_core::proto::NetworkCredentialBinding {
+                provider: provider.to_string(),
+            });
+        policy
     }
 
     fn test_ambiguous_policy() -> ProtoSandboxPolicy {
@@ -6011,6 +6573,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-snapshot-consistency".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -6563,6 +7126,267 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_config_rejects_credential_binding_to_unattached_provider() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox(
+            "sb-unattached-binding",
+            "unattached-binding",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "unattached-binding".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(test_policy_with_credential_binding(
+                    "cloud",
+                    "api.cloud.example",
+                    "missing-provider",
+                )),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("unattached provider binding must fail before persistence");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("not attached"));
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-unattached-binding")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_policy_binding_for_endpointful_profile() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-double-binding",
+            "double-binding",
+            ProtoSandboxPolicy::default(),
+            vec!["work-github".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "double-binding".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(test_policy_with_credential_binding(
+                    "cloud",
+                    "api.cloud.example",
+                    "work-github",
+                )),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("profile and policy must not both define credential endpoints");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("already defines endpoints"));
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_sigv4_without_credential_source_before_persisting_revision() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox(
+            "sb-signing-no-source",
+            "signing-no-source",
+            ProtoSandboxPolicy::default(),
+            Vec::new(),
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "signing-no-source".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(test_sigv4_policy("s3.amazonaws.com", None)),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("SigV4 policy without an AWS credential source must fail before persistence");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("no resolvable AWS credential source")
+        );
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-signing-no-source")
+                .await
+                .unwrap()
+                .is_none(),
+            "invalid policy must not leave a revision in history"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_sigv4_for_unbound_endpointless_aws_profile() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_aws_provider("aws-prod", "aws"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-signing-unbound-aws",
+            "signing-unbound-aws",
+            ProtoSandboxPolicy::default(),
+            vec!["aws-prod".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "signing-unbound-aws".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(test_sigv4_policy("s3.amazonaws.com", None)),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("endpointless AWS profile must be bound explicitly");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("no resolvable AWS credential source")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_accepts_sigv4_bound_to_endpointless_aws_profile() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_aws_provider("aws-prod", "aws"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-signing-bound-aws",
+            "signing-bound-aws",
+            ProtoSandboxPolicy::default(),
+            vec!["aws-prod".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "signing-bound-aws".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(test_sigv4_policy("s3.amazonaws.com", Some("aws-prod"))),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("bound endpointless AWS profile supplies SigV4 credentials");
+
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-signing-bound-aws")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_accepts_sigv4_covered_by_endpointful_aws_profile() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_aws_provider("s3-prod", "aws-s3"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-signing-profile-endpoint",
+            "signing-profile-endpoint",
+            ProtoSandboxPolicy::default(),
+            vec!["s3-prod".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "signing-profile-endpoint".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(test_sigv4_policy("bucket.s3.amazonaws.com", None)),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("endpoint-bearing AWS profile covers the signed endpoint");
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_sigv4_outside_endpointful_aws_profile_boundary() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_aws_provider("s3-prod", "aws-s3"))
+            .await
+            .unwrap();
+        let mut sandbox = test_sandbox(
+            "sb-signing-profile-mismatch",
+            "signing-profile-mismatch",
+            ProtoSandboxPolicy::default(),
+            vec!["s3-prod".to_string()],
+        );
+        sandbox.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "signing-profile-mismatch".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(test_sigv4_policy("api.example.com", None)),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("profile endpoint boundary must cover a signed endpoint");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("no resolvable AWS credential source")
+        );
+    }
+
+    #[tokio::test]
     async fn merge_operations_reject_ambiguity_before_persisting_revision() {
         let state = test_server_state().await;
         let mut policy = test_ambiguous_policy();
@@ -6581,7 +7405,10 @@ mod tests {
             "default",
             None,
             &operations,
-            &[],
+            PolicyMergeValidationContext {
+                provider_layers: &[],
+                credential_binding: None,
+            },
             None,
         )
         .await
@@ -7044,6 +7871,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-env".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -7056,6 +7884,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-env".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -7068,13 +7897,331 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_env_revision_changes_when_attached_provider_record_changes() {
+    async fn provider_environment_withholds_static_credentials_from_legacy_supervisors() {
         use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
-        use std::time::Duration;
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-legacy-provider-env",
+                "legacy-provider-env",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-legacy-provider-env".to_string(),
+                supports_static_credential_bindings: false,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.environment.contains_key("GITHUB_TOKEN"));
+        assert!(response.static_credential_bindings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_environment_uses_policy_binding_for_endpointless_profile() {
+        use openshell_core::proto::{
+            GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest,
+            NetworkCredentialBinding, ProviderProfile, ProviderProfileCategory,
+            StoredProviderProfile,
+        };
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-endpointless".to_string(),
+                    name: "endpointless".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                profile: Some(ProviderProfile {
+                    id: "endpointless".to_string(),
+                    display_name: "Endpointless".to_string(),
+                    category: ProviderProfileCategory::Other as i32,
+                    endpoints: Vec::new(),
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+        let mut provider = test_provider("work-cloud", "endpointless");
+        provider.credentials =
+            HashMap::from([("CLOUD_TOKEN".to_string(), "cloud-secret".to_string())]);
+        state.store.put_message(&provider).await.unwrap();
+
+        let mut policy = test_policy_with_rule("cloud_api", "api.cloud.example");
+        policy
+            .network_policies
+            .get_mut("cloud_api")
+            .unwrap()
+            .endpoints[0]
+            .credential_binding = Some(NetworkCredentialBinding {
+            provider: "work-cloud".to_string(),
+        });
+        openshell_policy::ensure_sandbox_process_identity(&mut policy);
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-policy-binding",
+                "policy-binding",
+                policy.clone(),
+                vec!["work-cloud".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let config = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-policy-binding".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let environment = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-policy-binding".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            environment.environment.get("CLOUD_TOKEN"),
+            Some(&"cloud-secret".to_string())
+        );
+        assert_eq!(
+            environment.static_credential_bindings["CLOUD_TOKEN"].endpoints,
+            vec![StaticCredentialEndpointBinding {
+                host: "api.cloud.example".to_string(),
+                port: 443,
+                path: String::new(),
+            }]
+        );
+        assert_eq!(
+            config.provider_env_revision, environment.provider_env_revision,
+            "config and provider environment must advertise one atomic revision"
+        );
+
+        let mut next_policy = policy;
+        next_policy
+            .network_policies
+            .get_mut("cloud_api")
+            .unwrap()
+            .endpoints[0]
+            .host = "api2.cloud.example".to_string();
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "policy-binding".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(next_policy.clone()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("policy binding update must succeed");
+        let next_config = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-policy-binding".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let next_environment = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-policy-binding".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_ne!(
+            config.provider_env_revision, next_config.provider_env_revision,
+            "changing the policy binding must rotate the provider environment revision"
+        );
+        assert_eq!(
+            next_config.provider_env_revision,
+            next_environment.provider_env_revision
+        );
+        assert_eq!(
+            next_environment.static_credential_bindings["CLOUD_TOKEN"].endpoints[0].host,
+            "api2.cloud.example"
+        );
+
+        let mut unbound_policy = next_policy;
+        unbound_policy
+            .network_policies
+            .get_mut("cloud_api")
+            .unwrap()
+            .endpoints[0]
+            .credential_binding = None;
+        handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "policy-binding".to_string(),
+                workspace: "default".to_string(),
+                policy: Some(unbound_policy),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("removing a policy binding must succeed");
+        let unbound_environment = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-policy-binding".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_ne!(
+            next_environment.provider_env_revision, unbound_environment.provider_env_revision,
+            "removing the binding must rotate the provider environment revision"
+        );
+        assert!(
+            !unbound_environment.environment.contains_key("CLOUD_TOKEN"),
+            "removing the only binding must withhold the static credential"
+        );
+        assert!(
+            !unbound_environment
+                .static_credential_bindings
+                .contains_key("CLOUD_TOKEN"),
+            "an endpointless profile must not emit incomplete binding metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_static_binding_does_not_suppress_valid_dynamic_credentials() {
+        use openshell_core::proto::{
+            GetSandboxProviderEnvironmentRequest, ProviderCredentialTokenGrant, ProviderProfile,
+            ProviderProfileCategory, ProviderProfileCredential, StoredProviderProfile,
+        };
+
+        let state = test_server_state().await;
+        let mut invalid_static = test_provider("invalid-static", "profile-without-endpoints");
+        invalid_static.credentials =
+            HashMap::from([("INVALID_TOKEN".to_string(), "static-secret".to_string())]);
+        let dynamic = test_provider("dynamic", "custom-dynamic");
+        let dynamic_profile = StoredProviderProfile {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "profile-custom-dynamic".to_string(),
+                name: "custom-dynamic".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            profile: Some(ProviderProfile {
+                id: "custom-dynamic".to_string(),
+                display_name: "Custom Dynamic".to_string(),
+                category: ProviderProfileCategory::Other as i32,
+                credentials: vec![ProviderProfileCredential {
+                    name: "access_token".to_string(),
+                    auth_style: "bearer".to_string(),
+                    header_name: "authorization".to_string(),
+                    token_grant: Some(ProviderCredentialTokenGrant {
+                        token_endpoint: "https://auth.example.test/token".to_string(),
+                        audience: "api://default".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.dynamic.example.test".to_string(),
+                    port: 443,
+                    path: "/**".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+
+        state.store.put_message(&invalid_static).await.unwrap();
+        state.store.put_message(&dynamic).await.unwrap();
+        state.store.put_message(&dynamic_profile).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-mixed-provider-env",
+                "mixed-provider-env",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["invalid-static".to_string(), "dynamic".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-mixed-provider-env".to_string(),
+                supports_static_credential_bindings: true,
+            })),
+        )
+        .await
+        .expect("mixed snapshot must be returned")
+        .into_inner();
+
+        assert_eq!(
+            response.environment.get("INVALID_TOKEN"),
+            Some(&"static-secret".to_string())
+        );
+        assert!(
+            !response
+                .static_credential_bindings
+                .contains_key("INVALID_TOKEN"),
+            "incomplete static metadata must reach the supervisor for fail-closed rejection"
+        );
+        assert!(
+            !response.dynamic_credentials.is_empty(),
+            "valid dynamic credentials must survive an unrelated static binding failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_env_revision_changes_on_consecutive_provider_updates_without_delay() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
 
         let state = test_server_state().await;
         let mut provider = test_provider("work-github", "github");
         state.store.put_message(&provider).await.unwrap();
+        let first_resource_version = state
+            .store
+            .get_by_name(Provider::object_type(), "default", "work-github")
+            .await
+            .unwrap()
+            .unwrap()
+            .resource_version;
         state
             .store
             .put_message(&test_sandbox(
@@ -7090,22 +8237,46 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-revision".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
         .unwrap()
         .into_inner();
 
-        tokio::time::sleep(Duration::from_millis(2)).await;
         provider
             .credentials
             .insert("GITHUB_TOKEN".to_string(), "rotated".to_string());
-        state.store.put_message(&provider).await.unwrap();
+        state
+            .store
+            .put_if(
+                Provider::object_type(),
+                provider.object_id(),
+                provider.object_name(),
+                provider.object_workspace(),
+                &provider.encode_to_vec(),
+                None,
+                crate::persistence::WriteCondition::Unconditional,
+            )
+            .await
+            .unwrap();
+        let second_resource_version = state
+            .store
+            .get_by_name(Provider::object_type(), "default", "work-github")
+            .await
+            .unwrap()
+            .unwrap()
+            .resource_version;
+        assert_ne!(
+            first_resource_version, second_resource_version,
+            "consecutive writes must advance the authoritative resource version"
+        );
 
         let second = handle_get_sandbox_provider_environment(
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-revision".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -7119,6 +8290,190 @@ mod tests {
         assert_eq!(
             second.environment.get("GITHUB_TOKEN"),
             Some(&"rotated".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_environment_revision_and_payload_share_immutable_record_snapshot() {
+        use openshell_core::proto::{
+            ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCategory,
+            ProviderProfileCredential, StoredProviderProfile,
+        };
+
+        fn dynamic_profile(
+            id: &str,
+            endpoint_host: &str,
+            token_endpoint: &str,
+        ) -> StoredProviderProfile {
+            StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("profile-{id}"),
+                    name: id.to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: "default".to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                profile: Some(ProviderProfile {
+                    id: id.to_string(),
+                    display_name: id.to_string(),
+                    category: ProviderProfileCategory::Other as i32,
+                    credentials: vec![ProviderProfileCredential {
+                        name: "access_token".to_string(),
+                        auth_style: "bearer".to_string(),
+                        header_name: "authorization".to_string(),
+                        token_grant: Some(ProviderCredentialTokenGrant {
+                            token_endpoint: token_endpoint.to_string(),
+                            audience: "api://snapshot".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    endpoints: vec![NetworkEndpoint {
+                        host: endpoint_host.to_string(),
+                        port: 443,
+                        path: "/**".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            }
+        }
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&dynamic_profile(
+                "snapshot-a",
+                "api.snapshot-a.example",
+                "https://auth.snapshot-a.example/token",
+            ))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&dynamic_profile(
+                "snapshot-b",
+                "api.snapshot-b.example",
+                "https://auth.snapshot-b.example/token",
+            ))
+            .await
+            .unwrap();
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .unwrap();
+
+        let mut first_provider = test_provider("replaceable", "snapshot-a");
+        first_provider.metadata.as_mut().unwrap().id = "provider-identity-a".to_string();
+        first_provider.credentials =
+            HashMap::from([("GITHUB_TOKEN".to_string(), "secret-a".to_string())]);
+        state.store.put_message(&first_provider).await.unwrap();
+
+        let provider_names = vec!["replaceable".to_string()];
+        let first_records = crate::grpc::provider::load_provider_environment_records(
+            state.store.as_ref(),
+            "default",
+            &provider_names,
+        )
+        .await
+        .unwrap();
+        let first_revision =
+            compute_provider_env_revision_from_records(&catalog, &first_records).unwrap();
+        let mut next_version_records = first_records.clone();
+        next_version_records[0].resource_version += 1;
+        assert_ne!(
+            first_revision,
+            compute_provider_env_revision_from_records(&catalog, &next_version_records).unwrap(),
+            "resource version alone must advance the provider environment revision"
+        );
+
+        state
+            .store
+            .delete_by_name(Provider::object_type(), "default", "replaceable")
+            .await
+            .unwrap();
+        let mut replacement = test_provider("replaceable", "snapshot-b");
+        replacement.metadata.as_mut().unwrap().id = "provider-identity-b".to_string();
+        replacement.credentials =
+            HashMap::from([("GITHUB_TOKEN".to_string(), "secret-b".to_string())]);
+        state.store.put_message(&replacement).await.unwrap();
+
+        let first_environment = crate::grpc::provider::resolve_provider_environment_from_records(
+            state.store.as_ref(),
+            &catalog,
+            &first_records,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            first_environment.environment.get("GITHUB_TOKEN"),
+            Some(&"secret-a".to_string())
+        );
+        assert_eq!(
+            first_environment
+                .static_credential_bindings
+                .get("GITHUB_TOKEN")
+                .map(|binding| binding.credential_identity.as_str()),
+            Some("provider-identity-a:GITHUB_TOKEN")
+        );
+        assert_eq!(first_environment.dynamic_credentials.len(), 1);
+        assert!(
+            first_environment
+                .dynamic_credentials
+                .values()
+                .all(|credential| {
+                    credential.token_grant.as_ref().is_some_and(|grant| {
+                        grant.token_endpoint == "https://auth.snapshot-a.example/token"
+                    })
+                }),
+            "dynamic grants must come from the first loaded provider snapshot"
+        );
+
+        let replacement_records = crate::grpc::provider::load_provider_environment_records(
+            state.store.as_ref(),
+            "default",
+            &provider_names,
+        )
+        .await
+        .unwrap();
+        let replacement_revision =
+            compute_provider_env_revision_from_records(&catalog, &replacement_records).unwrap();
+        let replacement_environment =
+            crate::grpc::provider::resolve_provider_environment_from_records(
+                state.store.as_ref(),
+                &catalog,
+                &replacement_records,
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(first_revision, replacement_revision);
+        assert_eq!(
+            replacement_environment.environment.get("GITHUB_TOKEN"),
+            Some(&"secret-b".to_string())
+        );
+        assert_eq!(
+            replacement_environment
+                .static_credential_bindings
+                .get("GITHUB_TOKEN")
+                .map(|binding| binding.credential_identity.as_str()),
+            Some("provider-identity-b:GITHUB_TOKEN")
+        );
+        assert_eq!(replacement_environment.dynamic_credentials.len(), 1);
+        assert!(
+            replacement_environment
+                .dynamic_credentials
+                .values()
+                .all(|credential| {
+                    credential.token_grant.as_ref().is_some_and(|grant| {
+                        grant.token_endpoint == "https://auth.snapshot-b.example/token"
+                    })
+                }),
+            "dynamic grants must change only after loading the replacement record"
         );
     }
 
@@ -7240,6 +8595,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn platform_profile_narrowing_changes_platform_provider_revision_when_shadowed() {
+        use crate::persistence::WriteCondition;
+        use openshell_core::proto::{
+            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
+        };
+
+        fn stored_profile(workspace: &str, path: &str) -> StoredProviderProfile {
+            StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!(
+                        "profile-scoped-revision-{}",
+                        if workspace.is_empty() {
+                            "platform"
+                        } else {
+                            workspace
+                        }
+                    ),
+                    name: "scoped-revision".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: workspace.to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                profile: Some(ProviderProfile {
+                    id: "scoped-revision".to_string(),
+                    display_name: format!("{workspace} scoped revision"),
+                    category: ProviderProfileCategory::Other as i32,
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.test".to_string(),
+                        port: 443,
+                        path: path.to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            }
+        }
+
+        let store = test_store().await;
+        store.put_message(&stored_profile("", "/**")).await.unwrap();
+        store
+            .put_message(&stored_profile("default", "/workspace/**"))
+            .await
+            .unwrap();
+        let mut provider = test_provider("platform-scoped", "scoped-revision");
+        provider.profile_workspace = String::new();
+        store.put_message(&provider).await.unwrap();
+
+        let first =
+            compute_provider_env_revision(&store, "default", &["platform-scoped".to_string()])
+                .await
+                .unwrap();
+
+        let mut platform = store
+            .get_message_by_name::<StoredProviderProfile>("", "scoped-revision")
+            .await
+            .unwrap()
+            .unwrap();
+        let metadata = platform.metadata.as_ref().unwrap();
+        let object_id = metadata.id.clone();
+        let resource_version = metadata.resource_version;
+        platform.profile.as_mut().unwrap().endpoints[0].path = "/v1/**".to_string();
+        store
+            .put_if(
+                StoredProviderProfile::object_type(),
+                &object_id,
+                "scoped-revision",
+                "",
+                &platform.encode_to_vec(),
+                None,
+                WriteCondition::MatchResourceVersion(resource_version),
+            )
+            .await
+            .unwrap();
+
+        let second =
+            compute_provider_env_revision(&store, "default", &["platform-scoped".to_string()])
+                .await
+                .unwrap();
+        assert_ne!(
+            first, second,
+            "narrowing the selected platform fallback must refresh sandbox credentials"
+        );
+    }
+
+    #[tokio::test]
     async fn sandbox_config_and_provider_env_follow_attached_provider_lifecycle() {
         use crate::grpc::sandbox::{
             handle_attach_sandbox_provider, handle_detach_sandbox_provider,
@@ -7277,6 +8720,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -7306,6 +8750,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -7343,6 +8788,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -7445,6 +8891,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -7477,6 +8924,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -7513,6 +8961,7 @@ mod tests {
             &state,
             with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
+                supports_static_credential_bindings: true,
             })),
         )
         .await
@@ -11673,7 +13122,10 @@ mod tests {
                 "default",
                 None,
                 &add_allow,
-                &[],
+                PolicyMergeValidationContext {
+                    provider_layers: &[],
+                    credential_binding: None,
+                },
                 None
             ),
             apply_merge_operations_with_retry(
@@ -11682,7 +13134,10 @@ mod tests {
                 "default",
                 None,
                 &add_deny,
-                &[],
+                PolicyMergeValidationContext {
+                    provider_layers: &[],
+                    credential_binding: None,
+                },
                 None
             ),
         );
