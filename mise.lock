@@ -82,7 +82,6 @@ checksum = "sha256:195e786eb84ec145854f20528992e86637c77d1968731dfe6ce850c90e28f
 url = "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_windows_amd64.zip"
 url_api = "https://api.github.com/repos/anchore/syft/releases/assets/410001172"
 provenance = "github-attestations"
-provenance_verified = true
 
 [[tools."github:mozilla/sccache"]]
 version = "0.16.0"
