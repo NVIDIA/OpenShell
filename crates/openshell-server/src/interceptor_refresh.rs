@@ -35,7 +35,12 @@ pub fn spawn_interceptor_refresh_worker(state: Arc<crate::ServerState>, poll_int
 
     for (name, client) in clients {
         let tx = tx.clone();
-        tokio::spawn(watch_interceptor_connection(name, client, tx));
+        tokio::spawn(watch_interceptor_connection(
+            name,
+            client,
+            tx,
+            poll_interval,
+        ));
     }
 
     let state = state.clone();
@@ -103,6 +108,7 @@ async fn watch_interceptor_connection(
     name: String,
     mut client: GatewayInterceptorClient<Channel>,
     tx: mpsc::Sender<String>,
+    healthy_probe_interval: Duration,
 ) {
     let mut connected = true;
     let mut backoff = RECONNECT_PROBE_INTERVAL;
@@ -110,7 +116,7 @@ async fn watch_interceptor_connection(
     loop {
         let sleep_duration = if connected {
             backoff = RECONNECT_PROBE_INTERVAL;
-            RECONNECT_BACKOFF_MAX
+            healthy_probe_interval
         } else {
             backoff
         };

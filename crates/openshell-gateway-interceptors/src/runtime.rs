@@ -220,20 +220,15 @@ impl GatewayInterceptorRuntime {
     pub async fn refresh(&self) -> Result<bool> {
         let current = self.plan.load_full();
         let new_plan = current.refresh().await?;
-        let bindings_changed = current.binding_keys() != new_plan.binding_keys();
-        let sources_changed = current.profile_sources_map().keys().collect::<Vec<_>>()
-            != new_plan.profile_sources_map().keys().collect::<Vec<_>>();
-        let count: usize = new_plan.binding_keys().len();
-        self.plan.store(Arc::new(new_plan));
-        let changed = bindings_changed || sources_changed;
+        let changed = current.manifest_fingerprint() != new_plan.manifest_fingerprint();
         if changed {
             info!(
-                bindings = count,
-                bindings_changed,
-                sources_changed,
-                "gateway interceptor manifest refreshed with structural changes"
+                bindings = new_plan.binding_keys().len(),
+                profile_sources = new_plan.profile_sources_map().len(),
+                "gateway interceptor manifest changed"
             );
         }
+        self.plan.store(Arc::new(new_plan));
         Ok(changed)
     }
 

@@ -23,6 +23,8 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tower::service_fn;
 use tracing::{info, warn};
 
+use sha2::Digest as _;
+
 use crate::profile_source::GatewayInterceptorProfileSource;
 use crate::routes::OpenShellRouteIndex;
 use crate::{InterceptorError, Result};
@@ -171,6 +173,7 @@ pub struct ExecutionPlan {
     profile_sources: BTreeMap<String, GatewayInterceptorProfileSource>,
     routes: OpenShellRouteIndex,
     handles: Vec<InterceptorHandle>,
+    manifest_fingerprint: String,
 }
 
 impl ExecutionPlan {
@@ -181,6 +184,7 @@ impl ExecutionPlan {
             profile_sources: BTreeMap::new(),
             routes,
             handles: Vec::new(),
+            manifest_fingerprint: String::new(),
         }
     }
 
@@ -194,6 +198,8 @@ impl ExecutionPlan {
         let mut bindings: BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>> = BTreeMap::new();
         let mut profile_sources = BTreeMap::new();
         let mut handles = Vec::new();
+        let mut fingerprint_hasher = sha2::Sha256::new();
+        fingerprint_hasher.update(b"openshell-interceptor-manifest-v1");
 
         for config in configs {
             let channel = connect_endpoint(&config.grpc_endpoint).await?;
@@ -223,6 +229,7 @@ impl ExecutionPlan {
                         ))
                     })?
                     .into_inner();
+            fingerprint_hasher.update(prost::Message::encode_to_vec(&manifest));
             let service_default = match config.binding_policy {
                 GatewayInterceptorBindingPolicy::Dynamic => {
                     let manifest_default = parse_optional_failure_policy(&manifest.failure_policy)?;
@@ -312,6 +319,7 @@ impl ExecutionPlan {
             handles.push(InterceptorHandle { config, channel });
         }
 
+        let manifest_fingerprint = format!("sha256:{:x}", fingerprint_hasher.finalize());
         let count: usize = bindings.values().map(Vec::len).sum();
         info!(
             bindings = count,
@@ -323,6 +331,7 @@ impl ExecutionPlan {
             profile_sources,
             routes,
             handles,
+            manifest_fingerprint,
         })
     }
 
@@ -371,6 +380,10 @@ impl ExecutionPlan {
         self.bindings.keys().cloned().collect()
     }
 
+    pub(crate) fn manifest_fingerprint(&self) -> &str {
+        &self.manifest_fingerprint
+    }
+
     pub(crate) fn interceptor_clients(&self) -> Vec<(String, GatewayInterceptorClient<Channel>)> {
         self.handles
             .iter()
@@ -391,6 +404,8 @@ impl ExecutionPlan {
         let mut bindings: BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>> = BTreeMap::new();
         let mut profile_sources = BTreeMap::new();
         let mut new_handles = Vec::new();
+        let mut fingerprint_hasher = sha2::Sha256::new();
+        fingerprint_hasher.update(b"openshell-interceptor-manifest-v1");
 
         for handle in &self.handles {
             let config = &handle.config;
@@ -421,6 +436,7 @@ impl ExecutionPlan {
                         ))
                     })?
                     .into_inner();
+            fingerprint_hasher.update(prost::Message::encode_to_vec(&manifest));
 
             let service_default = match config.binding_policy {
                 GatewayInterceptorBindingPolicy::Dynamic => {
@@ -505,11 +521,13 @@ impl ExecutionPlan {
             });
         }
 
+        let manifest_fingerprint = format!("sha256:{:x}", fingerprint_hasher.finalize());
         Ok(Self {
             bindings,
             profile_sources,
             routes: self.routes.clone(),
             handles: new_handles,
+            manifest_fingerprint,
         })
     }
 }
