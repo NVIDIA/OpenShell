@@ -486,6 +486,29 @@ If SSH relay connections fail, verify the workspace NetworkPolicy selects the
 gateway's actual `app.kubernetes.io/name` and
 `app.kubernetes.io/instance` labels.
 
+For a sandbox that requested disruption protection, verify the operator gate,
+the persisted deadline, PDB ownership, and gateway RBAC:
+
+```bash
+helm -n openshell get values openshell | grep -A4 disruptionProtection
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -A3 disruption_protection
+kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o go-template='{{ index .metadata.annotations "openshell.io/disruption-protected-until" }}{{ "\n" }}'
+kubectl -n <sandbox-namespace> get poddisruptionbudget <sandbox-name> -o yaml
+kubectl auth can-i --as=system:serviceaccount:openshell:openshell get poddisruptionbudgets.policy -n <sandbox-namespace>
+kubectl auth can-i --as=system:serviceaccount:openshell:openshell patch poddisruptionbudgets.policy -n <sandbox-namespace>
+```
+
+Both opt-ins are required: Helm
+`server.disruptionProtection.enabled=true` and sandbox driver config
+`kubernetes.disruption_protection.duration`. A request over `maxDuration` is
+rejected. The PDB should use `minAvailable: 1`,
+`unhealthyPodEvictionPolicy: AlwaysAllow`, and an owner reference to the
+Sandbox CR. OpenShell stores an absolute UTC deadline in
+`openshell.io/disruption-protected-until`; an expired PDB can remain while all
+gateways are down but should be removed after gateway reconciliation resumes.
+PDBs apply only to voluntary Eviction API operations, not node failure,
+preemption, direct deletion, backup, or restore.
+
 Check the configured sandbox service account when TokenReview bootstrap or
 sandbox registration fails. Helm creates a dedicated sandbox service account by
 default and writes it to `[openshell.drivers.kubernetes].service_account_name`;
@@ -685,6 +708,7 @@ configuration — check that the gateway spawned the driver binary you expect
 | Docker GPU sandbox fails before startup | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
+| Kubernetes sandbox requested disruption protection but has no PDB | Operator gate is disabled, request exceeds `maxDuration`, gateway lacks `poddisruptionbudgets.policy` RBAC, or reconciliation failed | Helm values, rendered `gateway.toml`, gateway logs, Sandbox deadline annotation, `kubectl auth can-i`, PDB selector and owner reference |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
 | Edge or OIDC gateway returns `Unauthenticated` | Stored login expired, audience/scopes mismatch, or gateway auth configuration changed | `openshell gateway info`, `openshell gateway login <name>`, gateway auth logs |
