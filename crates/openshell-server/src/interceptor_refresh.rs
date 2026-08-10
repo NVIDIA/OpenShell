@@ -35,12 +35,7 @@ pub fn spawn_interceptor_refresh_worker(state: Arc<crate::ServerState>, poll_int
 
     for (name, client) in clients {
         let tx = tx.clone();
-        tokio::spawn(watch_interceptor_connection(
-            name,
-            client,
-            tx,
-            poll_interval,
-        ));
+        tokio::spawn(watch_interceptor_connection(name, client, tx));
     }
 
     let state = state.clone();
@@ -104,11 +99,14 @@ pub fn spawn_interceptor_refresh_worker(state: Arc<crate::ServerState>, poll_int
     });
 }
 
+/// Probes an interceptor channel and sends the interceptor name on `tx` when
+/// a reconnection is detected (transition from unhealthy → healthy).  Healthy
+/// channels are re-probed every [`RECONNECT_PROBE_INTERVAL`] so that short
+/// outages are detected within seconds regardless of the poll interval.
 async fn watch_interceptor_connection(
     name: String,
     mut client: GatewayInterceptorClient<Channel>,
     tx: mpsc::Sender<String>,
-    healthy_probe_interval: Duration,
 ) {
     let mut connected = true;
     let mut backoff = RECONNECT_PROBE_INTERVAL;
@@ -116,7 +114,7 @@ async fn watch_interceptor_connection(
     loop {
         let sleep_duration = if connected {
             backoff = RECONNECT_PROBE_INTERVAL;
-            healthy_probe_interval
+            RECONNECT_PROBE_INTERVAL
         } else {
             backoff
         };
@@ -141,5 +139,132 @@ async fn watch_interceptor_connection(
             }
             backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openshell_core::proto::gateway_interceptor::v1::{
+        DescribeRequest, InterceptorEvaluation, InterceptorManifest, InterceptorResult,
+        ProviderProfileSnapshot, ProviderProfileSnapshotRequest,
+        gateway_interceptor_server::{GatewayInterceptor, GatewayInterceptorServer},
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Status};
+
+    #[derive(Clone)]
+    struct ToggleInterceptor {
+        healthy: Arc<AtomicBool>,
+    }
+
+    #[tonic::async_trait]
+    impl GatewayInterceptor for ToggleInterceptor {
+        async fn describe(
+            &self,
+            _request: Request<DescribeRequest>,
+        ) -> Result<tonic::Response<InterceptorManifest>, Status> {
+            if self.healthy.load(Ordering::Relaxed) {
+                Ok(tonic::Response::new(InterceptorManifest {
+                    name: "toggle".to_string(),
+                    ..InterceptorManifest::default()
+                }))
+            } else {
+                Err(Status::unavailable("simulated outage"))
+            }
+        }
+
+        async fn evaluate(
+            &self,
+            _request: Request<InterceptorEvaluation>,
+        ) -> Result<tonic::Response<InterceptorResult>, Status> {
+            Err(Status::unimplemented("not needed"))
+        }
+
+        async fn snapshot_provider_profiles(
+            &self,
+            _request: Request<ProviderProfileSnapshotRequest>,
+        ) -> Result<tonic::Response<ProviderProfileSnapshot>, Status> {
+            Err(Status::unimplemented("not needed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_detects_reconnect_and_sends_notification() {
+        let healthy = Arc::new(AtomicBool::new(true));
+        let interceptor = ToggleInterceptor {
+            healthy: healthy.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let _server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(GatewayInterceptorServer::new(interceptor))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        let client = GatewayInterceptorClient::connect(addr).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+
+        tokio::spawn(watch_interceptor_connection(
+            "toggle".to_string(),
+            client,
+            tx,
+        ));
+
+        healthy.store(false, Ordering::Relaxed);
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "no reconnect notification while still unhealthy"
+        );
+
+        healthy.store(true, Ordering::Relaxed);
+
+        let notification = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("watcher should detect reconnect within timeout")
+            .expect("channel should not be closed");
+
+        assert_eq!(notification, "toggle");
+    }
+
+    #[tokio::test]
+    async fn watcher_does_not_notify_when_continuously_healthy() {
+        let healthy = Arc::new(AtomicBool::new(true));
+        let interceptor = ToggleInterceptor {
+            healthy: healthy.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let _server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(GatewayInterceptorServer::new(interceptor))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        let client = GatewayInterceptorClient::connect(addr).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+
+        tokio::spawn(watch_interceptor_connection(
+            "stable".to_string(),
+            client,
+            tx,
+        ));
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no notification when interceptor stays healthy"
+        );
     }
 }

@@ -301,7 +301,7 @@ The gateway validates snapshot structure and provider-profile semantics. It trea
 
 `failure_policy` accepts `fail_closed` or `fail_open`. `timeout` accepts `ms` and `s` suffixes. In `dynamic` mode, binding overrides may select a manifest binding by `id`, `rpc`, or `service` plus `method`; they can disable a binding, narrow its phases, or override its failure policy.
 
-`interceptor_refresh_interval_secs` sets the periodic safety-net interval for re-fetching interceptor manifests. The gateway also monitors each interceptor channel and triggers an immediate refresh when a reconnection is detected (e.g., after an interceptor pod restart). Set to `0` to disable both the reconnect watcher and the periodic poll. Defaults to `10` when interceptors are configured.
+`interceptor_refresh_interval_secs` sets the periodic safety-net interval for re-fetching interceptor manifests. The gateway also monitors each interceptor channel every 2 seconds and triggers a manifest refresh when a reconnection is detected (e.g., after an interceptor pod restart). Set to `0` to disable both the reconnect watcher and the periodic poll. Defaults to `10` when interceptors are configured.
 
 ```toml
 [openshell.gateway]
