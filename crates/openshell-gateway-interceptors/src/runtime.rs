@@ -241,6 +241,12 @@ impl GatewayInterceptorRuntime {
         self.plan.load_full().profile_sources_map().clone()
     }
 
+    pub fn interceptor_clients(
+        &self,
+    ) -> Vec<(String, openshell_core::proto::gateway_interceptor::v1::gateway_interceptor_client::GatewayInterceptorClient<tonic::transport::Channel>)>{
+        self.plan.load_full().interceptor_clients()
+    }
+
     async fn evaluate_phase_with_plan(
         &self,
         plan: &ExecutionPlan,

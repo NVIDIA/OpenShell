@@ -371,6 +371,22 @@ impl ExecutionPlan {
         self.bindings.keys().cloned().collect()
     }
 
+    pub(crate) fn interceptor_clients(&self) -> Vec<(String, GatewayInterceptorClient<Channel>)> {
+        self.handles
+            .iter()
+            .map(|h| {
+                let max = h
+                    .config
+                    .max_response_bytes
+                    .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES);
+                (
+                    h.config.name.clone(),
+                    GatewayInterceptorClient::new(h.channel.clone()).max_decoding_message_size(max),
+                )
+            })
+            .collect()
+    }
+
     pub(crate) async fn refresh(&self) -> Result<Self> {
         let mut bindings: BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>> = BTreeMap::new();
         let mut profile_sources = BTreeMap::new();
