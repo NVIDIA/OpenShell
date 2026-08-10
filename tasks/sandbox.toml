@@ -10,3 +10,9 @@ usage = """
 arg "[command]" var=#true help="Command to run in the sandbox (default: claude)"
 """
 run = "bash tasks/scripts/sandbox.sh"
+
+["sandbox:dev"]
+description = "Build and create or reconnect to the OpenShell development sandbox"
+raw = true
+tools = { "github:moby/buildkit" = "0.30.0" }
+run = "uv run --no-sync python scripts/devbox/sandbox-dev.py"

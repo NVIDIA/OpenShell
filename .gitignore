@@ -202,8 +202,9 @@ artifacts/
 # Local mise settings
 mise.local.toml
 
-# Local Codex app state
+# Local agent state
 .codex/
+.pi/
 
 # Ignore plans for now
 architecture/plans

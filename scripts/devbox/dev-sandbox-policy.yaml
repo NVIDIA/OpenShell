@@ -1,0 +1,183 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /dev/zero
+    - /app
+    - /etc
+    - /var/log
+    - /home/sandbox
+  read_write:
+    - /sandbox
+    - /sccache
+    - /tmp
+    - /dev/null
+
+landlock:
+  compatibility: best_effort
+
+network_policies:
+  openai_coding_agents:
+    name: openai-coding-agents
+    endpoints:
+      - host: api.openai.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+      - host: auth.openai.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+      - host: chatgpt.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+      - host: ab.chatgpt.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+    binaries:
+      # Codex may call OpenAI directly. Pi runs under the shared Node runtime,
+      # so this temporarily permits any mise-managed Node process.
+      - path: /usr/local/share/mise/installs/node/*/bin/codex
+      - path: /usr/local/share/mise/installs/node/*/bin/node
+
+  anthropic_coding_agents:
+    name: anthropic-coding-agents
+    endpoints:
+      - host: api.anthropic.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+      - host: statsig.anthropic.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+      - host: sentry.io
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+    binaries:
+      # Claude Code may call Anthropic directly. Pi runs under the shared Node
+      # runtime, so this temporarily permits any mise-managed Node process.
+      - path: /usr/local/share/mise/installs/node/*/bin/claude
+      - path: /usr/local/share/mise/installs/node/*/bin/node
+
+  pi_model_catalog:
+    name: pi-model-catalog
+    endpoints:
+      - host: pi.dev
+        port: 443
+        path: /api/models/providers/*
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: /api/models/providers/*
+    binaries:
+      - path: /usr/local/share/mise/installs/node/*/bin/node
+
+  node_package_downloads:
+    name: node-package-downloads
+    endpoints:
+      - host: registry.npmjs.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+        allow_encoded_slash: true
+    binaries:
+      - path: /usr/local/share/mise/installs/node/*/bin/node
+
+  python_package_downloads:
+    name: python-package-downloads
+    endpoints:
+      - host: pypi.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+      - host: files.pythonhosted.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+    binaries:
+      - path: /usr/local/share/mise/installs/uv/**/uv
+
+  rust_package_downloads:
+    name: rust-package-downloads
+    endpoints:
+      - host: index.crates.io
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+      - host: static.crates.io
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+    binaries:
+      - path: /usr/local/lib/rust/bin/cargo
+      - path: /usr/local/lib/rustup/toolchains/*/bin/cargo
+      - path: /usr/local/share/mise/installs/rust/*/bin/cargo
+
+  go_package_downloads:
+    name: go-package-downloads
+    endpoints:
+      - host: proxy.golang.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+      - host: sum.golang.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+    binaries:
+      - path: /usr/local/share/mise/installs/go/*/bin/go
+
+  github_cli:
+    name: github-cli
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+      - host: api.github.com
+        port: 443
+        path: /graphql
+        protocol: graphql
+        enforcement: enforce
+        access: read-write
+      # Permit clone and fetch operations while leaving pushes denied.
+      - host: github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "**" }
+          - allow: { method: HEAD, path: "**" }
+          - allow: { method: OPTIONS, path: "**" }
+          - allow: { method: POST, path: "/**/git-upload-pack" }
+    binaries:
+      - path: /usr/local/bin/gh

@@ -1,0 +1,172 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OpenShell development image for agent-driven work inside a sandbox.
+#
+# This image supports the repository's local validation path (`mise run ci`).
+# It intentionally omits container engines and VM tooling because OpenShell
+# sandboxes cannot provide the nested runtime or virtualization required by the
+# repository's end-to-end workflows.
+
+ARG BASE_IMAGE=nvcr.io/nvidia/base/ubuntu:noble-20251013
+ARG GH_VERSION=2.92.0
+ARG MISE_VERSION=v2026.8.3
+ARG NPM_VERSION=11.13.0
+
+FROM ${BASE_IMAGE} AS download-base
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Shared download dependencies for independently cached image inputs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM download-base AS build-base
+
+# Native build dependencies shared by toolchain installation and the final
+# development environment.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    clang \
+    cmake \
+    git \
+    libclang-dev \
+    libssl-dev \
+    libz3-dev \
+    musl-tools \
+    pkg-config \
+    python3 \
+    python3-venv \
+    unzip \
+    xz-utils \
+    zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM build-base AS system
+
+# Runtime dependencies used by the Rust, Python, Go, Helm, and documentation
+# checks that compose `mise run ci`.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fd-find \
+    iproute2 \
+    jq \
+    nftables \
+    openssh-client \
+    ripgrep \
+    rsync \
+    socat \
+    && apt-get install -y --only-upgrade gpgv python3 \
+    && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM download-base AS github-cli
+
+ARG GH_VERSION
+ARG TARGETARCH
+
+# GitHub CLI is useful for agent-driven issue and pull-request workflows, but
+# does not install or expose a nested container runtime.
+RUN --mount=type=secret,id=GITHUB_TOKEN \
+    case "${TARGETARCH}" in \
+      amd64) gh_arch=amd64 ;; \
+      arm64) gh_arch=arm64 ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}"; exit 1 ;; \
+    esac \
+    && github_download() { \
+      if [ -s /run/secrets/GITHUB_TOKEN ]; then \
+        curl -fsSL \
+          -H "Authorization: Bearer $(cat /run/secrets/GITHUB_TOKEN)" \
+          "$1"; \
+      else \
+        curl -fsSL "$1"; \
+      fi; \
+    } \
+    && github_download \
+      "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${gh_arch}.tar.gz" \
+    | tar xz --strip-components=2 -C /usr/local/bin \
+      "gh_${GH_VERSION}_linux_${gh_arch}/bin/gh"
+
+FROM build-base AS mise-toolchain
+
+ARG MISE_VERSION
+ARG NPM_VERSION
+
+ENV RUSTUP_HOME=/usr/local/lib/rustup
+ENV PATH="/usr/local/share/mise/shims:${PATH}"
+
+# Keep the complete locked Linux toolset synchronized with the checkout.
+# Runtime task definitions come from the checkout uploaded into the sandbox,
+# so task-only changes do not need to invalidate this expensive install layer.
+# Container engines and VM tooling are not part of the mise configuration and
+# remain intentionally absent from this image.
+COPY mise.toml mise.lock /opt/openshell-mise/
+
+WORKDIR /opt/openshell-mise
+
+RUN --mount=type=secret,id=MISE_GITHUB_TOKEN \
+    --mount=type=cache,target=/root/.cache/mise \
+    --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/root/go/pkg/mod \
+    if [ -r /run/secrets/MISE_GITHUB_TOKEN ]; then \
+      mise_github_token="$(cat /run/secrets/MISE_GITHUB_TOKEN)"; \
+      export MISE_GITHUB_TOKEN="${mise_github_token}"; \
+      export GITHUB_API_TOKEN="${MISE_GITHUB_TOKEN}"; \
+      export GITHUB_TOKEN="${MISE_GITHUB_TOKEN}"; \
+      echo "Using MISE_GITHUB_TOKEN build secret for mise installs."; \
+    else \
+      echo "No MISE_GITHUB_TOKEN build secret available; GitHub API requests are unauthenticated."; \
+    fi \
+    && export CARGO_HOME=/usr/local/lib/rust \
+    && curl -fsSL https://mise.run \
+      | MISE_VERSION="${MISE_VERSION}" MISE_INSTALL_PATH=/usr/local/bin/mise sh \
+    && mise trust /opt/openshell-mise/mise.toml \
+    && mise install --system --locked \
+    && mise exec -- npm install --global "npm@${NPM_VERSION}" \
+    && (mise exec -- rustup component remove rust-docs || true) \
+    && MISE_DATA_DIR=/usr/local/share/mise mise reshim \
+    && chmod -R a+rX /usr/local/lib/rust /usr/local/lib/rustup
+
+# Resolve these floating packages on every image build. The bootstrap task
+# changes this argument without invalidating the preceding mise toolchain layer.
+ARG AGENT_CLI_BUILD_ID
+RUN --mount=type=cache,target=/root/.npm \
+    test -n "${AGENT_CLI_BUILD_ID}" \
+    && mise exec -- npm install --global --no-audit --no-fund \
+      @anthropic-ai/claude-code \
+      @earendil-works/pi-coding-agent \
+      @openai/codex \
+    && export MISE_DATA_DIR=/usr/local/share/mise \
+    && mise reshim \
+    && mise which claude \
+    && mise which codex \
+    && mise which pi
+
+FROM system
+
+ENV MISE_TRUSTED_CONFIG_PATHS=/sandbox
+ENV RUSTUP_HOME=/usr/local/lib/rustup
+ENV PATH="/usr/local/share/mise/shims:${PATH}"
+
+COPY --from=github-cli /usr/local/bin/gh /usr/local/bin/gh
+COPY --from=mise-toolchain /usr/local/bin/mise /usr/local/bin/mise
+COPY --from=mise-toolchain /usr/local/share/mise/ /usr/local/share/mise/
+COPY --from=mise-toolchain /usr/local/lib/rust/ /usr/local/lib/rust/
+COPY --from=mise-toolchain /usr/local/lib/rustup/ /usr/local/lib/rustup/
+
+# Use the same unprivileged identity and writable workspace across compute
+# drivers. Mise discovers the immutable system tool installation independently
+# of the runtime user's HOME.
+RUN groupadd --gid 10001 sandbox \
+    && useradd --uid 10001 --gid sandbox --create-home --shell /bin/bash sandbox \
+    && install -d -o sandbox -g sandbox /sandbox
+
+USER sandbox
+WORKDIR /sandbox
+
+# OpenShell replaces CMD when a sandbox command is supplied. The default keeps
+# the image useful for an interactive development sandbox.
+CMD ["/bin/bash"]
