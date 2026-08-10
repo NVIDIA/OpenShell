@@ -1283,6 +1283,10 @@ def test_refresher_concurrent_write_back_does_not_trample(tmp_path: Path) -> Non
         r.close()
 
 
+class _WindowsPermissionError(PermissionError):
+    winerror: int
+
+
 def test_atomic_replace_retries_windows_sharing_violations(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -1298,7 +1302,7 @@ def test_atomic_replace_retries_windows_sharing_violations(
         nonlocal attempts
         attempts += 1
         if attempts < 3:
-            error = PermissionError("destination is busy")
+            error = _WindowsPermissionError("destination is busy")
             error.winerror = 32
             raise error
         return real_replace(path, target)
@@ -1325,7 +1329,7 @@ def test_atomic_replace_does_not_retry_permanent_windows_errors(
     def replace(_path: Path, _target: Path) -> Path:
         nonlocal attempts
         attempts += 1
-        error = PermissionError("access denied")
+        error = _WindowsPermissionError("access denied")
         error.winerror = 13
         raise error
 
