@@ -53,8 +53,7 @@ Arguments after the Bazel separator are passed to the guest runner:
 
 ```shell
 bazel run //bzl/test-guest:ubuntu_docker -- \
-  --copy ./openshell:/usr/local/bin/openshell \
-  -- openshell --version
+  -- uname -a
 ```
 
 Without a command, the target opens an interactive SSH session. Every run
@@ -107,29 +106,32 @@ credentials; ordinary CI and developer clients should use read-only cache
 credentials. Bump the image `generation` when intentionally refreshing guest
 packages. Strict reproducibility requires pinned distro repository snapshots.
 
-## Install or copy artifacts
+## Declare build artifacts
 
-Install a repository-built package:
+Test-guest consumers take Bazel targets, not host filesystem paths. Declare
+packages with `packages` and files copied into the guest with `copies`:
 
-```shell
-bazel run //bzl/test-guest:ubuntu_docker -- \
-  --install artifacts/openshell_0.0.0-local_arm64.deb \
-  -- openshell --version
+```starlark
+load("//bzl/test-guest:test_guest.bzl", "test_guest_test")
+
+test_guest_test(
+    name = "fedora_podman_openshell",
+    command = ["/usr/local/bin/openshell", "--version"],
+    copies = {
+        "//bazel/releases:openshell_linux_aarch64": "/usr/local/bin/openshell",
+    },
+    image = "//bzl/test-guest:fedora_podman_image",
+    size = "enormous",
+)
 ```
 
-Ubuntu accepts `.deb` packages. CentOS, Fedora, and Rocky accept `.rpm`
-packages. Package architecture must match the host and guest architecture.
-
-Copy executables without packaging them:
-
-```shell
-bazel run //bzl/test-guest:fedora_podman -- \
-  --copy ./openshell:/usr/local/bin/openshell \
-  -- openshell --version
-```
-
-`--install` and `--copy` are repeatable. Copied files are installed with mode
-`0755`. These per-run artifacts are never included in the prepared QCOW2.
+Each label must produce exactly one file. `packages` accepts `.deb` outputs for
+Ubuntu and `.rpm` outputs for CentOS, Fedora, and Rocky. `copies` maps an output
+label to an absolute guest destination and installs it with mode `0755`. Use a
+host-native artifact target or a platform `select()` because guest architecture
+must match the host. Bazel builds the artifacts and includes them in the
+consumer's runfiles automatically; they are never included in the prepared
+QCOW2.
 
 Forward a loopback port with `--forward-port HOST_PORT:GUEST_PORT`. Both ports
 must be between 1024 and 65535, and each host port may appear only once.

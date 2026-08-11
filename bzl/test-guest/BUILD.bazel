@@ -1,3 +1,4 @@
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load(":catalog.bzl", "declare_test_guest_targets")
 load(
     ":test_guest.bzl",
@@ -58,10 +59,28 @@ declare_test_guest_targets(
     variant_macro = test_guest_variant,
 )
 
+write_file(
+    name = "smoke_artifact",
+    out = "smoke-artifact",
+    content = [
+        "#!/usr/bin/env bash",
+        "exit 0",
+    ],
+    is_executable = True,
+    tags = ["manual"],
+)
+
 test_guest_test(
     name = "fedora_podman_smoke",
     size = "enormous",
-    command = ["true"],
+    command = [
+        "test",
+        "-x",
+        "/usr/local/bin/test-guest-smoke-artifact",
+    ],
+    copies = {
+        ":smoke_artifact": "/usr/local/bin/test-guest-smoke-artifact",
+    },
     image = ":fedora_podman_image",
     tags = ["manual"],
 )

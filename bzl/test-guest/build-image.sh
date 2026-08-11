@@ -162,7 +162,7 @@ for index in "${!configurations[@]}"; do
 	)
 done
 prepare_args+=(
-	--copy
+	--bazel-copy
 	"${seal}:/usr/local/sbin/openshell-test-guest-image-seal"
 	--
 	sudo

@@ -224,9 +224,9 @@ def _launcher_content(ctx, image, tools, fixed_args, is_test):
         lines.append("export TMPDIR=${TEST_TMPDIR:-${TMPDIR:-/tmp}}")
     lines.append("args=({})".format(" ".join([_shell_quote(arg) for arg in base_args])))
     for package in package_files:
-        lines.append("args+=(--install \"$(rlocation {})\")".format(_shell_quote(_rlocation_path(ctx, package))))
+        lines.append("args+=(--bazel-package \"$(rlocation {})\")".format(_shell_quote(_rlocation_path(ctx, package))))
     for file, destination in copy_files:
-        lines.append("args+=(--copy \"$(rlocation {}):{}\")".format(
+        lines.append("args+=(--bazel-copy \"$(rlocation {}):{}\")".format(
             _shell_quote(_rlocation_path(ctx, file)),
             destination,
         ))

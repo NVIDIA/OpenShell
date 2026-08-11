@@ -12,8 +12,6 @@ Usage:
   bazel run //bzl/test-guest:VARIANT -- [OPTIONS] [-- COMMAND...]
 
 Options:
-  --install PATH      Install a .deb or .rpm package; repeatable
-  --copy SRC:DEST     Copy an executable to an absolute guest path; repeatable
   --ssh-port PORT     Use a specific loopback SSH forwarding port
   --forward-port HOST_PORT:GUEST_PORT
                       Forward a loopback host port to a guest port; repeatable
@@ -86,12 +84,13 @@ while [ "$#" -gt 0 ]; do
 		configuration_paths+=("$3")
 		shift 3
 		;;
-	--install)
+	# Internal transport for artifacts declared by the Bazel consumer rule.
+	--bazel-package)
 		require_value "$@"
 		packages+=("$2")
 		shift 2
 		;;
-	--copy)
+	--bazel-copy)
 		require_value "$@"
 		copies+=("$2")
 		shift 2
@@ -244,22 +243,22 @@ for copy_spec in "${copies[@]}"; do
 	if [ "${source_path}" = "${copy_spec}" ] ||
 		! source_path=$(realpath -- "${source_path}") ||
 		[ ! -f "${source_path}" ]; then
-		echo "invalid --copy source: ${copy_spec}" >&2
+		echo "invalid Bazel copy artifact source: ${copy_spec}" >&2
 		exit 2
 	fi
 	case "${destination}" in
 	/*)
 		if [[ ${destination} == *"/../"* ]] || [[ ${destination} == */.. ]]; then
-			echo "--copy destination must not contain '..': ${destination}" >&2
+			echo "Bazel copy destination must not contain '..': ${destination}" >&2
 			exit 2
 		fi
 		if [[ ! ${destination} =~ ^/[A-Za-z0-9._+~/-]+$ ]]; then
-			echo "--copy destination contains unsupported characters: ${destination}" >&2
+			echo "Bazel copy destination contains unsupported characters: ${destination}" >&2
 			exit 2
 		fi
 		;;
 	*)
-		echo "--copy destination must be absolute: ${destination}" >&2
+		echo "Bazel copy destination must be absolute: ${destination}" >&2
 		exit 2
 		;;
 	esac
