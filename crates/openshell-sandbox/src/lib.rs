@@ -732,6 +732,21 @@ pub async fn run_sandbox(
                 }
             });
 
+        let (ssh_exit_tx, ssh_exit_rx) = if ssh_socket_path.is_some() {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let ssh_exited: Pin<Box<dyn Future<Output = ()> + Send>> = if let Some(rx) = ssh_exit_rx {
+            Box::pin(async {
+                let _ = rx.await;
+            })
+        } else {
+            Box::pin(std::future::pending())
+        };
+        tokio::pin!(ssh_exited);
+
         let entrypoint_started_tx =
             if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -764,6 +779,7 @@ pub async fn run_sandbox(
             openshell_endpoint.as_deref(),
             ssh_socket_path,
             sidecar_network_enforcement,
+            ssh_exit_tx,
             &process_policy,
             resolved_process_identity,
             process_enforcement_mode,
@@ -814,6 +830,21 @@ pub async fn run_sandbox(
                         "proxy accept loop exited unexpectedly"
                     ));
                 }
+                () = &mut ssh_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "SSH accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "SSH accept loop exited unexpectedly"
+                    ));
+                }
             }
         } else {
             tokio::select! {
@@ -831,6 +862,21 @@ pub async fn run_sandbox(
                     );
                     return Err(miette::miette!(
                         "proxy accept loop exited unexpectedly"
+                    ));
+                }
+                () = &mut ssh_exited => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "SSH accept loop exited unexpectedly; terminating sandbox"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "SSH accept loop exited unexpectedly"
                     ));
                 }
             }
