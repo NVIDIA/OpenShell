@@ -652,7 +652,8 @@ type NetworkEndpoint struct {
 	// Single port (backwards compat). Use `ports` for multiple ports.
 	// Mutually exclusive with `ports` — if both are set, `ports` takes precedence.
 	Port uint32 `protobuf:"varint,2,opt,name=port,proto3" json:"port,omitempty"`
-	// Application protocol for L7 inspection: "rest", "websocket", "graphql", "sql", or "" (L4-only).
+	// Endpoint protocol. "tcp" and "" select L4-only handling; "rest",
+	// "websocket", "graphql", "sql", "json-rpc", and "mcp" select L7 inspection.
 	Protocol string `protobuf:"bytes,3,opt,name=protocol,proto3" json:"protocol,omitempty"`
 	// TLS handling: "terminate" or "passthrough" (default).
 	Tls string `protobuf:"bytes,4,opt,name=tls,proto3" json:"tls,omitempty"`
