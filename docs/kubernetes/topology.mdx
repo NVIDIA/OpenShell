@@ -196,17 +196,13 @@ workload boundary, not as a replacement for the combined topology's full
 supervisor controls.
 
 You can set a default runtime class in the Kubernetes driver configuration or
-override it for sandboxes created from a named template with Kubernetes driver
-config:
+override it for sandboxes created from a named template:
 
-```json
-{
-  "kubernetes": {
-    "pod": {
-      "runtime_class_name": "kata-containers"
-    }
-  }
-}
+```shell
+openshell sandbox template create kata-python \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers"}}}'
+
+openshell sandbox create --template kata-python
 ```
 
 ## Enable Sidecar Mode

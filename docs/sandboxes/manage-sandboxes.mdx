@@ -52,9 +52,20 @@ does not change VM allocation.
 ### Driver-Specific Configuration
 
 Driver-specific sandbox settings belong in named sandbox templates, not direct
-sandbox create requests. Template `driver_config` values are JSON objects keyed
-by driver name. The gateway forwards only the block for its configured compute
-driver:
+sandbox create requests. Create the template with an image and driver-keyed
+JSON, then create sandboxes from the template:
+
+```shell
+openshell sandbox template create gpu-kata \
+  --from cuda:latest \
+  --gpu 1 \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}'
+
+openshell sandbox create --template gpu-kata -- claude
+```
+
+Template `driver_config` values are JSON objects keyed by driver name. The
+gateway forwards only the block for its configured compute driver:
 
 Nested keys inside each driver block use snake_case. The top-level envelope keys
 are driver names, such as `kubernetes`, and are not part of the nested schema.
@@ -73,6 +84,31 @@ are driver names, such as `kubernetes`, and are not part of the nested schema.
 Use template driver config only for driver-specific fields that do not have a
 stable CLI flag. Prefer stable direct-create flags such as `--cpu`, `--memory`,
 and `--gpu` when they cover the same behavior.
+
+### Sandbox Templates
+
+Use templates when multiple sandboxes should share the same image, resources,
+driver-specific settings, or startup service objective:
+
+```shell
+openshell sandbox template create python-fast \
+  --cpu 2 \
+  --memory 4Gi \
+  --ready-within 30s \
+  --max-burst 5
+
+openshell sandbox template list
+openshell sandbox template get python-fast
+openshell sandbox create --template python-fast --provider github -- claude
+openshell sandbox template delete python-fast
+```
+
+Templates own workload shape, so `sandbox create --template` cannot be combined
+with `--from`, `--cpu`, `--memory`, `--gpu`, `--env`, or
+`--driver-config-json`. Sandbox create still owns sandbox-specific metadata,
+policy, providers, and the command to run after creation.
+
+Omit `--from` when the template should use the gateway's default sandbox image.
 
 ### GPU Resources
 

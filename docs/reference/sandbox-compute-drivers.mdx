@@ -70,23 +70,24 @@ container requests and limits. The VM driver accepts the fields but currently
 ignores them.
 
 Sandbox templates accept experimental driver-owned config through
-`SandboxTemplate.spec.driver_config`. The value is a JSON object keyed by driver
-name. The gateway forwards only the block for the active driver, so a
-Kubernetes gateway receives the `kubernetes` object from a value such as:
+`SandboxTemplate.spec.driver_config`. Attach it through
+`openshell sandbox template create --driver-config-json`, then create sandboxes
+from that template:
+
+```shell
+openshell sandbox template create batch-kata \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","priority_class_name":"batch-low"}}}'
+
+openshell sandbox create --template batch-kata
+```
+
+When `--from` is omitted, sandboxes created from the template use the gateway's
+default sandbox image. The driver config value is a JSON object keyed by driver
+name. The gateway forwards only the block for the active driver, so a Kubernetes
+gateway receives the `kubernetes` object from the value above.
 
 Nested keys inside each driver block use snake_case. The top-level envelope keys
 are driver names, such as `kubernetes`, and are not part of the nested schema.
-
-```json
-{
-  "kubernetes": {
-    "pod": {
-      "runtime_class_name": "kata-containers",
-      "priority_class_name": "batch-low"
-    }
-  }
-}
-```
 
 Driver config is for operator-controlled templates and fields without a stable
 public flag. Direct sandbox create remains portable; prefer `--cpu`, `--memory`,

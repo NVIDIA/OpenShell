@@ -727,18 +727,24 @@ pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
     }
     // Split off the last character by its UTF-8 length: indexing by byte
     // length would panic on multi-byte units (e.g. "5\u{20ac}").
-    let last_len = s.chars().last().map_or(0, char::len_utf8);
-    let (num_str, unit) = s.split_at(s.len() - last_len);
+    let (num_str, unit) = s.strip_suffix("ms").map_or_else(
+        || {
+            let last_len = s.chars().last().map_or(0, char::len_utf8);
+            s.split_at(s.len() - last_len)
+        },
+        |num| (num, "ms"),
+    );
     let num: i64 = num_str
         .parse()
         .map_err(|_| miette::miette!("invalid duration: {s} (expected e.g. 5m, 1h, 30s)"))?;
     let multiplier = match unit {
+        "ms" => 1,
         "s" => 1_000,
         "m" => 60_000,
         "h" => 3_600_000,
         _ => {
             return Err(miette::miette!(
-                "unknown duration unit: {unit} (use s, m, or h)"
+                "unknown duration unit: {unit} (use ms, s, m, or h)"
             ));
         }
     };
@@ -1059,6 +1065,7 @@ mod tests {
     #[test]
     fn parse_duration_to_ms_parses_supported_units() {
         assert_eq!(parse_duration_to_ms("30s").expect("parse"), 30_000);
+        assert_eq!(parse_duration_to_ms("500ms").expect("parse"), 500);
         assert_eq!(parse_duration_to_ms("5m").expect("parse"), 300_000);
         assert_eq!(parse_duration_to_ms("1h").expect("parse"), 3_600_000);
     }
