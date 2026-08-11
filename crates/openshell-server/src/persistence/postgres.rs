@@ -25,10 +25,43 @@ pub struct PostgresStore {
     pool: PgPool,
 }
 
+/// Default pool ceiling, unchanged from the previously hardcoded value.
+const DEFAULT_MAX_CONNECTIONS: u32 = 10;
+
+/// Pool ceiling for the Postgres store.
+///
+/// A fixed ceiling makes the pool the throughput limit under concurrent
+/// sandbox creation: once every connection is checked out, callers queue on
+/// `acquire` and sqlx logs `time to acquire exceeded slow threshold`. The
+/// right ceiling depends on the deployment — how many gateway replicas share
+/// the server, and what `max_connections` the server itself allows — so it
+/// cannot be one number baked into the binary. See NVIDIA/OpenShell#2561.
+///
+/// Falls back to the default when unset, unparseable, or zero, so a typo
+/// degrades to today's behaviour instead of crash-looping the gateway.
+fn max_connections() -> u32 {
+    let Ok(raw) = std::env::var("OPENSHELL_DB_MAX_CONNECTIONS") else {
+        return DEFAULT_MAX_CONNECTIONS;
+    };
+    match raw.trim().parse::<u32>() {
+        Ok(n) if n > 0 => n,
+        _ => {
+            tracing::warn!(
+                value = %raw,
+                default = DEFAULT_MAX_CONNECTIONS,
+                "OPENSHELL_DB_MAX_CONNECTIONS is not a positive integer; using the default"
+            );
+            DEFAULT_MAX_CONNECTIONS
+        }
+    }
+}
+
 impl PostgresStore {
     pub async fn connect(url: &str) -> PersistenceResult<Self> {
+        let max_connections = max_connections();
+        tracing::info!(max_connections, "connecting Postgres store");
         let pool = PgPoolOptions::new()
-            .max_connections(10)
+            .max_connections(max_connections)
             .connect(url)
             .await
             .map_err(|e| map_db_error(&e))?;
@@ -1023,4 +1056,69 @@ fn row_to_draft_chunk_record(row: sqlx::postgres::PgRow) -> PersistenceResult<Dr
         created_at_ms,
         updated_at_ms,
     )
+}
+
+#[cfg(test)]
+mod max_connections_tests {
+    use super::{DEFAULT_MAX_CONNECTIONS, max_connections};
+
+    const KEY: &str = "OPENSHELL_DB_MAX_CONNECTIONS";
+
+    struct EnvVarGuard(Option<String>);
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn set(value: Option<&str>) -> Self {
+            let original = std::env::var(KEY).ok();
+            // SAFETY: tests serialize environment mutation with TEST_ENV_LOCK.
+            match value {
+                Some(v) => unsafe { std::env::set_var(KEY, v) },
+                None => unsafe { std::env::remove_var(KEY) },
+            }
+            Self(original)
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: tests serialize environment mutation with TEST_ENV_LOCK.
+            match self.0.as_deref() {
+                Some(v) => unsafe { std::env::set_var(KEY, v) },
+                None => unsafe { std::env::remove_var(KEY) },
+            }
+        }
+    }
+
+    fn with_env(value: Option<&str>) -> u32 {
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvVarGuard::set(value);
+        max_connections()
+    }
+
+    #[test]
+    fn unset_keeps_the_previous_hardcoded_ceiling() {
+        assert_eq!(with_env(None), DEFAULT_MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn a_positive_integer_overrides_the_ceiling() {
+        assert_eq!(with_env(Some("64")), 64);
+        assert_eq!(with_env(Some("  32  ")), 32);
+    }
+
+    #[test]
+    fn unusable_values_fall_back_rather_than_crash_looping() {
+        // A typo must not take the gateway down on startup, and zero would
+        // deadlock every acquire.
+        for bad in ["", "0", "-5", "many", "10.5"] {
+            assert_eq!(
+                with_env(Some(bad)),
+                DEFAULT_MAX_CONNECTIONS,
+                "input {bad:?}"
+            );
+        }
+    }
 }
