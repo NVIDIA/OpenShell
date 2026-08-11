@@ -417,7 +417,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
-| `disruption_protection.enabled` | `server.disruptionProtection.enabled` | Allow individual sandboxes to request a time-bounded PodDisruptionBudget. Disabled by default. Enabling it does not protect sandboxes that omit a duration request. |
+| `disruption_protection.enabled` | `server.disruptionProtection.enabled` | Allow individual sandboxes to request a PodDisruptionBudget with a fail-closed expiration target. Disabled by default. Enabling it does not protect sandboxes that omit a duration request. |
 | `disruption_protection.max_duration` | `server.disruptionProtection.maxDuration` | Set the maximum accepted per-sandbox protection duration. The default is `24h`; values support positive integer seconds, minutes, or hours. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
 
@@ -466,8 +466,8 @@ If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the c
 
 ### Kubernetes Disruption Protection
 
-Operators can allow sandboxes to request time-bounded protection from
-voluntary Kubernetes evictions:
+Operators can allow sandboxes to request fail-closed protection from voluntary
+Kubernetes evictions with an expiration target:
 
 ```yaml
 server:
@@ -484,17 +484,30 @@ openshell sandbox create \
   -- claude
 ```
 
+OpenShell rejects sandbox creation if the operator gate is disabled, the
+duration is invalid, or the request exceeds `maxDuration`.
+
 OpenShell creates a `policy/v1` PodDisruptionBudget with `minAvailable: 1` and
 persists an absolute UTC deadline on the Sandbox CR. The gateway reconciles the
-PDB from that deadline after restarts and deletes it after expiration. If every
-gateway is unavailable when the deadline passes, protection remains active
-until a gateway resumes reconciliation.
+PDB from that deadline after restarts and schedules deletion at expiration
+while its Kubernetes watch is healthy. If every gateway is unavailable when
+the deadline passes, protection remains active until a gateway resumes
+reconciliation or an operator deletes the PDB. Treat the requested duration as
+a fail-closed expiration target, not a Kubernetes-enforced TTL. If the persisted
+deadline becomes malformed, OpenShell retains the PDB until an operator repairs
+or removes the annotation.
 
 This protects only against voluntary evictions that honor PDBs. It does not
 prevent node failure, preemption, direct pod or Sandbox deletion, or platform
 outages, and it is not a backup or restore mechanism. Unhealthy sandbox pods
 remain evictable through `unhealthyPodEvictionPolicy: AlwaysAllow` so a broken
 pod does not indefinitely block node maintenance.
+
+Non-Helm deployments must grant the gateway service account `create`, `delete`,
+`get`, `list`, and `patch` on `policy/v1` PodDisruptionBudgets in the sandbox
+namespace. The OpenShell Helm chart grants mutation permissions when
+`server.disruptionProtection.enabled` is true and retains cleanup permissions
+when it is false.
 
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.
