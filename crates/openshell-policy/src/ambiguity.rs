@@ -190,7 +190,7 @@ fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<
 /// cannot compete with the single L7/connection-config endpoint selected for
 /// that request.
 fn endpoint_contributes_request_pipeline_metadata(endpoint: &NetworkEndpoint) -> bool {
-    !endpoint.protocol.is_empty()
+    (!endpoint.protocol.is_empty() && !endpoint.protocol.eq_ignore_ascii_case("tcp"))
         || !endpoint.allowed_ips.is_empty()
         || !endpoint.tls.is_empty()
         || endpoint.credential_binding.is_some()
@@ -201,8 +201,8 @@ fn request_pipeline_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -
     push_conflict(
         &mut conflicts,
         "protocol",
-        &left.protocol.to_ascii_lowercase(),
-        &right.protocol.to_ascii_lowercase(),
+        &normalized_request_protocol(&left.protocol),
+        &normalized_request_protocol(&right.protocol),
     );
     push_conflict(
         &mut conflicts,
@@ -298,6 +298,14 @@ fn request_pipeline_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -
         );
     }
     conflicts
+}
+
+fn normalized_request_protocol(protocol: &str) -> String {
+    if protocol.eq_ignore_ascii_case("tcp") {
+        String::new()
+    } else {
+        protocol.to_ascii_lowercase()
+    }
 }
 
 fn websocket_graphql_policy(endpoint: &NetworkEndpoint) -> bool {
@@ -1026,5 +1034,16 @@ mod tests {
             find_endpoint_ambiguities(&policy_with(left, right)).len(),
             1
         );
+    }
+
+    #[test]
+    fn explicit_tcp_and_omitted_protocol_are_ambiguity_equivalent() {
+        let mut explicit_tcp = endpoint("api.example.com", 443);
+        explicit_tcp.protocol = "tcp".to_string();
+        explicit_tcp.tls = "skip".to_string();
+        let mut omitted = endpoint("api.example.com", 443);
+        omitted.tls = "skip".to_string();
+
+        assert!(find_endpoint_ambiguities(&policy_with(explicit_tcp, omitted)).is_empty());
     }
 }

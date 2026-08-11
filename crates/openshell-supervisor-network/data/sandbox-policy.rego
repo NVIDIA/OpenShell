@@ -943,10 +943,13 @@ endpoint_path_matches_request(ep, request) if {
 	path_matches(request.path, path)
 }
 
-# An endpoint has extended config if it specifies L7 protocol, allowed_ips,
-# or an explicit tls mode (e.g. tls: skip).
+# An endpoint has extended config if it specifies an L7 protocol, allowed_ips,
+# or an explicit tls mode (e.g. tls: skip). Explicit protocol "tcp" is the
+# authored spelling of plain L4 behavior and does not select an L7 config.
 endpoint_has_extended_config(ep) if {
-	ep.protocol
+	protocol := object.get(ep, "protocol", "")
+	protocol != ""
+	lower(protocol) != "tcp"
 }
 
 endpoint_has_extended_config(ep) if {

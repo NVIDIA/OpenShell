@@ -2692,6 +2692,7 @@ network_policies:
     name: l4_only
     endpoints:
       - { host: l4only.example.com, port: 443 }
+      - { host: explicit-tcp.example.com, port: 443, protocol: tcp }
     binaries:
       - { path: /usr/bin/curl }
 filesystem_policy:
@@ -4473,6 +4474,26 @@ network_policies:
         let l7 = crate::l7::parse_l7_config(&config).unwrap();
         assert_eq!(l7.protocol, crate::l7::L7Protocol::Rest);
         assert_eq!(l7.enforcement, crate::l7::EnforcementMode::Enforce);
+    }
+
+    #[test]
+    fn explicit_tcp_authorizes_as_l4_without_endpoint_config() {
+        let engine = l7_engine();
+        let input = NetworkInput {
+            host: "explicit-tcp.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        assert!(matches!(
+            engine.evaluate_network_action(&input).unwrap(),
+            NetworkAction::Allow { .. }
+        ));
+        assert!(engine.query_endpoint_config(&input).unwrap().is_none());
+        assert!(engine.query_exact_declared_endpoint_host(&input).unwrap());
     }
 
     #[test]

@@ -4352,6 +4352,37 @@ binaries:
     }
 
     #[test]
+    fn validate_accepts_explicit_tcp_without_l7_fields() {
+        let profile = parse_profile_yaml(
+            r"
+id: valid-tcp
+display_name: Valid TCP
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: database.example.com
+    port: 5432
+    protocol: tcp
+binaries:
+  - /usr/bin/psql
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("profile.yaml".to_string(), profile)]);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == "error")
+            .collect();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
     fn validate_rejects_unknown_protocol() {
         let profile = parse_profile_yaml(
             r"
