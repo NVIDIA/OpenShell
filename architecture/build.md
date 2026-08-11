@@ -62,14 +62,15 @@ continue to opt in with `bundled-z3`.
 `openshell-crypto` owns backend selection for everything that uses the
 process-default provider: OpenShell's own TLS, PKI, JWT, AEAD, RNG, and hashing
 that serves a cryptographic purpose. For those, the backend is one feature rather
-than an audit of call sites. No other crate may name a backend directly, and the
-workspace `rustls`, `tokio-rustls`, and `rcgen` entries deliberately declare no
-backend feature — adding one back would link `ring` unconditionally and silently
-defeat the FIPS build.
+than an audit of call sites. The workspace `rustls`, `tokio-rustls`, and `rcgen`
+entries deliberately declare no backend feature — adding one back would link
+`ring` unconditionally and silently defeat the FIPS build.
 
-Two dependencies are explicit exceptions because they construct their own
-provider: `sqlx` and `aws-smithy-http-client`. `openshell-server` selects their
-backends directly, and each has its own enforcement — see the table below.
+A crate should name a backend directly only where a dependency leaves no choice,
+and those exceptions are confined to `openshell-server` so they stay enumerable:
+`sqlx` and `aws-smithy-http-client` both construct their own provider, so
+`openshell-server` selects their backends and each carries its own enforcement —
+see the table below. Adding a third exception means adding a row to that table.
 Content and revision hashing is also out of scope.
 
 `fips` is a one-way switch rather than one half of a mutually exclusive pair.

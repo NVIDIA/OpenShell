@@ -9,9 +9,11 @@ audit of every call site.
 exceptions, selected by `openshell-server` and enforced separately. Content and
 revision hashing is also out of scope. See [Boundaries](#boundaries).
 
-**No other crate may name a crypto backend directly.** The workspace `rustls`,
-`tokio-rustls`, and `rcgen` entries deliberately declare no backend feature;
-adding one back links `ring` unconditionally and silently defeats the FIPS build.
+**Name a crypto backend directly only where a dependency leaves no choice**, and
+keep those exceptions in `openshell-server` where they are enumerated and
+separately enforced. The workspace `rustls`, `tokio-rustls`, and `rcgen` entries
+deliberately declare no backend feature; adding one back links `ring`
+unconditionally and silently defeats the FIPS build.
 
 ## Build modes
 

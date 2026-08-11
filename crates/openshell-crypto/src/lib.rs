@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Single point of crypto backend selection for the workspace.
+//! Crypto backend selection for everything that uses the process-default provider.
 //!
-//! Every TLS, PKI, SSH, and AEAD operation in `OpenShell` routes its algorithm
-//! and module choice through this crate so that a FIPS build is one Cargo
-//! feature rather than an audit of twenty call sites.
+//! `OpenShell`'s own TLS, PKI, SSH, and AEAD operations route their algorithm and
+//! module choice through this crate, so a FIPS build is one Cargo feature rather
+//! than an audit of twenty call sites.
+//!
+//! `sqlx` and the AWS SDK construct a provider themselves and cannot be routed
+//! here; `openshell-server` selects their backends and enforces each separately.
 //!
 //! # Build modes
 //!
