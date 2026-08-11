@@ -921,6 +921,31 @@ _matching_endpoint_records := [record |
 	record := records[_]
 ]
 
+# Endpoints eligible for policy DNS are a policy-data snapshot, not an
+# authorization decision. In particular, they do not depend on input.exec or
+# grant access to any process. Only endpoints that explicitly opt into raw TCP
+# and provide a resolvable host plus concrete ports are materialized.
+policy_dns_eligible_endpoint_records := [record |
+	some policy_name
+	policy := data.network_policies[policy_name]
+	some endpoint_index
+	ep := policy.endpoints[endpoint_index]
+	lower(object.get(ep, "protocol", "")) == "tcp"
+	object.get(ep, "host", "") != ""
+	ports := object.get(ep, "ports", [])
+	count(ports) > 0
+	every port in ports {
+		is_number(port)
+		port >= 1
+		port <= 65535
+	}
+	record := {
+		"policy_name": policy_name,
+		"endpoint_index": endpoint_index,
+		"endpoint": ep,
+	}
+]
+
 matched_endpoint_config := _matching_endpoint_configs[0] if {
 	count(_matching_endpoint_configs) > 0
 }

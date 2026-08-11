@@ -4291,6 +4291,7 @@ dependencies = [
  "futures",
  "glob",
  "hex",
+ "hickory-proto",
  "http 1.4.0",
  "ipnet",
  "libc",

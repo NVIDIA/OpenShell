@@ -3,7 +3,7 @@
 
 //! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
 
-mod destination;
+pub(crate) mod destination;
 mod egress;
 mod relay;
 

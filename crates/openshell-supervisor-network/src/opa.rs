@@ -58,6 +58,16 @@ pub struct MatchedEndpoint {
     pub endpoint: regorus::Value,
 }
 
+/// Policy-DNS eligible endpoint metadata captured from one policy generation.
+///
+/// This is policy data only. It deliberately contains no process identity or
+/// network authorization decision.
+#[derive(Debug, Clone)]
+pub struct PolicyDnsEligibilitySnapshot {
+    pub endpoints: Vec<MatchedEndpoint>,
+    pub generation: u64,
+}
+
 /// Atomic policy result used to authorize and materialize one egress request.
 #[derive(Debug, Clone)]
 pub struct EgressAuthorization {
@@ -594,6 +604,48 @@ impl OpaEngine {
             endpoint_configs,
             matched_endpoints,
             exact_declared_endpoint_host,
+            generation,
+        })
+    }
+
+    /// Return all explicit TCP endpoints eligible for policy DNS.
+    ///
+    /// The owned endpoint records and generation are captured while holding
+    /// the engine lock, so reloads cannot mix data from one generation with
+    /// the generation number of another. Fail-closed quarantine produces an
+    /// empty snapshot for its quarantine generation.
+    pub fn policy_dns_eligibility_snapshot(&self) -> Result<PolicyDnsEligibilitySnapshot> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.current_generation();
+
+        if self
+            .fail_closed_reason
+            .read()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .is_some()
+        {
+            return Ok(PolicyDnsEligibilitySnapshot {
+                endpoints: Vec::new(),
+                generation,
+            });
+        }
+
+        let value = engine
+            .eval_rule("data.openshell.sandbox.policy_dns_eligible_endpoint_records".into())
+            .map_err(|error| miette::miette!("{error}"))?;
+        let endpoints = match value {
+            regorus::Value::Array(values) => {
+                values.iter().filter_map(parse_matched_endpoint).collect()
+            }
+            regorus::Value::Undefined => Vec::new(),
+            other => parse_matched_endpoint(&other).into_iter().collect(),
+        };
+
+        Ok(PolicyDnsEligibilitySnapshot {
+            endpoints,
             generation,
         })
     }
@@ -2072,6 +2124,71 @@ mod tests {
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
         }
+    }
+
+    const POLICY_DNS_SNAPSHOT_DATA: &str = r#"
+network_policies:
+  dns_transport:
+    name: dns_transport
+    endpoints:
+      - { host: resolver.example, ports: [53, 853], protocol: tcp }
+      - { host: web.example, port: 443, protocol: rest, access: full }
+      - { host: implicit.example, port: 443 }
+      - { host: "", port: 53, protocol: tcp, allowed_ips: [8.8.8.8] }
+      - { host: secondary.example, port: 5353, protocol: tcp }
+    binaries:
+      - { path: /usr/bin/one-process }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+
+    #[test]
+    fn policy_dns_snapshot_is_tcp_only_stable_and_generation_consistent() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, POLICY_DNS_SNAPSHOT_DATA).unwrap();
+
+        let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
+
+        assert_eq!(snapshot.generation, engine.current_generation());
+        assert_eq!(snapshot.endpoints.len(), 2);
+        assert_eq!(snapshot.endpoints[0].policy_name, "dns_transport");
+        assert_eq!(snapshot.endpoints[0].endpoint_index, 0);
+        assert_eq!(
+            get_str(&snapshot.endpoints[0].endpoint, "host").as_deref(),
+            Some("resolver.example")
+        );
+        let Some(regorus::Value::Array(ports)) =
+            get_field(&snapshot.endpoints[0].endpoint, "ports")
+        else {
+            panic!("eligible endpoint must retain concrete ports");
+        };
+        assert_eq!(ports.as_ref(), &[53.into(), 853.into()]);
+        assert_eq!(snapshot.endpoints[1].endpoint_index, 4);
+
+        engine
+            .reload(TEST_POLICY, POLICY_DNS_SNAPSHOT_DATA)
+            .unwrap();
+        let reloaded = engine.policy_dns_eligibility_snapshot().unwrap();
+        assert_eq!(reloaded.generation, snapshot.generation + 1);
+        assert_eq!(reloaded.endpoints.len(), 2);
+        assert_eq!(reloaded.endpoints[1].endpoint_index, 4);
+    }
+
+    #[test]
+    fn policy_dns_snapshot_is_empty_during_fail_closed_quarantine() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, POLICY_DNS_SNAPSHOT_DATA).unwrap();
+        let generation = engine.enter_fail_closed("invalid candidate").unwrap();
+
+        let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
+
+        assert_eq!(snapshot.generation, generation);
+        assert!(snapshot.endpoints.is_empty());
     }
 
     #[test]
