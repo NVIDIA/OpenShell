@@ -22,7 +22,11 @@
 //!   request-target, raw non-ASCII bytes, and paths that cannot be parsed
 //!   as origin-form.
 //! - Strip trailing `;params` from each segment by default (Tomcat-class
-//!   `;jsessionid` ACL-bypass mitigation).
+//!   `;jsessionid` ACL-bypass mitigation). Stripping happens *before*
+//!   dot-segment resolution so that `..;` cannot evade the traversal guard
+//!   and then revert to `..` on the way out.
+//! - Reject any `.`/`..` that survives to the end of canonicalization. The
+//!   policy engine trusts this function to have removed them.
 //! - Reject `%2F` (encoded slash) inside a segment by default. Operators
 //!   can opt in per-endpoint for APIs that rely on encoded slashes in
 //!   slugs.
@@ -44,6 +48,8 @@ pub enum CanonicalizeError {
     NonAscii,
     #[error("request-target's `..` segment would escape the path root")]
     TraversalAboveRoot,
+    #[error("request-target still contains a `.`/`..` segment after canonicalization")]
+    ResidualDotSegment,
     #[error("request-target exceeds the configured maximum length")]
     PathTooLong,
     #[error("request-target is not a valid origin-form path")]
@@ -172,9 +178,31 @@ pub fn canonicalize_request_target(
     //    with a real path separator.
     let decoded = percent_decode_with_sentinel(raw_path.as_bytes(), opts.allow_encoded_slash)?;
 
-    // 9. Split on literal `/` and resolve dot-segments.
+    // 9. Split on literal `/`, then strip `;params` *before* resolving
+    //    dot-segments. Stripping afterwards would let a `..;` segment slip
+    //    past the traversal guard (it is not byte-equal to `..`) and then
+    //    revert to a bare `..` during reconstruction.
     let segments = split_path_segments(&decoded);
+    let segments: Vec<&[u8]> = if opts.strip_path_parameters {
+        segments.into_iter().map(strip_path_parameters).collect()
+    } else {
+        segments
+    };
     let resolved = resolve_dot_segments(segments)?;
+
+    // 9b. Defense in depth: no `.`/`..` may survive canonicalization. The
+    //     policy engine trusts this function to have removed them, so a
+    //     residual dot-segment is always a bug or an attack. This also
+    //     catches a `..` hidden behind a `%2F` sentinel on endpoints that
+    //     opted into `allow_encoded_slash`, where the sentinel keeps the
+    //     dot-segment inside its segment and out of `resolve_dot_segments`.
+    for seg in &resolved {
+        for part in seg.split(|&b| b == ENCODED_SLASH_SENTINEL) {
+            if part == b".." || part == b"." {
+                return Err(CanonicalizeError::ResidualDotSegment);
+            }
+        }
+    }
 
     // 10. Reconstruct. Strip `;params` per segment if requested; re-encode
     //     any byte that must be percent-encoded in the pchar set.
@@ -238,6 +266,13 @@ fn percent_decode_with_sentinel(
     Ok(out)
 }
 
+/// Drop a trailing `;params` suffix from a single path segment.
+fn strip_path_parameters(seg: &[u8]) -> &[u8] {
+    seg.iter()
+        .position(|&b| b == b';')
+        .map_or(seg, |pos| &seg[..pos])
+}
+
 fn split_path_segments(decoded: &[u8]) -> Vec<&[u8]> {
     // decoded is guaranteed to start with `/`. Skip the leading `/` and
     // split on subsequent `/` bytes. The sentinel byte for encoded slashes
@@ -286,10 +321,7 @@ fn build_canonical_path(
             out.push('/');
         }
         let trimmed: &[u8] = if opts.strip_path_parameters {
-            match seg.iter().position(|&b| b == b';') {
-                Some(pos) => &seg[..pos],
-                None => seg,
-            }
+            strip_path_parameters(seg)
         } else {
             seg
         };
@@ -581,5 +613,96 @@ mod tests {
     #[test]
     fn regression_dot_slash_dotdot() {
         assert_eq!(canon("/public/./../secret").unwrap(), "/secret");
+    }
+
+    // ---------------------------------------------------------------------
+    // A `;params` suffix on the dot segment itself must not let the segment
+    // slip past the traversal guard. Stripping used to run after dot-segment
+    // resolution, so `..;` was not byte-equal to `..` when the guard looked
+    // at it, and reverted to a bare `..` during reconstruction — handing the
+    // policy engine and the upstream a path that still escaped its prefix.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn regression_dotdot_with_path_parameter_is_resolved_not_smuggled() {
+        assert_eq!(canon("/public/..;/secret").unwrap(), "/secret");
+        assert_eq!(canon("/public/..;x/secret").unwrap(), "/secret");
+        assert_eq!(
+            canon("/public/..;jsessionid=xyz/secret").unwrap(),
+            "/secret"
+        );
+        assert_eq!(canon("/public/.;/secret").unwrap(), "/public/secret");
+        assert_eq!(canon("/public/.;x/secret").unwrap(), "/public/secret");
+    }
+
+    #[test]
+    fn regression_percent_encoded_dotdot_with_path_parameter() {
+        // `%2e%2e;` and `..%3B` both decode to `..;` before segmentation.
+        assert_eq!(canon("/public/%2e%2e;/secret").unwrap(), "/secret");
+        assert_eq!(canon("/public/..%3B/secret").unwrap(), "/secret");
+        assert_eq!(canon("/public/..%3b/secret").unwrap(), "/secret");
+    }
+
+    #[test]
+    fn regression_chained_dotdot_with_path_parameters_hits_root_guard() {
+        assert_eq!(
+            canon("/public/..;/..;/secret"),
+            Err(CanonicalizeError::TraversalAboveRoot)
+        );
+        assert_eq!(
+            canon("/api/v1/..;/..;/..;/admin/keys"),
+            Err(CanonicalizeError::TraversalAboveRoot)
+        );
+        assert_eq!(canon("/..;"), Err(CanonicalizeError::TraversalAboveRoot));
+    }
+
+    #[test]
+    fn regression_dotdot_behind_encoded_slash_is_rejected_when_opted_in() {
+        // With `allow_encoded_slash`, the `%2F` sentinel keeps the dot-segment
+        // inside its segment, so `resolve_dot_segments` never sees it. The
+        // residual guard is what closes this.
+        let opts = CanonicalizeOptions {
+            allow_encoded_slash: true,
+            ..CanonicalizeOptions::default()
+        };
+        assert_eq!(
+            canon_with("/public/..%2fsecret", opts),
+            Err(CanonicalizeError::ResidualDotSegment)
+        );
+        assert_eq!(
+            canon_with("/public/..%2f..%2fsecret", opts),
+            Err(CanonicalizeError::ResidualDotSegment)
+        );
+        assert_eq!(
+            canon_with("/public/.%2fsecret", opts),
+            Err(CanonicalizeError::ResidualDotSegment)
+        );
+        // A legitimate encoded-slash slug still round-trips.
+        assert_eq!(
+            canon_with("/repos/group%2fproject/issues", opts).unwrap(),
+            "/repos/group%2Fproject/issues"
+        );
+    }
+
+    #[test]
+    fn canonical_output_never_contains_dot_segments() {
+        // The contract the policy engine relies on: whatever comes back is
+        // free of `.`/`..`, so rego never has to defend against them.
+        for target in [
+            "/public/..;/secret",
+            "/public/.;/secret",
+            "/public/%2e%2e;/secret",
+            "/a;jsessionid=xyz/b",
+            "/public//../secret",
+            "/a/b/..",
+            "/a/b/.",
+        ] {
+            if let Ok(path) = canon(target) {
+                assert!(
+                    !path.split('/').any(|seg| seg == ".." || seg == "."),
+                    "{target} canonicalized to {path}, which still has a dot-segment"
+                );
+            }
+        }
     }
 }
