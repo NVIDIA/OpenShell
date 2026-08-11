@@ -59,7 +59,7 @@ exports_files([
 include("//bazel/annotations:aws-lc-sys.MODULE.bazel")
 include("//bazel/annotations:z3-sys.MODULE.bazel")
 include("//bazel/annotations:zstd-sys.MODULE.bazel")
-include("//nix/test-guest:test-guest.MODULE.bazel")
+include("//bzl/test-guest:test-guest.MODULE.bazel")
 
 z3_repository = use_repo_rule("//third_party/z3:repositories.bzl", "z3_repository")
 

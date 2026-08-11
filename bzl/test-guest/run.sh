@@ -9,7 +9,7 @@ set -Eeuo pipefail
 usage() {
 	cat <<'EOF'
 Usage:
-  bazel run //nix/test-guest:VARIANT -- [OPTIONS] [-- COMMAND...]
+  bazel run //bzl/test-guest:VARIANT -- [OPTIONS] [-- COMMAND...]
 
 Options:
   --install PATH      Install a .deb or .rpm package; repeatable
@@ -25,7 +25,7 @@ EOF
 }
 
 if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ]; then
-	echo "run this script through a //nix/test-guest Bazel target" >&2
+	echo "run this script through a //bzl/test-guest Bazel target" >&2
 	exit 2
 fi
 

@@ -364,7 +364,7 @@
     "@@rules_nixpkgs_core+//extensions:package.bzl%nix_pkg": {
       "general": {
         "bzlTransitiveDigest": "2alEQC7q9PgrArc8ZeI662VmDHLGfuswqnzBJvVDnmg=",
-        "usagesDigest": "fl4aParJMb0nPCq6frFoa6jNrTkzN3pIXtOS+jtCE9o=",
+        "usagesDigest": "GMnvOnFYwW4oMFhsUdj25RAeRBLVnU9Itk5tNi71YBs=",
         "recordedInputs": [
           "REPO_MAPPING:,openshell_nixpkgs rules_nixpkgs_core++nix_repo+openshell_nixpkgs",
           "REPO_MAPPING:rules_nixpkgs_core+,bazel_skylib bazel_skylib+"
@@ -375,14 +375,14 @@
             "attributes": {
               "unmangled_name": "test_guest_host_tools",
               "attribute_path": "bazelHostTools",
-              "nix_file": "@@//nix/test-guest:host-tools.nix",
+              "nix_file": "@@//bzl/test-guest:host-tools.nix",
               "nix_file_deps": {
-                "@@//nix/test-guest:run.sh": "'@@//nix/test-guest:run.sh'"
+                "@@//bzl/test-guest:run.sh": "'@@//bzl/test-guest:run.sh'"
               },
               "nix_file_content": "",
               "repository": "@@rules_nixpkgs_core++nix_repo+openshell_nixpkgs//:openshell_nixpkgs",
               "repositories": {},
-              "build_file": "@@//nix/test-guest:host-tools.BUILD.bazel",
+              "build_file": "@@//bzl/test-guest:host-tools.BUILD.bazel",
               "build_file_content": "",
               "nixopts": [],
               "quiet": false,
@@ -403,7 +403,7 @@
     "@@rules_nixpkgs_core+//extensions:repository.bzl%nix_repo": {
       "general": {
         "bzlTransitiveDigest": "dTTtWNdwe7E4j77oKh1mHI1qtdxfaVSGSZa1oPf2QjU=",
-        "usagesDigest": "AfE65A51oA1/OZrxKwzTys8xTdDXCUyt3dmnbsZnA0E=",
+        "usagesDigest": "bqUszMUoRUj7FHpInNBJFrGKU8e9C2CfkzSQtVuUlYY=",
         "recordedInputs": [
           "REPO_MAPPING:rules_nixpkgs_core+,bazel_skylib bazel_skylib+"
         ],
@@ -412,7 +412,7 @@
             "repoRuleId": "@@rules_nixpkgs_core+//:nixpkgs.bzl%_nixpkgs_local_repository",
             "attributes": {
               "unmangled_name": "openshell_nixpkgs",
-              "nix_file": "@@//nix/test-guest:nixpkgs.nix",
+              "nix_file": "@@//bzl/test-guest:nixpkgs.nix",
               "nix_file_deps": [
                 "@@//:flake.lock"
               ]

@@ -3,7 +3,7 @@
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
-_HOST_TOOLS_TOOLCHAIN = "//nix/test-guest:host_tools_toolchain_type"
+_HOST_TOOLS_TOOLCHAIN = "//bzl/test-guest:host_tools_toolchain_type"
 
 TestGuestBaseImageInfo = provider(
     fields = {
@@ -168,11 +168,11 @@ test_guest_image = rule(
         "generation": attr.int(default = 1),
         "_builder": attr.label(
             allow_single_file = True,
-            default = "//nix/test-guest:build-image.sh",
+            default = "//bzl/test-guest:build-image.sh",
         ),
         "_seal": attr.label(
             allow_single_file = True,
-            default = "//nix/test-guest:image-seal.sh",
+            default = "//bzl/test-guest:image-seal.sh",
         ),
     },
     toolchains = [_HOST_TOOLS_TOOLCHAIN],

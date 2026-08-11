@@ -155,20 +155,18 @@ do not infer from kube context.
 
 ## Disposable Test Guests
 
-The Nix test guest harness under `nix/test-guest` boots native-architecture cloud images
-through QEMU for package, release, and E2E validation. A prepared cache entry is
-captured after the exact ordered Ansible configuration list and before
-test-specific packages, copied binaries, forwarded ports, or commands.
+The Bazel test guest harness under `bzl/test-guest` boots native-architecture cloud images
+through QEMU for package, release, and E2E validation. A prepared QCOW2 is
+emitted as a cacheable Bazel output after the exact ordered Ansible
+configuration list and before test-specific packages, copied binaries,
+forwarded ports, or commands.
 
-Prepared disks are flattened, sanitized QCOW2 images. The local cache keeps them
-read-only and each test receives a fresh writable overlay and cloud-init
-identity. The optional shared cache stores the compressed standalone disk and
-its compatibility metadata as a custom OCI artifact. Normal test runs ensure
-the exact local entry exists, invoking the cache builder automatically on a
-miss before booting a disposable overlay. The separate cache app owns OCI
-pulls and explicit publication. OCI pulls require a trusted manifest digest
-and retain that provenance with the local entry; mutable tags are used only
-for explicit publication.
+Prepared disks are flattened, sanitized QCOW2 images with deterministic
+compatibility metadata. Bazel stores both outputs in its local or remote action
+cache. Run and test targets consume the prepared disk read-only and give each
+guest a fresh writable overlay and cloud-init identity. Image construction
+executes locally because it needs host virtualization, but its declared outputs
+remain eligible for remote cache upload and download.
 
 ## Python Wheel Packaging
 

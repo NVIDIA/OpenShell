@@ -9,7 +9,7 @@ nix_repo = use_extension(
 )
 nix_repo.file(
     name = "openshell_nixpkgs",
-    file = "//nix/test-guest:nixpkgs.nix",
+    file = "//bzl/test-guest:nixpkgs.nix",
     file_deps = ["//:flake.lock"],
 )
 use_repo(nix_repo, "openshell_nixpkgs")
@@ -21,16 +21,16 @@ nix_pkg = use_extension(
 nix_pkg.file(
     name = "test_guest_host_tools",
     attr = "bazelHostTools",
-    build_file = "//nix/test-guest:host-tools.BUILD.bazel",
-    file = "//nix/test-guest:host-tools.nix",
+    build_file = "//bzl/test-guest:host-tools.BUILD.bazel",
+    file = "//bzl/test-guest:host-tools.nix",
     file_deps = [
-        "//nix/test-guest:run.sh",
+        "//bzl/test-guest:run.sh",
     ],
     repo = "@openshell_nixpkgs",
 )
 use_repo(nix_pkg, "test_guest_host_tools")
 
-test_guest_images = use_extension("//nix/test-guest:extensions.bzl", "test_guest_images")
+test_guest_images = use_extension("//bzl/test-guest:extensions.bzl", "test_guest_images")
 use_repo(
     test_guest_images,
     "test_guest_centos_aarch64",
@@ -43,4 +43,4 @@ use_repo(
     "test_guest_ubuntu_x86_64",
 )
 
-register_toolchains("//nix/test-guest:nix_host_tools_toolchain")
+register_toolchains("//bzl/test-guest:nix_host_tools_toolchain")

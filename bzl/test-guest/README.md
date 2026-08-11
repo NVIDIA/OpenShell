@@ -27,14 +27,14 @@ Linux hosts, and a slower TCG fallback on Linux when KVM is unavailable.
 Build a prepared Fedora image with Podman:
 
 ```shell
-bazel build //nix/test-guest:fedora_podman_image
+bazel build //bzl/test-guest:fedora_podman_image
 ```
 
 The target produces cacheable Bazel outputs:
 
 ```text
-bazel-bin/nix/test-guest/fedora_podman_image.qcow2
-bazel-bin/nix/test-guest/fedora_podman_image.metadata.json
+bazel-bin/bzl/test-guest/fedora_podman_image.qcow2
+bazel-bin/bzl/test-guest/fedora_podman_image.metadata.json
 ```
 
 The image action boots the pinned cloud image, applies its declared Ansible
@@ -46,13 +46,13 @@ compressed QCOW2, and validates a fresh boot from that output.
 Run an interactive guest backed by the prepared image:
 
 ```shell
-bazel run //nix/test-guest:fedora_podman
+bazel run //bzl/test-guest:fedora_podman
 ```
 
 Arguments after the Bazel separator are passed to the guest runner:
 
 ```shell
-bazel run //nix/test-guest:ubuntu_docker -- \
+bazel run //bzl/test-guest:ubuntu_docker -- \
   --copy ./openshell:/usr/local/bin/openshell \
   -- openshell --version
 ```
@@ -65,7 +65,7 @@ creates a fresh writable overlay; the prepared Bazel output remains unchanged.
 The representative smoke test consumes the same prepared image provider:
 
 ```shell
-bazel test //nix/test-guest:fedora_podman_smoke
+bazel test //bzl/test-guest:fedora_podman_smoke
 ```
 
 Image and VM test actions execute locally because they require networking and
@@ -86,7 +86,7 @@ Append `_image` to a variant to build its QCOW2 directly. Query the package to
 see every generated target:
 
 ```shell
-bazel query //nix/test-guest:all
+bazel query //bzl/test-guest:all
 ```
 
 Ubuntu 24.04 provides Podman 4 without the `pasta` helper required by OpenShell
@@ -111,7 +111,7 @@ packages. Strict reproducibility requires pinned distro repository snapshots.
 Install a repository-built package:
 
 ```shell
-bazel run //nix/test-guest:ubuntu_docker -- \
+bazel run //bzl/test-guest:ubuntu_docker -- \
   --install artifacts/openshell_0.0.0-local_arm64.deb \
   -- openshell --version
 ```
@@ -122,7 +122,7 @@ packages. Package architecture must match the host and guest architecture.
 Copy executables without packaging them:
 
 ```shell
-bazel run //nix/test-guest:fedora_podman -- \
+bazel run //bzl/test-guest:fedora_podman -- \
   --copy ./openshell:/usr/local/bin/openshell \
   -- openshell --version
 ```
@@ -151,7 +151,7 @@ must correspond to a supported target suffix, such as `rocky_docker_selinux`.
 ## Directory structure
 
 ```text
-nix/test-guest/
+bzl/test-guest/
 ├── README.md
 ├── BUILD.bazel
 ├── catalog.bzl

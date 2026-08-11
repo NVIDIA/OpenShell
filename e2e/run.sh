@@ -163,7 +163,7 @@ if [ "${mode}" = vm ]; then
 	for configuration in "${with_configurations[@]}"; do
 		vm_target_name+=_${configuration}
 	done
-	vm_bazel_target="//nix/test-guest:${vm_target_name}"
+	vm_bazel_target="//bzl/test-guest:${vm_target_name}"
 	if ! (cd "${ROOT}" && bazel query "${vm_bazel_target}" >/dev/null); then
 		die "unsupported Bazel test-guest combination: ${vm_target_name}"
 	fi
