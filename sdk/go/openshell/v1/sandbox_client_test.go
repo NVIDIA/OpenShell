@@ -59,6 +59,11 @@ func (s *mockSandboxServer) CreateSandbox(_ context.Context, req *pb.CreateSandb
 	if s.createErr != nil {
 		return nil, s.createErr
 	}
+	spec := &pb.SandboxSpec{
+		Workload:  req.GetWorkload(),
+		Policy:    req.GetPolicy(),
+		Providers: req.GetProviders(),
+	}
 	sb := &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{
 			Id:              "sb-" + req.GetName(),
@@ -67,7 +72,7 @@ func (s *mockSandboxServer) CreateSandbox(_ context.Context, req *pb.CreateSandb
 			Labels:          req.GetLabels(),
 			ResourceVersion: 1,
 		},
-		Spec:   req.GetSpec(),
+		Spec:   spec,
 		Status: &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_PROVISIONING},
 	}
 	s.sandboxes[req.GetName()] = sb
@@ -249,9 +254,8 @@ func TestSandboxCreate(t *testing.T) {
 	defer cleanup()
 
 	spec := &SandboxSpec{
-		LogLevel:    "debug",
-		Environment: map[string]string{"FOO": "bar"},
-		Providers:   []string{"claude"},
+		Workload:  &SandboxWorkloadConfig{Image: "python:3.12", Environment: map[string]string{"FOO": "bar"}},
+		Providers: []string{"claude"},
 	}
 	labels := map[string]string{"env": "dev"}
 
@@ -271,7 +275,7 @@ func TestSandboxCreate_RejectsUnrepresentableResourcesBeforeRPC(t *testing.T) {
 	defer cleanup()
 
 	_, err := client.Create(context.Background(), "default", "bad", &SandboxSpec{
-		Template: &SandboxTemplate{Resources: map[string]any{"invalid": make(chan int)}},
+		DriverConfig: map[string]any{"invalid": make(chan int)},
 	}, nil)
 	require.Error(t, err)
 	assert.True(t, IsInvalidArgument(err))
@@ -296,7 +300,7 @@ func TestSandboxGet(t *testing.T) {
 	mock := newMockSandboxServer()
 	mock.sandboxes["existing"] = &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{Id: "sb-1", Name: "existing", ResourceVersion: 5},
-		Spec:     &pb.SandboxSpec{LogLevel: "info"},
+		Spec:     &pb.SandboxSpec{Workload: &pb.SandboxWorkloadConfig{Image: "python:3.12"}},
 		Status:   &pb.SandboxStatus{Phase: pb.SandboxPhase_SANDBOX_PHASE_READY},
 	}
 	client, cleanup := setupSandboxTest(t, mock)

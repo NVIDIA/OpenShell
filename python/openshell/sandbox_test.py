@@ -1702,6 +1702,7 @@ def test_create_without_args_sends_empty_metadata() -> None:
     assert stub.create_request.name == ""
     assert dict(stub.create_request.labels) == {}
     assert stub.create_request.workspace == "default"
+    assert stub.create_request.HasField("workload")
 
 
 def test_create_copies_caller_labels() -> None:
@@ -1714,6 +1715,26 @@ def test_create_copies_caller_labels() -> None:
 
     assert stub.create_request is not None
     assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
+
+
+def test_create_forwards_spec_workload_and_providers() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+    spec = openshell_pb2.SandboxSpec(
+        workload=openshell_pb2.SandboxWorkloadConfig(
+            image="python:3.12",
+            environment={"LANG": "C.UTF-8"},
+        ),
+        providers=["github"],
+    )
+
+    client.create(workspace="default", spec=spec)
+
+    assert stub.create_request is not None
+    assert stub.create_request.HasField("workload")
+    assert stub.create_request.workload.image == "python:3.12"
+    assert dict(stub.create_request.workload.environment) == {"LANG": "C.UTF-8"}
+    assert list(stub.create_request.providers) == ["github"]
 
 
 def test_create_session_forwards_name_and_labels() -> None:

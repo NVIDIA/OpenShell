@@ -17,27 +17,29 @@ use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, ClearDraftChunksRequest,
     ClearDraftChunksResponse, ComputeDriverCapabilities, ComputeDriverInfo,
     ConfigureProviderRefreshRequest, ConfigureProviderRefreshResponse, CreateProviderRequest,
-    CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    CreateWorkspaceRequest, CreateWorkspaceResponse, DeleteProviderProfileRequest,
-    DeleteProviderProfileResponse, DeleteProviderRefreshRequest, DeleteProviderRefreshResponse,
-    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteServiceRequest, DeleteServiceResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
-    EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
-    ExposeServiceRequest, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
-    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
-    GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
-    GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
-    GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
-    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
+    CreateSshSessionResponse, CreateWorkspaceRequest, CreateWorkspaceResponse,
+    DeleteProviderProfileRequest, DeleteProviderProfileResponse, DeleteProviderRefreshRequest,
+    DeleteProviderRefreshResponse, DeleteProviderRequest, DeleteProviderResponse,
+    DeleteSandboxRequest, DeleteSandboxResponse, DeleteSandboxTemplateRequest,
+    DeleteSandboxTemplateResponse, DeleteServiceRequest, DeleteServiceResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DetachSandboxProviderRequest,
+    DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent,
+    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, GatewayMessage,
+    GetCurrentUserRequest, GetCurrentUserResponse, GetDraftHistoryRequest, GetDraftHistoryResponse,
+    GetDraftPolicyRequest, GetDraftPolicyResponse, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetGatewayInfoRequest, GetGatewayInfoResponse,
+    GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse, HealthRequest, HealthResponse,
-    ImportProviderProfilesRequest, ImportProviderProfilesResponse, IssueSandboxTokenRequest,
-    IssueSandboxTokenResponse, LintProviderProfilesRequest, LintProviderProfilesResponse,
-    ListProviderProfilesRequest, ListProviderProfilesResponse, ListProvidersRequest,
-    ListProvidersResponse, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
+    GetSandboxTemplateRequest, GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse,
+    HealthRequest, HealthResponse, ImportProviderProfilesRequest, ImportProviderProfilesResponse,
+    IssueSandboxTokenRequest, IssueSandboxTokenResponse, LintProviderProfilesRequest,
+    LintProviderProfilesResponse, ListProviderProfilesRequest, ListProviderProfilesResponse,
+    ListProvidersRequest, ListProvidersResponse, ListSandboxPoliciesRequest,
+    ListSandboxPoliciesResponse, ListSandboxProvidersRequest, ListSandboxProvidersResponse,
+    ListSandboxTemplatesRequest, ListSandboxTemplatesResponse, ListSandboxesRequest,
     ListSandboxesResponse, ListServicesRequest, ListServicesResponse, ListWorkspaceMembersRequest,
     ListWorkspaceMembersResponse, ListWorkspacesRequest, ListWorkspacesResponse,
     ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
@@ -45,10 +47,10 @@ use openshell_core::proto::{
     RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
     RemoveWorkspaceMemberResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
     RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
-    RotateProviderCredentialResponse, SandboxResponse, ServiceEndpointResponse, ServiceStatus,
-    StartSandboxRequest, StopSandboxRequest, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    RotateProviderCredentialResponse, SandboxResponse, SandboxTemplateResponse,
+    ServiceEndpointResponse, ServiceStatus, StartSandboxRequest, StopSandboxRequest,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame,
+    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
     WatchSandboxRequest, open_shell_server::OpenShell,
 };
@@ -129,8 +131,6 @@ const MAX_NAME_LEN: usize = 253;
 const MAX_ROUTABLE_NAME_LEN: usize = 19;
 /// Maximum number of providers that can be attached to a sandbox.
 const MAX_PROVIDERS: usize = 32;
-/// Maximum length for the `log_level` field.
-const MAX_LOG_LEVEL_LEN: usize = 32;
 /// Maximum number of entries in `spec.environment`.
 const MAX_ENVIRONMENT_ENTRIES: usize = 128;
 /// Maximum length for an environment map key (bytes).
@@ -139,8 +139,6 @@ const MAX_MAP_KEY_LEN: usize = 256;
 const MAX_MAP_VALUE_LEN: usize = 8192;
 /// Maximum length for template string fields.
 const MAX_TEMPLATE_STRING_LEN: usize = 1024;
-/// Maximum number of entries in template map fields.
-const MAX_TEMPLATE_MAP_ENTRIES: usize = 128;
 /// Maximum number of entries in metadata annotations.
 const MAX_METADATA_ANNOTATIONS_ENTRIES: usize = 128;
 /// Maximum serialized size (bytes) for template Struct fields.
@@ -294,6 +292,34 @@ impl OpenShell for OpenShellService {
         request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         sandbox::handle_list_sandboxes(&self.state, request).await
+    }
+
+    async fn create_sandbox_template(
+        &self,
+        request: Request<CreateSandboxTemplateRequest>,
+    ) -> Result<Response<SandboxTemplateResponse>, Status> {
+        sandbox::handle_create_sandbox_template(&self.state, request).await
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        request: Request<GetSandboxTemplateRequest>,
+    ) -> Result<Response<SandboxTemplateResponse>, Status> {
+        sandbox::handle_get_sandbox_template(&self.state, request).await
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        request: Request<ListSandboxTemplatesRequest>,
+    ) -> Result<Response<ListSandboxTemplatesResponse>, Status> {
+        sandbox::handle_list_sandbox_templates(&self.state, request).await
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        request: Request<DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
+        sandbox::handle_delete_sandbox_template(&self.state, request).await
     }
 
     async fn list_sandbox_providers(

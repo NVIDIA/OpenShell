@@ -91,9 +91,9 @@ impl From<i32> for SandboxPhase {
 
 /// Caller intent for a new sandbox.
 ///
-/// Only the most commonly used fields are exposed. Callers that need the
-/// full proto surface (volume claim templates, runtime classes, struct
-/// resources, etc.) should drop down to [`crate::raw`].
+/// Only the most commonly used portable fields are exposed. Callers that need
+/// named sandbox templates or operator-controlled driver config should drop
+/// down to [`crate::raw`].
 #[derive(Clone, Debug, Default)]
 pub struct SandboxSpec {
     /// Optional user-supplied sandbox name. When empty the server generates one.
@@ -106,8 +106,8 @@ pub struct SandboxSpec {
     pub environment: HashMap<String, String>,
     /// Provider names to attach.
     pub providers: Vec<String>,
-    /// Request a GPU. Driver-specific device selection is configured via
-    /// driver config on the raw proto surface (see [`crate::raw`]).
+    /// Request a GPU. Driver-specific device selection is configured through
+    /// named sandbox templates on the raw proto surface (see [`crate::raw`]).
     pub gpu: bool,
 }
 

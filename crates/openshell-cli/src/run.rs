@@ -33,6 +33,7 @@ use openshell_bootstrap::{
 };
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::ProviderProfileCategory;
+use openshell_core::proto::create_sandbox_request;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
     ClearDraftChunksRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
@@ -43,14 +44,14 @@ use openshell_core::proto::{
     GetGatewayConfigRequest, GetInferenceRouteRequest, GetProviderProfileRequest,
     GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
-    GetSandboxRequest, GetServiceRequest, GpuResourceRequirements, ImportProviderProfilesRequest,
+    GetSandboxRequest, GetServiceRequest, ImportProviderProfilesRequest,
     LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
     ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
     ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
-    RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope,
+    ProviderProfileImportItem, RejectDraftChunkRequest, RevokeSshSessionRequest,
+    RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxResources,
+    SandboxWorkloadConfig, ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope,
     StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
     UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
     exec_sandbox_event, setting_value, tcp_forward_init,
@@ -225,40 +226,19 @@ fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>) -> bool {
 fn build_sandbox_resource_limits(
     cpu: Option<&str>,
     memory: Option<&str>,
-) -> Result<Option<prost_types::Struct>> {
-    use prost_types::{Struct, Value, value::Kind};
-
-    fn string_value(value: String) -> Value {
-        Value {
-            kind: Some(Kind::StringValue(value)),
-        }
-    }
-
-    let mut limits = std::collections::BTreeMap::new();
+) -> Result<Option<SandboxResources>> {
+    let mut resources = SandboxResources::default();
     if let Some(cpu) = cpu {
-        limits.insert("cpu".to_string(), string_value(validate_cpu_quantity(cpu)?));
+        resources.cpu = validate_cpu_quantity(cpu)?;
     }
     if let Some(memory) = memory {
-        limits.insert(
-            "memory".to_string(),
-            string_value(validate_memory_quantity(memory)?),
-        );
+        resources.memory = validate_memory_quantity(memory)?;
     }
 
-    if limits.is_empty() {
-        return Ok(None);
-    }
-
-    let mut fields = std::collections::BTreeMap::new();
-    fields.insert(
-        "limits".to_string(),
-        Value {
-            kind: Some(Kind::StructValue(Struct { fields: limits })),
-        },
-    );
-    Ok(Some(Struct { fields }))
+    Ok((!resources.cpu.is_empty() || !resources.memory.is_empty()).then_some(resources))
 }
 
+#[cfg(test)]
 fn parse_driver_config_json(value: &str) -> Result<prost_types::Struct> {
     let parsed: serde_json::Value = serde_json::from_str(value)
         .into_diagnostic()
@@ -368,7 +348,7 @@ pub struct SandboxCreateConfig<'a> {
     pub from: Option<&'a str>,
     pub uploads: &'a [(String, Option<String>, bool)],
     pub keep: bool,
-    pub gpu_requirements: Option<GpuResourceRequirements>,
+    pub gpu_requirements: Option<u32>,
     pub cpu: Option<&'a str>,
     pub memory: Option<&'a str>,
     pub driver_config_json: Option<&'a str>,
@@ -503,33 +483,30 @@ pub async fn sandbox_create(
     .await?;
 
     let policy = load_sandbox_policy(policy)?;
-    let resource_limits = build_sandbox_resource_limits(cpu, memory)?;
-    let driver_config = driver_config_json
-        .map(parse_driver_config_json)
-        .transpose()?;
-
-    let template = if image.is_some() || resource_limits.is_some() || driver_config.is_some() {
-        Some(SandboxTemplate {
-            image: image.unwrap_or_default(),
-            resources: resource_limits,
-            driver_config,
-            ..SandboxTemplate::default()
-        })
-    } else {
-        None
+    if driver_config_json.is_some() {
+        return Err(miette!(
+            "--driver-config-json is only supported through named sandbox templates"
+        ));
+    }
+    let mut resources = build_sandbox_resource_limits(cpu, memory)?.unwrap_or_default();
+    if let Some(gpu_count) = gpu_requirements {
+        resources.gpu_count = Some(gpu_count);
+    }
+    let resources = (!resources.cpu.is_empty()
+        || !resources.memory.is_empty()
+        || resources.gpu_count.is_some())
+    .then_some(resources);
+    let timeout_resources = resources.clone();
+    let workload = SandboxWorkloadConfig {
+        image: image.unwrap_or_default(),
+        environment,
+        resources,
     };
 
-    let resource_requirements = gpu_requirements.map(|gpu| ResourceRequirements { gpu: Some(gpu) });
-
     let request = CreateSandboxRequest {
-        spec: Some(SandboxSpec {
-            resource_requirements,
-            environment,
-            policy,
-            providers: configured_providers,
-            template,
-            ..SandboxSpec::default()
-        }),
+        workload_source: Some(create_sandbox_request::WorkloadSource::Workload(workload)),
+        policy,
+        providers: configured_providers,
         name: name.unwrap_or_default().to_string(),
         labels,
         annotations: HashMap::new(),
@@ -681,7 +658,7 @@ pub async fn sandbox_create(
         if remaining.is_zero() {
             let timeout_message = provisioning_timeout_message(
                 provision_timeout.as_secs(),
-                resource_requirements.as_ref(),
+                timeout_resources.as_ref(),
                 last_condition_message.as_deref(),
             );
             if let Some(d) = display.as_interactive_mut() {
@@ -702,7 +679,7 @@ pub async fn sandbox_create(
                 // Timeout fired — the stream was idle for too long.
                 let timeout_message = provisioning_timeout_message(
                     provision_timeout.as_secs(),
-                    resource_requirements.as_ref(),
+                    timeout_resources.as_ref(),
                     last_condition_message.as_deref(),
                 );
                 if let Some(d) = display.as_interactive_mut() {
@@ -7153,11 +7130,11 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        GetSandboxConfigResponse, GpuResourceRequirements, PolicySource, PolicyStatus, Provider,
-        ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
-        ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
-        ProviderProfileCredential, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
-        SandboxPolicyRevision, SandboxStatus, datamodel::v1::ObjectMeta,
+        GetSandboxConfigResponse, PolicySource, PolicyStatus, Provider, ProviderCredentialRefresh,
+        ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+        ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential, Sandbox,
+        SandboxCondition, SandboxPhase, SandboxPolicyRevision, SandboxResources, SandboxStatus,
+        datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -7531,39 +7508,9 @@ mod tests {
             .expect("resource limits should parse")
             .expect("resource limits should be present");
 
-        let limits = resources
-            .fields
-            .get("limits")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StructValue(inner) => Some(inner),
-                _ => None,
-            })
-            .expect("limits should be a struct");
-
-        assert_eq!(
-            limits
-                .fields
-                .get("cpu")
-                .and_then(|value| value.kind.as_ref())
-                .and_then(|kind| match kind {
-                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                    _ => None,
-                }),
-            Some("500m")
-        );
-        assert_eq!(
-            limits
-                .fields
-                .get("memory")
-                .and_then(|value| value.kind.as_ref())
-                .and_then(|kind| match kind {
-                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                    _ => None,
-                }),
-            Some("2Gi")
-        );
-        assert!(!resources.fields.contains_key("requests"));
+        assert_eq!(resources.cpu, "500m");
+        assert_eq!(resources.memory, "2Gi");
+        assert_eq!(resources.gpu_count, None);
     }
 
     #[test]
@@ -7869,12 +7816,13 @@ mod tests {
 
     #[test]
     fn provisioning_timeout_message_includes_condition_and_gpu_hint() {
-        let resource_requirements = ResourceRequirements {
-            gpu: Some(GpuResourceRequirements { count: None }),
+        let resources = SandboxResources {
+            gpu_count: Some(1),
+            ..SandboxResources::default()
         };
         let message = provisioning_timeout_message(
             120,
-            Some(&resource_requirements),
+            Some(&resources),
             Some("DependenciesNotReady: Pod exists with phase: Pending; Service Exists"),
         );
 
@@ -7892,8 +7840,8 @@ mod tests {
 
     #[test]
     fn provisioning_timeout_message_omits_gpu_hint_without_gpu_requirements() {
-        let resource_requirements = ResourceRequirements { gpu: None };
-        let message = provisioning_timeout_message(120, Some(&resource_requirements), None);
+        let resources = SandboxResources::default();
+        let message = provisioning_timeout_message(120, Some(&resources), None);
 
         assert_eq!(message, "sandbox provisioning timed out after 120s");
     }

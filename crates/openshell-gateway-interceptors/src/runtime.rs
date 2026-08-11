@@ -603,8 +603,7 @@ mod tests {
     use super::*;
     use openshell_core::proto::gateway_interceptor::v1::gateway_interceptor_client::GatewayInterceptorClient;
     use openshell_core::proto::{
-        CreateProviderRequest, CreateSandboxRequest, Provider, SandboxSpec, SandboxTemplate,
-        UpdateConfigRequest,
+        CreateProviderRequest, CreateSandboxRequest, Provider, UpdateConfigRequest,
     };
     use openshell_extension_core::BearerTokenInterceptor;
     use serde_json::json;
@@ -1048,29 +1047,20 @@ mod tests {
         let codec =
             ProtoJsonCodec::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
         let request = CreateSandboxRequest {
-            spec: Some(SandboxSpec {
-                template: Some(SandboxTemplate {
-                    resources: Some(
-                        json_to_struct(json!({
-                            "limits": {
-                                "cpu": "2",
-                                "memory": "4Gi"
-                            }
-                        }))
-                        .unwrap(),
-                    ),
-                    driver_config: Some(
-                        json_to_struct(json!({
-                            "docker": {
-                                "userns": "host"
-                            }
-                        }))
-                        .unwrap(),
-                    ),
-                    ..SandboxTemplate::default()
-                }),
-                ..SandboxSpec::default()
-            }),
+            workload_source: Some(
+                openshell_core::proto::create_sandbox_request::WorkloadSource::Workload(
+                    openshell_core::proto::SandboxWorkloadConfig {
+                        resources: Some(openshell_core::proto::SandboxResources {
+                            cpu: "2".to_string(),
+                            memory: "4Gi".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            policy: None,
+            providers: Vec::new(),
             name: "demo".to_string(),
             labels: HashMap::new(),
             annotations: HashMap::new(),
@@ -1082,16 +1072,8 @@ mod tests {
             .decode_bytes_to_json("openshell.v1.CreateSandboxRequest", &bytes)
             .unwrap();
 
-        assert_eq!(json["spec"]["template"]["resources"]["limits"]["cpu"], "2");
-        assert_eq!(
-            json["spec"]["template"]["driverConfig"]["docker"]["userns"],
-            "host"
-        );
-        assert!(
-            json["spec"]["template"]["resources"]
-                .get("fields")
-                .is_none()
-        );
+        assert_eq!(json["workload"]["resources"]["cpu"], "2");
+        assert!(json["workload"]["resources"].get("fields").is_none());
 
         let encoded = codec
             .encode_json_to_message("openshell.v1.CreateSandboxRequest", &json)
@@ -1145,13 +1127,13 @@ mod tests {
         let cases = [
             (
                 "openshell.v1.CreateSandboxRequest",
-                json!({"name": "demo", "spec": {}}),
-                patch("replace", "/spec", json!("not-a-message")),
+                json!({"name": "demo", "workload": {}}),
+                patch("replace", "/workload", json!("not-a-message")),
             ),
             (
                 "openshell.v1.CreateSandboxRequest",
-                json!({"name": "demo", "spec": {"providers": []}}),
-                patch("replace", "/spec/providers", json!({"provider": "github"})),
+                json!({"name": "demo", "workload": {}, "providers": []}),
+                patch("replace", "/providers", json!({"provider": "github"})),
             ),
             (
                 "openshell.v1.ReportPolicyStatusRequest",

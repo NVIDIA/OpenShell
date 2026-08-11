@@ -18,6 +18,24 @@ type SandboxSpec = types.SandboxSpec
 // SandboxTemplate defines the container template for a sandbox.
 type SandboxTemplate = types.SandboxTemplate
 
+// SandboxWorkloadConfig defines the portable workload for a sandbox.
+type SandboxWorkloadConfig = types.SandboxWorkloadConfig
+
+// SandboxResources defines portable sandbox resource requirements.
+type SandboxResources = types.SandboxResources
+
+// SandboxTemplateSpec holds reusable sandbox template settings.
+type SandboxTemplateSpec = types.SandboxTemplateSpec
+
+// SandboxServiceLevel describes desired operational characteristics.
+type SandboxServiceLevel = types.SandboxServiceLevel
+
+// SandboxStartup describes desired startup characteristics.
+type SandboxStartup = types.SandboxStartup
+
+// SandboxTemplateProvenance identifies the template revision used to create a sandbox.
+type SandboxTemplateProvenance = types.SandboxTemplateProvenance
+
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus = types.SandboxStatus
 

@@ -130,7 +130,9 @@ func TestFakeClient_AddSandbox(t *testing.T) {
 
 	sb := &types.Sandbox{
 		Name: "pre-seeded",
-		Spec: types.SandboxSpec{LogLevel: "debug"},
+		Spec: types.SandboxSpec{
+			Workload: &types.SandboxWorkloadConfig{Image: "preseed:v1"},
+		},
 		Status: types.SandboxStatus{
 			Phase: types.SandboxReady,
 		},
@@ -141,7 +143,8 @@ func TestFakeClient_AddSandbox(t *testing.T) {
 	got, err := fc.Sandboxes().Get(ctx, "default", "pre-seeded")
 	require.NoError(t, err)
 	assert.Equal(t, "pre-seeded", got.Name)
-	assert.Equal(t, "debug", got.Spec.LogLevel)
+	require.NotNil(t, got.Spec.Workload)
+	assert.Equal(t, "preseed:v1", got.Spec.Workload.Image)
 	assert.Equal(t, types.SandboxReady, got.Status.Phase)
 }
 

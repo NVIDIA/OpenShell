@@ -12,12 +12,11 @@ import (
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
 func TestSandboxFromProto(t *testing.T) {
-	userNS := true
 	gpuCount := uint32(2)
 	proto := &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{
@@ -30,32 +29,24 @@ func TestSandboxFromProto(t *testing.T) {
 			Workspace:           "prod",
 			DeletionTimestampMs: 1700000060000,
 		},
+		CreatedFromTemplate: &pb.SandboxTemplateProvenance{
+			Name:            "python",
+			ResourceVersion: "7",
+		},
 		Spec: &pb.SandboxSpec{
-			LogLevel:    "debug",
-			Environment: map[string]string{"FOO": "bar"},
-			Template: &pb.SandboxTemplate{
-				Image:            "nvidia/sandbox:latest",
-				RuntimeClassName: "kata",
-				AgentSocket:      "/var/run/agent.sock",
-				Labels:           map[string]string{"app": "test"},
-				Annotations:      map[string]string{"note": "hello"},
-				Environment:      map[string]string{"TMPL_VAR": "val"},
-				UserNamespaces:   &userNS,
-				Resources: func() *structpb.Struct {
-					s, _ := structpb.NewStruct(map[string]any{"cpu": "2", "memory": "4Gi"})
-					return s
-				}(),
-				DriverConfig: func() *structpb.Struct {
-					s, _ := structpb.NewStruct(map[string]any{"runtime": "kata", "nested": map[string]any{"key": "val"}})
-					return s
-				}(),
-			},
-			Providers: []string{"claude", "github"},
-			ResourceRequirements: &pb.ResourceRequirements{
-				Gpu: &pb.GpuResourceRequirements{
-					Count: &gpuCount,
+			Workload: &pb.SandboxWorkloadConfig{
+				Image:       "python:3.12",
+				Environment: map[string]string{"FOO": "bar"},
+				Resources: &pb.SandboxResources{
+					Cpu:      "2",
+					Memory:   "4Gi",
+					GpuCount: &gpuCount,
 				},
 			},
+			DriverConfig: structpb.NewStructValue(&structpb.Struct{
+				Fields: map[string]*structpb.Value{"kubernetes": structpb.NewBoolValue(true)},
+			}).GetStructValue(),
+			Providers: []string{"claude", "github"},
 		},
 		Status: &pb.SandboxStatus{
 			SandboxName:          "sb-compute-1",
@@ -88,31 +79,21 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, "prod", s.Workspace)
 	require.NotNil(t, s.DeletionTimestamp)
 	assert.Equal(t, time.UnixMilli(1700000060000).UTC(), *s.DeletionTimestamp)
+	require.NotNil(t, s.CreatedFromTemplate)
+	assert.Equal(t, "python", s.CreatedFromTemplate.Name)
+	assert.Equal(t, "7", s.CreatedFromTemplate.ResourceVersion)
 
-	// Spec
-	assert.Equal(t, "debug", s.Spec.LogLevel)
-	assert.Equal(t, map[string]string{"FOO": "bar"}, s.Spec.Environment)
+	require.NotNil(t, s.Spec.Workload)
+	assert.Equal(t, "python:3.12", s.Spec.Workload.Image)
+	assert.Equal(t, map[string]string{"FOO": "bar"}, s.Spec.Workload.Environment)
+	require.NotNil(t, s.Spec.Workload.Resources)
+	assert.Equal(t, "2", s.Spec.Workload.Resources.CPU)
+	assert.Equal(t, "4Gi", s.Spec.Workload.Resources.Memory)
+	require.NotNil(t, s.Spec.Workload.Resources.GPUCount)
+	assert.Equal(t, uint32(2), *s.Spec.Workload.Resources.GPUCount)
+	assert.Equal(t, map[string]any{"kubernetes": true}, s.Spec.DriverConfig)
 	assert.Equal(t, []string{"claude", "github"}, s.Spec.Providers)
-	require.NotNil(t, s.Spec.GPUCount)
-	assert.Equal(t, uint32(2), *s.Spec.GPUCount)
 
-	// Template
-	require.NotNil(t, s.Spec.Template)
-	assert.Equal(t, "nvidia/sandbox:latest", s.Spec.Template.Image)
-	assert.Equal(t, "kata", s.Spec.Template.RuntimeClassName)
-	assert.Equal(t, "/var/run/agent.sock", s.Spec.Template.AgentSocket)
-	assert.Equal(t, map[string]string{"app": "test"}, s.Spec.Template.Labels)
-	assert.Equal(t, map[string]string{"note": "hello"}, s.Spec.Template.Annotations)
-	assert.Equal(t, map[string]string{"TMPL_VAR": "val"}, s.Spec.Template.Environment)
-	require.NotNil(t, s.Spec.Template.UserNamespaces)
-	assert.True(t, *s.Spec.Template.UserNamespaces)
-	assert.Equal(t, map[string]any{"cpu": "2", "memory": "4Gi"}, s.Spec.Template.Resources)
-	assert.Equal(t, "kata", s.Spec.Template.DriverConfig["runtime"])
-	nested, ok := s.Spec.Template.DriverConfig["nested"].(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, "val", nested["key"])
-
-	// Status
 	assert.Equal(t, "sb-compute-1", s.Status.SandboxName)
 	assert.Equal(t, "agent-pod-xyz", s.Status.AgentPod)
 	assert.Equal(t, "fd-agent", s.Status.AgentFd)
@@ -127,50 +108,19 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, "2024-01-01T00:00:00Z", s.Status.Conditions[0].LastTransitionTime)
 }
 
-func TestSandboxFromProto_TemplateResourcesDeepCopy(t *testing.T) {
-	proto := &pb.Sandbox{
-		Spec: &pb.SandboxSpec{
-			Template: &pb.SandboxTemplate{
-				Image: "img:v1",
-				Resources: func() *structpb.Struct {
-					s, _ := structpb.NewStruct(map[string]any{"cpu": "2"})
-					return s
-				}(),
-				DriverConfig: func() *structpb.Struct {
-					s, _ := structpb.NewStruct(map[string]any{"runtime": "kata"})
-					return s
-				}(),
-			},
-		},
-	}
-
-	s := SandboxFromProto(proto)
-	require.NotNil(t, s)
-
-	proto.Spec.Template.Resources.Fields["cpu"] = structpb.NewStringValue("MUTATED")
-	assert.Equal(t, "2", s.Spec.Template.Resources["cpu"], "Resources must be deep copied")
-
-	proto.Spec.Template.DriverConfig.Fields["runtime"] = structpb.NewStringValue("MUTATED")
-	assert.Equal(t, "kata", s.Spec.Template.DriverConfig["runtime"], "DriverConfig must be deep copied")
-}
-
 func TestSandboxFromProto_NilFields(t *testing.T) {
-	proto := &pb.Sandbox{}
-
-	s := SandboxFromProto(proto)
+	s := SandboxFromProto(&pb.Sandbox{})
 
 	require.NotNil(t, s)
 	assert.Empty(t, s.ID)
 	assert.Empty(t, s.Name)
 	assert.True(t, s.CreatedAt.IsZero())
-	assert.Nil(t, s.Spec.Template)
-	assert.Nil(t, s.Spec.GPUCount)
+	assert.Nil(t, s.Spec.Workload)
 	assert.Equal(t, v1.SandboxUnknown, s.Status.Phase)
 }
 
 func TestSandboxFromProto_Nil(t *testing.T) {
-	s := SandboxFromProto(nil)
-	assert.Nil(t, s)
+	assert.Nil(t, SandboxFromProto(nil))
 }
 
 func TestSandboxPhaseFromProto(t *testing.T) {
@@ -183,9 +133,6 @@ func TestSandboxPhaseFromProto(t *testing.T) {
 		{pb.SandboxPhase_SANDBOX_PHASE_ERROR, v1.SandboxError},
 		{pb.SandboxPhase_SANDBOX_PHASE_DELETING, v1.SandboxDeleting},
 		{pb.SandboxPhase_SANDBOX_PHASE_UNKNOWN, v1.SandboxUnknown},
-		{pb.SandboxPhase_SANDBOX_PHASE_STOPPING, v1.SandboxStopping},
-		{pb.SandboxPhase_SANDBOX_PHASE_STOPPED, v1.SandboxStopped},
-		{pb.SandboxPhase_SANDBOX_PHASE_STARTING, v1.SandboxStarting},
 		{pb.SandboxPhase_SANDBOX_PHASE_UNSPECIFIED, v1.SandboxUnknown},
 		{pb.SandboxPhase(999), v1.SandboxUnknown},
 	}
@@ -205,9 +152,6 @@ func TestSandboxPhaseToProto(t *testing.T) {
 		{v1.SandboxError, pb.SandboxPhase_SANDBOX_PHASE_ERROR},
 		{v1.SandboxDeleting, pb.SandboxPhase_SANDBOX_PHASE_DELETING},
 		{v1.SandboxUnknown, pb.SandboxPhase_SANDBOX_PHASE_UNKNOWN},
-		{v1.SandboxStopping, pb.SandboxPhase_SANDBOX_PHASE_STOPPING},
-		{v1.SandboxStopped, pb.SandboxPhase_SANDBOX_PHASE_STOPPED},
-		{v1.SandboxStarting, pb.SandboxPhase_SANDBOX_PHASE_STARTING},
 		{v1.SandboxPhase("bogus"), pb.SandboxPhase_SANDBOX_PHASE_UNKNOWN},
 	}
 
@@ -217,7 +161,6 @@ func TestSandboxPhaseToProto(t *testing.T) {
 }
 
 func TestSandboxToProto(t *testing.T) {
-	userNS := true
 	gpuCount := uint32(4)
 	delTime := time.UnixMilli(1700000060000).UTC()
 	s := &v1.Sandbox{
@@ -229,25 +172,27 @@ func TestSandboxToProto(t *testing.T) {
 		ResourceVersion:   3,
 		Workspace:         "prod",
 		DeletionTimestamp: &delTime,
+		CreatedFromTemplate: &v1.SandboxTemplateProvenance{
+			Name:            "python",
+			ResourceVersion: "9",
+		},
 		Spec: v1.SandboxSpec{
-			LogLevel:    "info",
-			Environment: map[string]string{"KEY": "val"},
-			Template: &v1.SandboxTemplate{
-				Image:            "img:v1",
-				RuntimeClassName: "runc",
-				AgentSocket:      "/sock",
-				Labels:           map[string]string{"l": "v"},
-				Annotations:      map[string]string{"a": "v"},
-				Environment:      map[string]string{"E": "V"},
-				UserNamespaces:   &userNS,
+			Workload: &v1.SandboxWorkloadConfig{
+				Image:       "img:v1",
+				Environment: map[string]string{"E": "V"},
+				Resources: &v1.SandboxResources{
+					CPU:      "500m",
+					Memory:   "1Gi",
+					GPUCount: &gpuCount,
+				},
 			},
-			Providers: []string{"prov-a"},
-			GPUCount:  &gpuCount,
+			DriverConfig: map[string]any{"kubernetes": map[string]any{"runtime_class_name": "kata"}},
+			Providers:    []string{"prov-a"},
 		},
 	}
 
-	p := SandboxToProto(s)
-
+	p, err := SandboxToProto(s)
+	require.NoError(t, err)
 	require.NotNil(t, p)
 	require.NotNil(t, p.Metadata)
 	assert.Equal(t, "sb-1", p.Metadata.Id)
@@ -258,49 +203,38 @@ func TestSandboxToProto(t *testing.T) {
 	assert.Equal(t, uint64(3), p.Metadata.ResourceVersion)
 	assert.Equal(t, "prod", p.Metadata.Workspace)
 	assert.Equal(t, int64(1700000060000), p.Metadata.DeletionTimestampMs)
+	require.NotNil(t, p.CreatedFromTemplate)
+	assert.Equal(t, "python", p.CreatedFromTemplate.Name)
+	assert.Equal(t, "9", p.CreatedFromTemplate.ResourceVersion)
 
 	require.NotNil(t, p.Spec)
-	assert.Equal(t, "info", p.Spec.LogLevel)
-	assert.Equal(t, map[string]string{"KEY": "val"}, p.Spec.Environment)
+	require.NotNil(t, p.Spec.Workload)
+	assert.Equal(t, "img:v1", p.Spec.Workload.Image)
+	assert.Equal(t, map[string]string{"E": "V"}, p.Spec.Workload.Environment)
+	require.NotNil(t, p.Spec.Workload.Resources)
+	assert.Equal(t, "500m", p.Spec.Workload.Resources.Cpu)
+	assert.Equal(t, "1Gi", p.Spec.Workload.Resources.Memory)
+	assert.Equal(t, uint32(4), p.Spec.Workload.Resources.GetGpuCount())
 	assert.Equal(t, []string{"prov-a"}, p.Spec.Providers)
-
-	require.NotNil(t, p.Spec.ResourceRequirements)
-	require.NotNil(t, p.Spec.ResourceRequirements.Gpu)
-	assert.Equal(t, uint32(4), p.Spec.ResourceRequirements.Gpu.GetCount())
-
-	require.NotNil(t, p.Spec.Template)
-	assert.Equal(t, "img:v1", p.Spec.Template.Image)
-	assert.Equal(t, "runc", p.Spec.Template.RuntimeClassName)
-	assert.Equal(t, "/sock", p.Spec.Template.AgentSocket)
-	assert.Equal(t, map[string]string{"l": "v"}, p.Spec.Template.Labels)
-	assert.Equal(t, map[string]string{"a": "v"}, p.Spec.Template.Annotations)
-	assert.Equal(t, map[string]string{"E": "V"}, p.Spec.Template.Environment)
-	require.NotNil(t, p.Spec.Template.UserNamespaces)
-	assert.True(t, *p.Spec.Template.UserNamespaces)
+	require.NotNil(t, p.Spec.DriverConfig)
+	assert.Equal(t, "kata", p.Spec.DriverConfig.Fields["kubernetes"].GetStructValue().Fields["runtime_class_name"].GetStringValue())
 }
 
 func TestSandboxToProto_Nil(t *testing.T) {
-	p := SandboxToProto(nil)
+	p, err := SandboxToProto(nil)
+	require.NoError(t, err)
 	assert.Nil(t, p)
 }
 
-func TestSandboxToProto_NilTemplate(t *testing.T) {
-	s := &v1.Sandbox{
-		Spec: v1.SandboxSpec{
-			LogLevel: "warn",
-		},
-	}
-
-	p := SandboxToProto(s)
-
+func TestSandboxToProto_NilWorkload(t *testing.T) {
+	p, err := SandboxToProto(&v1.Sandbox{})
+	require.NoError(t, err)
 	require.NotNil(t, p)
 	require.NotNil(t, p.Spec)
-	assert.Nil(t, p.Spec.Template)
-	assert.Nil(t, p.Spec.ResourceRequirements)
+	assert.Nil(t, p.Spec.Workload)
 }
 
 func TestSandboxRoundTrip(t *testing.T) {
-	userNS := false
 	gpuCount := uint32(1)
 	rtDelTime := time.UnixMilli(1700000090000).UTC()
 	original := &v1.Sandbox{
@@ -313,14 +247,13 @@ func TestSandboxRoundTrip(t *testing.T) {
 		Workspace:         "staging",
 		DeletionTimestamp: &rtDelTime,
 		Spec: v1.SandboxSpec{
-			LogLevel:    "trace",
-			Environment: map[string]string{"A": "B"},
-			Template: &v1.SandboxTemplate{
-				Image:          "img:rt",
-				UserNamespaces: &userNS,
+			Workload: &v1.SandboxWorkloadConfig{
+				Image: "img:rt",
+				Resources: &v1.SandboxResources{
+					GPUCount: &gpuCount,
+				},
 			},
 			Providers: []string{"p1", "p2"},
-			GPUCount:  &gpuCount,
 			Policy: &v1.SandboxPolicy{
 				Version: 3,
 				Filesystem: &v1.FilesystemPolicy{
@@ -339,14 +272,7 @@ func TestSandboxRoundTrip(t *testing.T) {
 					"web": {
 						Name: "web",
 						Endpoints: []v1.PolicyNetworkEndpoint{
-							{
-								Host:     "api.example.com",
-								Port:     443,
-								Protocol: "rest",
-								CredentialBinding: &v1.NetworkCredentialBinding{
-									Provider: "api-credentials",
-								},
-							},
+							{Host: "api.example.com", Port: 443, Protocol: "rest"},
 						},
 					},
 				},
@@ -354,7 +280,8 @@ func TestSandboxRoundTrip(t *testing.T) {
 		},
 	}
 
-	p := SandboxToProto(original)
+	p, err := SandboxToProto(original)
+	require.NoError(t, err)
 	back := SandboxFromProto(p)
 
 	assert.Equal(t, original.ID, back.ID)
@@ -366,17 +293,13 @@ func TestSandboxRoundTrip(t *testing.T) {
 	assert.Equal(t, original.Workspace, back.Workspace)
 	require.NotNil(t, back.DeletionTimestamp)
 	assert.Equal(t, *original.DeletionTimestamp, *back.DeletionTimestamp)
-	assert.Equal(t, original.Spec.LogLevel, back.Spec.LogLevel)
-	assert.Equal(t, original.Spec.Environment, back.Spec.Environment)
+	require.NotNil(t, back.Spec.Workload)
+	assert.Equal(t, original.Spec.Workload.Image, back.Spec.Workload.Image)
+	require.NotNil(t, back.Spec.Workload.Resources)
+	require.NotNil(t, back.Spec.Workload.Resources.GPUCount)
+	assert.Equal(t, *original.Spec.Workload.Resources.GPUCount, *back.Spec.Workload.Resources.GPUCount)
 	assert.Equal(t, original.Spec.Providers, back.Spec.Providers)
-	require.NotNil(t, back.Spec.GPUCount)
-	assert.Equal(t, *original.Spec.GPUCount, *back.Spec.GPUCount)
-	require.NotNil(t, back.Spec.Template)
-	assert.Equal(t, original.Spec.Template.Image, back.Spec.Template.Image)
-	require.NotNil(t, back.Spec.Template.UserNamespaces)
-	assert.Equal(t, *original.Spec.Template.UserNamespaces, *back.Spec.Template.UserNamespaces)
 
-	// Policy round-trip
 	require.NotNil(t, back.Spec.Policy)
 	assert.Equal(t, uint32(3), back.Spec.Policy.Version)
 	require.NotNil(t, back.Spec.Policy.Filesystem)
@@ -394,22 +317,21 @@ func TestSandboxRoundTrip(t *testing.T) {
 	assert.Equal(t, "web", webRule.Name)
 	require.Len(t, webRule.Endpoints, 1)
 	assert.Equal(t, "api.example.com", webRule.Endpoints[0].Host)
-	require.NotNil(t, webRule.Endpoints[0].CredentialBinding)
-	assert.Equal(t, "api-credentials", webRule.Endpoints[0].CredentialBinding.Provider)
 }
 
 func TestSandboxSpecToProto(t *testing.T) {
 	gpuCount := uint32(3)
 	spec := &v1.SandboxSpec{
-		LogLevel:    "debug",
-		Environment: map[string]string{"X": "Y"},
-		Template: &v1.SandboxTemplate{
-			Image:        "img:spec",
-			Resources:    map[string]any{"cpu": "4"},
-			DriverConfig: map[string]any{"runtime": "kata"},
+		Workload: &v1.SandboxWorkloadConfig{
+			Image:       "img:spec",
+			Environment: map[string]string{"X": "Y"},
+			Resources: &v1.SandboxResources{
+				CPU:      "2",
+				Memory:   "8Gi",
+				GPUCount: &gpuCount,
+			},
 		},
 		Providers: []string{"prov"},
-		GPUCount:  &gpuCount,
 		Policy: &v1.SandboxPolicy{
 			Version: 2,
 			Filesystem: &v1.FilesystemPolicy{
@@ -418,22 +340,18 @@ func TestSandboxSpecToProto(t *testing.T) {
 		},
 	}
 
-	p := SandboxSpecToProto(spec)
-
+	p, err := SandboxSpecToProto(spec)
+	require.NoError(t, err)
 	require.NotNil(t, p)
-	assert.Equal(t, "debug", p.LogLevel)
-	assert.Equal(t, map[string]string{"X": "Y"}, p.Environment)
+	require.NotNil(t, p.Workload)
+	assert.Equal(t, "img:spec", p.Workload.Image)
+	assert.Equal(t, map[string]string{"X": "Y"}, p.Workload.Environment)
+	require.NotNil(t, p.Workload.Resources)
+	assert.Equal(t, "2", p.Workload.Resources.Cpu)
+	assert.Equal(t, "8Gi", p.Workload.Resources.Memory)
+	assert.Equal(t, uint32(3), p.Workload.Resources.GetGpuCount())
 	assert.Equal(t, []string{"prov"}, p.Providers)
-	require.NotNil(t, p.ResourceRequirements)
-	assert.Equal(t, uint32(3), p.ResourceRequirements.Gpu.GetCount())
-	require.NotNil(t, p.Template)
-	assert.Equal(t, "img:spec", p.Template.Image)
-	require.NotNil(t, p.Template.Resources)
-	assert.Equal(t, "4", p.Template.Resources.Fields["cpu"].GetStringValue())
-	require.NotNil(t, p.Template.DriverConfig)
-	assert.Equal(t, "kata", p.Template.DriverConfig.Fields["runtime"].GetStringValue())
 
-	// Policy conversion
 	require.NotNil(t, p.Policy)
 	assert.Equal(t, uint32(2), p.Policy.Version)
 	require.NotNil(t, p.Policy.Filesystem)
@@ -441,9 +359,80 @@ func TestSandboxSpecToProto(t *testing.T) {
 }
 
 func TestSandboxSpecToProto_Nil(t *testing.T) {
-	p := SandboxSpecToProto(nil)
+	p, err := SandboxSpecToProto(nil)
+	require.NoError(t, err)
 	assert.Nil(t, p)
 }
 
-// Verify proto import is used (suppress unused import warning).
-var _ = proto.Marshal
+func TestSandboxSpecToProto_InvalidMapReturnsError(t *testing.T) {
+	spec := &v1.SandboxSpec{
+		DriverConfig: map[string]any{"bad": make(chan int)},
+	}
+
+	p, err := SandboxSpecToProto(spec)
+	require.Error(t, err, "SandboxSpecToProto must return an error for unconvertible map values")
+	assert.Nil(t, p)
+	assert.Contains(t, err.Error(), "convert driver config")
+}
+
+func TestSandboxTemplateRoundTrip(t *testing.T) {
+	readyWithin := 15 * time.Second
+	template := &v1.SandboxTemplate{
+		ID:              "tmpl-1",
+		Name:            "python",
+		CreatedAt:       time.UnixMilli(1700000000000).UTC(),
+		Labels:          map[string]string{"runtime": "python"},
+		ResourceVersion: 5,
+		Workspace:       "default",
+		Spec: v1.SandboxTemplateSpec{
+			Workload: &v1.SandboxWorkloadConfig{Image: "python:3.12"},
+			DriverConfig: map[string]any{
+				"kubernetes": map[string]any{"runtime_class_name": "kata"},
+			},
+			DesiredServiceLevel: &v1.SandboxServiceLevel{
+				Startup: &v1.SandboxStartup{
+					ReadyWithin: readyWithin,
+					MaxBurst:    2,
+				},
+			},
+		},
+	}
+
+	p, err := SandboxTemplateToProto(template)
+	require.NoError(t, err)
+	back := SandboxTemplateFromProto(p)
+
+	require.NotNil(t, back)
+	assert.Equal(t, template.ID, back.ID)
+	assert.Equal(t, template.Name, back.Name)
+	assert.Equal(t, template.CreatedAt, back.CreatedAt)
+	assert.Equal(t, template.Labels, back.Labels)
+	assert.Equal(t, template.ResourceVersion, back.ResourceVersion)
+	assert.Equal(t, template.Workspace, back.Workspace)
+	require.NotNil(t, back.Spec.Workload)
+	assert.Equal(t, "python:3.12", back.Spec.Workload.Image)
+	assert.Equal(t, map[string]any{"kubernetes": map[string]any{"runtime_class_name": "kata"}}, back.Spec.DriverConfig)
+	require.NotNil(t, back.Spec.DesiredServiceLevel)
+	require.NotNil(t, back.Spec.DesiredServiceLevel.Startup)
+	assert.Equal(t, readyWithin, back.Spec.DesiredServiceLevel.Startup.ReadyWithin)
+	assert.Equal(t, uint32(2), back.Spec.DesiredServiceLevel.Startup.MaxBurst)
+}
+
+func TestSandboxTemplateFromProto_Duration(t *testing.T) {
+	template := SandboxTemplateFromProto(&pb.SandboxTemplate{
+		Spec: &pb.SandboxTemplateSpec{
+			DesiredServiceLevel: &pb.SandboxServiceLevel{
+				Startup: &pb.SandboxStartup{
+					ReadyWithin: durationpb.New(30 * time.Second),
+					MaxBurst:    4,
+				},
+			},
+		},
+	})
+
+	require.NotNil(t, template)
+	require.NotNil(t, template.Spec.DesiredServiceLevel)
+	require.NotNil(t, template.Spec.DesiredServiceLevel.Startup)
+	assert.Equal(t, 30*time.Second, template.Spec.DesiredServiceLevel.Startup.ReadyWithin)
+	assert.Equal(t, uint32(4), template.Spec.DesiredServiceLevel.Startup.MaxBurst)
+}

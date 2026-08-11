@@ -445,13 +445,14 @@ class SandboxClient:
         labels: Mapping[str, str] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
+        request = _create_sandbox_request(
+            spec=request_spec,
+            name=name or "",
+            labels=dict(labels) if labels else {},
+            workspace=workspace,
+        )
         response = self._stub.CreateSandbox(
-            openshell_pb2.CreateSandboxRequest(
-                spec=request_spec,
-                name=name or "",
-                labels=dict(labels) if labels else {},
-                workspace=workspace,
-            ),
+            request,
             timeout=self._timeout,
         )
         sandbox_ref = _sandbox_ref(response.sandbox)
@@ -1104,6 +1105,28 @@ def _default_spec() -> openshell_pb2.SandboxSpec:
     # container image and ensures sandboxes get the full dev-sandbox-policy
     # (including network_policies) out of the box.
     return openshell_pb2.SandboxSpec()
+
+
+def _create_sandbox_request(
+    *,
+    spec: openshell_pb2.SandboxSpec,
+    name: str,
+    labels: Mapping[str, str],
+    workspace: str,
+) -> openshell_pb2.CreateSandboxRequest:
+    request = openshell_pb2.CreateSandboxRequest(
+        name=name,
+        labels=dict(labels),
+        workspace=workspace,
+    )
+    if spec.HasField("workload"):
+        request.workload.CopyFrom(spec.workload)
+    else:
+        request.workload.CopyFrom(openshell_pb2.SandboxWorkloadConfig())
+    if spec.HasField("policy"):
+        request.policy.CopyFrom(spec.policy)
+    request.providers.extend(spec.providers)
+    return request
 
 
 def _xdg_config_home() -> pathlib.Path:

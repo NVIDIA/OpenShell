@@ -77,6 +77,7 @@ fn sandbox_with_phase_ws(
             phase: phase.into(),
             ..Default::default()
         }),
+        created_from_template: None,
     }
 }
 
@@ -238,6 +239,34 @@ impl OpenShell for TestOpenShell {
                 sandbox_with_phase("beta", proto::SandboxPhase::Provisioning),
             ],
         }))
+    }
+
+    async fn create_sandbox_template(
+        &self,
+        _: tonic::Request<proto::CreateSandboxTemplateRequest>,
+    ) -> Result<Response<proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        _: tonic::Request<proto::GetSandboxTemplateRequest>,
+    ) -> Result<Response<proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        _: tonic::Request<proto::ListSandboxTemplatesRequest>,
+    ) -> Result<Response<proto::ListSandboxTemplatesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        _: tonic::Request<proto::DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<proto::DeleteSandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn list_sandbox_providers(
@@ -782,18 +811,18 @@ async fn create_sandbox_passes_spec_through() {
     assert_eq!(observed.name, "my-box");
     assert_eq!(observed.labels, labels);
     assert!(observed.annotations.is_empty());
-    let observed_spec = observed.spec.unwrap();
-    assert!(
-        observed_spec
-            .resource_requirements
-            .as_ref()
-            .and_then(|r| r.gpu.as_ref())
-            .is_some()
-    );
+    let workload = match observed.workload_source.as_ref() {
+        Some(proto::create_sandbox_request::WorkloadSource::Workload(workload)) => workload,
+        other => panic!("expected inline workload, got {other:?}"),
+    };
     assert_eq!(
-        observed_spec.template.as_ref().unwrap().image,
-        "ghcr.io/foo:bar"
+        workload
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.gpu_count),
+        Some(1)
     );
+    assert_eq!(workload.image, "ghcr.io/foo:bar");
 }
 
 #[tokio::test]

@@ -20,14 +20,13 @@ use openshell_core::proto::{
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GpuResourceRequirements,
-    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, PlatformEvent, ProviderResponse, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, Sandbox, SandboxCondition, SandboxLogLine, SandboxPhase,
-    SandboxResponse, SandboxStatus, SandboxStreamEvent, ServiceStatus, SettingValue,
-    SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest, sandbox_stream_event,
-    setting_value,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
+    ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, PlatformEvent,
+    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox, SandboxCondition,
+    SandboxLogLine, SandboxPhase, SandboxResponse, SandboxStatus, SandboxStreamEvent,
+    SandboxWorkloadConfig, ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest,
+    WatchSandboxRequest, create_sandbox_request, sandbox_stream_event, setting_value,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -159,6 +158,34 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         Ok(Response::new(ListSandboxesResponse::default()))
+    }
+
+    async fn create_sandbox_template(
+        &self,
+        _: tonic::Request<openshell_core::proto::CreateSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListSandboxTemplatesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxTemplatesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteSandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn list_sandbox_providers(
@@ -1141,8 +1168,15 @@ fn test_tls(server: &TestServer) -> TlsOptions {
     server.tls.with_gateway_name("openshell")
 }
 
-fn gpu_requirements(count: Option<u32>) -> GpuResourceRequirements {
-    GpuResourceRequirements { count }
+fn gpu_requirements(count: Option<u32>) -> u32 {
+    count.unwrap_or(1)
+}
+
+fn inline_workload(request: &CreateSandboxRequest) -> &SandboxWorkloadConfig {
+    match request.workload_source.as_ref() {
+        Some(create_sandbox_request::WorkloadSource::Workload(workload)) => workload,
+        other => panic!("expected inline workload, got {other:?}"),
+    }
 }
 
 /// Shared defaults for integration tests. Note: `keep` is `true` here (most
@@ -1249,49 +1283,16 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
     .expect("sandbox create should succeed");
 
     let requests = create_requests(&server).await;
-    let resources = requests[0]
-        .spec
+    let resources = inline_workload(&requests[0])
+        .resources
         .as_ref()
-        .and_then(|spec| spec.template.as_ref())
-        .and_then(|template| template.resources.as_ref())
         .expect("resource limits should be sent");
-    let limits = resources
-        .fields
-        .get("limits")
-        .and_then(|value| value.kind.as_ref())
-        .and_then(|kind| match kind {
-            prost_types::value::Kind::StructValue(inner) => Some(inner),
-            _ => None,
-        })
-        .expect("limits should be a struct");
-
-    assert_eq!(
-        limits
-            .fields
-            .get("cpu")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                _ => None,
-            }),
-        Some("500m")
-    );
-    assert_eq!(
-        limits
-            .fields
-            .get("memory")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                _ => None,
-            }),
-        Some("2Gi")
-    );
-    assert!(!resources.fields.contains_key("requests"));
+    assert_eq!(resources.cpu, "500m");
+    assert_eq!(resources.memory, "2Gi");
 }
 
 #[tokio::test]
-async fn sandbox_create_sends_driver_config_json() {
+async fn sandbox_create_rejects_direct_driver_config_json() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
     let xdg_dir = tempfile::tempdir().unwrap();
@@ -1299,7 +1300,7 @@ async fn sandbox_create_sends_driver_config_json() {
     let tls = test_tls(&server);
     install_fake_ssh(&fake_ssh_dir);
 
-    run::sandbox_create(
+    let err = run::sandbox_create(
         &server.endpoint,
         "openshell",
         run::SandboxCreateConfig {
@@ -1314,43 +1315,11 @@ async fn sandbox_create_sends_driver_config_json() {
         &tls,
     )
     .await
-    .expect("sandbox create should succeed");
-
-    let requests = create_requests(&server).await;
-    let driver_config = requests[0]
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.template.as_ref())
-        .and_then(|template| template.driver_config.as_ref())
-        .expect("driver config should be sent");
-    let kubernetes = driver_config
-        .fields
-        .get("kubernetes")
-        .and_then(|value| value.kind.as_ref())
-        .and_then(|kind| match kind {
-            prost_types::value::Kind::StructValue(inner) => Some(inner),
-            _ => None,
-        })
-        .expect("kubernetes block should be a struct");
-    let pod = kubernetes
-        .fields
-        .get("pod")
-        .and_then(|value| value.kind.as_ref())
-        .and_then(|kind| match kind {
-            prost_types::value::Kind::StructValue(inner) => Some(inner),
-            _ => None,
-        })
-        .expect("pod block should be a struct");
-
-    assert_eq!(
-        pod.fields
-            .get("priority_class_name")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                _ => None,
-            }),
-        Some("batch-low")
+    .expect_err("inline driver config should be rejected");
+    assert!(
+        err.to_string()
+            .contains("--driver-config-json is only supported through named sandbox templates"),
+        "unexpected error: {err:?}"
     );
 }
 
@@ -1379,14 +1348,13 @@ async fn sandbox_create_sends_gpu_default_request() {
     .expect("sandbox create should succeed");
 
     let requests = create_requests(&server).await;
-    let gpu = requests[0]
-        .spec
+    let gpu_count = inline_workload(&requests[0])
+        .resources
         .as_ref()
-        .and_then(|spec| spec.resource_requirements.as_ref())
-        .and_then(|requirements| requirements.gpu.as_ref())
+        .and_then(|resources| resources.gpu_count)
         .expect("GPU requirement should be sent");
 
-    assert_eq!(gpu.count, None);
+    assert_eq!(gpu_count, 1);
 }
 
 #[tokio::test]
@@ -1414,14 +1382,13 @@ async fn sandbox_create_sends_gpu_count_request() {
     .expect("sandbox create should succeed");
 
     let requests = create_requests(&server).await;
-    let gpu = requests[0]
-        .spec
+    let gpu_count = inline_workload(&requests[0])
+        .resources
         .as_ref()
-        .and_then(|spec| spec.resource_requirements.as_ref())
-        .and_then(|requirements| requirements.gpu.as_ref())
+        .and_then(|resources| resources.gpu_count)
         .expect("GPU requirement should be sent");
 
-    assert_eq!(gpu.count, Some(2));
+    assert_eq!(gpu_count, 2);
 }
 
 #[tokio::test]
@@ -1450,12 +1417,7 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
     .expect("sandbox create should succeed without inferred provider");
 
     let requests = create_requests(&server).await;
-    let providers = requests[0]
-        .spec
-        .as_ref()
-        .expect("sandbox spec should be sent")
-        .providers
-        .clone();
+    let providers = requests[0].providers.clone();
     assert!(
         providers.is_empty(),
         "providers v2 should not infer command providers, got {providers:?}"
@@ -1871,11 +1833,7 @@ async fn sandbox_create_sends_environment_variables() {
     .expect("sandbox create should succeed");
 
     let requests = create_requests(&server).await;
-    let environment = &requests[0]
-        .spec
-        .as_ref()
-        .expect("spec should be present")
-        .environment;
+    let environment = &inline_workload(&requests[0]).environment;
     assert_eq!(environment.get("FOO").map(String::as_str), Some("bar"));
     assert_eq!(
         environment.get("BAZ").map(String::as_str),

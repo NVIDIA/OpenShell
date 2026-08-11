@@ -19,8 +19,6 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
-use openshell_core::proto::GpuResourceRequirements;
-
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
     /// The gateway name (used for TLS cert directory, metadata lookup, etc.).
@@ -35,11 +33,11 @@ enum GpuCliRequest {
     Count(u32),
 }
 
-impl From<GpuCliRequest> for GpuResourceRequirements {
+impl From<GpuCliRequest> for u32 {
     fn from(gpu: GpuCliRequest) -> Self {
         match gpu {
-            GpuCliRequest::Count(count) => Self { count: Some(count) },
-            GpuCliRequest::DriverDefault => Self { count: None },
+            GpuCliRequest::Count(count) => count,
+            GpuCliRequest::DriverDefault => 1,
         }
     }
 }
@@ -1383,11 +1381,11 @@ enum SandboxCommands {
         #[arg(long)]
         memory: Option<String>,
 
-        /// Experimental driver-keyed JSON object for driver-specific sandbox settings.
-        /// Validation behavior is not yet finalized.
+        /// Deprecated direct-create driver config.
         ///
-        /// For Kubernetes, pass a value such as
-        /// `{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}`.
+        /// Driver-specific sandbox settings are supported through named sandbox
+        /// templates. Direct inline workload creates are portable and reject
+        /// this flag.
         #[arg(long, value_name = "JSON")]
         driver_config_json: Option<String>,
 
@@ -3041,7 +3039,7 @@ async fn run_async() -> Result<()> {
                         .map(|s| openshell_core::forward::ForwardSpec::parse(&s))
                         .transpose()?;
                     let keep = keep || !no_keep || editor.is_some() || forward.is_some();
-                    let gpu_requirements: Option<GpuResourceRequirements> = gpu.map(Into::into);
+                    let gpu_requirements: Option<u32> = gpu.map(Into::into);
 
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
@@ -4264,23 +4262,23 @@ mod tests {
 
     #[test]
     fn gpu_cli_request_option_maps_absent_gpu_to_no_requirements() {
-        let gpu: Option<GpuResourceRequirements> = Option::<GpuCliRequest>::None.map(Into::into);
+        let gpu: Option<u32> = Option::<GpuCliRequest>::None.map(Into::into);
 
         assert_eq!(gpu, None);
     }
 
     #[test]
-    fn gpu_cli_request_driver_default_converts_to_requirements() {
-        let gpu = GpuResourceRequirements::from(GpuCliRequest::DriverDefault);
+    fn gpu_cli_request_driver_default_converts_to_one_gpu() {
+        let gpu = u32::from(GpuCliRequest::DriverDefault);
 
-        assert_eq!(gpu.count, None);
+        assert_eq!(gpu, 1);
     }
 
     #[test]
-    fn gpu_cli_request_count_converts_to_requirements() {
-        let gpu = GpuResourceRequirements::from(GpuCliRequest::Count(2));
+    fn gpu_cli_request_count_converts_to_count() {
+        let gpu = u32::from(GpuCliRequest::Count(2));
 
-        assert_eq!(gpu.count, Some(2));
+        assert_eq!(gpu, 2);
     }
 
     #[test]

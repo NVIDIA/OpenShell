@@ -800,21 +800,21 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         providers,
         gpu,
     } = spec;
-    let template = image.map(|image| proto::SandboxTemplate {
-        image,
-        ..proto::SandboxTemplate::default()
+    let resources = gpu.then_some(proto::SandboxResources {
+        gpu_count: Some(1),
+        ..proto::SandboxResources::default()
     });
-    let resource_requirements = gpu.then_some(proto::ResourceRequirements {
-        gpu: Some(proto::GpuResourceRequirements { count: None }),
-    });
+    let workload = proto::SandboxWorkloadConfig {
+        image: image.unwrap_or_default(),
+        environment,
+        resources,
+    };
     proto::CreateSandboxRequest {
-        spec: Some(proto::SandboxSpec {
-            environment,
-            template,
-            providers,
-            resource_requirements,
-            ..proto::SandboxSpec::default()
-        }),
+        workload_source: Some(proto::create_sandbox_request::WorkloadSource::Workload(
+            workload,
+        )),
+        policy: None,
+        providers,
         name: name.unwrap_or_default(),
         labels,
         annotations: HashMap::new(),

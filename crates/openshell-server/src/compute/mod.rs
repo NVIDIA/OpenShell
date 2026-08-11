@@ -45,8 +45,8 @@ use openshell_core::proto::compute::v1::{
     gateway_listener_requirement::Selector, watch_sandboxes_event,
 };
 use openshell_core::proto::{
-    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxTemplate, ServiceEndpoint, SshSession,
+    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxResources, SandboxSpec,
+    SandboxStatus, SandboxWorkloadConfig, ServiceEndpoint, SshSession,
 };
 use openshell_core::{ObjectLabels, ObjectWorkspace};
 #[cfg(not(target_os = "windows"))]
@@ -3194,37 +3194,45 @@ fn driver_sandbox_spec_from_public(
     driver_name: &str,
 ) -> Result<DriverSandboxSpec, Box<Status>> {
     Ok(DriverSandboxSpec {
-        log_level: spec.log_level.clone(),
-        environment: spec.environment.clone(),
-        template: spec
-            .template
+        log_level: String::new(),
+        environment: spec
+            .workload
             .as_ref()
-            .map(|template| driver_sandbox_template_from_public(template, driver_name))
+            .map_or_else(Default::default, |workload| workload.environment.clone()),
+        template: spec
+            .workload
+            .as_ref()
+            .map(|workload| {
+                driver_sandbox_template_from_public(workload, &spec.driver_config, driver_name)
+            })
             .transpose()?,
-        resource_requirements: spec.resource_requirements.as_ref().map(|requirements| {
-            DriverSandboxResourceRequirements {
-                gpu: requirements
-                    .gpu
-                    .as_ref()
-                    .map(|gpu| DriverGpuResourceRequirements { count: gpu.count }),
-            }
+        resource_requirements: spec.workload.as_ref().and_then(|workload| {
+            let resources = workload.resources.as_ref()?;
+            openshell_core::gpu::sandbox_gpu_requested(Some(resources)).then_some(
+                DriverSandboxResourceRequirements {
+                    gpu: Some(DriverGpuResourceRequirements {
+                        count: resources.gpu_count,
+                    }),
+                },
+            )
         }),
         sandbox_token: String::new(),
     })
 }
 
 fn driver_sandbox_template_from_public(
-    template: &SandboxTemplate,
+    workload: &SandboxWorkloadConfig,
+    driver_config: &Option<prost_types::Struct>,
     driver_name: &str,
 ) -> Result<DriverSandboxTemplate, Box<Status>> {
     Ok(DriverSandboxTemplate {
-        image: template.image.clone(),
-        agent_socket_path: template.agent_socket.clone(),
-        labels: template.labels.clone(),
-        environment: template.environment.clone(),
-        resources: extract_typed_resources(&template.resources),
-        platform_config: build_platform_config(template),
-        driver_config: select_driver_config(&template.driver_config, driver_name)?,
+        image: workload.image.clone(),
+        agent_socket_path: String::new(),
+        labels: HashMap::default(),
+        environment: workload.environment.clone(),
+        resources: extract_typed_resources(workload.resources.as_ref()),
+        platform_config: None,
+        driver_config: select_driver_config(driver_config, driver_name)?,
     })
 }
 
@@ -3241,40 +3249,21 @@ fn select_driver_config(
     match value.kind.as_ref() {
         Some(prost_types::value::Kind::StructValue(inner)) => Ok(Some(inner.clone())),
         _ => Err(Box::new(Status::invalid_argument(format!(
-            "template.driver_config.{driver_name} must be an object"
+            "driver_config.{driver_name} must be an object"
         )))),
     }
 }
 
-/// Extract typed CPU/memory quantities from the public `resources` Struct.
-///
-/// The public API exposes resources as an untyped `google.protobuf.Struct`
-/// with the Kubernetes limits/requests shape. We pull out the well-known
-/// keys into the typed `DriverResourceRequirements` message.
+/// Extract typed CPU/memory quantities from portable public resources.
 fn extract_typed_resources(
-    resources: &Option<prost_types::Struct>,
+    resources: Option<&SandboxResources>,
 ) -> Option<DriverResourceRequirements> {
-    fn get_quantity(s: &prost_types::Struct, section: &str, key: &str) -> String {
-        s.fields
-            .get(section)
-            .and_then(|v| match v.kind.as_ref() {
-                Some(prost_types::value::Kind::StructValue(inner)) => inner.fields.get(key),
-                _ => None,
-            })
-            .and_then(|v| match v.kind.as_ref() {
-                Some(prost_types::value::Kind::StringValue(val)) => Some(val.clone()),
-                _ => None,
-            })
-            .unwrap_or_default()
-    }
-
-    let s = resources.as_ref()?;
-
+    let resources = resources?;
     let req = DriverResourceRequirements {
-        cpu_request: get_quantity(s, "requests", "cpu"),
-        cpu_limit: get_quantity(s, "limits", "cpu"),
-        memory_request: get_quantity(s, "requests", "memory"),
-        memory_limit: get_quantity(s, "limits", "memory"),
+        cpu_request: resources.cpu.clone(),
+        cpu_limit: resources.cpu.clone(),
+        memory_request: resources.memory.clone(),
+        memory_limit: resources.memory.clone(),
     };
 
     // Return None when all fields are empty so drivers can distinguish
@@ -3287,130 +3276,6 @@ fn extract_typed_resources(
         None
     } else {
         Some(req)
-    }
-}
-
-/// Build the opaque `platform_config` Struct from platform-specific public
-/// template fields (`runtime_class_name`, annotations) plus any resource fields
-/// beyond CPU/memory.
-fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Struct> {
-    use prost_types::{Struct, Value, value::Kind};
-
-    let mut fields = std::collections::BTreeMap::new();
-
-    if !template.runtime_class_name.is_empty() {
-        fields.insert(
-            "runtime_class_name".to_string(),
-            Value {
-                kind: Some(Kind::StringValue(template.runtime_class_name.clone())),
-            },
-        );
-    }
-
-    if !template.annotations.is_empty() {
-        let annotation_fields = template
-            .annotations
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    Value {
-                        kind: Some(Kind::StringValue(v.clone())),
-                    },
-                )
-            })
-            .collect();
-        fields.insert(
-            "annotations".to_string(),
-            Value {
-                kind: Some(Kind::StructValue(Struct {
-                    fields: annotation_fields,
-                })),
-            },
-        );
-    }
-
-    // Invert: the public API uses `user_namespaces: true` (positive sense)
-    // while the K8s driver expects `host_users: false` (K8s convention).
-    // The driver inverts this back via `!host_users` to resolve the final
-    // pod-level `hostUsers` field.
-    if let Some(user_ns) = template.user_namespaces {
-        fields.insert(
-            "host_users".to_string(),
-            Value {
-                kind: Some(Kind::BoolValue(!user_ns)),
-            },
-        );
-    }
-
-    // Pass through any resource fields that do not map to the typed
-    // DriverResourceRequirements so platform-specific drivers can still see
-    // custom resources such as GPU limits.
-    if let Some(res) = build_platform_resources_config(&template.resources) {
-        fields.insert(
-            "resources_raw".to_string(),
-            Value {
-                kind: Some(Kind::StructValue(res)),
-            },
-        );
-    }
-
-    if fields.is_empty() {
-        None
-    } else {
-        Some(Struct { fields })
-    }
-}
-
-fn build_platform_resources_config(
-    resources: &Option<prost_types::Struct>,
-) -> Option<prost_types::Struct> {
-    use prost_types::{Struct, Value, value::Kind};
-
-    let resources = resources.as_ref()?;
-    let mut fields = std::collections::BTreeMap::new();
-
-    for (section_name, value) in &resources.fields {
-        if !matches!(section_name.as_str(), "limits" | "requests") {
-            fields.insert(section_name.clone(), value.clone());
-            continue;
-        }
-
-        let Some(Kind::StructValue(section)) = value.kind.as_ref() else {
-            fields.insert(section_name.clone(), value.clone());
-            continue;
-        };
-
-        let section_fields = section
-            .fields
-            .iter()
-            .filter_map(|(resource_name, resource_value)| {
-                let is_typed_quantity = matches!(resource_name.as_str(), "cpu" | "memory")
-                    && matches!(resource_value.kind.as_ref(), Some(Kind::StringValue(_)));
-                if is_typed_quantity {
-                    None
-                } else {
-                    Some((resource_name.clone(), resource_value.clone()))
-                }
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-
-        if !section_fields.is_empty() {
-            fields.insert(
-                section_name.clone(),
-                Value {
-                    kind: Some(Kind::StructValue(Struct {
-                        fields: section_fields,
-                    })),
-                },
-            );
-        }
-    }
-
-    if fields.is_empty() {
-        None
-    } else {
-        Some(Struct { fields })
     }
 }
 
@@ -3442,6 +3307,12 @@ fn driver_condition_from_public(condition: &SandboxCondition) -> DriverCondition
 impl ObjectType for Sandbox {
     fn object_type() -> &'static str {
         "sandbox"
+    }
+}
+
+impl ObjectType for openshell_core::proto::SandboxTemplate {
+    fn object_type() -> &'static str {
+        "sandbox_template"
     }
 }
 
@@ -3773,7 +3644,8 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
 
 fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Option<&SandboxSpec>) {
     let gpu_requested = spec
-        .and_then(|sandbox_spec| sandbox_spec.resource_requirements.as_ref())
+        .and_then(|sandbox_spec| sandbox_spec.workload.as_ref())
+        .and_then(|workload| workload.resources.as_ref())
         .is_some_and(|requirements| openshell_core::gpu::sandbox_gpu_requested(Some(requirements)));
     if !gpu_requested {
         return;
@@ -4031,12 +3903,6 @@ mod tests {
         }
     }
 
-    fn number_value(value: f64) -> prost_types::Value {
-        prost_types::Value {
-            kind: Some(prost_types::value::Kind::NumberValue(value)),
-        }
-    }
-
     fn struct_value(
         fields: impl IntoIterator<Item = (impl Into<String>, prost_types::Value)>,
     ) -> prost_types::Value {
@@ -4053,8 +3919,12 @@ mod tests {
     #[test]
     fn driver_sandbox_spec_from_public_preserves_gpu_requirement() {
         let public = SandboxSpec {
-            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
-                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(2) }),
+            workload: Some(SandboxWorkloadConfig {
+                resources: Some(SandboxResources {
+                    gpu_count: Some(2),
+                    ..Default::default()
+                }),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -4135,7 +4005,7 @@ mod tests {
         let err = select_driver_config(&Some(config), "kubernetes").unwrap_err();
 
         assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("template.driver_config.kubernetes"));
+        assert!(err.message().contains("driver_config.kubernetes"));
     }
 
     #[derive(Debug, Default)]
@@ -5075,123 +4945,6 @@ mod tests {
     }
 
     #[test]
-    fn build_platform_config_omits_typed_cpu_and_memory_resources() {
-        let template = SandboxTemplate {
-            resources: Some(prost_types::Struct {
-                fields: [
-                    (
-                        "limits",
-                        struct_value([("cpu", string_value("2")), ("memory", string_value("1Gi"))]),
-                    ),
-                    (
-                        "requests",
-                        struct_value([
-                            ("cpu", string_value("500m")),
-                            ("memory", string_value("512Mi")),
-                        ]),
-                    ),
-                ]
-                .into_iter()
-                .map(|(key, value)| (key.to_string(), value))
-                .collect(),
-            }),
-            ..Default::default()
-        };
-
-        assert!(build_platform_config(&template).is_none());
-    }
-
-    #[test]
-    fn build_platform_config_preserves_non_typed_resource_fields() {
-        let template = SandboxTemplate {
-            resources: Some(prost_types::Struct {
-                fields: [
-                    (
-                        "limits",
-                        struct_value([
-                            ("cpu", string_value("2")),
-                            ("memory", string_value("1Gi")),
-                            ("nvidia.com/gpu", string_value("1")),
-                        ]),
-                    ),
-                    (
-                        "requests",
-                        struct_value([
-                            ("cpu", string_value("500m")),
-                            ("memory", string_value("512Mi")),
-                            ("hugepages-2Mi", string_value("4Mi")),
-                        ]),
-                    ),
-                    ("opaque_cpu", number_value(2.0)),
-                ]
-                .into_iter()
-                .map(|(key, value)| (key.to_string(), value))
-                .collect(),
-            }),
-            ..Default::default()
-        };
-
-        let platform_config = build_platform_config(&template).unwrap();
-        let resources_raw = platform_config
-            .fields
-            .get("resources_raw")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StructValue(inner) => Some(inner),
-                _ => None,
-            })
-            .unwrap();
-
-        let limits = resources_raw
-            .fields
-            .get("limits")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StructValue(inner) => Some(inner),
-                _ => None,
-            })
-            .unwrap();
-        assert!(!limits.fields.contains_key("cpu"));
-        assert!(!limits.fields.contains_key("memory"));
-        assert_eq!(
-            limits
-                .fields
-                .get("nvidia.com/gpu")
-                .and_then(|value| value.kind.as_ref())
-                .and_then(|kind| match kind {
-                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                    _ => None,
-                }),
-            Some("1")
-        );
-
-        let requests = resources_raw
-            .fields
-            .get("requests")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StructValue(inner) => Some(inner),
-                _ => None,
-            })
-            .unwrap();
-        assert!(!requests.fields.contains_key("cpu"));
-        assert!(!requests.fields.contains_key("memory"));
-        assert_eq!(
-            requests
-                .fields
-                .get("hugepages-2Mi")
-                .and_then(|value| value.kind.as_ref())
-                .and_then(|kind| match kind {
-                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                    _ => None,
-                }),
-            Some("4Mi")
-        );
-
-        assert!(resources_raw.fields.contains_key("opaque_cpu"));
-    }
-
-    #[test]
     fn rewrite_user_facing_conditions_rewrites_gpu_unschedulable_message() {
         let mut status = Some(SandboxStatus {
             sandbox_name: "test".to_string(),
@@ -5209,8 +4962,12 @@ mod tests {
         rewrite_user_facing_conditions(
             &mut status,
             Some(&SandboxSpec {
-                resource_requirements: Some(openshell_core::proto::ResourceRequirements {
-                    gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                workload: Some(SandboxWorkloadConfig {
+                    resources: Some(SandboxResources {
+                        gpu_count: Some(1),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -6156,8 +5913,7 @@ mod tests {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         sandbox.spec = Some(SandboxSpec {
-            log_level: "debug".to_string(),
-            template: Some(SandboxTemplate {
+            workload: Some(SandboxWorkloadConfig {
                 image: "example.test/sandbox:complete".to_string(),
                 ..Default::default()
             }),
@@ -6180,8 +5936,8 @@ mod tests {
             stored
                 .spec
                 .as_ref()
-                .and_then(|spec| spec.template.as_ref())
-                .map(|template| template.image.as_str()),
+                .and_then(|spec| spec.workload.as_ref())
+                .map(|workload| workload.image.as_str()),
             Some("example.test/sandbox:complete")
         );
         assert_eq!(
@@ -6937,7 +6693,10 @@ mod tests {
         let runtime = test_runtime(driver).await;
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         sandbox.spec = Some(SandboxSpec {
-            log_level: "debug".to_string(),
+            workload: Some(SandboxWorkloadConfig {
+                environment: HashMap::from([("DEBUG_MARKER".to_string(), "true".to_string())]),
+                ..Default::default()
+            }),
             ..Default::default()
         });
         runtime.store.put_message(&sandbox).await.unwrap();
@@ -6961,8 +6720,13 @@ mod tests {
         );
         assert_sandbox_owned_records(&runtime, &sandbox, &session, true).await;
         assert_eq!(
-            stored.spec.as_ref().map(|spec| spec.log_level.as_str()),
-            Some("debug")
+            stored
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.workload.as_ref())
+                .and_then(|workload| workload.environment.get("DEBUG_MARKER"))
+                .map(String::as_str),
+            Some("true")
         );
     }
 
@@ -7696,8 +7460,12 @@ mod tests {
 
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
-                resource_requirements: Some(openshell_core::proto::ResourceRequirements {
-                    gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                workload: Some(SandboxWorkloadConfig {
+                    resources: Some(SandboxResources {
+                        gpu_count: Some(1),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -7723,7 +7491,12 @@ mod tests {
             SandboxPhase::Ready
         );
         assert!(stored.spec.as_ref().is_some_and(|spec| {
-            openshell_core::gpu::sandbox_gpu_requested(spec.resource_requirements.as_ref())
+            spec.workload
+                .as_ref()
+                .and_then(|workload| workload.resources.as_ref())
+                .is_some_and(|resources| {
+                    openshell_core::gpu::sandbox_gpu_requested(Some(resources))
+                })
         }));
     }
 
@@ -8199,48 +7972,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_platform_config_inverts_user_namespaces_to_host_users() {
-        use prost_types::value::Kind;
-
-        // user_namespaces: true  → host_users: false
-        let mut template = SandboxTemplate {
-            user_namespaces: Some(true),
-            ..SandboxTemplate::default()
-        };
-        let config = build_platform_config(&template).expect("config should be Some");
-        let host_users = config
-            .fields
-            .get("host_users")
-            .expect("host_users must exist");
-        assert_eq!(
-            host_users.kind,
-            Some(Kind::BoolValue(false)),
-            "user_namespaces: true must produce host_users: false"
-        );
-
-        // user_namespaces: false → host_users: true
-        template.user_namespaces = Some(false);
-        let config = build_platform_config(&template).expect("config should be Some");
-        let host_users = config
-            .fields
-            .get("host_users")
-            .expect("host_users must exist");
-        assert_eq!(
-            host_users.kind,
-            Some(Kind::BoolValue(true)),
-            "user_namespaces: false must produce host_users: true"
-        );
-
-        // user_namespaces: None → host_users absent
-        template.user_namespaces = None;
-        let config = build_platform_config(&template);
-        assert!(
-            config.is_none() || !config.as_ref().unwrap().fields.contains_key("host_users"),
-            "unset user_namespaces must not produce host_users"
-        );
-    }
-
     #[tokio::test]
     async fn compute_driver_initialization_records_an_operation_span() {
         use crate::otel_tracing::test_exporter;
@@ -8444,24 +8175,23 @@ mod tests {
 
         let mut sandbox = sandbox_record("sb-uds", "uds-sandbox", SandboxPhase::Provisioning);
         sandbox.spec = Some(SandboxSpec {
-            log_level: "debug".to_string(),
-            template: Some(SandboxTemplate {
+            workload: Some(SandboxWorkloadConfig {
                 image: "ghcr.io/nvidia/openshell/sandbox:test".to_string(),
-                driver_config: Some(prost_types::Struct {
-                    fields: [
-                        (
-                            "external-test".to_string(),
-                            struct_value([("pool", string_value("ci"))]),
-                        ),
-                        (
-                            "docker".to_string(),
-                            struct_value([("network_mode", string_value("bridge"))]),
-                        ),
-                    ]
-                    .into_iter()
-                    .collect(),
-                }),
                 ..Default::default()
+            }),
+            driver_config: Some(prost_types::Struct {
+                fields: [
+                    (
+                        "external-test".to_string(),
+                        struct_value([("pool", string_value("ci"))]),
+                    ),
+                    (
+                        "docker".to_string(),
+                        struct_value([("network_mode", string_value("bridge"))]),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
             }),
             ..Default::default()
         });

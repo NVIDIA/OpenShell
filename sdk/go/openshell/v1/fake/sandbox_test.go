@@ -30,10 +30,13 @@ func TestSandbox_Create(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{LogLevel: "debug"}, map[string]string{"env": "test"})
+	sb, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{
+		Workload: &types.SandboxWorkloadConfig{Image: "img:v1"},
+	}, map[string]string{"env": "test"})
 	require.NoError(t, err)
 	assert.Equal(t, "test-sb", sb.Name)
-	assert.Equal(t, "debug", sb.Spec.LogLevel)
+	require.NotNil(t, sb.Spec.Workload)
+	assert.Equal(t, "img:v1", sb.Spec.Workload.Image)
 	assert.Equal(t, "test", sb.Labels["env"])
 	assert.Equal(t, types.SandboxProvisioning, sb.Status.Phase)
 	assert.NotZero(t, sb.CreatedAt)
@@ -137,22 +140,28 @@ func TestCopyAnyMap(t *testing.T) {
 
 func TestCopySandboxTemplate_ResourcesDeepCopy(t *testing.T) {
 	tmpl := types.SandboxTemplate{
-		Image:        "img:v1",
-		Resources:    map[string]any{"cpu": "2", "nested": map[string]any{"key": "val"}},
-		DriverConfig: map[string]any{"runtime": "kata"},
+		Spec: types.SandboxTemplateSpec{
+			Workload: &types.SandboxWorkloadConfig{
+				Image: "img:v1",
+				Resources: &types.SandboxResources{
+					CPU: "2",
+				},
+			},
+			DriverConfig: map[string]any{"runtime": "kata", "nested": map[string]any{"key": "val"}},
+		},
 	}
 
 	copied := copySandboxTemplate(tmpl)
 
-	tmpl.Resources["cpu"] = "MUTATED"
-	assert.Equal(t, "2", copied.Resources["cpu"])
+	tmpl.Spec.Workload.Resources.CPU = "MUTATED"
+	assert.Equal(t, "2", copied.Spec.Workload.Resources.CPU)
 
-	tmpl.DriverConfig["runtime"] = "MUTATED"
-	assert.Equal(t, "kata", copied.DriverConfig["runtime"])
+	tmpl.Spec.DriverConfig["runtime"] = "MUTATED"
+	assert.Equal(t, "kata", copied.Spec.DriverConfig["runtime"])
 
-	nested := tmpl.Resources["nested"].(map[string]any)
+	nested := tmpl.Spec.DriverConfig["nested"].(map[string]any)
 	nested["key"] = "MUTATED"
-	copiedNested := copied.Resources["nested"].(map[string]any)
+	copiedNested := copied.Spec.DriverConfig["nested"].(map[string]any)
 	assert.Equal(t, "val", copiedNested["key"])
 }
 
@@ -169,13 +178,16 @@ func TestSandbox_Get(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{LogLevel: "info"}, nil)
+	_, err := sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{
+		Workload: &types.SandboxWorkloadConfig{Image: "img:v1"},
+	}, nil)
 	require.NoError(t, err)
 
 	got, err := sc.Get(ctx, "default", "test-sb")
 	require.NoError(t, err)
 	assert.Equal(t, "test-sb", got.Name)
-	assert.Equal(t, "info", got.Spec.LogLevel)
+	require.NotNil(t, got.Spec.Workload)
+	assert.Equal(t, "img:v1", got.Spec.Workload.Image)
 }
 
 func TestSandbox_Get_NotFound(t *testing.T) {
@@ -237,8 +249,10 @@ func TestSandbox_DeepCopy_OnCreate(t *testing.T) {
 
 	labels := map[string]string{"env": "test"}
 	spec := &types.SandboxSpec{
-		LogLevel:    "debug",
-		Environment: map[string]string{"KEY": "value"},
+		Workload: &types.SandboxWorkloadConfig{
+			Image:       "img:v1",
+			Environment: map[string]string{"KEY": "value"},
+		},
 	}
 
 	sb, err := sc.Create(ctx, "default", "test-sb", spec, labels)
@@ -246,14 +260,15 @@ func TestSandbox_DeepCopy_OnCreate(t *testing.T) {
 
 	// Mutating inputs should not affect stored object
 	labels["env"] = "mutated"
-	spec.LogLevel = "mutated"
-	spec.Environment["KEY"] = "mutated"
+	spec.Workload.Image = "mutated"
+	spec.Workload.Environment["KEY"] = "mutated"
 
 	got, err := sc.Get(ctx, "default", "test-sb")
 	require.NoError(t, err)
 	assert.Equal(t, "test", got.Labels["env"])
-	assert.Equal(t, "debug", got.Spec.LogLevel)
-	assert.Equal(t, "value", got.Spec.Environment["KEY"])
+	require.NotNil(t, got.Spec.Workload)
+	assert.Equal(t, "img:v1", got.Spec.Workload.Image)
+	assert.Equal(t, "value", got.Spec.Workload.Environment["KEY"])
 
 	// Mutating returned object should not affect stored object
 	sb.Labels["env"] = "mutated-return"
@@ -267,17 +282,19 @@ func TestSandbox_DeepCopy_OnGet(t *testing.T) {
 	ctx := context.Background()
 
 	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{
-		Environment: map[string]string{"KEY": "value"},
+		Workload: &types.SandboxWorkloadConfig{
+			Environment: map[string]string{"KEY": "value"},
+		},
 	}, nil)
 
 	got, err := sc.Get(ctx, "default", "test-sb")
 	require.NoError(t, err)
 
-	got.Spec.Environment["KEY"] = "mutated"
+	got.Spec.Workload.Environment["KEY"] = "mutated"
 
 	got2, err := sc.Get(ctx, "default", "test-sb")
 	require.NoError(t, err)
-	assert.Equal(t, "value", got2.Spec.Environment["KEY"])
+	assert.Equal(t, "value", got2.Spec.Workload.Environment["KEY"])
 }
 
 // --- T009: WaitReady tests ---
@@ -393,14 +410,17 @@ func TestSandbox_Watch_AddedOnCreate(t *testing.T) {
 	require.NoError(t, err)
 	defer w.Stop()
 
-	_, err = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{LogLevel: "info"}, nil)
+	_, err = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{
+		Workload: &types.SandboxWorkloadConfig{Image: "watch:v1"},
+	}, nil)
 	require.NoError(t, err)
 
 	select {
 	case ev := <-w.ResultChan():
 		assert.Equal(t, types.EventAdded, ev.Type)
 		assert.Equal(t, "test-sb", ev.Object.Name)
-		assert.Equal(t, "info", ev.Object.Spec.LogLevel)
+		require.NotNil(t, ev.Object.Spec.Workload)
+		assert.Equal(t, "watch:v1", ev.Object.Spec.Workload.Image)
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for ADDED event")
 	}
@@ -516,7 +536,9 @@ func TestSandbox_Watch_DeletedEventContainsFullObject(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{LogLevel: "debug"}, map[string]string{"env": "test"})
+	_, _ = sc.Create(ctx, "default", "test-sb", &types.SandboxSpec{
+		Workload: &types.SandboxWorkloadConfig{Image: "deleted:v1"},
+	}, map[string]string{"env": "test"})
 
 	w, err := sc.Watch(ctx, "default", "")
 	require.NoError(t, err)
@@ -528,7 +550,8 @@ func TestSandbox_Watch_DeletedEventContainsFullObject(t *testing.T) {
 	case ev := <-w.ResultChan():
 		assert.Equal(t, types.EventDeleted, ev.Type)
 		// Verify the DELETED event contains the full last-known object
-		assert.Equal(t, "debug", ev.Object.Spec.LogLevel)
+		require.NotNil(t, ev.Object.Spec.Workload)
+		assert.Equal(t, "deleted:v1", ev.Object.Spec.Workload.Image)
 		assert.Equal(t, "test", ev.Object.Labels["env"])
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for DELETED event")
@@ -564,7 +587,9 @@ func TestSandbox_ConcurrentCreateGetDeleteWatch(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < opsPerGoroutine; j++ {
 				name := fmt.Sprintf("sb-%d-%d", id, j)
-				_, _ = sc.Create(ctx, "default", name, &types.SandboxSpec{LogLevel: "info"}, nil)
+				_, _ = sc.Create(ctx, "default", name, &types.SandboxSpec{
+					Workload: &types.SandboxWorkloadConfig{Image: "concurrent:v1"},
+				}, nil)
 				_, _ = sc.Get(ctx, "default", name)
 				_, _ = sc.List(ctx, "default")
 				_, _ = sc.WaitReady(ctx, "default", name)
@@ -821,7 +846,7 @@ func TestFakeSandboxCreateWithPolicy(t *testing.T) {
 	ctx := context.Background()
 
 	spec := &types.SandboxSpec{
-		LogLevel: "debug",
+		Workload: &types.SandboxWorkloadConfig{Image: "policy:v1"},
 		Policy: &types.SandboxPolicy{
 			Version: 3,
 			Filesystem: &types.FilesystemPolicy{
@@ -904,7 +929,9 @@ func TestFakeSandboxCreateWithNilPolicy(t *testing.T) {
 	sc := newTestSandboxClient()
 	ctx := context.Background()
 
-	created, err := sc.Create(ctx, "default", "no-policy-sb", &types.SandboxSpec{LogLevel: "info"}, nil)
+	created, err := sc.Create(ctx, "default", "no-policy-sb", &types.SandboxSpec{
+		Workload: &types.SandboxWorkloadConfig{Image: "no-policy:v1"},
+	}, nil)
 	require.NoError(t, err)
 	assert.Nil(t, created.Spec.Policy)
 

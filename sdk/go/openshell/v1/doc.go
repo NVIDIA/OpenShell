@@ -22,8 +22,10 @@
 // # Sandbox Lifecycle
 //
 //	sandbox, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{
-//	    Template: &v1.SandboxTemplate{Image: "python:3.12"},
-//	    Environment: map[string]string{"LANG": "en_US.UTF-8"},
+//	    Workload: &v1.SandboxWorkloadConfig{
+//	        Image:       "python:3.12",
+//	        Environment: map[string]string{"LANG": "en_US.UTF-8"},
+//	    },
 //	}, nil)
 //	if err != nil {
 //	    log.Fatal(err)
@@ -278,7 +280,7 @@
 // Set an initial security policy when creating a sandbox:
 //
 //	sandbox, err := client.Sandboxes().Create(ctx, "default", "secure-sandbox", &v1.SandboxSpec{
-//	    Template: &v1.SandboxTemplate{Image: "python:3.12"},
+//	    Workload: &v1.SandboxWorkloadConfig{Image: "python:3.12"},
 //	    Policy: &v1.SandboxPolicy{
 //	        Version: 1,
 //	        Filesystem: &v1.FilesystemPolicy{

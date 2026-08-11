@@ -592,7 +592,7 @@ pub fn ready_false_condition_message(
 
 pub fn provisioning_timeout_message(
     timeout_secs: u64,
-    resource_requirements: Option<&openshell_core::proto::ResourceRequirements>,
+    resources: Option<&openshell_core::proto::SandboxResources>,
     condition_message: Option<&str>,
 ) -> String {
     let mut message = format!("sandbox provisioning timed out after {timeout_secs}s");
@@ -602,7 +602,7 @@ pub fn provisioning_timeout_message(
         message.push_str(condition_message);
     }
 
-    if resource_requirements.is_some_and(|requirements| requirements.gpu.is_some()) {
+    if resources.is_some_and(|resources| resources.gpu_count.is_some()) {
         message.push_str(
             ". Hint: this may be because the available GPU is already in use by another sandbox.",
         );

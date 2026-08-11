@@ -32,12 +32,16 @@ func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec
 	}
 	req := &pb.CreateSandboxRequest{
 		Name:      name,
-		Spec:      protoSpec,
 		Labels:    labels,
 		Workspace: workspace,
 	}
 	if len(opts) > 0 {
 		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
+	}
+	if protoSpec != nil {
+		req.WorkloadSource = &pb.CreateSandboxRequest_Workload{Workload: protoSpec.GetWorkload()}
+		req.Policy = protoSpec.GetPolicy()
+		req.Providers = protoSpec.GetProviders()
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
