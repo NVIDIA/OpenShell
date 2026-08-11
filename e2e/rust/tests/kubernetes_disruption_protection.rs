@@ -99,6 +99,39 @@ async fn sandbox_disruption_protection_denies_eviction_and_expires() {
     sandbox.cleanup().await;
 }
 
+#[tokio::test]
+async fn sandbox_delete_removes_active_disruption_protection() {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        % 1_000_000_000;
+    let sandbox_name = format!("pdb-delete-e2e-{suffix}");
+    let driver_config = r#"{"kubernetes":{"disruption_protection":{"duration":"30m"}}}"#;
+    let mut sandbox = SandboxGuard::create_keep_with_args(
+        &[
+            "--name",
+            &sandbox_name,
+            "--driver-config-json",
+            driver_config,
+        ],
+        &["sh", "-lc", "echo pdb-delete-ready; sleep infinity"],
+        "pdb-delete-ready",
+    )
+    .await
+    .expect("create disruption-protected Kubernetes sandbox for deletion");
+
+    let sandbox_object = wait_for_sandbox_object(&sandbox_name).await;
+    let kube_name = sandbox_object["metadata"]["name"]
+        .as_str()
+        .expect("Sandbox metadata.name")
+        .to_string();
+    wait_for_effective_pdb(&kube_name).await;
+
+    sandbox.cleanup().await;
+    wait_for_pdb_deletion(&kube_name).await;
+}
+
 async fn wait_for_sandbox_object(sandbox_name: &str) -> Value {
     let selector = format!("openshell.ai/sandbox-name={sandbox_name}");
     for _ in 0..30 {

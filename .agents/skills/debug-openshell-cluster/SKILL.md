@@ -439,8 +439,9 @@ kubectl -n <gateway-namespace> get configmap <gateway-configmap> -o jsonpath='{.
 PDB_RESOURCE=$(kubectl -n <sandbox-namespace> get sandboxes.agents.x-k8s.io -l 'openshell.ai/sandbox-name=<sandbox-name>,openshell.ai/sandbox-workspace=<workspace>' -o jsonpath='{.items[0].metadata.name}')
 kubectl -n <sandbox-namespace> get sandbox "$PDB_RESOURCE" -o go-template='{{ index .metadata.annotations "openshell.io/disruption-protected-until" }}{{ "\n" }}'
 kubectl -n <sandbox-namespace> get poddisruptionbudget "$PDB_RESOURCE" -o yaml
-kubectl auth can-i --as=system:serviceaccount:<gateway-namespace>:<gateway-service-account> get poddisruptionbudgets.policy -n <sandbox-namespace>
-kubectl auth can-i --as=system:serviceaccount:<gateway-namespace>:<gateway-service-account> patch poddisruptionbudgets.policy -n <sandbox-namespace>
+for verb in create delete get list patch; do
+  kubectl auth can-i --as=system:serviceaccount:<gateway-namespace>:<gateway-service-account> "$verb" poddisruptionbudgets.policy -n <sandbox-namespace>
+done
 ```
 
 Both opt-ins are required: Helm
@@ -471,7 +472,8 @@ the gateway rejects projected tokens from other service accounts.
 helm -n <gateway-namespace> get values <release-name> | grep -A3 sandboxServiceAccount
 kubectl -n <sandbox-namespace> get serviceaccount <sandbox-service-account>
 kubectl -n <gateway-namespace> get configmap <gateway-configmap> -o jsonpath='{.data.gateway\.toml}'
-kubectl -n <sandbox-namespace> get sandboxes.agents.x-k8s.io "$PDB_RESOURCE" -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
+SANDBOX_RESOURCE=$(kubectl -n <sandbox-namespace> get sandboxes.agents.x-k8s.io -l 'openshell.ai/sandbox-name=<sandbox-name>,openshell.ai/sandbox-workspace=<workspace>' -o jsonpath='{.items[0].metadata.name}')
+kubectl -n <sandbox-namespace> get sandboxes.agents.x-k8s.io "$SANDBOX_RESOURCE" -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
 ```
 
 If `topology = "sidecar"` is rendered under `[openshell.drivers.kubernetes]`,
