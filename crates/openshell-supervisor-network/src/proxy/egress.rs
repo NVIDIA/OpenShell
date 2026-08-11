@@ -38,6 +38,9 @@ pub(super) struct EndpointDecision {
     pub(super) destination: Option<DestinationValidationPlan>,
     /// Raw endpoint configs returned with the authoritative egress decision.
     pub(super) policy_configs: Vec<regorus::Value>,
+    /// Full endpoint identities and metadata captured in the same generation.
+    #[allow(dead_code, reason = "consumed when the policy DNS adapter lands")]
+    pub(super) matched_endpoints: Vec<crate::opa::MatchedEndpoint>,
     /// Whether policy matched the requested hostname exactly (not by glob).
     pub(super) exact_declared_host: bool,
 }
@@ -49,6 +52,7 @@ impl Default for EndpointDecision {
             l7_route: None,
             destination: None,
             policy_configs: Vec::new(),
+            matched_endpoints: Vec::new(),
             exact_declared_host: false,
         }
     }
@@ -58,6 +62,7 @@ impl EndpointDecision {
     pub(super) fn from_authorization(authorization: &crate::opa::EgressAuthorization) -> Self {
         Self {
             policy_configs: authorization.endpoint_configs.clone(),
+            matched_endpoints: authorization.matched_endpoints.clone(),
             exact_declared_host: authorization.exact_declared_endpoint_host,
             ..Self::default()
         }

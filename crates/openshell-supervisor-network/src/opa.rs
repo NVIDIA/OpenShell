@@ -50,11 +50,20 @@ pub enum NetworkAction {
     Deny { reason: String },
 }
 
+/// Endpoint identity and metadata captured with one policy generation.
+#[derive(Debug, Clone)]
+pub struct MatchedEndpoint {
+    pub policy_name: String,
+    pub endpoint_index: usize,
+    pub endpoint: regorus::Value,
+}
+
 /// Atomic policy result used to authorize and materialize one egress request.
 #[derive(Debug, Clone)]
 pub struct EgressAuthorization {
     pub action: NetworkAction,
     pub endpoint_configs: Vec<regorus::Value>,
+    pub matched_endpoints: Vec<MatchedEndpoint>,
     pub exact_declared_endpoint_host: bool,
     pub generation: u64,
 }
@@ -544,6 +553,7 @@ impl OpaEngine {
             return Ok(EgressAuthorization {
                 action: NetworkAction::Deny { reason },
                 endpoint_configs: Vec::new(),
+                matched_endpoints: Vec::new(),
                 exact_declared_endpoint_host: false,
                 generation,
             });
@@ -558,6 +568,12 @@ impl OpaEngine {
         let matched_policy = get_str(&result, "matched_policy").filter(|name| !name.is_empty());
         let endpoint_configs = match get_field(&result, "endpoint_configs") {
             Some(regorus::Value::Array(values)) => values.to_vec(),
+            _ => Vec::new(),
+        };
+        let matched_endpoints = match get_field(&result, "matched_endpoints") {
+            Some(regorus::Value::Array(values)) => {
+                values.iter().filter_map(parse_matched_endpoint).collect()
+            }
             _ => Vec::new(),
         };
         let exact_declared_endpoint_host =
@@ -576,6 +592,7 @@ impl OpaEngine {
         Ok(EgressAuthorization {
             action,
             endpoint_configs,
+            matched_endpoints,
             exact_declared_endpoint_host,
             generation,
         })
@@ -1170,6 +1187,21 @@ fn get_field<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a regorus::Valu
         regorus::Value::Object(map) => map.get(&key_val),
         _ => None,
     }
+}
+
+fn parse_matched_endpoint(value: &regorus::Value) -> Option<MatchedEndpoint> {
+    let policy_name = get_str(value, "policy_name")?;
+    let endpoint_index = match get_field(value, "endpoint_index")? {
+        regorus::Value::Number(number) => usize::try_from(number.as_i64()?).ok()?,
+        _ => return None,
+    };
+    let endpoint = get_field(value, "endpoint")?.clone();
+
+    Some(MatchedEndpoint {
+        policy_name,
+        endpoint_index,
+        endpoint,
+    })
 }
 
 fn regorus_value_to_struct(value: &regorus::Value) -> prost_types::Struct {
@@ -1843,6 +1875,11 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     }
                     if !e.signing_region.is_empty() {
                         ep["signing_region"] = e.signing_region.clone().into();
+                    }
+                    if let Some(binding) = &e.credential_binding {
+                        ep["credential_binding"] = serde_json::json!({
+                            "provider": binding.provider.clone(),
+                        });
                     }
                     if !e.persisted_queries.is_empty() {
                         ep["persisted_queries"] = e.persisted_queries.clone().into();
@@ -5398,6 +5435,18 @@ process:
             }
         );
 
+        let authorization = engine.authorize_egress(&input).unwrap();
+        let mut endpoint_identities = authorization
+            .matched_endpoints
+            .iter()
+            .map(|matched| (matched.policy_name.as_str(), matched.endpoint_index))
+            .collect::<Vec<_>>();
+        endpoint_identities.sort_unstable();
+        assert_eq!(
+            endpoint_identities,
+            [("allow_192_168_1_100_8567", 0), ("test_server", 0),]
+        );
+
         let (configs, generation) = engine
             .query_endpoint_configs_with_generation(&input)
             .unwrap();
@@ -5867,6 +5916,92 @@ process:
             get_str_array(&authorization.endpoint_configs[0], "allowed_ips"),
             vec!["10.0.5.0/24"]
         );
+        assert_eq!(authorization.matched_endpoints.len(), 1);
+        assert_eq!(
+            authorization.matched_endpoints[0].policy_name,
+            "internal_api"
+        );
+        assert_eq!(authorization.matched_endpoints[0].endpoint_index, 0);
+        assert_eq!(
+            get_str(&authorization.matched_endpoints[0].endpoint, "host").as_deref(),
+            Some("my-service.corp.net")
+        );
+    }
+
+    #[test]
+    fn egress_authorization_preserves_explicit_tcp_endpoint_identity() {
+        let engine = OpaEngine::from_strings(
+            TEST_POLICY,
+            r#"
+network_policies:
+  native_tcp:
+    name: native_tcp
+    endpoints:
+      - host: database.example.com
+        port: 5432
+        protocol: tcp
+    binaries:
+      - path: /usr/bin/client
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#,
+        )
+        .expect("explicit TCP policy should load");
+        let input = NetworkInput {
+            host: "database.example.com".into(),
+            port: 5432,
+            binary_path: PathBuf::from("/usr/bin/client"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let authorization = engine.authorize_egress(&input).unwrap();
+
+        assert!(authorization.endpoint_configs.is_empty());
+        assert_eq!(authorization.matched_endpoints.len(), 1);
+        let matched = &authorization.matched_endpoints[0];
+        assert_eq!(matched.policy_name, "native_tcp");
+        assert_eq!(matched.endpoint_index, 0);
+        assert_eq!(
+            get_str(&matched.endpoint, "protocol").as_deref(),
+            Some("tcp")
+        );
+    }
+
+    #[test]
+    fn proto_activation_rejects_explicit_tcp_credential_binding() {
+        let proto = openshell_policy::parse_sandbox_policy(
+            r#"
+version: 1
+network_policies:
+  native_tcp:
+    name: native_tcp
+    endpoints:
+      - host: database.example.com
+        port: 5432
+        protocol: tcp
+        credential_binding:
+          provider: database
+    binaries:
+      - path: /usr/bin/client
+"#,
+        )
+        .expect("policy should parse before semantic validation");
+
+        let error = OpaEngine::from_proto(&proto)
+            .err()
+            .expect("explicit TCP must reject credential binding during activation");
+
+        assert!(error.to_string().contains("credential_binding"));
+        assert!(error.to_string().contains("protocol tcp"));
     }
 
     #[test]

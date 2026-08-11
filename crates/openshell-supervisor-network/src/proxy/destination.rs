@@ -20,7 +20,14 @@ pub(super) enum AddressAuthorization {
     ExplicitAllowedIps(Vec<IpNet>),
     ExactDeclaredHost,
     ImplicitIpLiteral(IpAddr),
-    TrustedGatewayAlias { expected_ip: IpAddr },
+    TrustedGatewayAlias {
+        expected_ip: IpAddr,
+    },
+    /// Addresses already resolved and authorized by policy DNS. This mode must
+    /// never resolve `DestinationRequest::host` again before constructing the
+    /// unopened connector.
+    #[allow(dead_code, reason = "used when the policy DNS adapter lands")]
+    PinnedResolved(Vec<IpAddr>),
 }
 
 /// Fully materialized input to shared destination validation.
@@ -91,6 +98,24 @@ pub(super) fn build_validation_plan(
 
     Ok(DestinationValidationPlan {
         address_authorization,
+    })
+}
+
+/// Build the destination mode used by policy DNS after it has validated and
+/// pinned a non-empty answer set for an endpoint.
+#[allow(dead_code, reason = "used when the policy DNS adapter lands")]
+pub(super) fn build_pinned_validation_plan(
+    addresses: Vec<IpAddr>,
+) -> Result<DestinationValidationPlan, DestinationDenial> {
+    if addresses.is_empty() {
+        return Err(DestinationDenial::new(
+            DestinationDenialKind::InvalidAllowedIps,
+            "policy DNS produced an empty pinned address set".to_string(),
+        ));
+    }
+
+    Ok(DestinationValidationPlan {
+        address_authorization: AddressAuthorization::PinnedResolved(addresses),
     })
 }
 
@@ -179,6 +204,11 @@ pub(super) async fn validate_destination(
                     DestinationDenial::new(DestinationDenialKind::InternalAddress, reason)
                 })?
         }
+        AddressAuthorization::PinnedResolved(addresses) => addresses
+            .iter()
+            .copied()
+            .map(|address| SocketAddr::new(address, port))
+            .collect(),
     };
 
     Ok(UpstreamConnector::new(host, port, addrs))
@@ -264,6 +294,27 @@ mod tests {
             .expect("loopback cannot be a trusted gateway");
 
         assert_eq!(denial.kind, DestinationDenialKind::TrustedGateway);
+    }
+
+    #[tokio::test]
+    async fn pinned_addresses_construct_connector_without_resolving_host() {
+        let pinned_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let plan = build_pinned_validation_plan(vec![pinned_ip]).unwrap();
+
+        let connector = validate_destination(request("does-not-resolve.invalid", &plan))
+            .await
+            .expect("pinned mode must not resolve the hostname");
+
+        assert_eq!(connector.addrs(), &[SocketAddr::new(pinned_ip, 80)]);
+    }
+
+    #[test]
+    fn pinned_addresses_must_not_be_empty() {
+        let denial = build_pinned_validation_plan(Vec::new())
+            .expect_err("an empty pinned answer set must be rejected");
+
+        assert_eq!(denial.kind, DestinationDenialKind::InvalidAllowedIps);
+        assert!(denial.reason.contains("empty pinned address set"));
     }
 
     #[test]

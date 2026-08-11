@@ -49,6 +49,26 @@ pub fn is_explicit_tcp_protocol(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case("tcp")
 }
 
+/// Reject additional L7-only fields represented outside
+/// [`L7EndpointFields`] by the runtime and provider-profile schemas.
+///
+/// Callers pass only authored fields with a non-default value. Keeping the
+/// diagnostic construction here ensures both activation paths use the same
+/// explicit-TCP contract.
+pub fn validate_explicit_tcp_additional_fields(
+    protocol: &str,
+    present_fields: &[&str],
+) -> Vec<String> {
+    if !is_explicit_tcp_protocol(protocol) || present_fields.is_empty() {
+        return Vec::new();
+    }
+
+    vec![format!(
+        "protocol tcp does not support L7-only fields: {}; remove those fields",
+        present_fields.join(", ")
+    )]
+}
+
 /// Fields extracted from an endpoint definition needed for L7 semantic
 /// validation. Both profile lint and the runtime validator construct this
 /// from their own data representation.
@@ -430,6 +450,16 @@ mod tests {
                 "protocol tcp does not support access, rules, or deny_rules; remove those L7 fields"
             ]
         );
+    }
+
+    #[test]
+    fn explicit_tcp_rejects_additional_l7_fields() {
+        let errors =
+            validate_explicit_tcp_additional_fields("tcp", &["enforcement", "credential_signing"]);
+
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("enforcement, credential_signing"));
+        assert!(validate_explicit_tcp_additional_fields("rest", &["enforcement"]).is_empty());
     }
 
     #[test]

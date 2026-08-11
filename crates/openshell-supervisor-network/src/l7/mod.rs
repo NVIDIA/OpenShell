@@ -22,7 +22,9 @@ pub(crate) mod token_grant_injection;
 pub(crate) mod websocket;
 
 pub use openshell_policy::L7Protocol;
-use openshell_policy::{L7EndpointFields, validate_l7_endpoint_semantics};
+use openshell_policy::{
+    L7EndpointFields, validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
+};
 
 pub(crate) fn build_credential_endpoint_mismatch_finding(
     policy_name: &str,
@@ -1000,6 +1002,69 @@ fn json_endpoint_has_graphql_policy(ep: &serde_json::Value) -> bool {
 ///
 /// Returns a list of errors and warnings. Errors should prevent sandbox startup;
 /// warnings are logged but don't block.
+fn additional_l7_fields(ep: &serde_json::Value) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    let non_empty_string = |name| {
+        ep.get(name)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    let enabled = |name| {
+        ep.get(name)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+
+    for (name, present) in [
+        ("enforcement", non_empty_string("enforcement")),
+        ("path", non_empty_string("path")),
+        ("allow_encoded_slash", enabled("allow_encoded_slash")),
+        (
+            "websocket_credential_rewrite",
+            enabled("websocket_credential_rewrite"),
+        ),
+        (
+            "request_body_credential_rewrite",
+            enabled("request_body_credential_rewrite"),
+        ),
+        ("persisted_queries", non_empty_string("persisted_queries")),
+        (
+            "graphql_persisted_queries",
+            ep.get("graphql_persisted_queries").is_some(),
+        ),
+        (
+            "graphql_max_body_bytes",
+            ep.get("graphql_max_body_bytes").is_some(),
+        ),
+        (
+            "json_rpc_max_body_bytes",
+            ep.get("json_rpc_max_body_bytes").is_some(),
+        ),
+        (
+            "mcp.strict_tool_names",
+            ep.get("mcp_strict_tool_names").is_some(),
+        ),
+        (
+            "mcp.allow_all_known_mcp_methods",
+            ep.get("mcp_allow_all_known_mcp_methods").is_some(),
+        ),
+        ("credential_signing", non_empty_string("credential_signing")),
+        ("signing_service", non_empty_string("signing_service")),
+        ("signing_region", non_empty_string("signing_region")),
+        (
+            "credential_binding",
+            ep.get("credential_binding")
+                .is_some_and(|value| !value.is_null()),
+        ),
+    ] {
+        if present {
+            fields.push(name);
+        }
+    }
+
+    fields
+}
+
 pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<String>) {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
@@ -1130,6 +1195,10 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 allow_all_known_mcp_methods: mcp_allow_all_known_mcp_methods,
             };
             for msg in validate_l7_endpoint_semantics(&l7_fields) {
+                errors.push(format!("{loc}: {msg}"));
+            }
+            for msg in validate_explicit_tcp_additional_fields(protocol, &additional_l7_fields(ep))
+            {
                 errors.push(format!("{loc}: {msg}"));
             }
 
@@ -1913,6 +1982,63 @@ mod tests {
                 .any(|w| w.contains("websocket_credential_rewrite is ignored")),
             "expected websocket_credential_rewrite warning: {warnings:?}"
         );
+    }
+
+    #[test]
+    fn validate_explicit_tcp_rejects_additional_l7_field_families() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "database.example.com",
+                        "port": 5432,
+                        "protocol": "tcp",
+                        "enforcement": "enforce",
+                        "path": "/query",
+                        "allow_encoded_slash": true,
+                        "websocket_credential_rewrite": true,
+                        "request_body_credential_rewrite": true,
+                        "persisted_queries": "allow_registered",
+                        "graphql_persisted_queries": {},
+                        "graphql_max_body_bytes": 1024,
+                        "json_rpc_max_body_bytes": 1024,
+                        "mcp_strict_tool_names": false,
+                        "mcp_allow_all_known_mcp_methods": false,
+                        "credential_signing": "sigv4",
+                        "signing_service": "rds",
+                        "signing_region": "us-west-2",
+                        "credential_binding": {"provider": "database"}
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+
+        let (errors, _) = validate_l7_policies(&data);
+        let tcp_error = errors
+            .iter()
+            .find(|error| error.contains("protocol tcp does not support L7-only fields"))
+            .expect("explicit TCP should reject additional L7 fields");
+
+        for field in [
+            "enforcement",
+            "path",
+            "allow_encoded_slash",
+            "websocket_credential_rewrite",
+            "request_body_credential_rewrite",
+            "persisted_queries",
+            "graphql_persisted_queries",
+            "graphql_max_body_bytes",
+            "json_rpc_max_body_bytes",
+            "mcp.strict_tool_names",
+            "mcp.allow_all_known_mcp_methods",
+            "credential_signing",
+            "signing_service",
+            "signing_region",
+            "credential_binding",
+        ] {
+            assert!(tcp_error.contains(field), "missing {field}: {tcp_error}");
+        }
     }
 
     #[test]

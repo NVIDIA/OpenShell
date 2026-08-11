@@ -243,6 +243,7 @@ egress_authorization := {
 	"deny_reason": _egress_deny_reason,
 	"matched_policy": _egress_matched_policy,
 	"endpoint_configs": _matching_endpoint_configs,
+	"matched_endpoints": _matching_endpoint_records,
 	"exact_declared_endpoint_host": _egress_exact_declared_endpoint_host,
 }
 
@@ -894,6 +895,30 @@ _matching_endpoint_configs := [cfg |
 	cfgs := _policy_endpoint_configs(data.network_policies[pname])
 	cfg := cfgs[_]
 	endpoint_has_extended_config(cfg)
+]
+
+# Full matched endpoint records are kept separate from the legacy
+# endpoint-config list, which intentionally contains only connection/L7
+# metadata. The policy name and array index identify the endpoint within this
+# policy generation while the complete endpoint preserves explicit protocol
+# markers needed by later policy-DNS correlation.
+
+_policy_endpoint_records(policy_name, policy) := [record |
+	some endpoint_index
+	ep := policy.endpoints[endpoint_index]
+	endpoint_matches_request(ep, input.network)
+	record := {
+		"policy_name": policy_name,
+		"endpoint_index": endpoint_index,
+		"endpoint": ep,
+	}
+]
+
+_matching_endpoint_records := [record |
+	some pname
+	_matching_policy_names[pname]
+	records := _policy_endpoint_records(pname, data.network_policies[pname])
+	record := records[_]
 ]
 
 matched_endpoint_config := _matching_endpoint_configs[0] if {

@@ -165,6 +165,12 @@ fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<
     let mut conflicts = Vec::new();
     push_conflict(
         &mut conflicts,
+        "transparent_tcp_eligible",
+        &is_explicit_tcp(&left.protocol),
+        &is_explicit_tcp(&right.protocol),
+    );
+    push_conflict(
+        &mut conflicts,
         "tls",
         &normalized_tls(&left.tls),
         &normalized_tls(&right.tls),
@@ -182,6 +188,10 @@ fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<
         &right.advisor_proposed,
     );
     conflicts
+}
+
+fn is_explicit_tcp(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("tcp")
 }
 
 /// Keep request-pipeline ambiguity checks aligned with Rego's
@@ -1037,13 +1047,20 @@ mod tests {
     }
 
     #[test]
-    fn explicit_tcp_and_omitted_protocol_are_ambiguity_equivalent() {
+    fn explicit_tcp_and_omitted_protocol_are_ambiguous_for_native_tcp_eligibility() {
         let mut explicit_tcp = endpoint("api.example.com", 443);
         explicit_tcp.protocol = "tcp".to_string();
         explicit_tcp.tls = "skip".to_string();
         let mut omitted = endpoint("api.example.com", 443);
         omitted.tls = "skip".to_string();
 
-        assert!(find_endpoint_ambiguities(&policy_with(explicit_tcp, omitted)).is_empty());
+        let ambiguities = find_endpoint_ambiguities(&policy_with(explicit_tcp, omitted));
+        assert_eq!(ambiguities.len(), 1);
+        assert!(
+            ambiguities[0]
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.contains("transparent_tcp_eligible"))
+        );
     }
 }

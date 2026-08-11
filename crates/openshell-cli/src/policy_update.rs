@@ -332,6 +332,11 @@ fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
             "--add-endpoint protocol segment must be 'tcp', 'rest', 'websocket', or 'sql'; got '{protocol}' in '{spec}'"
         ));
     }
+    if protocol == "tcp" && (!access.is_empty() || !enforcement.is_empty()) {
+        return Err(miette!(
+            "--add-endpoint protocol 'tcp' does not support access or enforcement in '{spec}'"
+        ));
+    }
     if !enforcement.is_empty() && !matches!(enforcement, "enforce" | "audit") {
         return Err(miette!(
             "--add-endpoint enforcement segment must be 'enforce' or 'audit'; got '{enforcement}' in '{spec}'"
@@ -854,6 +859,26 @@ mod tests {
             error
                 .to_string()
                 .contains("cannot set enforcement without protocol")
+        );
+    }
+
+    #[test]
+    fn parse_add_endpoint_rejects_l7_fields_with_tcp() {
+        let error = build_policy_update_plan(
+            &["database.example.com:5432::tcp:enforce".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect_err("TCP must reject L7 enforcement");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not support access or enforcement")
         );
     }
 
