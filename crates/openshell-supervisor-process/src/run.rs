@@ -67,6 +67,7 @@ pub async fn run_process(
     openshell_endpoint: Option<&str>,
     ssh_socket_path: Option<String>,
     shared_ssh_socket: bool,
+    ssh_exit_tx: Option<tokio::sync::oneshot::Sender<()>>,
     policy: &SandboxPolicy,
     resolved_process_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
@@ -292,6 +293,7 @@ pub async fn run_process(
         let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
 
         tokio::spawn(async move {
+            let _ssh_exit_guard = ssh_exit_tx;
             if let Err(err) = crate::ssh::run_ssh_server(
                 listen_path,
                 ssh_ready_tx,
