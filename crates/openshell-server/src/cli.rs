@@ -423,6 +423,8 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
             admin_role: args.oidc_admin_role.clone(),
             user_role: args.oidc_user_role.clone(),
             scopes_claim: args.oidc_scopes_claim.clone(),
+            // clap's `value_delimiter` + `default_value = ""` produces
+            // `vec![""]` when the user supplies no value — filter it out.
             admin_subjects: args
                 .oidc_admin_subjects
                 .iter()

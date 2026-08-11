@@ -554,9 +554,9 @@ pub struct OidcConfig {
     /// privileges regardless of their JWT role claims. Works alongside
     /// `admin_role` — either mechanism grants admin access.
     ///
-    /// This is a no-op in auth-only mode (when both `admin_role` and
-    /// `user_role` are empty), because every authenticated user is already
-    /// a platform admin in that mode.
+    /// When `admin_subjects` is set but `admin_role` and `user_role` are
+    /// empty, only listed subjects receive Platform Admin — overriding the
+    /// default auth-only behavior where every authenticated user is admin.
     #[serde(default)]
     pub admin_subjects: Vec<String>,
 }

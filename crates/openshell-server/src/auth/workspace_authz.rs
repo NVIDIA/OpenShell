@@ -41,8 +41,9 @@ impl AdminPolicy {
 
     /// Create an empty `AdminPolicy` (auth-only mode).
     ///
-    /// When `admin_role` is empty, every authenticated user is treated as
-    /// Platform Admin — matching the existing behavior.
+    /// When both `admin_role` and `admin_subjects` are empty, every
+    /// authenticated user is treated as Platform Admin — matching the
+    /// existing auth-only behavior.
     pub fn auth_only() -> Self {
         Self {
             admin_role: String::new(),
@@ -210,9 +211,10 @@ pub fn require_platform_admin(
 /// Check whether the caller is a Platform Admin.
 ///
 /// Returns `true` if:
-/// - `admin_role` is empty (auth-only mode — everyone is admin), OR
-/// - the caller’s roles include `admin_role`, OR
-/// - the caller’s `sub` is in `admin_subjects`.
+/// - auth-only mode (`admin_role` empty AND `admin_subjects` empty) —
+///   every authenticated user is admin, OR
+/// - the caller's roles include `admin_role`, OR
+/// - the caller's `sub` is in `admin_subjects`.
 pub fn is_platform_admin_principal(
     subject: &str,
     identity_roles: &[String],
@@ -222,8 +224,9 @@ pub fn is_platform_admin_principal(
 }
 
 fn is_platform_admin(subject: &str, identity_roles: &[String], admin_policy: &AdminPolicy) -> bool {
-    admin_policy.admin_role.is_empty()
-        || identity_roles.iter().any(|r| r == &admin_policy.admin_role)
+    (admin_policy.admin_role.is_empty() && admin_policy.admin_subjects.is_empty())
+        || (!admin_policy.admin_role.is_empty()
+            && identity_roles.iter().any(|r| r == &admin_policy.admin_role))
         || admin_policy.admin_subjects.contains(subject)
 }
 
@@ -379,14 +382,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_subjects_no_op_in_auth_only_mode() {
+    async fn admin_subjects_only_restricts_admin_access() {
         let store = test_store().await;
         let policy = AdminPolicy {
             admin_role: String::new(),
             admin_subjects: HashSet::from(["specific-sub".to_string()]),
         };
-        // In auth-only mode, everyone is admin regardless of admin_subjects.
+        // When admin_subjects is set (even without admin_role), only
+        // listed subjects should get Platform Admin.
         let principal = user_principal("random-user", &[]);
+        let result = authorize_workspace(
+            &store,
+            &policy,
+            &principal,
+            "default",
+            MinWorkspaceRole::Admin,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn admin_subjects_only_grants_listed_subject() {
+        let store = test_store().await;
+        let policy = AdminPolicy {
+            admin_role: String::new(),
+            admin_subjects: HashSet::from(["specific-sub".to_string()]),
+        };
+        let principal = user_principal("specific-sub", &[]);
         let result = authorize_workspace(
             &store,
             &policy,
