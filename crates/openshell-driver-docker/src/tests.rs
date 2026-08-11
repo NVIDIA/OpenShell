@@ -2469,14 +2469,14 @@ fn extract_first_tar_entry_rejects_empty_archive() {
 }
 
 #[test]
-fn container_state_needs_resume_matches_startable_states() {
+fn container_state_needs_start_matches_startable_states() {
     for state in [
         ContainerSummaryStateEnum::EXITED,
         ContainerSummaryStateEnum::CREATED,
     ] {
         assert!(
-            container_state_needs_resume(state),
-            "{state:?} should be resumed with Docker start",
+            container_state_needs_start(state),
+            "{state:?} should be started with Docker start",
         );
     }
 
@@ -2489,8 +2489,8 @@ fn container_state_needs_resume_matches_startable_states() {
         ContainerSummaryStateEnum::EMPTY,
     ] {
         assert!(
-            !container_state_needs_resume(state),
-            "{state:?} should not be resumed with Docker start",
+            !container_state_needs_start(state),
+            "{state:?} should not be started with Docker start",
         );
     }
 }

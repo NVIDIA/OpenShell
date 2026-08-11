@@ -2687,9 +2687,9 @@ fn phase_label(phase: i32) -> String {
         x if x == SandboxPhase::Ready as i32 => "Ready",
         x if x == SandboxPhase::Error as i32 => "Error",
         x if x == SandboxPhase::Deleting as i32 => "Deleting",
-        x if x == SandboxPhase::Suspending as i32 => "Suspending",
-        x if x == SandboxPhase::Suspended as i32 => "Suspended",
-        x if x == SandboxPhase::Resuming as i32 => "Resuming",
+        x if x == SandboxPhase::Stopping as i32 => "Stopping",
+        x if x == SandboxPhase::Stopped as i32 => "Stopped",
+        x if x == SandboxPhase::Starting as i32 => "Starting",
         _ => "Unknown",
     }
     .to_string()
@@ -2724,10 +2724,10 @@ mod phase_label_tests {
     use super::*;
 
     #[test]
-    fn phase_label_covers_suspend_and_resume_lifecycle() {
-        assert_eq!(phase_label(SandboxPhase::Suspending as i32), "Suspending");
-        assert_eq!(phase_label(SandboxPhase::Suspended as i32), "Suspended");
-        assert_eq!(phase_label(SandboxPhase::Resuming as i32), "Resuming");
+    fn phase_label_covers_stop_and_start_lifecycle() {
+        assert_eq!(phase_label(SandboxPhase::Stopping as i32), "Stopping");
+        assert_eq!(phase_label(SandboxPhase::Stopped as i32), "Stopped");
+        assert_eq!(phase_label(SandboxPhase::Starting as i32), "Starting");
     }
 }
 

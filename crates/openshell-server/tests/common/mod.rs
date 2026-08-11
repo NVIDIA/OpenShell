@@ -83,16 +83,16 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(SandboxResponse::default()))
     }
 
-    async fn suspend_sandbox(
+    async fn stop_sandbox(
         &self,
-        _request: tonic::Request<openshell_core::proto::SuspendSandboxRequest>,
+        _request: tonic::Request<openshell_core::proto::StopSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
 
-    async fn resume_sandbox(
+    async fn start_sandbox(
         &self,
-        _request: tonic::Request<openshell_core::proto::ResumeSandboxRequest>,
+        _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }

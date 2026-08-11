@@ -91,8 +91,8 @@ func (s *sandboxClient) Delete(ctx context.Context, workspace, name string) erro
 	return nil
 }
 
-func (s *sandboxClient) Suspend(ctx context.Context, workspace, name string) (*Sandbox, error) {
-	resp, err := s.client.SuspendSandbox(ctx, &pb.SuspendSandboxRequest{
+func (s *sandboxClient) Stop(ctx context.Context, workspace, name string) (*Sandbox, error) {
+	resp, err := s.client.StopSandbox(ctx, &pb.StopSandboxRequest{
 		Name:      name,
 		Workspace: workspace,
 	})
@@ -102,8 +102,8 @@ func (s *sandboxClient) Suspend(ctx context.Context, workspace, name string) (*S
 	return converter.SandboxFromProto(resp.GetSandbox()), nil
 }
 
-func (s *sandboxClient) Resume(ctx context.Context, workspace, name string) (*Sandbox, error) {
-	resp, err := s.client.ResumeSandbox(ctx, &pb.ResumeSandboxRequest{
+func (s *sandboxClient) Start(ctx context.Context, workspace, name string) (*Sandbox, error) {
+	resp, err := s.client.StartSandbox(ctx, &pb.StartSandboxRequest{
 		Name:      name,
 		Workspace: workspace,
 	})
@@ -165,8 +165,8 @@ func (s *sandboxClient) WaitReady(ctx context.Context, workspace, name string, o
 	return s.waitForPhase(ctx, workspace, name, SandboxReady, opts...)
 }
 
-func (s *sandboxClient) WaitSuspended(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error) {
-	return s.waitForPhase(ctx, workspace, name, SandboxSuspended, opts...)
+func (s *sandboxClient) WaitStopped(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error) {
+	return s.waitForPhase(ctx, workspace, name, SandboxStopped, opts...)
 }
 
 func (s *sandboxClient) waitForPhase(ctx context.Context, workspace, name string, target SandboxPhase, opts ...WaitOptions) (*Sandbox, error) {

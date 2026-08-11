@@ -42,8 +42,8 @@ use openshell_core::proto::compute::v1::{
     DriverSandboxTemplate, GatewayListenerRequirement, GetCapabilitiesRequest,
     GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, ResumeSandboxRequest,
-    ResumeSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
     compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
@@ -901,14 +901,14 @@ impl DockerComputeDriver {
     }
 
     /// Start a managed sandbox container that was previously stopped. Used
-    /// by the gateway to resume sandboxes after a restart so that running
+    /// by the gateway to start sandboxes after a restart so that running
     /// state in the gateway store is matched by an actually-running
     /// container.
     ///
     /// Returns `Ok(true)` when a container existed and was started (or was
     /// already running), `Ok(false)` when no managed container is found for
     /// the sandbox, and `Err(...)` for any Docker failure.
-    pub async fn resume_sandbox(
+    pub async fn start_sandbox(
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
@@ -923,13 +923,13 @@ impl DockerComputeDriver {
             return Ok(false);
         };
         let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
-        if !container_state_needs_resume(state) {
+        if !container_state_needs_start(state) {
             return Ok(true);
         }
 
         match self.docker.start_container(&target, None).await {
             Ok(()) => Ok(true),
-            // Already running — race with another resume path or the
+            // Already running — race with another start path or the
             // restart policy. Treat as success.
             Err(err) if is_not_modified_error(&err) => Ok(true),
             Err(err) if is_not_found_error(&err) => Ok(false),
@@ -1485,18 +1485,18 @@ impl ComputeDriver for DockerComputeDriver {
         Ok(Response::new(StopSandboxResponse {}))
     }
 
-    async fn resume_sandbox(
+    async fn start_sandbox(
         &self,
-        request: Request<ResumeSandboxRequest>,
-    ) -> Result<Response<ResumeSandboxResponse>, Status> {
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
         let request = request.into_inner();
         require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
-        if !Self::resume_sandbox(self, &request.sandbox_id, &request.sandbox_name).await? {
+        if !Self::start_sandbox(self, &request.sandbox_id, &request.sandbox_name).await? {
             return Err(Status::not_found("sandbox not found"));
         }
         self.publish_container_snapshot(&request.sandbox_id, &request.sandbox_name)
             .await?;
-        Ok(Response::new(ResumeSandboxResponse {}))
+        Ok(Response::new(StartSandboxResponse {}))
     }
 
     async fn delete_sandbox(
@@ -2983,7 +2983,7 @@ fn container_state_needs_shutdown_stop(state: ContainerSummaryStateEnum) -> bool
 /// `start_container`. Skip `Restarting` (already coming up), `Removing`,
 /// `Dead` (terminal), `Paused` (needs `unpause`, not `start`), and
 /// `Running` (nothing to do).
-fn container_state_needs_resume(state: ContainerSummaryStateEnum) -> bool {
+fn container_state_needs_start(state: ContainerSummaryStateEnum) -> bool {
     matches!(
         state,
         ContainerSummaryStateEnum::EXITED | ContainerSummaryStateEnum::CREATED

@@ -32,8 +32,8 @@ pub enum LaunchAbortReason {
     /// opportunity to release host resources they allocated in
     /// [`LifecycleExtension::before_launch`].
     ProcessExited,
-    /// The gateway intentionally suspended the sandbox while retaining disk state.
-    Suspended,
+    /// The gateway intentionally stopped the sandbox while retaining disk state.
+    Stopped,
 }
 
 #[derive(Debug, Clone)]

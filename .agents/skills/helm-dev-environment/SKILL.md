@@ -220,7 +220,7 @@ ServiceAccount bootstrap and gateway-minted sandbox JWT path.
 
 ---
 
-## Cluster Lifecycle (suspend/resume)
+## Cluster Lifecycle (stop/start)
 
 Stop the cluster without losing state (faster than delete/recreate):
 ```bash

@@ -849,8 +849,8 @@ impl PodmanComputeDriver {
             .map_err(ComputeDriverError::from)
     }
 
-    /// Resume a previously stopped sandbox container.
-    pub async fn resume_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
+    /// Start a previously stopped sandbox container.
+    pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
         let container = self
             .find_container(sandbox_id)
             .await?
@@ -859,7 +859,7 @@ impl PodmanComputeDriver {
             return Ok(());
         }
         let container_id = container.id;
-        info!(sandbox_id = %sandbox_id, container = %container_id, "Resuming sandbox container");
+        info!(sandbox_id = %sandbox_id, container = %container_id, "Starting sandbox container");
 
         self.client
             .start_container(&container_id)
@@ -1206,7 +1206,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_and_resume_target_the_existing_container() {
+    async fn stop_and_start_target_the_existing_container() {
         let (stop_socket, stop_requests, stop_handle) = spawn_podman_stub(
             "lifecycle-stop",
             vec![
@@ -1237,9 +1237,9 @@ mod tests {
             ],
         );
         test_driver(start_socket.clone())
-            .resume_sandbox("sandbox-1")
+            .start_sandbox("sandbox-1")
             .await
-            .expect("resume should succeed");
+            .expect("start should succeed");
         start_handle.await.expect("start stub should finish");
         assert_eq!(
             start_requests

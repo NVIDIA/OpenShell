@@ -41,9 +41,9 @@ const (
 	SandboxPhase_SANDBOX_PHASE_ERROR        SandboxPhase = 3
 	SandboxPhase_SANDBOX_PHASE_DELETING     SandboxPhase = 4
 	SandboxPhase_SANDBOX_PHASE_UNKNOWN      SandboxPhase = 5
-	SandboxPhase_SANDBOX_PHASE_SUSPENDING   SandboxPhase = 6
-	SandboxPhase_SANDBOX_PHASE_SUSPENDED    SandboxPhase = 7
-	SandboxPhase_SANDBOX_PHASE_RESUMING     SandboxPhase = 8
+	SandboxPhase_SANDBOX_PHASE_STOPPING     SandboxPhase = 6
+	SandboxPhase_SANDBOX_PHASE_STOPPED      SandboxPhase = 7
+	SandboxPhase_SANDBOX_PHASE_STARTING     SandboxPhase = 8
 )
 
 // Enum value maps for SandboxPhase.
@@ -55,9 +55,9 @@ var (
 		3: "SANDBOX_PHASE_ERROR",
 		4: "SANDBOX_PHASE_DELETING",
 		5: "SANDBOX_PHASE_UNKNOWN",
-		6: "SANDBOX_PHASE_SUSPENDING",
-		7: "SANDBOX_PHASE_SUSPENDED",
-		8: "SANDBOX_PHASE_RESUMING",
+		6: "SANDBOX_PHASE_STOPPING",
+		7: "SANDBOX_PHASE_STOPPED",
+		8: "SANDBOX_PHASE_STARTING",
 	}
 	SandboxPhase_value = map[string]int32{
 		"SANDBOX_PHASE_UNSPECIFIED":  0,
@@ -66,9 +66,9 @@ var (
 		"SANDBOX_PHASE_ERROR":        3,
 		"SANDBOX_PHASE_DELETING":     4,
 		"SANDBOX_PHASE_UNKNOWN":      5,
-		"SANDBOX_PHASE_SUSPENDING":   6,
-		"SANDBOX_PHASE_SUSPENDED":    7,
-		"SANDBOX_PHASE_RESUMING":     8,
+		"SANDBOX_PHASE_STOPPING":     6,
+		"SANDBOX_PHASE_STOPPED":      7,
+		"SANDBOX_PHASE_STARTING":     8,
 	}
 )
 
@@ -2137,8 +2137,8 @@ func (x *DeleteSandboxRequest) GetWorkspace() string {
 	return ""
 }
 
-// Suspend sandbox request.
-type SuspendSandboxRequest struct {
+// Stop sandbox request.
+type StopSandboxRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Sandbox name (canonical lookup key).
 	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -2148,20 +2148,20 @@ type SuspendSandboxRequest struct {
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *SuspendSandboxRequest) Reset() {
-	*x = SuspendSandboxRequest{}
+func (x *StopSandboxRequest) Reset() {
+	*x = StopSandboxRequest{}
 	mi := &file_openshell_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *SuspendSandboxRequest) String() string {
+func (x *StopSandboxRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*SuspendSandboxRequest) ProtoMessage() {}
+func (*StopSandboxRequest) ProtoMessage() {}
 
-func (x *SuspendSandboxRequest) ProtoReflect() protoreflect.Message {
+func (x *StopSandboxRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_openshell_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -2173,27 +2173,27 @@ func (x *SuspendSandboxRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use SuspendSandboxRequest.ProtoReflect.Descriptor instead.
-func (*SuspendSandboxRequest) Descriptor() ([]byte, []int) {
+// Deprecated: Use StopSandboxRequest.ProtoReflect.Descriptor instead.
+func (*StopSandboxRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{27}
 }
 
-func (x *SuspendSandboxRequest) GetName() string {
+func (x *StopSandboxRequest) GetName() string {
 	if x != nil {
 		return x.Name
 	}
 	return ""
 }
 
-func (x *SuspendSandboxRequest) GetWorkspace() string {
+func (x *StopSandboxRequest) GetWorkspace() string {
 	if x != nil {
 		return x.Workspace
 	}
 	return ""
 }
 
-// Resume sandbox request.
-type ResumeSandboxRequest struct {
+// Start sandbox request.
+type StartSandboxRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Sandbox name (canonical lookup key).
 	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -2203,20 +2203,20 @@ type ResumeSandboxRequest struct {
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *ResumeSandboxRequest) Reset() {
-	*x = ResumeSandboxRequest{}
+func (x *StartSandboxRequest) Reset() {
+	*x = StartSandboxRequest{}
 	mi := &file_openshell_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *ResumeSandboxRequest) String() string {
+func (x *StartSandboxRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*ResumeSandboxRequest) ProtoMessage() {}
+func (*StartSandboxRequest) ProtoMessage() {}
 
-func (x *ResumeSandboxRequest) ProtoReflect() protoreflect.Message {
+func (x *StartSandboxRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_openshell_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -2228,19 +2228,19 @@ func (x *ResumeSandboxRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use ResumeSandboxRequest.ProtoReflect.Descriptor instead.
-func (*ResumeSandboxRequest) Descriptor() ([]byte, []int) {
+// Deprecated: Use StartSandboxRequest.ProtoReflect.Descriptor instead.
+func (*StartSandboxRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{28}
 }
 
-func (x *ResumeSandboxRequest) GetName() string {
+func (x *StartSandboxRequest) GetName() string {
 	if x != nil {
 		return x.Name
 	}
 	return ""
 }
 
-func (x *ResumeSandboxRequest) GetWorkspace() string {
+func (x *StartSandboxRequest) GetWorkspace() string {
 	if x != nil {
 		return x.Workspace
 	}
@@ -13122,11 +13122,11 @@ const file_openshell_proto_rawDesc = "" +
 	"\tworkspace\x18\x04 \x01(\tR\tworkspace\"H\n" +
 	"\x14DeleteSandboxRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1c\n" +
-	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"I\n" +
-	"\x15SuspendSandboxRequest\x12\x12\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"F\n" +
+	"\x12StopSandboxRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1c\n" +
-	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"H\n" +
-	"\x14ResumeSandboxRequest\x12\x12\n" +
+	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"G\n" +
+	"\x13StartSandboxRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1c\n" +
 	"\tworkspace\x18\x02 \x01(\tR\tworkspace\"B\n" +
 	"\x0fSandboxResponse\x12/\n" +
@@ -13971,17 +13971,17 @@ const file_openshell_proto_rawDesc = "" +
 	"\x05limit\x18\x02 \x01(\rR\x05limit\x12\x16\n" +
 	"\x06offset\x18\x03 \x01(\rR\x06offset\"W\n" +
 	"\x1cListWorkspaceMembersResponse\x127\n" +
-	"\amembers\x18\x01 \x03(\v2\x1d.openshell.v1.WorkspaceMemberR\amembers*\x8d\x02\n" +
+	"\amembers\x18\x01 \x03(\v2\x1d.openshell.v1.WorkspaceMemberR\amembers*\x89\x02\n" +
 	"\fSandboxPhase\x12\x1d\n" +
 	"\x19SANDBOX_PHASE_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aSANDBOX_PHASE_PROVISIONING\x10\x01\x12\x17\n" +
 	"\x13SANDBOX_PHASE_READY\x10\x02\x12\x17\n" +
 	"\x13SANDBOX_PHASE_ERROR\x10\x03\x12\x1a\n" +
 	"\x16SANDBOX_PHASE_DELETING\x10\x04\x12\x19\n" +
-	"\x15SANDBOX_PHASE_UNKNOWN\x10\x05\x12\x1c\n" +
-	"\x18SANDBOX_PHASE_SUSPENDING\x10\x06\x12\x1b\n" +
-	"\x17SANDBOX_PHASE_SUSPENDED\x10\a\x12\x1a\n" +
-	"\x16SANDBOX_PHASE_RESUMING\x10\b*\xc3\x03\n" +
+	"\x15SANDBOX_PHASE_UNKNOWN\x10\x05\x12\x1a\n" +
+	"\x16SANDBOX_PHASE_STOPPING\x10\x06\x12\x19\n" +
+	"\x15SANDBOX_PHASE_STOPPED\x10\a\x12\x1a\n" +
+	"\x16SANDBOX_PHASE_STARTING\x10\b*\xc3\x03\n" +
 	"!ProviderCredentialRefreshStrategy\x124\n" +
 	"0PROVIDER_CREDENTIAL_REFRESH_STRATEGY_UNSPECIFIED\x10\x00\x12/\n" +
 	"+PROVIDER_CREDENTIAL_REFRESH_STRATEGY_STATIC\x10\x01\x121\n" +
@@ -14013,7 +14013,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\rWorkspaceRole\x12\x1e\n" +
 	"\x1aWORKSPACE_ROLE_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13WORKSPACE_ROLE_USER\x10\x01\x12\x18\n" +
-	"\x14WORKSPACE_ROLE_ADMIN\x10\x022\x9cD\n" +
+	"\x14WORKSPACE_ROLE_ADMIN\x10\x022\x94D\n" +
 	"\tOpenShell\x12Z\n" +
 	"\x06Health\x12\x1b.openshell.v1.HealthRequest\x1a\x1c.openshell.v1.HealthResponse\"\x15\x82\xb5\x18\x11\n" +
 	"\x0funauthenticated\x12i\n" +
@@ -14035,10 +14035,10 @@ const file_openshell_proto_rawDesc = "" +
 	"\x15DetachSandboxProvider\x12*.openshell.v1.DetachSandboxProviderRequest\x1a+.openshell.v1.DetachSandboxProviderResponse\"!\x82\xb5\x18\x1d\n" +
 	"\x06bearer\x12\x04user\"\rsandbox:write\x12{\n" +
 	"\rDeleteSandbox\x12\".openshell.v1.DeleteSandboxRequest\x1a#.openshell.v1.DeleteSandboxResponse\"!\x82\xb5\x18\x1d\n" +
-	"\x06bearer\x12\x04user\"\rsandbox:write\x12w\n" +
-	"\x0eSuspendSandbox\x12#.openshell.v1.SuspendSandboxRequest\x1a\x1d.openshell.v1.SandboxResponse\"!\x82\xb5\x18\x1d\n" +
-	"\x06bearer\x12\x04user\"\rsandbox:write\x12u\n" +
-	"\rResumeSandbox\x12\".openshell.v1.ResumeSandboxRequest\x1a\x1d.openshell.v1.SandboxResponse\"!\x82\xb5\x18\x1d\n" +
+	"\x06bearer\x12\x04user\"\rsandbox:write\x12q\n" +
+	"\vStopSandbox\x12 .openshell.v1.StopSandboxRequest\x1a\x1d.openshell.v1.SandboxResponse\"!\x82\xb5\x18\x1d\n" +
+	"\x06bearer\x12\x04user\"\rsandbox:write\x12s\n" +
+	"\fStartSandbox\x12!.openshell.v1.StartSandboxRequest\x1a\x1d.openshell.v1.SandboxResponse\"!\x82\xb5\x18\x1d\n" +
 	"\x06bearer\x12\x04user\"\rsandbox:write\x12\x84\x01\n" +
 	"\x10CreateSshSession\x12%.openshell.v1.CreateSshSessionRequest\x1a&.openshell.v1.CreateSshSessionResponse\"!\x82\xb5\x18\x1d\n" +
 	"\x06bearer\x12\x04user\"\rsandbox:write\x12}\n" +
@@ -14199,8 +14199,8 @@ var file_openshell_proto_goTypes = []any{
 	(*AttachSandboxProviderRequest)(nil),                 // 30: openshell.v1.AttachSandboxProviderRequest
 	(*DetachSandboxProviderRequest)(nil),                 // 31: openshell.v1.DetachSandboxProviderRequest
 	(*DeleteSandboxRequest)(nil),                         // 32: openshell.v1.DeleteSandboxRequest
-	(*SuspendSandboxRequest)(nil),                        // 33: openshell.v1.SuspendSandboxRequest
-	(*ResumeSandboxRequest)(nil),                         // 34: openshell.v1.ResumeSandboxRequest
+	(*StopSandboxRequest)(nil),                           // 33: openshell.v1.StopSandboxRequest
+	(*StartSandboxRequest)(nil),                          // 34: openshell.v1.StartSandboxRequest
 	(*SandboxResponse)(nil),                              // 35: openshell.v1.SandboxResponse
 	(*ListSandboxesResponse)(nil),                        // 36: openshell.v1.ListSandboxesResponse
 	(*ListSandboxProvidersResponse)(nil),                 // 37: openshell.v1.ListSandboxProvidersResponse
@@ -14557,8 +14557,8 @@ var file_openshell_proto_depIdxs = []int32{
 	30,  // 157: openshell.v1.OpenShell.AttachSandboxProvider:input_type -> openshell.v1.AttachSandboxProviderRequest
 	31,  // 158: openshell.v1.OpenShell.DetachSandboxProvider:input_type -> openshell.v1.DetachSandboxProviderRequest
 	32,  // 159: openshell.v1.OpenShell.DeleteSandbox:input_type -> openshell.v1.DeleteSandboxRequest
-	33,  // 160: openshell.v1.OpenShell.SuspendSandbox:input_type -> openshell.v1.SuspendSandboxRequest
-	34,  // 161: openshell.v1.OpenShell.ResumeSandbox:input_type -> openshell.v1.ResumeSandboxRequest
+	33,  // 160: openshell.v1.OpenShell.StopSandbox:input_type -> openshell.v1.StopSandboxRequest
+	34,  // 161: openshell.v1.OpenShell.StartSandbox:input_type -> openshell.v1.StartSandboxRequest
 	41,  // 162: openshell.v1.OpenShell.CreateSshSession:input_type -> openshell.v1.CreateSshSessionRequest
 	43,  // 163: openshell.v1.OpenShell.ExposeService:input_type -> openshell.v1.ExposeServiceRequest
 	44,  // 164: openshell.v1.OpenShell.GetService:input_type -> openshell.v1.GetServiceRequest
@@ -14623,8 +14623,8 @@ var file_openshell_proto_depIdxs = []int32{
 	38,  // 223: openshell.v1.OpenShell.AttachSandboxProvider:output_type -> openshell.v1.AttachSandboxProviderResponse
 	39,  // 224: openshell.v1.OpenShell.DetachSandboxProvider:output_type -> openshell.v1.DetachSandboxProviderResponse
 	40,  // 225: openshell.v1.OpenShell.DeleteSandbox:output_type -> openshell.v1.DeleteSandboxResponse
-	35,  // 226: openshell.v1.OpenShell.SuspendSandbox:output_type -> openshell.v1.SandboxResponse
-	35,  // 227: openshell.v1.OpenShell.ResumeSandbox:output_type -> openshell.v1.SandboxResponse
+	35,  // 226: openshell.v1.OpenShell.StopSandbox:output_type -> openshell.v1.SandboxResponse
+	35,  // 227: openshell.v1.OpenShell.StartSandbox:output_type -> openshell.v1.SandboxResponse
 	42,  // 228: openshell.v1.OpenShell.CreateSshSession:output_type -> openshell.v1.CreateSshSessionResponse
 	50,  // 229: openshell.v1.OpenShell.ExposeService:output_type -> openshell.v1.ServiceEndpointResponse
 	50,  // 230: openshell.v1.OpenShell.GetService:output_type -> openshell.v1.ServiceEndpointResponse

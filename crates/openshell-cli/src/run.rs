@@ -48,12 +48,12 @@ use openshell_core::proto::{
     ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
     ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements, ResumeSandboxRequest,
+    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
     RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
     SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope,
-    SuspendSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
-    UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
-    setting_value, tcp_forward_init,
+    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
+    exec_sandbox_event, setting_value, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -2418,8 +2418,8 @@ pub async fn sandbox_delete(
     Ok(())
 }
 
-/// Suspend a sandbox while retaining its persistent workspace.
-pub async fn sandbox_suspend(
+/// Stop a sandbox while retaining its persistent workspace.
+pub async fn sandbox_stop(
     server: &str,
     name: &str,
     workspace: &str,
@@ -2436,7 +2436,7 @@ pub async fn sandbox_suspend(
 
     let mut client = grpc_client(server, tls).await?;
     let sandbox = client
-        .suspend_sandbox(SuspendSandboxRequest {
+        .stop_sandbox(StopSandboxRequest {
             name: name.to_string(),
             workspace: workspace.to_string(),
         })
@@ -2444,14 +2444,14 @@ pub async fn sandbox_suspend(
         .into_diagnostic()?
         .into_inner()
         .sandbox
-        .ok_or_else(|| miette!("gateway returned no sandbox after suspend"))?;
-    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Suspended).await?;
-    println!("{} Suspended sandbox {name}", "✓".green().bold());
+        .ok_or_else(|| miette!("gateway returned no sandbox after stop"))?;
+    wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Stopped).await?;
+    println!("{} Stopped sandbox {name}", "✓".green().bold());
     Ok(())
 }
 
-/// Resume a suspended sandbox and wait until it is ready.
-pub async fn sandbox_resume(
+/// Start a stopped sandbox and wait until it is ready.
+pub async fn sandbox_start(
     server: &str,
     name: &str,
     workspace: &str,
@@ -2459,7 +2459,7 @@ pub async fn sandbox_resume(
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
     let sandbox = client
-        .resume_sandbox(ResumeSandboxRequest {
+        .start_sandbox(StartSandboxRequest {
             name: name.to_string(),
             workspace: workspace.to_string(),
         })
@@ -2467,9 +2467,9 @@ pub async fn sandbox_resume(
         .into_diagnostic()?
         .into_inner()
         .sandbox
-        .ok_or_else(|| miette!("gateway returned no sandbox after resume"))?;
+        .ok_or_else(|| miette!("gateway returned no sandbox after start"))?;
     wait_for_lifecycle_phase(&mut client, sandbox, SandboxPhase::Ready).await?;
-    println!("{} Resumed sandbox {name}", "✓".green().bold());
+    println!("{} Started sandbox {name}", "✓".green().bold());
     Ok(())
 }
 

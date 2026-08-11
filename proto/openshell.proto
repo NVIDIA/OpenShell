@@ -108,8 +108,8 @@ service OpenShell {
     };
   }
 
-  // Suspend a sandbox while retaining its persistent state.
-  rpc SuspendSandbox(SuspendSandboxRequest) returns (SandboxResponse) {
+  // Stop a sandbox while retaining its persistent state.
+  rpc StopSandbox(StopSandboxRequest) returns (SandboxResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
@@ -117,8 +117,8 @@ service OpenShell {
     };
   }
 
-  // Resume a previously suspended sandbox.
-  rpc ResumeSandbox(ResumeSandboxRequest) returns (SandboxResponse) {
+  // Start a previously stopped sandbox.
+  rpc StartSandbox(StartSandboxRequest) returns (SandboxResponse) {
     option (openshell.options.v1.authorization) = {
       auth_mode: "bearer"
       scope: "sandbox:write"
@@ -897,9 +897,9 @@ enum SandboxPhase {
   SANDBOX_PHASE_ERROR = 3;
   SANDBOX_PHASE_DELETING = 4;
   SANDBOX_PHASE_UNKNOWN = 5;
-  SANDBOX_PHASE_SUSPENDING = 6;
-  SANDBOX_PHASE_SUSPENDED = 7;
-  SANDBOX_PHASE_RESUMING = 8;
+  SANDBOX_PHASE_STOPPING = 6;
+  SANDBOX_PHASE_STOPPED = 7;
+  SANDBOX_PHASE_STARTING = 8;
 }
 
 // Public platform event exposed on the sandbox watch stream.
@@ -997,16 +997,16 @@ message DeleteSandboxRequest {
   string workspace = 2;
 }
 
-// Suspend sandbox request.
-message SuspendSandboxRequest {
+// Stop sandbox request.
+message StopSandboxRequest {
   // Sandbox name (canonical lookup key).
   string name = 1;
   // Workspace scope. Empty defaults to "default".
   string workspace = 2;
 }
 
-// Resume sandbox request.
-message ResumeSandboxRequest {
+// Start sandbox request.
+message StartSandboxRequest {
   // Sandbox name (canonical lookup key).
   string name = 1;
   // Workspace scope. Empty defaults to "default".

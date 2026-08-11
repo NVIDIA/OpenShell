@@ -55,8 +55,8 @@ path = "tests/driver_config_volume.rs"
 required-features = ["e2e-local-container-driver"]
 
 [[test]]
-name = "gateway_resume"
-path = "tests/gateway_resume.rs"
+name = "gateway_start"
+path = "tests/gateway_start.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
@@ -65,8 +65,8 @@ path = "tests/local_driver_token_restart.rs"
 required-features = ["e2e"]
 
 [[test]]
-name = "podman_gateway_resume"
-path = "tests/podman_gateway_resume.rs"
+name = "podman_gateway_start"
+path = "tests/podman_gateway_start.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
@@ -80,8 +80,8 @@ path = "tests/podman_oci_identity.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
-name = "vm_gateway_resume"
-path = "tests/vm_gateway_resume.rs"
+name = "vm_gateway_start"
+path = "tests/vm_gateway_start.rs"
 required-features = ["e2e-vm"]
 
 [[test]]

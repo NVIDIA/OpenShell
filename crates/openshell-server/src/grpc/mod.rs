@@ -44,11 +44,11 @@ use openshell_core::proto::{
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
     RemoveWorkspaceMemberResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    ResumeSandboxRequest, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
-    ServiceEndpointResponse, ServiceStatus, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, SupervisorMessage, SuspendSandboxRequest, TcpForwardFrame,
-    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
+    RotateProviderCredentialResponse, SandboxResponse, ServiceEndpointResponse, ServiceStatus,
+    StartSandboxRequest, StopSandboxRequest, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
+    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
     WatchSandboxRequest, open_shell_server::OpenShell,
 };
@@ -324,18 +324,18 @@ impl OpenShell for OpenShellService {
         sandbox::handle_delete_sandbox(&self.state, request).await
     }
 
-    async fn suspend_sandbox(
+    async fn stop_sandbox(
         &self,
-        request: Request<SuspendSandboxRequest>,
+        request: Request<StopSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        sandbox::handle_suspend_sandbox(&self.state, request).await
+        sandbox::handle_stop_sandbox(&self.state, request).await
     }
 
-    async fn resume_sandbox(
+    async fn start_sandbox(
         &self,
-        request: Request<ResumeSandboxRequest>,
+        request: Request<StartSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        sandbox::handle_resume_sandbox(&self.state, request).await
+        sandbox::handle_start_sandbox(&self.state, request).await
     }
 
     // --- Exec ---

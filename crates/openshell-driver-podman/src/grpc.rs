@@ -8,7 +8,7 @@ use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, ResumeSandboxRequest, ResumeSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
     StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
     compute_driver_server::ComputeDriver,
@@ -128,19 +128,19 @@ impl ComputeDriver for ComputeDriverService {
         Ok(Response::new(StopSandboxResponse {}))
     }
 
-    async fn resume_sandbox(
+    async fn start_sandbox(
         &self,
-        request: Request<ResumeSandboxRequest>,
-    ) -> Result<Response<ResumeSandboxResponse>, Status> {
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
         let request = request.into_inner();
         if request.sandbox_id.is_empty() {
             return Err(Status::invalid_argument("sandbox_id is required"));
         }
         self.driver
-            .resume_sandbox(&request.sandbox_id)
+            .start_sandbox(&request.sandbox_id)
             .await
             .map_err(Status::from)?;
-        Ok(Response::new(ResumeSandboxResponse {}))
+        Ok(Response::new(StartSandboxResponse {}))
     }
 
     async fn delete_sandbox(

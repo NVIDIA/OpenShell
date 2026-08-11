@@ -18,12 +18,12 @@ The gateway runs as a host process. The Docker driver creates one container per
 sandbox and starts the `openshell-sandbox` supervisor inside that container. The
 supervisor then creates the nested sandbox namespace for the agent process.
 
-## Suspend and Resume
+## Stop and Start
 
-Suspend stops the managed container without removing it. Docker retains the
+Stop stops the managed container without removing it. Docker retains the
 container writable layer, attached volumes, labels, token material, and restart
-policy. Resume starts that same container, so files in the resolved OCI
-workspace remain available. A durably suspended sandbox is excluded from
+policy. Start starts that same container, so files in the resolved OCI
+workspace remain available. A durably stopped sandbox is excluded from
 gateway startup recovery and stays stopped across gateway restarts. Delete
 continues to force-remove the container and clean up driver-owned material.
 

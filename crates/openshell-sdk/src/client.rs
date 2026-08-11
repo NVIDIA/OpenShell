@@ -217,29 +217,29 @@ impl OpenShellClient {
         Ok(response.deleted)
     }
 
-    /// Suspend a sandbox by name.
-    pub async fn suspend_sandbox(&self, name: &str) -> Result<SandboxRef> {
+    /// Stop a sandbox by name.
+    pub async fn stop_sandbox(&self, name: &str) -> Result<SandboxRef> {
         let response = self
             .unary(|mut grpc| {
-                let request = proto::SuspendSandboxRequest {
+                let request = proto::StopSandboxRequest {
                     name: name.to_string(),
                     workspace: String::new(),
                 };
-                async move { grpc.suspend_sandbox(request).await }
+                async move { grpc.stop_sandbox(request).await }
             })
             .await?;
         sandbox_from_response(response.sandbox)
     }
 
-    /// Resume a suspended sandbox by name.
-    pub async fn resume_sandbox(&self, name: &str) -> Result<SandboxRef> {
+    /// Start a stopped sandbox by name.
+    pub async fn start_sandbox(&self, name: &str) -> Result<SandboxRef> {
         let response = self
             .unary(|mut grpc| {
-                let request = proto::ResumeSandboxRequest {
+                let request = proto::StartSandboxRequest {
                     name: name.to_string(),
                     workspace: String::new(),
                 };
-                async move { grpc.resume_sandbox(request).await }
+                async move { grpc.start_sandbox(request).await }
             })
             .await?;
         sandbox_from_response(response.sandbox)
@@ -614,31 +614,31 @@ impl WorkspaceScopedClient {
         Ok(response.deleted)
     }
 
-    /// Suspend a sandbox by name in this workspace.
-    pub async fn suspend_sandbox(&self, name: &str) -> Result<SandboxRef> {
+    /// Stop a sandbox by name in this workspace.
+    pub async fn stop_sandbox(&self, name: &str) -> Result<SandboxRef> {
         let response = self
             .client
             .unary(|mut grpc| {
-                let request = proto::SuspendSandboxRequest {
+                let request = proto::StopSandboxRequest {
                     name: name.to_string(),
                     workspace: self.workspace.clone(),
                 };
-                async move { grpc.suspend_sandbox(request).await }
+                async move { grpc.stop_sandbox(request).await }
             })
             .await?;
         sandbox_from_response(response.sandbox)
     }
 
-    /// Resume a suspended sandbox by name in this workspace.
-    pub async fn resume_sandbox(&self, name: &str) -> Result<SandboxRef> {
+    /// Start a stopped sandbox by name in this workspace.
+    pub async fn start_sandbox(&self, name: &str) -> Result<SandboxRef> {
         let response = self
             .client
             .unary(|mut grpc| {
-                let request = proto::ResumeSandboxRequest {
+                let request = proto::StartSandboxRequest {
                     name: name.to_string(),
                     workspace: self.workspace.clone(),
                 };
-                async move { grpc.resume_sandbox(request).await }
+                async move { grpc.start_sandbox(request).await }
             })
             .await?;
         sandbox_from_response(response.sandbox)

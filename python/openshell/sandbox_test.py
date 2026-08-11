@@ -1543,8 +1543,8 @@ class _FakeSandboxStub:
         self.list_request: openshell_pb2.ListSandboxesRequest | None = None
         self.get_request: openshell_pb2.GetSandboxRequest | None = None
         self.delete_request: openshell_pb2.DeleteSandboxRequest | None = None
-        self.suspend_request: openshell_pb2.SuspendSandboxRequest | None = None
-        self.resume_request: openshell_pb2.ResumeSandboxRequest | None = None
+        self.stop_request: openshell_pb2.StopSandboxRequest | None = None
+        self.start_request: openshell_pb2.StartSandboxRequest | None = None
         self._listed = listed or []
 
     def GetSandbox(
@@ -1569,34 +1569,34 @@ class _FakeSandboxStub:
         _ = timeout
         return SimpleNamespace(deleted=True)
 
-    def SuspendSandbox(
+    def StopSandbox(
         self,
-        request: openshell_pb2.SuspendSandboxRequest,
+        request: openshell_pb2.StopSandboxRequest,
         timeout: float | None = None,
     ) -> Any:
-        self.suspend_request = request
+        self.stop_request = request
         _ = timeout
         return SimpleNamespace(
             sandbox=_make_sandbox_proto(
                 "sandbox-1",
                 request.name,
-                phase=openshell_pb2.SANDBOX_PHASE_SUSPENDED,
+                phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
                 workspace=request.workspace,
             )
         )
 
-    def ResumeSandbox(
+    def StartSandbox(
         self,
-        request: openshell_pb2.ResumeSandboxRequest,
+        request: openshell_pb2.StartSandboxRequest,
         timeout: float | None = None,
     ) -> Any:
-        self.resume_request = request
+        self.start_request = request
         _ = timeout
         return SimpleNamespace(
             sandbox=_make_sandbox_proto(
                 "sandbox-1",
                 request.name,
-                phase=openshell_pb2.SANDBOX_PHASE_RESUMING,
+                phase=openshell_pb2.SANDBOX_PHASE_STARTING,
                 workspace=request.workspace,
             )
         )
@@ -1675,21 +1675,21 @@ def test_create_forwards_name_and_labels() -> None:
     assert dict(ref.labels) == {"aiq": "deep-research"}
 
 
-def test_suspend_and_resume_forward_workspace_and_return_phase() -> None:
+def test_stop_and_start_forward_workspace_and_return_phase() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)
 
-    suspended = client.suspend("job-1", workspace="team-a")
-    assert stub.suspend_request is not None
-    assert stub.suspend_request.name == "job-1"
-    assert stub.suspend_request.workspace == "team-a"
-    assert suspended.phase == openshell_pb2.SANDBOX_PHASE_SUSPENDED
+    stopped = client.stop("job-1", workspace="team-a")
+    assert stub.stop_request is not None
+    assert stub.stop_request.name == "job-1"
+    assert stub.stop_request.workspace == "team-a"
+    assert stopped.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
 
-    resuming = client.resume("job-1", workspace="team-a")
-    assert stub.resume_request is not None
-    assert stub.resume_request.name == "job-1"
-    assert stub.resume_request.workspace == "team-a"
-    assert resuming.phase == openshell_pb2.SANDBOX_PHASE_RESUMING
+    starting = client.start("job-1", workspace="team-a")
+    assert stub.start_request is not None
+    assert stub.start_request.name == "job-1"
+    assert stub.start_request.workspace == "team-a"
+    assert starting.phase == openshell_pb2.SANDBOX_PHASE_STARTING
 
 
 def test_create_without_args_sends_empty_metadata() -> None:

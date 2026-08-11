@@ -22,10 +22,10 @@ use openshell_core::proto::{
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent, ExecSandboxExit,
     ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, Provider, ResumeSandboxRequest, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, SshRelayTarget,
-    SuspendSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest,
-    relay_open, tcp_forward_init,
+    ListSandboxesResponse, Provider, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    SandboxResponse, SandboxStreamEvent, SshRelayTarget, StartSandboxRequest, StopSandboxRequest,
+    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open,
+    tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use openshell_core::telemetry::{
@@ -764,14 +764,14 @@ async fn handle_delete_sandbox_inner(
     }))
 }
 
-pub(super) async fn handle_suspend_sandbox(
+pub(super) async fn handle_stop_sandbox(
     state: &Arc<ServerState>,
-    request: Request<SuspendSandboxRequest>,
+    request: Request<StopSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
-    let result = handle_suspend_sandbox_inner(state, request).await;
+    let result = handle_stop_sandbox_inner(state, request).await;
     openshell_core::telemetry::emit_lifecycle(
         LifecycleResource::Sandbox,
-        LifecycleOperation::Suspend,
+        LifecycleOperation::Stop,
         if result.is_ok() {
             TelemetryOutcome::Success
         } else {
@@ -781,9 +781,9 @@ pub(super) async fn handle_suspend_sandbox(
     result
 }
 
-async fn handle_suspend_sandbox_inner(
+async fn handle_stop_sandbox_inner(
     state: &Arc<ServerState>,
-    request: Request<SuspendSandboxRequest>,
+    request: Request<StopSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
@@ -801,21 +801,21 @@ async fn handle_suspend_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
-    let sandbox = state.compute.suspend_sandbox(&workspace, &req.name).await?;
-    info!(sandbox_name = %req.name, "SuspendSandbox request completed successfully");
+    let sandbox = state.compute.stop_sandbox(&workspace, &req.name).await?;
+    info!(sandbox_name = %req.name, "StopSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
 }
 
-pub(super) async fn handle_resume_sandbox(
+pub(super) async fn handle_start_sandbox(
     state: &Arc<ServerState>,
-    request: Request<ResumeSandboxRequest>,
+    request: Request<StartSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
-    let result = handle_resume_sandbox_inner(state, request).await;
+    let result = handle_start_sandbox_inner(state, request).await;
     openshell_core::telemetry::emit_lifecycle(
         LifecycleResource::Sandbox,
-        LifecycleOperation::Resume,
+        LifecycleOperation::Start,
         if result.is_ok() {
             TelemetryOutcome::Success
         } else {
@@ -825,9 +825,9 @@ pub(super) async fn handle_resume_sandbox(
     result
 }
 
-async fn handle_resume_sandbox_inner(
+async fn handle_start_sandbox_inner(
     state: &Arc<ServerState>,
-    request: Request<ResumeSandboxRequest>,
+    request: Request<StartSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
@@ -845,8 +845,8 @@ async fn handle_resume_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
-    let sandbox = state.compute.resume_sandbox(&workspace, &req.name).await?;
-    info!(sandbox_name = %req.name, "ResumeSandbox request completed successfully");
+    let sandbox = state.compute.start_sandbox(&workspace, &req.name).await?;
+    info!(sandbox_name = %req.name, "StartSandbox request completed successfully");
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
@@ -4517,17 +4517,17 @@ mod tests {
         );
 
         for result in [
-            handle_suspend_sandbox(
+            handle_stop_sandbox(
                 &state,
-                non_member_request(SuspendSandboxRequest {
+                non_member_request(StopSandboxRequest {
                     workspace: "no-such-ws".into(),
                     name: "any".into(),
                 }),
             )
             .await,
-            handle_resume_sandbox(
+            handle_start_sandbox(
                 &state,
-                non_member_request(ResumeSandboxRequest {
+                non_member_request(StartSandboxRequest {
                     workspace: "no-such-ws".into(),
                     name: "any".into(),
                 }),

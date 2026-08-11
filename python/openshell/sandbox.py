@@ -251,14 +251,12 @@ class SandboxSession:
     def delete(self) -> bool:
         return self._client.delete(self.sandbox.name, workspace=self._workspace)
 
-    def suspend(self) -> SandboxRef:
-        self.sandbox = self._client.suspend(
-            self.sandbox.name, workspace=self._workspace
-        )
+    def stop(self) -> SandboxRef:
+        self.sandbox = self._client.stop(self.sandbox.name, workspace=self._workspace)
         return self.sandbox
 
-    def resume(self) -> SandboxRef:
-        self.sandbox = self._client.resume(self.sandbox.name, workspace=self._workspace)
+    def start(self) -> SandboxRef:
+        self.sandbox = self._client.start(self.sandbox.name, workspace=self._workspace)
         return self.sandbox
 
 
@@ -557,16 +555,16 @@ class SandboxClient:
         )
         return bool(response.deleted)
 
-    def suspend(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
-        response = self._stub.SuspendSandbox(
-            openshell_pb2.SuspendSandboxRequest(name=sandbox_name, workspace=workspace),
+    def stop(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+        response = self._stub.StopSandbox(
+            openshell_pb2.StopSandboxRequest(name=sandbox_name, workspace=workspace),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
 
-    def resume(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
-        response = self._stub.ResumeSandbox(
-            openshell_pb2.ResumeSandboxRequest(name=sandbox_name, workspace=workspace),
+    def start(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+        response = self._stub.StartSandbox(
+            openshell_pb2.StartSandboxRequest(name=sandbox_name, workspace=workspace),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
@@ -599,14 +597,14 @@ class SandboxClient:
             timeout_seconds=timeout_seconds,
         )
 
-    def wait_suspended(
+    def wait_stopped(
         self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 300.0
     ) -> SandboxRef:
         return self._wait_for_phase(
             sandbox_name,
             workspace=workspace,
-            target_phase=openshell_pb2.SANDBOX_PHASE_SUSPENDED,
-            target_name="suspended",
+            target_phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
+            target_name="stopped",
             timeout_seconds=timeout_seconds,
         )
 

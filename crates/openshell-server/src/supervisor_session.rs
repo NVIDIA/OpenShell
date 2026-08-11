@@ -143,7 +143,7 @@ impl SupervisorSessionRegistry {
 
     /// Disconnect the current supervisor session for a sandbox.
     ///
-    /// Lifecycle suspension uses this to ensure a later resume must establish
+    /// Lifecycle stop uses this to ensure a later start must establish
     /// a fresh session before the sandbox can return to Ready.
     pub fn disconnect(&self, sandbox_id: &str) -> bool {
         let session = self.sessions.lock().unwrap().remove(sandbox_id);

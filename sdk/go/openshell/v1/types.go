@@ -17,9 +17,9 @@ const (
 	SandboxError        = types.SandboxError
 	SandboxDeleting     = types.SandboxDeleting
 	SandboxUnknown      = types.SandboxUnknown
-	SandboxSuspending   = types.SandboxSuspending
-	SandboxSuspended    = types.SandboxSuspended
-	SandboxResuming     = types.SandboxResuming
+	SandboxStopping     = types.SandboxStopping
+	SandboxStopped      = types.SandboxStopped
+	SandboxStarting     = types.SandboxStarting
 )
 
 // EventType classifies watch events.

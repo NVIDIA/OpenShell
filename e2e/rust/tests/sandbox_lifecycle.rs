@@ -130,19 +130,19 @@ async fn run_sandbox_lifecycle_command(operation: &str, name: &str) -> String {
 }
 
 #[tokio::test]
-async fn sandbox_suspend_resume_preserves_workspace() {
-    const SENTINEL: &str = "openshell-suspend-resume-sentinel";
-    const SENTINEL_PATH: &str = "/sandbox/.openshell-suspend-resume-e2e";
+async fn sandbox_stop_start_preserves_workspace() {
+    const SENTINEL: &str = "openshell-stop-start-sentinel";
+    const SENTINEL_PATH: &str = "/sandbox/.openshell-stop-start-e2e";
     let write_sentinel = format!("printf '%s\\n' '{SENTINEL}' > '{SENTINEL_PATH}'");
 
     let mut sandbox = SandboxGuard::create(&["--", "sh", "-lc", &write_sentinel])
         .await
         .expect("sandbox create should write the workspace sentinel");
 
-    let suspend_output = run_sandbox_lifecycle_command("suspend", &sandbox.name).await;
+    let stop_output = run_sandbox_lifecycle_command("stop", &sandbox.name).await;
     assert!(
-        suspend_output.contains("Suspended sandbox"),
-        "expected suspend confirmation in:\n{suspend_output}",
+        stop_output.contains("Stopped sandbox"),
+        "expected stop confirmation in:\n{stop_output}",
     );
 
     let mut exec_cmd = openshell_cmd();
@@ -159,43 +159,43 @@ async fn sandbox_suspend_resume_preserves_workspace() {
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let suspended_exec = exec_cmd
+    let stopped_exec = exec_cmd
         .output()
         .await
-        .expect("spawn openshell sandbox exec while suspended");
+        .expect("spawn openshell sandbox exec while stopped");
     assert!(
-        !suspended_exec.status.success(),
-        "sandbox exec should fail while suspended"
+        !stopped_exec.status.success(),
+        "sandbox exec should fail while stopped"
     );
 
-    let resume_output = run_sandbox_lifecycle_command("resume", &sandbox.name).await;
+    let start_output = run_sandbox_lifecycle_command("start", &sandbox.name).await;
     assert!(
-        resume_output.contains("Resumed sandbox"),
-        "expected resume confirmation in:\n{resume_output}",
+        start_output.contains("Started sandbox"),
+        "expected start confirmation in:\n{start_output}",
     );
 
     let sentinel = sandbox
         .exec(&["cat", SENTINEL_PATH])
         .await
-        .expect("sandbox exec should succeed after resume");
+        .expect("sandbox exec should succeed after start");
     assert!(
         sentinel.lines().any(|line| line.trim() == SENTINEL),
-        "workspace sentinel should survive suspend and resume:\n{sentinel}",
+        "workspace sentinel should survive stop and start:\n{sentinel}",
     );
 
     sandbox.cleanup().await;
 }
 
 #[tokio::test]
-async fn sandbox_can_be_deleted_while_suspended() {
+async fn sandbox_can_be_deleted_while_stopped() {
     let mut sandbox = SandboxGuard::create(&["--", "true"])
         .await
         .expect("sandbox create should succeed");
 
-    let suspend_output = run_sandbox_lifecycle_command("suspend", &sandbox.name).await;
+    let stop_output = run_sandbox_lifecycle_command("stop", &sandbox.name).await;
     assert!(
-        suspend_output.contains("Suspended sandbox"),
-        "expected suspend confirmation in:\n{suspend_output}",
+        stop_output.contains("Stopped sandbox"),
+        "expected stop confirmation in:\n{stop_output}",
     );
 
     let delete_output = run_sandbox_lifecycle_command("delete", &sandbox.name).await;
@@ -207,7 +207,7 @@ async fn sandbox_can_be_deleted_while_suspended() {
     if let Err(last_sandbox_list) = assert_sandbox_presence_eventually(&sandbox.name, false).await {
         sandbox.cleanup().await;
         panic!(
-            "suspended sandbox {} should be deleted without resuming after \
+            "stopped sandbox {} should be deleted without starting after \
              {SANDBOX_PRESENCE_TIMEOUT:?}; last observed sandbox list: {last_sandbox_list:?}",
             sandbox.name,
         );

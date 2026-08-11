@@ -43,7 +43,7 @@ use openshell_core::proto::compute::v1::{
     DriverSandboxTemplate as SandboxTemplate, GetCapabilitiesRequest, GetCapabilitiesResponse,
     GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
     GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
-    ResumeSandboxRequest, ResumeSandboxResponse, StopSandboxRequest, StopSandboxResponse,
+    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
     ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
     WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
     WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver, watch_sandboxes_event,
@@ -166,7 +166,7 @@ const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";
 const OVERLAY_TEMPLATE_CACHE_LAYOUT_VERSION: &str = "sandbox-overlay-ext4-v1";
 const SANDBOX_OVERLAY_IMAGE: &str = "overlay.ext4";
 const SANDBOX_REQUEST_FILE: &str = "sandbox.pb";
-const SANDBOX_SUSPENDED_FILE: &str = "suspended";
+const SANDBOX_STOPPED_FILE: &str = "stopped";
 const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
@@ -605,7 +605,7 @@ impl VmDriver {
             registry.remove(&sandbox.id);
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
             return Err(Status::internal(format!(
-                "write sandbox resume metadata failed: {err}"
+                "write sandbox start metadata failed: {err}"
             )));
         }
 
@@ -1087,9 +1087,9 @@ impl VmDriver {
 
         // Persist intent before detaching process handles or releasing host
         // allocations. If this write fails, the live record remains intact.
-        tokio::fs::write(state_dir.join(SANDBOX_SUSPENDED_FILE), b"suspended\n")
+        tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
             .await
-            .map_err(|err| Status::internal(format!("persist suspension marker failed: {err}")))?;
+            .map_err(|err| Status::internal(format!("persist stop marker failed: {err}")))?;
 
         let (process, provisioning_task, has_gpu, has_qemu_network, snapshot) = {
             let mut registry = self.registry.lock().await;
@@ -1116,29 +1116,24 @@ impl VmDriver {
                 .map_err(|err| Status::internal(format!("failed to stop vm: {err}")))?;
         }
         self.lifecycle_extensions
-            .after_launch_failed(&snapshot, &state_dir, LaunchAbortReason::Suspended)
+            .after_launch_failed(&snapshot, &state_dir, LaunchAbortReason::Stopped)
             .await;
         self.release_allocations(&record_id, has_gpu, has_qemu_network);
 
         if let Some(snapshot) = self
-            .set_snapshot_condition(&record_id, suspended_condition(), false)
+            .set_snapshot_condition(&record_id, stopped_condition(), false)
             .await
         {
             self.publish_snapshot(snapshot);
         }
         self.publish_platform_event(
             record_id,
-            platform_event(
-                "vm",
-                "Normal",
-                "Suspended",
-                "VM sandbox suspended".to_string(),
-            ),
+            platform_event("vm", "Normal", "Stopped", "VM sandbox stopped".to_string()),
         );
         Ok(())
     }
 
-    pub async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
+    pub async fn start_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<(), Status> {
         if !sandbox_id.is_empty() {
             validate_sandbox_id(sandbox_id)?;
         }
@@ -1165,9 +1160,9 @@ impl VmDriver {
         let sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
             .await
             .map_err(|err| {
-                Status::internal(format!("read sandbox resume metadata failed: {err}"))
+                Status::internal(format!("read sandbox start metadata failed: {err}"))
             })?;
-        let suspended_record = self
+        let stopped_record = self
             .registry
             .lock()
             .await
@@ -1181,8 +1176,8 @@ impl VmDriver {
                 .lock()
                 .await
                 .entry(record_id)
-                .or_insert(suspended_record);
-            return Err(Status::internal("failed to resume persisted VM sandbox"));
+                .or_insert(stopped_record);
+            return Err(Status::internal("failed to start persisted VM sandbox"));
         }
         Ok(())
     }
@@ -1393,11 +1388,11 @@ impl VmDriver {
                 continue;
             }
 
-            if tokio::fs::metadata(state_dir.join(SANDBOX_SUSPENDED_FILE))
+            if tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
                 .await
                 .is_ok()
             {
-                let snapshot = sandbox_snapshot(&sandbox, suspended_condition(), false);
+                let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
                 let mut registry = self.registry.lock().await;
                 registry.entry(sandbox.id.clone()).or_insert(SandboxRecord {
                     snapshot: snapshot.clone(),
@@ -1410,7 +1405,7 @@ impl VmDriver {
                 });
                 drop(registry);
                 self.publish_snapshot(snapshot);
-                info!(sandbox_id = %sandbox.id, "vm driver: restored suspended sandbox without launching compute");
+                info!(sandbox_id = %sandbox.id, "vm driver: restored stopped sandbox without launching compute");
                 continue;
             }
 
@@ -1420,14 +1415,14 @@ impl VmDriver {
     }
 
     /// Restore a persisted sandbox and report whether the driver accepted it.
-    /// For explicit resume, the suspension marker is cleared only after all
+    /// For explicit start, the stop marker is cleared only after all
     /// restore preflight checks pass and the replacement registry record is
-    /// installed. A failed restore therefore remains durably suspended.
+    /// installed. A failed restore therefore remains durably stopped.
     async fn restore_persisted_sandbox(
         &self,
         sandbox: Sandbox,
         state_dir: PathBuf,
-        clear_suspension_marker: bool,
+        clear_stop_marker: bool,
         reconciliation_span: &tracing::Span,
     ) -> bool {
         let Some(image_ref) = self.resolved_sandbox_image(&sandbox) else {
@@ -1497,8 +1492,8 @@ impl VmDriver {
             );
         }
 
-        if clear_suspension_marker {
-            match tokio::fs::remove_file(state_dir.join(SANDBOX_SUSPENDED_FILE)).await {
+        if clear_stop_marker {
+            match tokio::fs::remove_file(state_dir.join(SANDBOX_STOPPED_FILE)).await {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => {
@@ -1507,7 +1502,7 @@ impl VmDriver {
                         sandbox_id = %sandbox.id,
                         state_dir = %state_dir.display(),
                         error = %err,
-                        "vm driver: cannot clear suspension marker for persisted sandbox restore"
+                        "vm driver: cannot clear stop marker for persisted sandbox restore"
                     );
                     return false;
                 }
@@ -3360,14 +3355,14 @@ impl ComputeDriver for VmDriver {
         Ok(Response::new(StopSandboxResponse {}))
     }
 
-    async fn resume_sandbox(
+    async fn start_sandbox(
         &self,
-        request: Request<ResumeSandboxRequest>,
-    ) -> Result<Response<ResumeSandboxResponse>, Status> {
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
         let request = request.into_inner();
-        self.resume_sandbox(&request.sandbox_id, &request.sandbox_name)
+        self.start_sandbox(&request.sandbox_id, &request.sandbox_name)
             .await?;
-        Ok(Response::new(ResumeSandboxResponse {}))
+        Ok(Response::new(StartSandboxResponse {}))
     }
 
     async fn delete_sandbox(
@@ -5368,9 +5363,9 @@ fn deleting_condition() -> SandboxCondition {
     }
 }
 
-fn suspended_condition() -> SandboxCondition {
+fn stopped_condition() -> SandboxCondition {
     SandboxCondition {
-        r#type: "Suspended".to_string(),
+        r#type: "Stopped".to_string(),
         status: "True".to_string(),
         reason: "ComputeStopped".to_string(),
         message: "VM compute is stopped and persistent state is retained".to_string(),
@@ -6543,13 +6538,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_request_metadata_round_trips_for_resume() {
+    async fn sandbox_request_metadata_round_trips_for_start() {
         let base = unique_temp_dir();
         let state_dir = base.join("sandboxes").join("sandbox-123");
         std::fs::create_dir_all(&state_dir).unwrap();
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
-            name: "resume-sandbox".to_string(),
+            name: "start-sandbox".to_string(),
             namespace: "vm-dev".to_string(),
             spec: Some(SandboxSpec {
                 environment: HashMap::from([("KEY".to_string(), "value".to_string())]),
@@ -6590,22 +6585,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_resume_preserves_suspended_state() {
+    async fn failed_start_preserves_stopped_state() {
         let temp = tempfile::tempdir().unwrap();
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         driver.config.state_dir = temp.path().to_path_buf();
         let sandbox = Sandbox {
-            id: "sandbox-suspended".to_string(),
-            name: "suspended".to_string(),
+            id: "sandbox-stopped".to_string(),
+            name: "stopped".to_string(),
             ..Default::default()
         };
         let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
         create_private_dir_all(&state_dir).await.unwrap();
         write_sandbox_request(&state_dir, &sandbox).await.unwrap();
-        tokio::fs::write(state_dir.join(SANDBOX_SUSPENDED_FILE), b"suspended\n")
+        tokio::fs::write(state_dir.join(SANDBOX_STOPPED_FILE), b"stopped\n")
             .await
             .unwrap();
-        let snapshot = sandbox_snapshot(&sandbox, suspended_condition(), false);
+        let snapshot = sandbox_snapshot(&sandbox, stopped_condition(), false);
         driver.registry.lock().await.insert(
             sandbox.id.clone(),
             SandboxRecord {
@@ -6620,33 +6615,33 @@ mod tests {
         );
 
         let err = driver
-            .resume_sandbox(&sandbox.id, &sandbox.name)
+            .start_sandbox(&sandbox.id, &sandbox.name)
             .await
-            .expect_err("resume without an image should fail");
+            .expect_err("start without an image should fail");
 
         assert_eq!(err.code(), Code::Internal);
         assert!(
-            tokio::fs::metadata(state_dir.join(SANDBOX_SUSPENDED_FILE))
+            tokio::fs::metadata(state_dir.join(SANDBOX_STOPPED_FILE))
                 .await
                 .is_ok(),
-            "failed resume must retain its durable suspension marker"
+            "failed start must retain its durable stop marker"
         );
         let restored = driver
             .get_sandbox(&sandbox.id, &sandbox.name)
             .await
             .unwrap()
-            .expect("failed resume must retain its suspended registry record");
+            .expect("failed start must retain its stopped registry record");
         let condition = restored
             .status
             .as_ref()
             .and_then(|status| status.conditions.first())
-            .expect("suspended condition");
-        assert_eq!(condition.r#type, "Suspended");
+            .expect("stopped condition");
+        assert_eq!(condition.r#type, "Stopped");
         assert_eq!(condition.status, "True");
     }
 
     #[test]
-    fn prepare_sandbox_overlay_preserves_existing_overlay_on_resume() {
+    fn prepare_sandbox_overlay_preserves_existing_overlay_on_start() {
         let base = unique_temp_dir();
         std::fs::create_dir_all(&base).unwrap();
         let template = base.join("template.ext4");
@@ -6670,7 +6665,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_sandbox_overlay_creates_missing_overlay_on_resume() {
+    fn prepare_sandbox_overlay_creates_missing_overlay_on_start() {
         let base = unique_temp_dir();
         std::fs::create_dir_all(&base).unwrap();
         let template = base.join("template.ext4");

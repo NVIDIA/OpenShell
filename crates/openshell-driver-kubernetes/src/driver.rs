@@ -93,8 +93,8 @@ const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 /// Kubernetes defaults pod termination to 30 seconds when the pod template
 /// omits `terminationGracePeriodSeconds`.
 const DEFAULT_POD_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(30);
-const SUSPEND_INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const SUSPEND_MAX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const STOP_INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const STOP_MAX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 const SANDBOX_GROUP: &str = "agents.x-k8s.io";
 const SANDBOX_VERSION_V1BETA1: &str = "v1beta1";
@@ -938,20 +938,20 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
-        let (agent_sandbox_api, kube_name, pod_name, suspend_timeout) = self
+        let (agent_sandbox_api, kube_name, pod_name, stop_timeout) = self
             .patch_sandbox_operating_state(sandbox_id, false)
             .await?;
         let legacy_pod_api = (agent_sandbox_api.resource.version == SANDBOX_VERSION_V1ALPHA1)
             .then(|| Api::<Pod>::namespaced(self.client.clone(), &self.config.namespace));
 
-        let deadline = tokio::time::Instant::now() + suspend_timeout;
-        let mut poll_interval = SUSPEND_INITIAL_POLL_INTERVAL;
+        let deadline = tokio::time::Instant::now() + stop_timeout;
+        let mut poll_interval = STOP_INITIAL_POLL_INTERVAL;
         loop {
             let now = tokio::time::Instant::now();
             if now >= deadline {
                 return Err(format!(
-                    "timed out after {}s waiting for Kubernetes sandbox to suspend",
-                    suspend_timeout.as_secs()
+                    "timed out after {}s waiting for Kubernetes sandbox to stop",
+                    stop_timeout.as_secs()
                 ));
             }
             let request_timeout = KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(now));
@@ -959,15 +959,15 @@ impl KubernetesComputeDriver {
                 request_timeout,
                 agent_sandbox_api.api.get(&kube_name),
             )
-                .await
-                .map_err(|_| {
-                    format!(
-                        "timed out after {}s waiting for Kubernetes API while checking sandbox suspension",
-                        request_timeout.as_secs()
-                    )
-                })?
-                .map_err(|err| err.to_string())?;
-            if kubernetes_sandbox_has_suspended_condition(&object) {
+            .await
+            .map_err(|_| {
+                format!(
+                    "timed out after {}s waiting for Kubernetes API while checking sandbox stop",
+                    request_timeout.as_secs()
+                )
+            })?
+            .map_err(|err| err.to_string())?;
+            if kubernetes_sandbox_has_stopped_condition(&object) {
                 return Ok(());
             }
             if let Some(pod_api) = legacy_pod_api.as_ref()
@@ -978,16 +978,16 @@ impl KubernetesComputeDriver {
             let now = tokio::time::Instant::now();
             if now >= deadline {
                 return Err(format!(
-                    "timed out after {}s waiting for Kubernetes sandbox to suspend",
-                    suspend_timeout.as_secs()
+                    "timed out after {}s waiting for Kubernetes sandbox to stop",
+                    stop_timeout.as_secs()
                 ));
             }
             tokio::time::sleep(poll_interval.min(deadline.saturating_duration_since(now))).await;
-            poll_interval = next_suspend_poll_interval(poll_interval);
+            poll_interval = next_stop_poll_interval(poll_interval);
         }
     }
 
-    pub async fn resume_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
+    pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
         self.patch_sandbox_operating_state(sandbox_id, true)
             .await
             .map(|_| ())
@@ -1022,7 +1022,7 @@ impl KubernetesComputeDriver {
             .into_iter()
             .next()
             .ok_or_else(|| "sandbox not found".to_string())?;
-        let suspend_timeout = kubernetes_sandbox_suspend_timeout(&object);
+        let stop_timeout = kubernetes_sandbox_stop_timeout(&object);
         let kube_name = object
             .metadata
             .name
@@ -1063,7 +1063,7 @@ impl KubernetesComputeDriver {
             running,
             "Updated Kubernetes sandbox operating state"
         );
-        Ok((agent_sandbox_api, kube_name, pod_name, suspend_timeout))
+        Ok((agent_sandbox_api, kube_name, pod_name, stop_timeout))
     }
 
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
@@ -3260,7 +3260,7 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
     })
 }
 
-fn kubernetes_sandbox_has_suspended_condition(obj: &DynamicObject) -> bool {
+fn kubernetes_sandbox_has_stopped_condition(obj: &DynamicObject) -> bool {
     obj.data
         .get("status")
         .and_then(|status| status.get("conditions"))
@@ -3298,7 +3298,7 @@ async fn kubernetes_sandbox_pod_is_gone(
     }
 }
 
-fn kubernetes_sandbox_suspend_timeout(obj: &DynamicObject) -> Duration {
+fn kubernetes_sandbox_stop_timeout(obj: &DynamicObject) -> Duration {
     let termination_grace_period = obj
         .data
         .get("spec")
@@ -3314,8 +3314,8 @@ fn kubernetes_sandbox_suspend_timeout(obj: &DynamicObject) -> Duration {
     termination_grace_period.saturating_add(KUBE_API_TIMEOUT)
 }
 
-fn next_suspend_poll_interval(current: Duration) -> Duration {
-    current.saturating_mul(2).min(SUSPEND_MAX_POLL_INTERVAL)
+fn next_stop_poll_interval(current: Duration) -> Duration {
+    current.saturating_mul(2).min(STOP_MAX_POLL_INTERVAL)
 }
 
 fn sandbox_operating_state_patch(
@@ -3411,19 +3411,19 @@ mod tests {
 
     #[test]
     fn lifecycle_patch_uses_version_specific_operating_state() {
-        let beta_suspend = sandbox_operating_state_patch(SANDBOX_VERSION_V1BETA1, "42", false);
-        assert_eq!(beta_suspend["metadata"]["resourceVersion"], "42");
-        assert_eq!(beta_suspend["spec"]["operatingMode"], "Suspended");
-        assert!(beta_suspend["spec"].get("replicas").is_none());
+        let beta_stop = sandbox_operating_state_patch(SANDBOX_VERSION_V1BETA1, "42", false);
+        assert_eq!(beta_stop["metadata"]["resourceVersion"], "42");
+        assert_eq!(beta_stop["spec"]["operatingMode"], "Suspended");
+        assert!(beta_stop["spec"].get("replicas").is_none());
 
-        let alpha_resume = sandbox_operating_state_patch(SANDBOX_VERSION_V1ALPHA1, "43", true);
-        assert_eq!(alpha_resume["metadata"]["resourceVersion"], "43");
-        assert_eq!(alpha_resume["spec"]["replicas"], 1);
-        assert!(alpha_resume["spec"].get("operatingMode").is_none());
+        let alpha_start = sandbox_operating_state_patch(SANDBOX_VERSION_V1ALPHA1, "43", true);
+        assert_eq!(alpha_start["metadata"]["resourceVersion"], "43");
+        assert_eq!(alpha_start["spec"]["replicas"], 1);
+        assert!(alpha_start["spec"].get("operatingMode").is_none());
     }
 
     #[test]
-    fn suspend_timeout_includes_pod_grace_period_and_reconcile_headroom() {
+    fn stop_timeout_includes_pod_grace_period_and_reconcile_headroom() {
         let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
             SANDBOX_GROUP,
             SANDBOX_VERSION_V1BETA1,
@@ -3432,7 +3432,7 @@ mod tests {
         let mut sandbox = DynamicObject::new("sandbox", &resource);
 
         assert_eq!(
-            kubernetes_sandbox_suspend_timeout(&sandbox),
+            kubernetes_sandbox_stop_timeout(&sandbox),
             Duration::from_secs(60),
             "an omitted grace period uses the Kubernetes 30-second default"
         );
@@ -3445,14 +3445,14 @@ mod tests {
             }
         });
         assert_eq!(
-            kubernetes_sandbox_suspend_timeout(&sandbox),
+            kubernetes_sandbox_stop_timeout(&sandbox),
             Duration::from_secs(75)
         );
     }
 
     #[test]
-    fn suspend_poll_interval_backs_off_to_cap() {
-        let mut interval = SUSPEND_INITIAL_POLL_INTERVAL;
+    fn stop_poll_interval_backs_off_to_cap() {
+        let mut interval = STOP_INITIAL_POLL_INTERVAL;
         let expected = [
             Duration::from_millis(500),
             Duration::from_secs(1),
@@ -3461,13 +3461,13 @@ mod tests {
         ];
 
         for expected_interval in expected {
-            interval = next_suspend_poll_interval(interval);
+            interval = next_stop_poll_interval(interval);
             assert_eq!(interval, expected_interval);
         }
     }
 
     #[test]
-    fn suspended_status_requires_published_condition() {
+    fn stopped_status_requires_published_condition() {
         let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
             SANDBOX_GROUP,
             SANDBOX_VERSION_V1ALPHA1,
@@ -3477,7 +3477,7 @@ mod tests {
         sandbox.data = serde_json::json!({"status": {"replicas": 0}});
 
         assert!(
-            !kubernetes_sandbox_has_suspended_condition(&sandbox),
+            !kubernetes_sandbox_has_stopped_condition(&sandbox),
             "v1alpha1 omits a zero status replica count on the wire; it is not a usable completion signal"
         );
 
@@ -3486,7 +3486,7 @@ mod tests {
                 "conditions": [{"type": "Suspended", "status": "True"}]
             }
         });
-        assert!(kubernetes_sandbox_has_suspended_condition(&sandbox));
+        assert!(kubernetes_sandbox_has_stopped_condition(&sandbox));
     }
 
     #[test]
