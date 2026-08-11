@@ -77,10 +77,9 @@ rules:
   # TLS secret sync: read the source Secret in the release namespace and
   # create/update copies in workspace namespaces so sandbox pods can mount
   # client TLS material for mTLS to the gateway.
-  {{- if and (eq $workspaceMode "managed") .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
-  # Managed mode with kubernetes-secrets credential driver: credentials are
-  # stored as Secrets in workspace namespaces, requiring patch+delete in
-  # addition to the TLS sync verbs.
+  {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
+  # kubernetes-secrets credential driver: credentials are stored as Secrets
+  # in workspace namespaces, requiring patch+delete in addition to TLS sync.
   {{- end }}
   - apiGroups:
       - ""
@@ -90,7 +89,7 @@ rules:
       - get
       - create
       - update
-      {{- if and (eq $workspaceMode "managed") .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
+      {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
       - patch
       - delete
       {{- end }}

@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: ClusterRole RBAC
+templates:
+  - templates/clusterrole.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: grants secrets patch and delete when credential driver is enabled (operator)
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+      server.credentialDrivers.kubernetesSecrets.enabled: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get", "create", "update", "patch", "delete"]
+
+  - it: omits secrets patch and delete when credential driver is disabled (operator)
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get", "create", "update"]
+
+  - it: omits secrets rule entirely in shared mode
+    set:
+      server.drivers.kubernetes.workspaceMode: shared
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+          any: true

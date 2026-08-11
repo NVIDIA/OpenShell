@@ -565,13 +565,15 @@ impl KubernetesComputeDriver {
     /// already existed. Also creates the sandbox `ServiceAccount` in the
     /// namespace.
     ///
-    /// TODO: no `NetworkPolicy` is created here. The Helm-managed namespace gets
-    /// an SSH-isolation policy (port 2222 restricted to the gateway pod), but
-    /// managed-mode namespaces do not. Current risk is low: only sandbox pods
-    /// from the same workspace run in this namespace, so there is no lateral
-    /// movement target. A same-cluster `namespaceSelector` policy would also
-    /// break cross-cluster topologies where the gateway is external. Add a
-    /// configurable `NetworkPolicy` when mixed-workload or cross-cluster managed
+    /// TODO: no `NetworkPolicy` is created in dynamic namespaces. The
+    /// Helm-managed static namespace gets an SSH-isolation policy (port 2222
+    /// restricted to the gateway pod), but managed and operator namespaces do
+    /// not. In managed mode, risk is low: only sandbox pods from the same
+    /// workspace run in the namespace, so there is no lateral movement target.
+    /// In operator mode, the admin owns the namespace and is responsible for
+    /// applying appropriate policies. A same-cluster `namespaceSelector` policy
+    /// would also break cross-cluster topologies where the gateway is external.
+    /// Add a configurable `NetworkPolicy` when mixed-workload or cross-cluster
     /// namespaces are supported.
     pub async fn ensure_namespace(&self, workspace: &str) -> Result<String, KubernetesDriverError> {
         let ns_name = managed_namespace(&self.config.gateway_id, workspace);
@@ -627,6 +629,24 @@ impl KubernetesComputeDriver {
                 info!(namespace = %ns_name, workspace = %workspace, "created managed namespace");
             }
             Ok(Err(KubeError::Api(api))) if api.code == 409 => {
+                let existing =
+                    match tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.get(&ns_name)).await {
+                        Ok(Ok(ns)) => ns,
+                        Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
+                        Err(_) => {
+                            return Err(KubernetesDriverError::Message(format!(
+                                "timeout reading namespace {ns_name}"
+                            )));
+                        }
+                    };
+                if !is_namespace_owned_by_gateway(
+                    existing.metadata.labels.as_ref(),
+                    &self.config.gateway_id,
+                ) {
+                    return Err(KubernetesDriverError::Precondition(format!(
+                        "namespace {ns_name} exists but is not owned by this gateway"
+                    )));
+                }
                 debug!(namespace = %ns_name, "managed namespace already exists");
             }
             Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
@@ -726,7 +746,11 @@ impl KubernetesComputeDriver {
 
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
-            target_api.create(&PostParams::default(), &copy),
+            target_api.patch(
+                &self.config.client_tls_secret_name,
+                &PatchParams::apply("openshell"),
+                &Patch::Apply(&copy),
+            ),
         )
         .await
         {
@@ -734,39 +758,13 @@ impl KubernetesComputeDriver {
                 info!(
                     namespace = %namespace,
                     secret = %self.config.client_tls_secret_name,
-                    "created TLS secret copy"
+                    "applied TLS secret copy"
                 );
-            }
-            Ok(Err(KubeError::Api(api))) if api.code == 409 => {
-                match tokio::time::timeout(
-                    KUBE_API_TIMEOUT,
-                    target_api.replace(
-                        &self.config.client_tls_secret_name,
-                        &PostParams::default(),
-                        &copy,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        debug!(
-                            namespace = %namespace,
-                            secret = %self.config.client_tls_secret_name,
-                            "updated TLS secret copy"
-                        );
-                    }
-                    Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
-                    Err(_) => {
-                        return Err(KubernetesDriverError::Message(format!(
-                            "timeout updating TLS secret in {namespace}"
-                        )));
-                    }
-                }
             }
             Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
             Err(_) => {
                 return Err(KubernetesDriverError::Message(format!(
-                    "timeout creating TLS secret in {namespace}"
+                    "timeout applying TLS secret in {namespace}"
                 )));
             }
         }
@@ -774,35 +772,11 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
-    /// Delete the managed namespace if it contains no sandboxes (managed mode
-    /// only). Called via the `DeleteWorkspace` RPC after workspace deletion.
-    pub async fn delete_namespace_if_empty(
-        &self,
-        workspace: &str,
-    ) -> Result<(), KubernetesDriverError> {
+    /// Delete the managed namespace and all its contents (managed mode only).
+    /// Called via the `DeleteWorkspace` RPC after workspace deletion.
+    /// Kubernetes cascades namespace deletion to all resources within it.
+    pub async fn delete_namespace(&self, workspace: &str) -> Result<(), KubernetesDriverError> {
         let ns_name = managed_namespace(&self.config.gateway_id, workspace);
-
-        let sandbox_api_version = self
-            .supported_sandbox_api_version(self.client.clone())
-            .await
-            .map_err(KubernetesDriverError::Message)?;
-        let agent_api = Self::agent_sandbox_api(self.client.clone(), sandbox_api_version, &ns_name);
-
-        let lp = ListParams::default()
-            .labels(&openshell_sandbox_label_selector())
-            .limit(1);
-        let list = tokio::time::timeout(KUBE_API_TIMEOUT, agent_api.api.list(&lp))
-            .await
-            .map_err(|_| {
-                KubernetesDriverError::Message(format!("timeout listing sandboxes in {ns_name}"))
-            })?
-            .map_err(KubernetesDriverError::from_kube)?;
-
-        if !list.items.is_empty() {
-            debug!(namespace = %ns_name, "namespace still has sandboxes, skipping delete");
-            return Ok(());
-        }
-
         let ns_api: Api<Namespace> = Api::all(self.client.clone());
 
         let ns = match tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.get(&ns_name)).await {
@@ -819,14 +793,7 @@ impl KubernetesComputeDriver {
             }
         };
 
-        let labels = ns.metadata.labels.as_ref();
-        let is_owned = labels
-            .and_then(|l| l.get(LABEL_MANAGED_BY))
-            .is_some_and(|v| v == LABEL_MANAGED_BY_VALUE)
-            && labels
-                .and_then(|l| l.get(LABEL_GATEWAY_ID))
-                .is_some_and(|v| v == &self.config.gateway_id);
-        if !is_owned {
+        if !is_namespace_owned_by_gateway(ns.metadata.labels.as_ref(), &self.config.gateway_id) {
             debug!(
                 namespace = %ns_name,
                 "namespace not owned by this gateway, skipping delete"
@@ -841,7 +808,7 @@ impl KubernetesComputeDriver {
         .await
         {
             Ok(Ok(_)) => {
-                info!(namespace = %ns_name, workspace = %workspace, "deleted empty managed namespace");
+                info!(namespace = %ns_name, workspace = %workspace, "deleted managed namespace");
             }
             Ok(Err(KubeError::Api(api))) if api.code == 404 => {
                 debug!(namespace = %ns_name, "managed namespace already deleted");
@@ -919,22 +886,11 @@ impl KubernetesComputeDriver {
     }
 
     fn sandbox_lookup_selector(&self, sandbox_id: &str) -> String {
-        let mut selector =
-            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id}");
-        if self.config.workspace_mode == WorkspaceMode::Managed {
-            use std::fmt::Write;
-            write!(selector, ",{LABEL_GATEWAY_ID}={}", self.config.gateway_id).unwrap();
-        }
-        selector
+        sandbox_lookup_selector_for(sandbox_id, &self.config.gateway_id)
     }
 
     fn openshell_sandbox_selector(&self) -> String {
-        let mut selector = openshell_sandbox_label_selector();
-        if self.config.workspace_mode == WorkspaceMode::Managed {
-            use std::fmt::Write;
-            write!(selector, ",{LABEL_GATEWAY_ID}={}", self.config.gateway_id).unwrap();
-        }
-        selector
+        openshell_sandbox_selector_for(&self.config.gateway_id)
     }
 
     async fn supported_sandbox_api_version(&self, client: Client) -> Result<&'static str, String> {
@@ -1842,6 +1798,31 @@ fn validate_kube_resource_name_length(workspace: &str, name: &str) -> Result<(),
         )));
     }
     Ok(())
+}
+
+fn is_namespace_owned_by_gateway(
+    labels: Option<&BTreeMap<String, String>>,
+    gateway_id: &str,
+) -> bool {
+    labels
+        .and_then(|l| l.get(LABEL_MANAGED_BY))
+        .is_some_and(|v| v == LABEL_MANAGED_BY_VALUE)
+        && labels
+            .and_then(|l| l.get(LABEL_GATEWAY_ID))
+            .is_some_and(|v| v == gateway_id)
+}
+
+fn sandbox_lookup_selector_for(sandbox_id: &str, gateway_id: &str) -> String {
+    format!(
+        "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id},{LABEL_GATEWAY_ID}={gateway_id}"
+    )
+}
+
+fn openshell_sandbox_selector_for(gateway_id: &str) -> String {
+    use std::fmt::Write;
+    let mut selector = openshell_sandbox_label_selector();
+    write!(selector, ",{LABEL_GATEWAY_ID}={gateway_id}").unwrap();
+    selector
 }
 
 fn sandbox_labels(sandbox: &Sandbox, gateway_id: Option<&str>) -> BTreeMap<String, String> {
@@ -7377,5 +7358,70 @@ mod tests {
             upstream_proxy_auth_file_name()
         );
         assert_eq!(volume["secret"]["defaultMode"], 0o440);
+    }
+
+    #[test]
+    fn sandbox_lookup_selector_always_includes_gateway_id() {
+        let sel = sandbox_lookup_selector_for("sb-123", "gw-42");
+        assert!(
+            sel.contains(&format!("{LABEL_GATEWAY_ID}=gw-42")),
+            "selector must include gateway ID: {sel}"
+        );
+        assert!(
+            sel.contains(&format!("{LABEL_SANDBOX_ID}=sb-123")),
+            "selector must include sandbox ID: {sel}"
+        );
+        assert!(
+            sel.contains(&format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}")),
+            "selector must include managed-by: {sel}"
+        );
+    }
+
+    #[test]
+    fn openshell_sandbox_selector_always_includes_gateway_id() {
+        let sel = openshell_sandbox_selector_for("gw-99");
+        assert!(
+            sel.contains(&format!("{LABEL_GATEWAY_ID}=gw-99")),
+            "selector must include gateway ID: {sel}"
+        );
+        assert!(
+            sel.contains(&format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}")),
+            "selector must include managed-by: {sel}"
+        );
+    }
+
+    #[test]
+    fn namespace_owned_with_correct_labels() {
+        let labels = BTreeMap::from([
+            (
+                LABEL_MANAGED_BY.to_string(),
+                LABEL_MANAGED_BY_VALUE.to_string(),
+            ),
+            (LABEL_GATEWAY_ID.to_string(), "gw-1".to_string()),
+        ]);
+        assert!(is_namespace_owned_by_gateway(Some(&labels), "gw-1"));
+    }
+
+    #[test]
+    fn namespace_not_owned_missing_managed_by() {
+        let labels = BTreeMap::from([(LABEL_GATEWAY_ID.to_string(), "gw-1".to_string())]);
+        assert!(!is_namespace_owned_by_gateway(Some(&labels), "gw-1"));
+    }
+
+    #[test]
+    fn namespace_not_owned_wrong_gateway_id() {
+        let labels = BTreeMap::from([
+            (
+                LABEL_MANAGED_BY.to_string(),
+                LABEL_MANAGED_BY_VALUE.to_string(),
+            ),
+            (LABEL_GATEWAY_ID.to_string(), "gw-other".to_string()),
+        ]);
+        assert!(!is_namespace_owned_by_gateway(Some(&labels), "gw-1"));
+    }
+
+    #[test]
+    fn namespace_not_owned_no_labels() {
+        assert!(!is_namespace_owned_by_gateway(None, "gw-1"));
     }
 }

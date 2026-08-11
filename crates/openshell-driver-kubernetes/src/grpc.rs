@@ -184,11 +184,23 @@ impl ComputeDriver for ComputeDriverService {
         if workspace.is_empty() {
             return Err(Status::invalid_argument("workspace is required"));
         }
-        if self.driver.workspace_mode() == WorkspaceMode::Managed {
-            self.driver
-                .ensure_namespace(&workspace)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        match self.driver.workspace_mode() {
+            WorkspaceMode::Managed => {
+                self.driver
+                    .ensure_namespace(&workspace)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            }
+            WorkspaceMode::Operator => {
+                if let Some(allowlist) = self.driver.operator_allowlist()
+                    && !allowlist.contains(&workspace)
+                {
+                    return Err(Status::permission_denied(format!(
+                        "workspace '{workspace}' is not in the operator namespace allowlist"
+                    )));
+                }
+            }
+            WorkspaceMode::Shared => {}
         }
         Ok(Response::new(EnsureWorkspaceResponse {}))
     }
@@ -201,11 +213,23 @@ impl ComputeDriver for ComputeDriverService {
         if workspace.is_empty() {
             return Err(Status::invalid_argument("workspace is required"));
         }
-        if self.driver.workspace_mode() == WorkspaceMode::Managed {
-            self.driver
-                .delete_namespace_if_empty(&workspace)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        match self.driver.workspace_mode() {
+            WorkspaceMode::Managed => {
+                self.driver
+                    .delete_namespace(&workspace)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            }
+            WorkspaceMode::Operator => {
+                if let Some(allowlist) = self.driver.operator_allowlist()
+                    && !allowlist.contains(&workspace)
+                {
+                    return Err(Status::permission_denied(format!(
+                        "workspace '{workspace}' is not in the operator namespace allowlist"
+                    )));
+                }
+            }
+            WorkspaceMode::Shared => {}
         }
         Ok(Response::new(DeleteWorkspaceResponse {}))
     }
