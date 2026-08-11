@@ -38,10 +38,14 @@ fi
 
 echo
 echo "Distinct rustls versions in the FIPS build:"
-cargo tree -p "${PACKAGE}" --no-default-features --features fips,telemetry -e normal 2>/dev/null \
-  | grep -oE 'rustls v[0-9]+\.[0-9]+\.[0-9]+' \
-  | sort -u \
-  | sed 's/^/  /'
+# `--prefix none` prints one bare "name vX.Y.Z" per line, so anchoring to the
+# start of the line matches the `rustls` package exactly. Matching `rustls v...`
+# anywhere in tree-formatted output also catches `hyper-rustls` and
+# `tokio-rustls`, which inflates the count with versions that are not rustls.
+# The trailing " (*)" marks a repeated subtree; strip it before deduplicating.
+cargo tree -p "${PACKAGE}" --no-default-features --features fips,telemetry -e normal --prefix none 2>/dev/null \
+  | sed -n 's/^rustls \(v[0-9][^ ]*\).*/  \1/p' \
+  | sort -u
 echo
 echo "More than one rustls major means a second TLS stack that the installed"
 echo "CryptoProvider does not govern."

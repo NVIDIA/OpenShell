@@ -77,8 +77,11 @@ secrets at rest without anyone noticing it was a compliance-relevant surface.
 ### One crate owns backend selection
 
 `openshell-crypto` is the only crate permitted to name a cryptographic backend.
-Every TLS, PKI, JWT, AEAD, hashing, and randomness operation in the workspace
-routes through it.
+Every TLS, PKI, JWT, AEAD, and randomness operation routes through it, along with
+hashing that serves a cryptographic purpose — key identifiers and credential
+path derivation. Content and revision hashing is deliberately out of scope; see
+[Algorithm choices that cross process boundaries](#algorithm-choices-that-cross-process-boundaries)
+for where that line falls and why.
 
 The mechanism that makes this enforceable is a manifest convention: the workspace
 `rustls`, `tokio-rustls`, and `rcgen` entries declare **no** backend feature.
@@ -101,16 +104,17 @@ built with `--no-default-features --features fips,telemetry`.
 
 ```mermaid
 flowchart TD
-    A["cargo build --features fips"] --> B["openshell-crypto/fips"]
+    A["cargo build --no-default-features<br/>--features fips,telemetry"] --> B["openshell-crypto/fips"]
+    A2["cargo build --features fips"] -->|"db-tls-ring still on"| A3["compile_error!<br/>build rejected"]
     B --> C["rustls/aws_lc_rs + rustls/fips"]
     B --> D["rcgen/aws_lc_rs + rcgen/fips"]
     B --> E["aws-lc-rs/fips"]
     C --> F["install_default_provider()"]
     F --> G["process-default CryptoProvider"]
     G --> H["every ClientConfig::builder()<br/>and ServerConfig::builder()"]
-    F --> I["verify_fips_posture()"]
-    I -->|"provider not FIPS"| J["process exits"]
-    E --> K["aead / sha256 / RNG"]
+    F --> I["verify_fips_posture()<br/>reads get_default()"]
+    I -->|"installed provider not FIPS"| J["process exits"]
+    E --> K["AEAD / key hashing / RNG"]
     D --> L["PKI + JWT keygen"]
 ```
 

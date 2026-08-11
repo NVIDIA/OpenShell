@@ -60,8 +60,9 @@ continue to opt in with `bundled-z3`.
 ## Crypto Backend Selection
 
 `openshell-crypto` is the single point of cryptographic backend selection. Every
-TLS, PKI, JWT, AEAD, hashing, and RNG operation in the workspace routes through
-it, so the backend is one feature rather than an audit of call sites. No other
+TLS, PKI, JWT, AEAD, and RNG operation routes through it, along with hashing that
+serves a cryptographic purpose, so the backend is one feature rather than an
+audit of call sites. Content and revision hashing is out of scope — see below. No other
 crate may name a backend directly, and the workspace `rustls`, `tokio-rustls`,
 and `rcgen` entries deliberately declare no backend feature — adding one back
 would link `ring` unconditionally and silently defeat the FIPS build.

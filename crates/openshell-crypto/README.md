@@ -1,8 +1,10 @@
 # openshell-crypto
 
 Single point of cryptographic backend selection for the workspace. Every TLS,
-PKI, JWT, AEAD, hashing, and RNG operation routes through this crate so a FIPS
-build is one Cargo feature rather than an audit of every call site.
+PKI, JWT, AEAD, and RNG operation routes through this crate, along with hashing
+that serves a cryptographic purpose, so a FIPS build is one Cargo feature rather
+than an audit of every call site. Content and revision hashing is deliberately
+out of scope — see [Boundaries](#boundaries).
 
 **No other crate may name a crypto backend directly.** The workspace `rustls`,
 `tokio-rustls`, and `rcgen` entries deliberately declare no backend feature;
