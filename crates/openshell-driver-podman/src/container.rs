@@ -583,9 +583,9 @@ fn build_env(
 
     env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
-    // The final spec overwrites this only after a successful immutable-image
-    // probe. An explicit empty value prevents image ENV from forging the
-    // attestation contract on the /sandbox compatibility path.
+    // Protected identity keys must be explicit even when unset: an omitted
+    // key can inherit image ENV, while an empty driver-owned value masks image
+    // metadata until the driver has an authoritative value to supply.
     env.insert(
         openshell_core::sandbox_env::OCI_WORKSPACE_IDENTITY.into(),
         String::new(),

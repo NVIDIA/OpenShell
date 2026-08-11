@@ -2251,7 +2251,9 @@ fn build_environment_for_oci_user(
 
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
-    // Ignore image-provided Podman probe attestations.
+    // Protected identity keys must be explicit even when unset: an omitted
+    // key can inherit image ENV, while an empty driver-owned value masks image
+    // metadata until the driver has an authoritative value to supply.
     environment.insert(
         openshell_core::sandbox_env::OCI_WORKSPACE_IDENTITY.to_string(),
         String::new(),
