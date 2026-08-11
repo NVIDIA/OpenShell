@@ -148,6 +148,10 @@ enum WebSocketSessionEndReason {
   WEB_SOCKET_SESSION_END_REASON_CANCELLATION = 7;
   WEB_SOCKET_SESSION_END_REASON_UPSTREAM_REJECTED = 8;
   WEB_SOCKET_SESSION_END_REASON_POLICY_DENIAL = 9;
+  // The middleware stage voluntarily declined inspection during preflight.
+  // This is a successful stage-local outcome, not a cancellation or denial of
+  // the WebSocket upgrade.
+  WEB_SOCKET_SESSION_END_REASON_STAGE_SKIPPED = 10;
 }
 
 // WebSocketSessionEvent is one ordered event in a stage-local stream.
@@ -221,17 +225,17 @@ message WebSocketPreflightDecision {
   // Free-form service diagnostic. OpenShell never exposes this to the
   // workload or security logs. Limited to 4 KiB before discarding.
   string reason = 2;
-  // Audit-safe findings produced during preflight. At most 32 findings of at
-  // most 4 KiB encoded each are accepted.
-  repeated Finding findings = 3;
-  // Non-secret service-defined metadata included in diagnostics. At most 64
-  // entries and 32 KiB of combined key/value data are accepted.
-  map<string, string> metadata = 4;
   // Optional stable machine-readable code for a deny decision. Because
   // preflight runs before the HTTP upgrade completes, OpenShell may return
   // this code to the requester. Codes follow the same format and 64-byte
   // maximum as HttpRequestResult.reason_code.
-  string reason_code = 5;
+  string reason_code = 3;
+  // Audit-safe findings produced during preflight. At most 32 findings of at
+  // most 4 KiB encoded each are accepted.
+  repeated Finding findings = 4;
+  // Non-secret service-defined metadata included in diagnostics. At most 64
+  // entries and 32 KiB of combined key/value data are accepted.
+  map<string, string> metadata = 5;
 }
 
 // WebSocketMessageResult contains the decision and optional replacement for
@@ -247,11 +251,11 @@ message WebSocketMessageResult {
   // Free-form service diagnostic. OpenShell never exposes this to the
   // workload or security logs. Limited to 4 KiB before discarding.
   string reason = 5;
-  repeated Finding findings = 6;
-  map<string, string> metadata = 7;
   // Optional stable machine-readable code for OCSF only. Unlike the HTTP
   // reason_code, this value is never put in a WebSocket close frame.
-  string reason_code = 8;
+  string reason_code = 6;
+  repeated Finding findings = 7;
+  map<string, string> metadata = 8;
 }
 
 // WebSocketSessionEventResult is an evaluation result for a preflight or message

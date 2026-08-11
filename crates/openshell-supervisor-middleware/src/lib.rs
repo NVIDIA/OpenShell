@@ -5534,8 +5534,10 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_preflight_skip_removes_stage_without_message_calls() {
+        let (session_ends_tx, mut session_ends_rx) = tokio::sync::mpsc::unbounded_channel();
         let service = OpenAiRedactionService {
             skip: true,
+            session_ends: Some(session_ends_tx),
             ..Default::default()
         };
         let message_count = Arc::clone(&service.messages);
@@ -5590,6 +5592,14 @@ mod tests {
             runner.registry.session_admission.available_permits(),
             MAX_CONCURRENT_MIDDLEWARE_SESSIONS,
             "all-skip preflight must not retain session capacity"
+        );
+        assert_eq!(
+            session_ends_rx.recv().await,
+            Some(openshell_core::proto::WebSocketSessionEndReason::StageSkipped)
+        );
+        assert!(
+            session_ends_rx.try_recv().is_err(),
+            "a skipped stage receives at most one session_end"
         );
         let _ = shutdown_tx.send(());
         server_task

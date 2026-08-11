@@ -999,7 +999,7 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
         WebSocketPreflightAction::Skip => {
             let outcome =
                 preflight_stage_outcome(&entry, WebSocketInvocationOutcome::Skip, decision);
-            let _ = sender.try_send(session_end_request(WebSocketSessionEndReason::Cancellation));
+            let _ = sender.try_send(session_end_request(WebSocketSessionEndReason::StageSkipped));
             OpenStage::Skip(outcome)
         }
         WebSocketPreflightAction::Unspecified => {
