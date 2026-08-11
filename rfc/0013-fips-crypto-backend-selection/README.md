@@ -126,11 +126,28 @@ a runtime self-check can prove the whole process is in the intended mode.
 
 ### FIPS mode is compile-time only
 
-rustls derives `require_ems` — the TLS 1.2 extended-master-secret requirement —
-from its own `fips` feature at compile time. A single binary therefore cannot
-serve both modes. This is a constraint rather than a preference, and it happens to
-match the desired security property: a runtime switch would leave both modules
-linked and reachable, which is the posture the design exists to avoid.
+The validated module is chosen at link time and cannot be otherwise:
+`aws-lc-rs/fips` links `aws-lc-fips-sys` while its absence links `aws-lc-sys`, and
+those are different C libraries. A single artifact therefore cannot be validated
+on demand. This is a constraint rather than a preference, and it matches the
+desired security property: a runtime switch would require both modules linked and
+reachable, which is the posture the design exists to avoid.
+
+On rustls 0.23 a second mechanism points the same way — `require_ems`, the TLS 1.2
+extended-master-secret requirement, is derived from `cfg!(feature = "fips")`. That
+one is version-specific and is being removed: rustls is dropping the core `fips`
+feature on `main` (targeting 0.24) and keying those behaviors off the provider's
+declared FIPS status at runtime instead
+([rustls/rustls#3054](https://github.com/rustls/rustls/issues/3054)).
+
+That change does not reopen the question. rustls is retaining the `fips` feature
+on a separate provider crate precisely so it can statically determine the
+provider's make-up, and rustls maintainers note that running a FIPS provider in
+non-FIPS mode is undesirable anyway — FIPS code updates slowly and carries
+countermeasures that cost performance without improving security. What 0.24
+enables is runtime selection of *algorithm policy* within a binary already built
+against the validated module, not runtime selection of the module. The migration
+requirements are recorded in `architecture/build.md`.
 
 ### Algorithm restriction defers to rustls, with one narrowing
 
@@ -262,7 +279,7 @@ actually promises and are the ones most in need of review.
 | `rcgen/fips` selects the FIPS backend | Requires `rcgen/aws_lc_rs` **and** `rcgen/fips` | rcgen 0.13.2's `fips` feature pulls the FIPS sys crate but its backend selection gates on `feature = "aws_lc_rs"`; `fips` alone fails to compile |
 | AWS SDK migration is a "massive rewrite" | Done in Phase 2 as a dependency and client-construction change | `aws-smithy-http-client` 1.1.13 exposes a `rustls-aws-lc-fips` feature and a `CryptoMode::AwsLcFips` variant |
 | "The AWS SDK" is one item | **guarantee** — it is two: STS transport (closed in Phase 2) and SigV4 signing (not closable by configuration) | `aws-sigv4` depends on RustCrypto `hmac`/`sha2` unconditionally with no backend feature |
-| `require_ems` not mentioned | Set automatically by rustls's `fips` feature | Implies a single binary cannot serve both modes — the basis for compile-time-only selection |
+| `require_ems` not mentioned | Set automatically by rustls's `fips` feature on 0.23 | Reinforces compile-time-only selection, though the durable reason is that the validated module is a distinct linked library. rustls is moving this to a runtime check in 0.24 |
 
 ## Implementation plan
 
@@ -314,6 +331,17 @@ OpenSSL, so this is a packaging change rather than a feature flag.
 **Phase 4 — SDKs.** `GOFIPS140=v1.0.0` for the Go SDK, which is close to
 free since Go's own module is CMVP-validated. The Python SDK's bundled BoringSSL
 has no equivalent path and may stay a documented gap.
+
+**rustls 0.24 upgrade (tracking, not a phase).** rustls is removing the core
+`fips` feature and moving the provider to a separate `rustls-aws-lc-rs` crate
+([rustls/rustls#3054](https://github.com/rustls/rustls/issues/3054)). Neither is
+released — 0.24 exists only as a `0.24.0-dev` prerelease — and maintainers have
+said 0.23 will not change, so nothing is affected today. On upgrade,
+`openshell-crypto`'s `rustls/aws_lc_rs` and `rustls/fips` features and the
+`default_fips_provider()` call all move, and `verify_fips_posture()` becomes more
+load-bearing because rustls will derive protocol behavior from `provider.fips()`
+rather than a compile-time flag. Requirements are recorded in
+`architecture/build.md`.
 
 **Phase 5 (deferred) — SSH transport validation.** Either an aws-lc-rs backend
 upstream in russh or replacing the embedded server with OpenSSH. Deferred until
@@ -381,10 +409,17 @@ at all.
 ### Runtime FIPS toggle
 
 A configuration switch selecting the backend at startup, so one binary serves
-both modes. Rejected on two grounds: rustls's `require_ems` is compile-time, so
-the TLS 1.2 behavior cannot follow a runtime flag; and leaving both modules linked
-and reachable undermines the property that a validated module is the only code
-touching key material.
+both modes. Rejected because the validated module is a distinct linked library
+(`aws-lc-fips-sys` versus `aws-lc-sys`), so the choice cannot be deferred to
+runtime, and because having both linked and reachable would undermine the property
+that a validated module is the only code touching key material.
+
+rustls 0.24 will make rustls's own behavioral adaptations runtime-selectable
+(rustls/rustls#3054), which removes one of the mechanical obstacles but not the
+linking one. It would allow a binary built against the validated module to relax
+its algorithm policy at runtime — which is not what a FIPS deployment wants, and
+which rustls maintainers advise against on performance and update-cadence
+grounds.
 
 ### Per-crate feature flipping without a facade crate
 
@@ -404,11 +439,15 @@ would have been missed again.
 ## Prior art
 
 **rustls's own FIPS support** is the model this design follows rather than
-reinvents. rustls exposes `default_fips_provider()`, propagates `require_ems`
-from its `fips` feature, and reports posture through `CryptoProvider::fips()`.
-Deferring to it means the approved set tracks upstream's reading of the validated
-boundary. The lesson learned the hard way: upstream's view is more current than a
-static investigation, which is how the X25519 question surfaced.
+reinvents. On 0.23 rustls exposes `default_fips_provider()`, propagates
+`require_ems` from its `fips` feature, and reports posture through
+`CryptoProvider::fips()`. Deferring to it means the approved set tracks upstream's
+reading of the validated boundary rather than a list we maintain.
+
+The lesson learned the hard way, twice: upstream's view is more current than a
+static investigation. That is how the X25519 question surfaced, and how the
+`require_ems` justification turned out to be version-bound — rustls is reworking
+this whole area for 0.24, which is worth tracking rather than assuming stable.
 
 **AWS-LC-FIPS** (CMVP certificate lineage referenced in issue #900) is the
 validated module, reachable from Rust via `aws-lc-rs`'s `fips` feature. It was
@@ -442,6 +481,10 @@ one scheme rather than two.
 - Which CMVP certificate does the vendored `aws-lc-fips-sys` correspond to, and
   who owns tracking that across dependency bumps? Issue #900 raised this and it
   is still unanswered.
+- Should we track rustls 0.24 actively and plan the migration, or wait until it
+  is released and `rustls-aws-lc-rs` is published? The feature rename is
+  mechanical, but `verify_fips_posture()` changes from a reporting check to
+  something that governs protocol behavior, which deserves review when it lands.
 - Is reimplementing SigV4 signing against `openshell-crypto` acceptable risk, or
   should we upstream a backend feature to `aws-sigv4` and wait? A wrong signing
   implementation breaks all AWS provider access, so the test-vector coverage

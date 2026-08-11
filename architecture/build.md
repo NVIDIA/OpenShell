@@ -82,10 +82,16 @@ enabled. This is why a FIPS gateway is built with
 `--no-default-features --features fips,telemetry` and has to re-list its
 non-crypto defaults.
 
-FIPS mode cannot be a runtime toggle. rustls derives `require_ems` (the TLS 1.2
-extended-master-secret requirement) from its own `fips` feature at compile time,
-so one binary cannot serve both modes. A runtime switch would also leave both
-modules linked and reachable, which is the posture the crate exists to prevent.
+FIPS mode cannot be a runtime toggle. The binding constraint is that the module
+itself is chosen at link time: `aws-lc-rs/fips` links `aws-lc-fips-sys` and its
+absence links `aws-lc-sys`, which are different C libraries. A runtime switch
+would require both linked and reachable, which is the posture the crate exists to
+prevent.
+
+On rustls 0.23 `require_ems` (the TLS 1.2 extended-master-secret requirement) is
+also derived from `cfg!(feature = "fips")`, which makes that behavior
+compile-time too. That is a version-specific mechanism, not the underlying
+reason — see the 0.24 migration note below.
 
 Algorithm restriction comes from `rustls::crypto::default_fips_provider()`
 rather than a hand-maintained suite list, so the approved set tracks rustls's
@@ -123,6 +129,38 @@ content-addressing rather than cryptographic use.
 Build-mode differences that are visible outside the process — the JWT signing
 algorithm, the SSH host key type, and the database trust store — are documented
 in `docs/security/fips.mdx`.
+
+### rustls 0.24 migration note
+
+The FIPS feature plumbing described above is written against rustls 0.23 and will
+not carry forward unchanged. rustls is removing the `fips` feature from the core
+crate on `main` (targeting 0.24) and moving the behaviors it controlled — notably
+`require_ems` — to key off the provider's declared FIPS status at runtime. The
+feature is retained on a separate `rustls-aws-lc-rs` provider crate, where it both
+activates `aws-lc-rs/fips` and statically determines the provider's make-up. See
+[rustls/rustls#3054](https://github.com/rustls/rustls/issues/3054).
+
+Neither is released yet: rustls 0.24 exists only as a `0.24.0-dev` prerelease and
+`rustls-aws-lc-rs` is not published. rustls maintainers have stated 0.23 will not
+change, so nothing here is affected today.
+
+What the upgrade will require:
+
+- `openshell-crypto`'s `fips` feature lists `rustls/aws_lc_rs` and `rustls/fips`.
+  Both cease to exist; the equivalent moves to `rustls-aws-lc-rs/fips`.
+- `provider()` calls `rustls::crypto::default_fips_provider()`, which is gated on
+  the core `fips` feature today and will move with it.
+- `verify_fips_posture()` becomes *more* load-bearing, not less. Once rustls
+  derives its behavioral adaptations from `provider.fips()` at runtime, that
+  return value governs actual protocol behavior rather than only reporting
+  posture, so an unnoticed non-FIPS provider would silently relax TLS 1.2
+  handling instead of merely mislabeling the build.
+
+What the upgrade will **not** change: FIPS remains a build-time choice. The
+validated module is a distinct linked library (`aws-lc-fips-sys` versus
+`aws-lc-sys`), so a single artifact cannot be validated on demand. rustls 0.24
+makes *algorithm policy* selectable at runtime within a binary already built
+against the validated module — not the module itself.
 
 ## Linux Runtime Environments
 

@@ -21,11 +21,21 @@
 //! one. `ring` is an unconditional dependency and `fips` is a one-way switch,
 //! so there is no ambiguous state to resolve.
 //!
-//! FIPS mode is a compile-time property, not a runtime toggle. rustls derives
-//! `require_ems` (the TLS 1.2 extended-master-secret requirement) from its own
-//! `fips` feature at compile time, so a single binary cannot serve both modes.
-//! A runtime switch would also leave both modules linked and reachable, which is
-//! the posture this crate exists to avoid.
+//! FIPS mode is a compile-time property, not a runtime toggle. Which module gets
+//! linked is decided at build time and cannot be otherwise: `aws-lc-rs/fips`
+//! links `aws-lc-fips-sys` while its absence links `aws-lc-sys`, and those are
+//! different C libraries. A runtime switch would also require both to be linked
+//! and reachable, which is the posture this crate exists to avoid.
+//!
+//! Note the mechanism, not the conclusion, is version-specific. On rustls 0.23
+//! `require_ems` (the TLS 1.2 extended-master-secret requirement) is derived
+//! from `cfg!(feature = "fips")`, so that behavior is also compile-time. rustls
+//! is removing the core `fips` feature in 0.24 and keying those behaviors off
+//! the provider's declared FIPS status at runtime instead
+//! (rustls/rustls#3054). That changes how the *behaviors* are selected; it does
+//! not make the module choice a runtime one, because the `fips` feature stays on
+//! the provider crate precisely so it can statically determine the provider's
+//! make-up. See the 0.24 migration note in `architecture/build.md`.
 //!
 //! # What the `fips` feature does and does not guarantee
 //!

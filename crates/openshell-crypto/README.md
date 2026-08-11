@@ -33,8 +33,14 @@ unconditional dependency and `fips` is a one-way switch.
 from *its* features rather than the process default; a `compile_error!` in
 `openshell-server` enforces it.
 
-FIPS mode is compile-time only. rustls derives `require_ems` from its own `fips`
-feature at compile time, so one binary cannot serve both modes.
+FIPS mode is compile-time only, because which module gets linked is a build-time
+decision: `aws-lc-rs/fips` links `aws-lc-fips-sys`, its absence links
+`aws-lc-sys`, and those are different C libraries. A runtime switch would need
+both linked and reachable, which is the posture this crate exists to avoid.
+
+On rustls 0.23 `require_ems` is additionally derived from the `fips` feature, but
+that mechanism is going away in 0.24 — see the migration note in
+`architecture/build.md`. The conclusion does not change.
 
 ## Usage
 
