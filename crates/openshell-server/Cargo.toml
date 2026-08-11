@@ -99,6 +99,11 @@ sqlx = { workspace = true }
 reqwest = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-sts = { workspace = true }
+# The STS HTTP client is constructed explicitly rather than left to the SDK's
+# default, so its TLS backend follows this crate's `fips` feature instead of
+# whichever stack the SDK's own features happen to select. See
+# `provider_refresh::aws_http_client`.
+aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-ring"] }
 uuid = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }
@@ -145,7 +150,11 @@ test-support = []
 # Point `sslrootcert` in DATABASE_URL at the CA instead, which works
 # independently of the root store.
 db-tls-ring = ["sqlx/tls-rustls-ring-native-roots"]
-fips = ["openshell-crypto/fips", "sqlx/tls-rustls-aws-lc-rs"]
+fips = [
+    "openshell-crypto/fips",
+    "sqlx/tls-rustls-aws-lc-rs",
+    "aws-smithy-http-client/rustls-aws-lc-fips",
+]
 
 [dev-dependencies]
 # No backend feature: the connector picks up the process-default provider that

@@ -100,11 +100,19 @@ won the race. `ensure_default_provider()` covers library code that builds TLS
 clients without a binary entry point having run first; it only fills in a
 missing provider and never replaces one.
 
-Two dependencies do not honor the process default and are gated separately:
-`sqlx` selects a provider from its own features (so `openshell-server` forwards
-the backend choice to it, at the cost of losing native-root loading in FIPS
-mode), and `aws-smithy-http-client` constructs its own provider, so AWS SDK
-calls still use `ring`. `mise run fips:audit` reports the residual surface.
+Two dependencies do not honor the process default and are handled separately.
+`sqlx` selects a provider from its own features, so `openshell-server` forwards
+the backend choice to it, at the cost of losing native-root loading in FIPS mode.
+`aws-smithy-http-client` constructs its own provider, so the gateway builds the
+AWS SDK's HTTPS client explicitly (`provider_refresh::aws_http_client`) with a
+`CryptoMode` chosen by the `fips` feature; that also let the SDK's legacy
+`rustls 0.21` TLS features be dropped, leaving one rustls major in the graph.
+`mise run fips:audit` reports the residual surface.
+
+`aws-sigv4` cannot be handled either way: it depends on RustCrypto `hmac` and
+`sha2` unconditionally with no backend feature, so proxy-side AWS SigV4 request
+signing in `openshell-supervisor-network` computes HMAC-SHA256 outside the
+validated module regardless of build mode.
 
 Hashing is routed through the facade where it is a security function — key
 identifiers, credential-storage key identifiers, and Kubernetes Secret and Vault

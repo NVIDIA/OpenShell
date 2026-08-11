@@ -73,6 +73,7 @@ mise run fips:audit
 | X.509 key generation | ECDSA P-256 via `ring` | ECDSA P-256 via AWS-LC |
 | Gateway JWT signing | Ed25519 (`EdDSA`) | ECDSA P-256 (`ES256`) |
 | Credential encryption at rest | AES-256-GCM via `ring` | AES-256-GCM via AWS-LC |
+| AWS STS client TLS | `ring` (legacy rustls 0.21 stack) | AWS-LC (FIPS mode) |
 | Randomness (keys, nonces) | `ring` | AWS-LC |
 | Key and credential-identifier hashing | `ring` / RustCrypto | AWS-LC |
 | Content and revision hashing | RustCrypto | RustCrypto (unchanged — see below) |
@@ -126,9 +127,15 @@ These are known gaps, not oversights. A deployment claiming FIPS compliance need
 
 **`ring` remains linked.** `openshell-crypto` depends on `ring` unconditionally, so it is present in every build. This is deliberate: pairing `fips` with an opposite `backend-ring` feature would create a state where both are enabled at once, and any dependency resolving that ambiguity in favor of `ring` would silently produce a non-FIPS build. A one-way switch has no ambiguous state. `ring` is not *invoked* for OpenShell's own cryptography — provider selection is centralized and verified against the installed provider at startup — but "linked but unreachable" is a weaker claim than "absent". Run `mise run fips:audit` for the current inventory.
 
+The build now contains a single rustls major (0.23). The AWS SDK's legacy `rustls 0.21` stack, which was hard-wired to `ring` and outside the process-default provider's reach, has been removed by supplying the SDK's HTTPS client explicitly.
+
 **Content and revision hashing still uses RustCrypto.** Policy revisions, provider-profile catalog hashes, gateway-interceptor profile digests, and VM image digests compute SHA-256 with the RustCrypto `sha2` crate. These are content-addressing and change-detection, not security functions: they protect nothing and gate no decision. Cryptographic uses of SHA-256 — JWT key identifiers, credential-storage key identifiers, and Kubernetes Secret and Vault credential path derivation — are routed through the validated module. If an auditor requires every SHA-256 invocation to come from the validated module regardless of purpose, the remaining call sites are a mechanical change.
 
-**AWS SDK calls use `ring`.** `aws-config` and `aws-sdk-sts` pull `rustls 0.21` through `aws-smithy-http-client`, which selects its own provider rather than the process default. SigV4 signing and STS calls in a FIPS build therefore use `ring`. This is tractable: `aws-smithy-http-client` exposes a `rustls-aws-lc-fips` feature and a `CryptoMode::AwsLcFips` variant, so the fix is a dependency and client-construction change rather than a rewrite.
+**AWS SigV4 request signing uses an unvalidated module.** The supervisor's proxy-side AWS credential signing computes HMAC-SHA256 over the request, keyed with the AWS secret access key, through `aws-sigv4`. That crate depends on RustCrypto `hmac` and `sha2` unconditionally and exposes no backend feature, so this cannot be changed by configuration — unlike every other gap here, there is no flag that fixes it.
+
+This is the most significant remaining gap, because it is HMAC directly over credential material rather than a transport concern. Closing it requires either implementing SigV4 signing against `openshell-crypto` (well-specified, but a wrong implementation breaks all AWS provider access, so it needs the published AWS test vectors) or upstreaming a backend feature to `aws-sigv4`.
+
+Affects only sandboxes whose policy enables proxy-side AWS SigV4 signing. Deployments that do not use that feature are unaffected.
 
 **Container images are not FIPS-capable.** The published gateway image is distroless Debian and the supervisor is statically linked musl/Alpine. Neither provides a FIPS-mode system OpenSSL, and the static musl build cannot link one. A FIPS deployment on OpenShift needs a UBI-based image variant and a glibc supervisor build.
 

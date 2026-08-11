@@ -100,8 +100,16 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots-no-provider"] }
 
 # AWS SDK
-aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
-aws-sdk-sts = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+#
+# No TLS feature. `openshell-server` supplies the HTTPS client explicitly so the
+# backend follows its `fips` feature (see `provider_refresh::aws_http_client`),
+# which makes the SDK's own TLS features redundant. Dropping them also removes
+# the legacy stack: `aws-sdk-sts/rustls` pulls
+# `aws-smithy-runtime/tls-rustls` -> `legacy-rustls-ring`, which is rustls 0.21
+# on hyper 0.14 and hard-wired to ring. Re-adding either feature reintroduces a
+# second TLS stack that the installed CryptoProvider does not govern.
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 # WebSocket
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-native-roots"] }

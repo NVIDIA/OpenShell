@@ -60,9 +60,9 @@ secrets at rest without anyone noticing it was a compliance-relevant surface.
 - **Removing `ring` from the dependency graph.** `openshell-crypto` links it
   unconditionally by design, and the AWS SDK links its own copy. This RFC
   measures and documents the residual surface rather than eliminating it.
-- **Putting AWS SDK calls in FIPS mode.** SigV4 signing and STS calls construct
-  their own provider. A concrete path exists (see Implementation plan) but is out
-  of scope here.
+- **Making AWS SigV4 request signing use a validated module.** `aws-sigv4` offers
+  no backend choice, so this needs a reimplementation or an upstream change.
+  Tracked as Phase 2b. (STS transport is covered as of Phase 2.)
 - **FIPS-capable container images.** The published gateway image is distroless
   Debian and the supervisor is static musl. A UBI-based variant and a glibc
   supervisor build are separate work.
@@ -260,7 +260,8 @@ actually promises and are the ones most in need of review.
 | JWT signing algorithm not addressed | **guarantee** — EdDSA → ES256 under `fips`, with disjoint validation sets | Ed25519 approval depends on the module certificate covering FIPS 186-5 |
 | Credential encryption at rest not in scope | **guarantee** — included in Phase 1 | The `openshell-driver-db-credstore` crate postdates the investigation and encrypts secrets at rest through `ring`; highest audit sensitivity in the codebase |
 | `rcgen/fips` selects the FIPS backend | Requires `rcgen/aws_lc_rs` **and** `rcgen/fips` | rcgen 0.13.2's `fips` feature pulls the FIPS sys crate but its backend selection gates on `feature = "aws_lc_rs"`; `fips` alone fails to compile |
-| AWS SDK migration is a "massive rewrite" | Tractable dependency change | `aws-smithy-http-client` 1.1.13 exposes a `rustls-aws-lc-fips` feature and a `CryptoMode::AwsLcFips` variant |
+| AWS SDK migration is a "massive rewrite" | Done in Phase 2 as a dependency and client-construction change | `aws-smithy-http-client` 1.1.13 exposes a `rustls-aws-lc-fips` feature and a `CryptoMode::AwsLcFips` variant |
+| "The AWS SDK" is one item | **guarantee** — it is two: STS transport (closed in Phase 2) and SigV4 signing (not closable by configuration) | `aws-sigv4` depends on RustCrypto `hmac`/`sha2` unconditionally with no backend feature |
 | `require_ems` not mentioned | Set automatically by rustls's `fips` feature | Implies a single binary cannot serve both modes — the basis for compile-time-only selection |
 
 ## Implementation plan
@@ -283,9 +284,28 @@ under `-D warnings` in both modes. The tests assert on the negotiable algorithm
 sets rather than on the feature flag, so a regression in a restriction list fails
 rather than passing silently.
 
-**Phase 2 — AWS SDK leg.** Move `aws-config` and `aws-sdk-sts` onto the newer
-HTTP client stack with `aws-smithy-http-client`'s `rustls-aws-lc-fips` feature.
-Needs its own testing because it changes how AWS credential calls are made.
+**Phase 2 — AWS SDK leg. Transport done; signing blocked.**
+`openshell-server` now builds the SDK's HTTPS client explicitly
+(`provider_refresh::aws_http_client`) with a `CryptoMode` selected by the `fips`
+feature, so STS calls use AWS-LC in FIPS mode. `CryptoMode::AwsLcFips` asserts
+internally that its provider reports FIPS, so a mis-plumbed feature panics at
+client construction rather than downgrading silently.
+
+Supplying the client also made the SDK's own TLS features redundant, and dropping
+them removed the legacy `rustls 0.21` stack that `aws-sdk-sts/rustls` pulled in
+via `legacy-rustls-ring`. **The graph now contains a single rustls major (0.23),**
+which retires the "second TLS stack the installed provider does not govern"
+concern from Phase 1.
+
+What Phase 2 does **not** close is SigV4 request signing. `aws-sigv4` depends on
+RustCrypto `hmac` and `sha2` unconditionally and exposes no backend feature, so
+the HMAC-SHA256 chain keyed with the AWS secret access key runs outside the
+validated module in every build mode. This was not visible from the original
+investigation, which treated "the AWS SDK" as one item. It is arguably the more
+important half: it is HMAC directly over credential material rather than a
+transport concern. Closing it needs either a SigV4 implementation against
+`openshell-crypto`, validated against AWS's published test vectors, or an
+upstream backend feature in `aws-sigv4`. Tracked as Phase 2b.
 
 **Phase 3 — FIPS-capable images.** A UBI-based gateway image and a glibc
 supervisor build. The current static musl supervisor cannot link a system
@@ -422,6 +442,10 @@ one scheme rather than two.
 - Which CMVP certificate does the vendored `aws-lc-fips-sys` correspond to, and
   who owns tracking that across dependency bumps? Issue #900 raised this and it
   is still unanswered.
+- Is reimplementing SigV4 signing against `openshell-crypto` acceptable risk, or
+  should we upstream a backend feature to `aws-sigv4` and wait? A wrong signing
+  implementation breaks all AWS provider access, so the test-vector coverage
+  matters more than the code.
 - Should the remaining RustCrypto SHA-256 call sites (policy revisions, profile
   catalogs, image digests) also be routed through the validated module? They are
   content-addressing rather than security functions, but an auditor may not draw

@@ -31,6 +31,7 @@ cargo test -p openshell-driver-vault --no-default-features --features fips
 cargo test -p openshell-driver-kubernetes-secrets --no-default-features --features fips
 cargo test -p openshell-bootstrap --no-default-features --features fips
 cargo test -p openshell-server --no-default-features --features fips,telemetry --lib auth::
+cargo test -p openshell-server --no-default-features --features fips,telemetry --lib provider_refresh::
 cargo test -p openshell-supervisor-process --no-default-features --features fips
 """
 
