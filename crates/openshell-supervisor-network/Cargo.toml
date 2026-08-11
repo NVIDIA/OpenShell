@@ -52,9 +52,8 @@ uuid = { workspace = true }
 webpki-roots = { workspace = true, optional = true }
 
 [features]
-default = ["bundled-ca-roots", "backend-ring"]
+default = ["bundled-ca-roots"]
 bundled-ca-roots = ["dep:webpki-roots"]
-backend-ring = ["openshell-crypto/backend-ring"]
 fips = ["openshell-crypto/fips"]
 
 [dev-dependencies]

@@ -66,12 +66,20 @@ crate may name a backend directly, and the workspace `rustls`, `tokio-rustls`,
 and `rcgen` entries deliberately declare no backend feature — adding one back
 would link `ring` unconditionally and silently defeat the FIPS build.
 
-Two mutually exclusive modes, selected at compile time:
+`fips` is a one-way switch rather than one half of a mutually exclusive pair.
+`ring` is an unconditional dependency of `openshell-crypto`; enabling `fips`
+additionally compiles in AWS-LC and moves every selection to it. There is no
+`backend-ring` feature, deliberately: Cargo features are additive, so two
+mutually exclusive backend features can always both be enabled at once, and any
+dependency that resolves that ambiguity toward `ring` would yield a build that
+reports FIPS while using unvalidated crypto.
 
-- `backend-ring` (default) — `ring` backs TLS, PKI, and AEAD. Historical
-  behavior, unchanged.
-- `fips` — AWS-LC in FIPS mode backs all of the above, and every algorithm
-  choice narrows to the FIPS-approved set.
+Where a dependency selects for itself and the ambiguity cannot be removed, it is
+rejected at compile time. `openshell-server` carries a `compile_error!` for
+`fips` + `db-tls-ring` because sqlx prefers `ring` when both of its backends are
+enabled. This is why a FIPS gateway is built with
+`--no-default-features --features fips,telemetry` and has to re-list its
+non-crypto defaults.
 
 FIPS mode cannot be a runtime toggle. rustls derives `require_ems` (the TLS 1.2
 extended-master-secret requirement) from its own `fips` feature at compile time,
@@ -84,14 +92,24 @@ view of the module's validated boundary. `install_default_provider()` installs i
 as the process default, which every `ClientConfig::builder()` and
 `ServerConfig::builder()` call then inherits without threading a provider
 through call sites. `verify_fips_posture()` runs at gateway and CLI startup and
-fails the process if the `fips` feature reached `openshell-crypto` but not
-`rustls` — the case that would otherwise downgrade silently.
+fails the process if the *installed* provider is not FIPS-approved. It reads
+`CryptoProvider::get_default()` rather than a freshly built provider, so it
+catches both a mis-plumbed feature and a provider installed by something that
+won the race. `ensure_default_provider()` covers library code that builds TLS
+clients without a binary entry point having run first; it only fills in a
+missing provider and never replaces one.
 
 Two dependencies do not honor the process default and are gated separately:
 `sqlx` selects a provider from its own features (so `openshell-server` forwards
 the backend choice to it, at the cost of losing native-root loading in FIPS
 mode), and `aws-smithy-http-client` constructs its own provider, so AWS SDK
 calls still use `ring`. `mise run fips:audit` reports the residual surface.
+
+Hashing is routed through the facade where it is a security function — key
+identifiers, credential-storage key identifiers, and Kubernetes Secret and Vault
+credential path derivation. Content and revision hashing (policy revisions,
+profile catalogs, image digests) stays on RustCrypto `sha2`; those are
+content-addressing rather than cryptographic use.
 
 Build-mode differences that are visible outside the process — the JWT signing
 algorithm, the SSH host key type, and the database trust store — are documented

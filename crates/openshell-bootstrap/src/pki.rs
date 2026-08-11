@@ -16,9 +16,10 @@ pub struct PkiBundle {
     pub server_key_pem: String,
     pub client_cert_pem: String,
     pub client_key_pem: String,
-    /// PKCS#8 PEM Ed25519 private key for minting per-sandbox JWTs.
+    /// PKCS#8 PEM private key for minting per-sandbox JWTs. Ed25519 in a
+    /// default build, ECDSA P-256 under `fips`.
     pub jwt_signing_key_pem: String,
-    /// SPKI PEM Ed25519 public key, paired with `jwt_signing_key_pem`.
+    /// SPKI PEM public key, paired with `jwt_signing_key_pem`.
     pub jwt_public_key_pem: String,
     /// Stable identifier embedded in the `kid` header of every minted JWT.
     pub jwt_key_id: String,

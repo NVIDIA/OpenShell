@@ -19,7 +19,6 @@ use openshell_core::proto::credentials::v1::{
 use openshell_core::{Error, Result as CoreResult};
 use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tonic::{Request, Response, Status};
 
 const DEFAULT_MOUNT: &str = "secret";
@@ -126,6 +125,9 @@ impl VaultCredentialDriver {
     pub fn from_config(config: &toml::Table) -> CoreResult<Self> {
         let settings = VaultDriverSettings::from_table(config)?;
         let timeout_secs = timeout_secs(config)?;
+        // Library code can run without a binary entry point (tests, embedders),
+        // and rustls panics if a TLS config is built with no process default.
+        openshell_crypto::ensure_default_provider();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
@@ -764,20 +766,19 @@ fn managed_secret_path(
     credential_key: &str,
     object_id: &str,
 ) -> String {
-    let mut hasher = Sha256::new();
+    let mut hasher = openshell_crypto::Sha256Digest::new();
     hasher.update(workspace.as_bytes());
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(provider_id.as_bytes());
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(provider_name.as_bytes());
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(credential_key.as_bytes());
     if object_id != provider_id {
-        hasher.update([0]);
+        hasher.update(&[0]);
         hasher.update(object_id.as_bytes());
     }
-    let digest = hasher.finalize();
-    let hex = format!("{digest:x}");
+    let hex = openshell_crypto::hex_lower(&hasher.finish());
     format!("openshell/provider-credentials/{}", &hex[..40])
 }
 

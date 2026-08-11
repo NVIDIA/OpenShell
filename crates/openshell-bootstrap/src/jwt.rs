@@ -4,14 +4,13 @@
 //! Gateway-minted JWT signing-key generation.
 //!
 //! The gateway mints per-sandbox identity tokens (see PR 2 of the
-//! per-sandbox identity series, issue #1354) signed with an Ed25519
+//! per-sandbox identity series, issue #1354) signed with an
 //! keypair generated once at gateway init and persisted alongside the
 //! existing PKI bundle. The signing key never leaves the gateway; the
 //! public key plus a stable `kid` are consumed by the gateway's own
 //! validator and any future external verifiers.
 
 use miette::{IntoDiagnostic, Result, WrapErr};
-use sha2::{Digest, Sha256};
 
 /// All PEM-encoded material needed to mint and validate sandbox JWTs.
 ///
@@ -20,9 +19,9 @@ use sha2::{Digest, Sha256};
 /// any other replica). The `kid` is published in every minted JWT's
 /// header so the validator can pick the right key after a future rotation.
 pub struct JwtKeyMaterial {
-    /// PKCS#8 PEM-encoded Ed25519 private key.
+    /// PKCS#8 PEM-encoded private key (Ed25519, or ECDSA P-256 under `fips`).
     pub signing_key_pem: String,
-    /// `SubjectPublicKeyInfo` PEM-encoded Ed25519 public key.
+    /// `SubjectPublicKeyInfo` PEM-encoded public key.
     pub public_key_pem: String,
     /// Stable identifier derived from the public key (SHA-256 hex prefix).
     /// Embedded in every minted JWT's `kid` header so future rotation can
@@ -31,7 +30,11 @@ pub struct JwtKeyMaterial {
     pub kid: String,
 }
 
-/// Generate a fresh Ed25519 JWT signing key.
+/// Generate a fresh JWT signing key for this build mode.
+///
+/// Ed25519 by default, ECDSA P-256 under `fips`. The two are not
+/// interchangeable: a gateway cannot load key material generated under the
+/// other build mode and must rotate instead.
 ///
 /// Output PEM is in the formats `jsonwebtoken` consumes via
 /// `EncodingKey::from_ed_pem` (signing) and `DecodingKey::from_ed_pem`
@@ -57,7 +60,7 @@ pub fn generate_jwt_key() -> Result<JwtKeyMaterial> {
 /// signing keys a single deployment ever has, while staying short enough
 /// to keep JWT headers compact.
 fn kid_from_public_key_der(public_key_der: &[u8]) -> String {
-    let digest = Sha256::digest(public_key_der);
+    let digest = openshell_crypto::sha256(public_key_der);
     hex_encode_prefix(&digest, 16)
 }
 

@@ -46,6 +46,9 @@ use spiffe::WorkloadApiClient;
 /// Token cache shared across all provider token grants.
 static TOKEN_CACHE: LazyLock<TokenCache> = LazyLock::new(TokenCache::new);
 static TOKEN_GRANT_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    // Library code can run without a binary entry point (tests, embedders),
+    // and rustls panics if a TLS config is built with no process default.
+    openshell_crypto::ensure_default_provider();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(30))

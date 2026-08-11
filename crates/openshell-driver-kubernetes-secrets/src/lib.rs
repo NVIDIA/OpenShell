@@ -19,7 +19,6 @@ use openshell_core::proto::credentials::v1::{
     credential_driver_server::CredentialDriver,
 };
 use openshell_core::{Error, Result as CoreResult};
-use sha2::{Digest, Sha256};
 use tonic::{Request, Response, Status};
 
 const SERVICE_ACCOUNT_NAMESPACE_PATH: &str =
@@ -567,16 +566,15 @@ fn credential_owner_id(
     provider_name: &str,
     credential_key: &str,
 ) -> String {
-    let mut hasher = Sha256::new();
+    let mut hasher = openshell_crypto::Sha256Digest::new();
     hasher.update(workspace.as_bytes());
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(provider_id.as_bytes());
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(provider_name.as_bytes());
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(credential_key.as_bytes());
-    let digest = hasher.finalize();
-    format!("{digest:x}")
+    openshell_crypto::hex_lower(&hasher.finish())
 }
 
 fn managed_secret_name(
@@ -588,11 +586,11 @@ fn managed_secret_name(
 ) -> String {
     let mut hex = credential_owner_id(workspace, provider_id, provider_name, credential_key);
     if object_id != provider_id {
-        let mut hasher = Sha256::new();
+        let mut hasher = openshell_crypto::Sha256Digest::new();
         hasher.update(hex.as_bytes());
-        hasher.update([0]);
+        hasher.update(&[0]);
         hasher.update(object_id.as_bytes());
-        hex = format!("{:x}", hasher.finalize());
+        hex = openshell_crypto::hex_lower(&hasher.finish());
     }
     format!("openshell-cred-{}", &hex[..40])
 }

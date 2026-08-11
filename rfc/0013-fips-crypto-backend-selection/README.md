@@ -14,9 +14,9 @@ OpenShell performs every cryptographic operation through libraries that have no
 FIPS 140-3 validation. This RFC proposes centralizing cryptographic backend
 selection in a single crate, `openshell-crypto`, and gating the choice behind one
 Cargo feature. A default build keeps `ring` and current behavior; a `fips` build
-routes TLS, X.509 and JWT key generation, credential encryption at rest, hashing,
-and randomness through AWS-LC in FIPS mode, and narrows every algorithm choice to
-the approved set.
+routes TLS, X.509 and JWT key generation, credential encryption at rest, key and
+credential-identifier hashing, and randomness through AWS-LC in FIPS mode, and
+narrows every algorithm choice to the approved set.
 
 The proposal also records where the design diverged from the plan accepted in
 [issue #900](https://github.com/NVIDIA/OpenShell/issues/900) once it met the
@@ -57,9 +57,9 @@ secrets at rest without anyone noticing it was a compliance-relevant surface.
 - **Making the SSH transport FIPS-validated.** This RFC restricts SSH
   negotiation to approved algorithms but does not replace russh's unvalidated
   implementations. Tracked as Phase 2.
-- **Removing `ring` from the dependency graph.** Cargo features are additive and
-  the AWS SDK pulls `ring` transitively. This RFC measures and documents the
-  residual surface rather than eliminating it.
+- **Removing `ring` from the dependency graph.** `openshell-crypto` links it
+  unconditionally by design, and the AWS SDK links its own copy. This RFC
+  measures and documents the residual surface rather than eliminating it.
 - **Putting AWS SDK calls in FIPS mode.** SigV4 signing and STS calls construct
   their own provider. A concrete path exists (see Implementation plan) but is out
   of scope here.
@@ -82,11 +82,22 @@ routes through it.
 
 The mechanism that makes this enforceable is a manifest convention: the workspace
 `rustls`, `tokio-rustls`, and `rcgen` entries declare **no** backend feature.
-`openshell-crypto` supplies `rustls/ring` or `rustls/aws_lc_rs` + `rustls/fips`
-through its own features, and Cargo feature unification applies that choice to
-every crate in the graph. Adding a backend feature back to a workspace entry
-would link `ring` unconditionally and silently defeat the FIPS build, so those
-entries carry comments saying so.
+`openshell-crypto` supplies the backend through its own dependency declarations,
+and Cargo feature unification applies that choice to every crate in the graph.
+
+`fips` is a **one-way switch** with no opposing `backend-ring` feature. `ring` is
+an unconditional dependency; `fips` additionally compiles in AWS-LC and moves
+every selection to it. This shape is deliberate and is the single most important
+structural decision in the design. Cargo features are additive, so a pair of
+mutually exclusive backend features can always both be enabled at once — and any
+dependency that resolves that ambiguity by preferring `ring` produces a build
+that reports FIPS while using unvalidated crypto. sqlx does exactly this. A
+one-way switch has no ambiguous state to resolve.
+
+Where a dependency insists on choosing for itself, the ambiguity is rejected at
+compile time rather than resolved silently. `openshell-server` carries a
+`compile_error!` for `fips` + `db-tls-ring`, which is why a FIPS gateway must be
+built with `--no-default-features --features fips,telemetry`.
 
 ```mermaid
 flowchart TD
@@ -137,29 +148,53 @@ function, so reversing it is a small change if reviewers prefer rustls's positio
 ### Startup verification
 
 `verify_fips_posture()` runs at gateway and CLI startup and fails the process if
-the binary was built with `fips` but the installed provider does not report
-FIPS-approved cryptography. This catches the specific failure where the feature
-reached `openshell-crypto` but not `rustls` — a mis-plumbed manifest that would
+the provider actually installed does not report FIPS-approved cryptography. It
+inspects `CryptoProvider::get_default()` rather than a freshly constructed
+provider, because checking what we *would* have installed proves nothing about
+what is in use: `install_default()` loses to whoever got there first, so a
+dependency or an earlier code path can win the race.
+
+This catches two failures — a feature that reached `openshell-crypto` but not
+`rustls`, and a process default installed by something else. Both would
 otherwise downgrade silently and pass every functional test.
+
+A companion `ensure_default_provider()` exists for library code that constructs
+TLS clients without a binary entry point having run first — library crates are
+also used from tests and other embedders, and rustls panics when a TLS config is
+built with no process default. It only fills in a missing provider and can never
+replace one, so it is safe to call from a library.
 
 ### Algorithm choices that cross process boundaries
 
 Three build-mode differences are visible outside the process and need operator
 documentation rather than only code comments:
 
-**JWT signing.** Gateway-issued sandbox tokens move from Ed25519 (`EdDSA`) to
-ECDSA P-256 (`ES256`). Ed25519 is approved only under FIPS 186-5 and only when
+**JWT signing — requires key rotation.** Gateway-issued sandbox tokens move from
+Ed25519 (`EdDSA`) to ECDSA P-256 (`ES256`). Ed25519 is approved only under FIPS 186-5 and only when
 the module certificate covers EdDSA, which is not a property assertable for the
 implementations in use. Signing and validation are each pinned to exactly one
 algorithm and the sets are deliberately disjoint, so a FIPS gateway cannot
-validate a token signed with a non-approved key. The consequence is that
-**mixed-mode replica sets are unsupported** — tokens will fail validation across
-them. Sandbox tokens are short-lived and re-minted on demand, so switching an
-existing deployment resolves without operator action beyond a rollout window.
+validate a token signed with a non-approved key. There are two consequences. **Mixed-mode replica sets are unsupported** — tokens
+fail validation across them, and nothing detects the mismatch until the first
+cross-replica validation. And because the signing key is persisted, an existing
+gateway holds an Ed25519 key that a FIPS build cannot parse: it **fails to
+start** rather than merely invalidating in-flight tokens. Switching an existing
+deployment therefore requires rotating the JWT key with `generate-certs`. The
+error message names the required algorithm and the remedy, and a regression test
+asserts it does.
 
 **SSH host keys.** Host keys move from Ed25519 to ECDSA P-256, changing the
 fingerprint. Sandboxes are ephemeral and generate a host key per sandbox, so
 there is no persistent `known_hosts` entry to update.
+
+**Hashing scope.** Key identifiers, credential-storage key identifiers, and
+Kubernetes Secret and Vault credential path derivation are routed through the
+validated module. Content and revision hashing — policy revisions, profile
+catalogs, image digests — remains on RustCrypto `sha2`. Those are
+content-addressing and change detection rather than security functions: they
+protect nothing and gate no decision. An auditor requiring every SHA-256
+invocation to come from the validated module regardless of purpose would need a
+mechanical follow-up.
 
 **Database trust store.** sqlx offers native-root loading only on its `ring`
 backend, so a FIPS build uses webpki bundled roots for PostgreSQL. Deployments
@@ -208,6 +243,11 @@ actually promises and are the ones most in need of review.
 | Excluding X25519 follows from FIPS | **guarantee** — X25519 removal is a deliberate policy choice stricter than rustls | rustls keeps X25519 and X25519+ML-KEM768 because AWS-LC's boundary covers them; removing them costs the PQ hybrid |
 | `--no-default-features --features fips` excludes `ring` | **guarantee** — `ring` stays linked; documented and measured instead | Cargo features are additive, and the AWS SDK pulls rustls 0.21 → `ring` regardless |
 | Flip rustls features per crate at each of ~20 sites | One facade crate owns backend selection; workspace entries carry no backend feature | Feature unification gives a single point of control and makes a missed site impossible |
+| Paired `backend-ring` / `fips` features | **guarantee** — no opposing feature; `ring` unconditional, `fips` a one-way switch | Additive features make both simultaneously enableable, and sqlx resolves that toward `ring`, silently producing a non-FIPS build |
+| `--features fips` is the build command | **guarantee** — the gateway needs `--no-default-features --features fips,telemetry`, enforced by `compile_error!` | Same sqlx ambiguity; a build error is the only outcome that cannot be missed |
+| Switching build modes only invalidates in-flight tokens | **guarantee** — an existing gateway fails to start until its JWT key is rotated | The signing key is persisted, and a FIPS build cannot parse an Ed25519 key |
+| "Hashing and RNG" move to the validated module | **guarantee** — key and credential-identifier hashing move; content and revision hashing stays on RustCrypto | Those are content-addressing rather than security functions; the blanket claim was too broad |
+| Startup check validates the provider | **guarantee** — it validates the *installed* provider via `get_default()` | `install_default()` loses to whoever got there first, so checking a freshly built provider proves nothing |
 | Replace NSSH1 HMAC with aws-lc-rs HMAC | Dropped — the code no longer exists | `ssh_tunnel.rs` was removed in #1029 and the NSSH1 handshake with it; a dead `hmac` dependency was also removed |
 | tokio-tungstenite needs a backend feature change | No change needed | Its `__rustls-tls` feature pins no backend and already uses the process default |
 | reqwest: "switch to using the global provider" | Switched to `rustls-tls-native-roots-no-provider` | The plain `rustls-tls-native-roots` feature force-enables `__rustls-ring` |
@@ -228,11 +268,14 @@ key generation, credential AEAD, and both SSH configs; adds `mise run fips:{chec
 documents the operator-facing view in `docs/security/fips.mdx` and the workspace
 feature scheme in `architecture/build.md`.
 
-Validation: 5085 tests pass in default mode; 141 in FIPS mode via
-`mise run fips:test`, including credential-envelope round-trips and ES256 JWT
-round-trips; clippy clean under `-D warnings` in both modes. The tests assert on
-the negotiable algorithm sets rather than on the feature flag, so a regression in
-a restriction list fails rather than passing silently.
+Validation: 5087 tests pass in default mode; 473 in FIPS mode via
+`mise run fips:test`, which runs the **strict** feature graph
+(`--no-default-features --features fips,…`) so the tests exercise the same
+backend the shipped build uses. Coverage includes credential-envelope
+round-trips, ES256 JWT round-trips, and the key-rotation error. clippy is clean
+under `-D warnings` in both modes. The tests assert on the negotiable algorithm
+sets rather than on the feature flag, so a regression in a restriction list fails
+rather than passing silently.
 
 **Phase 2 — AWS SDK leg.** Move `aws-config` and `aws-sdk-sts` onto the newer
 HTTP client stack with `aws-smithy-http-client`'s `rustls-aws-lc-fips` feature.
@@ -271,6 +314,18 @@ in gateway registration metadata and failing loudly, which is an open question.
 **FIPS builds lose post-quantum key exchange.** The NIST-only narrowing removes
 X25519+ML-KEM768. For a threat model that weights harvest-now-decrypt-later
 highly, a FIPS build is worse than a default build on that axis.
+
+**The FIPS build command is easy to get wrong.** `--features fips` alone is the
+natural thing to type and is exactly the combination that must not ship. This is
+mitigated by a `compile_error!` rather than documentation, but it does mean the
+FIPS build line is longer and has to re-list the non-crypto defaults
+(`telemetry`, `bundled-z3`, `bundled-ca-roots`). A default that is dropped by
+mistake is a silent behavior change rather than a build failure.
+
+**Library crates now install a process-global provider.** `ensure_default_provider()`
+is called from library code that builds TLS clients. It can only fill in a
+missing provider, never replace one, but it does mean an embedder that expects to
+install its own provider must do so before calling into OpenShell.
 
 **Build toolchain cost.** `aws-lc-fips-sys` compiles from source and needs CMake
 and Go. This is why the FIPS build is not part of the default `ci` task, and it
@@ -361,6 +416,13 @@ one scheme rather than two.
 - Which CMVP certificate does the vendored `aws-lc-fips-sys` correspond to, and
   who owns tracking that across dependency bumps? Issue #900 raised this and it
   is still unanswered.
+- Should the remaining RustCrypto SHA-256 call sites (policy revisions, profile
+  catalogs, image digests) also be routed through the validated module? They are
+  content-addressing rather than security functions, but an auditor may not draw
+  that line the same way.
+- Is `compile_error!` the right enforcement for the sqlx conflict, or should
+  `db-tls-ring` stop being a default so the FIPS build line is shorter at the
+  cost of every ordinary build having to name it?
 - Should `mise run fips:audit` fail CI when the residual `ring` surface grows,
   rather than only reporting? A ratchet would prevent regression but needs a
   baseline everyone agrees on.

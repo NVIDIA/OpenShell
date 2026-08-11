@@ -12,13 +12,24 @@ adding one back links `ring` unconditionally and silently defeats the FIPS build
 
 | Feature | Backend | Algorithms |
 |---|---|---|
-| `backend-ring` (default) | `ring` | rustls/russh defaults, including ChaCha20-Poly1305 and X25519 |
+| *(none)* — default | `ring` | rustls/russh defaults, including ChaCha20-Poly1305 and X25519 |
 | `fips` | AWS-LC in FIPS mode | FIPS-approved only |
 
 ```shell
-cargo build -p openshell-server                  # default
-cargo build -p openshell-server --features fips   # FIPS (needs CMake + Go)
+cargo build -p openshell-server                   # default
+cargo build -p openshell-server \
+  --no-default-features --features fips,telemetry  # FIPS (needs CMake + Go)
 ```
+
+There is deliberately no opposite `backend-ring` feature. Cargo features are
+additive, so two mutually exclusive backend features can always both end up
+enabled — and a dependency resolving that toward `ring` (sqlx does exactly this)
+would produce a non-FIPS build that still looked like one. `ring` is an
+unconditional dependency and `fips` is a one-way switch.
+
+`--no-default-features` is required for the gateway because sqlx's backend comes
+from *its* features rather than the process default; a `compile_error!` in
+`openshell-server` enforces it.
 
 FIPS mode is compile-time only. rustls derives `require_ems` from its own `fips`
 feature at compile time, so one binary cannot serve both modes.
@@ -62,7 +73,12 @@ Three things this crate cannot fix, each documented at its definition:
   no validated module. Accepted because the SSH transport sits inside the mTLS
   boundary and performs no authentication of its own.
 - **`sqlx`.** Selects a provider from its own Cargo features rather than the
-  process default, so `openshell-server` forwards the backend choice separately.
+  process default, and prefers `ring` when both are enabled, so
+  `openshell-server` forwards the backend choice separately and a
+  `compile_error!` rejects the ambiguous combination.
+- **Content and revision hashing.** Policy revisions, profile catalogs, and
+  image digests still use RustCrypto `sha2`. Those are content-addressing rather
+  than security functions; key and credential-identifier hashing is routed here.
 - **`aws-smithy-http-client`.** Constructs its own provider, so AWS SDK calls use
   `ring` regardless of this crate.
 

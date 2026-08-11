@@ -3,7 +3,7 @@
 
 //! Gateway-minted per-sandbox JWTs.
 //!
-//! The gateway signs an Ed25519 JWT for each sandbox at create time and
+//! The gateway signs a JWT for each sandbox at create time and
 //! the sandbox supervisor presents it as `Authorization: Bearer <jwt>` on
 //! supervisor-to-gateway gRPC calls. This module implements both sides of the
 //! gateway-controlled token:
@@ -86,8 +86,15 @@ impl SandboxJwtIssuer {
         gateway_id: &str,
         ttl: Duration,
     ) -> Result<Self, String> {
-        let encoding_key = openshell_crypto::jwt_encoding_key(signing_key_pem)
-            .map_err(|e| format!("failed to parse Ed25519 signing key PEM: {e}"))?;
+        let encoding_key = openshell_crypto::jwt_encoding_key(signing_key_pem).map_err(|e| {
+            format!(
+                "failed to parse the sandbox JWT signing key as {}: {e}. A FIPS build \
+                     requires an ECDSA P-256 key and a default build requires an Ed25519 key; \
+                     a gateway whose key material was generated under the other build mode must \
+                     rotate it by re-running `openshell-gateway generate-certs`.",
+                openshell_crypto::JWT_JOSE_ALGORITHM
+            )
+        })?;
         let identity = format!("openshell-gateway:{gateway_id}");
         Ok(Self {
             encoding_key,
@@ -152,8 +159,13 @@ impl std::fmt::Debug for SandboxJwtAuthenticator {
 
 impl SandboxJwtAuthenticator {
     pub fn from_pem(public_key_pem: &[u8], kid: String, gateway_id: &str) -> Result<Self, String> {
-        let decoding_key = openshell_crypto::jwt_decoding_key(public_key_pem)
-            .map_err(|e| format!("failed to parse Ed25519 public key PEM: {e}"))?;
+        let decoding_key = openshell_crypto::jwt_decoding_key(public_key_pem).map_err(|e| {
+            format!(
+                "failed to parse the sandbox JWT public key as {}: {e}. See the signing-key \
+                     error above for the key-rotation requirement when switching build modes.",
+                openshell_crypto::JWT_JOSE_ALGORITHM
+            )
+        })?;
         let identity = format!("openshell-gateway:{gateway_id}");
         Ok(Self {
             decoding_key,
@@ -282,6 +294,37 @@ mod tests {
         )
         .unwrap();
         (issuer, auth)
+    }
+
+    /// Key material generated under the other build mode must be rejected with
+    /// an actionable error rather than a cryptic parse failure. Switching an
+    /// existing gateway to a FIPS build requires rotating the JWT key, and this
+    /// is the message that has to say so.
+    #[test]
+    fn key_material_from_the_other_build_mode_is_rejected_with_guidance() {
+        let other_mode_key = if openshell_crypto::IS_FIPS_BUILD {
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+        } else {
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        }
+        .expect("generate a key of the non-native type");
+
+        let err = SandboxJwtIssuer::from_pem(
+            other_mode_key.serialize_pem().as_bytes(),
+            "kid".to_string(),
+            "test-gateway",
+            Duration::from_secs(60),
+        )
+        .expect_err("a key of the wrong type must not load");
+
+        assert!(
+            err.contains("rotate") && err.contains("generate-certs"),
+            "the error must tell the operator how to recover, got: {err}"
+        );
+        assert!(
+            err.contains(openshell_crypto::JWT_JOSE_ALGORITHM),
+            "the error must name the expected algorithm, got: {err}"
+        );
     }
 
     #[tokio::test]

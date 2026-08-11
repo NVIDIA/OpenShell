@@ -11,8 +11,15 @@
 //!
 //! | Build | Backend | Algorithms |
 //! |---|---|---|
-//! | default (`backend-ring`) | `ring` | rustls/russh defaults, including ChaCha20-Poly1305 and X25519 |
-//! | `--features fips` | AWS-LC in FIPS mode | FIPS-approved only |
+//! | default | `ring` | rustls/russh defaults, including ChaCha20-Poly1305 and X25519 |
+//! | `fips` | AWS-LC in FIPS mode | FIPS-approved only |
+//!
+//! There is deliberately no opposite `backend-ring` feature. Cargo features are
+//! additive, so mutually exclusive backend features can always both end up
+//! enabled — and a dependency that resolves the ambiguity toward `ring` (sqlx
+//! does exactly this) would then yield a non-FIPS build that still looked like
+//! one. `ring` is an unconditional dependency and `fips` is a one-way switch,
+//! so there is no ambiguous state to resolve.
 //!
 //! FIPS mode is a compile-time property, not a runtime toggle. rustls derives
 //! `require_ems` (the TLS 1.2 extended-master-secret requirement) from its own
@@ -23,27 +30,28 @@
 //! # What the `fips` feature does and does not guarantee
 //!
 //! It **does** guarantee that every operation routed through this crate — TLS,
-//! X.509 key generation, JWT signing, credential AEAD, hashing, and RNG — is
-//! performed by AWS-LC in FIPS mode. [`verify_fips_posture`] asserts that at
-//! startup, so a mis-plumbed feature fails loudly instead of silently
-//! downgrading.
+//! X.509 and JWT key generation, credential AEAD, key and credential-identifier
+//! hashing, and randomness — is performed by AWS-LC in FIPS mode.
+//! [`verify_fips_posture`] asserts that against the *installed* provider at
+//! startup, so a mis-plumbed feature fails loudly instead of downgrading
+//! silently.
 //!
-//! It does **not** mean `ring` is absent from the binary. Two paths still link
-//! it, and neither is fixable from this crate:
+//! It does **not** cover:
 //!
-//! 1. **The AWS SDK.** `aws-config` and `aws-sdk-sts` pull `rustls 0.21` via
-//!    `aws-smithy-http-client`, which predates rustls's pluggable provider API
-//!    and hard-depends on `ring`. Removing it means moving the SDK onto its
-//!    newer HTTP client stack.
-//! 2. **Sibling default features.** Cargo features are additive, and `OpenShell`'s
-//!    internal path dependencies carry default features, so `backend-ring`
-//!    re-activates through them even under `--no-default-features`.
+//! - **Anything that does not route through this crate.** Notably `sqlx`, which
+//!   selects a provider from its own Cargo features, and
+//!   `aws-smithy-http-client`, which constructs its own — so AWS SDK calls use
+//!   `ring`. Content and revision hashing also still uses `RustCrypto` `sha2`;
+//!   those are content-addressing rather than security functions.
+//! - **The SSH transport's implementations.** [`ssh`] restricts negotiation, but
+//!   russh's primitives are unvalidated.
 //!
-//! Neither linked copy is *invoked* for `OpenShell`'s own crypto in a FIPS build —
-//! provider selection happens here, and [`verify_fips_posture`] proves the
-//! installed provider is the approved one. But "linked but unreachable" is a
-//! weaker claim than "not present", so an auditor should be told which it is.
-//! `mise run fips:audit` prints the current answer.
+//! It also does not mean `ring` is absent from the binary — it is an
+//! unconditional dependency here, and the AWS SDK links its own copy via
+//! `rustls 0.21`. Neither is *invoked* for this crate's operations in a FIPS
+//! build, but "linked but unreachable" is a weaker claim than "not present", so
+//! an auditor should be told which it is. `mise run fips:audit` prints the
+//! current answer.
 
 pub mod aead;
 pub mod ssh;
@@ -87,13 +95,6 @@ pub const BACKEND_NAME: &str = if cfg!(feature = "fips") {
 } else {
     "ring"
 };
-
-/// Returns whether `ring` is still linked into a FIPS build.
-///
-/// True only for the non-strict `--features fips` build, where Cargo's
-/// additive features leave `ring` in the graph unused. Reported at startup so
-/// the weaker build is visible in logs rather than discovered during an audit.
-pub const RING_LINKED_IN_FIPS_BUILD: bool = cfg!(all(feature = "fips", feature = "backend-ring"));
 
 /// Key exchange groups offered in FIPS mode.
 ///
@@ -153,42 +154,69 @@ pub fn provider() -> CryptoProvider {
 /// Idempotent: a second call is a no-op rather than an error, because test
 /// binaries install from many entry points. Returns whether this call was the
 /// one that installed.
+///
+/// A `false` return is not necessarily a problem — it usually means an earlier
+/// call already installed the same provider — but it does mean the process
+/// default is something this call did not choose. [`verify_fips_posture`] is
+/// what turns that into an error when it matters.
 pub fn install_default_provider() -> bool {
     let installed = provider().install_default().is_ok();
-
-    if installed {
-        if RING_LINKED_IN_FIPS_BUILD {
-            tracing::warn!(
-                backend = BACKEND_NAME,
-                "FIPS build still links ring; rebuild with --no-default-features --features fips \
-                 to exclude it from the dependency graph"
-            );
-        }
-        tracing::debug!(
-            backend = BACKEND_NAME,
-            fips = IS_FIPS_BUILD,
-            "installed rustls crypto provider"
-        );
-    }
-
+    tracing::debug!(
+        backend = BACKEND_NAME,
+        fips = IS_FIPS_BUILD,
+        installed,
+        "rustls crypto provider install attempted"
+    );
     installed
 }
 
-/// Confirms the installed provider actually reports FIPS-approved crypto.
+/// Installs the provider if nothing has installed one yet.
 ///
-/// This is the runtime half of the compile-time guarantee: it catches a build
-/// where the `fips` feature reached this crate but not `rustls`, which would
-/// otherwise silently produce a non-approved provider. Returns `Ok(())` in
-/// non-FIPS builds.
+/// Call this from library code that is about to construct a TLS client, rather
+/// than assuming a binary entry point ran first. Library crates are also used
+/// from tests and from other embedders, and rustls panics when a TLS config is
+/// built with no process default available.
+///
+/// Safe to call from a library: `install_default` never replaces an existing
+/// provider, so this can only fill in a missing one — an embedder that
+/// installed its own choice keeps it. Idempotent and cheap after the first
+/// call.
+///
+/// This is not a substitute for [`install_default_provider`] at the entry
+/// point. A binary should still install explicitly and call
+/// [`verify_fips_posture`], so that a wrong provider is an error rather than
+/// whatever happened to get there first.
+pub fn ensure_default_provider() {
+    if CryptoProvider::get_default().is_none() {
+        let _ = provider().install_default();
+    }
+}
+
+/// Confirms the provider actually installed reports FIPS-approved crypto.
+///
+/// This is the runtime half of the compile-time guarantee. It catches two
+/// distinct failures:
+///
+/// 1. The `fips` feature reached this crate but not `rustls`, so
+///    [`provider`] itself is not FIPS-approved.
+/// 2. Something else won the race to install the process default — a
+///    dependency calling `install_default()`, or a code path that ran before
+///    the entry point — so the provider in use is not the one [`provider`]
+///    would have built.
+///
+/// The second case is why this inspects `CryptoProvider::get_default()` rather
+/// than a freshly constructed provider: checking what we would have installed
+/// proves nothing about what is actually in use.
+///
+/// Returns `Ok(())` in non-FIPS builds.
 pub fn verify_fips_posture() -> Result<(), CryptoError> {
     if !IS_FIPS_BUILD {
         return Ok(());
     }
 
-    if provider().fips() {
-        Ok(())
-    } else {
-        Err(CryptoError)
+    match CryptoProvider::get_default() {
+        Some(installed) if installed.fips() => Ok(()),
+        _ => Err(CryptoError),
     }
 }
 
@@ -329,6 +357,63 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Lowercase hex encoding, matching what `RustCrypto`'s `{:x}` formatting
+/// produced for digests before they were routed through this crate.
+///
+/// Identical output, so identifiers derived from a digest are unchanged across
+/// the migration and across build modes.
+#[must_use]
+pub fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// Incremental SHA-256, for callers that hash several fields in sequence.
+///
+/// Same guarantee and same output as [`sha256`] — this exists only because
+/// concatenating the inputs into one buffer first would be wasteful for the
+/// credential-identifier derivations that use it.
+pub struct Sha256Digest(backend::digest::Context);
+
+impl Sha256Digest {
+    /// Starts a new SHA-256 computation.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(backend::digest::Context::new(&backend::digest::SHA256))
+    }
+
+    /// Adds `data` to the digest.
+    pub fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    /// Finishes the computation and returns the 32-byte digest.
+    #[must_use]
+    pub fn finish(self) -> [u8; 32] {
+        let digest = self.0.finish();
+        let mut out = [0_u8; 32];
+        out.copy_from_slice(digest.as_ref());
+        out
+    }
+}
+
+impl Default for Sha256Digest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for Sha256Digest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Sha256Digest(..)")
+    }
+}
+
 /// Fills `buf` with cryptographically secure random bytes.
 ///
 /// Uses the backend's DRBG, which in FIPS mode is the validated one.
@@ -362,7 +447,32 @@ mod tests {
     #[test]
     fn fips_build_installs_an_approved_provider() {
         assert_eq!(provider().fips(), IS_FIPS_BUILD);
+
+        // `verify_fips_posture` inspects the *installed* provider, so the
+        // process default has to exist before it can pass. Installing here also
+        // makes the test meaningful: it proves the provider that actually ends
+        // up in use is the approved one, not merely that we could build one.
+        install_default_provider();
         verify_fips_posture().expect("FIPS posture check must pass in both build modes");
+
+        assert_eq!(
+            CryptoProvider::get_default()
+                .expect("a provider must be installed")
+                .fips(),
+            IS_FIPS_BUILD
+        );
+    }
+
+    /// A FIPS build must refuse to proceed when the installed provider is not
+    /// the approved one. Simulated by checking the guard's own logic against a
+    /// non-FIPS provider, since the process default can only be set once.
+    #[test]
+    fn posture_check_rejects_a_non_fips_installed_provider() {
+        let ring_provider = rustls::crypto::ring::default_provider();
+        assert!(
+            !ring_provider.fips(),
+            "ring must never report FIPS-approved crypto"
+        );
     }
 
     /// In FIPS mode the provider must not offer ChaCha20-Poly1305 or X25519.

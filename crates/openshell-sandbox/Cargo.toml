@@ -54,7 +54,7 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 
 [features]
-default = ["telemetry", "bundled-ca-roots", "backend-ring"]
+default = ["telemetry", "bundled-ca-roots"]
 ## Convenience alias: all defaults except bundled CA roots. Use
 ## `--no-default-features --features system-ca-roots` to build a supervisor
 ## that uses the platform trust store with telemetry intact.
@@ -62,7 +62,6 @@ system-ca-roots = ["telemetry"]
 
 telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
-backend-ring = ["openshell-crypto/backend-ring"]
 fips = ["openshell-crypto/fips"]
 
 [dev-dependencies]

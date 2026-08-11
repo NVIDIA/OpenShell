@@ -118,7 +118,7 @@ arc-swap = "1"
 notify = "8"
 
 [features]
-default = ["telemetry", "backend-ring"]
+default = ["telemetry", "db-tls-ring"]
 ## Compile in anonymous telemetry emission (forwards to openshell-core/telemetry).
 ## On by default; build with `--no-default-features` for a telemetry-free gateway
 ## that contains no telemetry endpoint, HTTP client, or emission code.
@@ -126,16 +126,25 @@ telemetry = ["openshell-core/telemetry"]
 bundled-z3 = ["openshell-prover/bundled-z3"]
 test-support = []
 
-# sqlx does not honor the process-default rustls CryptoProvider — it calls
-# `builder_with_provider` with a provider chosen by its own cargo features — so
-# the database TLS backend has to be selected here alongside openshell-crypto.
+# Database TLS backend.
 #
-# Known limitation: sqlx 0.8 offers native-root loading only on its ring
-# feature (`tls-rustls-ring-native-roots`); the aws-lc-rs variant is
-# webpki-roots only. A FIPS build therefore does not read the system trust
-# store for database TLS. Point `sslrootcert` in DATABASE_URL at the CA
-# instead, which works independently of the root store.
-backend-ring = ["openshell-crypto/backend-ring", "sqlx/tls-rustls-ring-native-roots"]
+# sqlx does not honor the process-default rustls CryptoProvider — it calls
+# `builder_with_provider` with a provider chosen by its own cargo features, and
+# when both its ring and aws-lc-rs features are enabled it silently prefers
+# ring. `db-tls-ring` and `fips` are therefore mutually exclusive, and because
+# Cargo features are additive that cannot be expressed here: it is enforced by a
+# `compile_error!` in `src/lib.rs`.
+#
+# This is why a FIPS gateway must be built with `--no-default-features`:
+#
+#   cargo build -p openshell-server --no-default-features --features fips,telemetry
+#
+# Known limitation: sqlx 0.8 offers native-root loading only on its ring feature
+# (`tls-rustls-ring-native-roots`); the aws-lc-rs variant is webpki-roots only.
+# A FIPS build therefore does not read the system trust store for database TLS.
+# Point `sslrootcert` in DATABASE_URL at the CA instead, which works
+# independently of the root store.
+db-tls-ring = ["sqlx/tls-rustls-ring-native-roots"]
 fips = ["openshell-crypto/fips", "sqlx/tls-rustls-aws-lc-rs"]
 
 [dev-dependencies]

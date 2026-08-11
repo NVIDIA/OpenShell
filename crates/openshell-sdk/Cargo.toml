@@ -31,8 +31,7 @@ tower = { workspace = true }
 tracing = { workspace = true }
 
 [features]
-default = ["backend-ring"]
-backend-ring = ["openshell-crypto/backend-ring"]
+default = []
 fips = ["openshell-crypto/fips"]
 
 [dev-dependencies]
