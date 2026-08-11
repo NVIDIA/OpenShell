@@ -42,7 +42,10 @@ For this tier, default to:
 - `access: read-only` when the user says "read", "browse", "view", "query", "fetch"
 - `access: read-write` when the user says "read-write", "create", "update" (but not "delete")
 - `access: full` when the user says "full access", "everything", "unrestricted"
-- L4-only (no `protocol`) when the user says "just allow it", "pass through", "no inspection"
+- L4-only (omit `protocol`, or use explicit `protocol: tcp`) when the user says
+  "just allow it", "pass through", "no inspection". Prefer omission unless the
+  user wants the transport intent stated explicitly; both currently have the
+  same host/port enforcement behavior.
 
 ### Moderate Tier (host + partial path knowledge)
 
@@ -188,7 +191,7 @@ Follow this decision tree based on the detail tier and user intent:
 ```
 Is L7 inspection needed?
 ├─ No (user wants pass-through / "just allow it")
-│   └─ Generate L4-only policy (no protocol, no tls, no rules/access)
+│   └─ Generate L4-only policy (no protocol, or protocol: tcp; no tls/rules/access)
 │
 └─ Yes (user wants method/path control)
     │
@@ -376,7 +379,8 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 ### Hard Errors (would block sandbox startup)
 
 - [ ] `rules` and `access` are NOT both present on the same endpoint
-- [ ] If `protocol` is set, either `rules` or `access` is also present
+- [ ] If an L7 `protocol` is set, either `rules` or `access` is also present;
+      `protocol: tcp` is L4-only and must not contain either field
 - [ ] If `tls: terminate` is set, `protocol` is also set
 - [ ] `rules` list is not empty when present
 - [ ] If `protocol: sql`, `enforcement` is not `enforce`
@@ -408,7 +412,7 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 
 | Condition | Warning to show |
 |-----------|----------------|
-| **L4-only** (no `protocol`) | "This policy allows all HTTP methods and paths without inspection. The proxy will only check host:port and binary identity. Consider adding `protocol: rest` with a preset if you want method-level control." |
+| **L4-only** (no `protocol`, or `protocol: tcp`) | "This policy allows all HTTP methods and paths without inspection. The proxy will only check host:port and binary identity. Consider adding `protocol: rest` with a preset if you want method-level control." |
 | **`access: full`** | "This policy allows all HTTP methods (including DELETE) on all paths. If you don't need DELETE, `read-write` is safer. If you only need to read, `read-only` is the most restrictive option." |
 | **`access: full` + `enforcement: audit`** | "Full access in audit mode provides no actual restriction — all traffic flows through. This is effectively a monitoring-only policy." |
 | **`access: read-write`** when user hasn't confirmed write need | "This policy allows POST, PUT, and PATCH on all paths. If you only need to read data, `read-only` is more restrictive." |
