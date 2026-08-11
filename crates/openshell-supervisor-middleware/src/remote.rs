@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_core::middleware::HttpRequestView;
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
@@ -18,6 +20,67 @@ use crate::MIDDLEWARE_GRPC_MESSAGE_BYTES;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Adapts the borrowed runtime request contract to the owned protobuf service
+/// contract only when dispatch crosses a gRPC-shaped boundary.
+#[derive(Clone)]
+pub struct GrpcMiddlewareService {
+    service: Arc<dyn SupervisorMiddleware>,
+}
+
+impl GrpcMiddlewareService {
+    /// Connect an operator registration and wrap its generated gRPC client.
+    pub async fn connect(registration_name: &str, grpc_endpoint: &str) -> Result<Self> {
+        Ok(Self {
+            service: Arc::new(
+                RemoteMiddlewareService::connect(registration_name, grpc_endpoint).await?,
+            ),
+        })
+    }
+
+    /// Wrap a protobuf-shaped service used by transport-boundary tests.
+    #[cfg(test)]
+    pub fn from_service(service: Arc<dyn SupervisorMiddleware>) -> Self {
+        Self { service }
+    }
+
+    /// Forward a manifest request through the protobuf service contract.
+    pub async fn describe(&self) -> std::result::Result<Response<MiddlewareManifest>, Status> {
+        self.service.describe(Request::new(())).await
+    }
+
+    /// Materialize the owned configuration request required by gRPC.
+    pub async fn validate_config(
+        &self,
+        middleware_name: &str,
+        config: &prost_types::Struct,
+    ) -> std::result::Result<Response<ValidateConfigResponse>, Status> {
+        self.service
+            .validate_config(Request::new(ValidateConfigRequest {
+                config: Some(config.clone()),
+                middleware_name: middleware_name.to_string(),
+            }))
+            .await
+    }
+
+    /// Materialize an owned protobuf evaluation immediately before transport.
+    pub async fn evaluate_http_request(
+        &self,
+        request: HttpRequestView<'_>,
+    ) -> std::result::Result<Response<HttpRequestResult>, Status> {
+        self.service
+            .evaluate_http_request(Request::new(HttpRequestEvaluation {
+                phase: request.phase() as i32,
+                context: Some(request.context().clone()),
+                config: Some(request.config().clone()),
+                target: Some(request.target().clone()),
+                headers: request.headers().to_vec(),
+                body: request.body().to_vec(),
+                middleware_name: request.middleware_name().to_string(),
+            }))
+            .await
+    }
+}
 
 #[derive(Clone)]
 pub struct RemoteMiddlewareService {

@@ -16,21 +16,26 @@ use std::time::Duration;
 use miette::{Result, miette};
 use prost::Message;
 
-use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestTarget,
-    MiddlewareBinding, MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
+    Decision, Finding, HeaderMutation, HttpHeader, HttpRequestTarget, MiddlewareBinding,
+    MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
-    ValidateConfigRequest,
+    ValidateConfigResponse,
 };
 use tokio::sync::OnceCell;
+
+#[cfg(test)]
+use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
+#[cfg(test)]
+use openshell_core::proto::{HttpRequestEvaluation, ValidateConfigRequest};
+#[cfg(test)]
 use tonic::Request;
 
 pub use openshell_core::middleware::{
-    DEFAULT_MIDDLEWARE_TIMEOUT, MAX_MIDDLEWARE_CHAIN_FINDINGS, MAX_MIDDLEWARE_CHAIN_STAGES,
-    MAX_MIDDLEWARE_CONFIGS, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_SELECTOR_PATTERNS,
-    MAX_MIDDLEWARE_TIMEOUT, MIN_MIDDLEWARE_TIMEOUT, middleware_timeout_or_default,
-    parse_middleware_timeout,
+    DEFAULT_MIDDLEWARE_TIMEOUT, HttpRequestView, InProcessMiddleware,
+    MAX_MIDDLEWARE_CHAIN_FINDINGS, MAX_MIDDLEWARE_CHAIN_STAGES, MAX_MIDDLEWARE_CONFIGS,
+    MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_SELECTOR_PATTERNS, MAX_MIDDLEWARE_TIMEOUT,
+    MIN_MIDDLEWARE_TIMEOUT, middleware_timeout_or_default, parse_middleware_timeout,
 };
 
 /// Largest request or replacement body accepted by the middleware platform.
@@ -298,12 +303,67 @@ pub struct ChainRunner {
     registry: Arc<MiddlewareRegistry>,
 }
 
+enum MiddlewareService {
+    /// Built-ins borrow the current request state and never construct protobuf.
+    InProcess(Arc<dyn InProcessMiddleware>),
+    /// Operator services receive an owned protobuf through the gRPC adapter.
+    Grpc(remote::GrpcMiddlewareService),
+}
+
+impl MiddlewareService {
+    async fn describe(
+        &self,
+    ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
+        match self {
+            Self::InProcess(service) => Ok(tonic::Response::new(service.describe().await)),
+            Self::Grpc(service) => service.describe().await,
+        }
+    }
+
+    async fn validate_config(
+        &self,
+        middleware_name: &str,
+        config: &prost_types::Struct,
+    ) -> std::result::Result<tonic::Response<ValidateConfigResponse>, tonic::Status> {
+        match self {
+            Self::InProcess(service) => Ok(tonic::Response::new(
+                match service.validate_config(middleware_name, config).await {
+                    Ok(()) => ValidateConfigResponse {
+                        valid: true,
+                        reason: String::new(),
+                    },
+                    Err(error) => ValidateConfigResponse {
+                        valid: false,
+                        reason: error.to_string(),
+                    },
+                },
+            )),
+            Self::Grpc(service) => service.validate_config(middleware_name, config).await,
+        }
+    }
+
+    async fn evaluate_http_request(
+        &self,
+        request: HttpRequestView<'_>,
+    ) -> std::result::Result<tonic::Response<openshell_core::proto::HttpRequestResult>, tonic::Status>
+    {
+        match self {
+            Self::InProcess(service) => service
+                .evaluate_http_request(request)
+                .await
+                .map(tonic::Response::new)
+                .map_err(|error| tonic::Status::invalid_argument(error.to_string())),
+            Self::Grpc(service) => service.evaluate_http_request(request).await,
+        }
+    }
+}
+
 struct MiddlewareServiceState {
     /// Policy-facing built-in name or operator-owned registration name. The
     /// single-service test constructor leaves this empty and uses the manifest
     /// name after Describe.
     attachment_name: Option<String>,
-    service: Arc<dyn SupervisorMiddleware>,
+    service: MiddlewareService,
     manifest: OnceCell<MiddlewareManifest>,
     diagnostic_policy: MiddlewareDiagnosticPolicy,
     operator_max_body_bytes: Option<usize>,
@@ -573,44 +633,27 @@ fn normalize_untrusted_diagnostics(
     }
 }
 
-fn validate_request_envelope(
-    evaluation: &HttpRequestEvaluation,
-) -> std::result::Result<(), &'static str> {
-    if evaluation.body.len() > MAX_MIDDLEWARE_BODY_BYTES {
+fn validate_request_view(request: HttpRequestView<'_>) -> std::result::Result<(), &'static str> {
+    if request.body().len() > MAX_MIDDLEWARE_BODY_BYTES {
         return Err("request_body_over_capacity");
     }
-    if evaluation
-        .config
-        .as_ref()
-        .is_some_and(|config| config.encoded_len() > MAX_MIDDLEWARE_CONFIG_BYTES)
-    {
+    if request.config().encoded_len() > MAX_MIDDLEWARE_CONFIG_BYTES {
         return Err("request_config_over_capacity");
     }
-    if evaluation
-        .context
-        .as_ref()
-        .is_some_and(|context| context.encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES)
-    {
+    if request.context().encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES {
         return Err("request_context_over_capacity");
     }
-    if evaluation
-        .target
-        .as_ref()
-        .is_some_and(|target| target.encoded_len() > MAX_MIDDLEWARE_TARGET_BYTES)
-    {
+    if request.target().encoded_len() > MAX_MIDDLEWARE_TARGET_BYTES {
         return Err("request_target_over_capacity");
     }
-    if evaluation.headers.len() > MAX_MIDDLEWARE_HEADERS {
+    if request.headers().len() > MAX_MIDDLEWARE_HEADERS {
         return Err("request_header_count_over_capacity");
     }
-    let header_bytes = evaluation.headers.iter().fold(0usize, |total, header| {
+    let header_bytes = request.headers().iter().fold(0usize, |total, header| {
         total.saturating_add(header.encoded_len())
     });
     if header_bytes > MAX_MIDDLEWARE_HEADER_BYTES {
         return Err("request_header_bytes_over_capacity");
-    }
-    if evaluation.encoded_len() > MIDDLEWARE_GRPC_MESSAGE_BYTES {
-        return Err("request_envelope_over_capacity");
     }
     Ok(())
 }
@@ -668,7 +711,7 @@ impl MiddlewareRegistry {
     /// Describe in-process services, then connect and validate every
     /// operator-provided service registration.
     pub async fn connect_services(
-        in_process_services: Vec<Arc<dyn SupervisorMiddleware>>,
+        in_process_services: Vec<Arc<dyn InProcessMiddleware>>,
         registrations: Vec<SupervisorMiddlewareService>,
     ) -> Result<Self> {
         let mut services = Vec::with_capacity(in_process_services.len() + registrations.len());
@@ -676,19 +719,17 @@ impl MiddlewareRegistry {
         let mut middleware_names = HashSet::new();
 
         for service in in_process_services {
-            let manifest = call_with_timeout(
-                DEFAULT_MIDDLEWARE_TIMEOUT,
-                "Describe",
-                service.describe(Request::new(())),
-            )
-            .await
-            .map(tonic::Response::into_inner)
-            .map_err(|error| {
-                miette!(
-                    "in-process middleware Describe failed: {}",
-                    safe_reason(&error.to_string())
-                )
-            })?;
+            let service = MiddlewareService::InProcess(service);
+            let manifest =
+                call_with_timeout(DEFAULT_MIDDLEWARE_TIMEOUT, "Describe", service.describe())
+                    .await
+                    .map(tonic::Response::into_inner)
+                    .map_err(|error| {
+                        miette!(
+                            "in-process middleware Describe failed: {}",
+                            safe_reason(&error.to_string())
+                        )
+                    })?;
             let source = if manifest.name.trim().is_empty() {
                 "in-process middleware service".to_string()
             } else {
@@ -737,27 +778,23 @@ impl MiddlewareRegistry {
                         registration.name
                     )
                 })?;
-            let service = Arc::new(
-                remote::RemoteMiddlewareService::connect(
+            let service = MiddlewareService::Grpc(
+                remote::GrpcMiddlewareService::connect(
                     &registration.name,
                     &registration.grpc_endpoint,
                 )
                 .await?,
             );
-            let manifest = call_with_timeout(
-                operator_timeout,
-                "Describe",
-                service.describe(Request::new(())),
-            )
-            .await
-            .map(tonic::Response::into_inner)
-            .map_err(|error| {
-                miette!(
-                    "middleware registration '{}' Describe failed: {}",
-                    registration.name,
-                    safe_reason(&error.to_string())
-                )
-            })?;
+            let manifest = call_with_timeout(operator_timeout, "Describe", service.describe())
+                .await
+                .map(tonic::Response::into_inner)
+                .map_err(|error| {
+                    miette!(
+                        "middleware registration '{}' Describe failed: {}",
+                        registration.name,
+                        safe_reason(&error.to_string())
+                    )
+                })?;
             validate_external_manifest(&registration, &manifest, operator_max_body_bytes)?;
             let manifest_cell = OnceCell::new();
             manifest_cell
@@ -846,7 +883,13 @@ impl Default for ChainRunner {
 }
 
 impl ChainRunner {
-    pub fn new(service: Arc<dyn SupervisorMiddleware>) -> Self {
+    /// Construct a runner around one in-process middleware implementation.
+    #[must_use]
+    pub fn new(service: Arc<dyn InProcessMiddleware>) -> Self {
+        Self::from_service(MiddlewareService::InProcess(service))
+    }
+
+    fn from_service(service: MiddlewareService) -> Self {
         Self {
             registry: Arc::new(MiddlewareRegistry {
                 services: Arc::new(vec![Arc::new(MiddlewareServiceState {
@@ -863,6 +906,13 @@ impl ChainRunner {
         }
     }
 
+    #[cfg(test)]
+    fn new_protobuf_for_tests(service: Arc<dyn SupervisorMiddleware>) -> Self {
+        Self::from_service(MiddlewareService::Grpc(
+            remote::GrpcMiddlewareService::from_service(service),
+        ))
+    }
+
     pub fn from_registry(registry: MiddlewareRegistry) -> Self {
         Self {
             registry: Arc::new(registry),
@@ -875,19 +925,15 @@ impl ChainRunner {
             let manifest = state
                 .manifest
                 .get_or_try_init(|| async {
-                    call_with_timeout(
-                        state.operator_timeout,
-                        "Describe",
-                        state.service.describe(Request::new(())),
-                    )
-                    .await
-                    .map(tonic::Response::into_inner)
-                    .map_err(|error| {
-                        miette!(
-                            "middleware Describe failed: {}",
-                            safe_reason(&error.to_string())
-                        )
-                    })
+                    call_with_timeout(state.operator_timeout, "Describe", state.service.describe())
+                        .await
+                        .map(tonic::Response::into_inner)
+                        .map_err(|error| {
+                            miette!(
+                                "middleware Describe failed: {}",
+                                safe_reason(&error.to_string())
+                            )
+                        })
                 })
                 .await?;
             manifests.push((Arc::clone(state), manifest.clone()));
@@ -985,12 +1031,7 @@ impl ChainRunner {
         let response = call_with_timeout(
             state.timeout_for_binding(binding)?,
             "ValidateConfig",
-            state
-                .service
-                .validate_config(Request::new(ValidateConfigRequest {
-                    config: Some(config),
-                    middleware_name: middleware_name.into(),
-                })),
+            state.service.validate_config(middleware_name, &config),
         )
         .await
         .map(tonic::Response::into_inner)
@@ -1043,15 +1084,47 @@ impl ChainRunner {
         transformed_body_policy: TransformedBodyPolicy<'_>,
     ) -> Result<ChainOutcome> {
         ensure_chain_capacity(entries.len())?;
-        let mut headers = input.headers.clone();
-        let mut body = input.body.clone();
+        let HttpRequestInput {
+            request_id,
+            sandbox_id,
+            scheme,
+            host,
+            port,
+            method,
+            path,
+            query,
+            headers,
+            connection_nominated_headers,
+            body,
+        } = input;
+        // The request envelope is moved into one stable chain state. Built-ins
+        // borrow these values for every stage; only the gRPC adapter clones them
+        // when an operator service requires an owned protobuf message.
+        let context = RequestContext {
+            request_id,
+            sandbox_id,
+            originating_process: None,
+        };
+        let target = HttpRequestTarget {
+            scheme,
+            host,
+            port: u32::from(port),
+            method,
+            path,
+            query,
+        };
+        let mut headers: Vec<HttpHeader> = headers
+            .into_iter()
+            .map(|(name, value)| HttpHeader { name, value })
+            .collect();
+        let mut body = body;
         let mut header_mutations = Vec::new();
         let mut findings = Vec::new();
         let mut metadata = BTreeMap::new();
         let mut applied = Vec::new();
 
         for entry in entries {
-            let Some(binding) = entry.binding.as_ref() else {
+            let Some(_binding) = entry.binding.as_ref() else {
                 match apply_on_error(entry, "binding_not_described", &mut applied) {
                     OnErrorAction::FailOpen => continue,
                     OnErrorAction::FailClosed(reason) => {
@@ -1085,8 +1158,16 @@ impl ChainRunner {
                     }
                 }
             }
-            let evaluation = build_evaluation(entry, binding, &input, &headers, &body);
-            if let Err(reason) = validate_request_envelope(&evaluation) {
+            let request = HttpRequestView::new(
+                PRE_CREDENTIALS_PHASE,
+                &context,
+                &entry.entry.config,
+                &target,
+                &headers,
+                &body,
+                &entry.entry.implementation,
+            );
+            if let Err(reason) = validate_request_view(request) {
                 match apply_on_error(entry, reason, &mut applied) {
                     OnErrorAction::FailOpen => continue,
                     OnErrorAction::FailClosed(reason) => {
@@ -1109,9 +1190,7 @@ impl ChainRunner {
             let mut result = match call_with_timeout(
                 entry.timeout,
                 "EvaluateHttpRequest",
-                service
-                    .service
-                    .evaluate_http_request(Request::new(evaluation)),
+                service.service.evaluate_http_request(request),
             )
             .await
             {
@@ -1245,40 +1324,48 @@ impl ChainRunner {
             // Validate and apply the entire stage atomically. Under fail-open,
             // one malformed mutation must not leave earlier mutations from the
             // same response visible to later middleware.
-            let updated_headers = match headers::apply(
-                &headers,
-                &input.connection_nominated_headers,
-                &result.header_mutations,
-            ) {
-                Ok(updated) => updated,
-                Err(error) => {
-                    let reason = service
-                        .diagnostic_policy
-                        .header_mutation_error_reason(&error);
-                    match apply_on_error(entry, &reason, &mut applied) {
-                        OnErrorAction::FailOpen => continue,
-                        OnErrorAction::FailClosed(reason) => {
-                            return Ok(ChainOutcome {
-                                allowed: false,
-                                reason,
-                                body,
-                                header_mutations,
-                                findings,
-                                metadata,
-                                applied,
-                                denial: None,
-                            });
+            let updated_headers = if result.header_mutations.is_empty() {
+                None
+            } else {
+                match headers::apply(
+                    &headers,
+                    &connection_nominated_headers,
+                    &result.header_mutations,
+                ) {
+                    Ok(updated) => Some(updated),
+                    Err(error) => {
+                        let reason = service
+                            .diagnostic_policy
+                            .header_mutation_error_reason(&error);
+                        match apply_on_error(entry, &reason, &mut applied) {
+                            OnErrorAction::FailOpen => continue,
+                            OnErrorAction::FailClosed(reason) => {
+                                return Ok(ChainOutcome {
+                                    allowed: false,
+                                    reason,
+                                    body,
+                                    header_mutations,
+                                    findings,
+                                    metadata,
+                                    applied,
+                                    denial: None,
+                                });
+                            }
                         }
                     }
                 }
             };
-            let headers_transformed = updated_headers != headers;
-            headers = updated_headers;
-            header_mutations.extend(result.header_mutations.iter().cloned());
+            let headers_transformed = updated_headers
+                .as_ref()
+                .is_some_and(|updated| updated != &headers);
+            if let Some(updated) = updated_headers {
+                headers = updated;
+            }
+            header_mutations.extend(std::mem::take(&mut result.header_mutations));
 
             let body_transformed = result.has_body;
             if body_transformed {
-                result.body.clone_into(&mut body);
+                body = std::mem::take(&mut result.body);
             }
             for finding in result.findings {
                 findings.push(NamespacedFinding {
@@ -1289,7 +1376,7 @@ impl ChainRunner {
             if !result.metadata.is_empty() {
                 metadata.insert(
                     entry.entry.name.clone(),
-                    result.metadata.clone().into_iter().collect(),
+                    result.metadata.into_iter().collect(),
                 );
             }
             applied.push(MiddlewareInvocation {
@@ -1370,41 +1457,6 @@ fn ensure_chain_capacity(count: usize) -> Result<()> {
     Ok(())
 }
 
-fn build_evaluation(
-    entry: &DescribedChainEntry,
-    binding: &MiddlewareBinding,
-    input: &HttpRequestInput,
-    headers: &[(String, String)],
-    body: &[u8],
-) -> HttpRequestEvaluation {
-    HttpRequestEvaluation {
-        phase: binding.phase,
-        context: Some(RequestContext {
-            request_id: input.request_id.clone(),
-            sandbox_id: input.sandbox_id.clone(),
-            originating_process: None,
-        }),
-        config: Some(entry.entry.config.clone()),
-        target: Some(HttpRequestTarget {
-            scheme: input.scheme.clone(),
-            host: input.host.clone(),
-            port: u32::from(input.port),
-            method: input.method.clone(),
-            path: input.path.clone(),
-            query: input.query.clone(),
-        }),
-        headers: headers
-            .iter()
-            .map(|(name, value)| HttpHeader {
-                name: name.clone(),
-                value: value.clone(),
-            })
-            .collect(),
-        body: body.to_vec(),
-        middleware_name: entry.entry.implementation.clone(),
-    }
-}
-
 pub(crate) fn safe_reason(reason: &str) -> String {
     reason
         .chars()
@@ -1478,28 +1530,320 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RequestAddresses {
+        phase: SupervisorMiddlewarePhase,
+        context: usize,
+        request_id: usize,
+        config: usize,
+        target: usize,
+        host: usize,
+        headers: usize,
+        first_header_name: usize,
+        body: usize,
+        originating_process_present: bool,
+        middleware_name: String,
+    }
+
+    /// Records borrowed addresses so the test can detect an owned envelope
+    /// being reconstructed between otherwise no-op in-process stages.
+    struct BorrowedRecordingService {
+        manifest_name: String,
+        received: std::sync::Mutex<Vec<RequestAddresses>>,
+    }
+
+    #[tonic::async_trait]
+    impl InProcessMiddleware for BorrowedRecordingService {
+        async fn describe(&self) -> MiddlewareManifest {
+            MiddlewareManifest {
+                name: self.manifest_name.clone(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_body_bytes: 4096,
+                    timeout: String::new(),
+                }],
+            }
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            request: HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            let addresses = RequestAddresses {
+                phase: request.phase(),
+                context: std::ptr::from_ref(request.context()).addr(),
+                request_id: request.context().request_id.as_ptr().addr(),
+                config: std::ptr::from_ref(request.config()).addr(),
+                target: std::ptr::from_ref(request.target()).addr(),
+                host: request.target().host.as_ptr().addr(),
+                headers: request.headers().as_ptr().addr(),
+                first_header_name: request
+                    .headers()
+                    .first()
+                    .map_or(0, |header| header.name.as_ptr().addr()),
+                body: request.body().as_ptr().addr(),
+                originating_process_present: request.context().originating_process.is_some(),
+                middleware_name: request.middleware_name().to_string(),
+            };
+            self.received
+                .lock()
+                .expect("borrowed request recorder lock")
+                .push(addresses);
+            Ok(allow_result())
+        }
+    }
+
     #[tokio::test]
-    async fn phase_one_evaluation_omits_originating_process() {
-        let entries = builtin_runner()
-            .describe_chain(&[entry("redact", OnError::FailClosed)])
+    async fn in_process_stages_share_one_borrowed_request_envelope() {
+        let service = Arc::new(BorrowedRecordingService {
+            manifest_name: "acme/redactor".into(),
+            received: std::sync::Mutex::new(Vec::new()),
+        });
+        let runner = ChainRunner::new(service.clone());
+        let entries = [
+            ChainEntry {
+                name: "first".into(),
+                implementation: "acme/redactor".into(),
+                order: 0,
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            },
+            ChainEntry {
+                name: "second".into(),
+                implementation: "acme/redactor".into(),
+                order: 10,
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            },
+        ];
+        let described = runner
+            .describe_chain(&entries)
             .await
             .expect("describe chain");
-        let entry = &entries[0];
-        let binding = entry.binding.as_ref().expect("described binding");
-        let input = input("payload");
-        let evaluation = build_evaluation(entry, binding, &input, &[], b"payload");
+        let expected_configs: Vec<_> = described
+            .iter()
+            .map(|entry| std::ptr::from_ref(&entry.entry.config).addr())
+            .collect();
+        let mut request = input("payload");
+        request.headers = vec![("x-test".into(), "value".into())];
+        let expected_body = request.body.as_ptr().addr();
+        let expected_request_id = request.request_id.as_ptr().addr();
+        let expected_host = request.host.as_ptr().addr();
+        let expected_header_name = request.headers[0].0.as_ptr().addr();
 
-        assert_eq!(
-            evaluation.phase,
-            SupervisorMiddlewarePhase::PreCredentials as i32
-        );
+        let outcome = runner
+            .evaluate_described(&described, request)
+            .await
+            .expect("evaluate borrowed chain");
+        let received = service.received.lock().expect("borrowed requests");
+
+        assert!(outcome.allowed);
+        assert_eq!(outcome.body.as_ptr().addr(), expected_body);
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].phase, SupervisorMiddlewarePhase::PreCredentials);
+        assert!(!received[0].originating_process_present);
+        assert_eq!(received[0].request_id, expected_request_id);
+        assert_eq!(received[0].host, expected_host);
+        assert_eq!(received[0].first_header_name, expected_header_name);
+        assert_eq!(received[0].body, expected_body);
+        assert_eq!(received[0].config, expected_configs[0]);
+        assert_eq!(received[1].config, expected_configs[1]);
+        assert_eq!(received[0].context, received[1].context);
+        assert_eq!(received[0].target, received[1].target);
+        assert_eq!(received[0].headers, received[1].headers);
+        assert_eq!(received[0].body, received[1].body);
         assert!(
-            evaluation
-                .context
-                .expect("request context")
-                .originating_process
-                .is_none()
+            received
+                .iter()
+                .all(|request| request.middleware_name == "acme/redactor")
         );
+    }
+
+    const TEST_REPLACEMENT_BODY: &[u8] = b"stage-one-replacement";
+
+    /// Records both sides of a successful body replacement so the test can
+    /// distinguish ownership transfer from a content-preserving body copy.
+    #[derive(Debug, Default)]
+    struct ReplacementTransferRecord {
+        invocations: usize,
+        returned_body: Option<usize>,
+        second_body: Option<usize>,
+        second_body_bytes: Vec<u8>,
+    }
+
+    /// Replaces the first request body and observes the body borrowed by the
+    /// second stage without replacing it again.
+    struct ReplacementTransferService {
+        record: std::sync::Mutex<ReplacementTransferRecord>,
+    }
+
+    #[tonic::async_trait]
+    impl InProcessMiddleware for ReplacementTransferService {
+        async fn describe(&self) -> MiddlewareManifest {
+            MiddlewareManifest {
+                name: "test/replacement-transfer".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_body_bytes: 4096,
+                    timeout: String::new(),
+                }],
+            }
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            request: HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            let mut record = self.record.lock().expect("replacement transfer record");
+            let invocation = record.invocations;
+            record.invocations += 1;
+
+            if invocation == 0 {
+                let replacement = TEST_REPLACEMENT_BODY.to_vec();
+                record.returned_body = Some(replacement.as_ptr().addr());
+                let mut result = allow_result();
+                result.body = replacement;
+                result.has_body = true;
+                Ok(result)
+            } else {
+                record.second_body = Some(request.body().as_ptr().addr());
+                record.second_body_bytes = request.body().to_vec();
+                Ok(allow_result())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_body_allocation_moves_through_next_stage_and_outcome() {
+        let service = Arc::new(ReplacementTransferService {
+            record: std::sync::Mutex::new(ReplacementTransferRecord::default()),
+        });
+        let runner = ChainRunner::new(service.clone());
+        let entries = [
+            ChainEntry {
+                name: "replace".into(),
+                implementation: "test/replacement-transfer".into(),
+                order: 0,
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            },
+            ChainEntry {
+                name: "observe".into(),
+                implementation: "test/replacement-transfer".into(),
+                order: 10,
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            },
+        ];
+
+        let outcome = runner
+            .evaluate(&entries, input("original-body"))
+            .await
+            .expect("evaluate replacement transfer chain");
+        let record = service.record.lock().expect("replacement transfer record");
+        let returned_body = record
+            .returned_body
+            .expect("first-stage replacement pointer");
+
+        assert!(outcome.allowed);
+        assert_eq!(record.invocations, 2);
+        assert_eq!(record.second_body_bytes, TEST_REPLACEMENT_BODY);
+        assert_eq!(record.second_body, Some(returned_body));
+        assert_eq!(outcome.body, TEST_REPLACEMENT_BODY);
+        assert_eq!(outcome.body.as_ptr().addr(), returned_body);
+    }
+
+    /// An in-process service that yields forever so the runtime must enforce
+    /// the binding timeout around borrowed validation and evaluation futures.
+    struct PendingInProcessService;
+
+    #[tonic::async_trait]
+    impl InProcessMiddleware for PendingInProcessService {
+        async fn describe(&self) -> MiddlewareManifest {
+            MiddlewareManifest {
+                name: "test/pending".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_body_bytes: 4096,
+                    timeout: "10ms".into(),
+                }],
+            }
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            std::future::pending().await
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn in_process_evaluation_remains_interruptible_by_stage_timeout() {
+        let runner = ChainRunner::new(Arc::new(PendingInProcessService));
+        let entry = |on_error| ChainEntry {
+            name: "pending".into(),
+            implementation: "test/pending".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error,
+        };
+        let closed = runner
+            .evaluate(&[entry(OnError::FailClosed)], input("payload"))
+            .await
+            .expect("timed-out in-process evaluation");
+        let open = runner
+            .evaluate(&[entry(OnError::FailOpen)], input("payload"))
+            .await
+            .expect("fail-open timed-out in-process evaluation");
+
+        assert!(!closed.allowed);
+        assert_eq!(closed.reason, "middleware_failed: middleware_timeout");
+        assert!(closed.applied[0].failed);
+        assert!(open.allowed);
+        assert!(open.applied[0].failed);
+    }
+
+    #[tokio::test]
+    async fn in_process_validation_remains_interruptible_by_binding_timeout() {
+        let runner = ChainRunner::new(Arc::new(PendingInProcessService));
+        let error = runner
+            .validate_config("test/pending", prost_types::Struct::default())
+            .await
+            .expect_err("timed-out in-process validation");
+
+        assert!(error.to_string().contains("ValidateConfig failed"));
+        assert!(error.to_string().contains("timed out"));
     }
 
     #[tokio::test]
@@ -1535,6 +1879,13 @@ mod tests {
             r#"token="[REDACTED]""#
         );
         assert_eq!(outcome.applied.len(), 2);
+        assert_eq!(
+            [
+                outcome.applied[0].transformed,
+                outcome.applied[1].transformed,
+            ],
+            [true, false]
+        );
     }
 
     #[tokio::test]
@@ -1644,15 +1995,13 @@ mod tests {
 
     #[tokio::test]
     async fn injected_services_cannot_duplicate_middleware_names() {
-        let first: Arc<dyn SupervisorMiddleware> = Arc::new(ScriptedService {
+        let first: Arc<dyn InProcessMiddleware> = Arc::new(BorrowedRecordingService {
             manifest_name: "openshell/test".into(),
-            max_body_bytes: 1024,
-            result: allow_result(),
+            received: std::sync::Mutex::new(Vec::new()),
         });
-        let second: Arc<dyn SupervisorMiddleware> = Arc::new(ScriptedService {
+        let second: Arc<dyn InProcessMiddleware> = Arc::new(BorrowedRecordingService {
             manifest_name: "openshell/test".into(),
-            max_body_bytes: 1024,
-            result: allow_result(),
+            received: std::sync::Mutex::new(Vec::new()),
         });
 
         let error = MiddlewareRegistry::connect_services(vec![first, second], Vec::new())
@@ -1695,16 +2044,11 @@ mod tests {
         async fn validate_config(
             &self,
             _request: Request<ValidateConfigRequest>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
-            tonic::Status,
-        > {
-            Ok(tonic::Response::new(
-                openshell_core::proto::ValidateConfigResponse {
-                    valid: true,
-                    reason: String::new(),
-                },
-            ))
+        ) -> std::result::Result<tonic::Response<ValidateConfigResponse>, tonic::Status> {
+            Ok(tonic::Response::new(ValidateConfigResponse {
+                valid: true,
+                reason: String::new(),
+            }))
         }
 
         async fn evaluate_http_request(
@@ -1744,17 +2088,12 @@ mod tests {
         async fn validate_config(
             &self,
             _request: Request<ValidateConfigRequest>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
-            tonic::Status,
-        > {
+        ) -> std::result::Result<tonic::Response<ValidateConfigResponse>, tonic::Status> {
             tokio::time::sleep(self.delay).await;
-            Ok(tonic::Response::new(
-                openshell_core::proto::ValidateConfigResponse {
-                    valid: true,
-                    reason: String::new(),
-                },
-            ))
+            Ok(tonic::Response::new(ValidateConfigResponse {
+                valid: true,
+                reason: String::new(),
+            }))
         }
 
         async fn evaluate_http_request(
@@ -1797,16 +2136,11 @@ mod tests {
         async fn validate_config(
             &self,
             _request: Request<ValidateConfigRequest>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
-            tonic::Status,
-        > {
-            Ok(tonic::Response::new(
-                openshell_core::proto::ValidateConfigResponse {
-                    valid: true,
-                    reason: String::new(),
-                },
-            ))
+        ) -> std::result::Result<tonic::Response<ValidateConfigResponse>, tonic::Status> {
+            Ok(tonic::Response::new(ValidateConfigResponse {
+                valid: true,
+                reason: String::new(),
+            }))
         }
 
         async fn evaluate_http_request(
@@ -1845,7 +2179,7 @@ mod tests {
         let service: Arc<dyn SupervisorMiddleware> = Arc::new(TwoStageService {
             second_ran: Arc::clone(&second_ran),
         });
-        let runner = ChainRunner::new(service);
+        let runner = ChainRunner::new_protobuf_for_tests(service);
         let transform = ChainEntry {
             name: "transform".into(),
             implementation: "test/two-stage".into(),
@@ -1907,7 +2241,7 @@ mod tests {
         let service: Arc<dyn SupervisorMiddleware> = Arc::new(TwoStageService {
             second_ran: Arc::clone(&second_ran),
         });
-        let runner = ChainRunner::new(service);
+        let runner = ChainRunner::new_protobuf_for_tests(service);
         let transform = ChainEntry {
             name: "transform".into(),
             implementation: "test/two-stage".into(),
@@ -1959,7 +2293,7 @@ mod tests {
         let service: Arc<dyn SupervisorMiddleware> = Arc::new(TwoStageService {
             second_ran: Arc::clone(&second_ran),
         });
-        let runner = ChainRunner::new(service);
+        let runner = ChainRunner::new_protobuf_for_tests(service);
         let entries = [
             ChainEntry {
                 name: "transform".into(),
@@ -2061,20 +2395,15 @@ mod tests {
         async fn validate_config(
             &self,
             request: Request<ValidateConfigRequest>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
-            tonic::Status,
-        > {
+        ) -> std::result::Result<tonic::Response<ValidateConfigResponse>, tonic::Status> {
             self.validated
                 .lock()
                 .expect("validated config lock")
                 .push(request.into_inner());
-            Ok(tonic::Response::new(
-                openshell_core::proto::ValidateConfigResponse {
-                    valid: true,
-                    reason: String::new(),
-                },
-            ))
+            Ok(tonic::Response::new(ValidateConfigResponse {
+                valid: true,
+                reason: String::new(),
+            }))
         }
 
         async fn evaluate_http_request(
@@ -2120,16 +2449,11 @@ mod tests {
         async fn validate_config(
             &self,
             _request: Request<ValidateConfigRequest>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
-            tonic::Status,
-        > {
-            Ok(tonic::Response::new(
-                openshell_core::proto::ValidateConfigResponse {
-                    valid: true,
-                    reason: String::new(),
-                },
-            ))
+        ) -> std::result::Result<tonic::Response<ValidateConfigResponse>, tonic::Status> {
+            Ok(tonic::Response::new(ValidateConfigResponse {
+                valid: true,
+                reason: String::new(),
+            }))
         }
 
         async fn evaluate_http_request(
@@ -2175,7 +2499,7 @@ mod tests {
                 second_action: action,
                 received: std::sync::Mutex::new(Vec::new()),
             });
-            let runner = ChainRunner::new(service.clone());
+            let runner = ChainRunner::new_protobuf_for_tests(service.clone());
             let entries = [
                 ChainEntry {
                     name: "first".into(),
@@ -2227,16 +2551,34 @@ mod tests {
             received: std::sync::Mutex::new(Vec::new()),
         });
         let recorder: Arc<dyn SupervisorMiddleware> = service.clone();
-        let runner = ChainRunner::new(recorder);
+        let runner = ChainRunner::new_protobuf_for_tests(recorder);
+        let validation_config = prost_types::Struct {
+            fields: std::iter::once((
+                "required".into(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue("present".into())),
+                },
+            ))
+            .collect(),
+        };
         runner
-            .validate_config("test/recorder", prost_types::Struct::default())
+            .validate_config("test/recorder", validation_config.clone())
             .await
             .expect("validate recorder config");
+        let evaluation_config = prost_types::Struct {
+            fields: std::iter::once((
+                "evaluation".into(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue("preserved".into())),
+                },
+            ))
+            .collect(),
+        };
         let recorder_entry = ChainEntry {
             name: "recorder".into(),
             implementation: "test/recorder".into(),
             order: 0,
-            config: prost_types::Struct::default(),
+            config: evaluation_config.clone(),
             on_error: OnError::FailClosed,
         };
         let mut request = input("payload");
@@ -2245,6 +2587,8 @@ mod tests {
             ("accept".into(), "application/json".into()),
             ("x-api-key".into(), "second-value".into()),
         ];
+        request.query = "page=2".into();
+        let original_body = request.body.as_ptr().addr();
 
         let outcome = runner
             .evaluate(&[recorder_entry], request)
@@ -2255,11 +2599,31 @@ mod tests {
         let validated = service.validated.lock().expect("validated configs");
         assert_eq!(validated.len(), 1);
         assert_eq!(validated[0].middleware_name, "test/recorder");
+        assert_eq!(validated[0].config.as_ref(), Some(&validation_config));
         drop(validated);
 
         let received = service.received.lock().expect("recorded evaluations");
         assert_eq!(received.len(), 1);
+        assert_eq!(outcome.body.as_ptr().addr(), original_body);
+        assert_ne!(received[0].body.as_ptr().addr(), original_body);
+        assert_eq!(received[0].body, b"payload");
+        assert_eq!(
+            received[0].phase,
+            SupervisorMiddlewarePhase::PreCredentials as i32
+        );
         assert_eq!(received[0].middleware_name, "test/recorder");
+        assert_eq!(received[0].config.as_ref(), Some(&evaluation_config));
+        let context = received[0].context.as_ref().expect("request context");
+        assert_eq!(context.request_id, "req");
+        assert_eq!(context.sandbox_id, "sbx");
+        assert!(context.originating_process.is_none());
+        let target = received[0].target.as_ref().expect("request target");
+        assert_eq!(target.scheme, "https");
+        assert_eq!(target.host, "api.example.com");
+        assert_eq!(target.port, 443);
+        assert_eq!(target.method, "POST");
+        assert_eq!(target.path, "/v1");
+        assert_eq!(target.query, "page=2");
         let headers: Vec<(&str, &str)> = received[0]
             .headers
             .iter()
@@ -2292,11 +2656,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("built-in middleware service");
-        let builtin_manifest = builtin_service
-            .describe(Request::new(()))
-            .await
-            .expect("describe built-in service")
-            .into_inner();
+        let builtin_manifest = builtin_service.describe().await;
         validate_manifest_bindings("test built-in service", &builtin_manifest, None)
             .expect("valid built-in manifest");
         let builtin_name = builtin_manifest.name.clone();
@@ -2321,7 +2681,7 @@ mod tests {
             services: Arc::new(vec![
                 Arc::new(MiddlewareServiceState {
                     attachment_name: Some(builtin_name.clone()),
-                    service: builtin_service,
+                    service: MiddlewareService::InProcess(builtin_service),
                     manifest: builtin_manifest_cell,
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                     operator_max_body_bytes: None,
@@ -2329,7 +2689,9 @@ mod tests {
                 }),
                 Arc::new(MiddlewareServiceState {
                     attachment_name: Some(registration_name.clone()),
-                    service,
+                    service: MiddlewareService::Grpc(remote::GrpcMiddlewareService::from_service(
+                        service,
+                    )),
                     manifest: manifest_cell,
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
                     operator_max_body_bytes: Some(operator_max_body_bytes),
@@ -2363,7 +2725,7 @@ mod tests {
 
     #[tokio::test]
     async fn descriptors_are_resolved_from_any_middleware_service() {
-        let runner = ChainRunner::new(Arc::new(ScriptedService {
+        let runner = ChainRunner::new_protobuf_for_tests(Arc::new(ScriptedService {
             manifest_name: "test/middleware".into(),
             max_body_bytes: 4096,
             result: allow_result(),
@@ -3032,7 +3394,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_reason_code_is_a_middleware_failure() {
-        let runner = ChainRunner::new(Arc::new(scripted_service(
+        let runner = ChainRunner::new_protobuf_for_tests(Arc::new(scripted_service(
             openshell_core::proto::HttpRequestResult {
                 decision: Decision::Deny as i32,
                 reason_code: "Secret value!".into(),
@@ -3192,7 +3554,7 @@ mod tests {
 
     #[tokio::test]
     async fn maximum_chain_retains_findings_from_every_stage() {
-        let runner = ChainRunner::new(Arc::new(ScriptedService {
+        let runner = ChainRunner::new_protobuf_for_tests(Arc::new(ScriptedService {
             manifest_name: "test/middleware".into(),
             max_body_bytes: 4096,
             result: openshell_core::proto::HttpRequestResult {
@@ -3242,7 +3604,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_decision_short_circuits_chain() {
-        let runner = ChainRunner::new(Arc::new(scripted_service(
+        let runner = ChainRunner::new_protobuf_for_tests(Arc::new(scripted_service(
             openshell_core::proto::HttpRequestResult {
                 decision: Decision::Deny as i32,
                 reason: "blocked_by_policy".into(),
@@ -3277,7 +3639,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_decision_ignores_unsafe_mutations_under_fail_open() {
-        let runner = ChainRunner::new(Arc::new(scripted_service(
+        let runner = ChainRunner::new_protobuf_for_tests(Arc::new(scripted_service(
             openshell_core::proto::HttpRequestResult {
                 decision: Decision::Deny as i32,
                 reason: "blocked_by_policy".into(),
@@ -3305,7 +3667,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_decision_ignores_oversized_replacement_under_fail_open() {
-        let runner = ChainRunner::new(Arc::new(ScriptedService {
+        let runner = ChainRunner::new_protobuf_for_tests(Arc::new(ScriptedService {
             manifest_name: BUILTIN_REGEX.into(),
             max_body_bytes: 4,
             result: openshell_core::proto::HttpRequestResult {
@@ -3333,7 +3695,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_and_findings_are_namespaced_per_config() {
-        let runner = ChainRunner::new(Arc::new(scripted_service(
+        let runner = ChainRunner::new_protobuf_for_tests(Arc::new(scripted_service(
             openshell_core::proto::HttpRequestResult {
                 findings: vec![Finding {
                     r#type: "pii.email".into(),
@@ -3390,7 +3752,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_response_headers_fail_closed_denies() {
-        let runner = ChainRunner::new(Arc::new(unsafe_header_service()));
+        let runner = ChainRunner::new_protobuf_for_tests(Arc::new(unsafe_header_service()));
         let outcome = runner
             .evaluate(&[entry("redact", OnError::FailClosed)], input("hello"))
             .await
@@ -3412,7 +3774,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_response_headers_fail_open_continues() {
-        let runner = ChainRunner::new(Arc::new(unsafe_header_service()));
+        let runner = ChainRunner::new_protobuf_for_tests(Arc::new(unsafe_header_service()));
         let outcome = runner
             .evaluate(&[entry("redact", OnError::FailOpen)], input("hello"))
             .await
@@ -3426,7 +3788,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_replacement_body_honors_on_error() {
-        let runner = ChainRunner::new(Arc::new(ScriptedService {
+        let runner = ChainRunner::new_protobuf_for_tests(Arc::new(ScriptedService {
             manifest_name: BUILTIN_REGEX.into(),
             max_body_bytes: 4,
             result: openshell_core::proto::HttpRequestResult {
@@ -3461,7 +3823,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_request_body_honors_on_error() {
-        let runner = ChainRunner::new(Arc::new(ScriptedService {
+        let runner = ChainRunner::new_protobuf_for_tests(Arc::new(ScriptedService {
             manifest_name: BUILTIN_REGEX.into(),
             max_body_bytes: 4,
             result: allow_result(),
@@ -3492,7 +3854,7 @@ mod tests {
 
     #[tokio::test]
     async fn unspecified_decision_uses_fail_closed() {
-        let runner = ChainRunner::new(Arc::new(scripted_service(
+        let runner = ChainRunner::new_protobuf_for_tests(Arc::new(scripted_service(
             openshell_core::proto::HttpRequestResult {
                 decision: Decision::Unspecified as i32,
                 ..allow_result()

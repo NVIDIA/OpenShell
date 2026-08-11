@@ -51,6 +51,7 @@ run = "bash tasks/scripts/e2e-gpu-build-images.sh"
 
 ["test:rust"]
 description = "Run Rust tests"
+env = { OPENSHELL_TELEMETRY_ENABLED = "false" }
 run = [
   # Run the workspace once without openshell-server so we can run that crate
   # with test-only helpers enabled.

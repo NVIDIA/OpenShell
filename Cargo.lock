@@ -3714,6 +3714,7 @@ dependencies = [
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "glob",
@@ -4188,6 +4189,7 @@ dependencies = [
 name = "openshell-supervisor-middleware-builtins"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "miette",
  "openshell-core",
  "prost-types",
@@ -4195,7 +4197,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tonic",
 ]
 
 [[package]]

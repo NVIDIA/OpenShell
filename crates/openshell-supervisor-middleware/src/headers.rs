@@ -3,7 +3,7 @@
 
 //! Validation and logical application of middleware request-header mutations.
 
-use openshell_core::proto::{ExistingHeaderAction, HeaderMutation, header_mutation};
+use openshell_core::proto::{ExistingHeaderAction, HeaderMutation, HttpHeader, header_mutation};
 
 pub const MAX_HEADER_MUTATIONS: usize = 64;
 pub const MAX_HEADER_MUTATION_BYTES: usize = 32 * 1024;
@@ -105,10 +105,10 @@ impl std::error::Error for HeaderMutationError {}
 /// state observed by the next middleware. Repeated values and wire order are
 /// preserved; comparisons are case-insensitive.
 pub fn apply(
-    existing_headers: &[(String, String)],
+    existing_headers: &[HttpHeader],
     connection_nominated_headers: &[String],
     mutations: &[HeaderMutation],
-) -> Result<Vec<(String, String)>, HeaderMutationError> {
+) -> Result<Vec<HttpHeader>, HeaderMutationError> {
     if mutations.len() > MAX_HEADER_MUTATIONS {
         return Err(HeaderMutationError::TooMany {
             count: mutations.len(),
@@ -148,12 +148,18 @@ pub fn apply(
                         name: write.name.clone(),
                     });
                 }
-                let exists = headers.iter().any(|(existing, _)| *existing == name);
+                let exists = headers.iter().any(|existing| existing.name == name);
                 if !exists || action == ExistingHeaderAction::Append {
-                    headers.push((name, write.value.clone()));
+                    headers.push(HttpHeader {
+                        name,
+                        value: write.value.clone(),
+                    });
                 } else if action == ExistingHeaderAction::Overwrite {
-                    headers.retain(|(existing, _)| *existing != name);
-                    headers.push((name, write.value.clone()));
+                    headers.retain(|existing| existing.name != name);
+                    headers.push(HttpHeader {
+                        name,
+                        value: write.value.clone(),
+                    });
                 } else if action != ExistingHeaderAction::Skip {
                     return Err(HeaderMutationError::UnsupportedExistingAction);
                 }
@@ -167,7 +173,7 @@ pub fn apply(
                 }
                 mutation_bytes = mutation_bytes.saturating_add(name.len());
                 enforce_size_limit(mutation_bytes)?;
-                headers.retain(|(existing, _)| *existing != name);
+                headers.retain(|existing| existing.name != name);
             }
             None => return Err(HeaderMutationError::Empty),
         }
@@ -276,6 +282,13 @@ mod tests {
         }
     }
 
+    fn header(name: &str, value: &str) -> HttpHeader {
+        HttpHeader {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+
     #[test]
     fn protected_header_write_is_rejected() {
         let error = apply(
@@ -313,8 +326,8 @@ mod tests {
     #[test]
     fn existing_header_write_obeys_collision_action() {
         let existing = [
-            ("x-openshell-middleware-tag".to_string(), "one".to_string()),
-            ("accept".to_string(), "application/json".to_string()),
+            header("x-openshell-middleware-tag", "one"),
+            header("accept", "application/json"),
         ];
         let appended = apply(
             &existing,
@@ -329,9 +342,9 @@ mod tests {
         assert_eq!(
             appended,
             vec![
-                ("x-openshell-middleware-tag".into(), "one".into()),
-                ("accept".into(), "application/json".into()),
-                ("x-openshell-middleware-tag".into(), "two".into()),
+                header("x-openshell-middleware-tag", "one"),
+                header("accept", "application/json"),
+                header("x-openshell-middleware-tag", "two"),
             ]
         );
 
@@ -348,8 +361,8 @@ mod tests {
         assert_eq!(
             overwritten,
             vec![
-                ("accept".into(), "application/json".into()),
-                ("x-openshell-middleware-tag".into(), "two".into()),
+                header("accept", "application/json"),
+                header("x-openshell-middleware-tag", "two"),
             ]
         );
 
@@ -369,12 +382,12 @@ mod tests {
     #[test]
     fn remove_drops_every_case_insensitive_value() {
         let existing = [
-            ("x-trace".to_string(), "one".to_string()),
-            ("accept".to_string(), "application/json".to_string()),
-            ("x-trace".to_string(), "two".to_string()),
+            header("x-trace", "one"),
+            header("accept", "application/json"),
+            header("x-trace", "two"),
         ];
         let updated = apply(&existing, &[], &[remove("X-Trace")]).expect("remove visible header");
-        assert_eq!(updated, vec![("accept".into(), "application/json".into())]);
+        assert_eq!(updated, vec![header("accept", "application/json")]);
     }
 
     #[test]
