@@ -82,11 +82,12 @@ enabled. This is why a FIPS gateway is built with
 `--no-default-features --features fips,telemetry` and has to re-list its
 non-crypto defaults.
 
-FIPS mode cannot be a runtime toggle. The binding constraint is that the module
-itself is chosen at link time: `aws-lc-rs/fips` links `aws-lc-fips-sys` and its
-absence links `aws-lc-sys`, which are different C libraries. A runtime switch
-would require both linked and reachable, which is the posture the crate exists to
-prevent.
+FIPS mode is selected at build time, not at runtime. On rustls 0.23 that is
+forced; from 0.24 it becomes a choice we are still making deliberately. The
+durable part is that a build offering *both* a FIPS and a `ring`-backed mode would
+have to link both AWS-LC variants (`aws-lc-fips-sys` and `aws-lc-sys`, different C
+libraries) and keep both reachable — which is the posture this crate exists to
+prevent. See the 0.24 migration note below for what does and does not change.
 
 On rustls 0.23 `require_ems` (the TLS 1.2 extended-master-secret requirement) is
 also derived from `cfg!(feature = "fips")`, which makes that behavior
@@ -116,9 +117,11 @@ AWS SDK's HTTPS client explicitly (`provider_refresh::aws_http_client`) with a
 `mise run fips:audit` reports the residual surface.
 
 `aws-sigv4` cannot be handled either way: it depends on RustCrypto `hmac` and
-`sha2` unconditionally with no backend feature, so proxy-side AWS SigV4 request
-signing in `openshell-supervisor-network` computes HMAC-SHA256 outside the
-validated module regardless of build mode.
+`sha2` unconditionally with no backend feature. SigV4 request signing therefore
+computes HMAC-SHA256 outside the validated module in every build mode, on two
+paths — proxy-side signing in `openshell-supervisor-network`, and the gateway's
+STS `AssumeRole` requests, which `aws-sdk-sts` signs via `aws-runtime`. Moving the
+STS *transport* to the validated module (Phase 2) did not change its *signing*.
 
 Hashing is routed through the facade where it is a security function — key
 identifiers, credential-storage key identifiers, and Kubernetes Secret and Vault
@@ -156,11 +159,16 @@ What the upgrade will require:
   posture, so an unnoticed non-FIPS provider would silently relax TLS 1.2
   handling instead of merely mislabeling the build.
 
-What the upgrade will **not** change: FIPS remains a build-time choice. The
-validated module is a distinct linked library (`aws-lc-fips-sys` versus
-`aws-lc-sys`), so a single artifact cannot be validated on demand. rustls 0.24
-makes *algorithm policy* selectable at runtime within a binary already built
-against the validated module — not the module itself.
+What the upgrade will **not** change: OpenShell will still ship separate FIPS and
+non-FIPS artifacts, but the reason is a product decision rather than a hard
+limit. Under 0.24 a single artifact *can* link only the FIPS provider and select
+rustls policy at runtime. What it cannot do is offer a `ring`-backed
+non-FIPS mode from that same artifact, because the two AWS-LC variants
+(`aws-lc-fips-sys` and `aws-lc-sys`) are different linked libraries. Since we
+keep a `ring`-backed default build — and rustls maintainers advise against
+running a FIPS provider in non-FIPS mode, given its slower update cadence and
+performance-costing countermeasures — separate artifacts remain the right shape
+for us.
 
 ## Linux Runtime Environments
 

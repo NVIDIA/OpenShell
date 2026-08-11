@@ -33,10 +33,10 @@ unconditional dependency and `fips` is a one-way switch.
 from *its* features rather than the process default; a `compile_error!` in
 `openshell-server` enforces it.
 
-FIPS mode is compile-time only, because which module gets linked is a build-time
-decision: `aws-lc-rs/fips` links `aws-lc-fips-sys`, its absence links
-`aws-lc-sys`, and those are different C libraries. A runtime switch would need
-both linked and reachable, which is the posture this crate exists to avoid.
+FIPS mode is selected at build time. Offering both a FIPS and a `ring`-backed mode
+from one artifact would require linking both AWS-LC variants — `aws-lc-fips-sys`
+and `aws-lc-sys` are different C libraries — and keeping both reachable, which is
+the posture this crate exists to avoid.
 
 On rustls 0.23 `require_ems` is additionally derived from the `fips` feature, but
 that mechanism is going away in 0.24 — see the migration note in
@@ -93,8 +93,13 @@ Four things this crate does not cover, each documented at its definition:
 - **Content and revision hashing.** Policy revisions, profile catalogs, and
   image digests still use RustCrypto `sha2`. Those are content-addressing rather
   than security functions; key and credential-identifier hashing is routed here.
-- **`aws-smithy-http-client`.** Constructs its own provider, so AWS SDK calls use
-  `ring` regardless of this crate.
+- **`aws-smithy-http-client`.** Constructs its own provider, so
+  `openshell-server` selects the AWS SDK's TLS backend explicitly
+  (`provider_refresh::aws_crypto_mode`) rather than inheriting the process
+  default.
+- **`aws-sigv4`.** Depends on RustCrypto `hmac` and `sha2` unconditionally with
+  no backend feature, so SigV4 request signing runs outside the validated module
+  in every build mode — this one is not fixable by configuration at any layer.
 
 `mise run fips:audit` reports the residual `ring` surface in a FIPS build.
 See `docs/security/fips.mdx` for the operator-facing view and

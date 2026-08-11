@@ -73,7 +73,8 @@ mise run fips:audit
 | X.509 key generation | ECDSA P-256 via `ring` | ECDSA P-256 via AWS-LC |
 | Gateway JWT signing | Ed25519 (`EdDSA`) | ECDSA P-256 (`ES256`) |
 | Credential encryption at rest | AES-256-GCM via `ring` | AES-256-GCM via AWS-LC |
-| AWS STS client TLS | `ring` (legacy rustls 0.21 stack) | AWS-LC (FIPS mode) |
+| AWS STS client TLS (transport only) | `ring` (legacy rustls 0.21 stack) | AWS-LC (FIPS mode) |
+| AWS SigV4 request signing | RustCrypto HMAC-SHA256 | RustCrypto HMAC-SHA256 (unchanged — see below) |
 | Randomness (keys, nonces) | `ring` | AWS-LC |
 | Key and credential-identifier hashing | `ring` / RustCrypto | AWS-LC |
 | Content and revision hashing | RustCrypto | RustCrypto (unchanged — see below) |
@@ -131,11 +132,18 @@ The build now contains a single rustls major (0.23). The AWS SDK's legacy `rustl
 
 **Content and revision hashing still uses RustCrypto.** Policy revisions, provider-profile catalog hashes, gateway-interceptor profile digests, and VM image digests compute SHA-256 with the RustCrypto `sha2` crate. These are content-addressing and change-detection, not security functions: they protect nothing and gate no decision. Cryptographic uses of SHA-256 — JWT key identifiers, credential-storage key identifiers, and Kubernetes Secret and Vault credential path derivation — are routed through the validated module. If an auditor requires every SHA-256 invocation to come from the validated module regardless of purpose, the remaining call sites are a mechanical change.
 
-**AWS SigV4 request signing uses an unvalidated module.** The supervisor's proxy-side AWS credential signing computes HMAC-SHA256 over the request, keyed with the AWS secret access key, through `aws-sigv4`. That crate depends on RustCrypto `hmac` and `sha2` unconditionally and exposes no backend feature, so this cannot be changed by configuration — unlike every other gap here, there is no flag that fixes it.
+**AWS SigV4 request signing uses an unvalidated module.** SigV4 computes HMAC-SHA256 over the request, keyed with the AWS secret access key, through `aws-sigv4`. That crate depends on RustCrypto `hmac` and `sha2` unconditionally and exposes no backend feature, so this cannot be changed by configuration — unlike every other gap here, there is no flag that fixes it.
+
+This affects **two** paths, not one:
+
+- **Supervisor proxy-side signing.** Sandboxes whose policy enables proxy-side AWS credential signing.
+- **Gateway STS credential refresh.** `aws-sdk-sts` signs every `AssumeRole` request through `aws-runtime` → `aws-sigv4`, so any provider using the `aws_sts_assume_role` refresh strategy handles its source secret access key through the unvalidated module too.
+
+The second path is easy to miss because the STS *transport* was moved to the validated module — see the table above. Transport and signing are separate concerns, and only the first is fixed.
 
 This is the most significant remaining gap, because it is HMAC directly over credential material rather than a transport concern. Closing it requires either implementing SigV4 signing against `openshell-crypto` (well-specified, but a wrong implementation breaks all AWS provider access, so it needs the published AWS test vectors) or upstreaming a backend feature to `aws-sigv4`.
 
-Affects only sandboxes whose policy enables proxy-side AWS SigV4 signing. Deployments that do not use that feature are unaffected.
+Deployments that use neither proxy-side signing nor the AWS STS refresh strategy are unaffected.
 
 **Container images are not FIPS-capable.** The published gateway image is distroless Debian and the supervisor is statically linked musl/Alpine. Neither provides a FIPS-mode system OpenSSL, and the static musl build cannot link one. A FIPS deployment on OpenShift needs a UBI-based image variant and a glibc supervisor build.
 

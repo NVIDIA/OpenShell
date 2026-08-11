@@ -845,14 +845,30 @@ async fn mint_google_service_account_jwt(
 fn aws_http_client() -> aws_sdk_sts::config::SharedHttpClient {
     use aws_smithy_http_client::{Builder, tls};
 
-    #[cfg(feature = "fips")]
-    let mode = tls::rustls_provider::CryptoMode::AwsLcFips;
-    #[cfg(not(feature = "fips"))]
-    let mode = tls::rustls_provider::CryptoMode::Ring;
-
     Builder::new()
-        .tls_provider(tls::Provider::Rustls(mode))
+        .tls_provider(tls::Provider::Rustls(aws_crypto_mode()))
         .build_https()
+}
+
+/// TLS backend for the AWS SDK's HTTPS client in this build mode.
+///
+/// Split out from [`aws_http_client`] so a test can assert on the choice itself.
+/// Both `rustls-ring` and `rustls-aws-lc-fips` are compiled in a FIPS build —
+/// `rustls-ring` is needed for the default build and Cargo features are additive
+/// — so `CryptoMode::Ring` constructs successfully even under `fips`. Asserting
+/// only that a client builds therefore proves nothing about which backend was
+/// selected.
+fn aws_crypto_mode() -> aws_smithy_http_client::tls::rustls_provider::CryptoMode {
+    use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
+
+    #[cfg(feature = "fips")]
+    {
+        CryptoMode::AwsLcFips
+    }
+    #[cfg(not(feature = "fips"))]
+    {
+        CryptoMode::Ring
+    }
 }
 
 async fn mint_aws_sts_assume_role(
@@ -1814,12 +1830,34 @@ mod tests {
         test_exporter::assert_has_parent(store_span);
     }
 
-    /// The AWS SDK is the one dependency that picks its own TLS provider, so a
-    /// FIPS build depends on `aws_http_client` selecting `CryptoMode::AwsLcFips`.
-    /// `CryptoMode::AwsLcFips` asserts internally that the provider reports FIPS,
-    /// so construction panicking is the failure mode this guards against — a
-    /// `fips` build whose `aws-smithy-http-client` feature was not plumbed
-    /// through would fail here rather than silently signing over ring-backed TLS.
+    /// The AWS SDK picks its own TLS provider, so a FIPS build depends on this
+    /// crate selecting `CryptoMode::AwsLcFips`.
+    ///
+    /// Asserts on the selected mode rather than on a client being constructible.
+    /// Both smithy TLS features are compiled in a FIPS build, so
+    /// `CryptoMode::Ring` also builds a working client — a construction-only test
+    /// would pass even if the FIPS build were wired to ring.
+    #[test]
+    fn aws_crypto_mode_matches_build_mode() {
+        use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
+
+        let mode = super::aws_crypto_mode();
+
+        // The variants are feature-gated, so each can only be named in the build
+        // where it exists.
+        #[cfg(feature = "fips")]
+        assert_eq!(
+            mode,
+            CryptoMode::AwsLcFips,
+            "a FIPS build must reach AWS over FIPS-validated TLS"
+        );
+        #[cfg(not(feature = "fips"))]
+        assert_eq!(mode, CryptoMode::Ring, "default build must keep ring");
+    }
+
+    /// `CryptoMode::AwsLcFips` asserts internally that its provider reports FIPS,
+    /// so this catches a `fips` build whose `aws-smithy-http-client` feature did
+    /// not propagate: it panics at construction rather than downgrading.
     #[test]
     fn aws_http_client_builds_for_this_build_mode() {
         let _client = super::aws_http_client();

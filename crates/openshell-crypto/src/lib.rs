@@ -21,11 +21,10 @@
 //! one. `ring` is an unconditional dependency and `fips` is a one-way switch,
 //! so there is no ambiguous state to resolve.
 //!
-//! FIPS mode is a compile-time property, not a runtime toggle. Which module gets
-//! linked is decided at build time and cannot be otherwise: `aws-lc-rs/fips`
-//! links `aws-lc-fips-sys` while its absence links `aws-lc-sys`, and those are
-//! different C libraries. A runtime switch would also require both to be linked
-//! and reachable, which is the posture this crate exists to avoid.
+//! FIPS mode is selected at build time, not at runtime. Offering both a FIPS and a
+//! `ring`-backed mode from one artifact would require linking both AWS-LC
+//! variants — `aws-lc-fips-sys` and `aws-lc-sys` are different C libraries — and
+//! keeping both reachable, which is the posture this crate exists to avoid.
 //!
 //! Note the mechanism, not the conclusion, is version-specific. On rustls 0.23
 //! `require_ems` (the TLS 1.2 extended-master-secret requirement) is derived
@@ -50,9 +49,14 @@
 //!
 //! - **Anything that does not route through this crate.** Notably `sqlx`, which
 //!   selects a provider from its own Cargo features, and
-//!   `aws-smithy-http-client`, which constructs its own — so AWS SDK calls use
-//!   `ring`. Content and revision hashing also still uses `RustCrypto` `sha2`;
-//!   those are content-addressing rather than security functions.
+//!   `aws-smithy-http-client`, which constructs its own; both have their backend
+//!   chosen explicitly by `openshell-server` instead. Content and revision
+//!   hashing also still uses `RustCrypto` `sha2`; those are content-addressing
+//!   rather than security functions.
+//! - **AWS `SigV4` request signing.** `aws-sigv4` depends on `RustCrypto` `hmac`
+//!   and `sha2` unconditionally with no backend feature, so request signing —
+//!   for both supervisor proxy-side signing and gateway STS `AssumeRole` — runs
+//!   outside the validated module in every build mode. Not fixable from here.
 //! - **The SSH transport's implementations.** [`ssh`] restricts negotiation, but
 //!   russh's primitives are unvalidated.
 //!

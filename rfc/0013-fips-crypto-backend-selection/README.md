@@ -126,12 +126,11 @@ a runtime self-check can prove the whole process is in the intended mode.
 
 ### FIPS mode is compile-time only
 
-The validated module is chosen at link time and cannot be otherwise:
-`aws-lc-rs/fips` links `aws-lc-fips-sys` while its absence links `aws-lc-sys`, and
-those are different C libraries. A single artifact therefore cannot be validated
-on demand. This is a constraint rather than a preference, and it matches the
-desired security property: a runtime switch would require both modules linked and
-reachable, which is the posture the design exists to avoid.
+Offering both a FIPS and a `ring`-backed mode from one artifact would require
+linking both AWS-LC variants — `aws-lc-fips-sys` and `aws-lc-sys` are different C
+libraries — and keeping both reachable. That is the posture the design exists to
+avoid, so build-time selection is the right shape regardless of what rustls
+allows.
 
 On rustls 0.23 a second mechanism points the same way — `require_ems`, the TLS 1.2
 extended-master-secret requirement, is derived from `cfg!(feature = "fips")`. That
@@ -140,14 +139,17 @@ feature on `main` (targeting 0.24) and keying those behaviors off the provider's
 declared FIPS status at runtime instead
 ([rustls/rustls#3054](https://github.com/rustls/rustls/issues/3054)).
 
-That change does not reopen the question. rustls is retaining the `fips` feature
-on a separate provider crate precisely so it can statically determine the
-provider's make-up, and rustls maintainers note that running a FIPS provider in
-non-FIPS mode is undesirable anyway — FIPS code updates slowly and carries
-countermeasures that cost performance without improving security. What 0.24
-enables is runtime selection of *algorithm policy* within a binary already built
-against the validated module, not runtime selection of the module. The migration
-requirements are recorded in `architecture/build.md`.
+That change narrows the question without reopening it. Under 0.24 a single
+artifact linked only against the FIPS module *can* select rustls policy at
+runtime — so "runtime FIPS" is achievable in that specific sense. What it cannot
+do is also offer a `ring`-backed mode, because that is a different linked library.
+Since OpenShell keeps a `ring`-backed default build, separate artifacts remain
+necessary; the constraint is our product shape rather than a rustls limitation.
+
+rustls maintainers also advise against running a FIPS provider in non-FIPS mode —
+FIPS code updates slowly and carries countermeasures that cost performance without
+improving security — which argues against wanting the single-artifact form anyway.
+Migration requirements are recorded in `architecture/build.md`.
 
 ### Algorithm restriction defers to rustls, with one narrowing
 
@@ -245,8 +247,12 @@ Two dependencies select a provider themselves and need separate handling:
 - **sqlx** calls `builder_with_provider` with a provider chosen by its own Cargo
   features, so `openshell-server` forwards the backend choice to it. This is the
   source of the trust-store limitation above.
-- **aws-smithy-http-client** constructs its own provider, so AWS SDK calls use
-  `ring` regardless of this design.
+- **aws-smithy-http-client** constructs its own provider, so `openshell-server`
+  selects the AWS SDK's TLS backend explicitly in code (Phase 2) rather than
+  leaving it to feature resolution.
+- **aws-sigv4** depends on RustCrypto `hmac` and `sha2` unconditionally with no
+  backend feature, so SigV4 request signing — supervisor proxy-side *and* gateway
+  STS `AssumeRole` — stays outside the validated module in every build mode.
 
 `mise run fips:audit` reports the residual `ring` surface and the number of
 distinct rustls versions in a FIPS build, so the gap is a measured number in CI
@@ -317,7 +323,11 @@ concern from Phase 1.
 What Phase 2 does **not** close is SigV4 request signing. `aws-sigv4` depends on
 RustCrypto `hmac` and `sha2` unconditionally and exposes no backend feature, so
 the HMAC-SHA256 chain keyed with the AWS secret access key runs outside the
-validated module in every build mode. This was not visible from the original
+validated module in every build mode. This applies to the gateway's own STS
+`AssumeRole` requests as well as to supervisor proxy-side signing: `aws-sdk-sts`
+signs through `aws-runtime` -> `aws-sigv4`. Phase 2 moved STS *transport* into the
+validated module and left STS *signing* outside it — a distinction worth stating
+plainly, because "STS now uses the validated module" would be a misreading. This was not visible from the original
 investigation, which treated "the AWS SDK" as one item. It is arguably the more
 important half: it is HMAC directly over credential material rather than a
 transport concern. Closing it needs either a SigV4 implementation against
@@ -409,17 +419,15 @@ at all.
 ### Runtime FIPS toggle
 
 A configuration switch selecting the backend at startup, so one binary serves
-both modes. Rejected because the validated module is a distinct linked library
-(`aws-lc-fips-sys` versus `aws-lc-sys`), so the choice cannot be deferred to
-runtime, and because having both linked and reachable would undermine the property
-that a validated module is the only code touching key material.
+both modes. Rejected because serving both would mean linking both AWS-LC variants
+(`aws-lc-fips-sys` and `aws-lc-sys`) and keeping both reachable, undermining the
+property that a validated module is the only code touching key material.
 
 rustls 0.24 will make rustls's own behavioral adaptations runtime-selectable
-(rustls/rustls#3054), which removes one of the mechanical obstacles but not the
-linking one. It would allow a binary built against the validated module to relax
-its algorithm policy at runtime — which is not what a FIPS deployment wants, and
-which rustls maintainers advise against on performance and update-cadence
-grounds.
+(rustls/rustls#3054), so a binary linked only against the FIPS module could relax
+its policy at runtime. That is a narrower capability than "runtime FIPS" suggests,
+it is not what a FIPS deployment wants, and rustls maintainers advise against it
+on performance and update-cadence grounds.
 
 ### Per-crate feature flipping without a facade crate
 

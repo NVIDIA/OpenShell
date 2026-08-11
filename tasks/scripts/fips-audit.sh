@@ -27,8 +27,10 @@ echo
 
 echo "Residual 'ring' consumers in the FIPS build:"
 echo "  (expected: openshell-crypto links ring unconditionally so the backend"
-echo "   choice cannot become ambiguous, plus the AWS SDK's rustls 0.21 leg."
-echo "   Neither is invoked for OpenShell crypto — see docs/security/fips.mdx)"
+echo "   choice cannot become ambiguous, and several dependencies enable"
+echo "   rustls/ring transitively. None is invoked for OpenShell crypto in a"
+echo "   FIPS build -- see docs/security/fips.mdx. The AWS SDK's rustls 0.21"
+echo "   leg was removed in FIPS Phase 2.)"
 echo
 if cargo tree -p "${PACKAGE}" --no-default-features --features fips,telemetry -e normal -i ring 2>/dev/null | sed 's/^/  /'; then
   :
