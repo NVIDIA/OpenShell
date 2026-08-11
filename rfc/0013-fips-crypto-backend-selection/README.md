@@ -31,6 +31,12 @@ The proposal also records where the design diverged from the plan accepted in
 codebase. Several of those divergences change what a FIPS build actually
 guarantees, so they need review rather than a changelog entry.
 
+[Amendment 1](#amendment-1--openssl-transport-for-rhel-and-openshift) adds a
+second FIPS build mode for RHEL and OpenShift that replaces the TLS transport
+with the platform's OpenSSL instead of driving rustls from a validated provider.
+It is additive — the AWS-LC mode described below is unchanged — and it reverses
+one of the Alternatives below on corrected evidence.
+
 ## Motivation
 
 FIPS-enabled RHEL 9 and OpenShift clusters are common in government, defense, and
@@ -73,12 +79,18 @@ secrets at rest without anyone noticing it was a compliance-relevant surface.
   Tracked as Phase 2b. (STS transport is covered as of Phase 2.)
 - **FIPS-capable container images.** The published gateway image is distroless
   Debian and the supervisor is static musl. A UBI-based variant and a glibc
-  supervisor build are separate work.
+  supervisor build are separate work — but they become a hard prerequisite for the
+  supervisor under [Amendment 1](#amendment-1--openssl-transport-for-rhel-and-openshift),
+  since a static musl binary cannot link the platform's libcrypto.
 - **SDK coverage.** The Go SDK does not set `GOFIPS140`; the Python SDK uses
   grpcio's bundled BoringSSL. Neither is addressed.
 - **Runtime FIPS toggling.** Explicitly rejected — see Alternatives.
 - **Host-level FIPS mode.** Building against a validated module does not put the
-  kernel or platform in FIPS mode. That remains an operator responsibility.
+  kernel or platform in FIPS mode. That remains an operator responsibility. Note
+  this inverts under [Amendment 1](#amendment-1--openssl-transport-for-rhel-and-openshift):
+  in the OpenSSL mode the host's FIPS state is load-bearing rather than
+  incidental, because the validated module and the algorithm policy both come
+  from the platform.
 
 ## Proposal
 
@@ -391,6 +403,10 @@ rather than a compile-time flag. Requirements are recorded in
 upstream in russh or replacing the embedded server with OpenSSH. Deferred until
 an audit actually requires it, since the transport is defense-in-depth.
 
+Phases 6 through 8 are defined in
+[Amendment 1](#amendment-1--openssl-transport-for-rhel-and-openshift), which adds
+the OpenSSL transport mode for RHEL and OpenShift.
+
 Every phase is independently shippable, and Phase 1 is off by default so none of
 this affects existing users until they opt in.
 
@@ -442,13 +458,22 @@ version corresponds to.
 
 ### System OpenSSL for everything
 
-Replace rustls with the `openssl` crate and russh with libssh2 or an OpenSSH
-subprocess, getting validation for every operation from RHEL 9's OpenSSL 3.x.
-This is the only approach that also closes the SSH gap. Rejected because it is a
-large rewrite, gives up rustls's memory-safety properties, adds a system library
-dependency, and complicates cross-platform builds. It is now further out of reach
-because the supervisor is a static musl binary that cannot link a system OpenSSL
-at all.
+**No longer rejected — adopted for the RHEL/OpenShift target. See
+[Amendment 1](#amendment-1--openssl-transport-for-rhel-and-openshift).**
+
+This entry originally read: *"Rejected because it is a large rewrite, gives up
+rustls's memory-safety properties, adds a system library dependency, and
+complicates cross-platform builds."* Most of that was wrong or overstated. The
+correction is recorded in the amendment rather than quietly edited away, because
+the original reasoning is why the AWS-LC path was built first.
+
+What held up: it does add a system library dependency, and it does give up
+rustls's memory safety for the TLS stack.
+
+What did not: it is not a large rewrite, because our multiplex, routing, and
+upgrade logic is generic over the stream type and never names a TLS type. And
+cross-platform builds are unaffected — the FIPS build targets Linux only, so
+macOS and Windows keep the rustls path.
 
 ### Runtime FIPS toggle
 
@@ -478,6 +503,154 @@ Regulated deployments stay unavailable, and the retrofit cost grows as new crate
 add crypto paths. `openshell-driver-db-credstore` is the concrete evidence: it
 added an unvalidated secrets-at-rest path after the original investigation and
 would have been missed again.
+
+## Amendment 1 — OpenSSL transport for RHEL and OpenShift
+
+*Status: proposed. Supersedes the "System OpenSSL for everything" rejection in
+[Alternatives](#system-openssl-for-everything). Additive — the AWS-LC mode
+described above is unchanged and remains the default FIPS build for non-RHEL
+targets.*
+
+### Why the original rejection was wrong
+
+Red Hat's FIPS validation covers the platform's system OpenSSL. A vendored
+AWS-LC-FIPS that we compile ourselves is a validated *module* but not *the*
+validated module on RHEL, so it does not support a RHEL FIPS claim. That alone
+would justify revisiting the decision.
+
+Two further findings make the original rejection untenable rather than merely
+debatable:
+
+**`rustls-openssl` is not FIPS-correct.** The obvious cheap path — keep rustls,
+back it with system OpenSSL via the existing `rustls-openssl` provider — does not
+work. That crate obtains classical algorithms through legacy implicit-fetch APIs
+(`Md::sha256()` → `EVP_sha256()`, `Cipher::aes_256_gcm()` → `EVP_aes_256_gcm()`),
+which return static algorithm objects from the default provider rather than
+fetching from the FIPS provider with an explicit library context. Only its
+post-quantum path uses the modern interface
+(`EVP_PKEY_CTX_new_from_name(libctx, …)`). FIPS-correct OpenSSL 3 use requires
+explicit fetch against an `OSSL_LIB_CTX`, which is precisely what the
+[`ossl`](https://crates.io/crates/ossl) crate provides and what
+`rustls-openssl` does not do.
+
+**rustls cannot inherit the platform crypto policy.** Even with a correct
+provider, rustls selects protocol versions and cipher suites itself.
+`update-crypto-policies` and `/etc/crypto-policies` have no effect on it. RHEL and
+OpenShift operators expect the platform policy to govern TLS, and that
+expectation is the deciding factor for this target: it is not satisfiable by any
+rustls provider, only by using OpenSSL's own TLS stack.
+
+### What changes
+
+A second FIPS build mode in which the TLS *transport* is OpenSSL rather than
+rustls. Primitives that OpenShell performs itself continue to route through
+`openshell-crypto`, backed by `ossl`.
+
+| Surface | AWS-LC mode | OpenSSL mode |
+|---|---|---|
+| TLS transport | rustls + `default_fips_provider()` | OpenSSL `libssl` via `tokio-openssl` |
+| gRPC (tonic) | `tonic` rustls features | [`tonic-tls`](https://crates.io/crates/tonic-tls) `openssl` feature |
+| HTTP (axum/hyper) | unchanged — no TLS coupling | unchanged — no TLS coupling |
+| Multiplex, routing, upgrades | unchanged | unchanged |
+| AEAD, digest, RNG, keygen | `aws-lc-rs` | `ossl` |
+| Database TLS | `sqlx/tls-rustls-aws-lc-rs` | `sqlx/tls-native-tls` |
+| Cipher suite / version policy | ours, hard-coded | inherited from `/etc/crypto-policies` |
+
+### Why the transport change is small
+
+The coupling is narrower than the count of rustls references suggests, because
+our own abstractions are already generic:
+
+- `MultiplexedService::serve<S>` and its siblings are generic over the stream
+  type. The complex part — gRPC/HTTP content-type routing, HTTP/2 keepalive
+  tuning, upgrade handling, listener scoping — never names a TLS type and does not
+  change.
+- axum has no TLS coupling at all; it is a `tower::Service`. Our serve loop
+  already follows the canonical low-level pattern (accept TCP → acceptor →
+  `TokioIo::new` → `hyper_util::server::conn::auto::Builder`), which is
+  acceptor-agnostic.
+- `tonic-tls` supplies both a server `TlsIncoming` and a client `TlsConnector`
+  over `tokio-openssl`, and takes a caller-constructed `SslAcceptor`/`SslConnector`
+  — so full verification control is retained.
+
+The actual edits are the acceptor, the client connectors, the peer-certificate
+extraction, and peripheral crate features:
+
+| Site | Change |
+|---|---|
+| `openshell-server/src/tls.rs` | Acceptor on `SslAcceptor` + `tokio-openssl`, preserving hot reload |
+| `openshell-server/src/lib.rs` (accept loop) | Acceptor type at the call site |
+| `openshell-server/src/multiplex.rs` | `peer_certificates()` → `ssl().peer_cert_chain()` |
+| `openshell-sdk/src/transport.rs`, `openshell-cli/src/tls.rs` | `tonic-tls::openssl::TlsConnector` |
+| `openshell-supervisor-network/src/l7/tls.rs` | Per-SNI leaf generation → `set_servername_callback` |
+| `reqwest`, `tokio-tungstenite`, `kube`, `sqlx` | their `native-tls`/OpenSSL features |
+
+`openssl` 0.10 exposes everything the architecture needs: `set_alpn_protos` and
+`set_alpn_select_callback` for HTTP/2 negotiation, `set_servername_callback` for
+the supervisor's per-host leaf certificates, and `set_verify` + `set_ca_file` +
+`set_client_ca_list` for gateway mTLS with client-certificate verification.
+
+`native-tls` was evaluated and rejected for the gateway: its `TlsAcceptorBuilder`
+exposes only protocol versions and ALPN, and its OpenSSL backend hardcodes
+`set_verify(SslVerifyMode::NONE)`, so mTLS client-certificate verification is not
+expressible. It remains the right choice for `sqlx`, which is client-only.
+
+### Sequencing is constrained by packaging
+
+The gateway is glibc-linked and can adopt this independently. **The supervisor is
+a statically linked musl binary and cannot link the platform's validated
+libcrypto at all**, so its OpenSSL path is blocked behind the glibc/UBI packaging
+work in Phase 3. Gateway first; supervisor after packaging.
+
+### What we give up
+
+Policy inheritance is the point of this change and also its main cost. Once
+`/etc/crypto-policies` governs TLS, an operator running
+`update-crypto-policies --set LEGACY`, or a policy that drops TLS 1.2, silently
+changes what OpenShell negotiates. This is the deliberate inverse of the
+NIST-only key-exchange narrowing that the AWS-LC mode applies: there we chose
+determinism over platform integration, here we choose the opposite. Both are
+defensible for their target; what is not defensible is claiming both properties
+at once.
+
+We also give up rustls's memory safety for the TLS stack, and take on a system
+library dependency with a version floor.
+
+### New phases
+
+**Phase 6 — OpenSSL transport for the gateway.** `ossl`-backed primitives in
+`openshell-crypto`; `tls.rs` acceptor on `tokio-openssl`; `tonic-tls` client
+connectors; peer-certificate extraction; `sqlx` on `tls-native-tls`. Gateway and
+CLI only.
+
+**Phase 7 — Certificate and JWT generation on `ossl`.** `rcgen` exposes a
+`RemoteKeyPair` trait that is *not* gated on its `crypto` feature, so it can be
+driven by an `ossl`-backed signer with rcgen reduced to ASN.1 encoding and neither
+`ring` nor `aws-lc-rs` linked through it. Note `serialize_der`/`serialize_pem`
+panic on remote key pairs, so the five production sites that persist private keys
+must obtain them from `ossl` instead. `jsonwebtoken` has no equivalent hook and
+needs either a small JOSE implementation over `ossl::signature` or replacement.
+
+**Phase 8 — OpenSSL transport for the supervisor.** Requires the Phase 3
+glibc/UBI packaging change first.
+
+### Open questions for this amendment
+
+- **Is `openssl` 0.10 acceptable for `SSL_CTX`/`SSL` construction?** Our reading
+  is yes: the objection to `rustls-openssl` was that it performs crypto itself
+  through legacy interfaces, whereas here `libssl` performs the crypto and fetches
+  from the configured provider, so correctness comes from OpenSSL rather than the
+  binding. If `ossl` is required even for TLS object construction, it has **no TLS
+  bindings at all** — no `SSL_CTX`, no `TLS_method` — and they would have to be
+  added upstream first. This question gates the start of Phase 6.
+- Does the AWS-LC mode remain supported, or become deprecated once the OpenSSL
+  mode ships? Keeping both means a three-way test matrix; dropping it abandons
+  non-RHEL FIPS targets.
+- What is the OpenSSL version floor, and does it hold for the target RHEL and
+  OpenShift releases? `ossl` gates features on `ossl320` (3.2+) and `ossl350`
+  (3.5+).
+- Does SigV4 signing (Phase 2b) get an `ossl` implementation, given `aws-sigv4`
+  offers no backend choice either way?
 
 ## Prior art
 
