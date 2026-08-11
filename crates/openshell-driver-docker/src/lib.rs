@@ -2195,7 +2195,6 @@ fn build_environment_for_oci_user(
             user_env.extend(template.environment.clone());
         }
         user_env.extend(spec.environment.clone());
-        user_env.remove(openshell_core::sandbox_env::OCI_WORKSPACE_IDENTITY);
         environment.extend(user_env.clone());
         if !user_env.is_empty()
             && let Ok(json) = serde_json::to_string(&user_env)

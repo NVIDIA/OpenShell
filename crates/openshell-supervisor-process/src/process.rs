@@ -1409,12 +1409,7 @@ pub fn validate_oci_workspace_as_process_identity(
     supplementary_gids.dedup();
 
     if nix::unistd::geteuid().is_root() {
-        #[cfg(not(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "haiku",
-            target_os = "redox"
-        )))]
+        #[cfg(target_os = "linux")]
         nix::unistd::setgroups(&supplementary_gids).into_diagnostic()?;
         nix::unistd::setgid(gid).into_diagnostic()?;
         nix::unistd::setuid(uid).into_diagnostic()?;

@@ -522,7 +522,6 @@ fn build_env(
             user_env.insert(k.clone(), v.clone());
         }
     }
-    user_env.remove(openshell_core::sandbox_env::OCI_WORKSPACE_IDENTITY);
     env.extend(user_env.clone());
     if !user_env.is_empty()
         && let Ok(json) = serde_json::to_string(&user_env)
