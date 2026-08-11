@@ -564,6 +564,26 @@ where
                 .await?;
             return Ok(());
         };
+        // The request was canonicalized before the matching config was known,
+        // so `allow_encoded_slash` was taken permissively across every config
+        // on this host:port. Re-check it against the config that actually
+        // matched: the opt-in is per-endpoint, and one endpoint enabling it
+        // must not loosen parsing for the others.
+        if !config.allow_encoded_slash
+            && crate::l7::path::canonical_path_has_encoded_slash(&route_target)
+        {
+            crate::l7::rest::RestProvider::default()
+                .deny_with_redacted_target(
+                    &req,
+                    &ctx.policy_name,
+                    "request-target contains an encoded '/' (%2F) which is not allowed on this endpoint",
+                    client,
+                    None,
+                    Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
+                )
+                .await?;
+            return Ok(());
+        }
         if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
             return Ok(());
         }
@@ -6084,6 +6104,186 @@ network_policies:
             .expect("relay should finish")
             .unwrap()
             .unwrap();
+    }
+
+    /// Policy allowing GET on both `/repos/**` and `/admin/**` for the same
+    /// host:port, so an encoded-slash denial can only come from the
+    /// per-endpoint `allow_encoded_slash` scoping.
+    const ENCODED_SLASH_SCOPING_POLICY: &str = r#"
+network_policies:
+  route_api:
+    name: route_api
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        path: /repos/**
+        protocol: rest
+        enforcement: enforce
+        allow_encoded_slash: true
+        rules:
+          - allow:
+              method: GET
+              path: "/repos/**"
+      - host: gateway.example.test
+        port: 443
+        path: /admin/**
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/admin/**"
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+
+    fn encoded_slash_scoping_configs() -> Vec<L7EndpointConfig> {
+        let rest = |path: &str, allow_encoded_slash: bool| L7EndpointConfig {
+            protocol: L7Protocol::Rest,
+            path: path.into(),
+            tls: crate::l7::TlsMode::Auto,
+            enforcement: EnforcementMode::Enforce,
+            graphql_max_body_bytes: 0,
+            json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
+            mcp_strict_tool_names: true,
+            allow_encoded_slash,
+            websocket_credential_rewrite: false,
+            request_body_credential_rewrite: false,
+            websocket_graphql_policy: false,
+            credential_signing: crate::l7::CredentialSigning::None,
+            signing_service: String::new(),
+            signing_region: String::new(),
+        };
+        // One endpoint opts in, the other does not.
+        vec![rest("/repos/**", true), rest("/admin/**", false)]
+    }
+
+    fn encoded_slash_scoping_ctx() -> L7EvalContext {
+        L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            request_default_port: Some(443),
+            policy_name: "route_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            ..Default::default()
+        }
+    }
+
+    /// Canonicalization runs before the matching config is known, so
+    /// `allow_encoded_slash` is taken permissively across the whole
+    /// host:port. The endpoint that did *not* opt in must still reject a
+    /// `%2F`, otherwise one endpoint's opt-in silently loosens every other
+    /// endpoint sharing that host:port.
+    #[tokio::test]
+    async fn route_selected_encoded_slash_optin_does_not_leak_to_other_endpoints() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, ENCODED_SLASH_SCOPING_POLICY).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let configs = encoded_slash_scoping_configs();
+        let ctx = encoded_slash_scoping_ctx();
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /admin/x%2Fy HTTP/1.1\r\nHost: gateway.example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut response = [0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("denial should reach client")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            response.contains("not allowed on this endpoint"),
+            "denial must name the encoded-slash reason: {response}"
+        );
+
+        let mut upstream_bytes = [0u8; 16];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            upstream.read(&mut upstream_bytes),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Ok(0))),
+            "request must not reach upstream"
+        );
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// The converse: tightening the scope must not break the endpoint that
+    /// legitimately opted in. A GitLab-style encoded slug still reaches the
+    /// upstream verbatim.
+    #[tokio::test]
+    async fn route_selected_encoded_slash_still_allowed_on_opted_in_endpoint() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, ENCODED_SLASH_SCOPING_POLICY).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let configs = encoded_slash_scoping_configs();
+        let ctx = encoded_slash_scoping_ctx();
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /repos/group%2Fproject HTTP/1.1\r\nHost: gateway.example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut upstream_bytes = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_bytes),
+        )
+        .await
+        .expect("opted-in request should reach upstream")
+        .unwrap();
+        let forwarded = String::from_utf8_lossy(&upstream_bytes[..n]);
+        assert!(
+            forwarded.contains("GET /repos/group%2Fproject "),
+            "encoded slug must be forwarded verbatim: {forwarded}"
+        );
+
+        drop(app);
+        drop(upstream);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), relay).await;
     }
 
     #[tokio::test]

@@ -218,6 +218,20 @@ pub fn canonicalize_request_target(
     ))
 }
 
+/// Report whether a canonical path carries a `%2F` that survived
+/// canonicalization.
+///
+/// Callers that canonicalize before they know which endpoint config applies
+/// use this to re-check the result against the config that actually matched.
+///
+/// The test is exact: [`build_canonical_path`] emits the literal `%2F` only
+/// for the encoded-slash sentinel, and percent-encodes any other `%` byte as
+/// `%25`, so no `%2F` substring can reach the output by another route.
+#[must_use]
+pub fn canonical_path_has_encoded_slash(canonical_path: &str) -> bool {
+    canonical_path.contains("%2F")
+}
+
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
@@ -682,6 +696,35 @@ mod tests {
             canon_with("/repos/group%2fproject/issues", opts).unwrap(),
             "/repos/group%2Fproject/issues"
         );
+    }
+
+    #[test]
+    fn encoded_slash_detection_on_canonical_paths_is_exact() {
+        let opts = CanonicalizeOptions {
+            allow_encoded_slash: true,
+            ..CanonicalizeOptions::default()
+        };
+
+        // A surviving sentinel is detected.
+        let slug = canon_with("/repos/group%2fproject/issues", opts).unwrap();
+        assert_eq!(slug, "/repos/group%2Fproject/issues");
+        assert!(canonical_path_has_encoded_slash(&slug));
+
+        // Ordinary paths are not.
+        assert!(!canonical_path_has_encoded_slash(
+            &canon("/public/secret").unwrap()
+        ));
+
+        // A literal `%` in the input is re-emitted as `%25`, so it cannot
+        // fabricate a `%2F` substring — including when the input spells out
+        // `%252F`, which decodes to the three characters `%`, `2`, `F`.
+        let escaped = canon("/a/%252F/b").unwrap();
+        assert_eq!(escaped, "/a/%252F/b");
+        assert!(!canonical_path_has_encoded_slash(&escaped));
+
+        let percent = canon("/a/100%25/b").unwrap();
+        assert_eq!(percent, "/a/100%25/b");
+        assert!(!canonical_path_has_encoded_slash(&percent));
     }
 
     #[test]

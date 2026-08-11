@@ -4448,6 +4448,39 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         };
+        // `canonicalize_options` was built before the matching config was
+        // known, so `allow_encoded_slash` was taken permissively across every
+        // config on this route. Re-check it against the config that actually
+        // matched: the opt-in is per-endpoint, and one endpoint enabling it
+        // must not loosen parsing for the others. Rejecting here yields the
+        // same response the parser would have produced had the option been
+        // scoped correctly from the start.
+        if !l7_config.config.allow_encoded_slash
+            && crate::l7::path::canonical_path_has_encoded_slash(&path)
+        {
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .message(
+                    "FORWARD rejecting non-canonical request-target: request-target contains an encoded '/' (%2F) which is not allowed on this endpoint".to_string(),
+                )
+                .build();
+            ocsf_emit!(event);
+            emit_activity_simple(activity_tx, true, "forward_parse_rejection");
+            respond(
+                client,
+                &build_json_error_response(
+                    400,
+                    "Bad Request",
+                    "invalid_request_target",
+                    "request-target must be canonical",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
         if crate::l7::rest::request_is_h2c_upgrade(&forward_request_bytes) {
             let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Other)
