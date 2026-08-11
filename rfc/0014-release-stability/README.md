@@ -17,6 +17,15 @@ It defines release qualification requirements, compatibility guidelines for
 stable and evolving APIs, per-commit development releases, nightly builds, and
 weekly stable releases.
 
+- Publish per-commit development releases, nightly candidates, and qualified
+  stable releases every Tuesday.
+- Establish stable and experimental API maturity, compatibility and versioning
+  rules, and maintenance for the latest and N-1 minor release lines.
+- Block stable publication on conformance, upgrade, breaking API change, and
+  security qualification across the supported release matrix.
+- Promote qualified binary payloads unchanged across standalone downloads,
+  packages, and container images, with recorded digests, SBOMs, and provenance.
+
 ## Motivation
 
 OpenShell's alpha process supports rapid iteration but does not define which
