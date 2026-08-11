@@ -1919,8 +1919,9 @@ type SupervisorMiddlewareService struct {
 	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// gRPC endpoint reachable from the sandbox supervisor.
 	GrpcEndpoint string `protobuf:"bytes,2,opt,name=grpc_endpoint,json=grpcEndpoint,proto3" json:"grpc_endpoint,omitempty"`
-	// Operator-owned body limit applied to every binding exposed by the service.
-	MaxBodyBytes uint64 `protobuf:"varint,3,opt,name=max_body_bytes,json=maxBodyBytes,proto3" json:"max_body_bytes,omitempty"`
+	// Operator-owned logical payload limit applied to every binding exposed by
+	// the service. This caps HTTP bodies and complete WebSocket messages.
+	MaxPayloadBytes uint64 `protobuf:"varint,3,opt,name=max_payload_bytes,json=maxPayloadBytes,proto3" json:"max_payload_bytes,omitempty"`
 	// Default RPC timeout for this service. Empty uses the platform default of
 	// 500ms. Values use an integer with an `ms` or `s` suffix and must be
 	// between 10ms and 30s.
@@ -1973,9 +1974,9 @@ func (x *SupervisorMiddlewareService) GetGrpcEndpoint() string {
 	return ""
 }
 
-func (x *SupervisorMiddlewareService) GetMaxBodyBytes() uint64 {
+func (x *SupervisorMiddlewareService) GetMaxPayloadBytes() uint64 {
 	if x != nil {
-		return x.MaxBodyBytes
+		return x.MaxPayloadBytes
 	}
 	return 0
 }
@@ -2155,11 +2156,11 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x1epolicy_validation_failure_mode\x18\v \x01(\tR\x1bpolicyValidationFailureMode\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
-	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\x96\x01\n" +
+	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\x9c\x01\n" +
 	"\x1bSupervisorMiddlewareService\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12#\n" +
-	"\rgrpc_endpoint\x18\x02 \x01(\tR\fgrpcEndpoint\x12$\n" +
-	"\x0emax_body_bytes\x18\x03 \x01(\x04R\fmaxBodyBytes\x12\x18\n" +
+	"\rgrpc_endpoint\x18\x02 \x01(\tR\fgrpcEndpoint\x12*\n" +
+	"\x11max_payload_bytes\x18\x03 \x01(\x04R\x0fmaxPayloadBytes\x12\x18\n" +
 	"\atimeout\x18\x04 \x01(\tR\atimeout*b\n" +
 	"\fSettingScope\x12\x1d\n" +
 	"\x19SETTING_SCOPE_UNSPECIFIED\x10\x00\x12\x19\n" +
