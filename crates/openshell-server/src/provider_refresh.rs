@@ -834,9 +834,11 @@ async fn mint_google_service_account_jwt(
 /// unvalidated module. Building the client here moves the choice into code, where
 /// it is explicit and testable, rather than leaving it to feature resolution.
 ///
-/// `CryptoMode::AwsLcFips` internally asserts that the provider reports FIPS, so
-/// a mis-plumbed feature panics at client construction rather than silently
-/// downgrading.
+/// `CryptoMode::AwsLcFips` internally asserts that its provider reports FIPS, but
+/// note that assertion does not fire here: `build_https` returns a lazy client and
+/// the provider is built when a connector is first requested. The build-mode
+/// guarantee therefore rests on [`aws_crypto_mode`] and its test, not on this
+/// function succeeding.
 ///
 /// Note this connection's key exchange groups are smithy's choice, not
 /// [`openshell_crypto::provider`]'s — smithy restricts cipher suites but not
@@ -1843,6 +1845,13 @@ mod tests {
 
         let mode = super::aws_crypto_mode();
 
+        // This is the whole of the build-mode guarantee for the AWS path. A test
+        // that merely built a client would not do: `build_https` is lazy, so the
+        // provider — and `CryptoMode::AwsLcFips`'s own FIPS assertion — is not
+        // constructed until a connector is requested. The mock-endpoint
+        // `AssumeRole` tests below exercise that end of it by issuing real
+        // requests through the client.
+        //
         // The variants are feature-gated, so each can only be named in the build
         // where it exists.
         #[cfg(feature = "fips")]
@@ -1853,14 +1862,6 @@ mod tests {
         );
         #[cfg(not(feature = "fips"))]
         assert_eq!(mode, CryptoMode::Ring, "default build must keep ring");
-    }
-
-    /// `CryptoMode::AwsLcFips` asserts internally that its provider reports FIPS,
-    /// so this catches a `fips` build whose `aws-smithy-http-client` feature did
-    /// not propagate: it panics at construction rather than downgrading.
-    #[test]
-    fn aws_http_client_builds_for_this_build_mode() {
-        let _client = super::aws_http_client();
     }
 
     #[test]

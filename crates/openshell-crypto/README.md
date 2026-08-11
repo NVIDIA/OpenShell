@@ -33,10 +33,11 @@ unconditional dependency and `fips` is a one-way switch.
 from *its* features rather than the process default; a `compile_error!` in
 `openshell-server` enforces it.
 
-FIPS mode is selected at build time. Offering both a FIPS and a `ring`-backed mode
-from one artifact would require linking both AWS-LC variants — `aws-lc-fips-sys`
-and `aws-lc-sys` are different C libraries — and keeping both reachable, which is
-the posture this crate exists to avoid.
+FIPS mode is selected at build time, not at runtime. That is a choice rather than
+a technical necessity — `ring` is already linked in a FIPS build, so one artifact
+could dispatch at runtime. Build-time selection keeps *which module is in use* a
+property of the artifact rather than of a code path, which is what lets
+`verify_fips_posture()` assert it once at startup.
 
 On rustls 0.23 `require_ems` is additionally derived from the `fips` feature, but
 that mechanism is going away in 0.24 — see the migration note in
@@ -80,7 +81,7 @@ Algorithm restriction comes from `rustls::crypto::default_fips_provider()`, not
 a hand-maintained suite list, so the approved set tracks rustls's view of the
 module's validated boundary.
 
-Four things this crate does not cover, each documented at its definition:
+Five things this crate does not cover, each documented at its definition:
 
 - **SSH implementations.** `ssh::preferred()` restricts negotiation, but russh
   implements those algorithms with `ed25519-dalek`, `p256`, and RustCrypto AES —

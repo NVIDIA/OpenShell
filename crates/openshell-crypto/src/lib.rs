@@ -21,10 +21,14 @@
 //! one. `ring` is an unconditional dependency and `fips` is a one-way switch,
 //! so there is no ambiguous state to resolve.
 //!
-//! FIPS mode is selected at build time, not at runtime. Offering both a FIPS and a
-//! `ring`-backed mode from one artifact would require linking both AWS-LC
-//! variants — `aws-lc-fips-sys` and `aws-lc-sys` are different C libraries — and
-//! keeping both reachable, which is the posture this crate exists to avoid.
+//! FIPS mode is selected at build time, not at runtime. That is a choice, not a
+//! technical necessity: `ring` is already linked in a FIPS build, so a single
+//! artifact could dispatch between backends at runtime. Build-time selection
+//! keeps *which module is in use* a property of the artifact rather than of a code
+//! path, which is what lets [`verify_fips_posture`] assert it once at startup. A
+//! runtime switch would make the guarantee depend on every dispatch site being
+//! correct, and would leave a non-validated path reachable in a FIPS
+//! deployment — the posture this crate exists to avoid.
 //!
 //! Note the mechanism, not the conclusion, is version-specific. On rustls 0.23
 //! `require_ems` (the TLS 1.2 extended-master-secret requirement) is derived
@@ -60,12 +64,11 @@
 //! - **The SSH transport's implementations.** [`ssh`] restricts negotiation, but
 //!   russh's primitives are unvalidated.
 //!
-//! It also does not mean `ring` is absent from the binary — it is an
-//! unconditional dependency here, and the AWS SDK links its own copy via
-//! `rustls 0.21`. Neither is *invoked* for this crate's operations in a FIPS
-//! build, but "linked but unreachable" is a weaker claim than "not present", so
-//! an auditor should be told which it is. `mise run fips:audit` prints the
-//! current answer.
+//! It also does not mean `ring` is absent from the binary: it is an unconditional
+//! dependency here, and several dependencies enable `rustls/ring` transitively.
+//! None of it is *invoked* for this crate's operations in a FIPS build, but
+//! "linked but unreachable" is a weaker claim than "not present", so an auditor
+//! should be told which it is. `mise run fips:audit` prints the current answer.
 
 pub mod aead;
 pub mod ssh;

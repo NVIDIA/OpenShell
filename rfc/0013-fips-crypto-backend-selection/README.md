@@ -126,11 +126,12 @@ a runtime self-check can prove the whole process is in the intended mode.
 
 ### FIPS mode is compile-time only
 
-Offering both a FIPS and a `ring`-backed mode from one artifact would require
-linking both AWS-LC variants — `aws-lc-fips-sys` and `aws-lc-sys` are different C
-libraries — and keeping both reachable. That is the posture the design exists to
-avoid, so build-time selection is the right shape regardless of what rustls
-allows.
+Build-time selection is a deliberate choice rather than a technical necessity.
+`ring` is already linked in a FIPS build, so one artifact could dispatch between
+backends at runtime. We decline because that would make *which module is in use* a
+property of a code path instead of the artifact, and the guarantee would then
+depend on every dispatch site being correct. Selecting at build time is what lets
+`verify_fips_posture()` assert the posture once, at startup.
 
 On rustls 0.23 a second mechanism points the same way — `require_ems`, the TLS 1.2
 extended-master-secret requirement, is derived from `cfg!(feature = "fips")`. That
@@ -139,12 +140,11 @@ feature on `main` (targeting 0.24) and keying those behaviors off the provider's
 declared FIPS status at runtime instead
 ([rustls/rustls#3054](https://github.com/rustls/rustls/issues/3054)).
 
-That change narrows the question without reopening it. Under 0.24 a single
-artifact linked only against the FIPS module *can* select rustls policy at
-runtime — so "runtime FIPS" is achievable in that specific sense. What it cannot
-do is also offer a `ring`-backed mode, because that is a different linked library.
-Since OpenShell keeps a `ring`-backed default build, separate artifacts remain
-necessary; the constraint is our product shape rather than a rustls limitation.
+That change narrows the question without reopening it. Under 0.24 "runtime FIPS"
+becomes achievable — a single artifact could select policy at runtime, and `ring`
+is already linked for a non-FIPS path. The reason we still would not is the one
+above: it moves the guarantee from the artifact to the dispatch sites. Nothing
+about it is a rustls limitation.
 
 rustls maintainers also advise against running a FIPS provider in non-FIPS mode —
 FIPS code updates slowly and carries countermeasures that cost performance without
@@ -268,7 +268,7 @@ actually promises and are the ones most in need of review.
 |---|---|---|
 | Hand-maintain FIPS cipher suite and kx lists | Suites come from rustls's `default_fips_provider()`; only kx is narrowed | rustls compiles ChaCha20 out under its own `fips` feature and tracks the validated boundary; a local list could only drift |
 | Excluding X25519 follows from FIPS | **guarantee** — X25519 removal is a deliberate policy choice stricter than rustls | rustls keeps X25519 and X25519+ML-KEM768 because AWS-LC's boundary covers them; removing them costs the PQ hybrid |
-| `--no-default-features --features fips` excludes `ring` | **guarantee** — `ring` stays linked; documented and measured instead | Cargo features are additive, and the AWS SDK pulls rustls 0.21 → `ring` regardless |
+| `--no-default-features --features fips` excludes `ring` | **guarantee** — `ring` stays linked; documented and measured instead | `openshell-crypto` depends on it unconditionally so the backend cannot become ambiguous, and several dependencies enable `rustls/ring` transitively |
 | Flip rustls features per crate at each of ~20 sites | One facade crate owns backend selection; workspace entries carry no backend feature | Feature unification gives a single point of control and makes a missed site impossible |
 | Paired `backend-ring` / `fips` features | **guarantee** — no opposing feature; `ring` unconditional, `fips` a one-way switch | Additive features make both simultaneously enableable, and sqlx resolves that toward `ring`, silently producing a non-FIPS build |
 | `--features fips` is the build command | **guarantee** — the gateway needs `--no-default-features --features fips,telemetry`, enforced by `compile_error!` | Same sqlx ambiguity; a build error is the only outcome that cannot be missed |
@@ -419,9 +419,10 @@ at all.
 ### Runtime FIPS toggle
 
 A configuration switch selecting the backend at startup, so one binary serves
-both modes. Rejected because serving both would mean linking both AWS-LC variants
-(`aws-lc-fips-sys` and `aws-lc-sys`) and keeping both reachable, undermining the
-property that a validated module is the only code touching key material.
+both modes. Technically possible — `ring` is already linked in a FIPS build —
+and rejected on design grounds: it would leave a non-validated path reachable in a
+FIPS deployment and make the guarantee contingent on every dispatch site, rather
+than a property of the artifact that can be asserted once at startup.
 
 rustls 0.24 will make rustls's own behavioral adaptations runtime-selectable
 (rustls/rustls#3054), so a binary linked only against the FIPS module could relax

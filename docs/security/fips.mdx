@@ -73,7 +73,7 @@ mise run fips:audit
 | X.509 key generation | ECDSA P-256 via `ring` | ECDSA P-256 via AWS-LC |
 | Gateway JWT signing | Ed25519 (`EdDSA`) | ECDSA P-256 (`ES256`) |
 | Credential encryption at rest | AES-256-GCM via `ring` | AES-256-GCM via AWS-LC |
-| AWS STS client TLS (transport only) | `ring` (legacy rustls 0.21 stack) | AWS-LC (FIPS mode) |
+| AWS STS client TLS (transport only) | `ring` | AWS-LC (FIPS mode) |
 | AWS SigV4 request signing | RustCrypto HMAC-SHA256 | RustCrypto HMAC-SHA256 (unchanged — see below) |
 | Randomness (keys, nonces) | `ring` | AWS-LC |
 | Key and credential-identifier hashing | `ring` / RustCrypto | AWS-LC |

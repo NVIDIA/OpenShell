@@ -82,12 +82,17 @@ enabled. This is why a FIPS gateway is built with
 `--no-default-features --features fips,telemetry` and has to re-list its
 non-crypto defaults.
 
-FIPS mode is selected at build time, not at runtime. On rustls 0.23 that is
-forced; from 0.24 it becomes a choice we are still making deliberately. The
-durable part is that a build offering *both* a FIPS and a `ring`-backed mode would
-have to link both AWS-LC variants (`aws-lc-fips-sys` and `aws-lc-sys`, different C
-libraries) and keep both reachable — which is the posture this crate exists to
-prevent. See the 0.24 migration note below for what does and does not change.
+FIPS mode is selected at build time, not at runtime. On rustls 0.23 the
+`require_ems` mechanism forces that; from 0.24 it becomes a deliberate choice
+rather than a constraint, because `ring` is already linked in a FIPS build and one
+artifact could dispatch between backends at runtime.
+
+We keep build-time selection because it makes *which module is in use* a property
+of the artifact rather than of a code path. That is what allows
+`verify_fips_posture()` to assert the posture once at startup; a runtime switch
+would make the guarantee depend on every dispatch site being correct and would
+leave a non-validated path reachable in a FIPS deployment. See the 0.24 migration
+note below.
 
 On rustls 0.23 `require_ems` (the TLS 1.2 extended-master-secret requirement) is
 also derived from `cfg!(feature = "fips")`, which makes that behavior
@@ -160,15 +165,13 @@ What the upgrade will require:
   handling instead of merely mislabeling the build.
 
 What the upgrade will **not** change: OpenShell will still ship separate FIPS and
-non-FIPS artifacts, but the reason is a product decision rather than a hard
-limit. Under 0.24 a single artifact *can* link only the FIPS provider and select
-rustls policy at runtime. What it cannot do is offer a `ring`-backed
-non-FIPS mode from that same artifact, because the two AWS-LC variants
-(`aws-lc-fips-sys` and `aws-lc-sys`) are different linked libraries. Since we
-keep a `ring`-backed default build — and rustls maintainers advise against
-running a FIPS provider in non-FIPS mode, given its slower update cadence and
-performance-costing countermeasures — separate artifacts remain the right shape
-for us.
+non-FIPS artifacts. That is a product decision, not a hard limit — a single
+artifact could link the FIPS provider and select policy at runtime, and `ring` is
+already present for a non-FIPS path. We decline because runtime dispatch turns the
+FIPS guarantee into a per-call-site property instead of an artifact-level one,
+which is precisely what the design set out to avoid. rustls maintainers also
+advise against running a FIPS provider in non-FIPS mode, given its slower update
+cadence and performance-costing countermeasures.
 
 ## Linux Runtime Environments
 
