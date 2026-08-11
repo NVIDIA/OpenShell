@@ -155,8 +155,10 @@ do not infer from kube context.
 
 ## Disposable Test Guests
 
-The Bazel test guest harness under `bzl/test-guest` boots native-architecture cloud images
-through QEMU for package, release, and E2E validation. A prepared QCOW2 is
+The reusable Bazel test guest rules under `bzl/test-guest` support the concrete
+image and test targets under `e2e/test-guest`. Those targets boot
+native-architecture cloud images through QEMU for package, release, and E2E
+validation. A prepared QCOW2 is
 emitted as a cacheable Bazel output after the exact ordered Ansible
 configuration list and before test-specific packages, copied binaries,
 forwarded ports, or commands.

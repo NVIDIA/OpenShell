@@ -28,6 +28,7 @@ platform_transition_binary(
     binary = "//crates/openshell-cli:openshell",
     tags = ["manual"],
     target_platform = "@rules_rs//rs/platforms:x86_64-unknown-linux-musl",
+    visibility = ["//e2e/test-guest:__pkg__"],
 )
 
 platform_transition_binary(
@@ -36,6 +37,7 @@ platform_transition_binary(
     binary = "//crates/openshell-cli:openshell",
     tags = ["manual"],
     target_platform = "@rules_rs//rs/platforms:aarch64-unknown-linux-musl",
+    visibility = ["//e2e/test-guest:__pkg__"],
 )
 
 platform_transition_binary(

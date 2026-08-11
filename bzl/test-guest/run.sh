@@ -9,7 +9,7 @@ set -Eeuo pipefail
 usage() {
 	cat <<'EOF'
 Usage:
-  bazel run //bzl/test-guest:VARIANT -- [OPTIONS] [-- COMMAND...]
+  bazel run TEST_GUEST_TARGET -- [OPTIONS] [-- COMMAND...]
 
 Options:
   --ssh-port PORT     Use a specific loopback SSH forwarding port
@@ -23,7 +23,7 @@ EOF
 }
 
 if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ]; then
-	echo "run this script through a //bzl/test-guest Bazel target" >&2
+	echo "run this script through a test_guest_binary Bazel target" >&2
 	exit 2
 fi
 

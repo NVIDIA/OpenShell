@@ -1,20 +1,10 @@
-load("@bazel_skylib//rules:write_file.bzl", "write_file")
-load(":catalog.bzl", "declare_test_guest_targets")
 load(
     ":test_guest.bzl",
-    "test_guest_base_image",
     "test_guest_host_tools",
-    "test_guest_test",
-    "test_guest_variant",
 )
 
 exports_files([
     "build-image.sh",
-    "catalog.bzl",
-    "configuration/docker.yml",
-    "configuration/podman.yml",
-    "configuration/selinux.yml",
-    "extensions.bzl",
     "host-tools.BUILD.bazel",
     "host-tools.nix",
     "image-seal.sh",
@@ -42,45 +32,4 @@ toolchain(
     toolchain = ":nix_host_tools",
     toolchain_type = ":host_tools_toolchain_type",
     use_target_platform_constraints = True,
-)
-
-config_setting(
-    name = "aarch64",
-    constraint_values = ["@platforms//cpu:aarch64"],
-)
-
-config_setting(
-    name = "x86_64",
-    constraint_values = ["@platforms//cpu:x86_64"],
-)
-
-declare_test_guest_targets(
-    base_image_rule = test_guest_base_image,
-    variant_macro = test_guest_variant,
-)
-
-write_file(
-    name = "smoke_artifact",
-    out = "smoke-artifact",
-    content = [
-        "#!/usr/bin/env bash",
-        "exit 0",
-    ],
-    is_executable = True,
-    tags = ["manual"],
-)
-
-test_guest_test(
-    name = "fedora_podman_smoke",
-    size = "enormous",
-    command = [
-        "test",
-        "-x",
-        "/usr/local/bin/test-guest-smoke-artifact",
-    ],
-    copies = {
-        ":smoke_artifact": "/usr/local/bin/test-guest-smoke-artifact",
-    },
-    image = ":fedora_podman_image",
-    tags = ["manual"],
 )

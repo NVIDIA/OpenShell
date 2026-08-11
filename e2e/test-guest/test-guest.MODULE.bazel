@@ -1,0 +1,14 @@
+"""Bzlmod repositories for test-guest E2E targets."""
+
+test_guest_images = use_extension("//e2e/test-guest:extensions.bzl", "test_guest_images")
+use_repo(
+    test_guest_images,
+    "test_guest_centos_aarch64",
+    "test_guest_centos_x86_64",
+    "test_guest_fedora_aarch64",
+    "test_guest_fedora_x86_64",
+    "test_guest_rocky_aarch64",
+    "test_guest_rocky_x86_64",
+    "test_guest_ubuntu_aarch64",
+    "test_guest_ubuntu_x86_64",
+)

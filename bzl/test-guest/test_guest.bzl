@@ -209,10 +209,14 @@ def _launcher_content(ctx, image, tools, fixed_args, is_test):
 
     copy_files = []
     for target, destination in ctx.attr.copies.items():
-        files = target[DefaultInfo].files.to_list()
-        if len(files) != 1:
-            fail("copy targets must provide exactly one file: {}".format(target.label))
-        copy_files.append((files[0], destination))
+        default_info = target[DefaultInfo]
+        artifact = default_info.files_to_run.executable
+        if not artifact:
+            files = default_info.files.to_list()
+            if len(files) != 1:
+                fail("copy targets must be executable or provide exactly one file: {}".format(target.label))
+            artifact = files[0]
+        copy_files.append((artifact, destination))
 
     lines = [
         "#!/usr/bin/env bash",

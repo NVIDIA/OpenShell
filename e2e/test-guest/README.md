@@ -27,14 +27,14 @@ Linux hosts, and a slower TCG fallback on Linux when KVM is unavailable.
 Build a prepared Fedora image with Podman:
 
 ```shell
-bazel build //bzl/test-guest:fedora_podman_image
+bazel build //e2e/test-guest:fedora_podman_image
 ```
 
 The target produces cacheable Bazel outputs:
 
 ```text
-bazel-bin/bzl/test-guest/fedora_podman_image.qcow2
-bazel-bin/bzl/test-guest/fedora_podman_image.metadata.json
+bazel-bin/e2e/test-guest/fedora_podman_image.qcow2
+bazel-bin/e2e/test-guest/fedora_podman_image.metadata.json
 ```
 
 The image action boots the pinned cloud image, applies its declared Ansible
@@ -46,13 +46,13 @@ compressed QCOW2, and validates a fresh boot from that output.
 Run an interactive guest backed by the prepared image:
 
 ```shell
-bazel run //bzl/test-guest:fedora_podman
+bazel run //e2e/test-guest:fedora_podman
 ```
 
 Arguments after the Bazel separator are passed to the guest runner:
 
 ```shell
-bazel run //bzl/test-guest:ubuntu_docker -- \
+bazel run //e2e/test-guest:ubuntu_docker -- \
   -- uname -a
 ```
 
@@ -65,7 +65,7 @@ creates a fresh writable overlay; the prepared Bazel output remains unchanged.
 The representative smoke test consumes the same prepared image provider:
 
 ```shell
-bazel test //bzl/test-guest:fedora_podman_smoke
+bazel test //e2e/test-guest:fedora_podman_smoke
 ```
 
 Image and VM test actions execute locally because they require networking and
@@ -86,7 +86,7 @@ Append `_image` to a variant to build its QCOW2 directly. Query the package to
 see every generated target:
 
 ```shell
-bazel query //bzl/test-guest:all
+bazel query //e2e/test-guest:all
 ```
 
 Ubuntu 24.04 provides Podman 4 without the `pasta` helper required by OpenShell
@@ -117,21 +117,26 @@ load("//bzl/test-guest:test_guest.bzl", "test_guest_test")
 test_guest_test(
     name = "fedora_podman_openshell",
     command = ["/usr/local/bin/openshell", "--version"],
-    copies = {
-        "//bazel/releases:openshell_linux_aarch64": "/usr/local/bin/openshell",
-    },
-    image = "//bzl/test-guest:fedora_podman_image",
+    copies = select({
+        ":aarch64": {
+            "//bazel/releases:openshell_linux_aarch64": "/usr/local/bin/openshell",
+        },
+        ":x86_64": {
+            "//bazel/releases:openshell_linux_x86_64": "/usr/local/bin/openshell",
+        },
+    }),
+    image = "//e2e/test-guest:fedora_podman_image",
     size = "enormous",
 )
 ```
 
-Each label must produce exactly one file. `packages` accepts `.deb` outputs for
-Ubuntu and `.rpm` outputs for CentOS, Fedora, and Rocky. `copies` maps an output
-label to an absolute guest destination and installs it with mode `0755`. Use a
-host-native artifact target or a platform `select()` because guest architecture
-must match the host. Bazel builds the artifacts and includes them in the
-consumer's runfiles automatically; they are never included in the prepared
-QCOW2.
+Package labels must produce exactly one file. `packages` accepts `.deb` outputs
+for Ubuntu and `.rpm` outputs for CentOS, Fedora, and Rocky. `copies` maps an
+executable target or single-file output target to an absolute guest destination
+and installs it with mode `0755`. Use a host-native artifact target or a
+platform `select()` because guest architecture must match the host. Bazel builds
+the artifacts and includes them in the consumer's runfiles automatically; they
+are never included in the prepared QCOW2.
 
 Forward a loopback port with `--forward-port HOST_PORT:GUEST_PORT`. Both ports
 must be between 1024 and 65535, and each host port may appear only once.
@@ -139,11 +144,19 @@ must be between 1024 and 65535, and each host port may appear only once.
 ## Directory structure
 
 ```text
-bzl/test-guest/
+e2e/test-guest/
 ├── README.md
 ├── BUILD.bazel
 ├── catalog.bzl
 ├── extensions.bzl
+├── test-guest.MODULE.bazel
+└── configuration/
+    ├── docker.yml
+    ├── podman.yml
+    └── selinux.yml
+
+bzl/test-guest/
+├── BUILD.bazel
 ├── test-guest.MODULE.bazel
 ├── test_guest.bzl
 ├── host-tools.nix
@@ -151,16 +164,15 @@ bzl/test-guest/
 ├── nixpkgs.nix
 ├── build-image.sh
 ├── image-seal.sh
-├── run.sh
-└── configuration/
-    ├── docker.yml
-    ├── podman.yml
-    └── selinux.yml
+└── run.sh
 ```
 
 - `catalog.bzl` is the single source for Bazel cloud-image provenance, guest
   metadata, and supported variants.
 - `extensions.bzl` creates pinned cloud-image repositories from the catalog.
+- `BUILD.bazel` declares the concrete prepared-image, run, and test targets.
+- `configuration/*.yml` are host-executed Ansible playbooks applied in their
+  declared order.
 - `host-tools.nix` builds the Nix host-tool closure imported through
   `rules_nixpkgs`; `nixpkgs.nix` ties it to the repository `flake.lock`.
 - `test_guest.bzl` defines the providers, host-tools toolchain, image action,
@@ -171,8 +183,6 @@ bzl/test-guest/
   capture.
 - `run.sh` owns cloud-init generation, QEMU startup, SSH readiness, Ansible
   execution, artifact installation, guest commands, and cleanup.
-- `configuration/*.yml` are host-executed Ansible playbooks applied in their
-  declared order.
 
 ## Current limitations
 

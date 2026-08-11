@@ -1,0 +1,45 @@
+load("//bzl/test-guest:test_guest.bzl", "test_guest_base_image", "test_guest_test", "test_guest_variant")
+load(":catalog.bzl", "declare_test_guest_targets")
+
+exports_files([
+    "catalog.bzl",
+    "configuration/docker.yml",
+    "configuration/podman.yml",
+    "configuration/selinux.yml",
+    "extensions.bzl",
+    "test-guest.MODULE.bazel",
+])
+
+config_setting(
+    name = "aarch64",
+    constraint_values = ["@platforms//cpu:aarch64"],
+)
+
+config_setting(
+    name = "x86_64",
+    constraint_values = ["@platforms//cpu:x86_64"],
+)
+
+declare_test_guest_targets(
+    base_image_rule = test_guest_base_image,
+    variant_macro = test_guest_variant,
+)
+
+test_guest_test(
+    name = "fedora_podman_smoke",
+    size = "enormous",
+    command = [
+        "/usr/local/bin/openshell",
+        "--version",
+    ],
+    copies = select({
+        ":aarch64": {
+            "//bazel/releases:openshell_linux_aarch64": "/usr/local/bin/openshell",
+        },
+        ":x86_64": {
+            "//bazel/releases:openshell_linux_x86_64": "/usr/local/bin/openshell",
+        },
+    }),
+    image = ":fedora_podman_image",
+    tags = ["manual"],
+)

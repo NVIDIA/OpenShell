@@ -1,6 +1,5 @@
 """Bzlmod dependencies and repositories for test-guest."""
 
-bazel_dep(name = "bazel_skylib", version = "1.9.0")
 bazel_dep(name = "rules_nixpkgs_core", version = "0.13.0")
 bazel_dep(name = "rules_shell", version = "0.6.1")
 
@@ -30,18 +29,5 @@ nix_pkg.file(
     repo = "@openshell_nixpkgs",
 )
 use_repo(nix_pkg, "test_guest_host_tools")
-
-test_guest_images = use_extension("//bzl/test-guest:extensions.bzl", "test_guest_images")
-use_repo(
-    test_guest_images,
-    "test_guest_centos_aarch64",
-    "test_guest_centos_x86_64",
-    "test_guest_fedora_aarch64",
-    "test_guest_fedora_x86_64",
-    "test_guest_rocky_aarch64",
-    "test_guest_rocky_x86_64",
-    "test_guest_ubuntu_aarch64",
-    "test_guest_ubuntu_x86_64",
-)
 
 register_toolchains("//bzl/test-guest:nix_host_tools_toolchain")
