@@ -998,6 +998,20 @@ arches:
     name: zlib
     evr: 1.2.11-40.el9
     sourcerpm: zlib-1.2.11-40.el9.src.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/codeready-builder/os/Packages/g/glibc-static-2.34-275.el9_8.aarch64.rpm
+    repoid: ubi-9-codeready-builder-rpms
+    size: 1249076
+    checksum: sha256:a683861245c3bbd125301070aca013ed0a7603f6bcf64d99914dcf9ae792b281
+    name: glibc-static
+    evr: 2.34-275.el9_8
+    sourcerpm: glibc-2.34-275.el9_8.src.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/aarch64/codeready-builder/os/Packages/l/libxcrypt-static-4.4.18-3.el9.aarch64.rpm
+    repoid: ubi-9-codeready-builder-rpms
+    size: 111974
+    checksum: sha256:8bb8a0eb808c389cfec8a0b29ef66a608cc04711b5d4a0ad515f3a32522ae6e0
+    name: libxcrypt-static
+    evr: 4.4.18-3.el9
+    sourcerpm: libxcrypt-4.4.18-3.el9.src.rpm
   source: []
   module_metadata: []
 - arch: x86_64
@@ -1982,5 +1996,19 @@ arches:
     name: zlib
     evr: 1.2.11-40.el9
     sourcerpm: zlib-1.2.11-40.el9.src.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/codeready-builder/os/Packages/g/glibc-static-2.34-275.el9_8.x86_64.rpm
+    repoid: ubi-9-codeready-builder-rpms
+    size: 1532701
+    checksum: sha256:d35de990a70f4a636753a1e45e2e73b6dd66fc46985bbd6695aaac2c68f399a0
+    name: glibc-static
+    evr: 2.34-275.el9_8
+    sourcerpm: glibc-2.34-275.el9_8.src.rpm
+  - url: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/x86_64/codeready-builder/os/Packages/l/libxcrypt-static-4.4.18-3.el9.x86_64.rpm
+    repoid: ubi-9-codeready-builder-rpms
+    size: 105711
+    checksum: sha256:e2b914f5e136df3c90367dc222e9d893d0c34662f9f2d496b0cadd7d277c579a
+    name: libxcrypt-static
+    evr: 4.4.18-3.el9
+    sourcerpm: libxcrypt-4.4.18-3.el9.src.rpm
   source: []
   module_metadata: []

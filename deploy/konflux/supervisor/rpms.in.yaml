@@ -21,13 +21,17 @@ contentOrigin:
       baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/baseos/os/
     - repoid: ubi-9-appstream-rpms
       baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/appstream/os/
+    # glibc-static (for `-C target-feature=+crt-static`) ships in CodeReady
+    # Builder, whose content is public on the UBI CDN.
+    - repoid: ubi-9-codeready-builder-rpms
+      baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/codeready-builder/os/
 packages:
-  # Build stage: musl toolchain build
+  # Build stage: static glibc + build tools
   - gcc
   - make
   - tar
-  - gzip
   - xz
+  - glibc-static
   # Build stage: Rust compilation (rustup provides rust/cargo)
   - gcc-c++
   - cmake

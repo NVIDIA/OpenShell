@@ -2,22 +2,39 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # RPM dependencies for Dockerfile.konflux.cli
-# Build + runtime stages combined. Generate lockfile with:
-#   rpm-lockfile-prototype --bare \
-#       --arch x86_64 --arch aarch64 \
-#       --outfile deploy/konflux/cli/rpms.lock.yaml \
+# Build + runtime stages combined.
+#
+# Resolved with `context.bare: true` so the lockfile pins the full dependency
+# closure. The image installs RPMs into two different bases (the ubi:9.6 build
+# stage and the ubi-minimal runtime stage); bare guarantees every package is
+# pinned and prefetched regardless of which base already provides it.
+#
+# Target arches and repos are declared in this file (not passed on the command
+# line) so Konflux MintMaker can regenerate the lockfile with no CLI flags.
+# Regenerate manually with:
+#   rpm-lockfile-prototype --outfile deploy/konflux/cli/rpms.lock.yaml \
 #       deploy/konflux/cli/rpms.in.yaml
 #
+# UBI content is public, so repos are inlined here rather than read from the
+# base image; rpm-lockfile-prototype resolves versions from the CDN and cannot
+# read /etc/yum.repos.d from inside the base image.
 contentOrigin:
-  repofiles:
-    - /etc/yum.repos.d/ubi.repo
+  repos:
+    - repoid: ubi-9-baseos-rpms
+      baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/baseos/os/
+    - repoid: ubi-9-appstream-rpms
+      baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/appstream/os/
+    # glibc-static (for `-C target-feature=+crt-static`) ships in CodeReady
+    # Builder, whose content is public on the UBI CDN.
+    - repoid: ubi-9-codeready-builder-rpms
+      baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/codeready-builder/os/
 packages:
-  # Build stage: musl toolchain build
+  # Build stage: static glibc + build tools
   - gcc
   - make
   - tar
-  - gzip
   - xz
+  - glibc-static
   # Build stage: Rust compilation (rustup provides rust/cargo)
   - gcc-c++
   - cmake
@@ -25,3 +42,8 @@ packages:
   - git-core
   # Runtime stage
   - ca-certificates
+arches:
+  - x86_64
+  - aarch64
+context:
+  bare: true
