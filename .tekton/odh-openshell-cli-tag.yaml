@@ -1,0 +1,64 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+#
+metadata:
+  annotations:
+    build.appstudio.openshift.io/repo: https://github.com/opendatahub-io/openshell?rev={{revision}}
+    build.appstudio.redhat.com/commit_sha: '{{revision}}'
+    build.appstudio.redhat.com/target_branch: '{{target_branch}}'
+    pipelinesascode.tekton.dev/cancel-in-progress: "false"
+    pipelinesascode.tekton.dev/max-keep-runs: "3"
+    pipelinesascode.tekton.dev/on-cel-expression: |
+      event == "push"
+      && target_branch.matches("^refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+-rhaiv\\.[0-9]+$")
+  creationTimestamp: null
+  labels:
+    appstudio.openshift.io/application: opendatahub-builds
+    appstudio.openshift.io/component: odh-openshell-cli-ci
+    pipelines.appstudio.openshift.io/type: build
+  name: odh-openshell-cli-on-tag
+  namespace: open-data-hub-tenant
+spec:
+  params:
+  - name: git-url
+    value: '{{source_url}}'
+  - name: revision
+    value: '{{revision}}'
+  - name: output-image
+    value: quay.io/opendatahub/odh-openshell-cli:{{git_tag}}
+  - name: dockerfile
+    value: deploy/docker/Dockerfile.konflux.cli
+  - name: path-context
+    value: .
+  - name: hermetic
+    value: "true"
+  - name: build-platforms
+    value:
+    - linux/x86_64
+    - linux/arm64
+  - name: prefetch-input
+    value: |
+      [
+        {"type": "cargo", "path": "."},
+        {"type": "rpm", "path": "deploy/konflux/cli"},
+        {"type": "generic", "path": "deploy/konflux/cli", "lockfile": "generic-fetcher.yaml"}
+      ]
+  - name: build-args
+    value:
+    - "OPENSHELL_VERSION={{git_tag}}"
+  pipelineRef:
+    resolver: git
+    params:
+    - name: url
+      value: https://github.com/opendatahub-io/odh-konflux-central.git
+    - name: revision
+      value: main
+    - name: pathInRepo
+      value: pipeline/multi-arch-container-build.yaml
+  taskRunTemplate:
+    serviceAccountName: build-pipeline-odh-openshell-cli-ci
+  workspaces:
+  - name: git-auth
+    secret:
+      secretName: '{{ git_auth_secret }}'
+status: {}
