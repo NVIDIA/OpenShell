@@ -11,12 +11,17 @@ links:
 ## Summary
 
 OpenShell performs every cryptographic operation through libraries that have no
-FIPS 140-3 validation. This RFC proposes centralizing cryptographic backend
-selection in a single crate, `openshell-crypto`, and gating the choice behind one
-Cargo feature. A default build keeps `ring` and current behavior; a `fips` build
-routes TLS, X.509 and JWT key generation, credential encryption at rest, key and
+FIPS 140-3 validation. This RFC proposes concentrating cryptographic backend
+selection in one crate, `openshell-crypto`, wherever a dependency can be made to
+honor the process-default provider, and gating the choice behind one Cargo
+feature. A default build keeps `ring` and current behavior; a `fips` build routes
+TLS, X.509 and JWT key generation, credential encryption at rest, key and
 credential-identifier hashing, and randomness through AWS-LC in FIPS mode, and
 narrows every algorithm choice to the approved set.
+
+Two dependencies cannot honor that provider and select for themselves; they are
+handled explicitly in `openshell-server` with their own enforcement, and one
+operation — AWS SigV4 request signing — cannot be moved at all.
 
 The proposal also records where the design diverged from the plan accepted in
 [issue #900](https://github.com/NVIDIA/OpenShell/issues/900) once it met the
@@ -74,7 +79,7 @@ secrets at rest without anyone noticing it was a compliance-relevant surface.
 
 ## Proposal
 
-### One crate owns backend selection
+### One crate owns selection where it can
 
 `openshell-crypto` owns backend selection for everything that can be made to
 route through it: OpenShell's own TLS, PKI, JWT, AEAD, randomness, and hashing
