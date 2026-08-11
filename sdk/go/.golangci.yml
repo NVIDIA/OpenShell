@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - ineffassign
+    - revive
+    - goheader
+  exclusions:
+    rules:
+      - path: "proto/"
+        linters:
+          - goheader
+          - revive
+
+linters-settings:
+  goheader:
+    template: |-
+      SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+      SPDX-License-Identifier: Apache-2.0
+  revive:
+    rules:
+      - name: blank-imports
+      - name: exported
+      - name: var-naming
+      - name: indent-error-flow
+      - name: range
+      - name: error-return
+      - name: error-naming
+      - name: error-strings
+      - name: receiver-naming
+      - name: increment-decrement
+      - name: superfluous-else
+      - name: unreachable-code

@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[book]
+title = "OpenShell Go SDK"
+authors = ["NVIDIA Corporation"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "ayu"
+preferred-dark-theme = "navy"
+additional-css = ["theme/custom.css"]
+git-repository-url = "https://github.com/NVIDIA/OpenShell/sdk/go"
+edit-url-template = "https://github.com/NVIDIA/OpenShell/sdk/go/edit/main/docs/src/{path}"
+
+[output.html.search]
+enable = true
+limit-results = 20

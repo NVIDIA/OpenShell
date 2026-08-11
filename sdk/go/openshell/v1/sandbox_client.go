@@ -25,17 +25,21 @@ func newSandboxClient(conn grpc.ClientConnInterface) *sandboxClient {
 	return &sandboxClient{client: pb.NewOpenShellClient(conn)}
 }
 
-func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string) (*Sandbox, error) {
-	pbSpec, err := converter.SandboxSpecToProto(spec)
+func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
+	protoSpec, err := converter.SandboxSpecToProtoChecked(spec)
 	if err != nil {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
 	}
-	resp, err := s.client.CreateSandbox(ctx, &pb.CreateSandboxRequest{
+	req := &pb.CreateSandboxRequest{
 		Name:      name,
-		Spec:      pbSpec,
+		Spec:      protoSpec,
 		Labels:    labels,
 		Workspace: workspace,
-	})
+	}
+	if len(opts) > 0 {
+		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
+	}
+	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
@@ -58,12 +62,14 @@ func (s *sandboxClient) List(ctx context.Context, workspace string, opts ...List
 		Workspace: workspace,
 	}
 	if len(opts) > 0 {
-		if opts[0].Limit > 0 {
-			req.Limit = uint32(opts[0].Limit)
+		if opts[0].Limit < 0 {
+			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
 		}
-		if opts[0].Offset > 0 {
-			req.Offset = uint32(opts[0].Offset)
+		if opts[0].Offset < 0 {
+			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
 		}
+		req.Limit = uint32(opts[0].Limit)
+		req.Offset = uint32(opts[0].Offset)
 		req.LabelSelector = opts[0].LabelSelector
 		req.AllWorkspaces = opts[0].AllWorkspaces
 	}
@@ -180,14 +186,8 @@ func (s *sandboxClient) waitForPhase(ctx context.Context, workspace, name string
 		return nil, err
 	}
 
-	if sb.Status.Phase == target {
-		return sb, nil
-	}
-	if sb.Status.Phase == SandboxError {
-		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is in error state", name)}
-	}
-	if sb.Status.Phase == SandboxDeleting {
-		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is being deleted", name)}
+	if result, termErr := checkTerminalPhase(sb, name, target); result != nil || termErr != nil {
+		return result, termErr
 	}
 
 	ticker := time.NewTicker(interval)
@@ -202,16 +202,24 @@ func (s *sandboxClient) waitForPhase(ctx context.Context, workspace, name string
 			if err != nil {
 				return nil, err
 			}
-			if sb.Status.Phase == target {
-				return sb, nil
-			}
-			if sb.Status.Phase == SandboxError {
-				return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is in error state", name)}
-			}
-			if sb.Status.Phase == SandboxDeleting {
-				return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is being deleted", name)}
+			if result, termErr := checkTerminalPhase(sb, name, target); result != nil || termErr != nil {
+				return result, termErr
 			}
 		}
+	}
+}
+
+func checkTerminalPhase(sb *Sandbox, name string, target SandboxPhase) (*Sandbox, error) {
+	if sb.Status.Phase == target {
+		return sb, nil
+	}
+	switch sb.Status.Phase {
+	case SandboxError:
+		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is in error state", name)}
+	case SandboxDeleting:
+		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q is being deleted", name)}
+	default:
+		return nil, nil
 	}
 }
 
@@ -225,7 +233,6 @@ func (s *sandboxClient) Watch(ctx context.Context, workspace, name string, opts 
 		watchOpts = opts[0]
 	}
 
-	// Resolve sandbox name to ID — the proto RPC takes Id, not name.
 	sb, err := s.Get(ctx, workspace, name)
 	if err != nil {
 		return nil, err
@@ -271,7 +278,6 @@ func (s *sandboxClient) Watch(ctx context.Context, workspace, name string, opts 
 				case <-w.done:
 					return
 				}
-				// StopOnTerminal: close watcher after delivering a terminal phase event
 				if watchOpts.StopOnTerminal && (sandbox.Status.Phase == SandboxReady || sandbox.Status.Phase == SandboxError) {
 					w.Stop()
 					return
@@ -281,6 +287,11 @@ func (s *sandboxClient) Watch(ctx context.Context, workspace, name string, opts 
 			ev, recvErr = stream.Recv()
 			if recvErr != nil {
 				if recvErr != io.EOF {
+					select {
+					case <-w.done:
+						return
+					default:
+					}
 					select {
 					case ch <- Event[*Sandbox]{Type: EventError, Err: converter.FromGRPCError(recvErr)}:
 					case <-w.done:
@@ -295,7 +306,6 @@ func (s *sandboxClient) Watch(ctx context.Context, workspace, name string, opts 
 }
 
 func (s *sandboxClient) GetLogs(ctx context.Context, workspace, sandboxName string, opts ...LogOption) (*LogResult, error) {
-	// Resolve sandbox name to ID — the proto RPC takes SandboxId, not name.
 	sb, err := s.Get(ctx, workspace, sandboxName)
 	if err != nil {
 		return nil, err

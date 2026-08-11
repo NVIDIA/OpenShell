@@ -3,7 +3,14 @@
 
 package v1
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrTransportNotAvailable indicates that this SDK build has no file-transfer
+// transport. Callers can detect it with errors.Is.
+var ErrTransportNotAvailable = errors.New("openshell: file transport not available")
 
 // FileInterface defines file transfer operations on sandboxes.
 // Methods accept a sandbox name and resolve it to an ID internally.

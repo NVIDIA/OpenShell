@@ -44,6 +44,3 @@ const (
 
 // TLSConfig holds TLS connection settings.
 type TLSConfig = types.TLSConfig
-
-// RetryPolicy configures automatic retry behavior for failed RPCs.
-type RetryPolicy = types.RetryPolicy

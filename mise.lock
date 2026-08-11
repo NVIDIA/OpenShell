@@ -114,9 +114,6 @@ provenance = "github-attestations"
 version = "0.16.0"
 backend = "github:mozilla/sccache"
 
-[tools."github:mozilla/sccache".options]
-asset_pattern = "sccache-v*x86_64*linux*.tar.gz"
-
 [tools."github:mozilla/sccache"."platforms.linux-arm64"]
 checksum = "sha256:f73a5c39f96bb6ebb89cc7915cf182260d4cbf30765322c5e793d0fe8bd80784"
 url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-aarch64-unknown-linux-musl.tar.gz"
@@ -136,10 +133,8 @@ url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/45206041
 version = "0.16.0"
 backend = "github:mozilla/sccache"
 
-[tools."github:mozilla/sccache"."platforms.linux-arm64"]
-checksum = "sha256:f73a5c39f96bb6ebb89cc7915cf182260d4cbf30765322c5e793d0fe8bd80784"
-url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-aarch64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060468"
+[tools."github:mozilla/sccache".options]
+asset_pattern = "sccache-v*x86_64*linux*.tar.gz"
 
 [tools."github:mozilla/sccache"."platforms.linux-x64"]
 checksum = "sha256:aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588"
