@@ -76,10 +76,17 @@ secrets at rest without anyone noticing it was a compliance-relevant surface.
 
 ### One crate owns backend selection
 
-`openshell-crypto` is the only crate permitted to name a cryptographic backend.
-Every TLS, PKI, JWT, AEAD, and randomness operation routes through it, along with
-hashing that serves a cryptographic purpose — key identifiers and credential
-path derivation. Content and revision hashing is deliberately out of scope; see
+`openshell-crypto` owns backend selection for everything that can be made to
+route through it: OpenShell's own TLS, PKI, JWT, AEAD, randomness, and hashing
+that serves a cryptographic purpose — key identifiers and credential path
+derivation.
+
+Two dependencies cannot be made to route through it, because they construct a
+provider themselves rather than using the process default: `sqlx` and
+`aws-smithy-http-client`. For those, `openshell-server` selects the backend
+explicitly and separate enforcement covers each — see
+[Dependencies that do not honor the process default](#dependencies-that-do-not-honor-the-process-default).
+Content and revision hashing is also deliberately out of scope; see
 [Algorithm choices that cross process boundaries](#algorithm-choices-that-cross-process-boundaries)
 for where that line falls and why.
 
@@ -121,8 +128,11 @@ flowchart TD
 Two consequences are worth naming. Installing the restricted provider as the
 *process default* means existing `ClientConfig::builder()` and
 `ServerConfig::builder()` call sites inherit the restriction with no change —
-provider threading is not required. And because selection happens in one function,
-a runtime self-check can prove the whole process is in the intended mode.
+provider threading is not required. And because that selection happens in one
+function, a runtime self-check can confirm the process default is the intended
+one. That check reaches only as far as the process default; the two dependencies
+that select for themselves need their own enforcement, described under
+[Startup verification](#startup-verification).
 
 ### FIPS mode is compile-time only
 
@@ -437,8 +447,8 @@ at all.
 A configuration switch selecting the backend at startup, so one binary serves
 both modes. Technically possible — `ring` is already linked in a FIPS build —
 and rejected on design grounds: it would leave a non-validated path reachable in a
-FIPS deployment and make the guarantee contingent on every dispatch site, rather
-than a property of the artifact that can be asserted once at startup.
+FIPS deployment and make the guarantee contingent on every dispatch site being
+correct, rather than a property fixed when the artifact is built.
 
 rustls 0.24 will make rustls's own behavioral adaptations runtime-selectable
 (rustls/rustls#3054), so a binary linked only against the FIPS module could relax

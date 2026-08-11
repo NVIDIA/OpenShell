@@ -216,8 +216,13 @@ pub fn ensure_default_provider() {
 
 /// Confirms the provider actually installed reports FIPS-approved crypto.
 ///
-/// This is the runtime half of the compile-time guarantee. It catches two
-/// distinct failures:
+/// This is the runtime half of the compile-time guarantee **for the
+/// process-default provider only**. Dependencies that construct their own
+/// provider — `sqlx` and the AWS SDK — are invisible here and are enforced
+/// separately by `openshell-server`. A clean result is not a whole-process
+/// attestation; see the enforcement table in `architecture/build.md`.
+///
+/// It catches two distinct failures:
 ///
 /// 1. The `fips` feature reached this crate but not `rustls`, so
 ///    [`provider`] itself is not FIPS-approved.

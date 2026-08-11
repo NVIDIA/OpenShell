@@ -1,10 +1,13 @@
 # openshell-crypto
 
-Single point of cryptographic backend selection for the workspace. Every TLS,
-PKI, JWT, AEAD, and RNG operation routes through this crate, along with hashing
-that serves a cryptographic purpose, so a FIPS build is one Cargo feature rather
-than an audit of every call site. Content and revision hashing is deliberately
-out of scope — see [Boundaries](#boundaries).
+Backend selection for everything that uses the process-default cryptographic
+provider: OpenShell's own TLS, PKI, JWT, AEAD, RNG, and hashing that serves a
+cryptographic purpose. For those, a FIPS build is one Cargo feature rather than an
+audit of every call site.
+
+`sqlx` and the AWS SDK construct their own provider and so are explicit
+exceptions, selected by `openshell-server` and enforced separately. Content and
+revision hashing is also out of scope. See [Boundaries](#boundaries).
 
 **No other crate may name a crypto backend directly.** The workspace `rustls`,
 `tokio-rustls`, and `rcgen` entries deliberately declare no backend feature;
