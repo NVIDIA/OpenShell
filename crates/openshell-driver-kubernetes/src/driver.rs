@@ -1253,17 +1253,18 @@ impl KubernetesComputeDriver {
                         ))
                     })?
                     .map_err(KubernetesDriverError::from_kube)?;
-                // A same-ID PDB is not sufficient by itself: it may be stale
-                // or have a selector/spec that provides no protection. Repair
-                // its functional state before creating the Sandbox. Preserve
-                // any existing owner reference until the Sandbox create result
-                // tells us which object should own it.
-                let mut desired = pdb.clone();
-                desired.metadata.owner_references = existing.metadata.owner_references.clone();
-                self.reconcile_existing_disruption_protection_pdb(
-                    &api, existing, sandbox_id, desired,
-                )
-                .await?;
+                Self::verify_managed_disruption_protection_pdb(&existing, sandbox_id)?;
+                // Do not rewrite an existing PDB before the Sandbox create
+                // succeeds. A duplicate CreateSandbox request calculates a new
+                // absolute deadline; applying it here would let a failed 409
+                // continually extend the protection of the live Sandbox. The
+                // existing object must already provide effective protection,
+                // and the success path below reconciles metadata and ownership.
+                if !Self::disruption_protection_pdb_is_functional(&existing, pdb) {
+                    return Err(KubernetesDriverError::Precondition(format!(
+                        "PodDisruptionBudget '{name}' already exists but does not provide the requested disruption protection"
+                    )));
+                }
                 Ok(false)
             }
             Ok(Err(err)) => Err(KubernetesDriverError::from_kube(err)),
@@ -1277,41 +1278,35 @@ impl KubernetesComputeDriver {
         existing: &PodDisruptionBudget,
         desired: &PodDisruptionBudget,
     ) -> bool {
-        let desired_labels_match = desired
-            .metadata
-            .labels
-            .as_ref()
-            .is_none_or(|desired_labels| {
-                existing
-                    .metadata
-                    .labels
-                    .as_ref()
-                    .is_some_and(|existing_labels| {
-                        desired_labels
-                            .iter()
-                            .all(|(key, value)| existing_labels.get(key) == Some(value))
-                    })
-            });
-        let desired_annotations_match =
-            desired
-                .metadata
-                .annotations
-                .as_ref()
-                .is_none_or(|desired_annotations| {
-                    existing
-                        .metadata
-                        .annotations
-                        .as_ref()
-                        .is_some_and(|existing_annotations| {
-                            desired_annotations
-                                .iter()
-                                .all(|(key, value)| existing_annotations.get(key) == Some(value))
-                        })
-                });
-        desired_labels_match
-            && desired_annotations_match
+        Self::disruption_protection_pdb_is_functional(existing, desired)
+            && Self::metadata_contains(
+                existing.metadata.annotations.as_ref(),
+                desired.metadata.annotations.as_ref(),
+            )
             && existing.metadata.owner_references == desired.metadata.owner_references
-            && existing.spec == desired.spec
+    }
+
+    fn disruption_protection_pdb_is_functional(
+        existing: &PodDisruptionBudget,
+        desired: &PodDisruptionBudget,
+    ) -> bool {
+        Self::metadata_contains(
+            existing.metadata.labels.as_ref(),
+            desired.metadata.labels.as_ref(),
+        ) && existing.spec == desired.spec
+    }
+
+    fn metadata_contains(
+        existing: Option<&BTreeMap<String, String>>,
+        desired: Option<&BTreeMap<String, String>>,
+    ) -> bool {
+        desired.is_none_or(|desired_values| {
+            existing.is_some_and(|existing_values| {
+                desired_values
+                    .iter()
+                    .all(|(key, value)| existing_values.get(key) == Some(value))
+            })
+        })
     }
 
     async fn reconcile_existing_disruption_protection_pdb(
@@ -1568,6 +1563,44 @@ impl KubernetesComputeDriver {
         Self::verify_managed_disruption_protection_pdb(pdb, sandbox_id)
             .map_err(|err| err.to_string())?;
         self.delete_disruption_protection_pdb(pdb).await
+    }
+
+    async fn reconcile_disruption_protection_after_create_conflict(
+        &self,
+        agent_sandbox_api: &AgentSandboxApi,
+        name: &str,
+        attempted_sandbox_id: &str,
+    ) -> Result<(), String> {
+        let live = tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.get_opt(name))
+            .await
+            .map_err(|_| format!("timed out fetching conflicting Sandbox '{name}'"))?
+            .map_err(|err| err.to_string())?;
+        let Some(live) = live else {
+            return self
+                .delete_owned_disruption_protection_pdb(name, attempted_sandbox_id, None)
+                .await;
+        };
+
+        let live_sandbox_id = sandbox_id_from_object(&live)?;
+        if live_sandbox_id != attempted_sandbox_id {
+            return self
+                .delete_owned_disruption_protection_pdb(name, attempted_sandbox_id, None)
+                .await;
+        }
+
+        let Some(protected_until) = live_disruption_protection_deadline(&live, Utc::now()) else {
+            return self
+                .delete_owned_disruption_protection_pdb(name, attempted_sandbox_id, None)
+                .await;
+        };
+        self.ensure_owned_disruption_protection_pdb(
+            &live,
+            &agent_sandbox_api.resource,
+            &live_sandbox_id,
+            protected_until,
+        )
+        .await
+        .map_err(|err| err.to_string())
     }
 
     async fn reconcile_disruption_protection_for_sandbox(
@@ -2229,18 +2262,33 @@ impl KubernetesComputeDriver {
                 Ok(())
             }
             Ok(Err(err)) => {
-                if initial_pdb_created
-                    && !matches!(&err, KubeError::Api(response) if response.code == 409)
-                    && let Err(cleanup_err) = self
-                        .delete_owned_disruption_protection_pdb(&kube_name, &sandbox.id, None)
+                if initial_pdb_created {
+                    let cleanup_result = if matches!(
+                        &err,
+                        KubeError::Api(response) if response.code == 409
+                    ) {
+                        // A concurrent or duplicate create may have won. Restore
+                        // the live Sandbox's authoritative deadline rather than
+                        // retaining the new deadline calculated by this failed
+                        // request or deleting a concurrently adopted PDB.
+                        self.reconcile_disruption_protection_after_create_conflict(
+                            &agent_sandbox_api,
+                            &kube_name,
+                            &sandbox.id,
+                        )
                         .await
-                {
-                    warn!(
-                        sandbox_id = %sandbox.id,
-                        pdb = %kube_name,
-                        error = %cleanup_err,
-                        "Failed to roll back PodDisruptionBudget after Sandbox creation failed"
-                    );
+                    } else {
+                        self.delete_owned_disruption_protection_pdb(&kube_name, &sandbox.id, None)
+                            .await
+                    };
+                    if let Err(cleanup_err) = cleanup_result {
+                        warn!(
+                            sandbox_id = %sandbox.id,
+                            pdb = %kube_name,
+                            error = %cleanup_err,
+                            "Failed to reconcile PodDisruptionBudget after Sandbox creation failed"
+                        );
+                    }
                 }
                 warn!(
                     sandbox_id = %sandbox.id,
@@ -3152,6 +3200,22 @@ fn parse_disruption_protected_until(value: &str) -> Result<DateTime<Utc>, String
     DateTime::parse_from_rfc3339(value)
         .map(|deadline| deadline.with_timezone(&Utc))
         .map_err(|err| format!("invalid disruption protection deadline '{value}': {err}"))
+}
+
+fn live_disruption_protection_deadline(
+    sandbox: &DynamicObject,
+    now: DateTime<Utc>,
+) -> Option<&str> {
+    let protected_until = sandbox
+        .metadata
+        .annotations
+        .as_ref()?
+        .get(DISRUPTION_PROTECTED_UNTIL_ANNOTATION)?;
+    match parse_disruption_protected_until(protected_until) {
+        Ok(deadline) if deadline <= now => None,
+        // Invalid authoritative metadata fails closed, matching reconciliation.
+        Ok(_) | Err(_) => Some(protected_until),
+    }
 }
 
 fn update_disruption_protection_deadline(
@@ -4737,6 +4801,16 @@ fn sandbox_template_to_k8s_with_validated_config(
         .iter()
         .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
         .collect::<serde_json::Map<String, serde_json::Value>>();
+    // These labels participate in identity and disruption-protection selectors.
+    // Never allow caller-provided template labels to impersonate another
+    // sandbox or make an unprotected pod consume a protected sandbox's budget.
+    for reserved in [
+        LABEL_MANAGED_BY,
+        LABEL_SANDBOX_ID,
+        DISRUPTION_PROTECTION_LABEL,
+    ] {
+        pod_labels.remove(reserved);
+    }
     if params.provider_spiffe_enabled {
         pod_labels.insert(
             LABEL_MANAGED_BY.to_string(),
@@ -6553,6 +6627,43 @@ mod tests {
     }
 
     #[test]
+    fn create_conflict_uses_only_the_live_sandbox_deadline() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("workspace--tool", &resource);
+        let now = DateTime::parse_from_rfc3339("2026-08-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        sandbox.metadata.annotations = Some(BTreeMap::from([(
+            DISRUPTION_PROTECTED_UNTIL_ANNOTATION.to_string(),
+            "2026-08-10T11:00:00Z".to_string(),
+        )]));
+        assert_eq!(live_disruption_protection_deadline(&sandbox, now), None);
+
+        sandbox.metadata.annotations.as_mut().unwrap().insert(
+            DISRUPTION_PROTECTED_UNTIL_ANNOTATION.to_string(),
+            "2026-08-10T13:00:00Z".to_string(),
+        );
+        assert_eq!(
+            live_disruption_protection_deadline(&sandbox, now),
+            Some("2026-08-10T13:00:00Z")
+        );
+
+        sandbox.metadata.annotations.as_mut().unwrap().insert(
+            DISRUPTION_PROTECTED_UNTIL_ANNOTATION.to_string(),
+            "invalid-fail-closed-deadline".to_string(),
+        );
+        assert_eq!(
+            live_disruption_protection_deadline(&sandbox, now),
+            Some("invalid-fail-closed-deadline")
+        );
+    }
+
+    #[test]
     fn disruption_protection_deadline_scheduler_tracks_absolute_deadlines() {
         let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
             SANDBOX_GROUP,
@@ -6723,6 +6834,31 @@ mod tests {
     }
 
     #[test]
+    fn functional_existing_pdb_does_not_adopt_a_new_deadline_before_create() {
+        let existing = disruption_protection_pdb(
+            "workspace--tool",
+            "openshell",
+            "sandbox-id",
+            "2026-08-10T16:00:00Z",
+            None,
+        );
+        let desired = disruption_protection_pdb(
+            "workspace--tool",
+            "openshell",
+            "sandbox-id",
+            "2026-08-10T20:00:00Z",
+            None,
+        );
+
+        assert!(
+            KubernetesComputeDriver::disruption_protection_pdb_is_functional(&existing, &desired)
+        );
+        assert!(!KubernetesComputeDriver::disruption_protection_pdb_matches(
+            &existing, &desired
+        ));
+    }
+
+    #[test]
     fn disruption_protection_delete_is_fenced_to_observed_identity() {
         let mut pdb = disruption_protection_pdb(
             "workspace--tool",
@@ -6759,6 +6895,14 @@ mod tests {
     #[test]
     fn disruption_protection_labels_the_sandbox_pod_for_the_pdb_selector() {
         let template = SandboxTemplate {
+            labels: std::collections::HashMap::from([
+                (LABEL_SANDBOX_ID.to_string(), "spoofed-id".to_string()),
+                (LABEL_MANAGED_BY.to_string(), "spoofed-manager".to_string()),
+                (
+                    DISRUPTION_PROTECTION_LABEL.to_string(),
+                    "spoofed-state".to_string(),
+                ),
+            ]),
             driver_config: Some(json_struct(serde_json::json!({
                 "disruption_protection": {
                     "duration": "4h"
@@ -6785,6 +6929,42 @@ mod tests {
             labels[DISRUPTION_PROTECTION_LABEL],
             DISRUPTION_PROTECTION_LABEL_VALUE
         );
+    }
+
+    #[test]
+    fn unprotected_sandbox_cannot_spoof_disruption_protection_selector_labels() {
+        let template = SandboxTemplate {
+            labels: std::collections::HashMap::from([
+                (LABEL_SANDBOX_ID.to_string(), "protected-id".to_string()),
+                (
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string(),
+                ),
+                (
+                    DISRUPTION_PROTECTION_LABEL.to_string(),
+                    DISRUPTION_PROTECTION_LABEL_VALUE.to_string(),
+                ),
+                ("example.com/user-label".to_string(), "kept".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let params = SandboxPodParams {
+            sandbox_id: "unprotected-id",
+            ..Default::default()
+        };
+
+        let pod = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+        let labels = pod["metadata"]["labels"].as_object().unwrap();
+        assert_eq!(labels["example.com/user-label"], "kept");
+        assert!(!labels.contains_key(LABEL_SANDBOX_ID));
+        assert!(!labels.contains_key(LABEL_MANAGED_BY));
+        assert!(!labels.contains_key(DISRUPTION_PROTECTION_LABEL));
     }
 
     #[test]
