@@ -7,7 +7,9 @@
 #
 # The supervisor binary is extracted and injected into arbitrary user
 # containers (Alpine, Debian, distroless, UBI) so it MUST be a fully-static
-# musl binary. musl libc is built from source since UBI9 does not ship it.
+# binary. It is built against glibc with `-C target-feature=+crt-static`
+# using Red Hat's glibc-static package (CodeReady Builder), so the build has
+# no dependency on musl.
 #
 # Requires prefetched dependencies via Hermeto (cargo, rpm, generic).
 # See deploy/konflux/ for prefetch configs.
@@ -15,27 +17,9 @@
 # Local build:  ./deploy/konflux/build-local.sh supervisor
 
 ARG RUST_VERSION=1.92.0
-ARG MUSL_VERSION=1.2.5
 
 # ---------------------------------------------------------------------------
-# Stage 1: build musl libc from source
-# ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi9/ubi:9.6@sha256:dec374e05cc13ebbc0975c9f521f3db6942d27f8ccdf06b180160490eef8bdbc AS musl-toolchain
-
-ARG MUSL_VERSION
-
-RUN dnf install -y --nodocs --setopt=install_weak_deps=0 gcc make tar gzip \
-    && dnf clean all
-
-WORKDIR /tmp/musl-build
-
-RUN tar xzf /cachi2/output/deps/generic/musl-${MUSL_VERSION}.tar.gz --strip-components=1 \
-    && ./configure --prefix=/usr/local/musl --disable-shared \
-    && make -j"$(nproc)" \
-    && make install
-
-# ---------------------------------------------------------------------------
-# Stage 2: compile supervisor (static musl binary)
+# Build stage: compile supervisor (fully-static glibc binary)
 # ---------------------------------------------------------------------------
 FROM registry.access.redhat.com/ubi9/ubi:9.6@sha256:dec374e05cc13ebbc0975c9f521f3db6942d27f8ccdf06b180160490eef8bdbc AS builder
 
@@ -44,29 +28,21 @@ ARG TARGETARCH
 
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
         gcc gcc-c++ make cmake \
+        glibc-static \
         openssl-devel git-core xz \
     && dnf clean all
 
-# Map TARGETARCH (amd64/arm64) to Rust triple components
+# Extract the Rust toolchain (GNU target) and record the target triple. The
+# GNU rust-std shipped with the toolchain is reused; no musl std is needed.
 RUN RUST_ARCH=$(case "${TARGETARCH}" in amd64) echo x86_64;; arm64) echo aarch64;; *) echo "${TARGETARCH}";; esac) && \
     RUST_TRIPLE="${RUST_ARCH}-unknown-linux-gnu" && \
-    MUSL_TRIPLE="${RUST_ARCH}-unknown-linux-musl" && \
     mkdir -p /tmp/rust-toolchain && \
     tar xJf /cachi2/output/deps/generic/rust-${RUST_VERSION}-${RUST_TRIPLE}.tar.xz -C /tmp/rust-toolchain --strip-components=1 && \
     /tmp/rust-toolchain/install.sh --prefix=/usr/local && \
     rm -rf /tmp/rust-toolchain && \
-    mkdir -p /tmp/musl-std && \
-    tar xJf /cachi2/output/deps/generic/rust-std-${RUST_VERSION}-${MUSL_TRIPLE}.tar.xz -C /tmp/musl-std --strip-components=1 && \
-    /tmp/musl-std/install.sh --prefix=/usr/local && \
-    rm -rf /tmp/musl-std
+    echo "RUST_TARGET=${RUST_TRIPLE}" > /tmp/build-env
 
-COPY --from=musl-toolchain /usr/local/musl /usr/local/musl
-
-# CC and target vars use the native arch musl triple
-RUN RUST_ARCH=$(case "${TARGETARCH}" in amd64) echo x86_64;; arm64) echo aarch64;; *) echo "${TARGETARCH}";; esac) && \
-    echo "MUSL_TARGET=${RUST_ARCH}-unknown-linux-musl" > /tmp/build-env
-ENV PATH="/usr/local/musl/bin:${PATH}" \
-    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -78,15 +54,17 @@ COPY proto/ proto/
 # pass the git tag with the leading "v" stripped. Empty otherwise.
 ARG OPENSHELL_VERSION=""
 
+# `-C target-feature=+crt-static` links glibc statically, producing a
+# fully-static (static-PIE) binary with no runtime libc dependency.
 RUN . /tmp/build-env && \
-    export CC_${MUSL_TARGET//-/_}=musl-gcc && \
     VER="${OPENSHELL_VERSION#v}" && \
     if [ -n "$VER" ]; then export OPENSHELL_GIT_VERSION="$VER"; fi && \
+    RUSTFLAGS="-C target-feature=+crt-static" \
     cargo build --release \
-        --target "${MUSL_TARGET}" \
+        --target "${RUST_TARGET}" \
         --package openshell-sandbox && \
     mkdir -p /build/output && \
-    cp /build/target/${MUSL_TARGET}/release/openshell-sandbox /build/output/
+    cp /build/target/${RUST_TARGET}/release/openshell-sandbox /build/output/
 
 # ---------------------------------------------------------------------------
 # Runtime
@@ -102,13 +80,12 @@ RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 \
         util-linux-core \
     && microdnf clean all
 
-# Copy the static binary from the arch-specific target directory.
-# Builder writes the target to /tmp/build-env; we resolve it here.
+# Copy the fully-static binary produced by the builder stage.
 COPY --from=builder --chmod=0555 /build/output/openshell-sandbox /openshell-sandbox
 
 LABEL com.redhat.component="odh-openshell-supervisor-container" \
-      description="Static musl-linked sandbox supervisor for OpenShell, injected into arbitrary user containers" \
-      summary="Static musl-linked sandbox supervisor for OpenShell, injected into arbitrary user containers" \
+      description="Statically linked (glibc) sandbox supervisor for OpenShell, injected into arbitrary user containers" \
+      summary="Statically linked (glibc) sandbox supervisor for OpenShell, injected into arbitrary user containers" \
       name="rhoai/odh-openshell-supervisor-rhel9" \
       maintainer="['managed-open-data-hub@redhat.com']" \
       io.openshift.expose-services="" \
