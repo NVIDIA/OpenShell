@@ -36,11 +36,13 @@ rules:
     resources:
       - poddisruptionbudgets
     verbs:
-      - create
       - delete
       - get
       - list
+      {{- if .Values.server.disruptionProtection.enabled }}
+      - create
       - patch
+      {{- end }}
   # Per-sandbox identity: TokenReview authenticates the projected token from
   # the configured sandbox service account, then the gateway resolves the
   # returned pod name and UID to the pod's `openshell.io/sandbox-id`

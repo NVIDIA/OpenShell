@@ -547,9 +547,12 @@ process_binary_aware_network_policy = true
 
 [openshell.drivers.kubernetes.disruption_protection]
 # Disabled by default. Enabling this permits, but does not automatically add,
-# per-sandbox PodDisruptionBudgets.
+# per-sandbox PodDisruptionBudgets. Requests are rejected while disabled.
 enabled      = false
-# Maximum duration accepted from sandbox Kubernetes driver config.
+# Maximum duration accepted from sandbox Kubernetes driver config. This is a
+# fail-closed expiration target: if every gateway is unavailable at the
+# deadline, the PDB remains until reconciliation resumes or an operator removes
+# it.
 max_duration = "24h"
 ```
 
@@ -557,6 +560,10 @@ In managed workspace mode, the Kubernetes driver copies each explicitly named
 `image_pull_secrets` Secret from `namespace` into the managed workspace
 namespace on sandbox creation. Shared and operator modes require the Secret to
 already exist in the sandbox namespace.
+
+Custom non-Helm deployments that enable this feature must grant the gateway
+service account `create`, `delete`, `get`, `list`, and `patch` on `policy/v1`
+PodDisruptionBudgets in the sandbox namespace.
 
 ### Docker
 

@@ -51,12 +51,12 @@ indefinitely when the API server is slow or unavailable.
 
 ## Disruption Protection
 
-The driver can create a time-bounded `policy/v1` `PodDisruptionBudget` for an
-individual sandbox. This capability uses two explicit opt-ins: the operator
-sets `disruption_protection.enabled = true`, and the sandbox requests
-`driver_config.kubernetes.disruption_protection.duration`. The operator's
-`max_duration` limits each request. Durations are positive integer seconds,
-minutes, or hours, such as `30m` or `4h`.
+The driver can create a `policy/v1` `PodDisruptionBudget` with a fail-closed
+expiration target for an individual sandbox. This capability uses two explicit
+opt-ins: the operator sets `disruption_protection.enabled = true`, and the
+sandbox requests `driver_config.kubernetes.disruption_protection.duration`.
+The operator's `max_duration` limits each request. Durations are positive
+integer seconds, minutes, or hours, such as `30m` or `4h`.
 
 OpenShell calculates an absolute UTC deadline and stores it in the
 `openshell.io/disruption-protected-until` annotation on both the Sandbox and
@@ -64,9 +64,12 @@ PDB. The PDB uses `minAvailable: 1`, selects only the corresponding OpenShell
 sandbox pod, and sets `unhealthyPodEvictionPolicy: AlwaysAllow`. The driver
 creates the PDB before the Sandbox, adds the Sandbox owner reference after the
 CR exists, repairs missing or changed managed PDBs during gateway
-reconciliation, and removes expired PDBs. If all gateways are unavailable at
-the deadline, the PDB remains conservatively active until reconciliation
-resumes.
+reconciliation, and schedules cleanup from Sandbox watch events at the
+deadline. The periodic gateway reconciliation sweep is the repair fallback.
+Expiration is fail-closed: if all gateways are unavailable at the deadline, the
+PDB remains active until a gateway resumes or an operator deletes it. A
+malformed persisted deadline also retains protection until an operator repairs
+or removes the annotation; it never serves as evidence that protection expired.
 
 PDBs constrain voluntary eviction through the Kubernetes Eviction API. They do
 not prevent node failure, preemption, direct pod or Sandbox deletion, or other
