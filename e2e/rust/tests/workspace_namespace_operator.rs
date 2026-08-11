@@ -65,6 +65,22 @@ fn unique_namespace(prefix: &str) -> String {
     format!("{prefix}-{ts}")
 }
 
+async fn wait_sandbox_gone(workspace: &str, sandbox: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (ok, out) = run_cli(&["sandbox", "list", "--workspace", workspace]).await;
+        if ok && !out.contains(sandbox) {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "sandbox {sandbox} still listed in workspace {workspace} 30s after delete: {out}"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 async fn provision_operator_namespace(name: &str) {
     let (ok, out) = kubectl(&["create", "namespace", name]).await;
     assert!(ok, "failed to create namespace {name}: {out}");
@@ -201,13 +217,8 @@ async fn operator_sandbox_in_labeled_namespace() {
     let (ok, out) = run_cli(&["sandbox", "delete", "op-sb", "--workspace", &ns]).await;
     assert!(ok, "sandbox delete failed: {out}");
 
-    // Verify sandbox is gone after deletion.
-    let (ok, out) = run_cli(&["sandbox", "list", "--workspace", &ns]).await;
-    assert!(ok, "sandbox list after delete failed: {out}");
-    assert!(
-        !out.contains("op-sb"),
-        "sandbox list should NOT find op-sb after deletion: {out}"
-    );
+    // Wait for the sandbox CR to be fully removed (deletion is asynchronous).
+    wait_sandbox_gone(&ns, "op-sb").await;
 
     let (ok, out) = run_cli(&["workspace", "delete", &ns]).await;
     assert!(ok, "workspace delete failed: {out}");
@@ -292,4 +303,148 @@ async fn operator_rejects_nonexistent_namespace() {
 
     // Clean up.
     let _ = run_cli(&["workspace", "delete", &ns]).await;
+}
+
+#[tokio::test]
+async fn operator_workspace_delete_preserves_namespace() {
+    let ns = unique_namespace("opdel");
+    let _cleanup = OperatorCleanup {
+        workspace: ns.clone(),
+        namespace: ns.clone(),
+        sandboxes: vec!["opdel-sb".into()],
+    };
+
+    provision_operator_namespace(&ns).await;
+
+    let (ok, out) = run_cli(&["workspace", "create", "--name", &ns]).await;
+    assert!(ok, "workspace create failed: {out}");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (ok, out) = run_cli(&[
+            "sandbox",
+            "create",
+            "--workspace",
+            &ns,
+            "--name",
+            "opdel-sb",
+            "--",
+            "echo",
+            "opdel-ok",
+        ])
+        .await;
+        if ok {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("sandbox create did not succeed within 30s: {out}");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    let (ok, out) = run_cli(&["sandbox", "delete", "opdel-sb", "--workspace", &ns]).await;
+    assert!(ok, "sandbox delete failed: {out}");
+
+    wait_sandbox_gone(&ns, "opdel-sb").await;
+
+    let (ok, out) = run_cli(&["workspace", "delete", &ns]).await;
+    assert!(ok, "workspace delete failed: {out}");
+
+    let (ok, out) = kubectl(&["get", "namespace", &ns]).await;
+    assert!(
+        ok,
+        "operator namespace {ns} should still exist after workspace delete: {out}"
+    );
+
+    let (ok, label_out) =
+        kubectl(&["get", "namespace", &ns, "-o", "jsonpath={.metadata.labels}"]).await;
+    assert!(ok, "failed to read namespace labels: {label_out}");
+    assert!(
+        label_out.contains("openshell.ai/e2e-operator-workspace"),
+        "operator label should be intact after workspace delete: {label_out}"
+    );
+
+    delete_namespace(&ns).await;
+}
+
+#[tokio::test]
+async fn operator_label_removal_blocks_sandbox_creation() {
+    let ns = unique_namespace("oplbl");
+    let _cleanup = OperatorCleanup {
+        workspace: ns.clone(),
+        namespace: ns.clone(),
+        sandboxes: vec!["lbl-sb1".into()],
+    };
+
+    provision_operator_namespace(&ns).await;
+
+    let (ok, out) = run_cli(&["workspace", "create", "--name", &ns]).await;
+    assert!(ok, "workspace create failed: {out}");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (ok, out) = run_cli(&[
+            "sandbox",
+            "create",
+            "--workspace",
+            &ns,
+            "--name",
+            "lbl-sb1",
+            "--",
+            "echo",
+            "lbl-ok",
+        ])
+        .await;
+        if ok {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("sandbox create did not succeed within 30s: {out}");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    let (ok, out) = run_cli(&["sandbox", "delete", "lbl-sb1", "--workspace", &ns]).await;
+    assert!(ok, "sandbox lbl-sb1 delete failed: {out}");
+
+    wait_sandbox_gone(&ns, "lbl-sb1").await;
+
+    let (ok, out) = kubectl(&[
+        "label",
+        "namespace",
+        &ns,
+        "openshell.ai/e2e-operator-workspace-",
+    ])
+    .await;
+    assert!(ok, "failed to remove operator label: {out}");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (ok, _out) = run_cli(&[
+            "sandbox",
+            "create",
+            "--workspace",
+            &ns,
+            "--name",
+            "lbl-sb2",
+            "--",
+            "echo",
+            "should-fail",
+        ])
+        .await;
+        if !ok {
+            break;
+        }
+        // Sandbox was created despite label removal — clean it up and retry.
+        let _ = run_cli(&["sandbox", "delete", "lbl-sb2", "--workspace", &ns]).await;
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "sandbox creation still succeeds 30s after operator label removal; \
+                 watcher did not remove namespace from allowlist"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    delete_namespace(&ns).await;
 }

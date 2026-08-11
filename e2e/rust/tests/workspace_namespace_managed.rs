@@ -70,6 +70,22 @@ fn unique_workspace(prefix: &str) -> String {
     format!("{prefix}-{ts}")
 }
 
+async fn wait_sandbox_gone(workspace: &str, sandbox: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (ok, out) = run_cli(&["sandbox", "list", "--workspace", workspace]).await;
+        if ok && !out.contains(sandbox) {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "sandbox {sandbox} still listed in workspace {workspace} 30s after delete: {out}"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 struct ManagedCleanup {
     workspace: String,
     sandboxes: Vec<String>,
@@ -186,13 +202,8 @@ async fn managed_creates_namespace_with_labels() {
     let (ok, out) = run_cli(&["sandbox", "delete", "mgd-sb", "--workspace", &ws]).await;
     assert!(ok, "sandbox delete failed: {out}");
 
-    // Verify sandbox is gone from the control plane after deletion.
-    let (ok, out) = run_cli(&["sandbox", "list", "--workspace", &ws]).await;
-    assert!(ok, "sandbox list after delete failed: {out}");
-    assert!(
-        !out.contains("mgd-sb"),
-        "sandbox list should NOT find mgd-sb after deletion: {out}"
-    );
+    // Wait for the sandbox CR to be fully removed (deletion is asynchronous).
+    wait_sandbox_gone(&ws, "mgd-sb").await;
 }
 
 #[tokio::test]
@@ -240,8 +251,8 @@ async fn managed_namespace_survives_with_remaining_sandboxes() {
     let (ok, out) = run_cli(&["sandbox", "delete", "sb-a", "--workspace", &ws]).await;
     assert!(ok, "sandbox sb-a delete failed: {out}");
 
-    // Brief wait, then verify the namespace still exists.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for sb-a to be fully removed before checking namespace state.
+    wait_sandbox_gone(&ws, "sb-a").await;
 
     let (ok, _) = kubectl(&["get", "namespace", &ns]).await;
     assert!(ok, "managed namespace {ns} should still exist with sb-b");
@@ -260,10 +271,6 @@ async fn managed_namespace_survives_with_remaining_sandboxes() {
     assert!(
         out.contains("sb-b"),
         "sandbox list should find sb-b via control plane: {out}"
-    );
-    assert!(
-        !out.contains("sb-a"),
-        "sandbox list should NOT find deleted sb-a: {out}"
     );
 }
 
@@ -362,5 +369,327 @@ async fn managed_isolates_workspaces_into_separate_namespaces() {
     assert!(
         !out.contains("sb-iso-a"),
         "sandbox list ws_b should NOT find sb-iso-a: {out}"
+    );
+}
+
+#[tokio::test]
+async fn managed_workspace_delete_removes_namespace() {
+    let ws = unique_workspace("mgddel");
+    let ns = managed_namespace(&ws);
+    let _cleanup = ManagedCleanup {
+        workspace: ws.clone(),
+        sandboxes: vec!["del-sb".into()],
+    };
+
+    let (ok, out) = run_cli(&["workspace", "create", "--name", &ws]).await;
+    assert!(ok, "workspace create failed: {out}");
+
+    let (ok, out) = run_cli(&[
+        "sandbox",
+        "create",
+        "--workspace",
+        &ws,
+        "--name",
+        "del-sb",
+        "--",
+        "echo",
+        "del-ok",
+    ])
+    .await;
+    assert!(ok, "sandbox create failed: {out}");
+    assert!(
+        out.contains("del-ok"),
+        "sandbox output missing expected string: {out}"
+    );
+
+    let (ok, _) = kubectl(&["get", "namespace", &ns]).await;
+    assert!(
+        ok,
+        "managed namespace {ns} should exist after sandbox create"
+    );
+
+    let (ok, out) = run_cli(&["sandbox", "delete", "del-sb", "--workspace", &ws]).await;
+    assert!(ok, "sandbox delete failed: {out}");
+
+    wait_sandbox_gone(&ws, "del-sb").await;
+
+    let (ok, out) = run_cli(&["workspace", "delete", &ws]).await;
+    assert!(ok, "workspace delete failed: {out}");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (exists, _) = kubectl(&["get", "namespace", &ns]).await;
+        if !exists {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("managed namespace {ns} still exists 30s after workspace delete");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+#[tokio::test]
+async fn managed_tls_secret_copied_to_namespace() {
+    let (ok, config_out) = kubectl(&[
+        "get",
+        "configmap",
+        "openshell-config",
+        "-n",
+        "openshell",
+        "-o",
+        "jsonpath={.data.gateway\\.toml}",
+    ])
+    .await;
+    if !ok || !config_out.contains("client_tls_secret_name") {
+        eprintln!("SKIP: client_tls_secret_name not configured; TLS secret copying disabled");
+        return;
+    }
+
+    let ws = unique_workspace("mgdtls");
+    let ns = managed_namespace(&ws);
+    let _cleanup = ManagedCleanup {
+        workspace: ws.clone(),
+        sandboxes: vec!["tls-sb".into()],
+    };
+
+    let (ok, out) = run_cli(&["workspace", "create", "--name", &ws]).await;
+    assert!(ok, "workspace create failed: {out}");
+
+    let (ok, out) = run_cli(&[
+        "sandbox",
+        "create",
+        "--workspace",
+        &ws,
+        "--name",
+        "tls-sb",
+        "--",
+        "echo",
+        "tls-ok",
+    ])
+    .await;
+    assert!(ok, "sandbox create failed: {out}");
+    assert!(
+        out.contains("tls-ok"),
+        "sandbox output missing expected string: {out}"
+    );
+
+    let (ok, out) = kubectl(&["get", "secret", "openshell-client-tls", "-n", &ns]).await;
+    assert!(
+        ok,
+        "TLS secret openshell-client-tls should be copied to managed namespace {ns}: {out}"
+    );
+
+    let (ok, label_out) = kubectl(&[
+        "get",
+        "secret",
+        "openshell-client-tls",
+        "-n",
+        &ns,
+        "-o",
+        "jsonpath={.metadata.labels}",
+    ])
+    .await;
+    assert!(ok, "failed to read TLS secret labels: {label_out}");
+    assert!(
+        label_out.contains("openshell.ai/managed-by"),
+        "copied TLS secret missing managed-by label: {label_out}"
+    );
+}
+
+#[tokio::test]
+async fn managed_rejects_namespace_owned_by_different_gateway() {
+    let ws = unique_workspace("mgdown");
+    let ns = managed_namespace(&ws);
+    let _cleanup = ManagedCleanup {
+        workspace: ws.clone(),
+        sandboxes: vec![],
+    };
+
+    let (ok, out) = kubectl(&["create", "namespace", &ns]).await;
+    assert!(ok, "failed to pre-create namespace {ns}: {out}");
+
+    let (ok, out) = kubectl(&[
+        "label",
+        "namespace",
+        &ns,
+        "openshell.ai/managed-by=openshell",
+        "openshell.ai/gateway-id=wrong-gateway",
+    ])
+    .await;
+    assert!(ok, "failed to label namespace: {out}");
+
+    let (ok, out) = run_cli(&["workspace", "create", "--name", &ws]).await;
+    assert!(ok, "workspace create failed: {out}");
+
+    let (ok, out) = run_cli(&[
+        "sandbox",
+        "create",
+        "--workspace",
+        &ws,
+        "--name",
+        "conflict-sb",
+        "--",
+        "echo",
+        "nope",
+    ])
+    .await;
+    assert!(
+        !ok,
+        "sandbox create should fail for namespace owned by different gateway, but succeeded: {out}"
+    );
+}
+
+#[tokio::test]
+async fn managed_full_lifecycle_with_multiple_sandboxes() {
+    let ws = unique_workspace("mgdlc");
+    let ns = managed_namespace(&ws);
+    let _cleanup = ManagedCleanup {
+        workspace: ws.clone(),
+        sandboxes: vec!["lc-a".into(), "lc-b".into()],
+    };
+
+    let (ok, out) = run_cli(&["workspace", "create", "--name", &ws]).await;
+    assert!(ok, "workspace create failed: {out}");
+
+    let (ok, out) = run_cli(&[
+        "sandbox",
+        "create",
+        "--workspace",
+        &ws,
+        "--name",
+        "lc-a",
+        "--",
+        "echo",
+        "a",
+    ])
+    .await;
+    assert!(ok, "sandbox lc-a create failed: {out}");
+
+    let (ok, out) = run_cli(&[
+        "sandbox",
+        "create",
+        "--workspace",
+        &ws,
+        "--name",
+        "lc-b",
+        "--",
+        "echo",
+        "b",
+    ])
+    .await;
+    assert!(ok, "sandbox lc-b create failed: {out}");
+
+    let (ok, _) = kubectl(&["get", "namespace", &ns]).await;
+    assert!(ok, "managed namespace {ns} should exist");
+
+    let (ok, out) = run_cli(&["sandbox", "delete", "lc-a", "--workspace", &ws]).await;
+    assert!(ok, "sandbox lc-a delete failed: {out}");
+
+    wait_sandbox_gone(&ws, "lc-a").await;
+
+    let (ok, _) = kubectl(&["get", "namespace", &ns]).await;
+    assert!(
+        ok,
+        "managed namespace {ns} should still exist with lc-b remaining"
+    );
+
+    let (ok, out) = run_cli(&["sandbox", "delete", "lc-b", "--workspace", &ws]).await;
+    assert!(ok, "sandbox lc-b delete failed: {out}");
+
+    wait_sandbox_gone(&ws, "lc-b").await;
+
+    let (ok, out) = run_cli(&["workspace", "delete", &ws]).await;
+    assert!(ok, "workspace delete failed: {out}");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (exists, _) = kubectl(&["get", "namespace", &ns]).await;
+        if !exists {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("managed namespace {ns} still exists 30s after full lifecycle cleanup");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+#[tokio::test]
+async fn managed_rejects_invalid_dns1123_sandbox_name() {
+    let ws = unique_workspace("mgddns");
+    let _cleanup = ManagedCleanup {
+        workspace: ws.clone(),
+        sandboxes: vec![],
+    };
+
+    let (ok, out) = run_cli(&["workspace", "create", "--name", &ws]).await;
+    assert!(ok, "workspace create failed: {out}");
+
+    let (ok, out) = run_cli(&[
+        "sandbox",
+        "create",
+        "--workspace",
+        &ws,
+        "--name",
+        "my_bad_name",
+        "--",
+        "echo",
+        "nope",
+    ])
+    .await;
+    assert!(
+        !ok,
+        "sandbox with underscore name should be rejected: {out}"
+    );
+    assert!(
+        out.contains("lowercase alphanumeric"),
+        "error should mention character constraint: {out}"
+    );
+
+    let (ok, out) = run_cli(&[
+        "sandbox",
+        "create",
+        "--workspace",
+        &ws,
+        "--name",
+        "MyBadName",
+        "--",
+        "echo",
+        "nope",
+    ])
+    .await;
+    assert!(!ok, "sandbox with uppercase name should be rejected: {out}");
+    assert!(
+        out.contains("lowercase alphanumeric"),
+        "error should mention character constraint: {out}"
+    );
+
+    let (ok, out) = run_cli(&[
+        "sandbox",
+        "create",
+        "--workspace",
+        &ws,
+        "--name",
+        "trailing-",
+        "--",
+        "echo",
+        "nope",
+    ])
+    .await;
+    assert!(
+        !ok,
+        "sandbox with trailing hyphen should be rejected: {out}"
+    );
+    let normalized: String = out
+        .chars()
+        .filter(|c| *c != '│')
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        normalized.contains("must not start or end with a hyphen"),
+        "error should mention hyphen constraint: {out}"
     );
 }
