@@ -62,6 +62,7 @@ creates a fresh writable overlay; the prepared Bazel output remains unchanged.
 
 ## Run a Bazel test
 
+`bazel test` is the canonical entrypoint for automated test-guest execution.
 The representative smoke test consumes the same prepared image provider:
 
 ```shell
@@ -132,21 +133,6 @@ bazel run //bzl/test-guest:fedora_podman -- \
 
 Forward a loopback port with `--forward-port HOST_PORT:GUEST_PORT`. Both ports
 must be between 1024 and 65535, and each host port may appear only once.
-
-## E2E integration
-
-The named E2E runner selects the corresponding Bazel guest target when VM mode
-is requested:
-
-```shell
-mise run e2e:test -- \
-  --with podman \
-  --gateway-config path/to/gateway.toml \
-  --suite suite-name
-```
-
-Use `--vm DISTRO` to override the inferred distro. The ordered `--with` values
-must correspond to a supported target suffix, such as `rocky_docker_selinux`.
 
 ## Directory structure
 
