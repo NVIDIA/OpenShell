@@ -18,6 +18,7 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder};
+use docker_credential::{CredentialRetrievalError, DockerCredential};
 use flate2::read::GzDecoder;
 use futures::{Stream, StreamExt, TryStreamExt};
 use nix::errno::Errno;
@@ -3561,46 +3562,40 @@ fn linux_oci_arch() -> &'static str {
 
 #[allow(clippy::result_large_err)]
 fn registry_auth(image_ref: &str) -> Result<RegistryAuth, Status> {
-    let username = env_non_empty("OPENSHELL_REGISTRY_USERNAME");
-    let token = env_non_empty("OPENSHELL_REGISTRY_TOKEN");
+    let reference = parse_registry_reference(image_ref)?;
+    let server = reference.resolve_registry().trim_end_matches('/');
 
-    match token {
-        Some(token) => {
-            let username = match username {
-                Some(username) => username,
-                None if image_reference_registry_host(image_ref)
-                    .eq_ignore_ascii_case("ghcr.io") =>
-                {
-                    "__token__".to_string()
-                }
-                None => {
-                    return Err(Status::failed_precondition(
-                        "OPENSHELL_REGISTRY_USERNAME is required when OPENSHELL_REGISTRY_TOKEN is set for non-GHCR registries",
-                    ));
-                }
-            };
-            Ok(RegistryAuth::Basic(username, token))
+    match docker_credential::get_credential(server) {
+        Ok(DockerCredential::UsernamePassword(username, password)) => {
+            info!(
+                registry = %server,
+                username = %username,
+                "vm driver: using Docker registry credentials"
+            );
+
+            Ok(RegistryAuth::Basic(username, password))
         }
-        None => Ok(RegistryAuth::Anonymous),
-    }
-}
 
-fn env_non_empty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-}
+        Ok(DockerCredential::IdentityToken(_)) => {
+            Err(Status::failed_precondition(format!(
+                "Docker registry for '{image_ref}' returned an identity token; \
+                 OpenShell currently requires username/password credentials"
+            )))
+        }
 
-fn image_reference_registry_host(image_ref: &str) -> &str {
-    let mut parts = image_ref.splitn(2, '/');
-    let first = parts.next().unwrap_or(image_ref);
-    let has_path = parts.next().is_some();
-    if has_path
-        && (first.contains('.') || first.contains(':') || first.eq_ignore_ascii_case("localhost"))
-    {
-        first
-    } else {
-        "docker.io"
+        Err(CredentialRetrievalError::ConfigNotFound)
+        | Err(CredentialRetrievalError::NoCredentialConfigured) => {
+            info!(
+                registry = %server,
+                "vm driver: no Docker registry credentials found; using anonymous auth"
+            );
+
+            Ok(RegistryAuth::Anonymous)
+        }
+
+        Err(err) => Err(Status::failed_precondition(format!(
+            "failed to read Docker registry credentials for '{image_ref}': {err}"
+        ))),
     }
 }
 
