@@ -84,6 +84,8 @@ mise run fips:audit
 
 The gateway verifies its own posture at startup. If the binary was built with `fips` but the feature did not reach the rustls dependency, it exits with an error rather than running with non-approved cryptography.
 
+That check covers the process-default cryptographic provider, which is what OpenShell's own TLS and most dependencies use. It does not and cannot cover dependencies that select a provider for themselves — the database driver and the AWS SDK — which are enforced at build time and by tests instead. Do not read a clean startup as a whole-process attestation; `mise run fips:audit` and `mise run fips:test` are the other two thirds of the picture.
+
 ### Key exchange is stricter than rustls's default
 
 OpenShell restricts TLS key exchange to NIST P-256 and P-384. This is deliberately narrower than rustls's own FIPS provider, which also offers X25519 and the X25519+ML-KEM768 post-quantum hybrid on the grounds that AWS-LC's validated boundary covers them.

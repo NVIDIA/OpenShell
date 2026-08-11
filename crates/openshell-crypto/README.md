@@ -36,8 +36,13 @@ from *its* features rather than the process default; a `compile_error!` in
 FIPS mode is selected at build time, not at runtime. That is a choice rather than
 a technical necessity — `ring` is already linked in a FIPS build, so one artifact
 could dispatch at runtime. Build-time selection keeps *which module is in use* a
-property of the artifact rather than of a code path, which is what lets
-`verify_fips_posture()` assert it once at startup.
+property of the artifact rather than of a code path.
+
+`verify_fips_posture()` covers only what uses the process-default provider. It
+reads `CryptoProvider::get_default()` and therefore cannot see `sqlx`'s or the AWS
+SDK's provider, each of which selects its own; those are enforced separately by a
+`compile_error!` and by a unit test in `openshell-server`. See
+`architecture/build.md` for the full table.
 
 On rustls 0.23 `require_ems` is additionally derived from the `fips` feature, but
 that mechanism is going away in 0.24 — see the migration note in
@@ -55,11 +60,12 @@ openshell_crypto::verify_fips_posture()?;
 Every `ClientConfig::builder()` and `ServerConfig::builder()` call then inherits
 the FIPS suite and group restrictions — no provider threading required.
 
-`verify_fips_posture()` is the runtime half of the compile-time guarantee. It
-inspects the *installed* provider, so it catches both a build where `fips`
-reached this crate but not `rustls`, and a process default installed by
-something that won the race. Either would otherwise produce a non-approved
-provider with no visible symptom.
+`verify_fips_posture()` is the runtime half of the compile-time guarantee *for the
+process-default provider*. It inspects the installed provider, so it catches both
+a build where `fips` reached this crate but not `rustls`, and a process default
+installed by something that won the race. Either would otherwise produce a
+non-approved provider with no visible symptom. It says nothing about `sqlx` or the
+AWS SDK — see above.
 
 Library code that builds a TLS client without a binary entry point having run
 first should call `ensure_default_provider()` instead — it fills in a missing

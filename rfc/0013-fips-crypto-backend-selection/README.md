@@ -130,8 +130,7 @@ Build-time selection is a deliberate choice rather than a technical necessity.
 `ring` is already linked in a FIPS build, so one artifact could dispatch between
 backends at runtime. We decline because that would make *which module is in use* a
 property of a code path instead of the artifact, and the guarantee would then
-depend on every dispatch site being correct. Selecting at build time is what lets
-`verify_fips_posture()` assert the posture once, at startup.
+depend on every dispatch site being correct.
 
 On rustls 0.23 a second mechanism points the same way — `require_ems`, the TLS 1.2
 extended-master-secret requirement, is derived from `cfg!(feature = "fips")`. That
@@ -177,7 +176,22 @@ provider, because checking what we *would* have installed proves nothing about
 what is in use: `install_default()` loses to whoever got there first, so a
 dependency or an earlier code path can win the race.
 
-This catches two failures — a feature that reached `openshell-crypto` but not
+Its scope is the process-default provider and nothing more. Dependencies that
+construct their own provider are invisible to it, so the design needs three
+enforcement mechanisms rather than one:
+
+| Mechanism | Covers | When it fires |
+|---|---|---|
+| `verify_fips_posture()` | Everything on the process-default provider: OpenShell's own TLS, `reqwest`, `kube`, `tokio-tungstenite` | Gateway and CLI startup |
+| `compile_error!` on `fips` + `db-tls-ring` | Database TLS, which `sqlx` selects from its own features | Compile time |
+| Unit test on `aws_crypto_mode()` | The AWS SDK path, which `aws-smithy-http-client` selects for itself | Test time |
+
+A build that wired the AWS path to `ring` would still pass the startup check; only
+the mode test catches it. Reviewers should not read the startup check as a
+whole-process guarantee.
+
+The startup check itself catches two failures — a feature that reached
+`openshell-crypto` but not
 `rustls`, and a process default installed by something else. Both would
 otherwise downgrade silently and pass every functional test.
 
@@ -311,8 +325,10 @@ rather than passing silently.
 `openshell-server` now builds the SDK's HTTPS client explicitly
 (`provider_refresh::aws_http_client`) with a `CryptoMode` selected by the `fips`
 feature, so STS calls use AWS-LC in FIPS mode. `CryptoMode::AwsLcFips` asserts
-internally that its provider reports FIPS, so a mis-plumbed feature panics at
-client construction rather than downgrading silently.
+internally that its provider reports FIPS, but that fires when the first connector
+is requested rather than at client construction — `build_https` is lazy. The
+build-mode guarantee for this path therefore rests on a unit test asserting the
+selected `CryptoMode`, not on the client being constructible.
 
 Supplying the client also made the SDK's own TLS features redundant, and dropping
 them removed the legacy `rustls 0.21` stack that `aws-sdk-sts/rustls` pulled in

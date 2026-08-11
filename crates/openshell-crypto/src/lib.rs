@@ -25,9 +25,8 @@
 //! technical necessity: `ring` is already linked in a FIPS build, so a single
 //! artifact could dispatch between backends at runtime. Build-time selection
 //! keeps *which module is in use* a property of the artifact rather than of a code
-//! path, which is what lets [`verify_fips_posture`] assert it once at startup. A
-//! runtime switch would make the guarantee depend on every dispatch site being
-//! correct, and would leave a non-validated path reachable in a FIPS
+//! path. A runtime switch would make the guarantee depend on every dispatch site
+//! being correct, and would leave a non-validated path reachable in a FIPS
 //! deployment — the posture this crate exists to avoid.
 //!
 //! Note the mechanism, not the conclusion, is version-specific. On rustls 0.23
@@ -48,6 +47,12 @@
 //! [`verify_fips_posture`] asserts that against the *installed* provider at
 //! startup, so a mis-plumbed feature fails loudly instead of downgrading
 //! silently.
+//!
+//! That check covers only what uses the process-default provider. Dependencies
+//! that select a provider for themselves are outside its reach and are enforced
+//! elsewhere: `sqlx` by a `compile_error!` in `openshell-server`, and the AWS SDK
+//! by a unit test on the `CryptoMode` that crate selects. See the enforcement
+//! table in `architecture/build.md`.
 //!
 //! It does **not** cover:
 //!

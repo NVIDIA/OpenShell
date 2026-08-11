@@ -88,11 +88,27 @@ rather than a constraint, because `ring` is already linked in a FIPS build and o
 artifact could dispatch between backends at runtime.
 
 We keep build-time selection because it makes *which module is in use* a property
-of the artifact rather than of a code path. That is what allows
-`verify_fips_posture()` to assert the posture once at startup; a runtime switch
-would make the guarantee depend on every dispatch site being correct and would
-leave a non-validated path reachable in a FIPS deployment. See the 0.24 migration
-note below.
+of the artifact rather than of a code path. A runtime switch would make the
+guarantee depend on every dispatch site being correct and would leave a
+non-validated path reachable in a FIPS deployment. See the 0.24 migration note
+below.
+
+### Three enforcement mechanisms, three surfaces
+
+No single check covers the whole build. Each dependency class that selects its own
+provider needs its own enforcement, and it is worth knowing which one covers what:
+
+| Mechanism | Covers | When it fires |
+|---|---|---|
+| `verify_fips_posture()` | Everything that uses the process-default provider: OpenShell's own TLS, `reqwest`, `kube`, `tokio-tungstenite` | Gateway and CLI startup |
+| `compile_error!` on `fips` + `db-tls-ring` | Database TLS, which `sqlx` selects from its own features | Compile time |
+| `aws_crypto_mode()` and its unit test | The AWS SDK path, which `aws-smithy-http-client` selects for itself | Test time; smithy's own internal assertion fires on first connector request |
+
+The boundary matters: `verify_fips_posture()` reads
+`CryptoProvider::get_default()`, so it cannot see `sqlx`'s or smithy's provider at
+all. A build that wired the AWS path to `ring` would still pass the startup check —
+only the mode test catches that. Treating the startup check as a whole-process
+guarantee is the mistake this table exists to prevent.
 
 On rustls 0.23 `require_ems` (the TLS 1.2 extended-master-secret requirement) is
 also derived from `cfg!(feature = "fips")`, which makes that behavior
