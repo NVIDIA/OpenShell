@@ -49,8 +49,14 @@ Every `ClientConfig::builder()` and `ServerConfig::builder()` call then inherits
 the FIPS suite and group restrictions — no provider threading required.
 
 `verify_fips_posture()` is the runtime half of the compile-time guarantee. It
-catches a build where `fips` reached this crate but not `rustls`, which would
-otherwise produce a non-approved provider with no visible symptom.
+inspects the *installed* provider, so it catches both a build where `fips`
+reached this crate but not `rustls`, and a process default installed by
+something that won the race. Either would otherwise produce a non-approved
+provider with no visible symptom.
+
+Library code that builds a TLS client without a binary entry point having run
+first should call `ensure_default_provider()` instead — it fills in a missing
+provider and never replaces one, so it is safe from a library.
 
 For anything that needs a backend explicitly:
 
@@ -68,7 +74,7 @@ Algorithm restriction comes from `rustls::crypto::default_fips_provider()`, not
 a hand-maintained suite list, so the approved set tracks rustls's view of the
 module's validated boundary.
 
-Three things this crate cannot fix, each documented at its definition:
+Four things this crate does not cover, each documented at its definition:
 
 - **SSH implementations.** `ssh::preferred()` restricts negotiation, but russh
   implements those algorithms with `ed25519-dalek`, `p256`, and RustCrypto AES —

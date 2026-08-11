@@ -266,11 +266,13 @@ actually promises and are the ones most in need of review.
 ## Implementation plan
 
 **Phase 1 — TLS, PKI, credential storage, SSH negotiation. Complete.**
-Adds `openshell-crypto` with `backend-ring` (default) and `fips` features;
-migrates all provider-install sites, custom certificate verifiers, PKI and JWT
-key generation, credential AEAD, and both SSH configs; adds `mise run fips:{check,test,build,audit}`;
-documents the operator-facing view in `docs/security/fips.mdx` and the workspace
-feature scheme in `architecture/build.md`.
+Adds `openshell-crypto` with a single one-way `fips` feature; migrates all
+provider-install sites, custom certificate verifiers, PKI and JWT key
+generation, credential AEAD, cryptographic hashing, and both SSH configs; adds
+the `compile_error!` guard for the sqlx conflict in `openshell-server`; adds
+`mise run fips:{check,test,build,audit}`; documents the operator-facing view in
+`docs/security/fips.mdx` and the workspace feature scheme in
+`architecture/build.md`.
 
 Validation: 5087 tests pass in default mode; 473 in FIPS mode via
 `mise run fips:test`, which runs the **strict** feature graph
