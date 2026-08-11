@@ -1,0 +1,158 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Building OpenShell in FIPS Mode for Regulated Deployments"
+sidebar-title: "FIPS Mode"
+slug: "security/fips"
+description: "How to build OpenShell against a FIPS 140-3 validated cryptographic module, what the fips feature covers, and which gaps remain."
+keywords: "FIPS, FIPS 140-3, Compliance, Cryptography, AWS-LC, TLS, Government"
+position: 2
+---
+
+OpenShell builds against a FIPS 140-3 validated cryptographic module when you enable the `fips` Cargo feature. This replaces `ring` with AWS-LC in FIPS mode and narrows every algorithm choice to the FIPS-approved set.
+
+The feature is off by default. Default builds are unchanged.
+
+<Warning>
+Enabling `fips` does not by itself make a deployment FIPS compliant. Several gaps remain, listed under [What is not covered](#what-is-not-covered). Read that section before making a compliance claim.
+</Warning>
+
+## Build requirements
+
+Compiling `aws-lc-fips-sys` from source requires:
+
+- CMake 3.x or later
+- Go 1.20 or later
+- A C compiler
+
+These are needed only at build time, not at runtime.
+
+## Building
+
+```shell
+mise run fips:build
+```
+
+Or directly. Note `--no-default-features`, and that the non-crypto defaults have
+to be listed again explicitly:
+
+```shell
+cargo build --release -p openshell-server \
+  --no-default-features --features fips,telemetry,bundled-z3
+cargo build --release -p openshell-cli --no-default-features --features fips
+cargo build --release -p openshell-sandbox \
+  --no-default-features --features fips,telemetry,bundled-ca-roots
+```
+
+<Warning>
+Building the gateway with plain `--features fips` fails with a `compile_error!`,
+and that is deliberate. sqlx picks its TLS backend from its own Cargo features
+rather than the process-default provider, and prefers `ring` when both backends
+are enabled. Because Cargo features are additive, `--features fips` alone leaves
+the default `db-tls-ring` feature on and would produce a gateway that reports
+FIPS while encrypting database traffic with `ring`. The build error is what
+prevents that combination from shipping.
+</Warning>
+
+Verify and test a FIPS build:
+
+```shell
+mise run fips:check
+mise run fips:test
+mise run fips:audit
+```
+
+## What the feature changes
+
+| Operation | Default build | FIPS build |
+|---|---|---|
+| TLS cipher suites | Includes ChaCha20-Poly1305 | AES-GCM only |
+| TLS key exchange | Includes X25519 | ECDH P-256/P-384 only |
+| TLS 1.2 extended master secret | Optional | Required |
+| TLS crypto module | `ring` | AWS-LC (FIPS mode) |
+| X.509 key generation | ECDSA P-256 via `ring` | ECDSA P-256 via AWS-LC |
+| Gateway JWT signing | Ed25519 (`EdDSA`) | ECDSA P-256 (`ES256`) |
+| Credential encryption at rest | AES-256-GCM via `ring` | AES-256-GCM via AWS-LC |
+| AWS STS client TLS (transport only) | `ring` | AWS-LC (FIPS mode) |
+| AWS SigV4 request signing | RustCrypto HMAC-SHA256 | RustCrypto HMAC-SHA256 (unchanged — see below) |
+| Randomness (keys, nonces) | `ring` | AWS-LC |
+| Key and credential-identifier hashing | `ring` / RustCrypto | AWS-LC |
+| Content and revision hashing | RustCrypto | RustCrypto (unchanged — see below) |
+| SSH host key | Ed25519 | ECDSA P-256 |
+| SSH key exchange | Includes Curve25519, ML-KEM | ECDH P-256/384/521, DH group 14/16 |
+| SSH cipher | Includes ChaCha20-Poly1305 | AES-GCM, AES-CTR |
+
+The gateway verifies its own posture at startup. If the binary was built with `fips` but the feature did not reach the rustls dependency, it exits with an error rather than running with non-approved cryptography.
+
+That check covers the process-default cryptographic provider, which is what OpenShell's own TLS and most dependencies use. It does not and cannot cover dependencies that select a provider for themselves — the database driver and the AWS SDK — which are enforced at build time and by tests instead. Do not read a clean startup as a whole-process attestation; `mise run fips:audit` and `mise run fips:test` are the other two thirds of the picture.
+
+### Key exchange is stricter than rustls's default
+
+OpenShell restricts TLS key exchange to NIST P-256 and P-384. This is deliberately narrower than rustls's own FIPS provider, which also offers X25519 and the X25519+ML-KEM768 post-quantum hybrid on the grounds that AWS-LC's validated boundary covers them.
+
+The reasoning is that an auditor reading SP 800-56A rev3 expects NIST curves, and every TLS 1.3 implementation supports P-256, so the interoperability cost is nil.
+
+The tradeoff is real: FIPS builds lose the post-quantum hybrid key exchange that default builds get. If your auditor accepts rustls's position, the restriction is a one-line change in `openshell-crypto` — see `FIPS_KX_GROUP_NAMES`.
+
+Cipher suites need no equivalent restriction. rustls compiles ChaCha20-Poly1305 out entirely under its `fips` feature.
+
+## Operational differences
+
+**JWT algorithm change — requires key rotation.** A FIPS gateway signs sandbox tokens with `ES256` and accepts only `ES256`. A default-build gateway signs and accepts only `EdDSA`. The two are deliberately disjoint so a FIPS gateway cannot validate a token signed by a non-approved key.
+
+<Warning>
+An existing gateway persists an Ed25519 JWT signing key. A FIPS build cannot
+parse it and **will fail to start**, reporting that the key must be rotated.
+This is not a background migration — rotate the key before or during the switch:
+
+```shell
+openshell-gateway generate-certs
+```
+
+Rotation invalidates outstanding sandbox tokens. They are short-lived and
+re-minted on demand, so no further operator action is needed once the gateway
+starts.
+</Warning>
+
+Also do not run FIPS and non-FIPS gateway replicas in the same set. Token validation will fail across them, and nothing detects the mismatch until the first cross-replica validation.
+
+**Database TLS trust store.** sqlx 0.8 offers native-root loading only on its `ring` backend, so a FIPS build uses the webpki bundled roots for PostgreSQL connections instead of the system trust store. If your database certificate is signed by a private CA, set `sslrootcert` in `DATABASE_URL` — that path works independently of the root store.
+
+**SSH host key fingerprint.** Host keys change from Ed25519 to ECDSA P-256. Sandboxes are ephemeral and generate a host key per sandbox, so there is no persistent `known_hosts` entry to update.
+
+## What is not covered
+
+<Warning>
+These are known gaps, not oversights. A deployment claiming FIPS compliance needs each of them addressed or accepted in writing.
+</Warning>
+
+**The SSH transport uses unvalidated implementations.** The `fips` feature restricts SSH *negotiation* to approved algorithms, but russh implements them with `ed25519-dalek`, `p256`, and RustCrypto AES — none validated modules. This is accepted on the grounds that the gateway-to-sandbox SSH transport runs inside the mTLS boundary and performs no authentication of its own. Closing it requires an aws-lc-rs backend upstream in russh or replacing the embedded server with OpenSSH.
+
+**`ring` remains linked.** `openshell-crypto` depends on `ring` unconditionally, so it is present in every build. This is deliberate: pairing `fips` with an opposite `backend-ring` feature would create a state where both are enabled at once, and any dependency resolving that ambiguity in favor of `ring` would silently produce a non-FIPS build. A one-way switch has no ambiguous state. `ring` is not *invoked* for OpenShell's own cryptography in a FIPS build: the process-default provider is verified at startup, and the two dependencies that select for themselves are pinned to AWS-LC by a compile-time guard and a unit test respectively. But "linked but unreachable" is a weaker claim than "absent". Run `mise run fips:audit` for the current inventory.
+
+The build now contains a single rustls major (0.23). The AWS SDK's legacy `rustls 0.21` stack, which was hard-wired to `ring` and outside the process-default provider's reach, has been removed by supplying the SDK's HTTPS client explicitly.
+
+**Content and revision hashing still uses RustCrypto.** Policy revisions, provider-profile catalog hashes, gateway-interceptor profile digests, and VM image digests compute SHA-256 with the RustCrypto `sha2` crate. These are content-addressing and change-detection, not security functions: they protect nothing and gate no decision. Cryptographic uses of SHA-256 — JWT key identifiers, credential-storage key identifiers, and Kubernetes Secret and Vault credential path derivation — are routed through the validated module. If an auditor requires every SHA-256 invocation to come from the validated module regardless of purpose, the remaining call sites are a mechanical change.
+
+**AWS SigV4 request signing uses an unvalidated module.** SigV4 computes HMAC-SHA256 over the request, keyed with the AWS secret access key, through `aws-sigv4`. That crate depends on RustCrypto `hmac` and `sha2` unconditionally and exposes no backend feature, so this cannot be changed by configuration — unlike every other gap here, there is no flag that fixes it.
+
+This affects **two** paths, not one:
+
+- **Supervisor proxy-side signing.** Sandboxes whose policy enables proxy-side AWS credential signing.
+- **Gateway STS credential refresh.** `aws-sdk-sts` signs every `AssumeRole` request through `aws-runtime` → `aws-sigv4`, so any provider using the `aws_sts_assume_role` refresh strategy handles its source secret access key through the unvalidated module too.
+
+The second path is easy to miss because the STS *transport* was moved to the validated module — see the table above. Transport and signing are separate concerns, and only the first is fixed.
+
+This is the most significant remaining gap, because it is HMAC directly over credential material rather than a transport concern. Closing it requires either implementing SigV4 signing against `openshell-crypto` (well-specified, but a wrong implementation breaks all AWS provider access, so it needs the published AWS test vectors) or upstreaming a backend feature to `aws-sigv4`.
+
+Deployments that use neither proxy-side signing nor the AWS STS refresh strategy are unaffected.
+
+**Container images are not FIPS-capable.** The published gateway image is distroless Debian and the supervisor is statically linked musl/Alpine. Neither provides a FIPS-mode system OpenSSL, and the static musl build cannot link one. A FIPS deployment on OpenShift needs a UBI-based image variant and a glibc supervisor build.
+
+**The host must be in FIPS mode.** Building against a validated module does not put the kernel or the platform in FIPS mode. On RHEL and OpenShift, enable it at the OS or cluster level separately.
+
+**SDKs are not covered.** The Go SDK does not set `GOFIPS140`, and the Python SDK uses grpcio's bundled BoringSSL, which is not a FIPS build.
+
+## Verifying a build
+
+`mise run fips:audit` reports whether the validated module is linked, which dependencies still pull `ring`, and how many distinct rustls versions are present. It exits non-zero only if `aws-lc-fips-sys` is missing entirely, which indicates the feature failed to propagate.

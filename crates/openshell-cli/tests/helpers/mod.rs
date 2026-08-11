@@ -76,7 +76,7 @@ impl Drop for EnvVarGuard {
 /// Safe to call multiple times — subsequent calls are no-ops.
 #[allow(dead_code)]
 pub fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    openshell_crypto::install_default_provider();
 }
 
 /// Generate a self-signed CA certificate and its key pair.

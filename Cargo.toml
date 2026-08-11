@@ -35,10 +35,16 @@ http-body = "1.0"
 http-body-util = "0.1"
 
 # TLS
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
-rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "ring"] }
+#
+# No crypto backend is selected here. `openshell-crypto` owns backend choice for
+# the whole workspace and turns on `rustls/ring` or `rustls/aws_lc_rs` + `rustls/fips`
+# via its own features; Cargo feature unification applies that to every crate.
+# Adding a backend feature back to these entries would silently defeat the FIPS
+# build by linking ring unconditionally.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12"] }
 rustls-pemfile = "2"
-rcgen = { version = "0.13", features = ["crypto", "pem"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem"] }
 webpki-roots = "1"
 rustls-native-certs = "0.8"
 
@@ -87,11 +93,23 @@ tower-mcp-types = "0.12.0"
 regex = "1"
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+#
+# `-no-provider` so reqwest uses the process-default CryptoProvider that
+# `openshell-crypto::install_default_provider` installs. The plain
+# `rustls-tls-native-roots` feature force-enables `rustls/ring`.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots-no-provider"] }
 
 # AWS SDK
-aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
-aws-sdk-sts = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+#
+# No TLS feature. `openshell-server` supplies the HTTPS client explicitly so the
+# backend follows its `fips` feature (see `provider_refresh::aws_http_client`),
+# which makes the SDK's own TLS features redundant. Dropping them also removes
+# the legacy stack: `aws-sdk-sts/rustls` pulls
+# `aws-smithy-runtime/tls-rustls` -> `legacy-rustls-ring`, which is rustls 0.21
+# on hyper 0.14 and hard-wired to ring. Re-adding either feature reintroduces a
+# second TLS stack that the installed CryptoProvider does not govern.
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 # WebSocket
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
@@ -100,11 +118,16 @@ tokio-tungstenite = { version = "0.26", default-features = false, features = ["c
 base64 = "0.22"
 
 # Crypto / Auth
+#
+# `openshell-crypto` is the only crate that should name a crypto backend
+# directly. Everything else depends on it and inherits the build's choice.
+openshell-crypto = { path = "crates/openshell-crypto", default-features = false }
 sha2 = "0.10"
 rand = "0.9"
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 getrandom = "0.3"
 ring = "0.17"
+russh = "0.62"
 spiffe = { version = "0.15", default-features = false, features = ["workload-api-jwt", "tracing"] }
 
 # Filesystem embedding
@@ -123,7 +146,12 @@ url = "2"
 indexmap = "2"
 
 # Database
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "sqlite", "migrate", "macros"] }
+#
+# No TLS feature here. sqlx picks its crypto provider with an explicit
+# `builder_with_provider` call gated on its own cargo features rather than
+# honoring the process default, so the backend has to be selected by the
+# consuming crate's `backend-ring` / `fips` feature. See openshell-server.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "sqlite", "migrate", "macros"] }
 
 # Kubernetes
 kube = { version = "0.90", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }

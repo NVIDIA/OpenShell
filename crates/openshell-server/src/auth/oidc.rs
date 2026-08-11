@@ -168,6 +168,9 @@ impl JwksCache {
     /// Create a new JWKS cache, discovering the JWKS URI and fetching the
     /// initial key set.
     pub async fn new(config: &OidcConfig) -> Result<Self, String> {
+        // Library code can run without a binary entry point (tests, embedders),
+        // and rustls panics if a TLS config is built with no process default.
+        openshell_crypto::ensure_default_provider();
         let http = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()

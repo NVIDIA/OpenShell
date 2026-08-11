@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# FIPS build tasks.
+#
+# The `fips` cargo feature switches every OpenShell crypto operation from `ring`
+# to AWS-LC in FIPS mode. Building it requires CMake and Go on the host to
+# compile `aws-lc-fips-sys`, which is why it is not part of the default `ci`
+# task. See docs/security/fips.mdx.
+#
+# The gateway must be built with `--no-default-features`: sqlx selects its TLS
+# backend from its own cargo features and prefers ring when both are enabled, so
+# the default `db-tls-ring` feature has to be off. A `compile_error!` in
+# openshell-server enforces this, but the non-crypto defaults still have to be
+# re-added by hand, which is what `--features fips,telemetry` does here.
+
+["fips:check"]
+description = "Type-check the gateway, CLI, and supervisor in FIPS mode"
+run = """
+cargo check -p openshell-server --no-default-features --features fips,telemetry --all-targets
+cargo check -p openshell-cli --no-default-features --features fips --all-targets
+cargo check -p openshell-sandbox --no-default-features --features fips,telemetry,bundled-ca-roots --all-targets
+"""
+
+["fips:test"]
+description = "Run the FIPS-mode test suites against the strict feature graph"
+run = """
+cargo test -p openshell-crypto --no-default-features --features fips
+cargo test -p openshell-driver-db-credstore --no-default-features --features fips
+cargo test -p openshell-driver-vault --no-default-features --features fips
+cargo test -p openshell-driver-kubernetes-secrets --no-default-features --features fips
+cargo test -p openshell-bootstrap --no-default-features --features fips
+cargo test -p openshell-server --no-default-features --features fips,telemetry --lib auth::
+cargo test -p openshell-server --no-default-features --features fips,telemetry --lib provider_refresh::
+cargo test -p openshell-supervisor-process --no-default-features --features fips
+"""
+
+["fips:build"]
+description = "Release-build the gateway in FIPS mode"
+run = "cargo build --release -p openshell-server --no-default-features --features fips,telemetry,bundled-z3"
+
+["fips:audit"]
+description = "Report which dependencies still link ring in a FIPS build"
+run = "tasks/scripts/fips-audit.sh"
+
+[fips]
+description = "Check, test, and audit the FIPS build"
+depends = ["fips:check", "fips:test", "fips:audit"]

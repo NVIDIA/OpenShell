@@ -23,6 +23,20 @@
 //! The VM launch plumbing now lives in [`compute::vm`]; keep this file limited
 //! to selecting and acquiring drivers.
 
+// sqlx picks its TLS provider from its own cargo features rather than the
+// process-default rustls `CryptoProvider`, and when both its ring and aws-lc-rs
+// features are enabled it silently prefers ring. Cargo features are additive,
+// so `--features fips` alone leaves `db-tls-ring` on from the default set and
+// would produce a gateway that reports FIPS while encrypting database traffic
+// with ring. There is no way to express mutual exclusion in the manifest, so it
+// is enforced here — a build error is the only outcome that cannot be missed.
+#[cfg(all(feature = "fips", feature = "db-tls-ring"))]
+compile_error!(
+    "features `fips` and `db-tls-ring` are mutually exclusive: sqlx would select ring for \
+     database TLS, silently producing a non-FIPS build. Build the FIPS gateway with \
+     `--no-default-features --features fips,telemetry` (add `bundled-z3` for release builds)."
+);
+
 mod auth;
 pub mod certgen;
 pub mod cli;

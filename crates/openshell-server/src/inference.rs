@@ -924,6 +924,9 @@ async fn verify_provider_endpoint(
     model_id: &str,
     route: &ResolvedProviderRoute,
 ) -> Result<ValidatedEndpoint, Status> {
+    // Library code can run without a binary entry point (tests, embedders),
+    // and rustls panics if a TLS config is built with no process default.
+    openshell_crypto::ensure_default_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()

@@ -15,6 +15,7 @@ name = "openshell-sandbox"
 path = "src/main.rs"
 
 [dependencies]
+openshell-crypto = { workspace = true }
 openshell-core = { path = "../openshell-core", default-features = false }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
@@ -61,6 +62,7 @@ system-ca-roots = ["telemetry"]
 
 telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
+fips = ["openshell-crypto/fips"]
 
 [dev-dependencies]
 tempfile = "3"

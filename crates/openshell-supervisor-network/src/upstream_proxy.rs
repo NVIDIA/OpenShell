@@ -1651,7 +1651,7 @@ mod tests {
 
         const SERVER_HOSTNAME: &str = "upstream.example.test";
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        openshell_crypto::install_default_provider();
 
         // Trusted CA; the client config trusts it, and the fake upstream
         // server presents a leaf for SERVER_HOSTNAME signed by it.

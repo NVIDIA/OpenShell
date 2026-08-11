@@ -18,7 +18,6 @@ use openshell_ocsf::{
     ConfigStateChangeBuilder, OCSF_TARGET, SandboxContext, SeverityId, StateId, StatusId,
 };
 use rustls::ServerConfig;
-use rustls::crypto::ring::sign;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use tokio::sync::{mpsc, watch};
@@ -256,7 +255,7 @@ fn build_server_config(
 
     // Validate the key type early — rustls defers this to handshake time,
     // which produces a cryptic error. A bad key type surfaces clearly here.
-    sign::any_supported_type(&key)
+    openshell_crypto::any_supported_signing_key(&key)
         .map_err(|e| Error::tls(format!("unsupported private key type: {e}")))?;
 
     let mut config = if let Some(ca_path) = client_ca_path {

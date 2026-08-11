@@ -11,6 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+openshell-crypto = { workspace = true }
 openshell-core = { path = "../openshell-core" }
 async-trait = "0.1"
 futures = { workspace = true }
@@ -28,6 +29,10 @@ tokio-tungstenite = { workspace = true }
 tonic = { workspace = true, features = ["tls-native-roots"] }
 tower = { workspace = true }
 tracing = { workspace = true }
+
+[features]
+default = []
+fips = ["openshell-crypto/fips"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

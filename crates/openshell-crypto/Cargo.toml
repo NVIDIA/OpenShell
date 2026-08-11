@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+jsonwebtoken = { workspace = true }
+rand = "0.10"
+russh = { workspace = true }
+tracing = { workspace = true }
+
+# The `ring` backend is always compiled in; `fips` additionally compiles in
+# AWS-LC and switches every selection over to it. rcgen resolves the pair on its
+# own (its backend gate prefers `aws_lc_rs`); rustls is selected explicitly by
+# `provider()`.
+rcgen = { workspace = true, features = ["ring"] }
+rustls = { workspace = true, features = ["ring"] }
+
+# `ring` is unconditional rather than paired with an opposite `backend-ring`
+# feature. Cargo features are additive, so two mutually exclusive backend
+# features can always both end up enabled — and any downstream crate that
+# resolves the ambiguity by preferring `ring` (sqlx does exactly this) would
+# then produce a non-FIPS build that still looked like a FIPS build. Making
+# `fips` a one-way switch removes the ambiguous state entirely.
+ring = { workspace = true }
+aws-lc-rs = { version = "1.16", optional = true }
+
+[features]
+default = []
+
+# FIPS build: AWS-LC in FIPS mode backs TLS, PKI, AEAD, hashing, and RNG, and
+# every algorithm selection narrows to the FIPS-approved set.
+#
+# Both backends are compiled in a FIPS build; `provider()` selects between them
+# and `verify_fips_posture()` proves the selection against the installed
+# provider at startup.
+#
+# Requires CMake and Go on the build host to compile aws-lc-fips-sys.
+#
+# `rcgen/aws_lc_rs` is required in addition to `rcgen/fips`: rcgen 0.13.2's
+# `fips` feature pulls the FIPS sys crate but its backend selection gates on
+# `feature = "aws_lc_rs"`, so `fips` alone fails to compile. Enabling both is
+# safe — `aws-lc-rs` links `aws-lc-fips-sys` whenever its own `fips` feature is
+# on, regardless of `aws-lc-sys` also being requested.
+fips = [
+    "dep:aws-lc-rs",
+    "aws-lc-rs/fips",
+    "rustls/aws_lc_rs",
+    "rustls/fips",
+    "rcgen/aws_lc_rs",
+    "rcgen/fips",
+]
+
+[lints]
+workspace = true

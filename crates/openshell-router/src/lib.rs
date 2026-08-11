@@ -37,6 +37,9 @@ pub struct Router {
 
 impl Router {
     pub fn new() -> Result<Self, RouterError> {
+        // Library code can run without a binary entry point (tests, embedders),
+        // and rustls panics if a TLS config is built with no process default.
+        openshell_crypto::ensure_default_provider();
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .build()

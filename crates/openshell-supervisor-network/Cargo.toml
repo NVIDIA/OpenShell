@@ -11,6 +11,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+openshell-crypto = { workspace = true }
 openshell-core = { path = "../openshell-core" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
@@ -53,6 +54,7 @@ webpki-roots = { workspace = true, optional = true }
 [features]
 default = ["bundled-ca-roots"]
 bundled-ca-roots = ["dep:webpki-roots"]
+fips = ["openshell-crypto/fips"]
 
 [dev-dependencies]
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }

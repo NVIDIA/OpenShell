@@ -3,7 +3,7 @@
 
 //! Gateway-minted per-sandbox JWTs.
 //!
-//! The gateway signs an Ed25519 JWT for each sandbox at create time and
+//! The gateway signs a JWT for each sandbox at create time and
 //! the sandbox supervisor presents it as `Authorization: Bearer <jwt>` on
 //! supervisor-to-gateway gRPC calls. This module implements both sides of the
 //! gateway-controlled token:
@@ -12,15 +12,16 @@
 //! - [`SandboxJwtAuthenticator`] validates tokens on inbound requests and
 //!   produces a [`Principal::Sandbox`] with [`SandboxIdentitySource::BootstrapJwt`].
 //!
-//! Algorithm: `EdDSA` (Ed25519). Pinned via `Validation::algorithms` to
-//! prevent algorithm-confusion attacks.
+//! Algorithm: `EdDSA` (Ed25519) in a default build, `ES256` (ECDSA P-256) in a
+//! FIPS build — see `openshell_crypto::jwt_algorithm`. Pinned via
+//! `Validation::algorithms` to prevent algorithm-confusion attacks, and pinned
+//! to exactly one algorithm so a FIPS gateway cannot accept a token signed with
+//! a non-approved key.
 
 use super::authenticator::Authenticator;
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
-use jsonwebtoken::{
-    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
-};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tonic::Status;
@@ -85,8 +86,15 @@ impl SandboxJwtIssuer {
         gateway_id: &str,
         ttl: Duration,
     ) -> Result<Self, String> {
-        let encoding_key = EncodingKey::from_ed_pem(signing_key_pem)
-            .map_err(|e| format!("failed to parse Ed25519 signing key PEM: {e}"))?;
+        let encoding_key = openshell_crypto::jwt_encoding_key(signing_key_pem).map_err(|e| {
+            format!(
+                "failed to parse the sandbox JWT signing key as {}: {e}. A FIPS build \
+                     requires an ECDSA P-256 key and a default build requires an Ed25519 key; \
+                     a gateway whose key material was generated under the other build mode must \
+                     rotate it by re-running `openshell-gateway generate-certs`.",
+                openshell_crypto::JWT_JOSE_ALGORITHM
+            )
+        })?;
         let identity = format!("openshell-gateway:{gateway_id}");
         Ok(Self {
             encoding_key,
@@ -114,7 +122,7 @@ impl SandboxJwtIssuer {
             exp,
             sandbox_id: sandbox_id.to_string(),
         };
-        let mut header = Header::new(Algorithm::EdDSA);
+        let mut header = Header::new(openshell_crypto::jwt_algorithm());
         header.kid = Some(self.kid.clone());
         let token = encode(&header, &claims, &self.encoding_key).map_err(|e| {
             warn!(error = %e, "failed to mint sandbox JWT");
@@ -151,8 +159,13 @@ impl std::fmt::Debug for SandboxJwtAuthenticator {
 
 impl SandboxJwtAuthenticator {
     pub fn from_pem(public_key_pem: &[u8], kid: String, gateway_id: &str) -> Result<Self, String> {
-        let decoding_key = DecodingKey::from_ed_pem(public_key_pem)
-            .map_err(|e| format!("failed to parse Ed25519 public key PEM: {e}"))?;
+        let decoding_key = openshell_crypto::jwt_decoding_key(public_key_pem).map_err(|e| {
+            format!(
+                "failed to parse the sandbox JWT public key as {}: {e}. See the signing-key \
+                     error above for the key-rotation requirement when switching build modes.",
+                openshell_crypto::JWT_JOSE_ALGORITHM
+            )
+        })?;
         let identity = format!("openshell-gateway:{gateway_id}");
         Ok(Self {
             decoding_key,
@@ -174,12 +187,17 @@ impl SandboxJwtAuthenticator {
         if header.kid.as_deref() != Some(self.kid.as_str()) {
             return Ok(None);
         }
-        if !matches!(header.alg, Algorithm::EdDSA) {
+        // A FIPS build signs and accepts ES256; a default build EdDSA. The
+        // sets are deliberately disjoint rather than overlapping: accepting the
+        // other mode's algorithm would let a FIPS gateway validate tokens
+        // signed by a non-approved key. Mixed-mode replica sets are therefore
+        // unsupported — see openshell-crypto::JWT_SIGNATURE_ALGORITHM.
+        if header.alg != openshell_crypto::jwt_algorithm() {
             return Ok(None);
         }
 
-        let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.algorithms = vec![Algorithm::EdDSA];
+        let mut validation = Validation::new(openshell_crypto::jwt_algorithm());
+        validation.algorithms = vec![openshell_crypto::jwt_algorithm()];
         validation.set_issuer(&[&self.issuer]);
         validation.set_audience(&[&self.audience]);
         validation.set_required_spec_claims(&["iss", "aud", "exp", "sub"]);
@@ -278,6 +296,37 @@ mod tests {
         (issuer, auth)
     }
 
+    /// Key material generated under the other build mode must be rejected with
+    /// an actionable error rather than a cryptic parse failure. Switching an
+    /// existing gateway to a FIPS build requires rotating the JWT key, and this
+    /// is the message that has to say so.
+    #[test]
+    fn key_material_from_the_other_build_mode_is_rejected_with_guidance() {
+        let other_mode_key = if openshell_crypto::IS_FIPS_BUILD {
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+        } else {
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        }
+        .expect("generate a key of the non-native type");
+
+        let err = SandboxJwtIssuer::from_pem(
+            other_mode_key.serialize_pem().as_bytes(),
+            "kid".to_string(),
+            "test-gateway",
+            Duration::from_secs(60),
+        )
+        .expect_err("a key of the wrong type must not load");
+
+        assert!(
+            err.contains("rotate") && err.contains("generate-certs"),
+            "the error must tell the operator how to recover, got: {err}"
+        );
+        assert!(
+            err.contains(openshell_crypto::JWT_JOSE_ALGORITHM),
+            "the error must name the expected algorithm, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn mint_and_validate_round_trip() {
         let (issuer, auth) = pair();
@@ -314,8 +363,8 @@ mod tests {
             .expect("exp=0 token should authenticate");
         assert!(matches!(principal, Principal::Sandbox(_)));
 
-        let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.algorithms = vec![Algorithm::EdDSA];
+        let mut validation = Validation::new(openshell_crypto::jwt_algorithm());
+        validation.algorithms = vec![openshell_crypto::jwt_algorithm()];
         validation.set_issuer(&["openshell-gateway:test-gateway"]);
         validation.set_audience(&["openshell-gateway:test-gateway"]);
         validation.set_required_spec_claims(&["iss", "aud", "exp", "sub"]);
@@ -384,7 +433,7 @@ mod tests {
             exp: now_secs() - 3600,
             sandbox_id: "sandbox-c".to_string(),
         };
-        let mut header = Header::new(Algorithm::EdDSA);
+        let mut header = Header::new(openshell_crypto::jwt_algorithm());
         header.kid = Some(mat.kid);
         let token = encode(&header, &claims, &issuer.encoding_key).unwrap();
         let err = auth

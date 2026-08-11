@@ -57,6 +57,144 @@ HTTP/TLS support behind explicit build features, so default system-Z3 builds do
 not reintroduce bundled Mozilla roots. Release builds that need bundled Z3
 continue to opt in with `bundled-z3`.
 
+## Crypto Backend Selection
+
+`openshell-crypto` owns backend selection for everything that uses the
+process-default provider: OpenShell's own TLS, PKI, JWT, AEAD, RNG, and hashing
+that serves a cryptographic purpose. For those, the backend is one feature rather
+than an audit of call sites. The workspace `rustls`, `tokio-rustls`, and `rcgen`
+entries deliberately declare no backend feature — adding one back would link
+`ring` unconditionally and silently defeat the FIPS build.
+
+A crate should name a backend directly only where a dependency leaves no choice,
+and those exceptions are confined to `openshell-server` so they stay enumerable:
+`sqlx` and `aws-smithy-http-client` both construct their own provider, so
+`openshell-server` selects their backends and each carries its own enforcement —
+see the table below. Adding a third exception means adding a row to that table.
+Content and revision hashing is also out of scope.
+
+`fips` is a one-way switch rather than one half of a mutually exclusive pair.
+`ring` is an unconditional dependency of `openshell-crypto`; enabling `fips`
+additionally compiles in AWS-LC and moves every selection to it. There is no
+`backend-ring` feature, deliberately: Cargo features are additive, so two
+mutually exclusive backend features can always both be enabled at once, and any
+dependency that resolves that ambiguity toward `ring` would yield a build that
+reports FIPS while using unvalidated crypto.
+
+Where a dependency selects for itself and the ambiguity cannot be removed, it is
+rejected at compile time. `openshell-server` carries a `compile_error!` for
+`fips` + `db-tls-ring` because sqlx prefers `ring` when both of its backends are
+enabled. This is why a FIPS gateway is built with
+`--no-default-features --features fips,telemetry` and has to re-list its
+non-crypto defaults.
+
+FIPS mode is selected at build time, not at runtime. On rustls 0.23 the
+`require_ems` mechanism forces that; from 0.24 it becomes a deliberate choice
+rather than a constraint, because `ring` is already linked in a FIPS build and one
+artifact could dispatch between backends at runtime.
+
+We keep build-time selection because it makes *which module is in use* a property
+of the artifact rather than of a code path. A runtime switch would make the
+guarantee depend on every dispatch site being correct and would leave a
+non-validated path reachable in a FIPS deployment. See the 0.24 migration note
+below.
+
+### Enforcement mechanisms and the surfaces they cover
+
+No single check covers the whole build. Each dependency class that selects its own
+provider needs its own enforcement, and it is worth knowing which one covers what:
+
+| Mechanism | Covers | When it fires |
+|---|---|---|
+| `verify_fips_posture()` | Everything that uses the process-default provider: OpenShell's own TLS, `reqwest`, `kube`, `tokio-tungstenite` | Gateway and CLI startup |
+| `compile_error!` on `fips` + `db-tls-ring` | Database TLS, which `sqlx` selects from its own features | Compile time |
+| `aws_crypto_mode()` and its unit test | The AWS SDK path, which `aws-smithy-http-client` selects for itself | Test time; smithy's own internal assertion fires on first connector request |
+
+The boundary matters: `verify_fips_posture()` reads
+`CryptoProvider::get_default()`, so it cannot see `sqlx`'s or smithy's provider at
+all. A build that wired the AWS path to `ring` would still pass the startup check —
+only the mode test catches that. Treating the startup check as a whole-process
+guarantee is the mistake this table exists to prevent.
+
+On rustls 0.23 `require_ems` (the TLS 1.2 extended-master-secret requirement) is
+also derived from `cfg!(feature = "fips")`, which makes that behavior
+compile-time too. That is a version-specific mechanism, not the underlying
+reason — see the 0.24 migration note below.
+
+Algorithm restriction comes from `rustls::crypto::default_fips_provider()`
+rather than a hand-maintained suite list, so the approved set tracks rustls's
+view of the module's validated boundary. `install_default_provider()` installs it
+as the process default, which every `ClientConfig::builder()` and
+`ServerConfig::builder()` call then inherits without threading a provider
+through call sites. `verify_fips_posture()` runs at gateway and CLI startup and
+fails the process if the *installed* provider is not FIPS-approved. It reads
+`CryptoProvider::get_default()` rather than a freshly built provider, so it
+catches both a mis-plumbed feature and a provider installed by something that
+won the race. `ensure_default_provider()` covers library code that builds TLS
+clients without a binary entry point having run first; it only fills in a
+missing provider and never replaces one.
+
+Two dependencies do not honor the process default and are handled separately.
+`sqlx` selects a provider from its own features, so `openshell-server` forwards
+the backend choice to it, at the cost of losing native-root loading in FIPS mode.
+`aws-smithy-http-client` constructs its own provider, so the gateway builds the
+AWS SDK's HTTPS client explicitly (`provider_refresh::aws_http_client`) with a
+`CryptoMode` chosen by the `fips` feature; that also let the SDK's legacy
+`rustls 0.21` TLS features be dropped, leaving one rustls major in the graph.
+`mise run fips:audit` reports the residual surface.
+
+`aws-sigv4` cannot be handled either way: it depends on RustCrypto `hmac` and
+`sha2` unconditionally with no backend feature. SigV4 request signing therefore
+computes HMAC-SHA256 outside the validated module in every build mode, on two
+paths — proxy-side signing in `openshell-supervisor-network`, and the gateway's
+STS `AssumeRole` requests, which `aws-sdk-sts` signs via `aws-runtime`. Moving the
+STS *transport* to the validated module (Phase 2) did not change its *signing*.
+
+Hashing is routed through the facade where it is a security function — key
+identifiers, credential-storage key identifiers, and Kubernetes Secret and Vault
+credential path derivation. Content and revision hashing (policy revisions,
+profile catalogs, image digests) stays on RustCrypto `sha2`; those are
+content-addressing rather than cryptographic use.
+
+Build-mode differences that are visible outside the process — the JWT signing
+algorithm, the SSH host key type, and the database trust store — are documented
+in `docs/security/fips.mdx`.
+
+### rustls 0.24 migration note
+
+The FIPS feature plumbing described above is written against rustls 0.23 and will
+not carry forward unchanged. rustls is removing the `fips` feature from the core
+crate on `main` (targeting 0.24) and moving the behaviors it controlled — notably
+`require_ems` — to key off the provider's declared FIPS status at runtime. The
+feature is retained on a separate `rustls-aws-lc-rs` provider crate, where it both
+activates `aws-lc-rs/fips` and statically determines the provider's make-up. See
+[rustls/rustls#3054](https://github.com/rustls/rustls/issues/3054).
+
+Neither is released yet: rustls 0.24 exists only as a `0.24.0-dev` prerelease and
+`rustls-aws-lc-rs` is not published. rustls maintainers have stated 0.23 will not
+change, so nothing here is affected today.
+
+What the upgrade will require:
+
+- `openshell-crypto`'s `fips` feature lists `rustls/aws_lc_rs` and `rustls/fips`.
+  Both cease to exist; the equivalent moves to `rustls-aws-lc-rs/fips`.
+- `provider()` calls `rustls::crypto::default_fips_provider()`, which is gated on
+  the core `fips` feature today and will move with it.
+- `verify_fips_posture()` becomes *more* load-bearing, not less. Once rustls
+  derives its behavioral adaptations from `provider.fips()` at runtime, that
+  return value governs actual protocol behavior rather than only reporting
+  posture, so an unnoticed non-FIPS provider would silently relax TLS 1.2
+  handling instead of merely mislabeling the build.
+
+What the upgrade will **not** change: OpenShell will still ship separate FIPS and
+non-FIPS artifacts. That is a product decision, not a hard limit — a single
+artifact could link the FIPS provider and select policy at runtime, and `ring` is
+already present for a non-FIPS path. We decline because runtime dispatch turns the
+FIPS guarantee into a per-call-site property instead of an artifact-level one,
+which is precisely what the design set out to avoid. rustls maintainers also
+advise against running a FIPS provider in non-FIPS mode, given its slower update
+cadence and performance-costing countermeasures.
+
 ## Linux Runtime Environments
 
 OpenShell uses different Linux libc environments for different host artifacts.

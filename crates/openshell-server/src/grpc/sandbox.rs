@@ -1780,6 +1780,9 @@ fn exec_ssh_client_config() -> russh::client::Config {
     russh::client::Config {
         keepalive_interval: Some(EXEC_KEEPALIVE_INTERVAL),
         keepalive_max: EXEC_KEEPALIVE_MAX,
+        // Must match the sandbox SSH server's restriction, or a FIPS build
+        // would negotiate down to whatever both sides still share.
+        preferred: openshell_crypto::ssh::preferred(),
         ..Default::default()
     }
 }
