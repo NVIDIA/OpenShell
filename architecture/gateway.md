@@ -29,6 +29,34 @@ gateway maps the verified certificate subject to a user principal. Kubernetes
 deployments use mTLS for transport only and require OIDC or a trusted access
 proxy for user authentication unless the explicit unsafe local-development
 `allow_unauthenticated_users` switch is enabled.
+OIDC deployments normally enforce RBAC roles for user and admin APIs, and
+authenticated gRPC methods fail closed when no user, sandbox, mTLS, or explicit
+local-dev principal can be derived.
+
+Auth validation runs in two stages so an unsafe gateway fails to start before
+any listener accepts traffic:
+
+1. **Configuration invariants** (`validate_gateway_auth_config`), checked before
+   the compute runtime is initialized. `allow_oidc_auth_only` requires OIDC, and
+   OIDC `admin_role` and `user_role` must both be set (RBAC) or both be empty
+   (authentication-only).
+2. **Resolved deployment posture** (`validate_gateway_auth_posture`), checked
+   after the compute runtime is selected or created and before listeners bind.
+
+The posture is derived from resolved facts — the selected compute driver kind,
+the configured gateway bind address, and any driver-provided gateway listener
+requirements — and never from raw driver-configuration strings. It encodes an
+exposure (`Shared` for Kubernetes, an exact non-loopback listener, or a default
+route interface; otherwise `Local`) and an mTLS usage (`UserAuthentication` or
+`TransportOnly`). Kubernetes is always `Shared` and `TransportOnly`.
+
+`Shared` exposure requires an explicit user auth path — OIDC, mTLS user auth, or
+`allow_unauthenticated_users` — and rejects OIDC authentication-only mode unless
+`allow_oidc_auth_only` is set explicitly. `TransportOnly` rejects enabled mTLS
+user auth outright, so a Kubernetes gateway cannot promote a client certificate
+to a user principal, including when the configured driver name differs in case
+or the driver was auto-detected from an empty driver list.
+
 When that service port is bound to loopback, the listener can also accept
 plaintext HTTP on the same port for sandbox service subdomains only. That local
 browser path is enabled by default and disabled with

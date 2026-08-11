@@ -23,7 +23,9 @@ const SCOPE_ALL: &str = "openshell:all";
 ///
 /// Supports two modes:
 /// - **RBAC mode**: both `admin_role` and `user_role` are non-empty.
-/// - **Authentication-only mode**: both are empty (any valid token is authorized).
+/// - **Authentication-only mode**: both are empty (role checks are skipped).
+///
+/// Configured scope checks apply in both modes.
 ///
 /// Partial configuration (one empty, one set) is rejected at construction
 /// to prevent accidentally leaving admin endpoints unprotected.
@@ -60,8 +62,8 @@ impl AuthzPolicy {
     /// Check whether the identity is authorized to call the given method.
     ///
     /// Returns `Ok(())` if authorized, `Err(PERMISSION_DENIED)` if not.
-    /// When both role names are empty, all authenticated callers are authorized
-    /// (authentication-only mode for providers like GitHub).
+    /// When both role names are empty, role checks are skipped. Configured
+    /// scope checks still apply.
     ///
     /// Methods annotated with `global_role` (e.g. `"platform_admin"`) require
     /// the `admin_role` OIDC claim. Methods annotated with `workspace_role`
