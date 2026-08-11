@@ -182,6 +182,34 @@ jobs:
       extra-helm-values: ${{ matrix.extra_helm_values }}
       cli-artifact-prefix: rust-binary-cli
 
+  kubernetes-workspace-managed-e2e:
+    needs: [pr_metadata, build-gateway, build-supervisor, build-cli]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      job-name: Kubernetes E2E (workspace managed mode)
+      e2e-task: e2e:kubernetes:workspace-managed
+      cli-artifact-prefix: rust-binary-cli
+
+  kubernetes-workspace-operator-e2e:
+    needs: [pr_metadata, build-gateway, build-supervisor, build-cli]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      job-name: Kubernetes E2E (workspace operator mode)
+      e2e-task: e2e:kubernetes:workspace-operator
+      cli-artifact-prefix: rust-binary-cli
+
   kubernetes-ha-e2e:
     needs: [pr_metadata, build-gateway, build-supervisor, build-cli]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
@@ -212,7 +240,7 @@ jobs:
 
   core-e2e-result:
     name: Core E2E result
-    needs: [pr_metadata, build-gateway, build-supervisor, build-cli, build-driver-vm-linux, e2e, kubernetes-e2e]
+    needs: [pr_metadata, build-gateway, build-supervisor, build-cli, build-driver-vm-linux, e2e, kubernetes-e2e, kubernetes-workspace-managed-e2e, kubernetes-workspace-operator-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -224,6 +252,8 @@ jobs:
           BUILD_DRIVER_VM_RESULT: ${{ needs.build-driver-vm-linux.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
           KUBERNETES_E2E_RESULT: ${{ needs.kubernetes-e2e.result }}
+          KUBERNETES_WORKSPACE_MANAGED_E2E_RESULT: ${{ needs.kubernetes-workspace-managed-e2e.result }}
+          KUBERNETES_WORKSPACE_OPERATOR_E2E_RESULT: ${{ needs.kubernetes-workspace-operator-e2e.result }}
         run: |
           set -euo pipefail
           failed=0
@@ -233,7 +263,9 @@ jobs:
             "build-cli:$BUILD_CLI_RESULT" \
             "build-driver-vm-linux:$BUILD_DRIVER_VM_RESULT" \
             "e2e:$E2E_RESULT" \
-            "kubernetes-e2e:$KUBERNETES_E2E_RESULT"; do
+            "kubernetes-e2e:$KUBERNETES_E2E_RESULT" \
+            "kubernetes-workspace-managed-e2e:$KUBERNETES_WORKSPACE_MANAGED_E2E_RESULT" \
+            "kubernetes-workspace-operator-e2e:$KUBERNETES_WORKSPACE_OPERATOR_E2E_RESULT"; do
             name="${item%%:*}"
             result="${item#*:}"
             if [ "$result" != "success" ]; then
