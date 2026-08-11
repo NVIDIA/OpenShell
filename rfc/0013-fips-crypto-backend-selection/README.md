@@ -19,9 +19,12 @@ TLS, X.509 and JWT key generation, credential encryption at rest, key and
 credential-identifier hashing, and randomness through AWS-LC in FIPS mode, and
 narrows every algorithm choice to the approved set.
 
-Two dependencies cannot honor that provider and select for themselves; they are
-handled explicitly in `openshell-server` with their own enforcement, and one
-operation — AWS SigV4 request signing — cannot be moved at all.
+`sqlx` and the AWS SDK cannot honor that provider and select for themselves; they
+are handled explicitly in `openshell-server` with their own enforcement. Some
+surfaces cannot be moved at any layer, because the crates implementing them offer
+no backend choice — AWS SigV4 request signing (`aws-sigv4`) and the SSH
+transport's primitives (`russh`). Those need upstream backend support or
+replacement, and are out of scope here.
 
 The proposal also records where the design diverged from the plan accepted in
 [issue #900](https://github.com/NVIDIA/OpenShell/issues/900) once it met the
@@ -61,7 +64,7 @@ secrets at rest without anyone noticing it was a compliance-relevant surface.
 
 - **Making the SSH transport FIPS-validated.** This RFC restricts SSH
   negotiation to approved algorithms but does not replace russh's unvalidated
-  implementations. Tracked as Phase 2.
+  implementations, which no Cargo feature can redirect. Tracked as Phase 5.
 - **Removing `ring` from the dependency graph.** `openshell-crypto` links it
   unconditionally by design, and the AWS SDK links its own copy. This RFC
   measures and documents the residual surface rather than eliminating it.

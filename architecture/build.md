@@ -99,7 +99,7 @@ guarantee depend on every dispatch site being correct and would leave a
 non-validated path reachable in a FIPS deployment. See the 0.24 migration note
 below.
 
-### Three enforcement mechanisms, three surfaces
+### Enforcement mechanisms and the surfaces they cover
 
 No single check covers the whole build. Each dependency class that selects its own
 provider needs its own enforcement, and it is worth knowing which one covers what:

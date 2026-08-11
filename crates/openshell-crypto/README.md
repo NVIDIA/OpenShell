@@ -92,7 +92,7 @@ Algorithm restriction comes from `rustls::crypto::default_fips_provider()`, not
 a hand-maintained suite list, so the approved set tracks rustls's view of the
 module's validated boundary.
 
-Five things this crate does not cover, each documented at its definition:
+What this crate does not cover, each documented at its definition:
 
 - **SSH implementations.** `ssh::preferred()` restricts negotiation, but russh
   implements those algorithms with `ed25519-dalek`, `p256`, and RustCrypto AES —
