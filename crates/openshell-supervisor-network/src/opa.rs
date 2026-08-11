@@ -50,6 +50,15 @@ pub enum NetworkAction {
     Deny { reason: String },
 }
 
+/// Atomic policy result used to authorize and materialize one egress request.
+#[derive(Debug, Clone)]
+pub struct EgressAuthorization {
+    pub action: NetworkAction,
+    pub endpoint_configs: Vec<regorus::Value>,
+    pub exact_declared_endpoint_host: bool,
+    pub generation: u64,
+}
+
 /// Input for a network access policy evaluation.
 pub struct NetworkInput {
     pub host: String,
@@ -267,15 +276,6 @@ impl OpaEngine {
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.generation_tx.send_replace(generation);
         generation
-    }
-
-    #[cfg(test)]
-    pub(crate) fn poison_lock_for_test(&self) {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = self.engine.lock().expect("test engine lock");
-            panic!("poison OPA engine lock for compatibility fallback test");
-        }));
-        assert!(self.engine.is_poisoned());
     }
 
     /// Load policy from a `.rego` rules file and data from a YAML file.
@@ -517,6 +517,13 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(NetworkAction, u64)> {
+        let authorization = self.authorize_egress(input)?;
+        Ok((authorization.action, authorization.generation))
+    }
+
+    /// Authorize egress and return all connection metadata from one Rego result
+    /// evaluated against one policy generation.
+    pub fn authorize_egress(&self, input: &NetworkInput) -> Result<EgressAuthorization> {
         #[cfg(test)]
         record_test_opa_query();
 
@@ -534,34 +541,44 @@ impl OpaEngine {
             .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
             .clone();
         if let Some(reason) = fail_closed_reason {
-            return Ok((NetworkAction::Deny { reason }, generation));
+            return Ok(EgressAuthorization {
+                action: NetworkAction::Deny { reason },
+                endpoint_configs: Vec::new(),
+                exact_declared_endpoint_host: false,
+                generation,
+            });
         }
 
         set_regorus_input(&mut engine, input_json)?;
 
-        let action_val = engine
-            .eval_rule("data.openshell.sandbox.network_action".into())
+        let result = engine
+            .eval_rule("data.openshell.sandbox.egress_authorization".into())
             .map_err(|e| miette::miette!("{e}"))?;
-        let action_str = value_to_string(&action_val);
+        let action_str = get_str(&result, "action").unwrap_or_default();
+        let matched_policy = get_str(&result, "matched_policy").filter(|name| !name.is_empty());
+        let endpoint_configs = match get_field(&result, "endpoint_configs") {
+            Some(regorus::Value::Array(values)) => values.to_vec(),
+            _ => Vec::new(),
+        };
+        let exact_declared_endpoint_host =
+            get_bool(&result, "exact_declared_endpoint_host").unwrap_or(false);
 
-        let matched = engine
-            .eval_rule("data.openshell.sandbox.matched_network_policy".into())
-            .map_err(|e| miette::miette!("{e}"))?;
-        let matched_policy = if matched == regorus::Value::Undefined {
-            None
+        let action = if action_str == "allow" {
+            NetworkAction::Allow { matched_policy }
         } else {
-            Some(value_to_string(&matched))
+            NetworkAction::Deny {
+                reason: get_str(&result, "deny_reason")
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or_else(|| "network connections not allowed by policy".to_string()),
+            }
         };
 
-        if action_str == "allow" {
-            Ok((NetworkAction::Allow { matched_policy }, generation))
-        } else {
-            let reason_val = engine
-                .eval_rule("data.openshell.sandbox.deny_reason".into())
-                .map_err(|e| miette::miette!("{e}"))?;
-            let reason = value_to_string(&reason_val);
-            Ok((NetworkAction::Deny { reason }, generation))
-        }
+        Ok(EgressAuthorization {
+            action,
+            endpoint_configs,
+            exact_declared_endpoint_host,
+            generation,
+        })
     }
 
     /// Reload policy and data from strings (data is YAML).
@@ -5821,6 +5838,35 @@ process:
             decision.reason
         );
         assert_eq!(decision.matched_policy.as_deref(), Some("internal_api"));
+    }
+
+    #[test]
+    fn egress_authorization_returns_one_generation_consistent_snapshot() {
+        let engine = allowed_ips_engine();
+        let input = NetworkInput {
+            host: "my-service.corp.net".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let authorization = engine.authorize_egress(&input).unwrap();
+
+        assert_eq!(authorization.generation, engine.current_generation());
+        assert_eq!(
+            authorization.action,
+            NetworkAction::Allow {
+                matched_policy: Some("internal_api".to_string())
+            }
+        );
+        assert!(authorization.exact_declared_endpoint_host);
+        assert_eq!(authorization.endpoint_configs.len(), 1);
+        assert_eq!(
+            get_str_array(&authorization.endpoint_configs[0], "allowed_ips"),
+            vec!["10.0.5.0/24"]
+        );
     }
 
     #[test]

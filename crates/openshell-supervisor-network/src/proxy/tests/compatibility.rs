@@ -13,7 +13,7 @@ fn allowed_decision(intent: EgressIntent) -> EgressDecision {
         action: NetworkAction::Allow {
             matched_policy: Some("proxy_compatibility".to_string()),
         },
-        l4_policy_generation: 0,
+        policy_generation: 0,
         identity: ProcessIdentityEvidence::Available,
         endpoint: EndpointDecision::default(),
         binary: Some(PathBuf::from("/usr/bin/curl")),
@@ -279,65 +279,31 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
     );
 }
 
-fn poisoned_engine() -> OpaEngine {
-    let engine = OpaEngine::from_strings(
-        include_str!("../../../data/sandbox-policy.rego"),
-        r#"
-network_policies:
-  proxy_compatibility:
-    name: proxy_compatibility
-    endpoints:
-      - host: target.example
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        tls: skip
-        allowed_ips: ["10.0.0.0/8"]
-        rules:
-          - allow: { method: GET, path: "/**" }
-    binaries:
-      - path: /usr/bin/curl
-"#,
-    )
-    .unwrap();
-    engine.poison_lock_for_test();
-    engine
-}
-
 #[test]
-fn l7_query_failure_preserves_l4_only_fallback() {
-    let engine = poisoned_engine();
+fn missing_authorized_l7_metadata_preserves_l4_only_fallback() {
     let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
-    assert!(query_l7_route_snapshot(&engine, &decision, "target.example", 443).is_none());
+    assert!(query_l7_route_snapshot(&decision, "target.example", 443).is_none());
 }
 
 #[test]
-fn tls_query_failure_preserves_auto_fallback() {
-    let engine = poisoned_engine();
+fn missing_authorized_tls_metadata_preserves_auto_fallback() {
     let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
     assert_eq!(
-        query_tls_mode(&engine, &decision, "target.example", 443),
+        query_tls_mode(&decision, "target.example", 443),
         crate::l7::TlsMode::Auto
     );
 }
 
 #[test]
-fn allowed_ips_query_failure_preserves_empty_fallback() {
-    let engine = poisoned_engine();
+fn missing_authorized_allowed_ips_preserves_empty_fallback() {
     let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
-    assert!(query_allowed_ips(&engine, &decision, "target.example", 443).is_empty());
+    assert!(query_allowed_ips(&decision).is_empty());
 }
 
 #[test]
-fn exact_host_query_failure_preserves_false_fallback() {
-    let engine = poisoned_engine();
+fn missing_authorized_exact_host_preserves_false_fallback() {
     let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
-    assert!(!query_exact_declared_endpoint_host(
-        &engine,
-        &decision,
-        "target.example",
-        443
-    ));
+    assert!(!decision.endpoint.exact_declared_host);
 }
 
 #[test]

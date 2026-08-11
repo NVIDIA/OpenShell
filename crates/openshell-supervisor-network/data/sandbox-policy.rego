@@ -214,6 +214,38 @@ network_action := "allow" if {
 	network_policy_for_request
 }
 
+# --- Authoritative egress authorization snapshot ---
+#
+# Rust evaluates this rule once per admitted connection. Keeping the action,
+# matched policy, endpoint metadata, and exact-host signal in one result makes
+# them an atomic view of one policy generation.
+
+default _egress_matched_policy := ""
+
+_egress_matched_policy := matched_network_policy if {
+	matched_network_policy
+}
+
+default _egress_deny_reason := ""
+
+_egress_deny_reason := deny_reason if {
+	network_action == "deny"
+}
+
+default _egress_exact_declared_endpoint_host := false
+
+_egress_exact_declared_endpoint_host := true if {
+	exact_declared_endpoint_host
+}
+
+egress_authorization := {
+	"action": network_action,
+	"deny_reason": _egress_deny_reason,
+	"matched_policy": _egress_matched_policy,
+	"endpoint_configs": _matching_endpoint_configs,
+	"exact_declared_endpoint_host": _egress_exact_declared_endpoint_host,
+}
+
 # ===========================================================================
 # L7 request evaluation (queried per-request within a tunnel)
 # ===========================================================================

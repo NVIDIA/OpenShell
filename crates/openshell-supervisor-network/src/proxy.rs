@@ -1385,7 +1385,7 @@ async fn handle_tcp_connection(
     }
 
     let connect_generation_guard =
-        match relay::pin_policy_generation(&opa_engine, decision.l4_policy_generation) {
+        match relay::pin_policy_generation(&opa_engine, decision.policy_generation) {
             Ok(guard) => guard,
             Err(error) => {
                 reject_stale_connect_policy(
@@ -1406,13 +1406,13 @@ async fn handle_tcp_connection(
     // allowed_ips validation below — so an internal-address CONNECT still gets
     // the SSRF 403 and telemetry in degraded state — but before the upstream
     // connect and before `200 Connection Established`.
-    hydrate_tls_mode(&opa_engine, &mut decision);
+    hydrate_tls_mode(&mut decision);
     let effective_tls_skip = decision.endpoint.tls_mode == crate::l7::TlsMode::Skip;
     let credential_guard = query_endpoint_credential_guard(&opa_engine, &decision, &host_lc, port)?;
 
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
-    match hydrate_destination_plan(&opa_engine, &mut decision, *trusted_host_gateway) {
+    match hydrate_destination_plan(&mut decision, *trusted_host_gateway) {
         Ok(()) => {}
         Err(denial) => {
             deny_connect_destination(
@@ -1558,9 +1558,8 @@ async fn handle_tcp_connection(
     }
 
     // CONNECT must use one policy generation from authorization through route
-    // hydration and relay startup. A later L7 lookup must never make a stale
-    // L4 allow appear current.
-    hydrate_l7_route(&opa_engine, &mut decision);
+    // materialization and relay startup.
+    hydrate_l7_route(&mut decision);
     let l7_route = decision.endpoint.l7_route.as_ref();
     if let Err(error) =
         relay::validate_route_generation(l7_route, connect_generation_guard.captured_generation())
@@ -2100,7 +2099,7 @@ fn authorize_egress_intent(
         EgressDecision {
             intent: intent.clone(),
             action: NetworkAction::Deny { reason },
-            l4_policy_generation: engine.current_generation(),
+            policy_generation: engine.current_generation(),
             identity,
             endpoint: EndpointDecision::default(),
             binary,
@@ -2166,13 +2165,13 @@ fn authorize_egress_intent(
         cmdline_paths: cmdline_paths.clone(),
     };
 
-    let result = match engine.evaluate_network_action_with_generation(&input) {
-        Ok((action, generation)) => EgressDecision {
+    let result = match engine.authorize_egress(&input) {
+        Ok(authorization) => EgressDecision {
             intent: intent.clone(),
-            action,
-            l4_policy_generation: generation,
+            action: authorization.action.clone(),
+            policy_generation: authorization.generation,
             identity: ProcessIdentityEvidence::Available,
-            endpoint: EndpointDecision::default(),
+            endpoint: EndpointDecision::from_authorization(&authorization),
             binary: Some(bin_path),
             binary_pid: Some(binary_pid),
             ancestors,
@@ -2221,15 +2220,15 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> Egres
         cmdline_paths: vec![],
     };
 
-    match engine.evaluate_network_action_with_generation(&input) {
-        Ok((action, generation)) => EgressDecision {
+    match engine.authorize_egress(&input) {
+        Ok(authorization) => EgressDecision {
             intent,
-            action,
-            l4_policy_generation: generation,
+            action: authorization.action.clone(),
+            policy_generation: authorization.generation,
             identity: ProcessIdentityEvidence::Unavailable(
                 IdentityUnavailableReason::EndpointOnlyMode,
             ),
-            endpoint: EndpointDecision::default(),
+            endpoint: EndpointDecision::from_authorization(&authorization),
             binary: None,
             binary_pid: None,
             ancestors: vec![],
@@ -2240,7 +2239,7 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> Egres
             action: NetworkAction::Deny {
                 reason: format!("policy evaluation error: {e}"),
             },
-            l4_policy_generation: engine.current_generation(),
+            policy_generation: engine.current_generation(),
             identity: ProcessIdentityEvidence::Unavailable(
                 IdentityUnavailableReason::EndpointOnlyMode,
             ),
@@ -2271,7 +2270,7 @@ fn authorize_egress_intent(
         action: NetworkAction::Deny {
             reason: "identity binding unavailable on this platform".into(),
         },
-        l4_policy_generation: engine.current_generation(),
+        policy_generation: engine.current_generation(),
         identity: ProcessIdentityEvidence::Unavailable(
             IdentityUnavailableReason::UnsupportedPlatform,
         ),
@@ -2923,27 +2922,25 @@ async fn reject_stale_connect_policy(
 ///
 /// Returns `Some(L7EndpointConfig)` if the matched endpoint has L7 config (protocol field),
 /// `None` for L4-only endpoints.
-fn hydrate_l7_route(engine: &OpaEngine, decision: &mut EgressDecision) {
+fn hydrate_l7_route(decision: &mut EgressDecision) {
     let host = decision.intent.destination.host.clone();
     let port = decision.intent.destination.port;
-    decision.endpoint.l7_route = query_l7_route_snapshot(engine, decision, &host, port);
+    decision.endpoint.l7_route = query_l7_route_snapshot(decision, &host, port);
 }
 
-fn hydrate_tls_mode(engine: &OpaEngine, decision: &mut EgressDecision) {
+fn hydrate_tls_mode(decision: &mut EgressDecision) {
     let host = decision.intent.destination.host.clone();
     let port = decision.intent.destination.port;
-    decision.endpoint.tls_mode = query_tls_mode(engine, decision, &host, port);
+    decision.endpoint.tls_mode = query_tls_mode(decision, &host, port);
 }
 
 fn hydrate_destination_plan(
-    engine: &OpaEngine,
     decision: &mut EgressDecision,
     trusted_host_gateway: Option<IpAddr>,
 ) -> std::result::Result<(), DestinationDenial> {
     let host = decision.intent.destination.host.clone();
-    let port = decision.intent.destination.port;
-    let raw_allowed_ips = query_allowed_ips(engine, decision, &host, port);
-    let exact_declared_host = query_exact_declared_endpoint_host(engine, decision, &host, port);
+    let raw_allowed_ips = query_allowed_ips(decision);
+    let exact_declared_host = decision.endpoint.exact_declared_host;
     let plan = build_validation_plan(
         &host,
         &host.to_ascii_lowercase(),
@@ -2956,7 +2953,6 @@ fn hydrate_destination_plan(
 }
 
 fn query_l7_route_snapshot(
-    engine: &OpaEngine,
     decision: &EgressDecision,
     host: &str,
     port: u16,
@@ -2970,46 +2966,27 @@ fn query_l7_route_snapshot(
         return None;
     }
 
-    let input = crate::opa::NetworkInput {
-        host: host.to_string(),
-        port,
-        binary_path: decision.binary.clone().unwrap_or_default(),
-        binary_sha256: String::new(),
-        ancestors: decision.ancestors.clone(),
-        cmdline_paths: decision.cmdline_paths.clone(),
-    };
-
-    match engine.query_endpoint_configs_with_generation(&input) {
-        Ok((vals, generation)) => {
-            let configs: Vec<_> = vals
-                .into_iter()
-                .filter_map(|val| crate::l7::parse_l7_config(&val))
-                .map(|config| L7ConfigSnapshot { config })
-                .collect();
-            debug!(
-                host,
-                port,
-                generation,
-                config_count = configs.len(),
-                "Forward proxy L7 route lookup complete"
-            );
-            Some(L7RouteSnapshot {
-                configs,
-                l7_policy_generation: generation,
-            })
-        }
-        Err(e) => {
-            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Fail)
-                .severity(SeverityId::Low)
-                .status(StatusId::Failure)
-                .dst_endpoint(Endpoint::from_domain(host, port))
-                .message(format!("Failed to query L7 endpoint config: {e}"))
-                .build();
-            ocsf_emit!(event);
-            None
-        }
+    let configs: Vec<_> = decision
+        .endpoint
+        .policy_configs
+        .iter()
+        .filter_map(crate::l7::parse_l7_config)
+        .map(|config| L7ConfigSnapshot { config })
+        .collect();
+    if configs.is_empty() {
+        return None;
     }
+    debug!(
+        host,
+        port,
+        generation = decision.policy_generation,
+        config_count = configs.len(),
+        "Egress L7 route materialized from authorization snapshot"
+    );
+    Some(L7RouteSnapshot {
+        configs,
+        l7_policy_generation: decision.policy_generation,
+    })
 }
 
 fn select_l7_config_for_path<'a>(
@@ -3025,12 +3002,7 @@ fn select_l7_config_for_path<'a>(
 /// Query the TLS mode for an endpoint, independent of L7 config.
 ///
 /// This extracts `tls: skip` from the endpoint even when no `protocol` is set.
-fn query_tls_mode(
-    engine: &OpaEngine,
-    decision: &EgressDecision,
-    host: &str,
-    port: u16,
-) -> crate::l7::TlsMode {
+fn query_tls_mode(decision: &EgressDecision, _host: &str, _port: u16) -> crate::l7::TlsMode {
     let has_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
         NetworkAction::Deny { .. } => false,
@@ -3039,19 +3011,11 @@ fn query_tls_mode(
         return crate::l7::TlsMode::Auto;
     }
 
-    let input = crate::opa::NetworkInput {
-        host: host.to_string(),
-        port,
-        binary_path: decision.binary.clone().unwrap_or_default(),
-        binary_sha256: String::new(),
-        ancestors: decision.ancestors.clone(),
-        cmdline_paths: decision.cmdline_paths.clone(),
-    };
-
-    match engine.query_endpoint_config(&input) {
-        Ok(Some(val)) => crate::l7::parse_tls_mode(&val),
-        _ => crate::l7::TlsMode::Auto,
-    }
+    decision
+        .endpoint
+        .policy_configs
+        .first()
+        .map_or(crate::l7::TlsMode::Auto, crate::l7::parse_tls_mode)
 }
 
 fn query_endpoint_credential_guard(
@@ -3674,13 +3638,8 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
     }
 }
 
-/// Query `allowed_ips` from the matched endpoint config for a CONNECT decision.
-fn query_allowed_ips(
-    engine: &OpaEngine,
-    decision: &EgressDecision,
-    host: &str,
-    port: u16,
-) -> Vec<String> {
+/// Read `allowed_ips` from the endpoint configs captured during authorization.
+fn query_allowed_ips(decision: &EgressDecision) -> Vec<String> {
     // Only query if action is Allow with a matched policy
     let has_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
@@ -3690,71 +3649,29 @@ fn query_allowed_ips(
         return vec![];
     }
 
-    let input = crate::opa::NetworkInput {
-        host: host.to_string(),
-        port,
-        binary_path: decision.binary.clone().unwrap_or_default(),
-        binary_sha256: String::new(),
-        ancestors: decision.ancestors.clone(),
-        cmdline_paths: decision.cmdline_paths.clone(),
-    };
-
-    match engine.query_allowed_ips(&input) {
-        Ok(ips) => ips,
-        Err(e) => {
-            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Fail)
-                .severity(SeverityId::Low)
-                .status(StatusId::Failure)
-                .dst_endpoint(Endpoint::from_domain(host, port))
-                .message(format!(
-                    "Failed to query allowed_ips from endpoint config: {e}"
-                ))
-                .build();
-            ocsf_emit!(event);
-            vec![]
-        }
-    }
+    decision
+        .endpoint
+        .policy_configs
+        .first()
+        .map(|config| endpoint_config_string_array(config, "allowed_ips"))
+        .unwrap_or_default()
 }
 
-/// Query whether the matched endpoint was declared as this exact hostname.
-fn query_exact_declared_endpoint_host(
-    engine: &OpaEngine,
-    decision: &EgressDecision,
-    host: &str,
-    port: u16,
-) -> bool {
-    let has_policy = match &decision.action {
-        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
-        NetworkAction::Deny { .. } => false,
+fn endpoint_config_string_array(config: &regorus::Value, key: &str) -> Vec<String> {
+    let regorus::Value::Object(fields) = config else {
+        return Vec::new();
     };
-    if !has_policy {
-        return false;
-    }
-
-    let input = crate::opa::NetworkInput {
-        host: host.to_string(),
-        port,
-        binary_path: decision.binary.clone().unwrap_or_default(),
-        binary_sha256: String::new(),
-        ancestors: decision.ancestors.clone(),
-        cmdline_paths: decision.cmdline_paths.clone(),
+    let key = regorus::Value::String(key.into());
+    let Some(regorus::Value::Array(values)) = fields.get(&key) else {
+        return Vec::new();
     };
-
-    match engine.query_exact_declared_endpoint_host(&input) {
-        Ok(is_exact_declared) => is_exact_declared,
-        Err(e) => {
-            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Fail)
-                .severity(SeverityId::Low)
-                .status(StatusId::Failure)
-                .dst_endpoint(Endpoint::from_domain(host, port))
-                .message(format!("Failed to query exact declared endpoint host: {e}"))
-                .build();
-            ocsf_emit!(event);
-            false
-        }
-    }
+    values
+        .iter()
+        .filter_map(|value| match value {
+            regorus::Value::String(value) => Some(value.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Canonicalize the request-target for inference pattern detection.
@@ -4533,7 +4450,7 @@ async fn handle_forward_proxy(
         binary = %binary_str,
         binary_pid = %pid_str,
         matched_policy = %policy_str,
-        l4_policy_generation = decision.l4_policy_generation,
+        policy_generation = decision.policy_generation,
         current_generation = opa_engine.current_generation(),
         action = ?decision.action,
         "Forward proxy L4 policy decision"
@@ -4541,14 +4458,14 @@ async fn handle_forward_proxy(
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
     let forward_generation_guard = match relay::pin_policy_generation(
         &opa_engine,
-        decision.l4_policy_generation,
+        decision.policy_generation,
     ) {
         Ok(guard) => guard,
         Err(e) => {
             warn!(
                 host = %host_lc,
                 port,
-                l4_policy_generation = decision.l4_policy_generation,
+                policy_generation = decision.policy_generation,
                 current_generation = opa_engine.current_generation(),
                 error = %e,
                 "Forward proxy rejected request because policy generation changed after L4 decision"
@@ -4589,7 +4506,7 @@ async fn handle_forward_proxy(
     //     connection, so a single evaluation suffices. The shared HTTP relay
     //     strips hop-by-hop `Connection` headers and drops the upstream after
     //     the response instead of asking the upstream to close it.
-    hydrate_l7_route(&opa_engine, &mut decision);
+    hydrate_l7_route(&mut decision);
     let canonicalize_options = crate::l7::path::CanonicalizeOptions {
         allow_encoded_slash: decision.endpoint.l7_route.as_ref().is_some_and(|route| {
             route
@@ -4658,7 +4575,7 @@ async fn handle_forward_proxy(
             warn!(
                 host = %host_lc,
                 port,
-                l4_policy_generation = decision.l4_policy_generation,
+                policy_generation = decision.policy_generation,
                 l4_guard_generation = forward_generation_guard.captured_generation(),
                 l7_policy_generation = route.l7_policy_generation,
                 current_generation = opa_engine.current_generation(),
@@ -5091,7 +5008,7 @@ async fn handle_forward_proxy(
     //    - Otherwise: reject internal IPs, allow public IPs through.
     //    When the policy host is already a literal IP address, treat it as
     //    implicitly allowed — the user explicitly declared the destination.
-    match hydrate_destination_plan(&opa_engine, &mut decision, *trusted_host_gateway) {
+    match hydrate_destination_plan(&mut decision, *trusted_host_gateway) {
         Ok(()) => {}
         Err(denial) => {
             deny_forward_destination(
@@ -7358,21 +7275,28 @@ network_policies:
     ) {
         let policy = include_str!("../data/sandbox-policy.rego");
         let engine = OpaEngine::from_strings(policy, data).unwrap();
+        let authorization = engine
+            .authorize_egress(&crate::opa::NetworkInput {
+                host: host.to_string(),
+                port,
+                binary_path: PathBuf::from("/usr/bin/node"),
+                binary_sha256: String::new(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            })
+            .expect("authorize egress");
         let decision = EgressDecision {
             intent: EgressIntent::forward_http(host.to_string(), port),
-            action: NetworkAction::Allow {
-                matched_policy: Some(policy_name.to_string()),
-            },
-            l4_policy_generation: engine.current_generation(),
+            action: authorization.action.clone(),
+            policy_generation: authorization.generation,
             identity: ProcessIdentityEvidence::Available,
-            endpoint: EndpointDecision::default(),
+            endpoint: EndpointDecision::from_authorization(&authorization),
             binary: Some(PathBuf::from("/usr/bin/node")),
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
         };
-        let route =
-            query_l7_route_snapshot(&engine, &decision, host, port).expect("L7 route should match");
+        let route = query_l7_route_snapshot(&decision, host, port).expect("L7 route should match");
         let config = select_l7_config_for_path(&route.configs, path)
             .expect("path-specific L7 config should match")
             .config
@@ -11553,10 +11477,8 @@ network_policies:
                 ancestors: vec![],
                 cmdline_paths: vec![],
             };
-            let (action, generation) = engine
-                .evaluate_network_action_with_generation(&input)
-                .expect("evaluate");
-            match &action {
+            let authorization = engine.authorize_egress(&input).expect("evaluate");
+            match &authorization.action {
                 NetworkAction::Allow { matched_policy } => {
                     assert!(matched_policy.is_some(), "allow must carry the policy name");
                 }
@@ -11566,16 +11488,16 @@ network_policies:
             }
             let decision = EgressDecision {
                 intent: EgressIntent::connect("203.0.113.10".to_string(), 443),
-                action,
-                l4_policy_generation: generation,
+                action: authorization.action.clone(),
+                policy_generation: authorization.generation,
                 identity: ProcessIdentityEvidence::Available,
-                endpoint: EndpointDecision::default(),
+                endpoint: EndpointDecision::from_authorization(&authorization),
                 binary: Some(input.binary_path),
                 binary_pid: Some(1),
                 ancestors: vec![],
                 cmdline_paths: vec![],
             };
-            query_tls_mode(&engine, &decision, "203.0.113.10", 443)
+            query_tls_mode(&decision, "203.0.113.10", 443)
         };
 
         assert_eq!(
