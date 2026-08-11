@@ -138,6 +138,16 @@ fn parse_gpu_request(value: &str) -> std::result::Result<GpuCliRequest, String> 
     Ok(GpuCliRequest::Count(count))
 }
 
+fn parse_positive_u32(value: &str) -> std::result::Result<u32, String> {
+    let count = value
+        .parse::<u32>()
+        .map_err(|_| "value must be a positive integer".to_string())?;
+    if count == 0 {
+        return Err("value must be greater than 0".to_string());
+    }
+    Ok(count)
+}
+
 fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
     gateway_flag
         .clone()
@@ -1326,6 +1336,10 @@ enum SandboxCommands {
         #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
+        /// Create the sandbox from a named sandbox template.
+        #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs"])]
+        template: Option<String>,
+
         /// Sandbox source: a community sandbox name (e.g., `ollama`), a path
         /// to a Dockerfile or directory containing one, or a full container
         /// image reference (e.g., `myregistry.com/img:tag`).
@@ -1649,6 +1663,104 @@ enum SandboxCommands {
     /// Manage providers attached to a sandbox.
     #[command(subcommand)]
     Provider(SandboxProviderCommands),
+
+    /// Manage reusable sandbox templates.
+    #[command(subcommand, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Template(SandboxTemplateCommands),
+}
+
+#[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
+enum SandboxTemplateCommands {
+    /// Create a sandbox template.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Create {
+        /// Template name.
+        name: String,
+
+        /// Container image reference or community sandbox name.
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Set a non-secret environment variable in the template workload.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
+
+        /// CPU limit for sandboxes created from the template.
+        #[arg(long)]
+        cpu: Option<String>,
+
+        /// Memory limit for sandboxes created from the template.
+        #[arg(long)]
+        memory: Option<String>,
+
+        /// Request GPU resources for sandboxes created from the template.
+        #[arg(long, num_args = 0..=1, value_name = "COUNT", default_missing_value = "", value_parser = parse_gpu_request)]
+        gpu: Option<GpuCliRequest>,
+
+        /// Driver-keyed JSON object for template-owned driver-specific settings.
+        #[arg(long, value_name = "JSON")]
+        driver_config_json: Option<String>,
+
+        /// Desired time for a sandbox created from this template to become ready.
+        #[arg(long, value_name = "DURATION")]
+        ready_within: Option<String>,
+
+        /// Maximum expected startup burst for this template.
+        #[arg(long, value_parser = parse_positive_u32)]
+        max_burst: Option<u32>,
+
+        /// Attach labels to the template (key=value format, repeatable).
+        #[arg(long = "label")]
+        labels: Vec<String>,
+
+        /// Attach annotations to the template (key=value format, repeatable).
+        #[arg(long = "annotation")]
+        annotations: Vec<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Fetch a sandbox template by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Template name.
+        name: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// List sandbox templates.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Maximum number of templates to return.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+
+        /// Offset into the template list.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+
+        /// List templates across all workspaces (overrides --workspace).
+        #[arg(long)]
+        all_workspaces: bool,
+    },
+
+    /// Delete sandbox templates by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Template names.
+        #[arg(required = true, num_args = 1.., value_name = "NAME")]
+        names: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2958,6 +3070,7 @@ async fn run_async() -> Result<()> {
             match command {
                 SandboxCommands::Create {
                     name,
+                    template,
                     from,
                     upload,
                     no_git_ignore,
@@ -3050,6 +3163,7 @@ async fn run_async() -> Result<()> {
                         &ctx.name,
                         run::SandboxCreateConfig {
                             name: name.as_deref(),
+                            template: template.as_deref(),
                             from: from.as_deref(),
                             uploads: &upload_specs,
                             keep,
@@ -3242,6 +3356,82 @@ async fn run_async() -> Result<()> {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             run::print_ssh_config(&ctx.name, &name, &cli.workspace);
                         }
+                        SandboxCommands::Template(command) => match command {
+                            SandboxTemplateCommands::Create {
+                                name,
+                                from,
+                                envs,
+                                cpu,
+                                memory,
+                                gpu,
+                                driver_config_json,
+                                ready_within,
+                                max_burst,
+                                labels,
+                                annotations,
+                                output,
+                            } => {
+                                run::sandbox_template_create(
+                                    endpoint,
+                                    run::SandboxTemplateCreateConfig {
+                                        name,
+                                        from,
+                                        environment: run::parse_env_pairs(&envs)?,
+                                        cpu,
+                                        memory,
+                                        gpu_count: gpu.map(Into::into),
+                                        driver_config_json,
+                                        ready_within,
+                                        max_burst,
+                                        labels: run::parse_key_value_pairs(&labels, "--label")?,
+                                        annotations: run::parse_key_value_pairs(
+                                            &annotations,
+                                            "--annotation",
+                                        )?,
+                                        output: output.as_str().to_string(),
+                                    },
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                            SandboxTemplateCommands::Get { name, output } => {
+                                run::sandbox_template_get(
+                                    endpoint,
+                                    &name,
+                                    output.as_str(),
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                            SandboxTemplateCommands::List {
+                                limit,
+                                offset,
+                                output,
+                                all_workspaces,
+                            } => {
+                                run::sandbox_template_list(
+                                    endpoint,
+                                    limit,
+                                    offset,
+                                    output.as_str(),
+                                    &cli.workspace,
+                                    all_workspaces,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                            SandboxTemplateCommands::Delete { names } => {
+                                run::sandbox_template_delete(
+                                    endpoint,
+                                    &names,
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                        },
                         SandboxCommands::Provider(command) => match command {
                             SandboxProviderCommands::List { name } => {
                                 let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
@@ -5252,6 +5442,197 @@ mod tests {
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandbox_create_template_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--template",
+            "gpu-kata",
+            "--provider",
+            "github",
+            "--",
+            "claude",
+        ])
+        .expect("sandbox create --template should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        template,
+                        providers,
+                        command,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(template.as_deref(), Some("gpu-kata"));
+                assert_eq!(providers, vec!["github".to_string()]);
+                assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_template_conflicts_with_inline_workload_flags() {
+        for (label, extra_args) in [
+            ("--from", &["--from", "python:3.12"][..]),
+            ("--cpu", &["--cpu", "2"][..]),
+            ("--env", &["--env", "FOO=bar"][..]),
+        ] {
+            let args = ["openshell", "sandbox", "create", "--template", "gpu-kata"]
+                .into_iter()
+                .chain(extra_args.iter().copied());
+            let result = Cli::try_parse_from(args);
+            assert!(result.is_err(), "--template should conflict with {label}");
+        }
+    }
+
+    #[test]
+    fn sandbox_template_create_parses_image_driver_config_and_startup() {
+        let json = r#"{"kubernetes":{"pod":{"runtime_class_name":"kata-containers"}}}"#;
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "template",
+            "create",
+            "gpu-kata",
+            "--from",
+            "cuda:latest",
+            "--env",
+            "MODE=on",
+            "--cpu",
+            "2",
+            "--memory",
+            "8Gi",
+            "--gpu",
+            "2",
+            "--driver-config-json",
+            json,
+            "--ready-within",
+            "30s",
+            "--max-burst",
+            "5",
+            "--label",
+            "tier=gold",
+            "--annotation",
+            "owner=platform",
+            "--output",
+            "json",
+        ])
+        .expect("sandbox template create should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Template(SandboxTemplateCommands::Create {
+                        name,
+                        from,
+                        envs,
+                        cpu,
+                        memory,
+                        gpu,
+                        driver_config_json,
+                        ready_within,
+                        max_burst,
+                        labels,
+                        annotations,
+                        output,
+                    })),
+                ..
+            }) => {
+                assert_eq!(name, "gpu-kata");
+                assert_eq!(from.as_deref(), Some("cuda:latest"));
+                assert_eq!(envs, vec!["MODE=on".to_string()]);
+                assert_eq!(cpu.as_deref(), Some("2"));
+                assert_eq!(memory.as_deref(), Some("8Gi"));
+                assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
+                assert_eq!(driver_config_json.as_deref(), Some(json));
+                assert_eq!(ready_within.as_deref(), Some("30s"));
+                assert_eq!(max_burst, Some(5));
+                assert_eq!(labels, vec!["tier=gold".to_string()]);
+                assert_eq!(annotations, vec!["owner=platform".to_string()]);
+                assert!(matches!(output, OutputFormat::Json));
+            }
+            other => panic!("expected SandboxTemplateCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_template_create_allows_omitted_from() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "template",
+            "create",
+            "default-image",
+            "--cpu",
+            "2",
+        ])
+        .expect("sandbox template create should allow omitting --from");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Template(SandboxTemplateCommands::Create {
+                        name,
+                        from,
+                        cpu,
+                        ..
+                    })),
+                ..
+            }) => {
+                assert_eq!(name, "default-image");
+                assert!(from.is_none());
+                assert_eq!(cpu.as_deref(), Some("2"));
+            }
+            other => panic!("expected SandboxTemplateCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_template_create_rejects_zero_max_burst() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "template",
+            "create",
+            "gpu-kata",
+            "--from",
+            "cuda:latest",
+            "--max-burst",
+            "0",
+        ]);
+        assert!(result.is_err(), "--max-burst 0 should be rejected");
+    }
+
+    #[test]
+    fn sandbox_template_list_json_output_parses() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "template",
+            "list",
+            "--output",
+            "json",
+        ])
+        .expect("sandbox template list --output json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Template(SandboxTemplateCommands::List {
+                    output,
+                    ..
+                })),
+                ..
+            }) if matches!(output, OutputFormat::Json)
+        ));
     }
 
     #[test]

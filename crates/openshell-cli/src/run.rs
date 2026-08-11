@@ -37,20 +37,22 @@ use openshell_core::proto::create_sandbox_request;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
     ClearDraftChunksRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
-    CreateSandboxRequest, CreateSshSessionRequest, DeleteInferenceRouteRequest,
-    DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
-    DeleteSandboxRequest, DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest,
-    ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetInferenceRouteRequest, GetProviderProfileRequest,
-    GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
-    GetSandboxRequest, GetServiceRequest, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
-    ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
+    CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
+    DeleteInferenceRouteRequest, DeleteProviderProfileRequest, DeleteProviderRefreshRequest,
+    DeleteProviderRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
+    DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
+    GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
+    GetInferenceRouteRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetSandboxTemplateRequest, GetServiceRequest,
+    ImportProviderProfilesRequest, LintProviderProfilesRequest, ListProviderProfilesRequest,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxProvidersRequest,
+    ListSandboxTemplatesRequest, ListSandboxesRequest, ListServicesRequest, ObjectMeta,
+    PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
     ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
     ProviderProfileImportItem, RejectDraftChunkRequest, RevokeSshSessionRequest,
     RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxResources,
+    SandboxServiceLevel, SandboxStartup, SandboxTemplate, SandboxTemplateSpec,
     SandboxWorkloadConfig, ServiceEndpointResponse, SetInferenceRouteRequest, SettingScope,
     StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
     UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
@@ -238,8 +240,7 @@ fn build_sandbox_resource_limits(
     Ok((!resources.cpu.is_empty() || !resources.memory.is_empty()).then_some(resources))
 }
 
-#[cfg(test)]
-fn parse_driver_config_json(value: &str) -> Result<prost_types::Struct> {
+pub fn parse_driver_config_json(value: &str) -> Result<prost_types::Struct> {
     let parsed: serde_json::Value = serde_json::from_str(value)
         .into_diagnostic()
         .wrap_err("--driver-config-json must be valid JSON")?;
@@ -345,6 +346,7 @@ async fn finalize_sandbox_create_session(
 #[derive(Debug)]
 pub struct SandboxCreateConfig<'a> {
     pub name: Option<&'a str>,
+    pub template: Option<&'a str>,
     pub from: Option<&'a str>,
     pub uploads: &'a [(String, Option<String>, bool)],
     pub keep: bool,
@@ -369,6 +371,7 @@ impl Default for SandboxCreateConfig<'_> {
     fn default() -> Self {
         Self {
             name: None,
+            template: None,
             from: None,
             uploads: &[],
             keep: false,
@@ -401,6 +404,7 @@ pub async fn sandbox_create(
 ) -> Result<()> {
     let SandboxCreateConfig {
         name,
+        template,
         from,
         uploads,
         keep,
@@ -426,6 +430,18 @@ pub async fn sandbox_create(
             "--editor cannot be used with a trailing command; use `openshell sandbox connect <name> --editor ...` after the sandbox is ready"
         ));
     }
+    if template.is_some()
+        && (from.is_some()
+            || cpu.is_some()
+            || memory.is_some()
+            || gpu_requirements.is_some()
+            || driver_config_json.is_some()
+            || !environment.is_empty())
+    {
+        return Err(miette!(
+            "--template cannot be used with inline workload flags such as --from, --cpu, --memory, --gpu, --env, or --driver-config-json"
+        ));
+    }
 
     // Check port availability *before* creating the sandbox so we don't
     // leave an orphaned sandbox behind when the forward would fail.
@@ -444,22 +460,31 @@ pub async fn sandbox_create(
     let effective_tls = tls.clone();
 
     // Resolve the --from flag into a container image reference, building from
-    // a Dockerfile first if necessary.
-    let image: Option<String> = match from {
-        Some(val) => {
-            let resolved = resolve_from(val)?;
-            match resolved {
-                ResolvedSource::Image(img) => Some(img),
-                ResolvedSource::Dockerfile {
-                    dockerfile,
-                    context,
-                } => {
-                    let tag = build_from_dockerfile(&dockerfile, &context, gateway_name).await?;
-                    Some(tag)
+    // a Dockerfile first if necessary. Template-based creates resolve workload
+    // shape on the gateway and must not build or override an image.
+    let image: Option<String> = if template.is_some() {
+        if from.is_some() {
+            return Err(miette!("--from cannot be used with --template"));
+        }
+        None
+    } else {
+        match from {
+            Some(val) => {
+                let resolved = resolve_from(val)?;
+                match resolved {
+                    ResolvedSource::Image(img) => Some(img),
+                    ResolvedSource::Dockerfile {
+                        dockerfile,
+                        context,
+                    } => {
+                        let tag =
+                            build_from_dockerfile(&dockerfile, &context, gateway_name).await?;
+                        Some(tag)
+                    }
                 }
             }
+            None => None,
         }
-        None => None,
     };
     let inferred_provider = inferred_provider_type(command);
     let providers_v2_enabled =
@@ -488,23 +513,37 @@ pub async fn sandbox_create(
             "--driver-config-json is only supported through named sandbox templates"
         ));
     }
-    let mut resources = build_sandbox_resource_limits(cpu, memory)?.unwrap_or_default();
-    if let Some(gpu_count) = gpu_requirements {
+    let mut resources = if template.is_some() {
+        SandboxResources::default()
+    } else {
+        build_sandbox_resource_limits(cpu, memory)?.unwrap_or_default()
+    };
+    if template.is_none()
+        && let Some(gpu_count) = gpu_requirements
+    {
         resources.gpu_count = Some(gpu_count);
     }
-    let resources = (!resources.cpu.is_empty()
-        || !resources.memory.is_empty()
-        || resources.gpu_count.is_some())
+    let resources = (template.is_none()
+        && (!resources.cpu.is_empty()
+            || !resources.memory.is_empty()
+            || resources.gpu_count.is_some()))
     .then_some(resources);
     let timeout_resources = resources.clone();
-    let workload = SandboxWorkloadConfig {
-        image: image.unwrap_or_default(),
-        environment,
-        resources,
-    };
+    let workload_source = template.map_or_else(
+        || {
+            create_sandbox_request::WorkloadSource::Workload(SandboxWorkloadConfig {
+                image: image.unwrap_or_default(),
+                environment,
+                resources,
+            })
+        },
+        |template| {
+            create_sandbox_request::WorkloadSource::WorkloadTemplateName(template.to_string())
+        },
+    );
 
     let request = CreateSandboxRequest {
-        workload_source: Some(create_sandbox_request::WorkloadSource::Workload(workload)),
+        workload_source: Some(workload_source),
         policy,
         providers: configured_providers,
         name: name.unwrap_or_default().to_string(),
@@ -2524,6 +2563,416 @@ async fn wait_for_lifecycle_phase(
     }
 }
 
+pub struct SandboxTemplateCreateConfig {
+    pub name: String,
+    pub from: Option<String>,
+    pub environment: HashMap<String, String>,
+    pub cpu: Option<String>,
+    pub memory: Option<String>,
+    pub gpu_count: Option<u32>,
+    pub driver_config_json: Option<String>,
+    pub ready_within: Option<String>,
+    pub max_burst: Option<u32>,
+    pub labels: HashMap<String, String>,
+    pub annotations: HashMap<String, String>,
+    pub output: String,
+}
+
+pub async fn sandbox_template_create(
+    server: &str,
+    config: SandboxTemplateCreateConfig,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let SandboxTemplateCreateConfig {
+        name,
+        from,
+        environment,
+        cpu,
+        memory,
+        gpu_count,
+        driver_config_json,
+        ready_within,
+        max_burst,
+        labels,
+        annotations,
+        output,
+    } = config;
+
+    if let Some(from) = from.as_deref()
+        && (Path::new(from).exists() || value_looks_like_local_source(from))
+    {
+        return Err(miette!(
+            "sandbox template --from only supports image references and community sandbox names in this release"
+        ));
+    }
+    let image = from.as_deref().map_or_else(String::new, |from| {
+        openshell_core::image::resolve_community_image(from)
+    });
+
+    let mut resources =
+        build_sandbox_resource_limits(cpu.as_deref(), memory.as_deref())?.unwrap_or_default();
+    if let Some(gpu_count) = gpu_count {
+        resources.gpu_count = Some(gpu_count);
+    }
+    let resources = (!resources.cpu.is_empty()
+        || !resources.memory.is_empty()
+        || resources.gpu_count.is_some())
+    .then_some(resources);
+
+    let driver_config = driver_config_json
+        .as_deref()
+        .map(parse_driver_config_json)
+        .transpose()?;
+    let ready_within = ready_within
+        .as_deref()
+        .map(parse_ready_within_duration)
+        .transpose()?;
+    let desired_service_level =
+        (ready_within.is_some() || max_burst.is_some()).then(|| SandboxServiceLevel {
+            startup: Some(SandboxStartup {
+                ready_within,
+                max_burst: max_burst.unwrap_or_default(),
+            }),
+        });
+
+    let template = SandboxTemplate {
+        metadata: Some(ObjectMeta {
+            name,
+            labels,
+            annotations,
+            workspace: workspace.to_string(),
+            ..ObjectMeta::default()
+        }),
+        spec: Some(SandboxTemplateSpec {
+            workload: Some(SandboxWorkloadConfig {
+                image,
+                environment,
+                resources,
+            }),
+            driver_config,
+            desired_service_level,
+        }),
+    };
+
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .create_sandbox_template(CreateSandboxTemplateRequest {
+            template: Some(template),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    let template = response
+        .into_inner()
+        .template
+        .ok_or_else(|| miette!("sandbox template missing from response"))?;
+    print_sandbox_template(&template, &output)
+}
+
+pub async fn sandbox_template_get(
+    server: &str,
+    name: &str,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_sandbox_template(GetSandboxTemplateRequest {
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    let template = response
+        .into_inner()
+        .template
+        .ok_or_else(|| miette!("sandbox template missing from response"))?;
+    print_sandbox_template(&template, output)
+}
+
+pub async fn sandbox_template_list(
+    server: &str,
+    limit: u32,
+    offset: u32,
+    output: &str,
+    workspace: &str,
+    all_workspaces: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .list_sandbox_templates(ListSandboxTemplatesRequest {
+            limit,
+            offset,
+            workspace: if all_workspaces {
+                String::new()
+            } else {
+                workspace.to_string()
+            },
+            all_workspaces,
+        })
+        .await
+        .into_diagnostic()?;
+    let templates = response.into_inner().templates;
+
+    if crate::output::print_output_collection(output, &templates, sandbox_template_to_json)? {
+        return Ok(());
+    }
+
+    if templates.is_empty() {
+        println!("No sandbox templates found.");
+        return Ok(());
+    }
+
+    let name_width = templates
+        .iter()
+        .map(|template| template.object_name().len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let image_width = templates
+        .iter()
+        .map(|template| template_image(template).len())
+        .max()
+        .unwrap_or(5)
+        .clamp(5, 48);
+
+    println!(
+        "{:<name_width$}  {:<image_width$}  {:<8}  {:<8}  {:<5}  {:<12}  {:<9}  {}",
+        "NAME".bold(),
+        "IMAGE".bold(),
+        "CPU".bold(),
+        "MEMORY".bold(),
+        "GPU".bold(),
+        "READY_WITHIN".bold(),
+        "MAX_BURST".bold(),
+        "CREATED".bold(),
+    );
+    for template in &templates {
+        println!(
+            "{:<name_width$}  {:<image_width$}  {:<8}  {:<8}  {:<5}  {:<12}  {:<9}  {}",
+            template.object_name(),
+            truncate_display(&template_image(template), image_width),
+            template_resource_cpu(template),
+            template_resource_memory(template),
+            template_resource_gpu(template),
+            template_ready_within(template),
+            template_max_burst(template),
+            template_age(template),
+        );
+    }
+    Ok(())
+}
+
+pub async fn sandbox_template_delete(
+    server: &str,
+    names: &[String],
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    for name in names {
+        let response = client
+            .delete_sandbox_template(DeleteSandboxTemplateRequest {
+                name: name.clone(),
+                workspace: workspace.to_string(),
+            })
+            .await
+            .into_diagnostic()?;
+        if response.into_inner().deleted {
+            println!("{} Deleted sandbox template {name}", "✓".green().bold());
+        } else {
+            println!("{} Sandbox template {name} not found", "!".yellow());
+        }
+    }
+    Ok(())
+}
+
+fn parse_ready_within_duration(value: &str) -> Result<prost_types::Duration> {
+    let millis = parse_duration_to_ms(value)?;
+    if millis < 0 {
+        return Err(miette!(
+            "--ready-within must be greater than or equal to zero"
+        ));
+    }
+    Ok(prost_types::Duration {
+        seconds: millis / 1_000,
+        nanos: i32::try_from((millis % 1_000) * 1_000_000)
+            .expect("millisecond remainder fits in prost Duration nanos"),
+    })
+}
+
+fn print_sandbox_template(template: &SandboxTemplate, output: &str) -> Result<()> {
+    if crate::output::print_output_single(output, template, sandbox_template_to_json)? {
+        return Ok(());
+    }
+
+    println!("{}", "Sandbox Template".cyan().bold());
+    println!();
+    println!("  {} {}", "Name:".dimmed(), template.object_name());
+    println!(
+        "  {} {}",
+        "Workspace:".dimmed(),
+        template.object_workspace()
+    );
+    println!("  {} {}", "Image:".dimmed(), template_image(template));
+    println!("  {} {}", "CPU:".dimmed(), template_resource_cpu(template));
+    println!(
+        "  {} {}",
+        "Memory:".dimmed(),
+        template_resource_memory(template)
+    );
+    println!("  {} {}", "GPU:".dimmed(), template_resource_gpu(template));
+    println!(
+        "  {} {}",
+        "Driver config:".dimmed(),
+        non_empty_or(&template_driver_config_keys(template).join(", "), "-")
+    );
+    println!(
+        "  {} {}",
+        "Ready within:".dimmed(),
+        template_ready_within(template)
+    );
+    println!(
+        "  {} {}",
+        "Max burst:".dimmed(),
+        template_max_burst(template)
+    );
+    if let Some(meta) = template.metadata.as_ref() {
+        println!(
+            "  {} {}",
+            "Resource version:".dimmed(),
+            meta.resource_version
+        );
+        println!(
+            "  {} {}",
+            "Created:".dimmed(),
+            format_epoch_ms(meta.created_at_ms)
+        );
+    }
+    Ok(())
+}
+
+fn sandbox_template_to_json(template: &SandboxTemplate) -> serde_json::Value {
+    let meta = template.metadata.as_ref();
+    serde_json::json!({
+        "id": meta.map_or("", |m| m.id.as_str()),
+        "name": template.object_name(),
+        "workspace": template.object_workspace(),
+        "resource_version": meta.map_or(0, |m| m.resource_version),
+        "created_at": meta.map_or_else(String::new, |m| format_epoch_ms(m.created_at_ms)),
+        "labels": meta.map_or_else(|| serde_json::json!({}), |m| serde_json::json!(m.labels)),
+        "annotations": meta.map_or_else(|| serde_json::json!({}), |m| serde_json::json!(m.annotations)),
+        "image": template_image(template),
+        "environment": template.spec.as_ref()
+            .and_then(|spec| spec.workload.as_ref())
+            .map_or_else(|| serde_json::json!({}), |workload| serde_json::json!(workload.environment)),
+        "resources": {
+            "cpu": template_resource_cpu(template),
+            "memory": template_resource_memory(template),
+            "gpu_count": template_resources(template).and_then(|resources| resources.gpu_count),
+        },
+        "driver_config_keys": template_driver_config_keys(template),
+        "ready_within": template_ready_within(template),
+        "max_burst": template.spec.as_ref()
+            .and_then(|spec| spec.desired_service_level.as_ref())
+            .and_then(|level| level.startup.as_ref())
+            .map_or(0, |startup| startup.max_burst),
+    })
+}
+
+fn template_image(template: &SandboxTemplate) -> String {
+    template
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.workload.as_ref())
+        .map_or_else(String::new, |workload| workload.image.clone())
+}
+
+fn template_resources(template: &SandboxTemplate) -> Option<&SandboxResources> {
+    template
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.workload.as_ref())
+        .and_then(|workload| workload.resources.as_ref())
+}
+
+fn template_resource_cpu(template: &SandboxTemplate) -> String {
+    non_empty_or(
+        template_resources(template).map_or("", |r| r.cpu.as_str()),
+        "-",
+    )
+    .to_string()
+}
+
+fn template_resource_memory(template: &SandboxTemplate) -> String {
+    non_empty_or(
+        template_resources(template).map_or("", |r| r.memory.as_str()),
+        "-",
+    )
+    .to_string()
+}
+
+fn template_resource_gpu(template: &SandboxTemplate) -> String {
+    template_resources(template)
+        .and_then(|resources| resources.gpu_count)
+        .map_or_else(|| "-".to_string(), |count| count.to_string())
+}
+
+fn template_driver_config_keys(template: &SandboxTemplate) -> Vec<String> {
+    let mut keys = template
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.driver_config.as_ref())
+        .map(|driver_config| driver_config.fields.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+fn template_ready_within(template: &SandboxTemplate) -> String {
+    template
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.desired_service_level.as_ref())
+        .and_then(|level| level.startup.as_ref())
+        .and_then(|startup| startup.ready_within.as_ref())
+        .map_or_else(|| "-".to_string(), format_proto_duration)
+}
+
+fn template_max_burst(template: &SandboxTemplate) -> String {
+    template
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.desired_service_level.as_ref())
+        .and_then(|level| level.startup.as_ref())
+        .map_or_else(|| "-".to_string(), |startup| startup.max_burst.to_string())
+}
+
+fn template_age(template: &SandboxTemplate) -> String {
+    template.metadata.as_ref().map_or_else(
+        || "-".to_string(),
+        |meta| format_epoch_ms(meta.created_at_ms),
+    )
+}
+
+fn format_proto_duration(duration: &prost_types::Duration) -> String {
+    let millis = duration.seconds.saturating_mul(1_000) + i64::from(duration.nanos / 1_000_000);
+    if millis == 0 {
+        "0ms".to_string()
+    } else if millis % 3_600_000 == 0 {
+        format!("{}h", millis / 3_600_000)
+    } else if millis % 60_000 == 0 {
+        format!("{}m", millis / 60_000)
+    } else if millis % 1_000 == 0 {
+        format!("{}s", millis / 1_000)
+    } else {
+        format!("{millis}ms")
+    }
+}
+
 /// Return the provider type inferred from the trailing command, if any.
 fn inferred_provider_type(command: &[String]) -> Option<String> {
     detect_provider_from_command(command).map(str::to_string)
@@ -2726,7 +3175,7 @@ async fn auto_create_provider(
         // Explicit name: create with exactly that name, no retries.
         let request = CreateProviderRequest {
             provider: Some(Provider {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                metadata: Some(ObjectMeta {
                     id: String::new(),
                     name: exact_name.to_string(),
                     created_at_ms: 0,
@@ -2774,7 +3223,7 @@ async fn auto_create_provider(
 
             let request = CreateProviderRequest {
                 provider: Some(Provider {
-                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    metadata: Some(ObjectMeta {
                         id: String::new(),
                         name: name.clone(),
                         created_at_ms: 0,
@@ -3537,7 +3986,7 @@ pub async fn provider_create_with_options(
     let response = client
         .create_provider(CreateProviderRequest {
             provider: Some(Provider {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                metadata: Some(ObjectMeta {
                     id: String::new(),
                     name: name.to_string(),
                     created_at_ms: 0,
@@ -4634,7 +5083,7 @@ pub async fn provider_update(
     let response = client
         .update_provider(UpdateProviderRequest {
             provider: Some(Provider {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                metadata: Some(ObjectMeta {
                     id: String::new(),
                     name: name.to_string(),
                     created_at_ms: 0,

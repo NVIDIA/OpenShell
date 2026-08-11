@@ -202,7 +202,7 @@ Key flags:
 - `--policy`: Custom policy YAML (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var)
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
 - `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
-- `--driver-config-json`: Pass experimental driver-specific sandbox configuration
+- `--template NAME`: Create from a named sandbox template. Use templates for driver-specific configuration.
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
 - `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
@@ -211,6 +211,42 @@ Key flags:
 - `--no-keep`: Delete the sandbox after the initial command or shell exits
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
+
+Direct `sandbox create --driver-config-json` is rejected. Driver-specific
+settings belong to reusable sandbox templates:
+
+```bash
+openshell sandbox template create gpu-kata \
+  --from ghcr.io/nvidia/openshell-community/sandboxes/python:latest \
+  --driver-config-json '{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}' \
+  --gpu 1
+
+openshell sandbox create --name my-sandbox --template gpu-kata --provider my-github
+```
+
+`--template` uses the template workload, so it cannot be combined with inline
+workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, or
+`--driver-config-json`. Keep per-run policy, providers, labels, uploads,
+forwarding, editor launch, and the initial command on `sandbox create`.
+
+### Manage sandbox templates
+
+```bash
+openshell sandbox template create gpu-kata \
+  --from ghcr.io/nvidia/openshell-community/sandboxes/python:latest \
+  --cpu 2 \
+  --memory 4Gi \
+  --gpu 1 \
+  --driver-config-json '{"kubernetes":{}}'
+openshell sandbox template list
+openshell sandbox template list --all-workspaces --output json
+openshell sandbox template get gpu-kata
+openshell sandbox template delete gpu-kata
+```
+
+Template `--from` accepts image references and community sandbox names in this
+release. It does not build local Dockerfiles or directories; use direct
+`sandbox create --from ./Dockerfile` for local BYOC builds.
 
 ### List and inspect sandboxes
 
@@ -706,6 +742,11 @@ $ openshell sandbox upload --help
 | Create sandbox (interactive) | `openshell sandbox create` |
 | Create sandbox with tool | `openshell sandbox create -- claude` |
 | Create sandbox with GPUs | `openshell sandbox create --gpu 1` |
+| Create sandbox from template | `openshell sandbox create --template <template>` |
+| Create sandbox template | `openshell sandbox template create <name> --from <image> --driver-config-json '{"kubernetes":{}}'` |
+| List sandbox templates | `openshell sandbox template list` |
+| Inspect sandbox template | `openshell sandbox template get <name>` |
+| Delete sandbox template | `openshell sandbox template delete <name>` |
 | Create with custom policy | `openshell sandbox create --policy ./p.yaml` |
 | Connect to sandbox | `openshell sandbox connect <name>` |
 | Stop sandbox compute | `openshell sandbox stop [name]` |
