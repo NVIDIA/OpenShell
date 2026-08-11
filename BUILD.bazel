@@ -1,1 +1,4 @@
-exports_files(["deploy/rpm/gateway.toml.default"])
+exports_files([
+    "deploy/rpm/gateway.toml.default",
+    "flake.lock",
+])

@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Build the current checkout, run its gateway on the host or in a disposable
-# Nix test guest, and execute one named host-side E2E suite against that gateway.
+# Bazel test guest, and execute one named host-side E2E suite against that gateway.
 
 set -Eeuo pipefail
 
@@ -23,8 +23,8 @@ Usage:
     --gateway-config PATH --suite NAME
 
 Options:
-  --vm DISTRO          Run the gateway in a Nix test guest
-  --with CONFIG        Apply a Nix test-guest configuration; repeatable
+  --vm DISTRO          Run the gateway in a Bazel test guest
+  --with CONFIG        Select a Bazel test-guest configuration; repeatable
   --gateway-config PATH
                        Fully resolved gateway TOML
   --suite NAME         Rust suite at e2e/rust/tests/NAME.rs
@@ -68,29 +68,8 @@ print(os.path.realpath(sys.argv[1]))
 PY
 }
 
-catalog_has_entry() {
-	local catalog=$1
-	local section=$2
-	local name=$3
-
-	printf '%s\n' "${catalog}" | awk -v wanted_section="${section}:" -v wanted_name="${name}" '
-		$0 == wanted_section {
-			in_section = 1
-			next
-		}
-		/^[^[:space:]]/ {
-			in_section = 0
-		}
-		in_section && $0 == "  " wanted_name {
-			found = 1
-		}
-		END {
-			exit(found ? 0 : 1)
-		}
-	'
-}
-
 vm=
+vm_bazel_target=
 gateway_config=
 suite_name=
 with_configurations=()
@@ -174,23 +153,20 @@ if [ "${mode}" = vm ]; then
 	if [ "${gateway_driver}" = podman ] && [ "${vm}" = ubuntu ]; then
 		die "the Ubuntu 24.04 guest lacks the Podman 5 pasta helper required for sandbox callbacks; use --vm fedora --with podman"
 	fi
-	if ! command -v nix >/dev/null 2>&1; then
-		die "Nix is required for VM mode"
+	if ! command -v bazel >/dev/null 2>&1; then
+		die "Bazel is required for VM mode"
 	fi
 	if ! command -v base64 >/dev/null 2>&1; then
 		die "base64 is required for VM mode"
 	fi
-	if ! vm_catalog="$(cd "${ROOT}" && nix run .#test-guest -- --list)"; then
-		die "failed to read the Nix test-guest catalog"
-	fi
-	if ! catalog_has_entry "${vm_catalog}" Distros "${vm}"; then
-		die "unknown VM distro in the Nix test-guest catalog: ${vm}"
-	fi
+	vm_target_name=${vm}
 	for configuration in "${with_configurations[@]}"; do
-		if ! catalog_has_entry "${vm_catalog}" Configurations "${configuration}"; then
-			die "unknown VM configuration in the Nix test-guest catalog: ${configuration}"
-		fi
+		vm_target_name+=_${configuration}
 	done
+	vm_bazel_target="//nix/test-guest:${vm_target_name}"
+	if ! (cd "${ROOT}" && bazel query "${vm_bazel_target}" >/dev/null); then
+		die "unsupported Bazel test-guest combination: ${vm_target_name}"
+	fi
 fi
 
 gateway_ready_timeout=${OPENSHELL_E2E_GATEWAY_READY_TIMEOUT:-600}
@@ -484,12 +460,8 @@ EOF
 	chmod 0700 "${guest_launcher}"
 
 	vm_args=(
-		nix run .#test-guest --
-		--distro "${vm}"
+		bazel run "${vm_bazel_target}" --
 	)
-	for configuration in "${with_configurations[@]}"; do
-		vm_args+=(--with "${configuration}")
-	done
 	vm_args+=(
 		--copy "${guest_gateway_bin}:/usr/local/bin/openshell-gateway"
 		--copy "${guest_launcher}:${guest_launcher_path}"

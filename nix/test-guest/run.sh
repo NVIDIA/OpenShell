@@ -9,30 +9,23 @@ set -Eeuo pipefail
 usage() {
 	cat <<'EOF'
 Usage:
-  nix run .#test-guest -- --distro DISTRO [OPTIONS] [-- COMMAND...]
+  bazel run //nix/test-guest:VARIANT -- [OPTIONS] [-- COMMAND...]
 
 Options:
-  --distro NAME       Base distro: ubuntu, centos, fedora, or rocky
-  --with NAME         Apply a configuration; repeatable (docker, podman, selinux)
   --install PATH      Install a .deb or .rpm package; repeatable
   --copy SRC:DEST     Copy an executable to an absolute guest path; repeatable
   --ssh-port PORT     Use a specific loopback SSH forwarding port
   --forward-port HOST_PORT:GUEST_PORT
                       Forward a loopback host port to a guest port; repeatable
   --keep              Keep the disposable disk and logs after shutdown
-  --list              List distros and configurations
   -h, --help          Show this help
 
 With no COMMAND, the runner opens an interactive SSH session.
 EOF
 }
 
-if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ] ||
-	[ ! -d "${OPENSHELL_TEST_GUEST_DISTROS:-}" ] ||
-	[ ! -d "${OPENSHELL_TEST_GUEST_CONFIGURATIONS:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_LIB:-}" ] ||
-	[ ! -r "${OPENSHELL_TEST_GUEST_CACHE_RUNNER:-}" ]; then
-	echo "run this script through 'nix run .#test-guest -- ...'" >&2
+if [ "${OPENSHELL_TEST_GUEST_RUNTIME:-}" != 1 ]; then
+	echo "run this script through a //nix/test-guest Bazel target" >&2
 	exit 2
 fi
 
@@ -44,10 +37,13 @@ require_value() {
 }
 
 distro=
+os_id=
+os_version=
+package_family=
 requested_ssh_port=
 keep=0
-list=0
 configurations=()
+configuration_paths=()
 packages=()
 copies=()
 forward_ports=()
@@ -60,10 +56,35 @@ while [ "$#" -gt 0 ]; do
 		distro=$2
 		shift 2
 		;;
+	--os-id)
+		require_value "$@"
+		os_id=$2
+		shift 2
+		;;
+	--os-version)
+		require_value "$@"
+		os_version=$2
+		shift 2
+		;;
+	--package-family)
+		require_value "$@"
+		package_family=$2
+		shift 2
+		;;
 	--with)
 		require_value "$@"
 		configurations+=("$2")
+		configuration_paths+=("")
 		shift 2
+		;;
+	--configuration-file)
+		if [ "$#" -lt 3 ] || [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+			echo "--configuration-file requires NAME PATH" >&2
+			exit 2
+		fi
+		configurations+=("$2")
+		configuration_paths+=("$3")
+		shift 3
 		;;
 	--install)
 		require_value "$@"
@@ -92,10 +113,6 @@ while [ "$#" -gt 0 ]; do
 		keep=1
 		shift
 		;;
-	--list)
-		list=1
-		shift
-		;;
 	-h | --help)
 		usage
 		exit 0
@@ -113,35 +130,34 @@ while [ "$#" -gt 0 ]; do
 	esac
 done
 
-if [ "${list}" -eq 1 ]; then
-	echo "Distros:"
-	for entry in "${OPENSHELL_TEST_GUEST_DISTROS}"/*; do
-		printf '  %s\n' "${entry##*/}"
-	done
-	echo "Configurations:"
-	for entry in "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}"/*; do
-		printf '  %s\n' "${entry##*/}"
-	done
-	exit 0
-fi
-
 if [ -z "${distro}" ]; then
-	echo "--distro is required" >&2
-	usage >&2
+	echo "Bazel launcher did not supply --distro" >&2
 	exit 2
 fi
-if [[ ! ${distro} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-	[ ! -r "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}" ]; then
+if [[ ! ${distro} =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
 	echo "unknown distro: ${distro}" >&2
 	exit 2
 fi
-# Distro profiles contain only trusted values generated into the Nix store.
-# shellcheck disable=SC1090
-. "${OPENSHELL_TEST_GUEST_DISTROS}/${distro}"
+if [[ ! ${os_id} =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+	echo "Bazel launcher supplied an invalid OS ID: ${os_id:-<empty>}" >&2
+	exit 2
+fi
+if [[ ! ${os_version} =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+	echo "Bazel launcher supplied an invalid OS version: ${os_version:-<empty>}" >&2
+	exit 2
+fi
+case "${package_family}" in
+deb | rpm) ;;
+*)
+	echo "Bazel launcher supplied an invalid package family: ${package_family:-<empty>}" >&2
+	exit 2
+	;;
+esac
 
-for item in "${configurations[@]}"; do
+for index in "${!configurations[@]}"; do
+	item=${configurations[index]}
 	if [[ ! ${item} =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-		[ ! -r "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}" ]; then
+		{ [ -n "${configuration_paths[index]}" ] && [ ! -r "${configuration_paths[index]}" ]; }; then
 		echo "unknown configuration: ${item:-<empty>}" >&2
 		exit 2
 	fi
@@ -210,10 +226,10 @@ for package in "${packages[@]}"; do
 		echo "package does not exist: ${package_input}" >&2
 		exit 2
 	fi
-	case "${TEST_GUEST_PACKAGE_FAMILY}:${package}" in
+	case "${package_family}:${package}" in
 	deb:*.deb | rpm:*.rpm) ;;
 	*)
-		echo "${package} does not match the ${TEST_GUEST_PACKAGE_FAMILY} package family" >&2
+		echo "${package} does not match the ${package_family} package family" >&2
 		exit 2
 		;;
 	esac
@@ -261,9 +277,6 @@ if [ "${TEST_GUEST_ACCELERATOR}" = kvm ] &&
 	ssh_wait_seconds=600
 fi
 
-# shellcheck disable=SC1090
-. "${OPENSHELL_TEST_GUEST_CACHE_LIB}"
-
 report_timing() {
 	local label=$1
 	local started_at=$2
@@ -282,36 +295,25 @@ if [ -n "${OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE:-}" ]; then
 	TEST_GUEST_IMAGE=${OPENSHELL_TEST_GUEST_IMAGE_OVERRIDE}
 	prepared_image=1
 	echo "==> Using explicit prepared guest image"
-elif [ "${OPENSHELL_TEST_GUEST_CACHE_DISABLE:-0}" -ne 1 ]; then
-	cache_root=$(test_vm_cache_root)
-	cache_key=$(test_vm_cache_key "${distro}" "${configurations[@]}")
-	cache_entry=$(test_vm_cache_entry_dir "${cache_root}" "${cache_key}")
-	if ! test_vm_cache_local_entry_valid \
-		"${cache_root}" "${cache_key}" "${distro}" "${configurations[@]}"; then
-		cache_args=(--distro "${distro}")
-		for item in "${configurations[@]}"; do
-			cache_args+=(--with "${item}")
-		done
-		echo "==> Cache local miss: populating ${cache_entry}"
-		OPENSHELL_TEST_GUEST_CACHE_DISABLE=1 \
-			"${TEST_GUEST_BASH}" "${OPENSHELL_TEST_GUEST_CACHE_RUNNER}" \
-			"${cache_args[@]}"
-		if ! test_vm_cache_local_entry_valid \
-			"${cache_root}" "${cache_key}" "${distro}" "${configurations[@]}"; then
-			echo "cache builder did not produce a valid entry: ${cache_entry}" >&2
-			exit 1
-		fi
-		echo "==> Cache populated: ${cache_entry}"
-	else
-		echo "==> Cache local hit: ${cache_entry}"
+elif [ -n "${OPENSHELL_TEST_GUEST_BASE_IMAGE_OVERRIDE:-}" ]; then
+	if [ ! -f "${OPENSHELL_TEST_GUEST_BASE_IMAGE_OVERRIDE}" ]; then
+		echo "base guest image does not exist: ${OPENSHELL_TEST_GUEST_BASE_IMAGE_OVERRIDE}" >&2
+		exit 2
 	fi
-	TEST_GUEST_IMAGE="${cache_entry}/disk.qcow2"
-	prepared_image=1
+	TEST_GUEST_IMAGE=${OPENSHELL_TEST_GUEST_BASE_IMAGE_OVERRIDE}
+	echo "==> Using explicit base guest image"
+else
+	echo "Bazel launcher did not supply a prepared or base guest image" >&2
+	exit 2
 fi
 
 if [ "${prepared_image}" -eq 0 ]; then
-	echo "==> Realizing the pinned ${distro} cloud image"
-	TEST_GUEST_IMAGE=$(nix build --no-link --print-out-paths "${TEST_GUEST_IMAGE_DRV}^out")
+	for index in "${!configurations[@]}"; do
+		if [ -z "${configuration_paths[index]}" ]; then
+			echo "missing declared playbook for configuration: ${configurations[index]}" >&2
+			exit 2
+		fi
+	done
 fi
 report_timing "guest image resolution" "${phase_started_at}"
 
@@ -549,10 +551,10 @@ report_timing "VM boot and SSH" "${phase_started_at}"
 
 phase_started_at=${SECONDS}
 echo "==> Validating ${distro}"
-# Profile values come from the trusted Nix-generated catalog.
+# Profile values come from the Bazel base-image provider.
 # shellcheck disable=SC2029
 ssh "${ssh_args[@]}" openshell@127.0.0.1 \
-	"set -eu; set +e; sudo cloud-init status --wait >/dev/null; status=\$?; set -e; [ \"\${status}\" -eq 0 ] || [ \"\${status}\" -eq 2 ]; . /etc/os-release; test \"\${ID}\" = '${TEST_GUEST_OS_ID}'; case \"\${VERSION_ID}\" in '${TEST_GUEST_OS_VERSION}'*) ;; *) exit 1 ;; esac; test \"\$(uname -m)\" = '${TEST_GUEST_ARCHITECTURE}'"
+	"set -eu; set +e; sudo cloud-init status --wait >/dev/null; status=\$?; set -e; [ \"\${status}\" -eq 0 ] || [ \"\${status}\" -eq 2 ]; . /etc/os-release; test \"\${ID}\" = '${os_id}'; case \"\${VERSION_ID}\" in '${os_version}'*) ;; *) exit 1 ;; esac; test \"\$(uname -m)\" = '${TEST_GUEST_ARCHITECTURE}'"
 # cloud-init returns 2 when it completes with recoverable errors. Fedora can
 # report that status for an initial transient-hostname warning even though the
 # requested user and SSH configuration were applied successfully.
@@ -574,10 +576,11 @@ guest ansible_host=127.0.0.1 ansible_port=${ssh_port} ansible_user=openshell ans
 EOF
 
 if [ "${prepared_image}" -eq 0 ]; then
-	for item in "${configurations[@]}"; do
+	for index in "${!configurations[@]}"; do
+		item=${configurations[index]}
 		echo "==> Applying configuration: ${item}"
 		ANSIBLE_CONFIG="${ansible_config}" ANSIBLE_NOCOLOR=1 \
-			ansible-playbook "${OPENSHELL_TEST_GUEST_CONFIGURATIONS}/${item}"
+			ansible-playbook "${configuration_paths[index]}"
 	done
 else
 	echo "==> Reusing cached configuration: ${configurations[*]:-base image}"
@@ -592,7 +595,7 @@ if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
 	remote_packages=()
 	artifact_index=0
 	for package in "${packages[@]}"; do
-		remote_path=${artifact_staging_dir}/package-${artifact_index}.${TEST_GUEST_PACKAGE_FAMILY}
+		remote_path=${artifact_staging_dir}/package-${artifact_index}.${package_family}
 		echo "==> Copying package: ${package##*/}"
 		scp -q "${scp_args[@]}" \
 			"${package}" "openshell@127.0.0.1:${remote_path}"
@@ -602,7 +605,7 @@ if [ "${#packages[@]}" -gt 0 ] || [ "${#copies[@]}" -gt 0 ]; then
 
 	if [ "${#remote_packages[@]}" -gt 0 ]; then
 		printf -v quoted_packages ' %q' "${remote_packages[@]}"
-		case "${TEST_GUEST_PACKAGE_FAMILY}" in
+		case "${package_family}" in
 		deb)
 			ssh "${ssh_args[@]}" openshell@127.0.0.1 \
 				"sudo apt-get update >/dev/null && sudo apt-get install -y --${quoted_packages}"

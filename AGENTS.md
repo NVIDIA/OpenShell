@@ -88,6 +88,22 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 - Store plan documents in `architecture/plans`. This is git ignored so its for easier access for humans. When asked to create Spikes or issues, you can skip to GitHub issues. Only use the plans dir when you aren't writing data somewhere else specific.
 - When asked to write a plan, write it there without asking for the location.
 
+## Bazel
+
+- Use the Bazel version pinned in `.bazelversion` and check its current
+  documentation before introducing a new build-system pattern.
+- Use Bzlmod (`MODULE.bazel`, module extensions, and `use_repo_rule`) instead of
+  adding `WORKSPACE`-era dependency wiring. Keep the root module concise by
+  moving subsystem-specific setup into `<name>.MODULE.bazel` files included
+  with `include()`.
+- Model tools and configuration with declared attributes, providers,
+  toolchains, and platform constraints. Actions must declare their inputs,
+  outputs, environment, and execution requirements; do not depend on ambient
+  host tools or environment state.
+- Prefer stable, non-deprecated Bazel and Starlark APIs, preserve local and
+  remote cacheability unless the operation inherently forbids it, and run
+  Buildifier plus a focused `bazel build` or `bazel test` for changed targets.
+
 ## Sandbox Logging (OCSF)
 
 When adding or modifying log emissions in `openshell-sandbox`, determine whether the event should use OCSF structured logging or plain `tracing`.

@@ -38,12 +38,8 @@
           programs.nixfmt.enable = true;
         };
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-        testGuest = import ./nix/test-guest { inherit pkgs; };
       in
       {
-        apps.test-guest = testGuest.app;
-        apps.test-guest-cache = testGuest.cacheApp;
-
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rustToolchain

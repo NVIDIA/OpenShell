@@ -1,0 +1,46 @@
+"""Bzlmod dependencies and repositories for test-guest."""
+
+bazel_dep(name = "rules_nixpkgs_core", version = "0.13.0")
+bazel_dep(name = "rules_shell", version = "0.6.1")
+
+nix_repo = use_extension(
+    "@rules_nixpkgs_core//extensions:repository.bzl",
+    "nix_repo",
+)
+nix_repo.file(
+    name = "openshell_nixpkgs",
+    file = "//nix/test-guest:nixpkgs.nix",
+    file_deps = ["//:flake.lock"],
+)
+use_repo(nix_repo, "openshell_nixpkgs")
+
+nix_pkg = use_extension(
+    "@rules_nixpkgs_core//extensions:package.bzl",
+    "nix_pkg",
+)
+nix_pkg.file(
+    name = "test_guest_host_tools",
+    attr = "bazelHostTools",
+    build_file = "//nix/test-guest:host-tools.BUILD.bazel",
+    file = "//nix/test-guest:host-tools.nix",
+    file_deps = [
+        "//nix/test-guest:run.sh",
+    ],
+    repo = "@openshell_nixpkgs",
+)
+use_repo(nix_pkg, "test_guest_host_tools")
+
+test_guest_images = use_extension("//nix/test-guest:extensions.bzl", "test_guest_images")
+use_repo(
+    test_guest_images,
+    "test_guest_centos_aarch64",
+    "test_guest_centos_x86_64",
+    "test_guest_fedora_aarch64",
+    "test_guest_fedora_x86_64",
+    "test_guest_rocky_aarch64",
+    "test_guest_rocky_x86_64",
+    "test_guest_ubuntu_aarch64",
+    "test_guest_ubuntu_x86_64",
+)
+
+register_toolchains("//nix/test-guest:nix_host_tools_toolchain")

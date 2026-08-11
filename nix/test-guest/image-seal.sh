@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Sanitize a configured test guest before its disk is published as a cache base.
+# Sanitize a configured test guest before capturing its prepared image.
 
 set -Eeuo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
-	echo "cache sealing must run as root" >&2
+	echo "image sealing must run as root" >&2
 	exit 1
 fi
 
@@ -47,8 +47,8 @@ rm -f -- "$0"
 sync
 
 # Deleted credentials can remain in allocated blocks. Fill free space with
-# zeroes so qemu-img convert can safely omit those blocks from the cache disk.
-zero_file=/var/tmp/openshell-cache-zero
+# zeroes so qemu-img convert can omit those blocks from the prepared disk.
+zero_file=/var/tmp/openshell-image-zero
 dd if=/dev/zero of="${zero_file}" bs=64M status=none 2>/dev/null || true
 rm -f "${zero_file}"
 sync

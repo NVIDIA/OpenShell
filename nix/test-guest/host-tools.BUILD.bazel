@@ -1,0 +1,57 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "bin/bash",
+    "bin/jq",
+    "bin/openshell-test-guest",
+    "bin/qemu-img",
+    "bin/sha256sum",
+    "versions/ansible",
+    "versions/qemu",
+])
+
+filegroup(
+    name = "all",
+    srcs = glob(
+        ["**"],
+        exclude = [
+            "BUILD",
+            "bazel-support/**",
+        ],
+    ),
+)
+
+filegroup(
+    name = "ansible_version",
+    srcs = ["versions/ansible"],
+)
+
+filegroup(
+    name = "bash",
+    srcs = ["bin/bash"],
+)
+
+filegroup(
+    name = "jq",
+    srcs = ["bin/jq"],
+)
+
+filegroup(
+    name = "qemu_img",
+    srcs = ["bin/qemu-img"],
+)
+
+filegroup(
+    name = "qemu_version",
+    srcs = ["versions/qemu"],
+)
+
+filegroup(
+    name = "runner",
+    srcs = ["bin/openshell-test-guest"],
+)
+
+filegroup(
+    name = "sha256sum",
+    srcs = ["bin/sha256sum"],
+)
