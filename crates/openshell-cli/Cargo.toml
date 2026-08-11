@@ -15,6 +15,7 @@ name = "openshell"
 path = "src/main.rs"
 
 [dependencies]
+openshell-crypto = { workspace = true }
 openshell-bootstrap = { path = "../openshell-bootstrap" }
 openshell-core = { path = "../openshell-core", default-features = false }
 openshell-policy = { path = "../openshell-policy" }
@@ -46,7 +47,9 @@ bytes = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "ring"] }
+# No backend feature: uses the process-default CryptoProvider installed by
+# `openshell-crypto`, so the FIPS build does not silently fall back to ring.
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging"] }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -83,6 +86,11 @@ tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+default = ["backend-ring"]
+backend-ring = ["openshell-crypto/backend-ring"]
+fips = ["openshell-crypto/fips"]
 
 [dev-dependencies]
 futures = { workspace = true }

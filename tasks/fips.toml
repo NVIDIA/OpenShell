@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# FIPS build tasks.
+#
+# The `fips` cargo feature switches every OpenShell crypto operation from `ring`
+# to AWS-LC in FIPS mode. Building it requires CMake and Go on the host to
+# compile `aws-lc-fips-sys`, which is why it is not part of the default `ci`
+# task. See docs/security/fips.mdx.
+
+["fips:check"]
+description = "Type-check the gateway, CLI, and supervisor in FIPS mode"
+run = "cargo check -p openshell-server -p openshell-cli -p openshell-sandbox --features fips --all-targets"
+
+["fips:test"]
+description = "Run the crypto and credential-storage test suites in FIPS mode"
+run = """
+cargo test -p openshell-crypto --no-default-features --features fips
+cargo test -p openshell-driver-db-credstore --no-default-features --features fips
+cargo test -p openshell-server --features fips --lib auth::
+"""
+
+["fips:build"]
+description = "Release-build the gateway in FIPS mode"
+run = "cargo build --release -p openshell-server --features fips"
+
+["fips:audit"]
+description = "Report which dependencies still link ring in a FIPS build"
+run = "tasks/scripts/fips-audit.sh"
+
+[fips]
+description = "Check, test, and audit the FIPS build"
+depends = ["fips:check", "fips:test", "fips:audit"]

@@ -20,7 +20,6 @@ use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, SeverityId, SshActivityBuilder, StatusId, ocsf_emit,
 };
-use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, ChannelOpenHandle, Handle, Session};
 use russh::{ChannelId, ChannelOpenFailure};
 use std::collections::HashMap;
@@ -48,11 +47,14 @@ fn ssh_server_init(
     enforcement_mode: ProcessEnforcementMode,
     shared_socket: bool,
 ) -> Result<SshServerInit> {
-    let mut rng = rand::rng();
-    let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
+    let host_key = openshell_crypto::ssh::generate_host_key().into_diagnostic()?;
 
     let mut config = russh::server::Config {
         auth_rejection_time: Duration::from_secs(1),
+        // Restricts negotiation to FIPS-approved algorithms in a FIPS build and
+        // leaves russh's defaults in place otherwise. Without this, the server
+        // offers ChaCha20-Poly1305 and Curve25519 regardless of build mode.
+        preferred: openshell_crypto::ssh::preferred(),
         ..Default::default()
     };
     config.keys.push(host_key);
@@ -2013,13 +2015,12 @@ mod tests {
     /// TCP connect, making the forwarding path reachable without a network
     /// namespace.
     async fn authenticated_test_client() -> russh::client::Handle<AcceptAnyServerKey> {
-        // Scoped so the `!Send` ThreadRng is dropped before the first await.
-        let host_key = {
-            let mut rng = rand::rng();
-            PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("host key")
-        };
+        // Scoped so the `!Send` ThreadRng inside key generation is dropped
+        // before the first await.
+        let host_key = { openshell_crypto::ssh::generate_host_key().expect("host key") };
         let mut server_config = russh::server::Config {
             auth_rejection_time: Duration::from_millis(1),
+            preferred: openshell_crypto::ssh::preferred(),
             ..Default::default()
         };
         server_config.keys.push(host_key);
@@ -2046,7 +2047,10 @@ mod tests {
         });
 
         let mut client = russh::client::connect_stream(
-            Arc::new(russh::client::Config::default()),
+            Arc::new(russh::client::Config {
+                preferred: openshell_crypto::ssh::preferred(),
+                ..Default::default()
+            }),
             client_stream,
             AcceptAnyServerKey,
         )

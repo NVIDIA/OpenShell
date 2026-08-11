@@ -219,9 +219,13 @@ pub fn command() -> Command {
 }
 
 pub async fn run_cli() -> Result<()> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
+    openshell_crypto::install_default_provider();
+    openshell_crypto::verify_fips_posture().map_err(|_| {
+        miette::miette!(
+            "binary was built with the `fips` feature but the installed rustls provider does not \
+             report FIPS-approved cryptography; the feature did not reach the rustls dependency"
+        )
+    })?;
 
     let matches = command().get_matches();
     let cli = Cli::from_arg_matches(&matches).expect("clap validated args");

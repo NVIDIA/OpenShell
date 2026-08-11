@@ -2151,9 +2151,13 @@ enum WorkspaceMemberCommands {
 async fn main() -> Result<()> {
     // Install the rustls crypto provider before completion runs — completers may
     // establish TLS connections to the gateway.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
+    openshell_crypto::install_default_provider();
+    openshell_crypto::verify_fips_posture().map_err(|_| {
+        miette::miette!(
+            "binary was built with the `fips` feature but the installed rustls provider does not \
+             report FIPS-approved cryptography; the feature did not reach the rustls dependency"
+        )
+    })?;
 
     CompleteEnv::with_factory(Cli::command).complete();
 

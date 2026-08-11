@@ -41,7 +41,7 @@ pub struct SandboxCa {
 impl SandboxCa {
     /// Generate a new ephemeral CA keypair.
     pub fn generate() -> Result<Self> {
-        let ca_key = KeyPair::generate().into_diagnostic()?;
+        let ca_key = openshell_crypto::generate_pki_keypair().into_diagnostic()?;
 
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -113,7 +113,7 @@ impl CertCache {
 
     /// Generate a new leaf certificate for the given hostname.
     fn generate_leaf(&self, hostname: &str) -> Result<CertifiedLeaf> {
-        let leaf_key = KeyPair::generate().into_diagnostic()?;
+        let leaf_key = openshell_crypto::generate_pki_keypair().into_diagnostic()?;
 
         let mut params = CertificateParams::new(vec![hostname.to_string()]).into_diagnostic()?;
         params.distinguished_name.push(DnType::CommonName, hostname);
@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn upstream_config_alpn() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        openshell_crypto::install_default_provider();
         let config = build_upstream_client_config("").unwrap();
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }

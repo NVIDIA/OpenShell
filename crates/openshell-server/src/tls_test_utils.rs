@@ -14,7 +14,7 @@ use rcgen::{CertificateParams, IsCa, KeyPair};
 /// Must be called once at the start of any test that exercises TLS handshakes.
 /// Multiple calls are harmless (subsequent calls return an error, ignored).
 pub fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    openshell_crypto::install_default_provider();
 }
 
 /// Write bytes to a file inside `dir`, panicking on failure.

@@ -519,7 +519,7 @@ fn main() -> Result<()> {
             .build()
             .into_diagnostic()?;
         return runtime.block_on(async move {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            openshell_crypto::install_default_provider();
             let exit = openshell_supervisor_process::debug_rpc::run(&raw_args[2..]).await?;
             std::process::exit(exit);
         });
@@ -565,7 +565,7 @@ fn main() -> Result<()> {
 
     let exit_code = runtime.block_on(async move {
         // Install rustls crypto provider before any TLS connections (including log push).
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        openshell_crypto::install_default_provider();
 
         // Set up optional log push layer (gRPC mode only).
         let log_push_state = if let (Some(sandbox_id), Some(endpoint)) =

@@ -57,6 +57,46 @@ HTTP/TLS support behind explicit build features, so default system-Z3 builds do
 not reintroduce bundled Mozilla roots. Release builds that need bundled Z3
 continue to opt in with `bundled-z3`.
 
+## Crypto Backend Selection
+
+`openshell-crypto` is the single point of cryptographic backend selection. Every
+TLS, PKI, JWT, AEAD, hashing, and RNG operation in the workspace routes through
+it, so the backend is one feature rather than an audit of call sites. No other
+crate may name a backend directly, and the workspace `rustls`, `tokio-rustls`,
+and `rcgen` entries deliberately declare no backend feature — adding one back
+would link `ring` unconditionally and silently defeat the FIPS build.
+
+Two mutually exclusive modes, selected at compile time:
+
+- `backend-ring` (default) — `ring` backs TLS, PKI, and AEAD. Historical
+  behavior, unchanged.
+- `fips` — AWS-LC in FIPS mode backs all of the above, and every algorithm
+  choice narrows to the FIPS-approved set.
+
+FIPS mode cannot be a runtime toggle. rustls derives `require_ems` (the TLS 1.2
+extended-master-secret requirement) from its own `fips` feature at compile time,
+so one binary cannot serve both modes. A runtime switch would also leave both
+modules linked and reachable, which is the posture the crate exists to prevent.
+
+Algorithm restriction comes from `rustls::crypto::default_fips_provider()`
+rather than a hand-maintained suite list, so the approved set tracks rustls's
+view of the module's validated boundary. `install_default_provider()` installs it
+as the process default, which every `ClientConfig::builder()` and
+`ServerConfig::builder()` call then inherits without threading a provider
+through call sites. `verify_fips_posture()` runs at gateway and CLI startup and
+fails the process if the `fips` feature reached `openshell-crypto` but not
+`rustls` — the case that would otherwise downgrade silently.
+
+Two dependencies do not honor the process default and are gated separately:
+`sqlx` selects a provider from its own features (so `openshell-server` forwards
+the backend choice to it, at the cost of losing native-root loading in FIPS
+mode), and `aws-smithy-http-client` constructs its own provider, so AWS SDK
+calls still use `ring`. `mise run fips:audit` reports the residual surface.
+
+Build-mode differences that are visible outside the process — the JWT signing
+algorithm, the SSH host key type, and the database trust store — are documented
+in `docs/security/fips.mdx`.
+
 ## Linux Runtime Environments
 
 OpenShell uses different Linux libc environments for different host artifacts.

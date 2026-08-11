@@ -1932,7 +1932,7 @@ mod tests {
 
     #[test]
     fn gateway_add_registers_plaintext_loopback_gateway_without_local_flag() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        openshell_crypto::install_default_provider();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
@@ -1964,7 +1964,7 @@ mod tests {
 
     #[test]
     fn gateway_add_respects_local_flag_for_plaintext_registrations() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        openshell_crypto::install_default_provider();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
@@ -1994,7 +1994,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_health_check_supports_plain_http_endpoints() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        openshell_crypto::install_default_provider();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");
         let server = thread::spawn(move || {
@@ -2023,7 +2023,7 @@ mod tests {
 
     #[test]
     fn gateway_add_oidc_rolls_back_on_auth_failure() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        openshell_crypto::install_default_provider();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
@@ -2080,7 +2080,7 @@ mod tests {
     }
     #[test]
     fn gateway_add_oidc_rollback_keeps_system_active_fallback_userless() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        openshell_crypto::install_default_provider();
         let user = tempfile::tempdir().expect("create user tmpdir");
         let system = tempfile::tempdir().expect("create system tmpdir");
         with_tmp_xdg_and_system(user.path(), system.path(), || {
@@ -2121,7 +2121,7 @@ mod tests {
 
     #[test]
     fn gateway_add_cloud_rolls_back_on_auth_failure() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        openshell_crypto::install_default_provider();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
             let _no_browser = EnvVarGuard::set("OPENSHELL_NO_BROWSER", "0");
@@ -2179,7 +2179,7 @@ mod tests {
     }
     #[test]
     fn gateway_add_cloud_rollback_keeps_system_active_fallback_userless() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        openshell_crypto::install_default_provider();
         let user = tempfile::tempdir().expect("create user tmpdir");
         let system = tempfile::tempdir().expect("create system tmpdir");
         with_tmp_xdg_and_system(user.path(), system.path(), || {

@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+jsonwebtoken = { workspace = true }
+rand = "0.10"
+rcgen = { workspace = true }
+rustls = { workspace = true }
+russh = { workspace = true }
+tracing = { workspace = true }
+
+aws-lc-rs = { version = "1.16", optional = true }
+ring = { workspace = true, optional = true }
+
+[features]
+default = ["backend-ring"]
+
+# Non-FIPS build: `ring` backs TLS, PKI, and AEAD. This is the historical
+# behavior and stays the default.
+backend-ring = ["dep:ring", "rustls/ring", "rcgen/ring"]
+
+# FIPS build: AWS-LC in FIPS mode backs TLS, PKI, AEAD, hashing, and RNG, and
+# every algorithm selection narrows to the FIPS-approved set.
+#
+# `fips` takes precedence over `backend-ring` at every branch, so enabling both
+# (which is what plain `--features fips` does, since Cargo features are additive)
+# still yields FIPS-approved behavior. It does not remove `ring` from the
+# dependency graph — see the crate docs for the two paths that still link it.
+#
+# Requires CMake and Go on the build host to compile aws-lc-fips-sys.
+#
+# `rcgen/aws_lc_rs` is required in addition to `rcgen/fips`: rcgen 0.13.2's
+# `fips` feature pulls the FIPS sys crate but its backend selection gates on
+# `feature = "aws_lc_rs"`, so `fips` alone fails to compile. Enabling both is
+# safe — `aws-lc-rs` links `aws-lc-fips-sys` whenever its own `fips` feature is
+# on, regardless of `aws-lc-sys` also being requested.
+fips = [
+    "dep:aws-lc-rs",
+    "aws-lc-rs/fips",
+    "rustls/aws_lc_rs",
+    "rustls/fips",
+    "rcgen/aws_lc_rs",
+    "rcgen/fips",
+]
+
+[lints]
+workspace = true

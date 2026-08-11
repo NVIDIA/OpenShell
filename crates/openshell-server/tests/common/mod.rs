@@ -544,7 +544,7 @@ impl OpenShell for TestOpenShell {
 
 /// Initialise the rustls crypto provider (idempotent).
 pub fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    openshell_crypto::install_default_provider();
 }
 
 /// PKI bundle: CA cert, server cert+key, client cert+key (all PEM).
