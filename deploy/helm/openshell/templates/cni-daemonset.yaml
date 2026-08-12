@@ -107,14 +107,16 @@ spec:
               # Kubernetes API lookup, so control-plane latency or an RBAC/token
               # problem cannot block unrelated workloads' pod creation.
               #
-              # The allowlist is computed automatically as the union of the static
-              # cni.sandboxNamespaces value and every namespace labeled
-              # openshell.ai/sandbox=true (each gateway release labels its own
-              # sandbox namespace via a helm hook). So an additional cni.external
-              # release is discovered and enforced automatically — no manual
-              # allowlist edit. `configVersion` binds node readiness to the desired
-              # config, so when the discovered set changes the reconcile repairs the
-              # entry before re-marking the node ready.
+              # The allowlist is computed automatically as the union of: the static
+              # cni.sandboxNamespaces value; every namespace containing a Helm-owned
+              # registration marker ConfigMap (openshell.ai/cni-registration=true,
+              # one per gateway release); and every namespace that still has a
+              # running OpenShell-managed sandbox pod (openshell.ai/managed-by=
+              # openshell), which keeps a namespace enforced until it drains. So an
+              # additional cni.external release is discovered and enforced
+              # automatically — no manual allowlist edit. `configVersion` binds node
+              # readiness to the desired config, so when the discovered set changes
+              # the reconcile repairs the entry before re-marking the node ready.
               owner="openshell"
               openshell_cni="/openshell-cni"
               sandbox_static_json='{{ $cniSandboxNamespaces | toJson }}'
@@ -292,9 +294,9 @@ spec:
               while true; do
                 cp /var/run/secrets/kubernetes.io/serviceaccount/token "${token_file}"
                 chmod 0600 "${token_file}"
-                # Refresh the aggregated allowlist (picks up newly labeled sandbox
-                # namespaces); config_version changes when the set does, so the
-                # health check below repairs the entry and re-enforces.
+                # Refresh the aggregated allowlist (picks up newly registered or
+                # drained sandbox namespaces); config_version changes when the set
+                # does, so the health check below repairs the entry and re-enforces.
                 write_plugin_config
                 # Fence before repair: the instant enforcement is not verifiably in
                 # place, clear readiness so no new sandbox pod schedules here, then

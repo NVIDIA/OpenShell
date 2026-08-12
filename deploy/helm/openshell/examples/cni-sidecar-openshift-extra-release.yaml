@@ -5,10 +5,12 @@
 # the OpenShell CNI singleton installed by another release. This release does not
 # install its own CNI; it reuses the cluster's existing installation.
 #
-# Registration is AUTOMATIC: this release runs a helm hook that labels its
-# sandbox namespace `openshell.ai/sandbox=true`, and the CNI singleton discovers
-# every labeled namespace and adds it to the enforcement allowlist within one
-# reconcile (~30s). No manual edit of the singleton owner is required.
+# Registration is AUTOMATIC: this release renders a Helm-owned marker ConfigMap
+# (labeled `openshell.ai/cni-registration=true`) in its namespace, and the CNI
+# singleton discovers every namespace holding such a marker and adds it to the
+# enforcement allowlist within one reconcile (~30s). The namespace also stays
+# enforced while it has running OpenShell-managed sandbox pods, so enforcement is
+# not dropped mid-drain. No manual edit of the singleton owner is required.
 #
 #   helm install openshell-team-b deploy/helm/openshell -n team-b \
 #     -f deploy/helm/openshell/examples/cni-sidecar-openshift-extra-release.yaml
