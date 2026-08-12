@@ -1092,6 +1092,19 @@ impl DockerComputeDriver {
             ),
         );
         self.publish_sandbox_snapshot(snapshot);
+
+        // Provisioning failures are terminal: there is no usable Docker resource to
+        // recover, and retaining the pending record would reserve the name
+        // until the user manually deletes the failed sandbox. Publish the
+        // failure snapshot first so the create watcher can report the cause,
+        // then remove the driver and gateway records so the name is reusable.
+        let removed = {
+            let mut pending = self.pending.lock().await;
+            pending.remove(&sandbox.id).is_some()
+        };
+        if removed {
+            self.publish_deleted(sandbox.id.clone());
+        }
     }
 
     async fn publish_container_snapshot(
