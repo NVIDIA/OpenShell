@@ -35,6 +35,8 @@ pub struct BootstrapData {
 pub struct EntrypointStarted {
     pub pid: u32,
     pub start_session: bool,
+    pub generation: String,
+    pub exit: Option<openshell_core::proto::MainProcessExit>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +59,9 @@ pub enum ControlUpdate {
     AgentProposals {
         enabled: bool,
         config_revision: u64,
+    },
+    MainProcessExitAck {
+        generation: String,
     },
 }
 
@@ -115,6 +120,12 @@ impl Publisher {
             config_revision,
         });
     }
+
+    pub fn publish_main_process_exit_ack(&self, generation: String) {
+        let _ = self
+            .updates
+            .send(WireServerMessage::MainProcessExitAck { generation });
+    }
 }
 
 pub struct ServerHandle {
@@ -154,8 +165,20 @@ pub struct ProcessConnection {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireClientMessage {
-    BootstrapRequest { supervisor_pid: u32 },
-    EntrypointStarted { pid: u32 },
+    BootstrapRequest {
+        supervisor_pid: u32,
+    },
+    EntrypointStarted {
+        pid: u32,
+        generation: String,
+    },
+    MainProcessExited {
+        generation: String,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        started_at_ms: i64,
+        finished_at_ms: i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +204,9 @@ enum WireServerMessage {
     AgentProposalsUpdated {
         enabled: bool,
         config_revision: u64,
+    },
+    MainProcessExitAck {
+        generation: String,
     },
 }
 
@@ -271,6 +297,9 @@ impl TryFrom<WireServerMessage> for ControlUpdate {
                 enabled,
                 config_revision,
             }),
+            WireServerMessage::MainProcessExitAck { generation } => {
+                Ok(Self::MainProcessExitAck { generation })
+            }
             WireServerMessage::BootstrapResponse { .. } => Err(miette::miette!(
                 "unexpected sidecar bootstrap response after initial handshake"
             )),
@@ -431,11 +460,14 @@ async fn handle_connection(
                 .send(EntrypointStarted {
                     pid: supervisor_pid,
                     start_session: false,
+                    generation: String::new(),
+                    exit: None,
                 })
                 .await
                 .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
         }
-        WireClientMessage::EntrypointStarted { .. } => {
+        WireClientMessage::EntrypointStarted { .. }
+        | WireClientMessage::MainProcessExited { .. } => {
             return Err(miette::miette!(
                 "sidecar control client sent entrypoint event before bootstrap"
             ));
@@ -462,7 +494,7 @@ async fn handle_connection(
                     WireClientMessage::BootstrapRequest { .. } => {
                         debug!("Ignoring duplicate sidecar bootstrap request");
                     }
-                    WireClientMessage::EntrypointStarted { pid } => {
+                    WireClientMessage::EntrypointStarted { pid, generation } => {
                         if pid == 0 {
                             warn!("Ignoring sidecar entrypoint event with pid=0");
                             continue;
@@ -471,6 +503,31 @@ async fn handle_connection(
                             .send(EntrypointStarted {
                                 pid,
                                 start_session: true,
+                                generation,
+                                exit: None,
+                            })
+                            .await
+                            .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
+                    }
+                    WireClientMessage::MainProcessExited {
+                        generation,
+                        exit_code,
+                        signal,
+                        started_at_ms,
+                        finished_at_ms,
+                    } => {
+                        entrypoint_tx
+                            .send(EntrypointStarted {
+                                pid: 0,
+                                start_session: false,
+                                generation: generation.clone(),
+                                exit: Some(openshell_core::proto::MainProcessExit {
+                                    generation,
+                                    exit_code,
+                                    signal,
+                                    started_at_ms,
+                                    finished_at_ms,
+                                }),
                             })
                             .await
                             .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
@@ -565,8 +622,27 @@ async fn connect_with_retry(path: &Path, timeout: Duration) -> Result<tokio::net
     }
 }
 
-pub async fn send_entrypoint_started(writer: &Arc<Mutex<OwnedWriteHalf>>, pid: u32) -> Result<()> {
-    let message = WireClientMessage::EntrypointStarted { pid };
+pub async fn send_entrypoint_started(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    pid: u32,
+    generation: String,
+) -> Result<()> {
+    let message = WireClientMessage::EntrypointStarted { pid, generation };
+    let mut writer = writer.lock().await;
+    write_json_line(&mut *writer, &message).await
+}
+
+pub async fn send_main_process_exited(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    exit: openshell_core::proto::MainProcessExit,
+) -> Result<()> {
+    let message = WireClientMessage::MainProcessExited {
+        generation: exit.generation,
+        exit_code: exit.exit_code,
+        signal: exit.signal,
+        started_at_ms: exit.started_at_ms,
+        finished_at_ms: exit.finished_at_ms,
+    };
     let mut writer = writer.lock().await;
     write_json_line(&mut *writer, &message).await
 }
@@ -702,8 +778,9 @@ mod tests {
             current_peer(),
         )
         .unwrap();
+        let publisher = server.publisher();
         let mut entrypoint_rx = server.into_entrypoint_receiver();
-        let (_bootstrap, connection) = connect_process_client(&socket, Duration::from_secs(1))
+        let (_bootstrap, mut connection) = connect_process_client(&socket, Duration::from_secs(1))
             .await
             .unwrap();
 
@@ -714,7 +791,7 @@ mod tests {
         assert_eq!(anchor.pid, std::process::id());
         assert!(!anchor.start_session);
 
-        send_entrypoint_started(&connection.writer, 4242)
+        send_entrypoint_started(&connection.writer, 4242, "generation-1".to_string())
             .await
             .unwrap();
 
@@ -724,6 +801,42 @@ mod tests {
             .unwrap();
         assert_eq!(started.pid, 4242);
         assert!(started.start_session);
+        assert_eq!(started.generation, "generation-1");
+        assert!(started.exit.is_none());
+
+        send_main_process_exited(
+            &connection.writer,
+            openshell_core::proto::MainProcessExit {
+                generation: "generation-1".to_string(),
+                exit_code: Some(0),
+                signal: None,
+                started_at_ms: 10,
+                finished_at_ms: 20,
+            },
+        )
+        .await
+        .unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(1), entrypoint_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.exit.unwrap().exit_code, Some(0));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), connection.updates.recv())
+                .await
+                .is_err(),
+            "process side must not observe a durable ACK before gateway persistence"
+        );
+        publisher.publish_main_process_exit_ack("generation-1".to_string());
+        let ack = tokio::time::timeout(Duration::from_secs(1), connection.updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            ack,
+            ControlUpdate::MainProcessExitAck { generation } if generation == "generation-1"
+        ));
     }
 
     #[tokio::test]

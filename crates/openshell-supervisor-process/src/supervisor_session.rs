@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, RelayOpenResult, SupervisorHeartbeat,
-    SupervisorHello, SupervisorMessage, TcpRelayTarget, gateway_message, relay_open,
-    supervisor_message,
+    GatewayMessage, MainProcessExit, RelayFrame, RelayInit, RelayOpen, RelayOpenResult,
+    SupervisorHeartbeat, SupervisorHello, SupervisorMessage, TcpRelayTarget, gateway_message,
+    relay_open, supervisor_message,
 };
 use openshell_ocsf::{
     ActivityId, ConnectionInfo, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext,
@@ -281,6 +281,7 @@ pub fn spawn(
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
+    instance_id: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_session_loop(
         endpoint,
@@ -289,6 +290,7 @@ pub fn spawn(
         netns_fd,
         expected_ssh_peer_pid,
         terminating,
+        instance_id,
     ))
 }
 
@@ -299,6 +301,7 @@ async fn run_session_loop(
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
+    instance_id: String,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
@@ -313,6 +316,7 @@ async fn run_session_loop(
             netns_fd,
             expected_ssh_peer_pid,
             Arc::clone(&terminating),
+            &instance_id,
         )
         .await
         {
@@ -344,6 +348,7 @@ async fn run_single_session(
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
+    instance_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -359,11 +364,11 @@ async fn run_single_session(
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
 
     // Send hello as the first message.
-    let instance_id = uuid::Uuid::new_v4().to_string();
     tx.send(SupervisorMessage {
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
             sandbox_id: sandbox_id.to_string(),
-            instance_id: instance_id.clone(),
+            instance_id: instance_id.to_string(),
+            exit_report_only: false,
         })),
     })
     .await
@@ -441,6 +446,56 @@ async fn run_single_session(
             }
         }
     }
+}
+
+/// Report the canonical process result on a short-lived authenticated session
+/// and wait until the gateway acknowledges durable handling.
+pub async fn report_main_process_exit(
+    endpoint: &str,
+    sandbox_id: &str,
+    instance_id: &str,
+    exit: MainProcessExit,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let channel = grpc_client::connect_channel_pub(endpoint)
+        .await
+        .map_err(|error| format!("connect failed: {error}"))?;
+    let mut client = OpenShellClient::new(channel);
+    let (tx, rx) = mpsc::channel::<SupervisorMessage>(4);
+    tx.send(SupervisorMessage {
+        payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+            sandbox_id: sandbox_id.to_string(),
+            instance_id: instance_id.to_string(),
+            exit_report_only: true,
+        })),
+    })
+    .await
+    .map_err(|_| "failed to queue supervisor hello")?;
+    let response = client
+        .connect_supervisor(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await?;
+    let mut inbound = response.into_inner();
+    let accepted = inbound
+        .message()
+        .await?
+        .and_then(|message| message.payload)
+        .is_some_and(|payload| matches!(payload, gateway_message::Payload::SessionAccepted(_)));
+    if !accepted {
+        return Err("gateway did not accept exit-report session".into());
+    }
+    let generation = exit.generation.clone();
+    tx.send(SupervisorMessage {
+        payload: Some(supervisor_message::Payload::MainProcessExit(exit)),
+    })
+    .await
+    .map_err(|_| "failed to queue main-process exit")?;
+    while let Some(message) = inbound.message().await? {
+        if let Some(gateway_message::Payload::MainProcessExitAck(ack)) = message.payload
+            && ack.generation == generation
+        {
+            return Ok(());
+        }
+    }
+    Err("gateway closed before acknowledging main-process exit".into())
 }
 
 struct GatewayMessageContext<'a> {

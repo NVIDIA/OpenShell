@@ -70,7 +70,9 @@ The simplest way to get a sandbox running:
 openshell sandbox create
 ```
 
-This creates a sandbox with defaults and drops you into an interactive shell.
+This creates a sandbox whose canonical main process is `/bin/bash -l` and
+attaches your terminal to that retained process. Add `--detach` to return after
+the sandbox becomes ready without attaching.
 
 When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
 
@@ -234,8 +236,13 @@ Key flags:
 - `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
 - `--no-git-ignore`: Disable `.gitignore` filtering for uploads
 - `--no-keep`: Delete the sandbox after the initial command or shell exits
+- `--detach`: Start the canonical main process without attaching
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
+
+Do not combine `--upload` with a trailing main command. Uploads currently finish
+after the canonical process starts; create a scratch sandbox and use
+`sandbox exec`, or build the files into the image.
 
 ### List and inspect sandboxes
 
@@ -254,7 +261,10 @@ openshell sandbox connect my-sandbox
 openshell sandbox connect my-sandbox --editor vscode
 ```
 
-Opens an interactive SSH shell. To configure VS Code Remote-SSH:
+Attaches to the sandbox's existing canonical main process. Disconnecting leaves
+that process running; reconnecting targets the same generation and replays
+recent output. Use `sandbox exec --tty -- /bin/bash -l` for a new shell. To
+configure VS Code Remote-SSH:
 
 ```bash
 openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
@@ -287,7 +297,9 @@ openshell sandbox exec --name my-sandbox --workdir /workspace -- ls -la
 openshell sandbox exec --name my-sandbox --env MODE=test -- cargo test
 ```
 
-`sandbox exec` streams output and exits with the remote command's exit code. Use `sandbox connect` for an interactive shell.
+`sandbox exec` starts an independent sibling process, streams output, and exits
+with the remote command's exit code. Use `sandbox connect` to attach to the
+canonical main process.
 Use `--env` only for non-secret values. Attach credentials to the sandbox with a
 provider instead of passing API keys, tokens, or other secrets to `sandbox exec`.
 

@@ -148,6 +148,16 @@ message DriverSandboxSpec {
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
   string sandbox_token = 11 [(openshell.options.v1.secret) = true];
+  // Exact canonical process specification forwarded to the supervisor.
+  MainProcessSpec main_process = 12;
+}
+
+// Exact, shell-free specification for the canonical main process.
+message MainProcessSpec {
+  repeated string command = 1;
+  map<string, string> environment = 2;
+  string working_directory = 3;
+  bool terminal = 4;
 }
 
 message ResourceRequirements {

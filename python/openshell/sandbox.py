@@ -127,9 +127,20 @@ def _normalize_bearer(
 
 
 @dataclass(frozen=True)
+class MainProcessStatusRef:
+    state: int
+    generation: str
+    exit_code: int | None
+    signal: int | None
+    started_at_ms: int
+    finished_at_ms: int
+
+
+@dataclass(frozen=True)
 class SandboxStatusRef:
     phase: int
     current_policy_version: int
+    main_process: MainProcessStatusRef | None = None
 
 
 class _ImmutableLabels(dict[str, str]):
@@ -1085,6 +1096,11 @@ def _serialize_python_callable(
 
 def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
     status = sandbox.status if sandbox.HasField("status") else None
+    main = (
+        status.main_process
+        if status is not None and status.HasField("main_process")
+        else None
+    )
     return SandboxRef(
         id=sandbox.metadata.id if sandbox.metadata else "",
         name=sandbox.metadata.name if sandbox.metadata else "",
@@ -1092,6 +1108,18 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
         status=SandboxStatusRef(
             phase=status.phase if status else 0,
             current_policy_version=status.current_policy_version if status else 0,
+            main_process=(
+                MainProcessStatusRef(
+                    state=main.state,
+                    generation=main.generation,
+                    exit_code=main.exit_code if main.HasField("exit_code") else None,
+                    signal=main.signal if main.HasField("signal") else None,
+                    started_at_ms=main.started_at_ms,
+                    finished_at_ms=main.finished_at_ms,
+                )
+                if main is not None
+                else None
+            ),
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},
     )

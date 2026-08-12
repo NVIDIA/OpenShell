@@ -9,8 +9,8 @@
 #![allow(clippy::result_large_err)] // Validation returns Result<_, Status>
 
 use openshell_core::proto::{
-    CredentialHandle, ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy,
-    SandboxTemplate,
+    CredentialHandle, ExecSandboxRequest, MainProcessSpec, Provider,
+    SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
 };
 use prost::Message;
 use tonic::Status;
@@ -33,6 +33,10 @@ pub(super) const MAX_EXEC_COMMAND_ARGS: usize = 1024;
 pub(super) const MAX_EXEC_ARG_LEN: usize = 32 * 1024; // 32 KiB
 /// Maximum length of the workdir field (bytes).
 pub(super) const MAX_EXEC_WORKDIR_LEN: usize = 4096;
+/// Maximum number of entries in the canonical main-process argv.
+pub(super) const MAX_MAIN_PROCESS_ARGS: usize = 256;
+/// Maximum aggregate byte size of the canonical main-process argv.
+pub(super) const MAX_MAIN_PROCESS_ARGV_SIZE: usize = 256 * 1024;
 
 /// Validate exec request size limits and field-specific character constraints.
 ///
@@ -194,6 +198,11 @@ pub(super) fn validate_sandbox_spec(
     // --- spec.resource_requirements.gpu ---
     validate_gpu_request_fields(spec)?;
 
+    // --- spec.main_process ---
+    if let Some(main_process) = spec.main_process.as_ref() {
+        validate_main_process_spec(main_process)?;
+    }
+
     // --- spec.policy serialized size ---
     if let Some(ref policy) = spec.policy {
         let size = policy.encoded_len();
@@ -204,6 +213,67 @@ pub(super) fn validate_sandbox_spec(
         }
     }
 
+    Ok(())
+}
+
+fn validate_main_process_spec(main_process: &MainProcessSpec) -> Result<(), Status> {
+    if main_process.command.is_empty() {
+        return Err(Status::invalid_argument(
+            "spec.main_process.command must not be empty",
+        ));
+    }
+    if main_process.command.len() > MAX_MAIN_PROCESS_ARGS {
+        return Err(Status::invalid_argument(format!(
+            "spec.main_process.command exceeds {MAX_MAIN_PROCESS_ARGS} argument limit"
+        )));
+    }
+    if main_process.command[0].is_empty() {
+        return Err(Status::invalid_argument(
+            "spec.main_process.command[0] must not be empty",
+        ));
+    }
+    let argv_size: usize = main_process.command.iter().map(String::len).sum();
+    if argv_size > MAX_MAIN_PROCESS_ARGV_SIZE {
+        return Err(Status::invalid_argument(format!(
+            "spec.main_process.command total size exceeds {MAX_MAIN_PROCESS_ARGV_SIZE} byte limit"
+        )));
+    }
+    for (index, argument) in main_process.command.iter().enumerate() {
+        if argument.len() > MAX_EXEC_ARG_LEN {
+            return Err(Status::invalid_argument(format!(
+                "spec.main_process.command[{index}] exceeds {MAX_EXEC_ARG_LEN} byte limit"
+            )));
+        }
+        reject_null_char(argument, &format!("spec.main_process.command[{index}]"))?;
+    }
+
+    validate_string_map(
+        &main_process.environment,
+        MAX_ENVIRONMENT_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        "spec.main_process.environment",
+    )?;
+    validate_env_entries(&main_process.environment, "spec.main_process.environment")?;
+
+    let workdir = &main_process.working_directory;
+    if !workdir.is_empty() {
+        if workdir.len() > MAX_EXEC_WORKDIR_LEN {
+            return Err(Status::invalid_argument(format!(
+                "spec.main_process.working_directory exceeds {MAX_EXEC_WORKDIR_LEN} byte limit"
+            )));
+        }
+        reject_control_chars(workdir, "spec.main_process.working_directory")?;
+        if !workdir.starts_with('/')
+            || workdir
+                .split('/')
+                .any(|component| component == "." || component == "..")
+        {
+            return Err(Status::invalid_argument(
+                "spec.main_process.working_directory must be an absolute normalized path",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1000,6 +1070,46 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_empty_defaults() {
         assert!(validate_sandbox_spec("", &default_spec()).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_exact_main_process_argv() {
+        let spec = SandboxSpec {
+            main_process: Some(MainProcessSpec {
+                command: vec!["/bin/sh".into(), "-c".into(), "printf 'a b'".into()],
+                working_directory: "/sandbox/work".into(),
+                terminal: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_sandbox_spec("", &spec).unwrap();
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_empty_main_process_command() {
+        let spec = SandboxSpec {
+            main_process: Some(MainProcessSpec::default()),
+            ..Default::default()
+        };
+        let error = validate_sandbox_spec("", &spec).unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("main_process.command"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_non_normal_main_process_workdir() {
+        let spec = SandboxSpec {
+            main_process: Some(MainProcessSpec {
+                command: vec!["/bin/true".into()],
+                working_directory: "/sandbox/../root".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = validate_sandbox_spec("", &spec).unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("absolute normalized path"));
     }
 
     #[test]

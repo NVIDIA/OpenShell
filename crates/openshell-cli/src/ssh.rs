@@ -71,6 +71,7 @@ struct SshSessionConfig {
     sandbox_id: String,
     gateway_url: String,
     token: String,
+    main_terminal: bool,
 }
 
 async fn ssh_session_config(
@@ -139,6 +140,11 @@ async fn ssh_session_config(
         sandbox_id: session.sandbox_id.clone(),
         gateway_url,
         token: session.token,
+        main_terminal: sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.main_process.as_ref())
+            .is_none_or(|main| main.terminal),
     })
 }
 
@@ -263,13 +269,17 @@ async fn sandbox_connect_with_mode(
     let session = ssh_session_config(server, name, tls, workspace).await?;
 
     let mut command = ssh_base_command(&session.proxy_command);
+    if session.main_terminal {
+        command.arg("-tt").arg("-o").arg("RequestTTY=force");
+    } else {
+        command.arg("-T");
+    }
     command
-        .arg("-tt")
-        .arg("-o")
-        .arg("RequestTTY=force")
         .arg("-o")
         .arg("SetEnv=TERM=xterm-256color")
+        .arg("-s")
         .arg("sandbox")
+        .arg("openshell-main")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -594,17 +604,6 @@ pub async fn sandbox_exec(
     workspace: &str,
 ) -> Result<()> {
     sandbox_exec_with_mode(server, name, command, tty, tls, true, workspace).await
-}
-
-pub(crate) async fn sandbox_exec_without_exec(
-    server: &str,
-    name: &str,
-    command: &[String],
-    tty: bool,
-    tls: &TlsOptions,
-    workspace: &str,
-) -> Result<()> {
-    sandbox_exec_with_mode(server, name, command, tty, tls, false, workspace).await
 }
 
 /// What to pack into the tar archive streamed to the sandbox.

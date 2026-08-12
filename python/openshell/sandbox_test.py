@@ -1772,6 +1772,25 @@ def test_sandbox_ref_retains_gateway_labels() -> None:
     assert dict(ref.labels) == {"aiq": "deep-research", "env": "dev"}
 
 
+def test_sandbox_ref_includes_main_process_result() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1")
+    proto.status.main_process.state = openshell_pb2.MAIN_PROCESS_STATE_EXITED
+    proto.status.main_process.generation = "generation-1"
+    proto.status.main_process.exit_code = 0
+    proto.status.main_process.started_at_ms = 10
+    proto.status.main_process.finished_at_ms = 20
+
+    main = _sandbox_ref(proto).status.main_process
+
+    assert main is not None
+    assert main.state == openshell_pb2.MAIN_PROCESS_STATE_EXITED
+    assert main.generation == "generation-1"
+    assert main.exit_code == 0
+    assert main.signal is None
+    assert main.started_at_ms == 10
+    assert main.finished_at_ms == 20
+
+
 def test_returned_labels_are_immutable() -> None:
     proto = _make_sandbox_proto("sandbox-1", "job-1", {"aiq": "deep-research"})
     ref = _sandbox_ref(proto)

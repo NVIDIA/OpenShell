@@ -13,6 +13,8 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 - Injecting sandbox identity and gateway callback configuration.
 - Supplying TLS or secret material for supervisor callbacks.
 - Providing the supervisor binary or image in the workload.
+- Forwarding the exact canonical main-process argv, environment, working
+  directory, and terminal mode without shell reconstruction.
 - Reporting lifecycle and platform events back to the gateway.
 - Cleaning up runtime-owned resources.
 

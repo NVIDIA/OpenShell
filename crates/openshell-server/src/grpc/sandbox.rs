@@ -22,10 +22,10 @@ use openshell_core::proto::{
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent, ExecSandboxExit,
     ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, Provider, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    SandboxResponse, SandboxStreamEvent, SshRelayTarget, StartSandboxRequest, StopSandboxRequest,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open,
-    tcp_forward_init,
+    ListSandboxesResponse, MainProcessSpec, Provider, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, SshRelayTarget,
+    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    WatchSandboxRequest, relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use openshell_core::telemetry::{
@@ -216,9 +216,18 @@ async fn handle_create_sandbox_inner(
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let spec = request
+    let mut spec = request
         .spec
         .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+
+    // Every newly persisted sandbox has one explicit canonical process. This
+    // portable default also preserves compatibility with callers compiled
+    // before the main-process field was introduced.
+    spec.main_process.get_or_insert_with(|| MainProcessSpec {
+        command: vec!["/bin/bash".to_string(), "-l".to_string()],
+        terminal: true,
+        ..MainProcessSpec::default()
+    });
 
     // Validate field sizes before any I/O (fail fast on oversized payloads).
     validate_sandbox_spec(&request.name, &spec)?;
@@ -261,7 +270,6 @@ async fn handle_create_sandbox_inner(
         .await?;
 
     // Ensure the template always carries the resolved image.
-    let mut spec = spec;
     let template = spec.template.get_or_insert_with(SandboxTemplate::default);
     if template.image.is_empty() {
         template.image = state.compute.default_image().to_string();

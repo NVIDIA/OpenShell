@@ -149,7 +149,9 @@ Pass a policy YAML file when creating the sandbox:
 openshell sandbox create --policy ./my-policy.yaml -- claude
 ```
 
-`openshell sandbox create` keeps the sandbox running after the initial command exits, which is useful when you plan to iterate on the policy. Add `--no-keep` if you want the sandbox deleted automatically instead.
+The trailing command is the sandbox's canonical main process. If it exits, the
+sandbox enters `Error`; use `sandbox exec` for one-shot commands that should not
+define sandbox health.
 
 To avoid passing `--policy` every time, set a default policy with an environment variable:
 

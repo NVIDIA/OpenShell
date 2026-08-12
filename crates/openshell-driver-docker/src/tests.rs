@@ -45,6 +45,7 @@ fn test_sandbox() -> DriverSandbox {
             }),
             resource_requirements: None,
             sandbox_token: String::new(),
+            main_process: None,
         }),
         status: None,
         workspace: String::new(),
@@ -624,6 +625,17 @@ fn build_environment_sets_docker_tls_paths() {
         openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
         openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
     )));
+    let encoded = env
+        .iter()
+        .find_map(|entry| {
+            entry
+                .strip_prefix("OPENSHELL_MAIN_PROCESS_SPEC=")
+                .map(str::to_string)
+        })
+        .expect("main-process transport");
+    let main = openshell_core::sandbox_env::MainProcessConfig::decode(&encoded).unwrap();
+    assert_eq!(main.command, vec!["/bin/bash", "-l"]);
+    assert!(main.terminal);
 }
 
 #[test]

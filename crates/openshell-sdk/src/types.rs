@@ -109,6 +109,28 @@ pub struct SandboxSpec {
     /// Request a GPU. Driver-specific device selection is configured via
     /// driver config on the raw proto surface (see [`crate::raw`]).
     pub gpu: bool,
+    /// Exact canonical process. `None` selects the gateway's scratch login shell.
+    pub main_process: Option<MainProcessSpec>,
+}
+
+/// Shell-free canonical main-process configuration.
+#[derive(Clone, Debug)]
+pub struct MainProcessSpec {
+    pub command: Vec<String>,
+    pub environment: HashMap<String, String>,
+    pub working_directory: Option<String>,
+    pub terminal: bool,
+}
+
+/// Last observed canonical-process generation and result.
+#[derive(Clone, Debug)]
+pub struct MainProcessStatus {
+    pub state: i32,
+    pub generation: String,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub started_at_ms: i64,
+    pub finished_at_ms: i64,
 }
 
 /// Reference to a sandbox owned by the gateway.
@@ -121,11 +143,24 @@ pub struct SandboxRef {
     pub phase: SandboxPhase,
     pub labels: HashMap<String, String>,
     pub resource_version: u64,
+    pub main_process: Option<MainProcessStatus>,
 }
 
 impl SandboxRef {
     pub(crate) fn from_proto(sandbox: proto::Sandbox) -> Self {
         let phase = sandbox.phase().into();
+        let main_process = sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.main_process.as_ref())
+            .map(|main| MainProcessStatus {
+                state: main.state,
+                generation: main.generation.clone(),
+                exit_code: main.exit_code,
+                signal: main.signal,
+                started_at_ms: main.started_at_ms,
+                finished_at_ms: main.finished_at_ms,
+            });
         let meta = sandbox.metadata.unwrap_or_default();
         Self {
             id: meta.id,
@@ -134,6 +169,7 @@ impl SandboxRef {
             phase,
             labels: meta.labels,
             resource_version: meta.resource_version,
+            main_process,
         }
     }
 }

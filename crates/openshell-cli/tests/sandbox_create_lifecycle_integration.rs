@@ -1291,6 +1291,45 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
 }
 
 #[tokio::test]
+async fn sandbox_create_persists_exact_trailing_argv_as_main_process() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+    let command = vec![
+        "/opt/agent binary".to_string(),
+        "--prompt=keep spaces".to_string(),
+        "literal * $HOME".to_string(),
+    ];
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("canonical-main"),
+            command: &command,
+            tty_override: Some(false),
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    let main = requests[0]
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.main_process.as_ref())
+        .expect("main process should be persisted at create time");
+    assert_eq!(main.command, command);
+    assert!(!main.terminal);
+}
+
+#[tokio::test]
 async fn sandbox_create_sends_driver_config_json() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();

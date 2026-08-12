@@ -772,6 +772,9 @@ message ComputeDriverCapabilities {
 
   // Driver-reported implementation version from the startup capability snapshot.
   string driver_version = 2;
+
+  // Whether the driver can launch the exact canonical main-process contract.
+  bool supports_main_process = 3;
 }
 
 // Public sandbox resource exposed by the OpenShell API.
@@ -817,6 +820,22 @@ message SandboxSpec {
   // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
+  // Canonical process launched once by the sandbox supervisor. The gateway
+  // normalizes an omitted value to the portable scratch login shell before
+  // persisting a newly-created sandbox.
+  MainProcessSpec main_process = 12;
+}
+
+// Exact, shell-free specification for the sandbox's canonical main process.
+message MainProcessSpec {
+  // Executable followed by its arguments. No shell parsing is performed.
+  repeated string command = 1;
+  // Non-secret environment overrides applied only to the main process.
+  map<string, string> environment = 2;
+  // Optional absolute working directory inside the sandbox.
+  string working_directory = 3;
+  // Allocate a retained pseudo-terminal for the main process.
+  bool terminal = 4;
 }
 
 message ResourceRequirements {
@@ -880,6 +899,26 @@ message SandboxStatus {
   SandboxPhase phase = 6;
   // Currently active policy version (updated when sandbox reports loaded).
   uint32 current_policy_version = 7;
+  // Last observed state of the canonical main process.
+  MainProcessStatus main_process = 8;
+}
+
+// Lifecycle state of the canonical main process.
+enum MainProcessState {
+  MAIN_PROCESS_STATE_UNSPECIFIED = 0;
+  MAIN_PROCESS_STATE_RUNNING = 1;
+  MAIN_PROCESS_STATE_EXITED = 2;
+}
+
+// Persisted result for the canonical main-process generation.
+message MainProcessStatus {
+  MainProcessState state = 1;
+  // Supervisor instance identifier used to reject stale exit reports.
+  string generation = 2;
+  optional int32 exit_code = 3;
+  optional int32 signal = 4;
+  int64 started_at_ms = 5;
+  int64 finished_at_ms = 6;
 }
 
 // User-facing sandbox condition derived from driver-native conditions.
@@ -2086,6 +2125,7 @@ message SupervisorMessage {
     SupervisorHeartbeat heartbeat = 2;
     RelayOpenResult relay_open_result = 3;
     RelayClose relay_close = 4;
+    MainProcessExit main_process_exit = 5;
   }
 }
 
@@ -2097,6 +2137,7 @@ message GatewayMessage {
     GatewayHeartbeat heartbeat = 3;
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
+    MainProcessExitAck main_process_exit_ack = 6;
   }
 }
 
@@ -2106,6 +2147,9 @@ message SupervisorHello {
   string sandbox_id = 1;
   // Supervisor instance ID (e.g. boot id or process epoch).
   string instance_id = 2;
+  // Short-lived terminal-result sessions authenticate an existing generation
+  // but must not replace the active relay session or advertise readiness.
+  bool exit_report_only = 3;
 }
 
 // Gateway accepts the supervisor session.
@@ -2127,6 +2171,21 @@ message SupervisorHeartbeat {}
 
 // Gateway heartbeat.
 message GatewayHeartbeat {}
+
+// Terminal result reported before the supervisor shuts down. A missing exit
+// code with a present signal represents signal termination.
+message MainProcessExit {
+  string generation = 1;
+  optional int32 exit_code = 2;
+  optional int32 signal = 3;
+  int64 started_at_ms = 4;
+  int64 finished_at_ms = 5;
+}
+
+// Gateway acknowledgement that the terminal result has been durably handled.
+message MainProcessExitAck {
+  string generation = 1;
+}
 
 // Gateway requests the supervisor to open a relay channel.
 //

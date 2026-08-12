@@ -19,6 +19,7 @@ import (
 func TestSandboxFromProto(t *testing.T) {
 	userNS := true
 	gpuCount := uint32(2)
+	exitCode := int32(0)
 	proto := &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{
 			Id:                  "sb-1",
@@ -56,6 +57,12 @@ func TestSandboxFromProto(t *testing.T) {
 					Count: &gpuCount,
 				},
 			},
+			MainProcess: &pb.MainProcessSpec{
+				Command:          []string{"/opt/agent", "--serve"},
+				Environment:      map[string]string{"MODE": "worker"},
+				WorkingDirectory: "/sandbox/app",
+				Terminal:         false,
+			},
 		},
 		Status: &pb.SandboxStatus{
 			SandboxName:          "sb-compute-1",
@@ -64,6 +71,13 @@ func TestSandboxFromProto(t *testing.T) {
 			SandboxFd:            "fd-sandbox",
 			Phase:                pb.SandboxPhase_SANDBOX_PHASE_READY,
 			CurrentPolicyVersion: 7,
+			MainProcess: &pb.MainProcessStatus{
+				State:        pb.MainProcessState_MAIN_PROCESS_STATE_EXITED,
+				Generation:   "generation-1",
+				ExitCode:     &exitCode,
+				StartedAtMs:  1700000001000,
+				FinishedAtMs: 1700000002000,
+			},
 			Conditions: []*pb.SandboxCondition{
 				{
 					Type:               "Ready",
@@ -95,6 +109,11 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, []string{"claude", "github"}, s.Spec.Providers)
 	require.NotNil(t, s.Spec.GPUCount)
 	assert.Equal(t, uint32(2), *s.Spec.GPUCount)
+	require.NotNil(t, s.Spec.MainProcess)
+	assert.Equal(t, []string{"/opt/agent", "--serve"}, s.Spec.MainProcess.Command)
+	assert.Equal(t, map[string]string{"MODE": "worker"}, s.Spec.MainProcess.Environment)
+	assert.Equal(t, "/sandbox/app", s.Spec.MainProcess.WorkingDirectory)
+	assert.False(t, s.Spec.MainProcess.Terminal)
 
 	// Template
 	require.NotNil(t, s.Spec.Template)
@@ -125,6 +144,14 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, "AllGood", s.Status.Conditions[0].Reason)
 	assert.Equal(t, "Sandbox is ready", s.Status.Conditions[0].Message)
 	assert.Equal(t, "2024-01-01T00:00:00Z", s.Status.Conditions[0].LastTransitionTime)
+	require.NotNil(t, s.Status.MainProcess)
+	assert.Equal(t, int32(pb.MainProcessState_MAIN_PROCESS_STATE_EXITED), s.Status.MainProcess.State)
+	assert.Equal(t, "generation-1", s.Status.MainProcess.Generation)
+	require.NotNil(t, s.Status.MainProcess.ExitCode)
+	assert.Equal(t, int32(0), *s.Status.MainProcess.ExitCode)
+	assert.Nil(t, s.Status.MainProcess.Signal)
+	assert.Equal(t, time.UnixMilli(1700000001000).UTC(), s.Status.MainProcess.StartedAt)
+	assert.Equal(t, time.UnixMilli(1700000002000).UTC(), s.Status.MainProcess.FinishedAt)
 }
 
 func TestSandboxFromProto_TemplateResourcesDeepCopy(t *testing.T) {
@@ -243,6 +270,12 @@ func TestSandboxToProto(t *testing.T) {
 			},
 			Providers: []string{"prov-a"},
 			GPUCount:  &gpuCount,
+			MainProcess: &v1.MainProcessSpec{
+				Command:          []string{"/opt/agent", "--serve"},
+				Environment:      map[string]string{"MODE": "worker"},
+				WorkingDirectory: "/sandbox/app",
+				Terminal:         false,
+			},
 		},
 	}
 
@@ -263,6 +296,11 @@ func TestSandboxToProto(t *testing.T) {
 	assert.Equal(t, "info", p.Spec.LogLevel)
 	assert.Equal(t, map[string]string{"KEY": "val"}, p.Spec.Environment)
 	assert.Equal(t, []string{"prov-a"}, p.Spec.Providers)
+	require.NotNil(t, p.Spec.MainProcess)
+	assert.Equal(t, []string{"/opt/agent", "--serve"}, p.Spec.MainProcess.Command)
+	assert.Equal(t, map[string]string{"MODE": "worker"}, p.Spec.MainProcess.Environment)
+	assert.Equal(t, "/sandbox/app", p.Spec.MainProcess.WorkingDirectory)
+	assert.False(t, p.Spec.MainProcess.Terminal)
 
 	require.NotNil(t, p.Spec.ResourceRequirements)
 	require.NotNil(t, p.Spec.ResourceRequirements.Gpu)
