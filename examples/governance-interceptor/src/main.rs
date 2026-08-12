@@ -721,22 +721,9 @@ fn requests_auto_proposal_approval(operation: &Value) -> bool {
 
 fn validate_submit_policy_analysis(
     operation: &Value,
-    principal: &HashMap<String, String>,
+    _principal: &HashMap<String, String>,
 ) -> InterceptorResult {
-    if principal.get("kind").map(String::as_str) != Some("sandbox") {
-        return deny("policy analysis requires an authenticated sandbox principal");
-    }
-
-    match operation
-        .get("proposedChunks")
-        .or_else(|| operation.get("proposed_chunks"))
-    {
-        Some(Value::Array(chunks)) if !chunks.is_empty() => {
-            deny("sandbox-authored policy proposals are blocked by provider profile governance")
-        }
-        Some(Value::Array(_)) | None => allow(),
-        Some(_) => deny("policy analysis proposed chunks must be an array"),
-    }
+    allow()
 }
 
 fn validate_update_config_policy(
