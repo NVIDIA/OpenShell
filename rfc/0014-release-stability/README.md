@@ -30,9 +30,10 @@ evolve quickly enough to keep pace with the ecosystem. At the same time, users
 need stable interfaces they can confidently build on.
 
 Starting with `0.1.0`, OpenShell provides both: a defined compatibility contract
-for stable interfaces and room to evolve experimental capabilities. Releases
-are suitable for production use within the published support matrix only after
-passing conformance, upgrade, compatibility, artifact, and security checks.
+for stable interfaces and room to evolve experimental APIs and features.
+Releases are suitable for production use within the published support matrix
+only after passing conformance, upgrade, compatibility, artifact, and security
+checks.
 
 ## Proposal
 
@@ -53,51 +54,42 @@ promotion.
 
 OpenShell builds a release candidate nightly for the next expected stable
 release when `main` has changed and normal CI passes. After `0.1.1`, candidates
-are numbered `0.1.2-rc.1`, `0.1.2-rc.2`, and so on. Git tags add the normal `v`
-prefix. Each release candidate identifies one source commit and one artifact
-manifest, uses the release feature set, and is the unit of release
-qualification. Release candidates are not supported production releases.
+are numbered `0.1.2-rc.1`, `0.1.2-rc.2`, and so on. A release candidate is promoted to a stable release tag as part of the weekly release pipeline once the candidate has passed qualification.
 
 ### Project version and compatibility contract
 
-Version 0.1.0 begins OpenShell's supported compatibility contract. For
-the 0.x series:
+Version `0.1.0` begins OpenShell's supported compatibility contract. For
+the `0.x` series:
 
 - Patch releases may contain bug fixes and additive, backward-compatible
   functionality. They do not intentionally break a stable interface.
 - An unavoidable breaking change to any stable interface starts a new minor
   release and resets the patch version, for example `0.1.x` to `0.2.0`.
 
-### Capability maturity and release availability
+### API and feature maturity
 
-Capability maturity is independent from the release that contains it:
+The maturity of an API or feature is independent of the release that contains
+it:
 
 | Maturity | API naming | Compatibility |
 | --- | --- | --- |
 | Stable | Stable protobuf packages such as `v1` or `v2` | Covered by the release compatibility contract |
 | Experimental | Explicit unstable package such as `v1beta1` | May change with documented migration guidance |
 
-Capability maturity and artifact availability are separate. Every capability is
-stable or experimental, regardless of whether it appears in stable, release
-candidate, or development artifacts. A capability omitted from stable artifacts
-has no stable availability or support promise.
+Every API and feature is stable or experimental, regardless of whether it
+appears in stable, release candidate, or development artifacts.
 
 An evolving API may ship in a beta package such as `v1beta1`. It may change to
 `v1beta2` in a patch release with release notes and migration guidance.
 Graduation adds a stable `v1` package instead of renaming the beta package.
 
 Unreleased features use named compile-time flags such as `unstable-<feature>`,
-collected under a `dev` feature. Development releases enable them; stable
+collected under a `dev` compilation flag. Development releases enable them; stable
 releases and release candidates exclude them from service binaries, the CLI,
 configuration, and documentation. For now, every SDK package may include their
-generated types and client methods, but the target service must implement them
-and only stable SDK interfaces have a compatibility guarantee. CI builds and
-tests both feature sets on every commit to `main`.
+generated types and client methods.
 
 ### Breaking changes and API versioning
-
-A project release version bump and a protocol package revision solve different
-problems and are applied together when appropriate.
 
 If a breaking change affects a stable OpenShell surface, the release moves to
 the next minor version. If the same change is incompatible with a stable
@@ -120,7 +112,7 @@ The following examples illustrate how these rules affect a release candidate:
 
 | Example | Concrete change | Release treatment |
 | --- | --- | --- |
-| Breaking stable Protobuf contract | `SandboxSpec.policy = 7` to `SandboxSpec.policy = 10` | Blocks a patch RC and requires a versioned API change. |
+| Breaking stable Protobuf contract | `v1: string policy = 7` to `v2: PolicyReference policy = 7` | Blocks a patch RC; ships as `v2` in a minor release while `v1` remains supported. |
 | Breaking experimental Python SDK method | `create_sandbox(timeout=30)` to `create_sandbox(deadline=...)` | May ship in a patch release with migration notes. |
 | Breaking stable policy document | `endpoints:` to `destinations:` | Blocks a patch RC unless both fields remain supported. |
 | Breaking stable CLI contract | `--policy policy.yaml` to `--policy-file policy.yaml` | Requires retaining the old flag as an alias or shipping a minor release. |
@@ -144,7 +136,7 @@ flowchart LR
     I -->|"fail"| G
 ```
 
-Every release candidate produces a manifest containing its canonical version,
+Every release candidate produces a manifest containing its version,
 full source commit, build inputs, artifact names and digests, SBOM and provenance
 references, and qualification results. Qualification installs and exercises the
 candidate artifacts wherever practical rather than substituting a source build.
@@ -171,7 +163,7 @@ The weekly release selects the newest eligible release candidate and promotes it
 
 ### Maintenance and backports
 
-OpenShell maintains two minor release lines: the latest minor and N-1. Support
+OpenShell maintains two release lines: the latest minor and N-1. Support
 applies to the newest patch on each line. Users on an older patch update to the
 new maintenance patch rather than receiving a separate fix for every historical
 patch.

@@ -1,17 +1,17 @@
 # RFC 0014 Supplement - Release Qualification
 
 A release candidate is eligible for stable release only after its published
-artifacts pass every required [conformance](#conformance) and
-[upgrade](#upgrade) workflow, its
+artifacts pass every required [conformance test](#conformance-tests) and
+[upgrade test](#upgrade-tests), its
 [breaking API change review](#breaking-api-change-review), and its
 [security review](#security-review).
 
-## Conformance
+## Conformance tests
 
-Conformance runs for different OpenShell driver and host configurations.
-Kubernetes runs once per supported gateway topology. Each workflow installs the
-candidate in one representative environment and verifies the supported
-OpenShell behavior for that driver and topology.
+Conformance tests run for different OpenShell driver, gateway, and host
+configurations. Each workflow installs the candidate in one representative
+environment and verifies the supported OpenShell behavior for that
+configuration.
 
 For each driver, the suite:
 
@@ -44,16 +44,18 @@ additional workflows.
 | ID | Compute driver | Representative environment | Gateway configuration |
 | --- | --- | --- | --- |
 | C01 | Docker | Ubuntu x86_64 with Docker 28.0.4 | Local gateway; TLS and sandbox mTLS; credentials; CDI GPU when stable |
-| C02 | Podman | Fedora x86_64 with Podman 5.x rootless and SELinux enforcing | Local gateway; TLS and sandbox mTLS; credentials; CDI GPU when stable |
+| C02 | Podman | Fedora x86_64 with Podman 5.x rootless | Local gateway; TLS and sandbox mTLS; credentials; CDI GPU when stable |
 | C03 | MicroVM | Linux x86_64 with KVM and IOMMU | Local gateway; libkrun CPU; TLS and sandbox mTLS; QEMU/VFIO GPU when stable |
 | C04 | Kubernetes | Kubernetes 1.29 | Sidecar, three replicas; external PostgreSQL; Kubernetes Secrets; TLS and OIDC; GPU when stable |
 | C05 | Kubernetes | Kubernetes 1.29 | Combined, three replicas; external PostgreSQL; Kubernetes Secrets; TLS and OIDC; GPU when stable |
+| C06 | Docker | Fedora x86_64 with Docker 28.0.4 and SELinux enforcing | Local gateway; TLS and sandbox mTLS; credentials |
+| C07 | Kubernetes | Supported OpenShift release | Combined, three replicas; external PostgreSQL; Kubernetes Secrets; TLS and OIDC |
 
-## Upgrade
+## Upgrade tests
 
-Upgrade runs once per supported product installation package. It verifies that
-users can move from every supported source release to the candidate without
-reinstalling or losing supported state.
+Upgrade tests run once per supported product installation package. They verify
+that users can move from every supported source release to the candidate
+without reinstalling or losing supported state.
 
 For each installation package, the suite:
 
@@ -88,13 +90,8 @@ any additional baseline required by the N-1 maintenance promise. The review:
 1. Runs protobuf compatibility checks against the supported descriptor
    baselines.
 2. Runs language-specific compatibility checks for generated and hand-written
-   SDK interfaces.
-3. Classifies each detected change as stable, experimental, or development-only
-   and records the evidence in the qualification record.
-4. Confirms that a patch release contains no breaking stable API change.
-5. For an intentional breaking change in a minor release, confirms the required
-   project version, protobuf package revision where applicable, migration
-   guidance, release notes, and approval.
+   SDK or configuration interfaces. An agent may assess this using a breaking
+   API detection skill.
 
 Breaking API change review passes when no unaddressed breaking change affects a
 stable API baseline and every intentional minor-release break satisfies the
@@ -102,17 +99,12 @@ versioning and migration requirements.
 
 ## Security review
 
-Security review runs once per candidate and covers the complete candidate
-artifact set. A designated security approver:
+Security review runs once per candidate and will:
 
-1. Reviews vulnerability, dependency, container, and infrastructure scan
+1. Produce vulnerability, dependency, container, and infrastructure scan
    results for the candidate artifacts.
-2. Reviews changes since the previous stable release to authentication,
-   authorization, policy enforcement, sandbox isolation, credentials, and any updated trust boundary.
-3. Confirms that required penetration testing is current for the affected trust
-   boundaries.
-4. Records the scope, evidence, findings, and disposition in the qualification
-   record.
+2. Run an agent-based security scanner, such as Codex Security, against changes
+   since the previous stable release.
 
 Security review passes when no unresolved critical or high-severity finding
 affects a supported configuration.
