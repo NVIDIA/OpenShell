@@ -3067,10 +3067,30 @@ async fn resolve_from_sandbox_hosts(
     None
 }
 
-async fn resolve_socket_addrs(
+trait DnsResolver: Sync {
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> impl Future<Output = std::result::Result<Vec<SocketAddr>, String>> + Send + 'a;
+}
+
+struct SystemDnsResolver;
+
+impl DnsResolver for SystemDnsResolver {
+    async fn resolve(&self, host: &str, port: u16) -> std::result::Result<Vec<SocketAddr>, String> {
+        let addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|error| format!("DNS resolution failed for {host}:{port}: {error}"))?;
+        Ok(addrs.collect())
+    }
+}
+
+async fn resolve_socket_addrs_with_resolver<R: DnsResolver>(
     host: &str,
     port: u16,
     entrypoint_pid: u32,
+    resolver: &R,
 ) -> std::result::Result<Vec<SocketAddr>, String> {
     if let Some(addrs) = resolve_ip_literal(host, port) {
         return Ok(addrs);
@@ -3081,10 +3101,7 @@ async fn resolve_socket_addrs(
     }
 
     let lookup_host = normalize_host_lookup_key(host);
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((lookup_host, port))
-        .await
-        .map_err(|e| format!("DNS resolution failed for {lookup_host}:{port}: {e}"))?
-        .collect();
+    let addrs = resolver.resolve(lookup_host, port).await?;
 
     if addrs.is_empty() {
         return Err(format!(
@@ -3093,6 +3110,14 @@ async fn resolve_socket_addrs(
     }
 
     Ok(addrs)
+}
+
+async fn resolve_socket_addrs(
+    host: &str,
+    port: u16,
+    entrypoint_pid: u32,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    resolve_socket_addrs_with_resolver(host, port, entrypoint_pid, &SystemDnsResolver).await
 }
 
 fn reject_internal_resolved_addrs(
@@ -3256,14 +3281,23 @@ async fn dial_upstream(
 ///
 /// Returns the resolved `SocketAddr` list on success. Returns an error string
 /// if any resolved IP is in an internal range or if DNS resolution fails.
+async fn resolve_and_reject_internal_with_resolver<R: DnsResolver>(
+    host: &str,
+    port: u16,
+    entrypoint_pid: u32,
+    resolver: &R,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    let addrs = resolve_socket_addrs_with_resolver(host, port, entrypoint_pid, resolver).await?;
+    reject_internal_resolved_addrs(host, &addrs)?;
+    Ok(addrs)
+}
+
 async fn resolve_and_reject_internal(
     host: &str,
     port: u16,
     entrypoint_pid: u32,
 ) -> std::result::Result<Vec<SocketAddr>, String> {
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
-    reject_internal_resolved_addrs(host, &addrs)?;
-    Ok(addrs)
+    resolve_and_reject_internal_with_resolver(host, port, entrypoint_pid, &SystemDnsResolver).await
 }
 
 /// Resolve a host:port using sandbox `/etc/hosts` first (when available), then
@@ -3274,15 +3308,32 @@ async fn resolve_and_reject_internal(
 /// Entries can be CIDR notation ("10.0.5.0/24") or exact IPs ("10.0.5.20").
 ///
 /// Returns the resolved `SocketAddr` list on success.
+async fn resolve_and_check_allowed_ips_with_resolver<R: DnsResolver>(
+    host: &str,
+    port: u16,
+    allowed_ips: &[ipnet::IpNet],
+    entrypoint_pid: u32,
+    resolver: &R,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    let addrs = resolve_socket_addrs_with_resolver(host, port, entrypoint_pid, resolver).await?;
+    validate_allowed_ips_for_resolved_addrs(host, port, &addrs, allowed_ips)?;
+    Ok(addrs)
+}
+
 async fn resolve_and_check_allowed_ips(
     host: &str,
     port: u16,
     allowed_ips: &[ipnet::IpNet],
     entrypoint_pid: u32,
 ) -> std::result::Result<Vec<SocketAddr>, String> {
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
-    validate_allowed_ips_for_resolved_addrs(host, port, &addrs, allowed_ips)?;
-    Ok(addrs)
+    resolve_and_check_allowed_ips_with_resolver(
+        host,
+        port,
+        allowed_ips,
+        entrypoint_pid,
+        &SystemDnsResolver,
+    )
+    .await
 }
 
 /// Resolve a host:port that was explicitly declared by hostname in policy.
@@ -5381,6 +5432,27 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    struct MockDnsResolver {
+        host: &'static str,
+        addresses: Vec<IpAddr>,
+    }
+
+    impl DnsResolver for MockDnsResolver {
+        async fn resolve(
+            &self,
+            host: &str,
+            port: u16,
+        ) -> std::result::Result<Vec<SocketAddr>, String> {
+            assert_eq!(host, self.host);
+            Ok(self
+                .addresses
+                .iter()
+                .copied()
+                .map(|address| SocketAddr::new(address, port))
+                .collect())
+        }
+    }
 
     struct BlockingForwardMiddleware {
         entered: Arc<tokio::sync::Notify>,
@@ -8540,9 +8612,15 @@ network_policies:
 
     #[tokio::test]
     async fn test_resolve_check_allowed_ips_rejects_outside_allowlist() {
-        // 8.8.8.8 resolves to a public IP which is NOT in 10.0.0.0/8
+        // 8.8.8.8 is a public IP which is NOT in 10.0.0.0/8.
+        let resolver = MockDnsResolver {
+            host: "dns.google",
+            addresses: vec!["8.8.8.8".parse().unwrap()],
+        };
         let nets = parse_allowed_ips(&["10.0.0.0/8".to_string()]).unwrap();
-        let result = resolve_and_check_allowed_ips("dns.google", 443, &nets, 0).await;
+        let result =
+            resolve_and_check_allowed_ips_with_resolver("dns.google", 443, &nets, 0, &resolver)
+                .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -9872,7 +9950,12 @@ network_policies:
     async fn test_forward_public_ip_allowed_without_allowed_ips() {
         // Public IPs (e.g. dns.google -> 8.8.8.8) should pass through
         // resolve_and_reject_internal without needing allowed_ips.
-        let result = resolve_and_reject_internal("dns.google", 80, 0).await;
+        let resolver = MockDnsResolver {
+            host: "dns.google",
+            addresses: vec!["8.8.8.8".parse().unwrap()],
+        };
+        let result =
+            resolve_and_reject_internal_with_resolver("dns.google", 80, 0, &resolver).await;
         assert!(
             result.is_ok(),
             "Public IP should be allowed without allowed_ips: {result:?}"

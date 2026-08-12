@@ -57,6 +57,30 @@ pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn enforce_landlock(prepared: PreparedSandbox) -> Result<()> {
+    if let Some(ruleset) = prepared.landlock {
+        landlock::enforce(ruleset)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn landlock_available() -> bool {
+    match landlock::probe_availability() {
+        landlock::LandlockAvailability::Available { .. } => true,
+        unavailable => {
+            eprintln!("skipping test: Landlock is {unavailable}");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn seccomp_filter_installation_available() -> bool {
+    seccomp::filter_installation_available()
+}
+
 /// Apply the supervisor seccomp prelude after privileged bootstrap completes.
 pub fn apply_supervisor_prelude() -> Result<()> {
     seccomp::apply_supervisor_prelude()

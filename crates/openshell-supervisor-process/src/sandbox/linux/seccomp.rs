@@ -362,6 +362,54 @@ fn add_masked_arg_rule(
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
+pub(super) fn filter_installation_available() -> bool {
+    const UNAVAILABLE_EXIT_CODE: libc::c_int = 77;
+
+    let mut rules = BTreeMap::new();
+    rules.insert(libc::SYS_getpid, Vec::new());
+    let filter = compile_filter(rules, SeccompAction::Errno(libc::EPERM as u32))
+        .expect("seccomp capability probe filter should compile");
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed while probing seccomp support");
+
+    if pid == 0 {
+        unsafe {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                libc::_exit(1);
+            }
+            match apply_filter(&filter) {
+                Ok(()) => libc::_exit(0),
+                Err(seccompiler::Error::Seccomp(error))
+                    if error.raw_os_error() == Some(libc::EPERM) =>
+                {
+                    libc::_exit(UNAVAILABLE_EXIT_CODE);
+                }
+                Err(error) => {
+                    let message = format!("unexpected seccomp capability probe error: {error}\n");
+                    libc::write(2, message.as_ptr().cast(), message.len());
+                    libc::_exit(1);
+                }
+            }
+        }
+    }
+
+    let mut status: libc::c_int = 0;
+    unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    assert!(
+        libc::WIFEXITED(status),
+        "seccomp capability probe child failed"
+    );
+    let exit_code = libc::WEXITSTATUS(status);
+    if exit_code == UNAVAILABLE_EXIT_CODE {
+        eprintln!("skipping test: seccomp filter installation is blocked by the environment");
+        return false;
+    }
+    assert_eq!(exit_code, 0, "seccomp capability probe failed unexpectedly");
+    true
+}
+
+#[cfg(test)]
 // libc/syscall FFI requires unsafe; these tests fork children and exercise
 // blocked syscalls, so unsafe blocks/calls are pervasive.
 #[allow(
@@ -659,6 +707,9 @@ mod tests {
 
     #[test]
     fn behavioral_supervisor_prelude_mount_blocked() {
+        if !filter_installation_available() {
+            return;
+        }
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
@@ -699,6 +750,9 @@ mod tests {
 
     #[test]
     fn behavioral_clone3_returns_enosys() {
+        if !filter_installation_available() {
+            return;
+        }
         // clone3 uses a separate filter that returns ENOSYS (not EPERM) so
         // glibc falls back to clone.
         let main_filter = build_filter(true).unwrap();
@@ -730,6 +784,9 @@ mod tests {
 
     #[test]
     fn behavioral_third_filter_install_blocked_after_startup() {
+        if !filter_installation_available() {
+            return;
+        }
         let main_filter = build_filter(true).unwrap();
         let clone3_filter = build_clone3_filter().unwrap();
         let third_filter = build_clone3_filter().unwrap();

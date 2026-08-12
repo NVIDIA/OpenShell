@@ -3123,6 +3123,9 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn effective_identity_validation_honors_landlock_denial() {
+        if !sandbox::linux::landlock_available() {
+            return;
+        }
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         let root = dir.path().canonicalize().unwrap().join("project");
         std::fs::create_dir(&root).unwrap();
@@ -3137,13 +3140,12 @@ mod tests {
         policy.landlock = LandlockPolicy {
             compatibility: openshell_core::policy::LandlockCompatibility::HardRequirement,
         };
-        let Ok(prepared) = sandbox::linux::prepare_current_user(&policy, None) else {
-            return;
-        };
+        let prepared = sandbox::linux::prepare_current_user(&policy, None)
+            .expect("Landlock rules should prepare when the capability probe succeeds");
 
         match unsafe { fork() }.expect("fork should succeed") {
             ForkResult::Child => {
-                let denied = sandbox::linux::enforce(prepared).is_ok()
+                let denied = sandbox::linux::enforce_landlock(prepared).is_ok()
                     && validate_oci_workspace_as_effective_identity(&root).is_err();
                 unsafe { libc::_exit(i32::from(!denied)) };
             }

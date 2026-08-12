@@ -1612,7 +1612,19 @@ mod tests {
         // With the old single-pty_master design, a window_change_request
         // for channel N would resize whatever PTY was stored last —
         // potentially belonging to a different channel.
-        let pty_a = openpty(None, None).expect("openpty a");
+        let pty_a = match openpty(None, None) {
+            Ok(pty) => pty,
+            Err(
+                nix::errno::Errno::EACCES
+                | nix::errno::Errno::ENOENT
+                | nix::errno::Errno::ENODEV
+                | nix::errno::Errno::ENXIO,
+            ) => {
+                eprintln!("skipping test: PTY allocation is unavailable");
+                return;
+            }
+            Err(error) => panic!("openpty a: {error}"),
+        };
         let pty_b = openpty(None, None).expect("openpty b");
         let master_a = std::fs::File::from(pty_a.master);
         let master_b = std::fs::File::from(pty_b.master);
@@ -1846,6 +1858,11 @@ mod tests {
         use openshell_core::policy::{
             FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
         };
+
+        #[cfg(target_os = "linux")]
+        if !sandbox::linux::seccomp_filter_installation_available() {
+            return;
+        }
 
         // No user/group configured and not running as root → drop_privileges is
         // a no-op, so spawn succeeds regardless of the effective UID.
