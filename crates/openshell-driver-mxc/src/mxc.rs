@@ -99,10 +99,10 @@ fn network_json(network: &MxcNetwork) -> serde_json::Value {
     // See also docs/reference/mxc-compute-driver-design.mdx §network.proxy.
     // The MxcNetwork.proxy field remains SocketAddr so callers keep full
     // precision; only the port is serialized into the localhost key.
+    // Released wxc-exec rejects allowedHosts and blockedHosts as unsupported,
+    // even when they are empty. The host proxy enforces the L7 allowlist.
     let mut value = serde_json::json!({
         "defaultPolicy": network.default_policy.as_str(),
-        "allowedHosts": [],
-        "blockedHosts": [],
     });
     if let Some(proxy) = network.proxy {
         value["proxy"] = serde_json::json!({ "localhost": proxy.port() });
@@ -758,18 +758,8 @@ mod tests {
         let config = provision_config_json(DEFAULT_CONFIGURATION_ID, &filesystem, Some(&network));
 
         assert_eq!(config["network"]["defaultPolicy"], "block");
-        assert!(
-            config["network"]["allowedHosts"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            config["network"]["blockedHosts"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(config["network"].get("allowedHosts").is_none());
+        assert!(config["network"].get("blockedHosts").is_none());
         // MXC 0.6.0-alpha accepts only {"proxy": {"localhost": N}}.
         assert_eq!(config["network"]["proxy"]["localhost"], 18080);
         assert!(
@@ -792,6 +782,8 @@ mod tests {
             proxy: Some("127.0.0.1:18080".parse().unwrap()),
         };
         let value = network_json(&network);
+        assert!(value.get("allowedHosts").is_none());
+        assert!(value.get("blockedHosts").is_none());
         assert_eq!(value["proxy"]["localhost"], 18080);
         assert!(value["proxy"].get("host").is_none());
         assert!(value["proxy"].get("port").is_none());

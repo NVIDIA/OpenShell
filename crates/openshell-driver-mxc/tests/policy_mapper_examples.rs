@@ -297,12 +297,11 @@ fn split_policy_routes_network_to_proxy() {
         "non-127.0.0.1 redirect must produce an error loss item"
     );
 
-    // Direct egress is blocked; allowedHosts is empty (proxy enforces the list).
+    // Direct egress is blocked; unsupported host-list fields are omitted and
+    // the proxy enforces the full list.
     assert_eq!(cfg["network"]["defaultPolicy"], "block");
-    assert!(
-        str_list(&cfg["network"]["allowedHosts"]).is_empty(),
-        "split path must not populate allowedHosts"
-    );
+    assert!(cfg["network"].get("allowedHosts").is_none());
+    assert!(cfg["network"].get("blockedHosts").is_none());
 
     // Filesystem grants are preserved unchanged.
     assert_eq!(

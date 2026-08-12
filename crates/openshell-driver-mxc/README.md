@@ -83,9 +83,14 @@ redirect, and the driver starts a host CONNECT proxy from the trimmed
 network-only `SandboxPolicy`. The proxy uses the configured agent command as
 the static sandbox process identity because MXC does not expose Linux-style
 procfs socket ownership. For HTTPS L7 inspection, the host proxy generates a
-per-sandbox CA, grants the CA directory read-only in MXC, and injects
-`NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
-`CURL_CA_BUNDLE`, and `GIT_SSL_CAINFO` into the agent process env. The
+per-sandbox CA and injects `NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `SSL_CERT_FILE`,
+`REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `GIT_SSL_CAINFO` into the agent
+process env. It does not add the generated CA directory to MXC read-only grants:
+released `wxc-exec` BaseContainer builds require `WRITE_DAC` on every such
+grant and reject the user-owned proxy temp directory. The driver seeds only
+`SYSTEMROOT`, `WINDIR`, `PATH`, `COMSPEC`, and `LOCALAPPDATA` from the gateway
+host before applying sandbox and TLS overrides, so required Windows bootstrap
+values remain available without exposing the gateway's full environment. The
 development export surface remains the
 [`policy-to-mxc`](examples/policy-to-mxc.rs) example; there is no production
 `openshell policy export-mxc` subcommand yet.

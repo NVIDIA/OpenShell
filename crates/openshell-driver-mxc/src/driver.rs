@@ -248,15 +248,30 @@ fn sandbox_config(sandbox: &DriverSandbox) -> Result<MxcSandboxConfig, tonic::St
     Ok(config)
 }
 
+// Minimum non-secret Windows environment needed by CreateProcessW and the
+// AppContainer DACL fallback before the workload runtime starts.
+const MINIMAL_WINDOWS_BOOTSTRAP_ENV: [&str; 5] =
+    ["SYSTEMROOT", "WINDIR", "PATH", "COMSPEC", "LOCALAPPDATA"];
+
 fn sandbox_environment(sandbox: &DriverSandbox) -> Vec<String> {
-    let Some(spec) = sandbox.spec.as_ref() else {
-        return Vec::new();
-    };
-    let mut environment = spec
-        .template
-        .as_ref()
-        .map_or_else(HashMap::new, |template| template.environment.clone());
-    environment.extend(spec.environment.clone());
+    // Released wxc-exec ProcessContainer builds start from the explicit
+    // process environment. Seed only the non-secret Windows bootstrap values;
+    // copying the gateway's full environment would leak unrelated host secrets
+    // into untrusted sandbox workloads.
+    let mut environment = MINIMAL_WINDOWS_BOOTSTRAP_ENV
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect::<HashMap<_, _>>();
+    if let Some(spec) = sandbox.spec.as_ref() {
+        if let Some(template) = spec.template.as_ref() {
+            environment.extend(template.environment.clone());
+        }
+        environment.extend(spec.environment.clone());
+    }
     let mut environment = environment
         .into_iter()
         .map(|(key, value)| format!("{key}={value}"))
@@ -374,25 +389,6 @@ fn append_tls_env_vars(env: &mut Vec<String>, ca_paths: Option<&(PathBuf, PathBu
         format!("CURL_CA_BUNDLE={combined_bundle_path}"),
         format!("GIT_SSL_CAINFO={combined_bundle_path}"),
     ]);
-}
-
-fn append_tls_readonly_grant(
-    readonly_paths: &mut Vec<String>,
-    ca_paths: Option<&(PathBuf, PathBuf)>,
-) {
-    let Some((ca_cert_path, _)) = ca_paths else {
-        return;
-    };
-    let Some(dir) = ca_cert_path.parent() else {
-        return;
-    };
-    let dir = dir.display().to_string();
-    if !readonly_paths
-        .iter()
-        .any(|existing| existing.eq_ignore_ascii_case(&dir))
-    {
-        readonly_paths.push(dir);
-    }
 }
 
 impl MxcComputeBackend {
@@ -858,8 +854,11 @@ async fn run_lifecycle(
         ));
     }
 
-    let mut readonly_paths = mapped.readonly_paths;
-    append_tls_readonly_grant(&mut readonly_paths, host_proxy_ca_paths.as_ref());
+    // Do not add the generated TLS directory to readonly_paths. Released
+    // wxc-exec BaseContainer builds require WRITE_DAC on every read-only grant;
+    // the user-owned proxy temp directory otherwise makes sandbox launch fail.
+    // CA paths remain available through the TLS trust environment variables.
+    let readonly_paths = mapped.readonly_paths;
     let filesystem = MxcFilesystem {
         readwrite_paths: mapped.readwrite_paths,
         readonly_paths,
@@ -870,6 +869,7 @@ async fn run_lifecycle(
     let command_line = encode_windows_command_line(&sandbox_config.command);
     let mut environment = sandbox_environment(&sandbox);
     append_tls_env_vars(&mut environment, host_proxy_ca_paths.as_ref());
+    info!(sandbox = %sandbox_name, count = environment.len(), "MXC process env vars");
     let process = MxcProcess {
         command_line: command_line.clone(),
         cwd: sandbox_config.cwd,
@@ -1248,7 +1248,7 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn sandbox_environment_uses_sandbox_scope_with_spec_precedence() {
+    fn sandbox_environment_inherits_host_with_spec_precedence() {
         let mut sandbox = driver_sandbox("sb-env");
         let spec = sandbox.spec.as_mut().unwrap();
         spec.template
@@ -1258,10 +1258,18 @@ mod lifecycle_tests {
             .insert("SHARED".into(), "template".into());
         spec.environment.insert("SHARED".into(), "spec".into());
         spec.environment.insert("TOKEN".into(), "value".into());
-        assert_eq!(
-            sandbox_environment(&sandbox),
-            vec!["SHARED=spec".to_string(), "TOKEN=value".to_string()]
-        );
+        let environment = sandbox_environment(&sandbox);
+        assert!(environment.contains(&"SHARED=spec".to_string()));
+        assert!(environment.contains(&"TOKEN=value".to_string()));
+        for key in MINIMAL_WINDOWS_BOOTSTRAP_ENV {
+            if let Ok(value) = std::env::var(key) {
+                assert!(environment.contains(&format!("{key}={value}")));
+            }
+        }
+        assert!(environment.iter().all(|entry| {
+            let key = entry.split_once('=').map_or(entry.as_str(), |(key, _)| key);
+            key == "SHARED" || key == "TOKEN" || MINIMAL_WINDOWS_BOOTSTRAP_ENV.contains(&key)
+        }));
     }
 
     #[test]
@@ -1294,19 +1302,6 @@ mod lifecycle_tests {
         assert!(env.contains(&format!("REQUESTS_CA_BUNDLE={bundle_path}")));
         assert!(env.contains(&format!("CURL_CA_BUNDLE={bundle_path}")));
         assert!(env.contains(&format!("GIT_SSL_CAINFO={bundle_path}")));
-    }
-
-    #[test]
-    fn tls_readonly_grant_adds_ca_directory_once() {
-        let tls_dir = std::env::temp_dir().join("openshell-mxc-tls-test");
-        let ca_cert = tls_dir.join("openshell-ca.pem");
-        let bundle = tls_dir.join("ca-bundle.pem");
-        let existing = tls_dir.display().to_string().to_ascii_lowercase();
-        let mut readonly = vec![existing.clone()];
-
-        append_tls_readonly_grant(&mut readonly, Some(&(ca_cert, bundle)));
-
-        assert_eq!(readonly, vec![existing]);
     }
 
     #[test]
@@ -1496,12 +1491,8 @@ mod lifecycle_tests {
 
         let recorded = crate::mxc::mock_recorded_config("sb-egress").expect("mock recorded config");
         assert_eq!(recorded["network"]["defaultPolicy"], "block");
-        assert!(
-            recorded["network"]["allowedHosts"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        assert!(recorded["network"].get("allowedHosts").is_none());
+        assert!(recorded["network"].get("blockedHosts").is_none());
         // MXC 0.6.0-alpha accepts only {"proxy": {"localhost": N}}.
         let proxy_port = recorded["network"]["proxy"]["localhost"]
             .as_u64()
