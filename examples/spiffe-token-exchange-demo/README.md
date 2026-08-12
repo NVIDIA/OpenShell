@@ -206,6 +206,16 @@ The script reuses your normal OpenShell CLI config so it can load the stored
 OIDC token for `OPENSHELL_GATEWAY`. If you set `ISOLATED_CONFIG=1`, register
 and log in to the gateway in that isolated config before running the demo.
 
+## Podman Demo
+
+A local Podman variant lives in `podman/`. It reuses the same dummy token
+issuer and protected service code, starts local SPIRE and demo service
+containers, manually registers one sandbox SPIFFE entry, and runs the same
+alpha/beta token exchange checks.
+
+See `podman/README.md` for the required gateway configuration and script
+usage.
+
 ## Cleanup
 
 Delete the sandbox through OpenShell:
