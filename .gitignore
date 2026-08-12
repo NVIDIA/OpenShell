@@ -216,6 +216,9 @@ mise.local.toml
 # Ignore plans for now
 architecture/plans
 
+# Superpowers scratch (plans/specs) — local working docs, not versioned
+docs/superpowers/
+
 rfc.md
 .worktrees
 .z3-trace
