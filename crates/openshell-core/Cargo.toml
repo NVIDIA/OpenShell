@@ -41,7 +41,7 @@ telemetry = ["dep:reqwest", "dep:chrono"]
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
-protobuf-src = { workspace = true }
+protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

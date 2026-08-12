@@ -21,16 +21,19 @@ hide = true
 ["test:install-sh"]
 description = "Run focused install.sh shell tests"
 run = "tasks/scripts/test-install-sh.sh"
+run_windows = "echo Skipping test:install-sh: Linux glibc installer tests do not apply on Windows."
 hide = true
 
 ["test:build-env"]
 description = "Run build-env.sh helper shell tests"
 run = "tasks/scripts/test-build-env.sh"
+run_windows = "echo Skipping test:build-env: the Unix build-env.sh helper does not apply on Windows."
 hide = true
 
 ["test:packaging-assets"]
 description = "Run static packaging asset tests"
 run = "tasks/scripts/test-packaging-assets.sh"
+run_windows = "echo Skipping test:packaging-assets: Linux service and RPM assets do not apply on Windows."
 hide = true
 
 [e2e]
@@ -58,6 +61,7 @@ run = [
   "cargo test --workspace --exclude openshell-server",
   "cargo test -p openshell-server --features test-support",
 ]
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit native"
 hide = true
 
 ["test:python"]

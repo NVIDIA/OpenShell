@@ -1439,6 +1439,10 @@ enum SandboxCommands {
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
 
+        /// Suppress warnings when --env values look like credentials.
+        #[arg(long = "no-credential-warnings")]
+        no_credential_warnings: bool,
+
         /// Approval mode for agent-authored policy proposals.
         ///
         /// `manual` (default): every proposal lands in the draft inbox for
@@ -2146,9 +2150,34 @@ enum WorkspaceMemberCommands {
     },
 }
 
+#[cfg(target_os = "windows")]
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("openshell-main".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_main)
+        .map_err(|err| miette::miette!("failed to start OpenShell main thread: {err}"))?
+        .join()
+        .map_err(|_| miette::miette!("OpenShell main thread panicked"))?
+}
+
+#[cfg(not(target_os = "windows"))]
 #[tokio::main]
-#[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; OK at top level.
 async fn main() -> Result<()> {
+    run_async().await
+}
+
+#[cfg(target_os = "windows")]
+fn run_main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| miette::miette!("failed to build Tokio runtime: {err}"))?
+        .block_on(run_async())
+}
+
+#[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; run on an expanded Windows stack.
+async fn run_async() -> Result<()> {
     // Install the rustls crypto provider before completion runs — completers may
     // establish TLS connections to the gateway.
     rustls::crypto::ring::default_provider()
@@ -2934,6 +2963,7 @@ async fn main() -> Result<()> {
                     no_auto_providers,
                     labels,
                     envs,
+                    no_credential_warnings,
                     approval_mode,
                     output,
                     command,
@@ -2971,6 +3001,7 @@ async fn main() -> Result<()> {
 
                     // Parse --env flags into a HashMap<String, String>.
                     let env_map = run::parse_env_pairs(&envs)?;
+                    run::warn_credential_env_vars(&env_map, no_credential_warnings);
 
                     // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
                     let upload_specs: Vec<(String, Option<String>, bool)> = upload

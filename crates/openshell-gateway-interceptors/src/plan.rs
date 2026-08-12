@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[cfg(unix)]
 use hyper_util::rt::TokioIo;
 use openshell_core::config::{
     GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
@@ -16,10 +17,13 @@ use openshell_core::proto::gateway_interceptor::v1::{
     DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorSelector,
     gateway_interceptor_client::GatewayInterceptorClient,
 };
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tonic::Request;
+#[cfg(unix)]
 use tonic::codegen::http::Uri;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+#[cfg(unix)]
 use tower::service_fn;
 use tracing::{info, warn};
 

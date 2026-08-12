@@ -22,6 +22,12 @@ url = "https://github.com/bufbuild/buf/releases/download/v1.72.0/buf-Darwin-arm6
 url_api = "https://api.github.com/repos/bufbuild/buf/releases/assets/480772487"
 provenance = "minisign"
 
+[tools.buf."platforms.windows-x64"]
+checksum = "sha256:0332d8d1bf062c95a0418081b7e574551032ee72064af05e304e3a1454f8cf11"
+url = "https://github.com/bufbuild/buf/releases/download/v1.72.0/buf-Windows-x86_64.zip"
+url_api = "https://api.github.com/repos/bufbuild/buf/releases/assets/480772631"
+provenance = "minisign"
+
 [[tools."github:EmbarkStudios/cargo-about"]]
 version = "0.8.4"
 backend = "github:EmbarkStudios/cargo-about"
@@ -44,6 +50,11 @@ checksum = "sha256:d5255ead3ac861a11c785bf19d4f70f16e59ac8b9519c312da61213d3d573
 url = "https://github.com/EmbarkStudios/cargo-about/releases/download/0.8.4/cargo-about-0.8.4-aarch64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/EmbarkStudios/cargo-about/releases/assets/324268695"
 
+[tools."github:EmbarkStudios/cargo-about"."platforms.windows-x64"]
+checksum = "sha256:d5c38fb914bbad57c6a7d58c4847315bc3fe11efbe4fb51b3c515f997a56ceb7"
+url = "https://github.com/EmbarkStudios/cargo-about/releases/download/0.8.4/cargo-about-0.8.4-x86_64-pc-windows-msvc.tar.gz"
+url_api = "https://api.github.com/repos/EmbarkStudios/cargo-about/releases/assets/324269449"
+
 [[tools."github:anchore/syft"]]
 version = "1.44.0"
 backend = "github:anchore/syft"
@@ -64,6 +75,12 @@ provenance = "github-attestations"
 checksum = "sha256:24e4d34078ae81da7c82539616f0ccac3e226cf4f74a38ce6fb3463619e50a55"
 url = "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_darwin_arm64.tar.gz"
 url_api = "https://api.github.com/repos/anchore/syft/releases/assets/410001187"
+provenance = "github-attestations"
+
+[tools."github:anchore/syft"."platforms.windows-x64"]
+checksum = "sha256:195e786eb84ec145854f20528992e86637c77d1968731dfe6ce850c90e28f47a"
+url = "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_windows_amd64.zip"
+url_api = "https://api.github.com/repos/anchore/syft/releases/assets/410001172"
 provenance = "github-attestations"
 
 [[tools."github:mozilla/sccache"]]
@@ -107,6 +124,11 @@ checksum = "sha256:ded590cae2c72042c61178632906bef62d635fa20d45f8b22110a2241f430
 url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-aarch64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060416"
 
+[tools."github:mozilla/sccache"."platforms.windows-x64"]
+checksum = "sha256:b8514ed7552e148b0a032114f745118dcb801791adafafeaf9935e4bfb0edf1b"
+url = "https://github.com/mozilla/sccache/releases/download/v0.16.0/sccache-v0.16.0-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/452060720"
+
 [[tools."github:rust-cross/cargo-zigbuild"]]
 version = "0.22.3"
 backend = "github:rust-cross/cargo-zigbuild"
@@ -126,6 +148,11 @@ checksum = "sha256:29caf036bdbb4e6f07afea31706b6f386cb5a4db9a46a3a8b462b9b78157e
 url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.22.3/cargo-zigbuild-aarch64-apple-darwin.tar.xz"
 url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/405676922"
 
+[tools."github:rust-cross/cargo-zigbuild"."platforms.windows-x64"]
+checksum = "sha256:675804464634cf068dc206e9fafc1bd4557ffcc0b1638a1ff246d899b776fe35"
+url = "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.22.3/cargo-zigbuild-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/rust-cross/cargo-zigbuild/releases/assets/405676944"
+
 [[tools.go]]
 version = "1.26.5"
 backend = "core:go"
@@ -141,6 +168,10 @@ url = "https://dl.google.com/go/go1.26.5.linux-amd64.tar.gz"
 [tools.go."platforms.macos-arm64"]
 checksum = "sha256:efb87ff28af9a188d0536ef5d42e63dd52ba8263cd7344a993cc48dd11dedb6a"
 url = "https://dl.google.com/go/go1.26.5.darwin-arm64.tar.gz"
+
+[tools.go."platforms.windows-x64"]
+checksum = "sha256:97e6b2a833b6d89f9ff17d25419ac0a7e3b482a044e9ab18cdef834bd834fd38"
+url = "https://dl.google.com/go/go1.26.5.windows-amd64.zip"
 
 [[tools."go:github.com/golangci/golangci-lint/v2/cmd/golangci-lint"]]
 version = "2.12.2"
@@ -174,6 +205,10 @@ url = "https://get.helm.sh/helm-v4.2.0-linux-amd64.tar.gz"
 checksum = "sha256:f13f959015447b6bc309f9fd506509926543988a39035c088b52522ec95e2acb"
 url = "https://get.helm.sh/helm-v4.2.0-darwin-arm64.tar.gz"
 
+[tools.helm."platforms.windows-x64"]
+checksum = "sha256:34bf9659f8f04f3841a60131183b8e2acc44e260db4c93b889ff09718cacca6f"
+url = "https://get.helm.sh/helm-v4.2.0-windows-amd64.tar.gz"
+
 [[tools.helm-docs]]
 version = "1.14.2"
 backend = "aqua:norwoodj/helm-docs"
@@ -192,6 +227,11 @@ url_api = "https://api.github.com/repos/norwoodj/helm-docs/releases/assets/17832
 checksum = "sha256:2d8399db5b33d240d5f8985241bcf5483563150b968e3229823822979f3e4b8b"
 url = "https://github.com/norwoodj/helm-docs/releases/download/v1.14.2/helm-docs_1.14.2_Darwin_arm64.tar.gz"
 url_api = "https://api.github.com/repos/norwoodj/helm-docs/releases/assets/178327215"
+
+[tools.helm-docs."platforms.windows-x64"]
+checksum = "sha256:3c54fd78d99e2769cf83a0faf12cf6cd4de1cac6ed7bee8d908a2c8fc23f538c"
+url = "https://github.com/norwoodj/helm-docs/releases/download/v1.14.2/helm-docs_1.14.2_Windows_x86_64.tar.gz"
+url_api = "https://api.github.com/repos/norwoodj/helm-docs/releases/assets/178327219"
 
 [[tools.k3d]]
 version = "5.8.3"
@@ -212,6 +252,11 @@ checksum = "sha256:8da468daa7dc7cf7cdd4735f90a9bb05179fa27858250f62e3d8cdf5b5ca0
 url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-darwin-arm64"
 url_api = "https://api.github.com/repos/k3d-io/k3d/releases/assets/229450067"
 
+[tools.k3d."platforms.windows-x64"]
+checksum = "sha256:655d2aadcb1f0a0dd196c5cbc564687ba945a9547c8e82c9fc532051fb260e22"
+url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-windows-amd64.exe"
+url_api = "https://api.github.com/repos/k3d-io/k3d/releases/assets/229450011"
+
 [[tools.kubectl]]
 version = "1.36.1"
 backend = "aqua:kubernetes/kubernetes/kubectl"
@@ -228,6 +273,10 @@ url = "https://dl.k8s.io/v1.36.1/bin/linux/amd64/kubectl"
 checksum = "sha256:9092778abaef3079449da4cd70ded0e4be112480c93efcdeace3155968d1d133"
 url = "https://dl.k8s.io/v1.36.1/bin/darwin/arm64/kubectl"
 
+[tools.kubectl."platforms.windows-x64"]
+checksum = "sha256:538f4229eee91a17b34724da7daade7687393d6988e33b723c6c306572c13900"
+url = "https://dl.k8s.io/v1.36.1/bin/windows/amd64/kubectl.exe"
+
 [[tools.node]]
 version = "24.15.0"
 backend = "core:node"
@@ -243,6 +292,10 @@ url = "https://nodejs.org/dist/v24.15.0/node-v24.15.0-linux-x64.tar.gz"
 [tools.node."platforms.macos-arm64"]
 checksum = "sha256:372331b969779ab5d15b949884fc6eaf88d5afe87bde8ba881d6400b9100ffc4"
 url = "https://nodejs.org/dist/v24.15.0/node-v24.15.0-darwin-arm64.tar.gz"
+
+[tools.node."platforms.windows-x64"]
+checksum = "sha256:cc5149eabd53779ce1e7bdc5401643622d0c7e6800ade18928a767e940bb0e62"
+url = "https://nodejs.org/dist/v24.15.0/node-v24.15.0-win-x64.zip"
 
 [[tools."npm:markdownlint-cli2"]]
 version = "0.22.0"
@@ -267,6 +320,11 @@ checksum = "sha256:b9576b5fa1a1ef3fe13a8c91d9d8204b46545759bea5ae155cd6ba2ea4cda
 url = "https://github.com/protocolbuffers/protobuf/releases/download/v29.6/protoc-29.6-osx-aarch_64.zip"
 url_api = "https://api.github.com/repos/protocolbuffers/protobuf/releases/assets/350795082"
 
+[tools.protoc."platforms.windows-x64"]
+checksum = "sha256:1ebd7c87baffb9f1c47169b640872bf5fb1e4408079c691af527be9561d8f6f7"
+url = "https://github.com/protocolbuffers/protobuf/releases/download/v29.6/protoc-29.6-win64.zip"
+url_api = "https://api.github.com/repos/protocolbuffers/protobuf/releases/assets/350795088"
+
 [[tools.python]]
 version = "3.14.5"
 backend = "core:python"
@@ -289,6 +347,11 @@ checksum = "sha256:3a0373cc39fefd494754ef555267f245c720cddbaaabf63a7c9a4269f1e56
 url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260602/cpython-3.14.5+20260602-aarch64-apple-darwin-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
+[tools.python."platforms.windows-x64"]
+checksum = "sha256:66b065143e538c07f069f764d831d8ffae95507907d4ca211304e6f3a056435c"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260602/cpython-3.14.5+20260602-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
+provenance = "github-attestations"
+
 [[tools.rust]]
 version = "1.95.0"
 backend = "core:rust"
@@ -306,6 +369,10 @@ url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-a
 
 [tools.skaffold."platforms.macos-arm64"]
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-darwin-arm64"
+
+[tools.skaffold."platforms.windows-x64"]
+checksum = "blake3:f6db036671e29118d0fdc4457dc563e99d7bff8a39f0f2f72e3e5d857d9013a3"
+url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-windows-amd64.exe"
 
 [[tools.uv]]
 version = "0.10.12"
@@ -329,6 +396,12 @@ url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-aarch64-appl
 url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/377491929"
 provenance = "github-attestations"
 
+[tools.uv."platforms.windows-x64"]
+checksum = "sha256:4c1d55501869b3330d4aabf45ad6024ce2367e0f3af83344395702d272c22e88"
+url = "https://github.com/astral-sh/uv/releases/download/0.10.12/uv-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/astral-sh/uv/releases/assets/377491992"
+provenance = "github-attestations"
+
 [[tools.zig]]
 version = "0.14.1"
 backend = "core:zig"
@@ -344,3 +417,8 @@ url = "https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz"
 [tools.zig."platforms.macos-arm64"]
 checksum = "sha256:39f3dc5e79c22088ce878edc821dedb4ca5a1cd9f5ef915e9b3cc3053e8faefa"
 url = "https://ziglang.org/download/0.14.1/zig-aarch64-macos-0.14.1.tar.xz"
+
+[tools.zig."platforms.windows-x64"]
+checksum = "sha256:554f5378228923ffd558eac35e21af020c73789d87afeabf4bfd16f2e6feed2c"
+url = "https://ziglang.org/download/0.14.1/zig-x86_64-windows-0.14.1.zip"
+provenance = "minisign"

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import errno
 import json
 import os
 import pathlib
@@ -1065,6 +1066,40 @@ def _xdg_config_home() -> pathlib.Path:
 # matches `openshell-bootstrap::oidc_token::is_token_expired`.
 _OIDC_TOKEN_EXPIRY_GRACE_SECONDS = 30
 
+_IS_WINDOWS = os.name == "nt"
+_WINDOWS_REPLACE_RETRYABLE_ERRORS = frozenset({5, 32})
+_WINDOWS_REPLACE_TIMEOUT_SECONDS = 0.25
+_WINDOWS_REPLACE_INITIAL_DELAY_SECONDS = 0.005
+_WINDOWS_REPLACE_MAX_DELAY_SECONDS = 0.05
+_WINDOWS_REPLACE_LOCK = threading.Lock()
+
+
+def _atomic_replace(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Atomically replace a file, retrying transient Windows sharing errors."""
+    if not _IS_WINDOWS:
+        source.replace(destination)
+        return
+
+    # Serialize writers in this process. The retry still handles other
+    # processes (including the Rust CLI) and filesystem scanners that briefly
+    # open the destination without delete sharing.
+    with _WINDOWS_REPLACE_LOCK:
+        deadline = time.monotonic() + _WINDOWS_REPLACE_TIMEOUT_SECONDS
+        delay = _WINDOWS_REPLACE_INITIAL_DELAY_SECONDS
+        while True:
+            try:
+                source.replace(destination)
+                return
+            except PermissionError as error:
+                winerror = getattr(error, "winerror", None)
+                retryable = winerror in _WINDOWS_REPLACE_RETRYABLE_ERRORS or (
+                    winerror is None and error.errno == errno.EACCES
+                )
+                if not retryable or time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, _WINDOWS_REPLACE_MAX_DELAY_SECONDS)
+
 
 def _read_oidc_token_bundle(gateway_dir: pathlib.Path) -> dict | None:
     """Read and parse `oidc_token.json` for a gateway.
@@ -1531,7 +1566,7 @@ class _OidcRefresher:
                 f.write(payload)
             with contextlib.suppress(OSError):
                 tmp_path.chmod(0o600)
-            tmp_path.replace(path)
+            _atomic_replace(tmp_path, path)
         except BaseException:
             # Clean up our tmp on failure so we don't leave orphaned
             # `.oidc_token.<rand>.tmp` files lying around. The replace

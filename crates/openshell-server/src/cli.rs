@@ -1207,11 +1207,15 @@ mod tests {
 
         let expected = format!(
             "sqlite:{}",
-            tmp.path().join("openshell/gateway/openshell.db").display()
+            tmp.path()
+                .join("openshell")
+                .join("gateway")
+                .join("openshell.db")
+                .display()
         );
         assert!(local_tls.is_none());
         assert_eq!(args.db_url.as_deref(), Some(expected.as_str()));
-        assert!(tmp.path().join("openshell/gateway").is_dir());
+        assert!(tmp.path().join("openshell").join("gateway").is_dir());
     }
 
     #[test]
@@ -1818,6 +1822,7 @@ mem_mib = "not-a-number"
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn driver_inherits_shared_image_from_gateway_section() {
         // [openshell.gateway].default_image inherits into the K8s driver
         // table when the driver-specific table does not set it.
@@ -1843,6 +1848,7 @@ namespace = "agents"
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn driver_specific_value_overrides_gateway_inheritance() {
         let file = config_file_from_toml(
             r#"

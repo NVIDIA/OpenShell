@@ -449,11 +449,14 @@ pub(crate) async fn run_server(
     // env var) and has a sandbox JWT issuer to mint replacements against;
     // outside the cluster we can't call the apiserver's TokenReview API,
     // and without the issuer there's nothing to exchange the SA token for.
+    #[cfg(not(target_os = "windows"))]
     if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
         // Pod lookups and TokenReview identity checks must match the sandbox
         // namespace and service account used by the Kubernetes driver.
         let kubernetes_config =
-            compute::driver_config::kubernetes_config_for_k8s_sa_bootstrap(config_file.as_ref())?;
+            compute::driver_config::builtin::kubernetes_config_for_k8s_sa_bootstrap(
+                config_file.as_ref(),
+            )?;
         let sandbox_namespace = kubernetes_config.namespace;
         let sandbox_service_account = kubernetes_config.service_account_name;
         match kube::Client::try_default().await {
@@ -837,6 +840,14 @@ async fn terminate_signal() {
     let _ = signal.recv().await;
 }
 
+#[cfg(target_os = "windows")]
+fn unsupported_builtin_compute_driver(driver: ComputeDriverKind) -> compute::ComputeError {
+    compute::ComputeError::Message(format!(
+        "{} compute driver is unsupported on Windows",
+        driver.as_str()
+    ))
+}
+
 // Internal wiring helper: each argument is a distinct piece of runtime state
 // that must be passed through, so the count is justified.
 #[allow(clippy::too_many_arguments)]
@@ -853,10 +864,13 @@ async fn build_compute_runtime(
     info!(driver = %driver.name(), "Using compute driver");
 
     let runtime = match driver {
+        #[cfg(target_os = "windows")]
+        ConfiguredComputeDriver::Builtin(driver) => Err(unsupported_builtin_compute_driver(driver)),
+        #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Kubernetes) => {
             warn_if_kubernetes_sandbox_jwt_expiry_disabled(config);
             let k8s_config =
-                compute::driver_config::kubernetes_config_from_context(driver_startup)?;
+                compute::driver_config::builtin::kubernetes_config_from_context(driver_startup)?;
             ComputeRuntime::new_kubernetes(
                 k8s_config,
                 store,
@@ -867,8 +881,10 @@ async fn build_compute_runtime(
             )
             .await
         }
+        #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Docker) => {
-            let docker_config = compute::driver_config::docker_config_from_context(driver_startup)?;
+            let docker_config =
+                compute::driver_config::builtin::docker_config_from_context(driver_startup)?;
             ComputeRuntime::new_docker(
                 config.clone(),
                 docker_config,
@@ -880,8 +896,10 @@ async fn build_compute_runtime(
             )
             .await
         }
+        #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Podman) => {
-            let podman_config = compute::driver_config::podman_config_from_context(driver_startup)?;
+            let podman_config =
+                compute::driver_config::builtin::podman_config_from_context(driver_startup)?;
             ComputeRuntime::new_podman(
                 podman_config,
                 store,
@@ -892,8 +910,10 @@ async fn build_compute_runtime(
             )
             .await
         }
+        #[cfg(not(target_os = "windows"))]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Vm) => {
-            let vm_config = compute::driver_config::vm_config_from_context(driver_startup)?;
+            let vm_config =
+                compute::driver_config::builtin::vm_config_from_context(driver_startup)?;
             let otlp_config = driver_startup
                 .file
                 .and_then(|file| file.openshell.gateway.otlp.as_ref());
@@ -1567,6 +1587,23 @@ mod tests {
             &config_with_jwt_ttl(3600)
         ));
         assert!(!kubernetes_sandbox_jwt_expiry_disabled(&Config::new(None)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_builtin_compute_drivers_report_unsupported() {
+        for driver in [
+            ComputeDriverKind::Docker,
+            ComputeDriverKind::Kubernetes,
+            ComputeDriverKind::Podman,
+            ComputeDriverKind::Vm,
+        ] {
+            let message = super::unsupported_builtin_compute_driver(driver).to_string();
+            assert!(
+                message.contains("unsupported on Windows"),
+                "{driver} rejection should be explicit, got: {message}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -16,11 +16,14 @@ use openshell_core::proto::{
     PlatformEvent, SandboxPhase, SandboxPolicy, SettingValue, setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
+use openshell_providers::builtin_profiles;
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+const DOCS_PROVIDERS_URL: &str = "https://docs.nvidia.com/openshell/latest/sandboxes/providers-v2";
 
 // ---------------------------------------------------------------------------
 // View types
@@ -743,6 +746,96 @@ pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
 // Parsing utilities
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSuggestion {
+    pub provider_type: String,
+    pub credential: String,
+}
+
+fn credential_env_matches(env: &HashMap<String, String>) -> Vec<(String, Vec<ProfileSuggestion>)> {
+    const KEYWORDS: [&str; 7_usize] = [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "CREDENTIAL",
+        "ACCESS_KEY",
+        "SECRET_KEY",
+        "API_KEY",
+    ];
+    let looks_like_credential = |key: &str| -> bool {
+        let upper = key.to_ascii_uppercase();
+        let segs = upper.split('_').collect::<Vec<&str>>();
+        KEYWORDS.iter().any(|kw| {
+            let words = kw.split('_').collect::<Vec<&str>>();
+            segs.windows(words.len()).any(|w| w == words.as_slice())
+        })
+    };
+
+    // scan builtin_profiles()
+    let profile_suggestions = |key: &str| -> Vec<ProfileSuggestion> {
+        let mut suggestions = Vec::new();
+        for profile in builtin_profiles() {
+            for cred in &profile.credentials {
+                if cred.env_vars.iter().any(|v| v.eq_ignore_ascii_case(key)) {
+                    suggestions.push(ProfileSuggestion {
+                        provider_type: profile.id.clone(),
+                        credential: cred.name.clone(),
+                    });
+                }
+            }
+        }
+        suggestions
+    };
+
+    let mut matches = Vec::new();
+
+    for key in env.keys() {
+        let sug = profile_suggestions(key);
+        if !sug.is_empty() || looks_like_credential(key) {
+            matches.push((key.clone(), sug));
+        }
+    }
+
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+    matches
+}
+
+#[allow(clippy::implicit_hasher)]
+pub fn warn_credential_env_vars(env: &HashMap<String, String>, suppress: bool) {
+    if suppress {
+        return;
+    }
+
+    let matches = credential_env_matches(env);
+    if matches.is_empty() {
+        return;
+    }
+
+    for (key, suggestions) in &matches {
+        eprintln!(
+            "{} {key} looks like a credential passed as a plain environment variable.",
+            "⚠".yellow()
+        );
+        eprintln!("  The agent inside the sandbox can read this value directly.");
+        eprintln!();
+
+        if suggestions.is_empty() {
+            eprintln!("  To hide it from the agent, use a provider instead of --env.");
+        } else {
+            eprintln!("  To hide it from the agent, use a provider instead:");
+            for s in suggestions {
+                eprintln!(
+                    "    openshell provider create --name my-{ty} --type {ty} --credential {key}",
+                    ty = s.provider_type
+                );
+            }
+            eprintln!("    openshell sandbox create --provider my-<name> ...");
+        }
+        eprintln!("  See: {DOCS_PROVIDERS_URL}");
+        eprintln!();
+    }
+}
+
 pub fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
 
@@ -974,5 +1067,119 @@ mod tests {
 
         let err = parse_duration_to_ms("\u{20ac}").expect_err("missing number should error");
         assert!(err.to_string().contains("invalid duration"));
+    }
+
+    // helper for building input
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn suffix_match_no_profile() {
+        let env = env(&[("FOO_TOKEN", "x")]);
+        let prof = credential_env_matches(&env);
+        assert_eq!(prof.len(), 1_usize);
+        assert_eq!(&prof[0].0, "FOO_TOKEN");
+        assert!(prof[0].1.is_empty());
+    }
+
+    #[test]
+    fn exact_profile_match() {
+        let env = env(&[("GITHUB_TOKEN", "x")]);
+
+        let prof = credential_env_matches(&env);
+        assert_eq!(prof.len(), 1_usize);
+        assert_eq!(prof[0].0, "GITHUB_TOKEN");
+
+        let sug = &prof[0].1;
+        assert_eq!(sug.len(), 2_usize);
+
+        assert_eq!(sug[0].provider_type, "copilot");
+        assert_eq!(sug[0].credential, "api_token");
+
+        assert_eq!(sug[1].provider_type, "github");
+        assert_eq!(sug[1].credential, "api_token");
+    }
+
+    #[test]
+    fn case_insensitive() {
+        let env = env(&[("gh_token", "x")]);
+
+        let prof = credential_env_matches(&env);
+        assert_eq!(prof.len(), 1_usize);
+        assert_eq!(prof[0].0, "gh_token");
+
+        let sug = &prof[0].1;
+        assert_eq!(sug.len(), 2_usize);
+
+        assert_eq!(sug[0].provider_type, "copilot");
+        assert_eq!(sug[0].credential, "api_token");
+
+        assert_eq!(sug[1].provider_type, "github");
+        assert_eq!(sug[1].credential, "api_token");
+    }
+
+    #[test]
+    fn non_credential_skipped() {
+        let env = env(&[("PATH", "x"), ("HOME", "y")]);
+
+        let prof = credential_env_matches(&env);
+        assert!(prof.is_empty());
+    }
+
+    #[test]
+    fn no_value_leak() {
+        let env = env(&[("APP_SECRET", "secretVALUE42")]);
+
+        let prof = credential_env_matches(&env);
+        assert_eq!(prof.len(), 1_usize);
+
+        let dumped = format!("{prof:?}");
+        assert!(!dumped.contains("secretVALUE42"), "value leaked: {dumped}");
+    }
+
+    #[test]
+    fn deterministic_order() {
+        let env = env(&[
+            ("ZED_TOKEN", "a"),
+            ("ABC_SECRET", "b"),
+            ("MID_PASSWORD", "c"),
+        ]);
+
+        let prof = credential_env_matches(&env);
+        let keys: Vec<&str> = prof.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["ABC_SECRET", "MID_PASSWORD", "ZED_TOKEN"]);
+    }
+
+    #[test]
+    fn nonsecrets() {
+        let env = env(&[
+            ("TOKENIZERS_PARALLELISM", "x"),
+            ("PASSWORDLESS_LOGIN", "y"),
+            ("SECRETARY_EMAIL", "z"),
+        ]);
+
+        let prof = credential_env_matches(&env);
+        assert!(prof.is_empty());
+    }
+
+    #[test]
+    fn segment_matches() {
+        let env = env(&[
+            ("DB_TOKEN", "a"),
+            ("MY_ACCESS_KEY", "b"),
+            ("PRIMARY_KEY", "c"),
+        ]);
+
+        let prof = credential_env_matches(&env);
+        assert_eq!(prof.len(), 2_usize);
+
+        let keys = prof.iter().map(|(k, _)| k.as_str()).collect::<Vec<&str>>();
+        assert!(keys.contains(&"DB_TOKEN"));
+        assert!(keys.contains(&"MY_ACCESS_KEY"));
+        assert!(!keys.contains(&"PRIMARY_KEY"));
     }
 }

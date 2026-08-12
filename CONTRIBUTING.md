@@ -84,6 +84,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Platform        | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs                                        |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
+| Platform        | `build-openshell-mxc-windows` | Maintain and validate the build-only x64 and ARM64 Windows MSVC lane                             |
 | Documentation   | `update-docs`             | Scan recent commits and draft doc updates for user-facing changes                                   |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
 | Reference       | `sbom`                    | Generate SBOMs and resolve dependency licenses                                                      |
@@ -287,7 +288,6 @@ Project requirements:
 - Rust 1.90+
 - Python 3.11+
 - Docker (running)
-- Z3 solver library (for the policy prover crate)
 
 ### Optional: Bazel (experimental)
 
@@ -307,28 +307,10 @@ Bazel builds Z3 from source, so no system Z3 installation is needed when using B
 echo "target" >> .bazelignore
 ```
 
-### macOS build tools
-
-Install Apple Command Line Tools before building locally:
-
-```bash
-xcode-select --install
-```
-
-If Cargo fails while building `protobuf-src` with an error such as
-`fatal error: 'utility' file not found`, `fatal error: 'cstdlib' file not
-found`, or `A compiler with support for C++11 language features is required`,
-your Command Line Tools install may not expose the libc++ headers on the
-compiler's default include path. Reinstall Command Line Tools to correct the error:
-
-```bash
-sudo rm -rf /Library/Developer/CommandLineTools
-xcode-select --install
-```
-
 ### Z3 installation
 
-The `openshell-prover` crate links against the system Z3 library via pkg-config.
+The `openshell-prover` crate links against Z3. On macOS and Linux, install the
+system Z3 development package; `z3-sys` discovers it through `pkg-config`.
 
 ```bash
 # macOS
@@ -341,10 +323,44 @@ sudo apt install libz3-dev
 sudo dnf install z3-devel
 ```
 
-If you prefer not to install Z3 system-wide, you can compile it from source as a one-time step:
+If you prefer not to install Z3 system-wide, use the bundled Z3 feature. This
+compiles Z3 from source during the Rust build:
 
 ```bash
 cargo build -p openshell-prover --features bundled-z3
+```
+
+For x86-64 Windows MSVC builds, use one of these Z3 paths:
+
+- System Z3: point `Z3_LIBRARY_PATH_OVERRIDE` at the directory containing the
+  64-bit MSVC Z3 library and `Z3_SYS_Z3_HEADER` at the full path to `z3.h`.
+  The `windows:*` tasks use this path automatically when `Z3_LIBRARY_PATH_OVERRIDE`
+  is set.
+- Bundled Z3: pass `--features bundled-z3` so `z3-sys` builds Z3 from source.
+
+Both Windows paths still require `libclang.dll` for `bindgen`. If LLVM is not on
+the default search path, set `LIBCLANG_PATH` to the directory containing
+`libclang.dll`.
+
+```powershell
+$env:LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Tools\Llvm\x64\bin'
+cargo build -p openshell-cli --target x86_64-pc-windows-msvc --features bundled-z3
+```
+
+To use a local x64 Z3 release with the Windows task wrapper:
+
+```powershell
+$env:Z3_LIBRARY_PATH_OVERRIDE='C:\path\to\z3-4.16.0-x64-win\bin'
+$env:Z3_SYS_Z3_HEADER='C:\path\to\z3-4.16.0-x64-win\include\z3.h'
+mise run --skip-tools windows:build:x64
+```
+
+### macOS build tools
+
+Install Apple Command Line Tools before building locally:
+
+```bash
+xcode-select --install
 ```
 
 ## Getting Started

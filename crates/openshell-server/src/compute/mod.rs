@@ -5,11 +5,16 @@
 
 pub mod driver_config;
 pub mod lease;
+#[cfg(not(target_os = "windows"))]
 pub mod vm;
 
+#[cfg(not(target_os = "windows"))]
 pub use openshell_driver_docker::DockerComputeConfig;
+#[cfg(not(target_os = "windows"))]
 pub use openshell_driver_kubernetes::KubernetesComputeConfig;
+#[cfg(not(target_os = "windows"))]
 pub use openshell_driver_podman::PodmanComputeConfig;
+#[cfg(not(target_os = "windows"))]
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
@@ -23,6 +28,7 @@ use crate::sandbox_watch::SandboxWatchBus;
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
+#[cfg(unix)]
 use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
@@ -42,10 +48,13 @@ use openshell_core::proto::{
     SandboxTemplate, ServiceEndpoint, SshSession,
 };
 use openshell_core::{ObjectLabels, ObjectWorkspace};
+#[cfg(not(target_os = "windows"))]
 use openshell_driver_docker::DockerComputeDriver;
+#[cfg(not(target_os = "windows"))]
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
 };
+#[cfg(not(target_os = "windows"))]
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
 use std::collections::HashMap;
@@ -58,8 +67,11 @@ use std::time::Duration;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, watch};
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
+#[cfg(unix)]
+use tonic::transport::Endpoint;
 use tonic::{Code, Request, Status};
+#[cfg(unix)]
 use tower::service_fn;
 use tracing::{Instrument as _, debug, info, warn};
 
@@ -268,6 +280,7 @@ trait ShutdownCleanup: Send + Sync {
 }
 
 #[tonic::async_trait]
+#[cfg(not(target_os = "windows"))]
 impl ShutdownCleanup for DockerComputeDriver {
     async fn cleanup_on_shutdown(&self) -> Result<(), String> {
         let stopped = self
@@ -293,6 +306,7 @@ trait StartupResume: Send + Sync {
 }
 
 #[tonic::async_trait]
+#[cfg(not(target_os = "windows"))]
 impl StartupResume for DockerComputeDriver {
     async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
         Self::resume_sandbox(self, sandbox_id, sandbox_name)
@@ -317,6 +331,7 @@ pub struct ManagedDriverProcess {
 }
 
 impl ManagedDriverProcess {
+    #[cfg(unix)]
     pub(crate) fn new(child: tokio::process::Child, socket_path: PathBuf) -> Self {
         Self {
             child: std::sync::Mutex::new(Some(child)),
@@ -710,6 +725,7 @@ impl ComputeRuntime {
         self.delete_gates.entry_count()
     }
 
+    #[cfg(not(target_os = "windows"))]
     pub async fn new_docker(
         config: openshell_core::Config,
         docker_config: DockerComputeConfig,
@@ -742,6 +758,7 @@ impl ComputeRuntime {
         .await
     }
 
+    #[cfg(not(target_os = "windows"))]
     pub async fn new_kubernetes(
         config: KubernetesComputeConfig,
         store: Arc<Store>,
@@ -793,6 +810,7 @@ impl ComputeRuntime {
         .await
     }
 
+    #[cfg(not(target_os = "windows"))]
     pub async fn new_podman(
         config: PodmanComputeConfig,
         store: Arc<Store>,

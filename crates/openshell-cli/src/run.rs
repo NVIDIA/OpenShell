@@ -5,7 +5,7 @@
 
 pub use crate::commands::common::{
     PolicyGetView, parse_credential_expiry_cli_value, parse_env_pairs, parse_key_value_pairs,
-    parse_secret_material_env_pairs,
+    parse_secret_material_env_pairs, warn_credential_env_vars,
 };
 use crate::commands::common::{
     ProvisioningDisplay, ProvisioningStep, confirm_global_setting_delete,
@@ -1820,8 +1820,10 @@ impl Drop for RawModeGuard {
     }
 }
 
+#[cfg(unix)]
 struct TaskGuard(tokio::task::JoinHandle<()>);
 
+#[cfg(unix)]
 impl Drop for TaskGuard {
     fn drop(&mut self) {
         self.0.abort();
@@ -1836,7 +1838,9 @@ async fn sandbox_exec_interactive_grpc(
     timeout_seconds: u32,
     environment: &HashMap<String, String>,
 ) -> Result<i32> {
-    use openshell_core::proto::{ExecSandboxInput, ExecSandboxWindowResize, exec_sandbox_input};
+    #[cfg(unix)]
+    use openshell_core::proto::ExecSandboxWindowResize;
+    use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -1875,31 +1879,26 @@ async fn sandbox_exec_interactive_grpc(
     // spawn_blocking) so the tokio runtime shutdown doesn't wait for a
     // thread blocked on stdin.read(). The thread exits when the channel
     // closes (blocking_send returns Err) or stdin hits EOF.
-    #[cfg(unix)]
-    {
-        let stdin_tx = input_tx.clone();
-        std::thread::spawn(move || {
-            let mut stdin = std::io::stdin().lock();
-            let mut buf = [0u8; 4096];
-            loop {
-                match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if stdin_tx
-                            .blocking_send(ExecSandboxInput {
-                                payload: Some(exec_sandbox_input::Payload::Stdin(
-                                    buf[..n].to_vec(),
-                                )),
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
+    let stdin_tx = input_tx.clone();
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stdin_tx
+                        .blocking_send(ExecSandboxInput {
+                            payload: Some(exec_sandbox_input::Payload::Stdin(buf[..n].to_vec())),
+                        })
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             }
-        });
-    }
+        }
+    });
 
     // SIGWINCH handler: forward terminal resize events.
     #[cfg(unix)]
