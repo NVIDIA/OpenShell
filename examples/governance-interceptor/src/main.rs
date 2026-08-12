@@ -720,7 +720,7 @@ fn requests_auto_proposal_approval(operation: &Value) -> bool {
 }
 
 fn validate_submit_policy_analysis(
-    operation: &Value,
+    _operation: &Value,
     _principal: &HashMap<String, String>,
 ) -> InterceptorResult {
     allow()

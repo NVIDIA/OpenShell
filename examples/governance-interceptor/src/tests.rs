@@ -902,7 +902,7 @@ fn automatic_proposal_approval_settings_are_denied() {
 }
 
 #[test]
-fn sandbox_policy_analysis_allows_telemetry_but_denies_proposals() {
+fn sandbox_policy_analysis_allows_telemetry_and_proposals() {
     let service = service();
 
     for operation in [
@@ -915,6 +915,10 @@ fn sandbox_policy_analysis_allows_telemetry_but_denies_proposals() {
             "summaries": [{"host": "denied.example", "port": 443}],
         }),
         json!({"name": "demo", "proposedChunks": []}),
+        json!({
+            "name": "demo",
+            "proposedChunks": [{"ruleName": "sandbox-added"}],
+        }),
     ] {
         let result = service
             .evaluate_inner(&sandbox_evaluation(
@@ -925,27 +929,14 @@ fn sandbox_policy_analysis_allows_telemetry_but_denies_proposals() {
             .unwrap();
         assert!(result.allowed);
     }
-
-    let proposal = service
-        .evaluate_inner(&sandbox_evaluation(
-            "SubmitPolicyAnalysis",
-            GatewayInterceptorPhase::Validate,
-            json!({
-                "name": "demo",
-                "proposedChunks": [{"ruleName": "sandbox-added"}],
-            }),
-        ))
-        .unwrap();
-    assert!(!proposal.allowed);
-    assert!(
-        proposal
-            .reason
-            .contains("sandbox-authored policy proposals")
-    );
 }
 
+/// Regression: the proxy sends SubmitPolicyAnalysis with a non-sandbox
+/// principal for network-activity checks. Denying these blocks all
+/// outbound proxy traffic from governed sandboxes.
+/// See https://github.com/NVIDIA/OpenShell/issues/2730
 #[test]
-fn policy_analysis_fails_closed_without_a_sandbox_principal() {
+fn policy_analysis_allows_non_sandbox_principals() {
     let service = service();
 
     let missing = service
@@ -955,7 +946,7 @@ fn policy_analysis_fails_closed_without_a_sandbox_principal() {
             json!({"name": "demo"}),
         ))
         .unwrap();
-    assert!(!missing.allowed);
+    assert!(missing.allowed);
 
     let mut user = evaluation(
         "SubmitPolicyAnalysis",
@@ -965,5 +956,5 @@ fn policy_analysis_fails_closed_without_a_sandbox_principal() {
     user.principal
         .insert("kind".to_string(), "user".to_string());
     let user = service.evaluate_inner(&user).unwrap();
-    assert!(!user.allowed);
+    assert!(user.allowed);
 }
