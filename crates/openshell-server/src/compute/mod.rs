@@ -54,7 +54,7 @@ use openshell_driver_docker::DockerComputeDriver;
 #[cfg(not(target_os = "windows"))]
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
-    OperatorNamespaceAllowlist,
+    OperatorNamespaceAllowlist, WorkspaceMode,
 };
 #[cfg(not(target_os = "windows"))]
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
@@ -797,6 +797,9 @@ impl ComputeRuntime {
         let driver = KubernetesComputeDriver::new(config)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
+        if driver.workspace_mode() == WorkspaceMode::Shared {
+            driver.backfill_gateway_id_labels().await;
+        }
         let operator_allowlist_arc = driver.operator_allowlist().cloned();
         let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new(driver));
         let runtime = Self::from_driver(

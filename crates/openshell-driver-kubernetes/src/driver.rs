@@ -559,6 +559,78 @@ impl KubernetesComputeDriver {
         self.config.workspace_mode
     }
 
+    /// Backfill the `openshell.ai/gateway-id` label on Sandbox CRs that
+    /// predate its introduction. Runs once at startup in shared mode so that
+    /// label-selector based lookups continue to find legacy resources.
+    pub async fn backfill_gateway_id_labels(&self) {
+        let sandbox_api = match self
+            .supported_sandbox_api_for_lookup(self.client.clone())
+            .await
+        {
+            Ok(api) => api,
+            Err(e) => {
+                warn!(error = %e, "skipping gateway-id label backfill: cannot resolve Sandbox API");
+                return;
+            }
+        };
+
+        let selector = openshell_sandbox_label_selector();
+        let list = match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            sandbox_api
+                .api
+                .list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        {
+            Ok(Ok(list)) => list,
+            Ok(Err(e)) => {
+                warn!(error = %e, "skipping gateway-id label backfill: list failed");
+                return;
+            }
+            Err(_) => {
+                warn!("skipping gateway-id label backfill: list timed out");
+                return;
+            }
+        };
+
+        let gateway_id = &self.config.gateway_id;
+        for obj in &list {
+            let has_label = obj
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(LABEL_GATEWAY_ID))
+                .is_some_and(|v| v == gateway_id);
+            if has_label {
+                continue;
+            }
+            let name = match obj.metadata.name.as_deref() {
+                Some(n) => n,
+                None => continue,
+            };
+            let patch = serde_json::json!({
+                "metadata": {
+                    "labels": {
+                        LABEL_GATEWAY_ID: gateway_id
+                    }
+                }
+            });
+            match sandbox_api
+                .api
+                .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+                .await
+            {
+                Ok(_) => {
+                    info!(sandbox = %name, gateway_id, "backfilled gateway-id label");
+                }
+                Err(e) => {
+                    warn!(sandbox = %name, error = %e, "failed to backfill gateway-id label");
+                }
+            }
+        }
+    }
+
     /// Ensure the K8s namespace for a workspace exists (managed mode only).
     ///
     /// Idempotent: returns the namespace name whether it was just created or

@@ -21,7 +21,7 @@ tests:
             resources: ["secrets"]
             verbs: ["get", "create", "update", "patch", "delete"]
 
-  - it: omits secrets patch and delete when credential driver is disabled (operator)
+  - it: grants secrets patch for TLS sync even when credential driver is disabled (operator)
     set:
       server.drivers.kubernetes.workspaceMode: operator
     asserts:
@@ -30,7 +30,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["secrets"]
-            verbs: ["get", "create", "update"]
+            verbs: ["get", "create", "update", "patch"]
 
   - it: omits secrets rule entirely in shared mode
     set:

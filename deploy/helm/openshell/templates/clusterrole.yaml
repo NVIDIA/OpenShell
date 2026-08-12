@@ -74,13 +74,11 @@ rules:
       - get
   {{- end }}
   {{- if ne $workspaceMode "shared" }}
-  # TLS secret sync: read the source Secret in the release namespace and
-  # create/update copies in workspace namespaces so sandbox pods can mount
-  # client TLS material for mTLS to the gateway.
-  {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
-  # kubernetes-secrets credential driver: credentials are stored as Secrets
-  # in workspace namespaces, requiring patch+delete in addition to TLS sync.
-  {{- end }}
+  # Secrets access for multi-namespace modes:
+  #   - TLS sync uses server-side apply (patch) to copy the client TLS Secret
+  #     into workspace namespaces so sandbox pods can mount mTLS material.
+  #   - The kubernetes-secrets credential driver stores credentials as Secrets
+  #     in workspace namespaces, additionally requiring delete for cleanup.
   - apiGroups:
       - ""
     resources:
@@ -89,8 +87,8 @@ rules:
       - get
       - create
       - update
-      {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
       - patch
+      {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
       - delete
       {{- end }}
   {{- end }}
