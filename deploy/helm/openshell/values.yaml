@@ -544,6 +544,29 @@ grpcRoute:
         # or the existing openshell-server-tls Secret (its SANs must include the
         # external hostname).
         certificateRefs: []
+  # BackendTLSPolicy for end-to-end TLS between the Gateway proxy and the
+  # OpenShell gateway pod. When enabled, the Gateway proxy terminates
+  # client-facing TLS at the listener and re-encrypts when connecting to the
+  # backend service, validating the backend's certificate against the
+  # specified CA. Requires the gateway pod to serve TLS (server.disableTls
+  # must be false). Supported on OpenShift 4.22+ and other platforms with
+  # BackendTLSPolicy support in the Gateway API implementation.
+  backendTLSPolicy:
+    # -- Create a BackendTLSPolicy resource for end-to-end TLS between the
+    # Gateway proxy and the OpenShell gateway pod. The traffic flow is:
+    # client → HTTPS → Gateway (terminate) → TLS (re-encrypt) → gateway pod.
+    # Requires server.disableTls=false and a ConfigMap containing the CA
+    # certificate for backend validation.
+    enabled: false
+    # -- Name of a ConfigMap containing the CA certificate (key: ca.crt) used
+    # to validate the gateway pod's TLS certificate. Create this ConfigMap
+    # from the CA that signed the server certificate. Required when enabled.
+    caCertificateConfigMapName: ""
+    # -- Hostname the Gateway proxy validates against the backend's TLS
+    # certificate SAN. Defaults to the service FQDN
+    # (<fullname>.<namespace>.svc.cluster.local) when empty, which matches
+    # the SAN included by both cert-manager and the pkiInitJob.
+    hostname: ""
 
 # OpenShift Route with TLS passthrough. The gateway terminates its own
 # TLS/mTLS; the router only forwards based on SNI, so it never sees plaintext
