@@ -588,6 +588,7 @@ fn main() -> Result<()> {
         // `ocsf_json_enabled` setting changes. The JSONL layer checks it
         // on each event and short-circuits when false.
         let ocsf_enabled = Arc::new(AtomicBool::new(false));
+        let ocsf_schema_version = Arc::new(std::sync::Mutex::new(String::new()));
 
         // Keep guards alive for the entire process. When a guard is dropped the
         // non-blocking writer flushes remaining logs.
@@ -606,7 +607,9 @@ fn main() -> Result<()> {
                 .ok()
                 .map(|roller| {
                     let (writer, guard) = tracing_appender::non_blocking(roller);
-                    let layer = OcsfJsonlLayer::new(writer).with_enabled_flag(ocsf_enabled.clone());
+                    let layer = OcsfJsonlLayer::new(writer)
+                        .with_enabled_flag(ocsf_enabled.clone())
+                        .with_target_version(ocsf_schema_version.clone());
                     (layer, guard)
                 });
             let (jsonl_layer, jsonl_guard) = match jsonl_logging {
@@ -681,6 +684,7 @@ fn main() -> Result<()> {
             args.health_port,
             args.inference_routes,
             ocsf_enabled,
+            ocsf_schema_version,
             args.mode.network,
             args.mode.process,
             upstream_proxy_args,

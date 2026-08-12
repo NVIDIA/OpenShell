@@ -123,6 +123,14 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         kind: SettingValueKind::Bool,
         allowed_string_values: None,
     },
+    // Target OCSF schema version for JSONL downgrade. When set (e.g. "1.1"
+    // or "1.3"), the JSONL layer strips fields and profiles that don't exist
+    // in the target version. Empty or unset means no downgrade.
+    RegisteredSetting {
+        key: "ocsf_schema_version",
+        kind: SettingValueKind::String,
+        allowed_string_values: None,
+    },
     // Sandbox-level opt-in for the agent-driven policy proposal surface.
     // See AGENT_POLICY_PROPOSALS_ENABLED_KEY for details. Defaults to false.
     RegisteredSetting {
