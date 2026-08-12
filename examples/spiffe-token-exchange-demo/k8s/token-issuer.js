@@ -27,6 +27,10 @@ const ACCESS_TOKEN_ISSUER =
 const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET;
 const DEMO_USER_SUBJECT = process.env.DEMO_USER_SUBJECT || "demo-user";
 const SPIRE_JWKS_CA_FILE = process.env.SPIRE_JWKS_CA_FILE || "";
+const JWT_SVID_VERIFY_ALGORITHMS = {
+  ES256: { algorithm: "sha256", dsaEncoding: "ieee-p1363" },
+  RS256: { algorithm: "RSA-SHA256" },
+};
 
 if (!ACCESS_TOKEN_SECRET) {
   throw new Error("ACCESS_TOKEN_SECRET is required");
@@ -110,7 +114,8 @@ function hasAudience(payload, expected) {
 
 async function verifyJwtSvid(jwt, subjectPrefix) {
   const parsed = parseJwt(jwt);
-  if (parsed.header.alg !== "RS256") {
+  const verifyAlgorithm = JWT_SVID_VERIFY_ALGORITHMS[parsed.header.alg];
+  if (!verifyAlgorithm) {
     throw new Error(`unsupported JWT-SVID alg ${parsed.header.alg}`);
   }
 
@@ -120,11 +125,15 @@ async function verifyJwtSvid(jwt, subjectPrefix) {
     throw new Error(`no JWKS key for kid ${parsed.header.kid}`);
   }
 
-  const verifier = crypto.createVerify("RSA-SHA256");
+  const verifier = crypto.createVerify(verifyAlgorithm.algorithm);
   verifier.update(parsed.signingInput);
   verifier.end();
   const publicKey = crypto.createPublicKey({ key: jwk, format: "jwk" });
-  if (!verifier.verify(publicKey, parsed.signature)) {
+  const verifyOptions = { key: publicKey };
+  if (verifyAlgorithm.dsaEncoding) {
+    verifyOptions.dsaEncoding = verifyAlgorithm.dsaEncoding;
+  }
+  if (!verifier.verify(verifyOptions, parsed.signature)) {
     throw new Error("JWT-SVID signature validation failed");
   }
 
