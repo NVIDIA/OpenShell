@@ -804,9 +804,37 @@ impl OpaEngine {
         self.generation.load(Ordering::Acquire)
     }
 
+    /// Run a short operation only while `expected_generation` is current.
+    ///
+    /// The engine mutex is also the policy reload mutex. Holding it across the
+    /// generation comparison and callback linearizes state derived from an OPA
+    /// snapshot with every policy reload and fail-closed transition. Callers
+    /// must not perform I/O or other long-running work in `operation`.
+    pub(crate) fn with_current_generation<T>(
+        &self,
+        expected_generation: u64,
+        operation: impl FnOnce(u64) -> T,
+    ) -> Result<Option<T>> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let current_generation = self.current_generation();
+        if current_generation != expected_generation {
+            return Ok(None);
+        }
+        Ok(Some(operation(current_generation)))
+    }
+
     /// Replace the complete middleware service registry and invalidate
     /// existing tunnels so subsequent requests use the new service set.
     pub fn replace_middleware_registry(&self, registry: MiddlewareRegistry) -> Result<()> {
+        // Generation changes serialize through the engine lock so guarded
+        // publication cannot overlap any runtime generation transition.
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         let mut runner = self
             .middleware_runner
             .write()

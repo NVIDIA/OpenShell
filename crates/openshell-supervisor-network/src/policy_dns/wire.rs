@@ -73,7 +73,7 @@ pub(crate) async fn handle_udp_query<R: TrustedResolver>(
             ));
             encode_message(response)
         }
-        Err(PolicyDnsError::Ineligible) => {
+        Err(PolicyDnsError::Ineligible | PolicyDnsError::TrustedGatewayUnavailable) => {
             encode_message(response_with_code(&request, ResponseCode::Refused))
         }
         Err(PolicyDnsError::Resolver(ResolveError::NxDomain)) => {
@@ -206,6 +206,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             Arc::new(ResolvedEndpointStore::new(
                 StoreConfig::new(pools, 8).unwrap(),
             )),
+            None,
         )
     }
 

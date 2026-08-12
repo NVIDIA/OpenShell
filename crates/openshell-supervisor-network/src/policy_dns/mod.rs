@@ -33,6 +33,7 @@ pub(crate) use store::{
 
 use crate::opa::OpaEngine;
 use crate::proxy::destination::{build_validation_plan, filter_resolved_addresses};
+use crate::proxy::is_host_gateway_alias;
 use openshell_core::host_pattern::HostSelector;
 use openshell_ocsf::{
     ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint,
@@ -60,6 +61,8 @@ pub(crate) enum PolicyDnsError {
     InvalidName,
     #[error("DNS name is not eligible for policy DNS")]
     Ineligible,
+    #[error("trusted host gateway is unavailable for the reserved alias")]
+    TrustedGatewayUnavailable,
     #[error("trusted resolver failed: {0}")]
     Resolver(#[from] resolver::ResolveError),
     #[error("no trusted resolver address passed endpoint destination policy")]
@@ -80,6 +83,7 @@ pub(crate) struct PolicyDnsService<R> {
     policy: Arc<OpaEngine>,
     resolver: R,
     store: Arc<ResolvedEndpointStore>,
+    trusted_host_gateway: Option<std::net::IpAddr>,
 }
 
 impl<R: TrustedResolver> PolicyDnsService<R> {
@@ -87,11 +91,13 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         policy: Arc<OpaEngine>,
         resolver: R,
         store: Arc<ResolvedEndpointStore>,
+        trusted_host_gateway: Option<std::net::IpAddr>,
     ) -> Self {
         Self {
             policy,
             resolver,
             store,
+            trusted_host_gateway,
         }
     }
 
@@ -104,11 +110,24 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         self.store.note_query();
         let normalized_name =
             NormalizedName::parse(raw_name).map_err(|_| PolicyDnsError::InvalidName)?;
+        if is_host_gateway_alias(normalized_name.as_str()) && self.trusted_host_gateway.is_none() {
+            self.store.note_refused();
+            emit_dns_denial(
+                &normalized_name,
+                "policy_dns_trusted_gateway_unavailable",
+                "Policy DNS refused a reserved host-gateway alias because no trusted gateway is configured",
+            );
+            return Err(PolicyDnsError::TrustedGatewayUnavailable);
+        }
         let snapshot = self
             .policy
             .policy_dns_eligibility_snapshot()
             .map_err(|error| PolicyDnsError::Policy(error.to_string()))?;
-        let eligible = eligible_endpoints(&snapshot.endpoints, &normalized_name)?;
+        let eligible = eligible_endpoints(
+            &snapshot.endpoints,
+            &normalized_name,
+            self.trusted_host_gateway,
+        )?;
         if eligible.is_empty() {
             self.store.note_refused();
             emit_dns_denial(
@@ -157,22 +176,22 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             return Err(PolicyDnsError::NoValidAddress);
         }
 
-        let current_generation = self.policy.current_generation();
-        if current_generation != snapshot.generation {
-            return Err(PolicyDnsError::StalePolicy);
-        }
-        let record = self.store.publish(
-            PublishRequest {
-                normalized_name: normalized_name.clone(),
-                family,
-                allocation_identity,
-                policy_generation: snapshot.generation,
-                ttl,
-                contracts,
-            },
-            current_generation,
-            now,
-        )?;
+        let request = PublishRequest {
+            normalized_name: normalized_name.clone(),
+            family,
+            allocation_identity,
+            policy_generation: snapshot.generation,
+            ttl,
+            contracts,
+        };
+        let publication = self
+            .policy
+            .with_current_generation(snapshot.generation, |current_generation| {
+                self.store.publish(request, current_generation, now)
+            })
+            .map_err(|error| PolicyDnsError::Policy(error.to_string()))?
+            .ok_or(PolicyDnsError::StalePolicy)?;
+        let record = publication?;
         emit_mapping_publication(&record);
         Ok(SyntheticAnswer {
             address: record.synthetic_address,
@@ -198,6 +217,7 @@ struct EligibleEndpoint {
 fn eligible_endpoints(
     endpoints: &[crate::opa::MatchedEndpoint],
     name: &NormalizedName,
+    trusted_host_gateway: Option<std::net::IpAddr>,
 ) -> Result<Vec<EligibleEndpoint>, PolicyDnsError> {
     let mut eligible = Vec::new();
     for endpoint in endpoints {
@@ -219,7 +239,7 @@ fn eligible_endpoints(
         let destination_plan = build_validation_plan(
             name.as_str(),
             name.as_str(),
-            None,
+            trusted_host_gateway,
             &raw_allowed_ips,
             exact_declared_host,
         )
@@ -364,6 +384,14 @@ mod tests {
     }
 
     fn service(policy_yaml: &str, addresses: Vec<IpAddr>) -> PolicyDnsService<FakeResolver> {
+        service_with_gateway(policy_yaml, addresses, None)
+    }
+
+    fn service_with_gateway(
+        policy_yaml: &str,
+        addresses: Vec<IpAddr>,
+        trusted_host_gateway: Option<IpAddr>,
+    ) -> PolicyDnsService<FakeResolver> {
         let policy = Arc::new(
             OpaEngine::from_strings(include_str!("../../data/sandbox-policy.rego"), policy_yaml)
                 .unwrap(),
@@ -385,6 +413,7 @@ mod tests {
             Arc::new(ResolvedEndpointStore::new(
                 StoreConfig::new(pools, 16).unwrap(),
             )),
+            trusted_host_gateway,
         )
     }
 
@@ -467,6 +496,93 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         );
     }
 
+    const HOST_GATEWAY_POLICY: &str = r"
+network_policies:
+  gateway:
+    name: gateway
+    endpoints:
+      - { host: host.openshell.internal, port: 8080, protocol: tcp }
+    binaries: [{ path: /usr/bin/client }]
+filesystem_policy: { include_workdir: true, read_only: [], read_write: [] }
+landlock: { compatibility: best_effort }
+process: { run_as_user: sandbox, run_as_group: sandbox }
+";
+
+    fn gateway_service(
+        addresses: Vec<IpAddr>,
+        trusted_host_gateway: Option<IpAddr>,
+    ) -> PolicyDnsService<FakeResolver> {
+        service_with_gateway(HOST_GATEWAY_POLICY, addresses, trusted_host_gateway)
+    }
+
+    #[tokio::test]
+    async fn reserved_gateway_alias_without_trusted_address_never_queries_resolver() {
+        for alias in [
+            "host.openshell.internal",
+            "host.containers.internal",
+            "host.docker.internal",
+        ] {
+            let yaml = HOST_GATEWAY_POLICY.replace("host.openshell.internal", alias);
+            let service = service_with_gateway(&yaml, vec!["169.254.1.2".parse().unwrap()], None);
+
+            let result = service
+                .answer_query(alias, AddressFamily::Ipv4, Instant::now())
+                .await;
+
+            assert!(matches!(
+                result,
+                Err(PolicyDnsError::TrustedGatewayUnavailable)
+            ));
+            assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn reserved_gateway_alias_pins_only_the_exact_trusted_address() {
+        let trusted: IpAddr = "169.254.1.2".parse().unwrap();
+        let service = gateway_service(
+            vec![
+                "169.254.169.254".parse().unwrap(),
+                "169.254.1.3".parse().unwrap(),
+                "10.2.3.4".parse().unwrap(),
+                trusted,
+            ],
+            Some(trusted),
+        );
+        let now = Instant::now();
+
+        let answer = service
+            .answer_query("host.openshell.internal", AddressFamily::Ipv4, now)
+            .await
+            .unwrap();
+        let mapping = service
+            .store
+            .lookup(answer.address, 8080, answer.policy_generation, now)
+            .unwrap();
+
+        assert_eq!(mapping.record.contracts[0].pinned_addresses, [trusted]);
+    }
+
+    #[tokio::test]
+    async fn reserved_gateway_alias_rejects_mismatch_metadata_private_and_wrong_family_answers() {
+        let trusted: IpAddr = "169.254.1.2".parse().unwrap();
+        for (family, address) in [
+            (AddressFamily::Ipv4, "169.254.1.3"),
+            (AddressFamily::Ipv4, "169.254.169.254"),
+            (AddressFamily::Ipv4, "10.2.3.4"),
+            (AddressFamily::Ipv6, "fe80::2"),
+        ] {
+            let service = gateway_service(vec![address.parse().unwrap()], Some(trusted));
+            let result = service
+                .answer_query("host.openshell.internal", family, Instant::now())
+                .await;
+            assert!(
+                matches!(result, Err(PolicyDnsError::NoValidAddress)),
+                "{address} must not satisfy the trusted gateway contract"
+            );
+        }
+    }
+
     struct BlockingResolver {
         started: Arc<Notify>,
         release: Arc<Notify>,
@@ -488,7 +604,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     }
 
     #[tokio::test]
-    async fn policy_reload_during_resolution_publishes_nothing() {
+    async fn delayed_stale_resolution_cannot_replace_newer_generation_mapping() {
         let policy = Arc::new(
             OpaEngine::from_strings(include_str!("../../data/sandbox-policy.rego"), BASE_POLICY)
                 .unwrap(),
@@ -510,6 +626,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 release: release.clone(),
             },
             store.clone(),
+            None,
         ));
         let query = tokio::spawn(async move {
             service
@@ -520,14 +637,42 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         policy
             .reload(include_str!("../../data/sandbox-policy.rego"), BASE_POLICY)
             .unwrap();
+        let current_service = PolicyDnsService::new(
+            policy.clone(),
+            FakeResolver {
+                calls: AtomicUsize::new(0),
+                answer: TrustedAnswer {
+                    addresses: vec!["8.8.4.4".parse().unwrap()],
+                    ttl: Duration::from_secs(10),
+                },
+            },
+            store.clone(),
+            None,
+        );
+        let now = Instant::now();
+        let current = current_service
+            .answer_query("db.example", AddressFamily::Ipv4, now)
+            .await
+            .unwrap();
         release.notify_one();
         assert!(matches!(
             query.await.unwrap(),
             Err(PolicyDnsError::StalePolicy)
         ));
-        let metrics = store.metrics(Instant::now());
-        assert_eq!(metrics.active_mappings, 0);
-        assert_eq!(metrics.allocated_identities, 0);
+        let mapping = store
+            .lookup(current.address, 5432, current.policy_generation, now)
+            .unwrap();
+        assert_eq!(
+            mapping.record.policy_generation,
+            policy.current_generation()
+        );
+        assert_eq!(
+            mapping.record.contracts[0].pinned_addresses,
+            ["8.8.4.4".parse::<IpAddr>().unwrap()]
+        );
+        let metrics = store.metrics(now);
+        assert_eq!(metrics.active_mappings, 1);
+        assert_eq!(metrics.allocated_identities, 1);
     }
 
     #[test]

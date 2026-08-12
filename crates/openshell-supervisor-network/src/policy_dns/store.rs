@@ -338,6 +338,17 @@ impl ResolvedEndpointStore {
             address
         };
 
+        // Defense in depth for callers outside the OPA generation guard: a
+        // delayed publication from an older generation must never replace a
+        // newer live correlation for the same stable allocation identity.
+        if state
+            .records
+            .get(&synthetic_address)
+            .is_some_and(|record| record.policy_generation > request.policy_generation)
+        {
+            return Err(PublishError::StalePolicy);
+        }
+
         state.next_mapping_generation = state.next_mapping_generation.saturating_add(1);
         let record = ResolvedEndpointRecord {
             synthetic_address,
@@ -617,6 +628,28 @@ mod tests {
         assert_eq!(metrics.allocated_identities, 1);
         assert_eq!(metrics.active_mappings, 1);
         assert_eq!(metrics.pool_exhausted, 1);
+    }
+
+    #[test]
+    fn older_generation_cannot_replace_newer_live_mapping() {
+        let store = store(1);
+        let now = Instant::now();
+        let newer = store
+            .publish(request("db.example", 2, Duration::from_secs(10)), 2, now)
+            .unwrap();
+
+        assert!(matches!(
+            store.publish(
+                request("db.example", 1, Duration::from_secs(10)),
+                1,
+                now + Duration::from_secs(1),
+            ),
+            Err(PublishError::StalePolicy)
+        ));
+
+        let mapping = store.lookup(newer.synthetic_address, 5432, 2, now).unwrap();
+        assert_eq!(mapping.record.mapping_id, newer.mapping_id);
+        assert_eq!(mapping.record.policy_generation, 2);
     }
 
     #[test]
