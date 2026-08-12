@@ -22,7 +22,9 @@ jobs:
           # independent of that unavailable wrapper so target artifacts save.
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc-x64
+          # v2 invalidates the empty archive produced while cargo metadata
+          # could not run without sccache.
+          shared-key: windows-msvc-x64-v2
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
@@ -51,7 +53,7 @@ jobs:
           # unavailable sccache wrapper exported by mise.
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc-arm64
+          shared-key: windows-msvc-arm64-v2
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
