@@ -2600,7 +2600,9 @@ impl ComputeRuntime {
             return Ok(());
         }
 
-        self.update_sandbox_record(incoming, existing_record.resource_version)
+        let existing_phase =
+            SandboxPhase::try_from(existing.phase()).unwrap_or(SandboxPhase::Unknown);
+        self.update_sandbox_record(incoming, existing_record.resource_version, existing_phase)
             .await
     }
 
@@ -2610,6 +2612,7 @@ impl ComputeRuntime {
         &self,
         incoming: DriverSandbox,
         expected_resource_version: u64,
+        existing_phase: SandboxPhase,
     ) -> Result<(), String> {
         let session_connected = self.supervisor_sessions.has_session(&incoming.id);
         let sandbox = self
@@ -2633,7 +2636,9 @@ impl ComputeRuntime {
 
         self.sandbox_index.update_from_sandbox(&sandbox);
         self.sandbox_watch_bus.notify(sandbox.object_id());
-        if sandbox.phase() == SandboxPhase::Stopped as i32 {
+        if existing_phase != SandboxPhase::Stopped
+            && sandbox.phase() == SandboxPhase::Stopped as i32
+        {
             self.cleanup_stopped_sandbox_sessions(&sandbox).await?;
         }
         Ok(())
@@ -5713,6 +5718,54 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(current.phase(), SandboxPhase::Stopped as i32);
+    }
+
+    #[tokio::test]
+    async fn repeated_stopped_snapshot_does_not_repeat_session_cleanup() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-stopping", "sandbox-stopping", SandboxPhase::Stopping);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let transition_session = ssh_session_record("transition-session", sandbox.object_id());
+        runtime
+            .store
+            .put_message(&transition_session)
+            .await
+            .unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+
+        let mut stopped = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        stopped.status = Some(make_driver_status(make_driver_condition(
+            "ContainerExited",
+            "container stopped by request",
+        )));
+        runtime.apply_sandbox_update(stopped.clone()).await.unwrap();
+
+        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(transition_session.object_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "the transition to stopped cleans up ephemeral SSH sessions"
+        );
+
+        let later_session = ssh_session_record("later-session", sandbox.object_id());
+        runtime.store.put_message(&later_session).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+        runtime.apply_sandbox_update(stopped).await.unwrap();
+
+        assert!(runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(later_session.object_id())
+                .await
+                .unwrap()
+                .is_some(),
+            "later stopped snapshots do not repeat session cleanup"
+        );
     }
 
     #[tokio::test]
