@@ -85,33 +85,22 @@ Capability maturity is independent from the release that contains it:
 | Stable | Stable protobuf packages such as `v1` or `v2` | Covered by the release compatibility contract |
 | Experimental | Explicit unstable package such as `v1beta1` | May change with documented migration guidance |
 
-Stable and experimental capabilities may be included in stable, release
-candidate, or development artifacts according to the release configuration.
-Availability only in a development or release candidate build is not a third
-maturity level and does not make the capability experimental. The capability
-must still be classified independently as stable or experimental. A capability
-absent from stable artifacts has no stable release availability or support
-promise.
+Capability maturity and artifact availability are separate. Every capability is
+stable or experimental, regardless of whether it appears in stable, release
+candidate, or development artifacts. A capability omitted from stable artifacts
+has no stable availability or support promise.
 
-A new API that is useful to release but whose design is still evolving starts
-with a package such as `v1beta1`. It may evolve to `v1beta2` in a patch release
-because the package name advertises the lack of stable compatibility. Release
-notes still explain the change and any migration path. Graduation creates a
-stable `v1` package; it does not rename the experimental package in place.
+An evolving API may ship in a beta package such as `v1beta1`. It may change to
+`v1beta2` in a patch release with release notes and migration guidance.
+Graduation adds a stable `v1` package instead of renaming the beta package.
 
-Features that are not ready to be released are protected by named compile-time
-features such as `unstable-<feature>` and collected under a `dev` feature.
-Development releases are built with all development compilation flags and
-features enabled. Stable tagged releases and release candidates build service
-binaries, CLI commands, configuration fields, and documentation without those
-features. For now, SDK packages may include the generated types and client
-methods for development capabilities in every release so the project does not
-need to publish separate development and release SDK variants. Their presence
-in an SDK does not make the capability available or supported: the target
-service must advertise and implement it, and only stable SDK interfaces are
-covered by the compatibility contract. CI for every commit to `main` builds and
-tests both the development feature set and the release feature set so
-compile-gated development cannot silently break supported builds.
+Unreleased features use named compile-time flags such as `unstable-<feature>`,
+collected under a `dev` feature. Development releases enable them; stable
+releases and release candidates exclude them from service binaries, the CLI,
+configuration, and documentation. For now, every SDK package may include their
+generated types and client methods, but the target service must implement them
+and only stable SDK interfaces have a compatibility guarantee. CI builds and
+tests both feature sets on every commit to `main`.
 
 ### Breaking changes and API versioning
 
