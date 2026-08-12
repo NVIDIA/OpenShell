@@ -40,13 +40,17 @@ may run multiple capability subcases inside that environment without creating
 additional workflows. Kubernetes uses a separate blocking workflow for each
 supported gateway topology.
 
+### Configurations to test
+
 | ID | Compute driver | Representative environment | Gateway configuration |
 | --- | --- | --- | --- |
 | C01 | Docker | Ubuntu x86_64 with Docker 28.0.4 | Local gateway; TLS and sandbox mTLS; credentials; CDI GPU when stable |
-| C02 | Podman | Fedora x86_64 with Podman 5.x rootless | Local gateway; TLS and sandbox mTLS; credentials; CDI GPU when stable |
+| C02 | Podman | Fedora x86_64 with Podman 5.x rootless and SELinux enforcing | Local gateway; TLS and sandbox mTLS; credentials; CDI GPU when stable |
 | C03 | MicroVM | Linux x86_64 with KVM and IOMMU | Local gateway; libkrun CPU; TLS and sandbox mTLS; QEMU/VFIO GPU when stable |
 | C04 | Kubernetes | Kubernetes 1.29 | Sidecar, three replicas; external PostgreSQL; Kubernetes Secrets; TLS and OIDC; GPU when stable |
 | C05 | Kubernetes | Kubernetes 1.29 | Combined, three replicas; external PostgreSQL; Kubernetes Secrets; TLS and OIDC; GPU when stable |
+
+C02 must pass without disabling SELinux or weakening the host SELinux policy.
 
 ## Upgrade
 
@@ -66,6 +70,8 @@ For each installation package, the suite:
 5. Runs a post-upgrade smoke test that verifies existing resources and creates
    and deletes a new sandbox.
 6. Exercises rollback when rollback is part of the supported upgrade contract.
+
+### Configurations to test
 
 | ID | Installation package | Representative environment | Drivers | Upgrade path |
 | --- | --- | --- | --- | --- |
