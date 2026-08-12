@@ -87,13 +87,132 @@ openshell gateway add http://127.0.0.1:8080 --local --name openshift
 openshell status
 ```
 
-## Production: expose externally with a real certificate
+## Production Deployments
 
-The steps above run the gateway over plaintext HTTP for quick evaluation. For
-a real deployment, cert-manager can issue the gateway's server certificate
-from a real Issuer or ClusterIssuer (for example, an ACME issuer), and an
-OpenShift Route with TLS passthrough exposes it externally while the gateway
-keeps terminating its own TLS and mTLS.
+The steps above run the gateway over plaintext HTTP for quick evaluation. For production deployments, choose one of the approaches below based on your OpenShift version.
+
+### End-to-end TLS (OpenShift 4.22+)
+
+OpenShift 4.22 and later support `BackendTLSPolicy` in the Gateway API, enabling end-to-end TLS between the OpenShift router and the OpenShell gateway pod. The traffic flow is:
+
+```text
+client → HTTPS → OpenShift Gateway (terminate TLS) → TLS (re-encrypt) → openshell gateway pod
+```
+
+This removes the requirement to run the gateway with `server.disableTls=true`. The OpenShift router terminates client-facing TLS at the listener and re-encrypts when connecting to the backend service, validating the backend's certificate against a CA you provide.
+
+#### Prerequisites
+
+- OpenShift 4.22+ cluster with the Gateway API enabled
+- cert-manager installed (recommended) or the built-in pkiInitJob for server certificates
+- A `GatewayClass` registered for the OpenShift gateway controller
+
+#### Create the GatewayClass
+
+If your cluster does not already have an OpenShift GatewayClass, create one:
+
+```shell
+oc apply -f - <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: openshift-default
+spec:
+  controllerName: openshift.io/gateway-controller/v1
+EOF
+```
+
+#### Create the Gateway
+
+Create a Gateway resource in the `openshift-ingress` namespace. Replace `<external-hostname>` with your cluster's route hostname:
+
+```shell
+oc apply -f - <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: openshell-gateway
+  namespace: openshift-ingress
+spec:
+  gatewayClassName: openshift-default
+  listeners:
+    - name: grpc
+      hostname: "<external-hostname>"
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: <listener-tls-secret>
+            kind: Secret
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshell
+EOF
+```
+
+The listener TLS Secret should contain the certificate for the external hostname. On ROSA and managed OpenShift clusters, you can copy the cluster's wildcard certificate from the `openshift-ingress` namespace.
+
+#### Install with e2e TLS
+
+Install the chart with cert-manager, the GRPCRoute, and BackendTLSPolicy enabled. The server certificate SAN list must include the external hostname so the gateway can serve TLS to both the cluster-internal service FQDN and external clients:
+
+```shell
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set podSecurityContext.fsGroup=null \
+  --set securityContext.runAsUser=null \
+  --set certManager.enabled=true \
+  --set 'certManager.serverDnsNames[0]=openshell' \
+  --set 'certManager.serverDnsNames[1]=openshell.openshell.svc' \
+  --set 'certManager.serverDnsNames[2]=openshell.openshell.svc.cluster.local' \
+  --set 'certManager.serverDnsNames[3]=localhost' \
+  --set 'certManager.serverDnsNames[4]=<external-hostname>' \
+  --set grpcRoute.enabled=true \
+  --set grpcRoute.gateway.name=openshell-gateway \
+  --set grpcRoute.gateway.namespace=openshift-ingress \
+  --set 'grpcRoute.hostnames[0]=<external-hostname>' \
+  --set grpcRoute.backendTLSPolicy.enabled=true \
+  --set grpcRoute.backendTLSPolicy.caCertificateConfigMapName=openshell-backend-ca
+```
+
+| Override | Reason |
+|---|---|
+| `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Let OpenShift's SCC admission assign UIDs. |
+| `certManager.enabled=true` | Use cert-manager for automatic server certificate lifecycle. |
+| `grpcRoute.enabled=true` | Create a GRPCRoute pointing at the external Gateway. |
+| `grpcRoute.gateway.name` / `namespace` | Reference the Gateway created above in `openshift-ingress`. |
+| `grpcRoute.backendTLSPolicy.enabled=true` | Create a BackendTLSPolicy for TLS re-encryption to the gateway pod. |
+| `grpcRoute.backendTLSPolicy.caCertificateConfigMapName` | ConfigMap containing the CA that signed the server certificate. |
+
+Note that `server.disableTls` is **not** set — the gateway pod serves TLS, and the BackendTLSPolicy tells the OpenShift router to connect over TLS.
+
+#### Create the backend CA ConfigMap
+
+After cert-manager issues the server certificate, create a ConfigMap containing the CA certificate so the BackendTLSPolicy can validate the backend:
+
+```shell
+oc -n openshell get secret openshell-server-tls \
+  -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/ca.crt
+
+oc -n openshell create configmap openshell-backend-ca \
+  --from-file=ca.crt=/tmp/ca.crt
+```
+
+#### Register over HTTPS
+
+```shell
+openshell gateway add https://<external-hostname> --name openshift
+openshell status
+```
+
+### Route with TLS Passthrough (All OpenShift Versions)
+
+For OpenShift versions prior to 4.22, or when you prefer Route-based ingress, cert-manager can issue the gateway's server certificate from a real Issuer or ClusterIssuer (for example, an ACME issuer), and an OpenShift Route with TLS passthrough exposes it externally while the gateway keeps terminating its own TLS and mTLS.
 
 Install cert-manager and configure a working `ClusterIssuer` first — see
 [Managing Certificates](/kubernetes/managing-certificates) for the

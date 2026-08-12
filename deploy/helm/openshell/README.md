@@ -56,6 +56,9 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
   --set securityContext.runAsUser=null
 ```
 
+On OpenShift 4.22+, end-to-end TLS is supported via `BackendTLSPolicy`. See the
+[OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift#end-to-end-tls-openshift-422) for details.
+
 ## Available versions
 
 | Tag | Source | Notes |
@@ -183,6 +186,9 @@ discovery endpoint or its TLS CA.
 | certManager.serverIpAddresses | list | `["127.0.0.1"]` | IP SANs on the cert-manager-issued server certificate. |
 | certManager.serverIssuerRef | object | `{"group":"","kind":"","name":""}` | Override the issuerRef for the external server Certificate (e.g. a real ACME ClusterIssuer for a publicly-trusted cert on an external hostname). When set, the chart creates a second server certificate from this issuer with only the hostnames in serverDnsNames; the internal server certificate is always signed by the chart's own CA. Leave name empty to use the chart CA for all server certificates (default). Requires certManager.enabled=true. |
 | fullnameOverride | string | `""` | Override the full generated resource name. |
+| grpcRoute.backendTLSPolicy.caCertificateConfigMapName | string | `""` | Name of a ConfigMap containing the CA certificate (key: ca.crt) used to validate the gateway pod's TLS certificate. Create this ConfigMap from the CA that signed the server certificate. Required when enabled. |
+| grpcRoute.backendTLSPolicy.enabled | bool | `false` | Create a BackendTLSPolicy resource for end-to-end TLS between the Gateway proxy and the OpenShell gateway pod. The traffic flow is: client → HTTPS → Gateway (terminate) → TLS (re-encrypt) → gateway pod. Requires server.disableTls=false and a ConfigMap containing the CA certificate for backend validation. |
+| grpcRoute.backendTLSPolicy.hostname | string | `""` | Hostname the Gateway proxy validates against the backend's TLS certificate SAN. Defaults to the service FQDN (<fullname>.<namespace>.svc.cluster.local) when empty, which matches the SAN included by both cert-manager and the pkiInitJob. |
 | grpcRoute.enabled | bool | `false` | Create a Gateway API GRPCRoute for the gateway service. |
 | grpcRoute.gateway.className | string | `"eg"` | GatewayClass to reference. Envoy Gateway installs one named "eg". |
 | grpcRoute.gateway.create | bool | `false` | When true, a Gateway resource is created in the release namespace. Set to false and provide name/namespace to attach to a pre-existing Gateway. |
