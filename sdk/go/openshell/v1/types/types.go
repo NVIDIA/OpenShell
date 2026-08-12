@@ -3,6 +3,8 @@
 
 package types
 
+import "time"
+
 // SandboxPhase represents the lifecycle phase of a sandbox.
 type SandboxPhase string
 
@@ -43,8 +45,12 @@ type TLSConfig struct {
 	CertFile string
 	KeyFile  string
 	CAFile   string
-	// Insecure disables TLS certificate verification. This makes the
-	// connection vulnerable to man-in-the-middle attacks. Only use for
-	// development gateways with self-signed certificates.
 	Insecure bool
+}
+
+// RetryPolicy configures automatic retry behavior for failed RPCs.
+type RetryPolicy struct {
+	MaxRetries  int
+	InitialWait time.Duration
+	MaxWait     time.Duration
 }
