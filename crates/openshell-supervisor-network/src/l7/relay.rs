@@ -2155,7 +2155,7 @@ fn evaluate_l7_request_once(
         ));
     }
 
-    let input_json = serde_json::json!({
+    let input = serde_json::json!({
         "network": {
             "host": ctx.host,
             "port": ctx.port,
@@ -2179,9 +2179,7 @@ fn evaluate_l7_request_once(
         .lock()
         .map_err(|_| miette!("OPA engine lock poisoned"))?;
 
-    engine
-        .set_input_json(&input_json.to_string())
-        .map_err(|e| miette!("{e}"))?;
+    crate::opa::set_regorus_input(&mut engine, input)?;
 
     let allowed = engine
         .eval_rule("data.openshell.sandbox.allow_request".into())
