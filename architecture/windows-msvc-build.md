@@ -54,11 +54,13 @@ creating misleading Windows driver artifacts.
 
 ## Mise Lane
 
-The GitHub Actions workflow is manually dispatched. Each architecture restores
-and saves a dedicated Rust cache containing the Cargo registry and dependency
-build artifacts, including artifacts from failed runs. Keep the workflow manual
-until cache-hit runtimes demonstrate that it is suitable for pull requests and
-merges to `main`.
+The GitHub Actions workflow is manually dispatched. Each architecture uses a
+dedicated GitHub Actions sccache namespace for compiler outputs and a separate
+Rust cache for Cargo registry data, including data from failed runs. The target
+directory is not transferred because sccache provides reusable compiler outputs
+without a multi-gigabyte target archive. Keep the workflow manual until
+cache-hit runtimes demonstrate that it is suitable for pull requests and merges
+to `main`.
 
 Windows validation is exposed through `tasks/windows.toml`:
 
@@ -77,8 +79,9 @@ Windows validation is exposed through `tasks/windows.toml`:
 The Windows tasks call `tasks/scripts/windows-msvc.ps1`. The wrapper discovers
 Visual Studio's `VsDevCmd.bat` with `vswhere` or by enumerating installed
 release directories, validates the requested compiler and ARM64 Spectre
-libraries, adds rustup MSVC targets, clears inherited `RUSTC_WRAPPER`, and
-keeps build artifacts under the normal Cargo target tree.
+libraries, adds rustup MSVC targets, uses an inherited `RUSTC_WRAPPER` when its
+executable is available, and otherwise clears it before invoking Cargo. Build
+artifacts remain under the normal Cargo target tree.
 On Windows, the generic `rust:check`, `rust:lint`, and `test:rust` tasks call
 the same wrapper with the host-native MSVC target. The wrapper preserves the
 Unix Cargo commands on Linux and macOS, excludes unsupported Windows runtime
@@ -140,10 +143,11 @@ mise run --skip-tools windows:test:x64
 mise run --skip-tools windows:test:unsupported:x64
 ```
 
-The cache is partitioned by architecture so incompatible x64 and ARM64 target
-artifacts cannot collide. It does not cache Cargo-installed binaries, which
-also keeps the disabled self-hosted ARM64 scaffold from modifying persistent
-runner tooling.
+The sccache and Cargo registry caches are partitioned by architecture so
+incompatible x64 and ARM64 artifacts cannot collide. The workflow does not
+cache Cargo target directories or Cargo-installed binaries, which also keeps
+the disabled self-hosted ARM64 scaffold from modifying persistent runner
+tooling.
 
 The local aggregate `windows:ci` task cross-builds ARM64 on an x64 host. The
 GitHub x64 job currently runs only the x64 tasks, and native ARM64 tests remain

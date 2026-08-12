@@ -134,7 +134,7 @@ from this skill.
 | `Z3_LIBRARY_PATH_OVERRIDE` | unset | Directory containing an x64 system `libz3.lib`; not valid for ARM64. |
 | `Z3_SYS_Z3_HEADER` | unset | Full `z3.h` path required with a system Z3 library. |
 | `Z3_SYS_BUNDLED_DIR_OVERRIDE` | pinned source cached under `CARGO_TARGET_DIR` when explicit, otherwise `%LOCALAPPDATA%\OpenShell\cache\z3` | Use an existing Z3 source tree containing `src/api/z3.h`; otherwise the wrapper fetches the pinned revision through Git and sets this automatically. |
-| `RUSTC_WRAPPER` | cleared by wrapper | The wrapper clears inherited values because `--skip-tools` does not provision `sccache`. |
+| `RUSTC_WRAPPER` | used when available, otherwise cleared | The wrapper resolves the configured executable before entering `cmd.exe`; local `--skip-tools` runs continue without it when unavailable. |
 
 Legacy fork variables such as `OPENSHELL_UPSTREAM`,
 `OPENSHELL_MXC_FORK_DIR`, and `OPENSHELL_MXC_FORK_BRANCH` are no longer part
@@ -187,10 +187,11 @@ order:
 6. Focused unsupported-driver contract tests.
 7. Artifact reporting.
 
-The GitHub Actions jobs use architecture-specific `Swatinem/rust-cache`
-entries for the Cargo registry and dependency target artifacts. Failed runs
-also save their usable dependency artifacts. The workflow remains manually
-dispatched until cache-hit runtimes justify restoring automatic triggers.
+The GitHub Actions jobs use architecture-specific GitHub Actions sccache
+namespaces for compiler outputs and `Swatinem/rust-cache` entries for Cargo
+registry data. They do not transfer Cargo target directories. Failed runs also
+save usable cache data. The workflow remains manually dispatched until
+cache-hit runtimes justify restoring automatic triggers.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
@@ -207,7 +208,7 @@ commands above on an ARM64 host.
 
 The repository-wide `mise run pre-commit` task is also supported on Windows.
 Its Rust check, Clippy, and test dependencies enter the same MSVC environment
-for the native host target and clear inherited `RUSTC_WRAPPER`. Linux glibc
+for the native host target and use an available inherited `RUSTC_WRAPPER`. Linux glibc
 installer tests and Linux service/RPM packaging-asset tests skip explicitly;
 the Linux build-environment shell-helper test also skips; cross-platform checks
 continue to run. The blocking Windows Clippy pass excludes unsupported
