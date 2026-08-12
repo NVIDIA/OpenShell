@@ -35,10 +35,9 @@ client/server skew variants as subcases without creating separate workflows.
 Unsupported capabilities must return documented errors rather than fail
 silently.
 
-Each workflow uses one representative environment for the compute driver. It
+Each workflow uses one representative environment for the configuration under test. It
 may run multiple capability subcases inside that environment without creating
-additional workflows. Kubernetes uses a separate blocking workflow for each
-supported gateway topology.
+additional workflows.
 
 ### Configurations to test
 
@@ -49,8 +48,6 @@ supported gateway topology.
 | C03 | MicroVM | Linux x86_64 with KVM and IOMMU | Local gateway; libkrun CPU; TLS and sandbox mTLS; QEMU/VFIO GPU when stable |
 | C04 | Kubernetes | Kubernetes 1.29 | Sidecar, three replicas; external PostgreSQL; Kubernetes Secrets; TLS and OIDC; GPU when stable |
 | C05 | Kubernetes | Kubernetes 1.29 | Combined, three replicas; external PostgreSQL; Kubernetes Secrets; TLS and OIDC; GPU when stable |
-
-C02 must pass without disabling SELinux or weakening the host SELinux policy.
 
 ## Upgrade
 
@@ -111,14 +108,11 @@ artifact set. A designated security approver:
 1. Reviews vulnerability, dependency, container, and infrastructure scan
    results for the candidate artifacts.
 2. Reviews changes since the previous stable release to authentication,
-   authorization, policy enforcement, sandbox isolation, credentials, and the
-   update trust boundary.
+   authorization, policy enforcement, sandbox isolation, credentials, and any updated trust boundary.
 3. Confirms that required penetration testing is current for the affected trust
    boundaries.
 4. Records the scope, evidence, findings, and disposition in the qualification
    record.
 
 Security review passes when no unresolved critical or high-severity finding
-affects a supported configuration. A medium-severity finding requires an
-explicit documented disposition before release. Low and informational findings
-remain tracked but do not block by default.
+affects a supported configuration.
