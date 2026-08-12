@@ -506,10 +506,15 @@ would have been missed again.
 
 ## Amendment 1 — OpenSSL transport for RHEL and OpenShift
 
-*Status: proposed. Supersedes the "System OpenSSL for everything" rejection in
-[Alternatives](#system-openssl-for-everything). Additive — the AWS-LC mode
-described above is unchanged and remains the default FIPS build for non-RHEL
+*Status: proposed, contingent. Supersedes the "System OpenSSL for everything"
+rejection in [Alternatives](#system-openssl-for-everything). Additive — the AWS-LC
+mode described above is unchanged and remains the default FIPS build for non-RHEL
 targets.*
+
+*Contingent because a cheaper option covers most of the same ground: see
+[`rustls-ossl` as the smaller alternative](#rustls-ossl-as-the-smaller-alternative).
+Adopt this amendment only if honoring `update-crypto-policies` TLS settings is a
+requirement.*
 
 ### Why the original rejection was wrong
 
@@ -533,12 +538,38 @@ explicit fetch against an `OSSL_LIB_CTX`, which is precisely what the
 [`ossl`](https://crates.io/crates/ossl) crate provides and what
 `rustls-openssl` does not do.
 
-**rustls cannot inherit the platform crypto policy.** Even with a correct
-provider, rustls selects protocol versions and cipher suites itself.
-`update-crypto-policies` and `/etc/crypto-policies` have no effect on it. RHEL and
-OpenShift operators expect the platform policy to govern TLS, and that
-expectation is the deciding factor for this target: it is not satisfiable by any
-rustls provider, only by using OpenSSL's own TLS stack.
+**rustls inherits provider-level policy but not libssl-level policy.** This is the
+deciding factor for the target, and it needs stating precisely, because an earlier
+draft of this amendment overstated it as "rustls cannot inherit the platform crypto
+policy" — which is not true.
+
+A correct `ossl`-backed provider *does* inherit a meaningful amount. `rustls-ossl`
+builds its library context with `load_default_configuration()`, so it reads the
+system `openssl.cnf` — which on a RHEL FIPS host is where the FIPS provider is
+activated. It then gates key exchange groups and signature algorithms on runtime
+availability (`EvpPkey::available(ctx, …)`, `available(ctx, sig_alg)`), so the
+negotiable set shrinks automatically to whatever the FIPS provider offers.
+
+What no rustls provider can inherit is **libssl-level TLS configuration**:
+`CipherString`, `MinProtocol`, `Groups` and friends, written by
+`update-crypto-policies` into
+`/etc/crypto-policies/back-ends/opensslcnf.config`. Those are consumed by libssl
+when an `SSL_CTX` is constructed. rustls is not libssl, so it never reads them —
+`update-crypto-policies --set LEGACY`, or a policy that removes SHA-1 or raises the
+minimum protocol version, has no effect on a rustls listener.
+
+| | `rustls-ossl` | OpenSSL transport |
+|---|---|---|
+| Validated module boundary | ✅ | ✅ |
+| FIPS activation from `openssl.cnf` | ✅ | ✅ |
+| Algorithm availability follows the FIPS provider | ✅ | ✅ |
+| `update-crypto-policies` TLS settings honored | ❌ | ✅ |
+
+So the choice between the two rests on exactly one question, recorded in
+[Open questions](#open-questions-for-this-amendment): does the requirement include
+honoring `update-crypto-policies` TLS settings, or is it satisfied by using the
+platform's FIPS provider with its algorithm availability? Only the former
+justifies replacing the transport.
 
 ### What changes
 
@@ -595,6 +626,43 @@ exposes only protocol versions and ALPN, and its OpenSSL backend hardcodes
 `set_verify(SslVerifyMode::NONE)`, so mTLS client-certificate verification is not
 expressible. It remains the right choice for `sqlx`, which is client-only.
 
+### `rustls-ossl` as the smaller alternative
+
+If libssl-level policy inheritance is *not* required, the cheaper option is
+[`rustls-ossl`](https://github.com/latchset/kryoptic/tree/main/rustls/ossl) — a
+rustls `CryptoProvider` over `ossl`, from the same project. It pins
+`rustls >=0.23.37, <0.24`, which our 0.23.38 satisfies.
+
+It is a `provider()` swap and nothing more. `tokio-rustls` is provider-agnostic —
+it wraps `rustls::ServerConnection`/`ClientConnection` and never sees the
+provider — and our workspace declares no backend feature on either `rustls` or
+`tokio-rustls`. So the acceptor, multiplex, hot reload, `peer_certificates()`,
+tonic, hyper-rustls and kube all stay as they are:
+
+```rust
+let config = ServerConfig::builder_with_provider(Arc::new(rustls_ossl::default_provider()))
+    .with_safe_default_protocol_versions()?
+    .with_client_cert_verifier(verifier)
+    .with_single_cert(certs, key)?;
+let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+```
+
+It is also the *cleanest* dependency graph of the three modes: with no backend
+feature on `rustls`, an ossl-only build drops both `ring` and `aws-lc-rs` from the
+rustls graph entirely, which neither the default nor the AWS-LC mode achieves.
+
+Two caveats, neither structural. Its cipher suites are **not** availability-gated
+the way its key exchange groups and signature algorithms are, so
+ChaCha20-Poly1305 is advertised unconditionally and would be offered even where the
+FIPS provider cannot supply it — we would filter it, using the same mechanism the
+AWS-LC mode already uses to narrow key exchange, and report the inconsistency
+upstream. And it is unpublished at v0.0.1 inside a monorepo, so consuming it means
+a pinned git dependency until latchset publishes.
+
+Choosing this instead of the transport change would also make Phase 8 unnecessary,
+since the supervisor's static musl build only blocks *linking the platform
+libcrypto for libssl*.
+
 ### Sequencing is constrained by packaging
 
 The gateway is glibc-linked and can adopt this independently. **The supervisor is
@@ -636,6 +704,12 @@ glibc/UBI packaging change first.
 
 ### Open questions for this amendment
 
+- **Does the requirement include honoring `update-crypto-policies` TLS settings
+  (`CipherString`, `MinProtocol`, `Groups`), or is it satisfied by using the
+  platform's FIPS provider and its algorithm availability?** This decides between
+  this amendment and
+  [`rustls-ossl`](#rustls-ossl-as-the-smaller-alternative), and it is the only
+  question that does. Everything else here is downstream of it.
 - **Is `openssl` 0.10 acceptable for `SSL_CTX`/`SSL` construction?** Our reading
   is yes: the objection to `rustls-openssl` was that it performs crypto itself
   through legacy interfaces, whereas here `libssl` performs the crypto and fetches
