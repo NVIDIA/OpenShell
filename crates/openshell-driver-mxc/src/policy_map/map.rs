@@ -75,9 +75,9 @@ pub struct MxcMappingResult {
 pub struct SplitPolicyResult {
     /// MXC `ContainerConfig` with filesystem grants and `network.proxy` redirect.
     ///
-    /// `network.allowedHosts` is empty — direct egress is blocked at the MXC
-    /// layer. All outbound connections flow through the proxy; the proxy enforces
-    /// the full `OpenShell` network policy.
+    /// Direct egress is blocked at the MXC layer. Unsupported host-list fields
+    /// are omitted; all outbound connections flow through the proxy, which
+    /// enforces the full `OpenShell` network policy.
     pub mxc_config: Value,
     /// Full `OpenShell` network policy preserved verbatim for the host CONNECT
     /// proxy. Only `network_policies` is populated; the proxy does not enforce
@@ -99,9 +99,9 @@ pub fn map_to_mxc(policy: &SandboxPolicy, opts: &MxcMappingOptions) -> MxcMappin
 /// `OpenShell` CONNECT proxy.
 ///
 /// The returned [`SplitPolicyResult::mxc_config`] sets `network.proxy` to
-/// `opts.proxy_redirect` and leaves `allowedHosts` empty — direct
-/// egress is blocked at the MXC layer and all outbound connections flow through
-/// the proxy. [`SplitPolicyResult::proxy_policy`] carries the original
+/// `opts.proxy_redirect` and omits unsupported host-list fields. Direct egress
+/// is blocked at the MXC layer and all outbound connections flow through the
+/// proxy. [`SplitPolicyResult::proxy_policy`] carries the original
 /// `network_policies` verbatim; no binary-scope, port, protocol, or wildcard
 /// loss items are generated for the network side.
 ///
@@ -172,7 +172,8 @@ fn build_split_mxc_config(
     }
 
     // Direct egress is blocked; all outbound flows through the OpenShell proxy.
-    // allowedHosts is intentionally empty — the proxy enforces the full policy.
+    // Released wxc-exec rejects allowedHosts and blockedHosts as unsupported,
+    // even when empty, so the proxy path omits both fields.
     //
     // MXC 0.6.0-alpha schema accepts ONLY {"proxy": {"localhost": <port>}}.
     // {"host": ..., "port": ...} and every other shape is rejected — verified
@@ -191,11 +192,7 @@ fn build_split_mxc_config(
             "The redirect cannot be emitted; use a 127.0.0.1:PORT address.",
         );
     }
-    let mut network = json!({
-        "defaultPolicy": "block",
-        "allowedHosts": [],
-        "blockedHosts": [],
-    });
+    let mut network = json!({ "defaultPolicy": "block" });
     if proxy_supported && proxy_addr.ip() == std::net::IpAddr::from([127, 0, 0, 1]) {
         network["proxy"] = json!({ "localhost": proxy_addr.port() });
     }

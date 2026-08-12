@@ -152,8 +152,6 @@ fn dryrun_accepts_network_block_without_proxy() {
         },
         "network": {
             "defaultPolicy": "block",
-            "allowedHosts": [],
-            "blockedHosts": [],
         },
     });
 
@@ -190,8 +188,6 @@ fn dryrun_accepts_localhost_proxy_shape() {
         },
         "network": {
             "defaultPolicy": "block",
-            "allowedHosts": [],
-            "blockedHosts": [],
             "proxy": { "localhost": 18080 },
         },
     });
@@ -229,8 +225,6 @@ fn dryrun_rejects_host_port_proxy_shape() {
         },
         "network": {
             "defaultPolicy": "block",
-            "allowedHosts": [],
-            "blockedHosts": [],
             // MXC 0.6.0-alpha rejects {"host","port"} — verified empirically.
             "proxy": { "host": "127.0.0.1", "port": 18080 },
         },
