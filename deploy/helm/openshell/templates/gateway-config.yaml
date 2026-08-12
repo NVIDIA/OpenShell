@@ -197,6 +197,11 @@ data:
     supervisor_image_pull_policy = {{ .Values.supervisor.image.pullPolicy | quote }}
     {{- end }}
 
+    [openshell.drivers.kubernetes.managed_ssh_ingress]
+    enabled                       = {{ .Values.networkPolicy.enabled }}
+    gateway_namespace             = {{ .Release.Namespace | quote }}
+    gateway_pod_selector          = { "app.kubernetes.io/name" = {{ include "openshell.name" . | quote }}, "app.kubernetes.io/instance" = {{ .Release.Name | quote }} }
+
     [openshell.drivers.kubernetes.sidecar]
     proxy_uid                    = {{ .Values.supervisor.sidecar.proxyUid | default 1337 }}
     process_binary_aware_network_policy = {{ .Values.supervisor.sidecar.processBinaryAwareNetworkPolicy }}

@@ -403,7 +403,8 @@ server:
 
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
-  # -- Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway.
+  # -- Restrict SSH ingress on sandbox pods to the gateway. In managed mode,
+  # the driver applies the equivalent policy to each workspace namespace.
   enabled: true
 
 # Built-in TLS PKI bootstrap via a pre-install/pre-upgrade hook Job.

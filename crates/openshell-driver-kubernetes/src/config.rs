@@ -3,7 +3,7 @@
 
 use openshell_core::config;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
@@ -304,6 +304,10 @@ pub struct KubernetesComputeConfig {
     pub image_pull_policy: String,
     /// Kubernetes `imagePullSecrets` names attached to sandbox pods.
     pub image_pull_secrets: Vec<String>,
+    /// Managed-mode SSH ingress isolation. When enabled, the driver creates a
+    /// `NetworkPolicy` in each managed workspace namespace that permits TCP 2222
+    /// only from gateway pods matching this peer.
+    pub managed_ssh_ingress: ManagedSshIngressConfig,
     /// Image that provides the `openshell-sandbox` supervisor binary.
     /// Mounted directly as an image volume, or copied via an init container,
     /// depending on `supervisor_sideload_method`.
@@ -392,6 +396,14 @@ pub struct KubernetesComputeConfig {
     pub sandbox_gid: Option<u32>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ManagedSshIngressConfig {
+    pub enabled: bool,
+    pub gateway_namespace: String,
+    pub gateway_pod_selector: BTreeMap<String, String>,
+}
+
 /// Lower bound enforced by kubelet for projected SA tokens.
 pub const MIN_SA_TOKEN_TTL_SECS: i64 = 600;
 
@@ -428,6 +440,7 @@ impl Default for KubernetesComputeConfig {
             // is Podman vocabulary and is not a valid Kubernetes value.
             image_pull_policy: String::new(),
             image_pull_secrets: Vec::new(),
+            managed_ssh_ingress: ManagedSshIngressConfig::default(),
             supervisor_image: config::default_supervisor_image(),
             supervisor_image_pull_policy: String::new(),
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
@@ -593,7 +606,7 @@ impl KubernetesComputeConfig {
     /// 3. Fallback defaults: UID=`1000`, GID=UID
     pub fn resolve_sandbox_uid(
         &self,
-        namespace_annotations: Option<&std::collections::BTreeMap<String, String>>,
+        namespace_annotations: Option<&BTreeMap<String, String>>,
     ) -> u32 {
         if let Some(uid) = self.sandbox_uid {
             return uid;
@@ -611,7 +624,7 @@ impl KubernetesComputeConfig {
     pub fn resolve_sandbox_gid(
         &self,
         resolved_uid: u32,
-        _namespace_annotations: Option<&std::collections::BTreeMap<String, String>>,
+        _namespace_annotations: Option<&BTreeMap<String, String>>,
     ) -> u32 {
         self.sandbox_gid
             .or(self.sandbox_uid)
@@ -737,6 +750,18 @@ impl KubernetesComputeConfig {
                         prefix,
                         prefix.len()
                     ));
+                }
+                if self.managed_ssh_ingress.enabled {
+                    if self.managed_ssh_ingress.gateway_namespace.is_empty() {
+                        return Err(
+                            "managed SSH ingress isolation requires gateway_namespace".into()
+                        );
+                    }
+                    if self.managed_ssh_ingress.gateway_pod_selector.is_empty() {
+                        return Err(
+                            "managed SSH ingress isolation requires gateway_pod_selector".into(),
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -1739,6 +1764,38 @@ mod tests {
         let cfg = KubernetesComputeConfig {
             workspace_mode: WorkspaceMode::Managed,
             gateway_id: "a".repeat(33),
+            ..KubernetesComputeConfig::default()
+        };
+        cfg.validate_workspace_mode().unwrap();
+    }
+
+    #[test]
+    fn validate_workspace_mode_managed_requires_complete_ssh_ingress_peer() {
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Managed,
+            managed_ssh_ingress: ManagedSshIngressConfig {
+                enabled: true,
+                gateway_namespace: "gateway".to_string(),
+                gateway_pod_selector: BTreeMap::new(),
+            },
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_workspace_mode().unwrap_err();
+        assert!(err.contains("gateway_pod_selector"), "{err}");
+    }
+
+    #[test]
+    fn validate_workspace_mode_managed_accepts_complete_ssh_ingress_peer() {
+        let cfg = KubernetesComputeConfig {
+            workspace_mode: WorkspaceMode::Managed,
+            managed_ssh_ingress: ManagedSshIngressConfig {
+                enabled: true,
+                gateway_namespace: "gateway".to_string(),
+                gateway_pod_selector: BTreeMap::from([(
+                    "app.kubernetes.io/name".to_string(),
+                    "openshell".to_string(),
+                )]),
+            },
             ..KubernetesComputeConfig::default()
         };
         cfg.validate_workspace_mode().unwrap();

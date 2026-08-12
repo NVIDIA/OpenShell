@@ -798,7 +798,10 @@ impl ComputeRuntime {
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         if driver.workspace_mode() == WorkspaceMode::Shared {
-            driver.backfill_gateway_id_labels().await;
+            driver
+                .backfill_gateway_id_labels()
+                .await
+                .map_err(|err| ComputeError::Message(err.to_string()))?;
         }
         let operator_allowlist_arc = driver.operator_allowlist().cloned();
         let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new(driver));
@@ -3817,7 +3820,18 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
 
 #[cfg(test)]
 #[derive(Debug, Default)]
-pub struct NoopTestDriver;
+pub struct NoopTestDriver {
+    workspace_delete_failures: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl NoopTestDriver {
+    pub fn failing_workspace_deletes(count: usize) -> Self {
+        Self {
+            workspace_delete_failures: std::sync::atomic::AtomicUsize::new(count),
+        }
+    }
+}
 
 #[cfg(test)]
 #[tonic::async_trait]
@@ -3937,6 +3951,17 @@ impl ComputeDriver for NoopTestDriver {
         &self,
         _request: Request<DeleteWorkspaceRequest>,
     ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
+        if self
+            .workspace_delete_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(Status::unavailable("injected workspace cleanup failure"));
+        }
         Ok(tonic::Response::new(DeleteWorkspaceResponse {}))
     }
 }
@@ -3948,8 +3973,17 @@ pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
 
 #[cfg(test)]
 pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -> ComputeRuntime {
+    new_test_runtime_with_driver(store, driver_name, Arc::new(NoopTestDriver::default())).await
+}
+
+#[cfg(test)]
+pub async fn new_test_runtime_with_driver(
+    store: Arc<Store>,
+    driver_name: &str,
+    driver: Arc<NoopTestDriver>,
+) -> ComputeRuntime {
     ComputeRuntime {
-        driver: TracedDriver::new(Arc::new(NoopTestDriver), "test".to_string()),
+        driver: TracedDriver::new(driver, "test".to_string()),
         driver_info: ComputeDriverInfoSnapshot {
             name: driver_name.to_string(),
             driver_name: driver_name.to_string(),

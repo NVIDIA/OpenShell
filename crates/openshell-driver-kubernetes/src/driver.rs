@@ -14,6 +14,12 @@ use k8s_openapi::api::core::v1::{
     Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Secret,
     ServiceAccount, Volume, VolumeMount,
 };
+use k8s_openapi::api::networking::v1::{
+    NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
+    NetworkPolicySpec,
+};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{
     Api, ApiResource, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions,
 };
@@ -53,6 +59,8 @@ use tracing::{debug, info, warn};
 
 pub type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, KubernetesDriverError>> + Send>>;
+
+const MANAGED_SSH_NETWORK_POLICY_NAME: &str = "openshell-sandbox-ssh";
 
 #[derive(Debug, thiserror::Error)]
 pub enum KubernetesDriverError {
@@ -562,17 +570,11 @@ impl KubernetesComputeDriver {
     /// Backfill the `openshell.ai/gateway-id` label on Sandbox CRs that
     /// predate its introduction. Runs once at startup in shared mode so that
     /// label-selector based lookups continue to find legacy resources.
-    pub async fn backfill_gateway_id_labels(&self) {
-        let sandbox_api = match self
+    pub async fn backfill_gateway_id_labels(&self) -> Result<(), KubernetesDriverError> {
+        let sandbox_api = self
             .supported_sandbox_api_for_lookup(self.client.clone())
             .await
-        {
-            Ok(api) => api,
-            Err(e) => {
-                warn!(error = %e, "skipping gateway-id label backfill: cannot resolve Sandbox API");
-                return;
-            }
-        };
+            .map_err(KubernetesDriverError::Message)?;
 
         let selector = openshell_sandbox_label_selector();
         let list = match tokio::time::timeout(
@@ -584,30 +586,21 @@ impl KubernetesComputeDriver {
         .await
         {
             Ok(Ok(list)) => list,
-            Ok(Err(e)) => {
-                warn!(error = %e, "skipping gateway-id label backfill: list failed");
-                return;
-            }
+            Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
             Err(_) => {
-                warn!("skipping gateway-id label backfill: list timed out");
-                return;
+                return Err(KubernetesDriverError::Message(
+                    "timeout listing Sandbox resources for gateway-id label backfill".to_string(),
+                ));
             }
         };
 
         let gateway_id = &self.config.gateway_id;
         for obj in &list {
-            let has_label = obj
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|l| l.get(LABEL_GATEWAY_ID))
-                .is_some_and(|v| v == gateway_id);
-            if has_label {
+            if !gateway_id_label_needs_backfill(obj.metadata.labels.as_ref(), gateway_id) {
                 continue;
             }
-            let name = match obj.metadata.name.as_deref() {
-                Some(n) => n,
-                None => continue,
+            let Some(name) = obj.metadata.name.as_deref() else {
+                continue;
             };
             let patch = serde_json::json!({
                 "metadata": {
@@ -616,19 +609,27 @@ impl KubernetesComputeDriver {
                     }
                 }
             });
-            match sandbox_api
-                .api
-                .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
-                .await
+            match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                sandbox_api
+                    .api
+                    .patch(name, &PatchParams::default(), &Patch::Merge(&patch)),
+            )
+            .await
             {
-                Ok(_) => {
+                Ok(Ok(_)) => {
                     info!(sandbox = %name, gateway_id, "backfilled gateway-id label");
                 }
-                Err(e) => {
-                    warn!(sandbox = %name, error = %e, "failed to backfill gateway-id label");
+                Ok(Err(e)) => return Err(KubernetesDriverError::from_kube(e)),
+                Err(_) => {
+                    return Err(KubernetesDriverError::Message(format!(
+                        "timeout backfilling gateway-id label on Sandbox {name}"
+                    )));
                 }
             }
         }
+
+        Ok(())
     }
 
     /// Ensure the K8s namespace for a workspace exists (managed mode only).
@@ -637,16 +638,6 @@ impl KubernetesComputeDriver {
     /// already existed. Also creates the sandbox `ServiceAccount` in the
     /// namespace.
     ///
-    /// TODO: no `NetworkPolicy` is created in dynamic namespaces. The
-    /// Helm-managed static namespace gets an SSH-isolation policy (port 2222
-    /// restricted to the gateway pod), but managed and operator namespaces do
-    /// not. In managed mode, risk is low: only sandbox pods from the same
-    /// workspace run in the namespace, so there is no lateral movement target.
-    /// In operator mode, the admin owns the namespace and is responsible for
-    /// applying appropriate policies. A same-cluster `namespaceSelector` policy
-    /// would also break cross-cluster topologies where the gateway is external.
-    /// Add a configurable `NetworkPolicy` when mixed-workload or cross-cluster
-    /// namespaces are supported.
     pub async fn ensure_namespace(&self, workspace: &str) -> Result<String, KubernetesDriverError> {
         let ns_name = managed_namespace(&self.config.gateway_id, workspace);
         let ns_api: Api<Namespace> = Api::all(self.client.clone());
@@ -730,8 +721,40 @@ impl KubernetesComputeDriver {
         }
 
         self.ensure_service_account(&ns_name).await?;
+        self.ensure_managed_ssh_network_policy(&ns_name).await?;
 
         Ok(ns_name)
+    }
+
+    async fn ensure_managed_ssh_network_policy(
+        &self,
+        namespace: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        if !self.config.managed_ssh_ingress.enabled {
+            return Ok(());
+        }
+
+        let policy = managed_ssh_network_policy(namespace, &self.config);
+        let policy_api: Api<NetworkPolicy> = Api::namespaced(self.client.clone(), namespace);
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            policy_api.patch(
+                MANAGED_SSH_NETWORK_POLICY_NAME,
+                &PatchParams::apply("openshell"),
+                &Patch::Apply(&policy),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                info!(namespace, "applied managed sandbox SSH NetworkPolicy");
+                Ok(())
+            }
+            Ok(Err(error)) => Err(KubernetesDriverError::from_kube(error)),
+            Err(_) => Err(KubernetesDriverError::Message(format!(
+                "timeout applying SSH NetworkPolicy in {namespace}"
+            ))),
+        }
     }
 
     async fn ensure_service_account(&self, namespace: &str) -> Result<(), KubernetesDriverError> {
@@ -844,6 +867,62 @@ impl KubernetesComputeDriver {
         Ok(())
     }
 
+    /// Copy the explicitly configured image-pull Secrets into a managed
+    /// workspace namespace. Server-side apply refreshes rotated credentials
+    /// without forcibly taking fields owned by another manager.
+    async fn ensure_image_pull_secrets(
+        &self,
+        namespace: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        let source_api: Api<Secret> = Api::namespaced(self.client.clone(), &self.config.namespace);
+        let target_api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+
+        for secret_name in &self.config.image_pull_secrets {
+            let source = match tokio::time::timeout(KUBE_API_TIMEOUT, source_api.get(secret_name))
+                .await
+            {
+                Ok(Ok(secret)) => secret,
+                Ok(Err(KubeError::Api(error))) if error.code == 404 => {
+                    return Err(KubernetesDriverError::Precondition(format!(
+                        "configured image-pull Secret {secret_name} does not exist in source namespace {}",
+                        self.config.namespace
+                    )));
+                }
+                Ok(Err(error)) => return Err(KubernetesDriverError::from_kube(error)),
+                Err(_) => {
+                    return Err(KubernetesDriverError::Message(format!(
+                        "timeout reading image-pull Secret {secret_name} from {}",
+                        self.config.namespace
+                    )));
+                }
+            };
+
+            let copy = image_pull_secret_copy(secret_name, namespace, source);
+            match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                target_api.patch(
+                    secret_name,
+                    &PatchParams::apply("openshell"),
+                    &Patch::Apply(&copy),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    info!(namespace, secret = %secret_name, "applied image-pull Secret copy");
+                }
+                Ok(Err(error)) => return Err(KubernetesDriverError::from_kube(error)),
+                Err(_) => {
+                    return Err(KubernetesDriverError::Message(format!(
+                        "timeout applying image-pull Secret {secret_name} in {namespace}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Delete the managed namespace and all its contents (managed mode only).
     /// Called via the `DeleteWorkspace` RPC after workspace deletion.
     /// Kubernetes cascades namespace deletion to all resources within it.
@@ -873,11 +952,14 @@ impl KubernetesComputeDriver {
             return Ok(());
         }
 
-        match tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            ns_api.delete(&ns_name, &DeleteParams::default()),
-        )
-        .await
+        let namespace_uid = ns.metadata.uid.ok_or_else(|| {
+            KubernetesDriverError::Message(format!(
+                "namespace {ns_name} has no UID; refusing an unguarded delete"
+            ))
+        })?;
+        let delete_params = namespace_delete_params(namespace_uid);
+
+        match tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.delete(&ns_name, &delete_params)).await
         {
             Ok(Ok(_)) => {
                 info!(namespace = %ns_name, workspace = %workspace, "deleted managed namespace");
@@ -1254,7 +1336,11 @@ impl KubernetesComputeDriver {
 
         let target_namespace = match self.config.workspace_mode {
             WorkspaceMode::Shared => self.config.namespace.clone(),
-            WorkspaceMode::Managed => self.ensure_namespace(workspace).await?,
+            WorkspaceMode::Managed => {
+                let namespace = self.ensure_namespace(workspace).await?;
+                self.ensure_image_pull_secrets(&namespace).await?;
+                namespace
+            }
             WorkspaceMode::Operator => {
                 if let Some(ref allowlist) = self.operator_allowlist
                     && !allowlist.contains(workspace)
@@ -1884,6 +1970,22 @@ fn is_namespace_owned_by_gateway(
             .is_some_and(|v| v == gateway_id)
 }
 
+fn gateway_id_label_needs_backfill(
+    labels: Option<&BTreeMap<String, String>>,
+    gateway_id: &str,
+) -> bool {
+    labels
+        .and_then(|labels| labels.get(LABEL_GATEWAY_ID))
+        .is_none_or(|value| value != gateway_id)
+}
+
+fn namespace_delete_params(uid: String) -> DeleteParams {
+    DeleteParams::default().preconditions(Preconditions {
+        uid: Some(uid),
+        resource_version: None,
+    })
+}
+
 fn sandbox_lookup_selector_for(sandbox_id: &str, gateway_id: &str) -> String {
     format!(
         "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id},{LABEL_GATEWAY_ID}={gateway_id}"
@@ -1913,6 +2015,70 @@ fn sandbox_labels(sandbox: &Sandbox, gateway_id: Option<&str>) -> BTreeMap<Strin
         labels.insert(LABEL_GATEWAY_ID.to_string(), gw_id.to_string());
     }
     labels
+}
+
+fn managed_ssh_network_policy(namespace: &str, config: &KubernetesComputeConfig) -> NetworkPolicy {
+    NetworkPolicy {
+        metadata: ObjectMeta {
+            name: Some(MANAGED_SSH_NETWORK_POLICY_NAME.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(BTreeMap::from([(
+                LABEL_MANAGED_BY.to_string(),
+                LABEL_MANAGED_BY_VALUE.to_string(),
+            )])),
+            ..Default::default()
+        },
+        spec: Some(NetworkPolicySpec {
+            pod_selector: LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    LABEL_MANAGED_BY.to_string(),
+                    LABEL_MANAGED_BY_VALUE.to_string(),
+                )])),
+                ..Default::default()
+            },
+            policy_types: Some(vec!["Ingress".to_string()]),
+            ingress: Some(vec![NetworkPolicyIngressRule {
+                from: Some(vec![NetworkPolicyPeer {
+                    namespace_selector: Some(LabelSelector {
+                        match_labels: Some(BTreeMap::from([(
+                            "kubernetes.io/metadata.name".to_string(),
+                            config.managed_ssh_ingress.gateway_namespace.clone(),
+                        )])),
+                        ..Default::default()
+                    }),
+                    pod_selector: Some(LabelSelector {
+                        match_labels: Some(config.managed_ssh_ingress.gateway_pod_selector.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ports: Some(vec![NetworkPolicyPort {
+                    port: Some(IntOrString::Int(2222)),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }]),
+            }]),
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
+fn image_pull_secret_copy(secret_name: &str, namespace: &str, source: Secret) -> Secret {
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(secret_name.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(BTreeMap::from([(
+                LABEL_MANAGED_BY.to_string(),
+                LABEL_MANAGED_BY_VALUE.to_string(),
+            )])),
+            ..Default::default()
+        },
+        data: source.data,
+        type_: source.type_,
+        ..Default::default()
+    }
 }
 
 fn sandbox_annotations(sandbox: &Sandbox) -> BTreeMap<String, String> {
@@ -7463,6 +7629,123 @@ mod tests {
     }
 
     #[test]
+    fn gateway_id_backfill_adopts_unlabelled_sandbox() {
+        let labels = BTreeMap::from([(
+            LABEL_MANAGED_BY.to_string(),
+            LABEL_MANAGED_BY_VALUE.to_string(),
+        )]);
+        assert!(gateway_id_label_needs_backfill(Some(&labels), "gw-1"));
+    }
+
+    #[test]
+    fn gateway_id_backfill_adopts_sandbox_from_previous_gateway() {
+        let labels = BTreeMap::from([(LABEL_GATEWAY_ID.to_string(), "gw-old".to_string())]);
+        assert!(gateway_id_label_needs_backfill(Some(&labels), "gw-1"));
+    }
+
+    #[test]
+    fn gateway_id_backfill_skips_sandbox_already_owned_by_gateway() {
+        let labels = BTreeMap::from([(LABEL_GATEWAY_ID.to_string(), "gw-1".to_string())]);
+        assert!(!gateway_id_label_needs_backfill(Some(&labels), "gw-1"));
+    }
+
+    #[test]
+    fn managed_ssh_policy_allows_only_gateway_peer_on_port_2222() {
+        let config = KubernetesComputeConfig {
+            managed_ssh_ingress: crate::config::ManagedSshIngressConfig {
+                enabled: true,
+                gateway_namespace: "gateway-ns".to_string(),
+                gateway_pod_selector: BTreeMap::from([(
+                    "app.kubernetes.io/name".to_string(),
+                    "openshell".to_string(),
+                )]),
+            },
+            ..KubernetesComputeConfig::default()
+        };
+        let policy = managed_ssh_network_policy("workspace-ns", &config);
+        let spec = policy.spec.unwrap();
+        assert_eq!(
+            spec.policy_types.as_deref(),
+            Some(["Ingress".to_string()].as_slice())
+        );
+        let ingress = &spec.ingress.unwrap()[0];
+        assert_eq!(
+            ingress.ports.as_ref().unwrap()[0].port,
+            Some(IntOrString::Int(2222))
+        );
+        let peer = &ingress.from.as_ref().unwrap()[0];
+        assert_eq!(
+            peer.namespace_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .unwrap()
+                .get("kubernetes.io/metadata.name")
+                .map(String::as_str),
+            Some("gateway-ns")
+        );
+        assert_eq!(
+            peer.pod_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .unwrap()
+                .get("app.kubernetes.io/name")
+                .map(String::as_str),
+            Some("openshell")
+        );
+    }
+
+    #[test]
+    fn image_pull_secret_copy_keeps_only_portable_secret_fields() {
+        let source: Secret = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": "regcred",
+                "namespace": "gateway",
+                "uid": "source-uid",
+                "resourceVersion": "42",
+                "labels": { "source-only": "true" },
+                "annotations": { "source-only": "true" },
+                "finalizers": ["example.test/finalizer"]
+            },
+            "type": "kubernetes.io/dockerconfigjson",
+            "data": { ".dockerconfigjson": "e30=" }
+        }))
+        .unwrap();
+
+        let copy = image_pull_secret_copy("regcred", "workspace", source);
+        assert_eq!(copy.metadata.name.as_deref(), Some("regcred"));
+        assert_eq!(copy.metadata.namespace.as_deref(), Some("workspace"));
+        assert_eq!(
+            copy.type_.as_deref(),
+            Some("kubernetes.io/dockerconfigjson")
+        );
+        assert!(
+            copy.data
+                .as_ref()
+                .unwrap()
+                .contains_key(".dockerconfigjson")
+        );
+        assert_eq!(
+            copy.metadata
+                .labels
+                .as_ref()
+                .unwrap()
+                .get(LABEL_MANAGED_BY)
+                .map(String::as_str),
+            Some(LABEL_MANAGED_BY_VALUE)
+        );
+        assert!(copy.metadata.uid.is_none());
+        assert!(copy.metadata.resource_version.is_none());
+        assert!(copy.metadata.annotations.is_none());
+        assert!(copy.metadata.finalizers.is_none());
+    }
+
+    #[test]
     fn namespace_owned_with_correct_labels() {
         let labels = BTreeMap::from([
             (
@@ -7495,5 +7778,16 @@ mod tests {
     #[test]
     fn namespace_not_owned_no_labels() {
         assert!(!is_namespace_owned_by_gateway(None, "gw-1"));
+    }
+
+    #[test]
+    fn namespace_delete_is_guarded_by_fetched_uid() {
+        let params = namespace_delete_params("namespace-uid".to_string());
+        assert_eq!(
+            params
+                .preconditions
+                .and_then(|preconditions| preconditions.uid),
+            Some("namespace-uid".to_string())
+        );
     }
 }

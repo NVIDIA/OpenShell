@@ -101,4 +101,16 @@ rules:
     verbs:
       - create
       - get
+  {{- if .Values.networkPolicy.enabled }}
+  # Apply gateway-only SSH ingress isolation in managed namespaces.
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+    verbs:
+      - get
+      - create
+      - patch
+      - update
+  {{- end }}
   {{- end }}

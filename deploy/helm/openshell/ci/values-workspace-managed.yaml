@@ -4,6 +4,8 @@
 # E2E overlay: deploy the gateway in managed workspace mode.
 # Sandbox namespaces are auto-created as openshell-{gateway_id}-{workspace}.
 server:
+  sandboxImagePullSecrets:
+    - name: e2e-regcred
   drivers:
     kubernetes:
       workspaceMode: "managed"

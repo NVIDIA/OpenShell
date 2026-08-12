@@ -3,6 +3,7 @@
 
 use clap::{ArgAction, Parser};
 use miette::{IntoDiagnostic, Result};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -12,7 +13,8 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID,
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
-    KubernetesSidecarConfig, SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
+    KubernetesSidecarConfig, ManagedSshIngressConfig, SupervisorSideloadMethod, SupervisorTopology,
+    WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -68,6 +70,19 @@ struct Args {
         value_delimiter = ','
     )]
     sandbox_image_pull_secrets: Vec<String>,
+
+    #[arg(long, env = "OPENSHELL_MANAGED_SSH_INGRESS_ENABLED")]
+    managed_ssh_ingress_enabled: bool,
+
+    #[arg(long, env = "OPENSHELL_MANAGED_SSH_GATEWAY_NAMESPACE")]
+    managed_ssh_gateway_namespace: Option<String>,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_MANAGED_SSH_GATEWAY_POD_SELECTOR",
+        value_delimiter = ','
+    )]
+    managed_ssh_gateway_pod_selector: Vec<String>,
 
     #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
     grpc_endpoint: Option<String>,
@@ -173,6 +188,19 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let managed_ssh_gateway_pod_selector = args
+        .managed_ssh_gateway_pod_selector
+        .iter()
+        .map(|entry| {
+            entry
+                .split_once('=')
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .ok_or_else(|| {
+                    miette::miette!("managed SSH gateway pod selector must use key=value: {entry}")
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+
     let driver = KubernetesComputeDriver::new(KubernetesComputeConfig {
         workspace_mode: args.workspace_mode,
         gateway_id: args.gateway_id,
@@ -183,6 +211,11 @@ async fn main() -> Result<()> {
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
         image_pull_secrets: args.sandbox_image_pull_secrets,
+        managed_ssh_ingress: ManagedSshIngressConfig {
+            enabled: args.managed_ssh_ingress_enabled,
+            gateway_namespace: args.managed_ssh_gateway_namespace.unwrap_or_default(),
+            gateway_pod_selector: managed_ssh_gateway_pod_selector,
+        },
         supervisor_image: args
             .supervisor_image
             .unwrap_or_else(openshell_core::config::default_supervisor_image),

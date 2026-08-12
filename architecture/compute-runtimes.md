@@ -327,13 +327,23 @@ embed the workspace prefix for collision avoidance. No namespace lifecycle
 management. RBAC uses a namespace-scoped Role.
 
 **Managed** auto-creates a K8s namespace per workspace on first sandbox create.
-Each new namespace receives a ServiceAccount and copies OpenShift SCC UID-range
-and supplemental-group annotations from the gateway namespace when present. The
-driver deletes the namespace when the last sandbox in it is removed
-(`delete_namespace_if_empty`). Requires a non-empty `gateway_id` (validated as a
+Each new namespace receives a ServiceAccount and the configured gateway-only
+SSH ingress NetworkPolicy. Configured image-pull Secrets are copied from the
+driver's source namespace on every sandbox create so registry credential
+rotations propagate. The namespace also copies OpenShift SCC UID-range and
+supplemental-group annotations from the gateway namespace when present. The
+driver deletes the namespace during workspace deletion. The workspace remains
+durably `Terminating` until the Kubernetes API accepts namespace cleanup, so a
+transient failure can be retried. Namespace deletion uses the fetched UID as a
+precondition to avoid deleting a replacement namespace. Requires a non-empty
+`gateway_id` (validated as a
 DNS-1123 label at startup) so the namespace prefix fits within the K8s 63-character
 limit. RBAC promotes sandbox CRD permissions to a ClusterRole and adds namespace
 `create`/`delete` and ServiceAccount `create`/`get` permissions.
+
+Operator mode does not create NetworkPolicies or copy image-pull Secrets.
+Platform teams must apply the gateway ingress boundary and provision configured
+image-pull Secrets in every operator-managed namespace.
 
 **Operator** uses pre-provisioned namespaces discovered through two optional
 sources: a K8s label selector (`operator_namespace_label`) and a drop-in

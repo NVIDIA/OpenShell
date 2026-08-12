@@ -9,6 +9,29 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: grants managed namespace NetworkPolicy apply permissions
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+            verbs: ["get", "create", "patch", "update"]
+
+  - it: omits managed NetworkPolicy permissions when isolation is disabled
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      networkPolicy.enabled: false
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["networking.k8s.io"]
+            resources: ["networkpolicies"]
+          any: true
+
   - it: grants secrets patch and delete when credential driver is enabled (operator)
     set:
       server.drivers.kubernetes.workspaceMode: operator

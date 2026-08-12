@@ -439,6 +439,7 @@ image_pull_secrets             = ["regcred"]
 # Defaults to the gateway version; override to pin a specific build.
 # supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "IfNotPresent"
+
 # Use the image volume on Kubernetes >= 1.35 (GA in 1.36); switch to "init-container"
 # on older clusters or where the ImageVolume feature gate is off.
 supervisor_sideload_method     = "image-volume"
@@ -507,6 +508,11 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # (hot-reloaded on change, e.g. via ConfigMap volume mount).
 # operator_namespace_file      = "/etc/openshell/workspace-namespaces.json"
 
+[openshell.drivers.kubernetes.managed_ssh_ingress]
+enabled = true
+gateway_namespace = "openshell"
+gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes.io/instance" = "openshell" }
+
 [openshell.drivers.kubernetes.sidecar]
 # UID used by relaxed long-running network sidecars. Strict process/binary-aware
 # sidecars run as UID 0 so Kubernetes grants the required /proc inspection
@@ -519,6 +525,11 @@ proxy_uid                      = 1337
 # policy.binaries.
 process_binary_aware_network_policy = true
 ```
+
+In managed workspace mode, the Kubernetes driver copies each explicitly named
+`image_pull_secrets` Secret from `namespace` into the managed workspace
+namespace on sandbox creation. Shared and operator modes require the Secret to
+already exist in the sandbox namespace.
 
 ### Docker
 

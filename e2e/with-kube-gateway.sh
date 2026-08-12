@@ -814,6 +814,14 @@ else
     --wait --timeout 5m
   HELM_INSTALLED=1
 
+  if [ -n "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET:-}" ]; then
+    kctl -n "${NAMESPACE}" create secret docker-registry \
+      "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET}" \
+      --docker-server=registry.example.test \
+      --docker-username=e2e-user \
+      --docker-password=e2e-password
+  fi
+
   LOCAL_PORT="$(e2e_pick_port)"
   echo "Starting kubectl port-forward svc/openshell ${LOCAL_PORT}:8080..."
   kctl -n "${NAMESPACE}" port-forward "svc/openshell" \

@@ -11,8 +11,8 @@
 //!
 //! Namespace cleanup after sandbox deletion is best-effort and depends on
 //! controller finalization timing. These tests focus on verifiable behavior:
-//! namespace creation, labels, ServiceAccount provisioning, and sandbox CR
-//! placement in the correct namespace.
+//! namespace creation, labels, ServiceAccount and SSH NetworkPolicy
+//! provisioning, and sandbox CR placement in the correct namespace.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -177,6 +177,58 @@ async fn managed_creates_namespace_with_labels() {
     // Verify the ServiceAccount was created in the managed namespace.
     let (ok, _) = kubectl(&["get", "serviceaccount", "openshell-sandbox", "-n", &ns]).await;
     assert!(ok, "ServiceAccount openshell-sandbox should exist in {ns}");
+
+    // The managed driver copies only explicitly configured image-pull Secrets
+    // from the gateway namespace into the workspace namespace.
+    let (ok, copied_secret) = kubectl(&[
+        "get",
+        "secret",
+        "e2e-regcred",
+        "-n",
+        &ns,
+        "-o",
+        "jsonpath={.type}",
+    ])
+    .await;
+    assert!(
+        ok && copied_secret.contains("kubernetes.io/dockerconfigjson"),
+        "configured image-pull Secret should be copied into {ns}: {copied_secret}"
+    );
+
+    // Verify SSH ingress is restricted to the gateway peer. Because Kubernetes
+    // NetworkPolicies are allowlists, the absence of a sandbox peer here
+    // denies sandbox-to-sandbox TCP 2222 traffic.
+    let (ok, policy) = kubectl(&[
+        "get",
+        "networkpolicy",
+        "openshell-sandbox-ssh",
+        "-n",
+        &ns,
+        "-o",
+        "json",
+    ])
+    .await;
+    assert!(
+        ok,
+        "managed SSH NetworkPolicy should exist in {ns}: {policy}"
+    );
+    let policy: serde_json::Value =
+        serde_json::from_str(&policy).expect("managed SSH NetworkPolicy should be valid JSON");
+    assert_eq!(
+        policy["spec"]["podSelector"]["matchLabels"]["openshell.ai/managed-by"],
+        "openshell"
+    );
+    assert_eq!(policy["spec"]["ingress"][0]["ports"][0]["port"], 2222);
+    assert_eq!(
+        policy["spec"]["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+        "openshell"
+    );
+    assert!(
+        policy["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]
+            ["app.kubernetes.io/name"]
+            .is_string(),
+        "SSH ingress peer must select gateway pods: {policy}"
+    );
 
     // Verify sandbox CR is in the managed namespace (not the gateway namespace).
     let (ok, out) = kubectl(&["get", "sandbox.agents.x-k8s.io", "-n", &ns, "-o", "name"]).await;
