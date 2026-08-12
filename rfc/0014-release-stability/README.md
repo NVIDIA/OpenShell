@@ -1,6 +1,6 @@
 ---
 authors:
-  - "@anewberry"
+  - "@drew"
 state: review
 links:
   - https://github.com/NVIDIA/OpenShell/pull/2148
@@ -21,10 +21,8 @@ release candidates, and weekly stable releases.
   candidates nightly, and publish qualified stable releases every Tuesday.
 - Establish stable and experimental API maturity, compatibility and versioning
   rules, and maintenance for the latest and N-1 minor release lines.
-- Block stable publication on conformance, upgrade, breaking API change, and
-  security qualification across the supported release matrix.
-- Promote qualified binary payloads unchanged across standalone downloads,
-  packages, and container images, with recorded digests, SBOMs, and provenance.
+- Maintain a release qualification pipeline covering conformance, upgrades,
+  API changes, and security reviews across the supported release matrix.
 
 ## Motivation
 
@@ -68,12 +66,6 @@ prefix. Each release candidate identifies one source commit and one artifact
 manifest, uses the release feature set, and is the unit of release
 qualification. Release candidates are not supported production releases.
 
-Release tooling maps development and release candidate versions into the syntax
-and ordering rules required by Python, Cargo, Debian, RPM, Snap, OCI, Helm, and
-other publication targets. The mapping must preserve the invariant that these
-prereleases sort before their corresponding stable release wherever the package
-ecosystem supports prerelease ordering.
-
 ### Project version and compatibility contract
 
 Version 0.1.0 begins OpenShell's supported compatibility contract. For
@@ -83,30 +75,6 @@ the 0.x series:
   functionality. They do not intentionally break a stable interface.
 - An unavoidable breaking change to any stable interface starts a new minor
   release and resets the patch version, for example `0.1.x` to `0.2.0`.
-- Security fixes may make the narrowest necessary incompatible change when no
-  safe compatible remediation exists. The release notes and security guidance
-  must describe the operator action without exposing embargoed information.
-- Deprecation is preferred to removal. Except for urgent security or safety
-  reasons, a deprecated stable interface remains available for the rest of its
-  minor release line and is removed only in a later minor release.
-
-The project version covers more than protobuf wire compatibility. Before
-0.1.0, OpenShell publishes an inventory that classifies at least these surfaces:
-
-| Surface | Stable promise when designated stable |
-| --- | --- |
-| Protobuf and generated SDK APIs | Source, wire, JSON, and documented semantic compatibility |
-| Hand-written SDK APIs | Documented public types, methods, and behavior remain compatible |
-| CLI | Documented commands, flags, exit behavior, and machine-readable output remain compatible |
-| Gateway configuration | Existing supported configuration continues to parse with equivalent semantics |
-| Sandbox policy schema | Existing supported policies continue to validate and enforce equivalent intent |
-| Helm and installation configuration | Supported values, environment variables, and upgrade paths remain compatible |
-| Extension contracts | Stable driver, interceptor, and middleware contracts evolve additively |
-| Persisted operational state | Supported upgrades migrate state without requiring a clean installation |
-
-The 0.1.0 schemas, SDK signatures, CLI contract fixtures, configuration and
-policy schemas, and upgrade fixtures become the initial compatibility baseline.
-Every later stable release records which baseline it was checked against.
 
 ### Capability maturity and release availability
 
