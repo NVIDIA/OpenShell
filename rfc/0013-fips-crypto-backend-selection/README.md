@@ -506,10 +506,11 @@ would have been missed again.
 
 ## Amendment 1 — OpenSSL transport for RHEL and OpenShift
 
-*Status: proposed, contingent. Supersedes the "System OpenSSL for everything"
-rejection in [Alternatives](#system-openssl-for-everything). Additive — the AWS-LC
-mode described above is unchanged and remains the default FIPS build for non-RHEL
-targets.*
+*Status: proposed, contingent, and **not yet implementable** — see
+[Implementation gate](#implementation-gate). Supersedes the "System OpenSSL for
+everything" rejection in [Alternatives](#system-openssl-for-everything). Additive —
+the AWS-LC mode described above is unchanged and remains the default FIPS build for
+non-RHEL targets.*
 
 *Contingent because a cheaper option covers most of the same ground: see
 [`rustls-ossl` as the smaller alternative](#rustls-ossl-as-the-smaller-alternative).
@@ -571,6 +572,34 @@ honoring `update-crypto-policies` TLS settings, or is it satisfied by using the
 platform's FIPS provider with its algorithm availability? Only the former
 justifies replacing the transport.
 
+### Dependency features are load-bearing
+
+`ossl`'s defaults do not use the system OpenSSL, and getting this wrong silently
+defeats the entire premise of this amendment.
+
+`ossl` defaults to `ossl-sys`, whose build script `.expect()`s
+`KRYOPTIC_OPENSSL_SOURCES` and runs `./Configure` to compile a **private** OpenSSL
+from source. `pkg_config` and dynamic linking against the platform library are
+reached only under the `dynamic` feature. A build that omits it links a
+self-compiled OpenSSL that is not Red Hat's validated module — while every runtime
+check still reports FIPS.
+
+Both OpenSSL-mode variants must therefore pin:
+
+```toml
+ossl = { version = "1.5", default-features = false, features = ["dynamic"] }
+```
+
+with `ossl`'s own `fips` feature **off** — that feature builds the vendored
+FIPS OpenSSL with Kryoptic's `KRYOPTIC_FIPS_VENDOR`/`VERSION`/`BUILD` stamps,
+which is the opposite of using the platform provider. FIPS state comes from the
+host, verified at runtime.
+
+`mise run fips:audit` must assert this on the resolved graph, not the manifest:
+absence of `ossl-sys`'s vendored build and presence of a dynamic link to the
+platform libcrypto. A manifest-only check would pass on a graph where another
+crate re-enabled the default feature.
+
 ### What changes
 
 A second FIPS build mode in which the TLS *transport* is OpenSSL rather than
@@ -583,9 +612,25 @@ rustls. Primitives that OpenShell performs itself continue to route through
 | gRPC (tonic) | `tonic` rustls features | [`tonic-tls`](https://crates.io/crates/tonic-tls) `openssl` feature |
 | HTTP (axum/hyper) | unchanged — no TLS coupling | unchanged — no TLS coupling |
 | Multiplex, routing, upgrades | unchanged | unchanged |
-| AEAD, digest, RNG, keygen | `aws-lc-rs` | `ossl` |
+| AEAD, digest, RNG, keygen | `aws-lc-rs` | `ossl` (`dynamic`) |
 | Database TLS | `sqlx/tls-rustls-aws-lc-rs` | `sqlx/tls-native-tls` |
+| **AWS STS transport** | `CryptoMode::AwsLcFips` | **no upstream path — see below** |
+| **JWT/JOSE sign + verify** | `jsonwebtoken/aws_lc_rs` | **no upstream path — see below** |
 | Cipher suite / version policy | ours, hard-coded | inherited from `/etc/crypto-policies` |
+
+Two rows have no upstream answer, and an OpenSSL-mode build cannot be described as
+OpenSSL-only until both are resolved:
+
+**AWS STS transport.** `provider_refresh.rs` constructs an
+`aws-smithy-http-client` explicitly. Smithy's TLS providers are rustls and
+s2n-tls; there is no OpenSSL option, and even `CryptoMode::Custom` takes a
+*rustls* `CryptoProvider`. So the choices are a hand-written
+`SharedHttpClient` over `tokio-openssl`, or retaining AWS-LC for the STS path and
+narrowing the compliance claim accordingly. This must be decided before Phase 6
+ships, not after.
+
+**JWT/JOSE.** `jsonwebtoken` is enabled with `aws_lc_rs` unconditionally, and it
+is not confined to signing — see Phase 7.
 
 ### Why the transport change is small
 
@@ -611,15 +656,32 @@ extraction, and peripheral crate features:
 |---|---|
 | `openshell-server/src/tls.rs` | Acceptor on `SslAcceptor` + `tokio-openssl`, preserving hot reload |
 | `openshell-server/src/lib.rs` (accept loop) | Acceptor type at the call site |
-| `openshell-server/src/multiplex.rs` | `peer_certificates()` → `ssl().peer_cert_chain()` |
+| `openshell-server/src/multiplex.rs` | `peer_certificates()` → `ssl().peer_certificate()` — **not** `peer_cert_chain()`; see below |
 | `openshell-sdk/src/transport.rs`, `openshell-cli/src/tls.rs` | `tonic-tls::openssl::TlsConnector` |
-| `openshell-supervisor-network/src/l7/tls.rs` | Per-SNI leaf generation → `set_servername_callback` |
+| `openshell-supervisor-network/src/l7/tls.rs` | Build the acceptor per host as today; **no SNI callback** — see below |
 | `reqwest`, `tokio-tungstenite`, `kube`, `sqlx` | their `native-tls`/OpenSSL features |
 
-`openssl` 0.10 exposes everything the architecture needs: `set_alpn_protos` and
-`set_alpn_select_callback` for HTTP/2 negotiation, `set_servername_callback` for
-the supervisor's per-host leaf certificates, and `set_verify` + `set_ca_file` +
-`set_client_ca_list` for gateway mTLS with client-certificate verification.
+`openssl` 0.10 exposes what the architecture needs: `set_alpn_protos` and
+`set_alpn_select_callback` for HTTP/2 negotiation, and `set_verify` +
+`set_ca_file` + `set_client_ca_list` for gateway mTLS with client-certificate
+verification.
+
+**mTLS identity must use `peer_certificate()`, not `peer_cert_chain()`.** On a
+server, OpenSSL's peer *chain* omits the client's leaf certificate — an
+asymmetry with the client side that OpenSSL documents explicitly. Our
+`extract_peer_identity` reads the leaf (`certs[0]`) to derive the principal, so
+translating it to `peer_cert_chain()` would silently break mTLS identity, either
+failing to authenticate or — worse — deriving identity from an intermediate. Use
+`SslRef::peer_certificate() -> Option<X509>`. An integration test asserting the
+extracted principal against a known client certificate is required, not optional:
+a unit test on the parsing helper would not catch this.
+
+**The supervisor needs no SNI callback.** `l7/tls.rs::acceptor_for(hostname)`
+already receives the hostname from the CONNECT request and builds a matching
+acceptor before the handshake begins. Moving that into
+`set_servername_callback` would add a dependency on the client sending SNI and
+risk regressing IP-literal and no-SNI traffic that works today. Keep the existing
+structure and only change the acceptor type.
 
 `native-tls` was evaluated and rejected for the gateway: its `TlsAcceptorBuilder`
 exposes only protocol versions and ALPN, and its OpenSSL backend hardcodes
@@ -633,11 +695,12 @@ If libssl-level policy inheritance is *not* required, the cheaper option is
 rustls `CryptoProvider` over `ossl`, from the same project. It pins
 `rustls >=0.23.37, <0.24`, which our 0.23.38 satisfies.
 
-It is a `provider()` swap and nothing more. `tokio-rustls` is provider-agnostic —
-it wraps `rustls::ServerConnection`/`ClientConnection` and never sees the
-provider — and our workspace declares no backend feature on either `rustls` or
-`tokio-rustls`. So the acceptor, multiplex, hot reload, `peer_certificates()`,
-tonic, hyper-rustls and kube all stay as they are:
+For **consumers that already use the rustls process-default provider** it is a
+`provider()` swap and nothing more. `tokio-rustls` is provider-agnostic — it wraps
+`rustls::ServerConnection`/`ClientConnection` and never sees the provider — and our
+workspace declares no backend feature on either `rustls` or `tokio-rustls`. So the
+acceptor, multiplex, hot reload, `peer_certificates()`, tonic, hyper-rustls and
+kube all stay as they are:
 
 ```rust
 let config = ServerConfig::builder_with_provider(Arc::new(rustls_ossl::default_provider()))
@@ -647,28 +710,100 @@ let config = ServerConfig::builder_with_provider(Arc::new(rustls_ossl::default_p
 let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
 ```
 
-It is also the *cleanest* dependency graph of the three modes: with no backend
+**It does not, however, cover the surfaces that bypass that provider.** An earlier
+draft described it as "a provider swap and nothing more", which was wrong. sqlx,
+the AWS Smithy client, our direct primitives (credential AEAD, digest, RNG,
+keygen) and `jsonwebtoken` all select crypto independently, so this option carries
+the same per-surface work as the transport option — everything in the table above
+except the transport rows. The saving is the transport, not the periphery.
+
+It is the *cleanest* rustls dependency graph of the three modes: with no backend
 feature on `rustls`, an ossl-only build drops both `ring` and `aws-lc-rs` from the
-rustls graph entirely, which neither the default nor the AWS-LC mode achieves.
+rustls graph, which neither the default nor the AWS-LC mode achieves.
 
-Two caveats, neither structural. Its cipher suites are **not** availability-gated
-the way its key exchange groups and signature algorithms are, so
-ChaCha20-Poly1305 is advertised unconditionally and would be offered even where the
-FIPS provider cannot supply it — we would filter it, using the same mechanism the
-AWS-LC mode already uses to narrow key exchange, and report the inconsistency
-upstream. And it is unpublished at v0.0.1 inside a monorepo, so consuming it means
-a pinned git dependency until latchset publishes.
+Caveats, none structural but all load-bearing:
 
-Choosing this instead of the transport change would also make Phase 8 unnecessary,
-since the supervisor's static musl build only blocks *linking the platform
-libcrypto for libssl*.
+- Its cipher suites are **not** availability-gated the way its key exchange groups
+  and signature algorithms are, so ChaCha20-Poly1305 is advertised unconditionally
+  and would be offered even where the FIPS provider cannot supply it. We would
+  filter it — the same mechanism the AWS-LC mode uses to narrow key exchange — and
+  report the inconsistency upstream.
+- Unpublished at v0.0.1 inside a monorepo, so consuming it means a pinned git
+  dependency until latchset publishes.
+- Its manifest enables `ossl320`, so the supported OpenSSL floor is 3.2+. The
+  RHEL/OpenShift version matrix must be settled before selecting it.
+- It links the platform libcrypto through `ossl` exactly as the transport option
+  does, so **it does not rescue the static-musl supervisor.** An earlier draft
+  claimed choosing this would make Phase 8 unnecessary; that was false. The
+  supervisor needs the glibc/UBI packaging change under either option.
+
+### Artifact and enforcement model
+
+Three modes — default `ring`, AWS-LC FIPS, system-OpenSSL FIPS — reintroduce
+exactly the additive-feature ambiguity Phase 1 was built to eliminate. The model
+has to be defined before code, or a wrong build will report success.
+
+**Mutually exclusive features.** Rename the existing `fips` to `fips-aws-lc` and
+add `fips-ossl`. Ambiguity is rejected at compile time, extending the pattern
+already used for the sqlx conflict:
+
+```rust
+#[cfg(all(feature = "fips-aws-lc", feature = "fips-ossl"))]
+compile_error!("...mutually exclusive...");
+```
+
+**Per-mode dependency forwarding.** Each crypto mode pulls the matching database
+TLS feature, so a mode cannot be selected without its dependent surfaces
+following. The `db-tls-*` trio becomes explicit rather than hiding a database
+concern inside `fips`:
+
+| | default | `fips-aws-lc` | `fips-ossl` |
+|---|---|---|---|
+| `openshell-crypto` backend | `ring` | `aws-lc-rs/fips` | `ossl` (`dynamic`) |
+| sqlx | `db-tls-ring` | `db-tls-aws-lc` | `db-tls-openssl` |
+| rustls backend feature | `ring` | `aws_lc_rs` + `fips` | none (ossl-provider variant) or n/a |
+
+**Exactly one valid build command per artifact**, recorded in `tasks/fips.toml`
+and in `docs/security/fips.mdx`, each re-listing the non-crypto defaults that
+`--no-default-features` drops.
+
+**Dependency audit as a gate, not a report.** `fips:audit` currently reports.
+For the OpenSSL mode it must *fail* on: a vendored `ossl-sys` OpenSSL build,
+absence of a dynamic link to the platform libcrypto, or a rustls backend feature
+leaking in. This is the only check that catches the `dynamic`-feature mistake
+above, because every runtime check still passes without it.
+
+**Runtime posture checks, per mode.** `verify_fips_posture()` currently inspects
+the rustls process-default provider. In the OpenSSL mode it must instead verify
+both:
+
+1. the **explicit `ossl` library context** used for our own primitives reports
+   FIPS (`OsslContext::fips_is_enabled()`), and
+2. the **libssl context** backing the transport is in FIPS mode,
+
+and fail startup otherwise. Neither alone is sufficient, because the two can
+diverge — our primitives could be validated while the transport is not.
+
+**Host state is part of the claim.** Unlike the AWS-LC mode, where FIPS is a
+property of the artifact, here the claim depends on the host being switched to
+FIPS mode per Red Hat's procedure
+([RHEL 9 security hardening guide](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/security_hardening/switching-rhel-to-fips-mode_security-hardening)).
+Tests must run on a genuinely FIPS-configured host under the FIPS crypto policy;
+a passing suite on a non-FIPS developer machine proves nothing about this mode.
 
 ### Sequencing is constrained by packaging
 
-The gateway is glibc-linked and can adopt this independently. **The supervisor is
-a statically linked musl binary and cannot link the platform's validated
-libcrypto at all**, so its OpenSSL path is blocked behind the glibc/UBI packaging
-work in Phase 3. Gateway first; supervisor after packaging.
+**The supervisor is a statically linked musl binary and cannot link the platform's
+validated libcrypto at all**, so its OpenSSL path is blocked behind the glibc/UBI
+packaging work in Phase 3.
+
+The gateway is glibc-linked, but that is necessary and not sufficient: **glibc
+linkage does not establish module provenance.** The claim requires the runtime
+image to contain Red Hat's OpenSSL and its policy configuration. The published
+gateway image is distroless Debian, whose libcrypto is not the validated module,
+so Phase 6 also needs a UBI/RHEL gateway image — not merely a compiler target
+change. Gateway first because its packaging change is smaller, not because it is
+already satisfied.
 
 ### What we give up
 
@@ -691,16 +826,60 @@ library dependency with a version floor.
 connectors; peer-certificate extraction; `sqlx` on `tls-native-tls`. Gateway and
 CLI only.
 
-**Phase 7 — Certificate and JWT generation on `ossl`.** `rcgen` exposes a
-`RemoteKeyPair` trait that is *not* gated on its `crypto` feature, so it can be
-driven by an `ossl`-backed signer with rcgen reduced to ASN.1 encoding and neither
-`ring` nor `aws-lc-rs` linked through it. Note `serialize_der`/`serialize_pem`
-panic on remote key pairs, so the five production sites that persist private keys
-must obtain them from `ossl` instead. `jsonwebtoken` has no equivalent hook and
-needs either a small JOSE implementation over `ossl::signature` or replacement.
+**Phase 7 — X.509 and all JOSE operations on `ossl`.**
+
+`rcgen` is the tractable half: it exposes a `RemoteKeyPair` trait *not* gated on
+its `crypto` feature, so an `ossl`-backed signer can drive it with rcgen reduced to
+ASN.1 encoding and neither `ring` nor `aws-lc-rs` linked through it. Note
+`serialize_der`/`serialize_pem` panic on remote key pairs, so the five production
+sites that persist private keys must obtain them from `ossl` instead.
+
+`jsonwebtoken` is larger than "JWT generation" and the earlier phrasing understated
+it. It has no external-signer hook, is enabled with `aws_lc_rs`
+unconditionally, and covers three distinct surfaces:
+
+- **Sandbox token signing and verification** — `auth/sandbox_jwt.rs`, ES256/EdDSA.
+- **OIDC / JWKS verification** — `auth/oidc.rs`, RS256 against fetched JWKS.
+- **Google service-account assertions** — `provider_refresh.rs`, RS256 signing.
+
+All three must move for an OpenSSL-only claim to hold. That means RSA
+verification against JWKS-supplied moduli and RSA assertion signing, not only
+ECDSA — a wider surface than the sandbox path alone. **Until Phase 7 lands, Phase 6
+must not be described as an OpenSSL-only mode**; it is an OpenSSL-transport mode
+with JOSE and (pending the STS decision) AWS SDK traffic still on AWS-LC. The
+`docs/security/fips.mdx` gap list and `fips:audit` output must say so from the
+first commit.
 
 **Phase 8 — OpenSSL transport for the supervisor.** Requires the Phase 3
 glibc/UBI packaging change first.
+
+### Implementation gate
+
+This amendment is not implementable as written. Before any Phase 6 code, the
+following must be resolved in the RFC:
+
+1. **Exact supported RHEL/OpenShift and OpenSSL versions.** `ossl` gates on
+   `ossl320` (3.2+) and `ossl350` (3.5+); `rustls-ossl` requires `ossl320`. The
+   matrix determines which options are available at all.
+2. **Mutually exclusive artifact features and one strict build command per
+   artifact**, per [Artifact and enforcement model](#artifact-and-enforcement-model).
+3. **A decision for every surface**, not just the transport: AWS STS, sqlx,
+   JWT/JOSE, and direct primitives. Each is either moved to `ossl` or explicitly
+   retained on AWS-LC with the compliance claim narrowed in
+   `docs/security/fips.mdx`. "Unspecified" is not an option, because the default is
+   silently AWS-LC or rustls.
+4. **Startup posture, dependency-audit, and UBI integration tests running under
+   the RHEL FIPS crypto policy** on a genuinely FIPS-configured host.
+5. **A vertical prototype** proving, through the platform OpenSSL: gateway mTLS
+   *identity extraction*, a gRPC client connection, a sqlx connection, and an AWS
+   STS call. This is the cheapest way to find the remaining unknowns, and the mTLS
+   identity item exists specifically because the first draft of this amendment got
+   that API wrong.
+
+The full-libssl option remains sound if `update-crypto-policies` TLS behavior is
+genuinely required. The phase plan above is not yet complete enough to preserve
+that guarantee, and shipping it in its current form would produce a mode that
+reports FIPS while routing JOSE, and possibly STS, through a different module.
 
 ### Open questions for this amendment
 
