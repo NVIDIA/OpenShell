@@ -1,6 +1,6 @@
 # RFC 0014 Supplement - Release Qualification
 
-A nightly candidate is eligible for stable release only after its published
+A release candidate is eligible for stable release only after its published
 artifacts pass every required [conformance](#conformance) and
 [upgrade](#upgrade) workflow, its
 [breaking API change review](#breaking-api-change-review), and its

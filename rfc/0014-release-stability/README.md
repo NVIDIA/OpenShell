@@ -14,11 +14,11 @@ links:
 The goal of this RFC is to define OpenShell's exit from alpha and establish a
 predictable release cycle for production users and ecosystem developers.
 It defines release qualification requirements, compatibility guidelines for
-stable and evolving APIs, per-commit development releases, nightly builds, and
-weekly stable releases.
+stable and evolving APIs, per-commit development releases, nightly-generated
+release candidates, and weekly stable releases.
 
-- Publish per-commit development releases, nightly candidates, and qualified
-  stable releases every Tuesday.
+- Publish development releases for every commit to `main`, build release
+  candidates nightly, and publish qualified stable releases every Tuesday.
 - Establish stable and experimental API maturity, compatibility and versioning
   rules, and maintenance for the latest and N-1 minor release lines.
 - Block stable publication on conformance, upgrade, breaking API change, and
@@ -61,18 +61,17 @@ development compilation flags and features. They are not qualification
 evidence, are not supported deployment pins, and are not candidates for stable
 promotion.
 
-OpenShell also publishes nightly prereleases of the next expected patch
-release. After `0.1.1`, a nightly release may be identified as
-`0.1.2-nightly.20260811.1`, where the final component distinguishes multiple
-candidates created on the same date. Git tags add the normal `v` prefix. Each
-nightly identifies one source commit and one artifact manifest. A floating
-`nightly` alias may point to the newest candidate for convenience, but the alias
-is not qualification evidence and is not a supported deployment pin.
+OpenShell builds a release candidate nightly for the next expected stable
+release when `main` has changed and normal CI passes. After `0.1.1`, candidates
+are numbered `0.1.2-rc.1`, `0.1.2-rc.2`, and so on. Git tags add the normal `v`
+prefix. Each release candidate identifies one source commit and one artifact
+manifest, uses the release feature set, and is the unit of release
+qualification. Release candidates are not supported production releases.
 
-Release tooling maps development and nightly versions into the syntax and
-ordering rules required by Python, Cargo, Debian, RPM, Snap, OCI, Helm, and
+Release tooling maps development and release candidate versions into the syntax
+and ordering rules required by Python, Cargo, Debian, RPM, Snap, OCI, Helm, and
 other publication targets. The mapping must preserve the invariant that these
-releases sort before their corresponding stable release wherever the package
+prereleases sort before their corresponding stable release wherever the package
 ecosystem supports prerelease ordering.
 
 ### Project version and compatibility contract
@@ -118,12 +117,13 @@ Capability maturity is independent from the release that contains it:
 | Stable | Stable protobuf packages such as `v1` or `v2` | Covered by the release compatibility contract |
 | Experimental | Explicit unstable package such as `v1beta1` | May change with documented migration guidance |
 
-Stable and experimental capabilities may be included in stable, nightly, or
-development artifacts according to the release configuration. Availability
-only in a development or nightly build is not a third maturity level and does
-not make the capability experimental. The capability must still be classified
-independently as stable or experimental. A capability absent from stable
-artifacts has no stable release availability or support promise.
+Stable and experimental capabilities may be included in stable, release
+candidate, or development artifacts according to the release configuration.
+Availability only in a development or release candidate build is not a third
+maturity level and does not make the capability experimental. The capability
+must still be classified independently as stable or experimental. A capability
+absent from stable artifacts has no stable release availability or support
+promise.
 
 A new API that is useful to release but whose design is still evolving starts
 with a package such as `v1beta1`. It may evolve to `v1beta2` in a patch release
@@ -134,16 +134,16 @@ stable `v1` package; it does not rename the experimental package in place.
 Features that are not ready to be released are protected by named compile-time
 features such as `unstable-<feature>` and collected under a `dev` feature.
 Development releases are built with all development compilation flags and
-features enabled. Stable tagged releases and nightlies build service binaries,
-CLI commands, configuration fields, and documentation without those features.
-For now, SDK packages may include the generated types and client methods for
-development capabilities in every release so the project does not need to
-publish separate development and release SDK variants. Their presence in an SDK
-does not make the capability available or supported: the target service must
-advertise and implement it, and only stable SDK interfaces are covered by the
-compatibility contract. CI for every commit to `main` builds and tests both the
-development feature set and the release feature set so compile-gated
-development cannot silently break supported builds.
+features enabled. Stable tagged releases and release candidates build service
+binaries, CLI commands, configuration fields, and documentation without those
+features. For now, SDK packages may include the generated types and client
+methods for development capabilities in every release so the project does not
+need to publish separate development and release SDK variants. Their presence
+in an SDK does not make the capability available or supported: the target
+service must advertise and implement it, and only stable SDK interfaces are
+covered by the compatibility contract. CI for every commit to `main` builds and
+tests both the development feature set and the release feature set so
+compile-gated development cannot silently break supported builds.
 
 ### Breaking changes and API versioning
 
@@ -163,16 +163,16 @@ a minor project release even when no protobuf package changes. Conversely, a
 new experimental `v1beta2` package does not require a minor project release
 when it does not break any stable interface.
 
-Breaking-change detection runs during code review and again during nightly
-qualification. Stable protobuf packages use Buf's `FILE` rules against the
-latest stable baseline and any additional supported baseline needed for the
-N-1 maintenance promise. Language-specific API checks or agent review skills
-cover the public SDKs.
+Breaking-change detection runs during code review and again during release
+candidate qualification. Stable protobuf packages use Buf's `FILE` rules
+against the latest stable baseline and any additional supported baseline needed
+for the N-1 maintenance promise. Language-specific API checks or agent review
+skills cover the public SDKs.
 Contract fixtures cover CLI, configuration, policy, and Helm surfaces. Upgrade
 and version-skew tests cover semantic and persisted-state behavior that a schema
 diff cannot detect.
 
-### Nightly qualification and stable release promotion
+### Release candidate qualification and stable release promotion
 
 The release system separates candidate creation, qualification, and stable
 publication:
@@ -181,8 +181,8 @@ publication:
 flowchart LR
     A["Commit to main"] --> B["Dev release<br/>dev features enabled"]
     A --> C["Qualified main commit"]
-    C --> D["Nightly candidate<br/>release feature set"]
-    D --> E["Nightly qualification"]
+    C --> D["Nightly RC build<br/>release feature set"]
+    D --> E["RC qualification"]
     E -->|"pass"| F["Eligible Tuesday candidate"]
     E -->|"fail"| G["No stable release"]
     F --> H["Build or promote stable artifacts"]
@@ -191,7 +191,7 @@ flowchart LR
     I -->|"fail"| G
 ```
 
-Every nightly candidate produces a manifest containing its canonical version,
+Every release candidate produces a manifest containing its canonical version,
 full source commit, build inputs, artifact names and digests, SBOM and provenance
 references, and qualification results. Qualification installs and exercises the
 candidate artifacts wherever practical rather than substituting a source build.
@@ -214,7 +214,7 @@ The initial release targets are defined in the [build matrix](build-matrix.md),
 and blocking coverage is defined in the
 [release qualification supplement](release-qualification.md).
 
-The weekly release selects the newest eligible nightly candidate published
+The weekly release selects the newest eligible release candidate published
 before a documented cutoff. No source change is allowed between candidate
 qualification and stable publication. The candidate build produces canonical
 binary payloads once; standalone downloads, OCI images, and installation
@@ -228,12 +228,13 @@ applicable blocking qualification suites before the stable tag and publication
 are created.
 
 The stable qualification record contains the final artifact digests, SBOM and
-provenance references, and results, and links them to the qualifying nightly
-manifest. A nightly result cannot be copied to a different artifact digest.
+provenance references, and results, and links them to the qualifying release
+candidate manifest. A release candidate result cannot be copied to a different
+artifact digest.
 
 The workflow creates the stable Git tag only after all blocking checks pass.
 It must not push a tag first and attempt qualification afterward. A failed
-weekly run publishes nothing; the next run selects the newest eligible nightly
+weekly run publishes nothing; the next run selects the newest eligible release
 candidate.
 
 ### Maintenance and backports
@@ -263,14 +264,14 @@ rule; it does not shorten a line's support while it remains N-1.
 
 ## Implementation plan
 
-1. **Keep per-commit dev releases and publish 0.1.0 nightlies.** Build every
-   commit to `main` with all development features, and publish
-   `0.1.0-nightly` candidates with the release feature set leading to 0.1.0.
+1. **Keep per-commit dev releases and build 0.1.0 RCs nightly.** Build every
+   commit to `main` with all development features, and publish sequential
+   `0.1.0-rc.N` candidates with the release feature set leading to 0.1.0.
 2. **Make the necessary breaking API changes.** Use the pre-0.1.0 window to
    finalize stable interfaces, move evolving APIs to experimental packages,
    and establish the compatibility baseline.
 3. **Build qualification tests and release machinery.** Automate compatibility
    detection, conformance, upgrade, breaking API change review, security
    qualification, artifact validation, and release publication gates.
-4. **Release 0.1.0.** Promote a qualified nightly candidate, publish the stable
+4. **Release 0.1.0.** Promote a qualified release candidate, publish the stable
    artifacts and support guidance, and begin the weekly release cadence.
