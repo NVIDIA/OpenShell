@@ -967,6 +967,76 @@ pub const MIN_SANDBOX_UID: u32 = 1000;
 /// UIDs above this exceed typical OS limits and are rejected.
 pub const MAX_SANDBOX_UID: u32 = 2_000_000_000;
 
+/// Inclusive numeric range for sandbox process UID and GID values.
+///
+/// Defaults match [`MIN_SANDBOX_UID`] and [`MAX_SANDBOX_UID`]. Gateway
+/// `min_sandbox_uid` / `min_sandbox_gid` override the minima. Root (`0`)
+/// is never accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxIdentityLimits {
+    /// Inclusive minimum UID. Must be at least 1.
+    pub min_uid: u32,
+    /// Inclusive minimum GID. Must be at least 1.
+    pub min_gid: u32,
+    /// Inclusive maximum UID and GID.
+    pub max: u32,
+}
+
+impl Default for SandboxIdentityLimits {
+    fn default() -> Self {
+        Self {
+            min_uid: MIN_SANDBOX_UID,
+            min_gid: MIN_SANDBOX_UID,
+            max: MAX_SANDBOX_UID,
+        }
+    }
+}
+
+impl SandboxIdentityLimits {
+    /// Build limits from operator-configured minima, keeping the default max.
+    #[must_use]
+    pub const fn from_mins(min_uid: u32, min_gid: u32) -> Self {
+        Self {
+            min_uid,
+            min_gid,
+            max: MAX_SANDBOX_UID,
+        }
+    }
+
+    /// Read minima from the sandbox supervisor environment.
+    ///
+    /// Missing or invalid values (including `0`) fall back to
+    /// [`MIN_SANDBOX_UID`].
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            min_uid: min_from_env(openshell_core::sandbox_env::MIN_SANDBOX_UID),
+            min_gid: min_from_env(openshell_core::sandbox_env::MIN_SANDBOX_GID),
+            max: MAX_SANDBOX_UID,
+        }
+    }
+
+    /// Return whether `uid` is inside the configured UID range.
+    #[must_use]
+    pub fn contains_uid(self, uid: u32) -> bool {
+        (self.min_uid..=self.max).contains(&uid)
+    }
+
+    /// Return whether `gid` is inside the configured GID range.
+    #[must_use]
+    pub fn contains_gid(self, gid: u32) -> bool {
+        (self.min_gid..=self.max).contains(&gid)
+    }
+}
+
+fn min_from_env(name: &str) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value >= 1 && value <= MAX_SANDBOX_UID)
+        .unwrap_or(MIN_SANDBOX_UID)
+}
+
 /// The literal string value accepted as a valid sandbox user/group name.
 const SANDBOX_NAME: &str = "sandbox";
 
@@ -981,12 +1051,16 @@ const SANDBOX_NAME: &str = "sandbox";
 /// - Values above `MAX_SANDBOX_UID`
 /// - Non-numeric strings other than `"sandbox"` (e.g. `"root"`, `"nobody"`)
 pub fn is_valid_sandbox_identity(value: &str) -> bool {
+    is_valid_sandbox_identity_in_range(value, MIN_SANDBOX_UID, MAX_SANDBOX_UID)
+}
+
+fn is_valid_sandbox_identity_in_range(value: &str, min: u32, max: u32) -> bool {
     if value == SANDBOX_NAME {
         return true;
     }
     value
         .parse::<u32>()
-        .is_ok_and(|uid| (MIN_SANDBOX_UID..=MAX_SANDBOX_UID).contains(&uid))
+        .is_ok_and(|id| (min..=max).contains(&id))
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,7 +1206,12 @@ const MAX_PATH_LENGTH: usize = 4096;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyViolation {
     /// An explicit `run_as_user` or `run_as_group` is unsafe.
-    InvalidProcessIdentity { field: &'static str, value: String },
+    InvalidProcessIdentity {
+        field: &'static str,
+        value: String,
+        min: u32,
+        max: u32,
+    },
     /// A filesystem path contains `..` components.
     PathTraversal { path: String },
     /// A filesystem path is not absolute (does not start with `/`).
@@ -1180,10 +1259,15 @@ pub enum PolicyViolation {
 impl fmt::Display for PolicyViolation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidProcessIdentity { field, value } => {
+            Self::InvalidProcessIdentity {
+                field,
+                value,
+                min,
+                max,
+            } => {
                 write!(
                     f,
-                    "{field} must be 'sandbox' or a numeric UID/GID in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}], got '{value}'"
+                    "{field} must be 'sandbox' or a numeric UID/GID in range [{min}, {max}], got '{value}'"
                 )
             }
             Self::PathTraversal { path } => {
@@ -1309,22 +1393,42 @@ impl fmt::Display for PolicyViolation {
 pub fn validate_sandbox_policy(
     policy: &SandboxPolicy,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
+    validate_sandbox_policy_with_limits(policy, SandboxIdentityLimits::default())
+}
+
+/// Validate a sandbox policy using operator-configured identity limits.
+pub fn validate_sandbox_policy_with_limits(
+    policy: &SandboxPolicy,
+    limits: SandboxIdentityLimits,
+) -> std::result::Result<(), Vec<PolicyViolation>> {
     let mut violations = Vec::new();
 
     // Omitted process identity fields are resolved by the compute runtime.
     // Explicit fields must be "sandbox" or a numeric UID/GID within the
     // acceptable sandbox range.
     if let Some(ref process) = policy.process {
-        if !process.run_as_user.is_empty() && !is_valid_sandbox_identity(&process.run_as_user) {
+        if !process.run_as_user.is_empty()
+            && !is_valid_sandbox_identity_in_range(&process.run_as_user, limits.min_uid, limits.max)
+        {
             violations.push(PolicyViolation::InvalidProcessIdentity {
                 field: "run_as_user",
                 value: process.run_as_user.clone(),
+                min: limits.min_uid,
+                max: limits.max,
             });
         }
-        if !process.run_as_group.is_empty() && !is_valid_sandbox_identity(&process.run_as_group) {
+        if !process.run_as_group.is_empty()
+            && !is_valid_sandbox_identity_in_range(
+                &process.run_as_group,
+                limits.min_gid,
+                limits.max,
+            )
+        {
             violations.push(PolicyViolation::InvalidProcessIdentity {
                 field: "run_as_group",
                 value: process.run_as_group.clone(),
+                min: limits.min_gid,
+                max: limits.max,
             });
         }
     }
@@ -2771,6 +2875,8 @@ network_policies:
         let v = PolicyViolation::InvalidProcessIdentity {
             field: "run_as_user",
             value: "root".into(),
+            min: MIN_SANDBOX_UID,
+            max: MAX_SANDBOX_UID,
         };
         let s = format!("{v}");
         assert!(s.contains("root"));
@@ -2827,6 +2933,13 @@ network_policies:
     #[test]
     fn valid_identity_rejects_empty_string() {
         assert!(!is_valid_sandbox_identity(""));
+    }
+
+    #[test]
+    fn valid_identity_in_range_accepts_gid_thirty_when_min_is_one() {
+        assert!(is_valid_sandbox_identity_in_range("30", 1, MAX_SANDBOX_UID));
+        assert!(!is_valid_sandbox_identity_in_range("0", 1, MAX_SANDBOX_UID));
+        assert!(!is_valid_sandbox_identity("30"));
     }
 
     // ---- Policy validation with numeric UIDs ----
@@ -2898,6 +3011,36 @@ network_policies:
     }
 
     #[test]
+    fn validate_with_limits_accepts_gid_thirty() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "1000".into(),
+            run_as_group: "30".into(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_err());
+        assert!(
+            validate_sandbox_policy_with_limits(
+                &policy,
+                SandboxIdentityLimits::from_mins(MIN_SANDBOX_UID, 1)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_with_limits_still_rejects_root() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "0".into(),
+            run_as_group: "0".into(),
+        });
+        let violations =
+            validate_sandbox_policy_with_limits(&policy, SandboxIdentityLimits::from_mins(1, 1))
+                .unwrap_err();
+        assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
     fn validate_rejects_root_string() {
         let mut policy = restrictive_default_policy();
         policy.process = Some(ProcessPolicy {
@@ -2947,6 +3090,8 @@ network_policies:
         let v = PolicyViolation::InvalidProcessIdentity {
             field: "run_as_user",
             value: "root".into(),
+            min: MIN_SANDBOX_UID,
+            max: MAX_SANDBOX_UID,
         };
         let s = format!("{v}");
         assert!(s.contains("sandbox"));

@@ -117,6 +117,11 @@ pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 /// Shared by the Docker and Podman drivers; override via driver config.
 pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
 
+/// Default minimum numeric UID/GID accepted for sandbox process identity.
+///
+/// Keep in sync with `openshell_policy::MIN_SANDBOX_UID`.
+pub const DEFAULT_MIN_SANDBOX_IDENTITY: u32 = 1000;
+
 /// Compute backends the gateway can orchestrate sandboxes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -485,6 +490,12 @@ pub struct Config {
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
 
+    /// Minimum numeric UID accepted for sandbox process identity.
+    pub min_sandbox_uid: u32,
+
+    /// Minimum numeric GID accepted for sandbox process identity.
+    pub min_sandbox_gid: u32,
+
     /// Maximum gRPC requests allowed per rate-limit window.
     ///
     /// When paired with [`Self::grpc_rate_limit_window_secs`], positive values
@@ -840,6 +851,8 @@ impl Config {
             credential_drivers: Vec::new(),
             default_credential_driver: None,
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
+            min_sandbox_uid: DEFAULT_MIN_SANDBOX_IDENTITY,
+            min_sandbox_gid: DEFAULT_MIN_SANDBOX_IDENTITY,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
@@ -927,6 +940,20 @@ impl Config {
     #[must_use]
     pub const fn with_ssh_session_ttl_secs(mut self, secs: u64) -> Self {
         self.ssh_session_ttl_secs = secs;
+        self
+    }
+
+    /// Create a new configuration with the minimum accepted sandbox UID.
+    #[must_use]
+    pub const fn with_min_sandbox_uid(mut self, uid: u32) -> Self {
+        self.min_sandbox_uid = uid;
+        self
+    }
+
+    /// Create a new configuration with the minimum accepted sandbox GID.
+    #[must_use]
+    pub const fn with_min_sandbox_gid(mut self, gid: u32) -> Self {
+        self.min_sandbox_gid = gid;
         self
     }
 

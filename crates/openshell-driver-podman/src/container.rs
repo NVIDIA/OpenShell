@@ -522,6 +522,14 @@ fn build_env(
         "sleep infinity".into(),
     );
     env.insert(
+        openshell_core::sandbox_env::MIN_SANDBOX_UID.into(),
+        config.min_sandbox_uid.to_string(),
+    );
+    env.insert(
+        openshell_core::sandbox_env::MIN_SANDBOX_GID.into(),
+        config.min_sandbox_gid.to_string(),
+    );
+    env.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),
         openshell_core::telemetry::enabled_env_value().into(),
     );

@@ -394,6 +394,12 @@ pub struct KubernetesComputeConfig {
     /// When empty and `sandbox_uid` is set, defaults to the resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_gid: Option<u32>,
+    /// Minimum accepted sandbox process UID.
+    #[serde(skip, default = "default_min_sandbox_identity")]
+    pub min_sandbox_uid: u32,
+    /// Minimum accepted sandbox process GID.
+    #[serde(skip, default = "default_min_sandbox_identity")]
+    pub min_sandbox_gid: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -415,6 +421,10 @@ pub const MAX_SA_TOKEN_TTL_SECS: i64 = 86_400;
 /// Default sandbox UID used when neither config nor `OpenShift` SCC annotations
 /// provide a resolved value.
 pub(crate) const DEFAULT_SANDBOX_UID: u32 = 1000;
+
+const fn default_min_sandbox_identity() -> u32 {
+    config::DEFAULT_MIN_SANDBOX_IDENTITY
+}
 
 /// The annotation key for the `OpenShift` `ServiceAccount` UID range.
 /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
@@ -465,6 +475,8 @@ impl Default for KubernetesComputeConfig {
             provider_spiffe_workload_api_socket_path: String::new(),
             sandbox_uid: None,
             sandbox_gid: None,
+            min_sandbox_uid: default_min_sandbox_identity(),
+            min_sandbox_gid: default_min_sandbox_identity(),
         }
     }
 }

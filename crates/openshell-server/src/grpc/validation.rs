@@ -824,7 +824,15 @@ pub(super) fn validate_object_metadata(
 /// Delegates to [`openshell_policy::validate_sandbox_policy`] and converts
 /// violations into a gRPC `INVALID_ARGUMENT` status.
 pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
-    if let Err(violations) = openshell_policy::validate_sandbox_policy(policy) {
+    validate_policy_safety_with_limits(policy, openshell_policy::SandboxIdentityLimits::default())
+}
+
+/// Validate policy safety using operator-configured identity limits.
+pub(super) fn validate_policy_safety_with_limits(
+    policy: &ProtoSandboxPolicy,
+    limits: openshell_policy::SandboxIdentityLimits,
+) -> Result<(), Status> {
+    if let Err(violations) = openshell_policy::validate_sandbox_policy_with_limits(policy, limits) {
         let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
         return Err(Status::invalid_argument(format!(
             "policy contains unsafe content: {}",
@@ -832,6 +840,16 @@ pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), 
         )));
     }
     Ok(())
+}
+
+/// Identity limits from the gateway runtime config.
+pub(super) fn identity_limits(
+    config: &openshell_core::Config,
+) -> openshell_policy::SandboxIdentityLimits {
+    openshell_policy::SandboxIdentityLimits::from_mins(
+        config.min_sandbox_uid,
+        config.min_sandbox_gid,
+    )
 }
 
 /// Validate that user-authored policy does not use provider-derived rule keys.
@@ -1999,6 +2017,30 @@ mod tests {
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("invalid on_error"));
         assert!(err.message().contains("invalid host pattern"));
+    }
+
+    #[test]
+    fn validate_policy_safety_with_limits_accepts_gid_thirty() {
+        use openshell_core::proto::ProcessPolicy;
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "1000".into(),
+            run_as_group: "30".into(),
+        });
+        let err = validate_policy_safety(&policy).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            validate_policy_safety_with_limits(
+                &policy,
+                openshell_policy::SandboxIdentityLimits::from_mins(
+                    openshell_policy::MIN_SANDBOX_UID,
+                    1,
+                ),
+            )
+            .is_ok()
+        );
+        assert!(err.message().contains("run_as_group"));
     }
 
     #[test]

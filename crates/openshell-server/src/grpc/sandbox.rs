@@ -53,9 +53,9 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique,
 };
 use super::validation::{
-    level_matches, normalize_process_identity_for_driver, source_matches,
+    identity_limits, level_matches, normalize_process_identity_for_driver, source_matches,
     validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
-    validate_policy_safety, validate_sandbox_spec,
+    validate_policy_safety_with_limits, validate_sandbox_spec,
 };
 use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -273,7 +273,7 @@ async fn handle_create_sandbox_inner(
     if let Some(ref mut policy) = spec.policy {
         normalize_process_identity_for_driver(policy, state.compute.driver_kind());
         validate_no_reserved_provider_policy_keys(policy)?;
-        validate_policy_safety(policy)?;
+        validate_policy_safety_with_limits(policy, identity_limits(&state.config))?;
         crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
     }
 

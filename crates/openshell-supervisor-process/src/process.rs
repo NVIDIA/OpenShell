@@ -946,12 +946,22 @@ impl Drop for ProcessHandle {
 /// `"sandbox"` identity and other names must resolve in `/etc/passwd`.
 #[cfg(unix)]
 pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
+    validate_sandbox_user_with_limits(policy, openshell_policy::SandboxIdentityLimits::from_env())
+}
+
+#[cfg(unix)]
+fn validate_sandbox_user_with_limits(
+    policy: &SandboxPolicy,
+    limits: openshell_policy::SandboxIdentityLimits,
+) -> Result<()> {
     let identity = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
 
     if let Ok(uid) = identity.parse::<u32>() {
-        if !(MIN_SANDBOX_UID..=MAX_SANDBOX_UID).contains(&uid) {
+        if !limits.contains_uid(uid) {
             return Err(miette::miette!(
-                "process user UID must be in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+                "process user UID must be in range [{}, {}]",
+                limits.min_uid,
+                limits.max
             ));
         }
         openshell_ocsf::ocsf_emit!(
@@ -999,7 +1009,9 @@ pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
             Ok(None) => {
                 return Err(miette::miette!(
                     "unrecognized sandbox identity '{identity}'; \
-                     expected 'sandbox' or a numeric UID in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+                     expected 'sandbox' or a numeric UID in range [{}, {}]",
+                    limits.min_uid,
+                    limits.max
                 ));
             }
             Err(e) => {
@@ -1018,12 +1030,22 @@ pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
 /// Mirrors [`validate_sandbox_user`] for the group dimension.
 #[cfg(unix)]
 pub fn validate_sandbox_group(policy: &SandboxPolicy) -> Result<()> {
+    validate_sandbox_group_with_limits(policy, openshell_policy::SandboxIdentityLimits::from_env())
+}
+
+#[cfg(unix)]
+fn validate_sandbox_group_with_limits(
+    policy: &SandboxPolicy,
+    limits: openshell_policy::SandboxIdentityLimits,
+) -> Result<()> {
     let identity = policy.process.run_as_group.as_deref().unwrap_or("sandbox");
 
     if let Ok(gid) = identity.parse::<u32>() {
-        if !(MIN_SANDBOX_UID..=MAX_SANDBOX_UID).contains(&gid) {
+        if !limits.contains_gid(gid) {
             return Err(miette::miette!(
-                "process group GID must be in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+                "process group GID must be in range [{}, {}]",
+                limits.min_gid,
+                limits.max
             ));
         }
         openshell_ocsf::ocsf_emit!(
@@ -1068,7 +1090,9 @@ pub fn validate_sandbox_group(policy: &SandboxPolicy) -> Result<()> {
             Ok(None) => {
                 return Err(miette::miette!(
                     "unrecognized sandbox group identity '{identity}'; \
-                     expected 'sandbox' or a numeric GID in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+                     expected 'sandbox' or a numeric GID in range [{}, {}]",
+                    limits.min_gid,
+                    limits.max
                 ));
             }
             Err(e) => {
@@ -2238,6 +2262,19 @@ mod tests {
 
         assert!(validate_sandbox_user(&policy).is_err());
         assert!(validate_sandbox_group(&policy).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn explicit_identity_accepts_system_ids_when_min_is_one() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("30".into()),
+            run_as_group: Some("30".into()),
+        });
+        let limits = openshell_policy::SandboxIdentityLimits::from_mins(1, 1);
+
+        assert!(validate_sandbox_user_with_limits(&policy, limits).is_ok());
+        assert!(validate_sandbox_group_with_limits(&policy, limits).is_ok());
     }
 
     #[test]

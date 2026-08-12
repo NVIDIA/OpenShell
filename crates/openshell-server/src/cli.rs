@@ -429,6 +429,19 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
         config = config.with_ssh_session_ttl_secs(ttl);
     }
 
+    if let Some(uid) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.min_sandbox_uid)
+    {
+        config = config.with_min_sandbox_uid(uid);
+    }
+    if let Some(gid) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.min_sandbox_gid)
+    {
+        config = config.with_min_sandbox_gid(gid);
+    }
+
     if let Some(mode) = file
         .as_ref()
         .and_then(|f| f.openshell.gateway.policy_validation_failure_mode)
@@ -1576,6 +1589,19 @@ ssh_session_ttl_secs = 1234
 ",
         );
         assert_eq!(file.openshell.gateway.ssh_session_ttl_secs, Some(1234));
+    }
+
+    #[test]
+    fn file_min_sandbox_identity_is_parsed() {
+        let file = config_file_from_toml(
+            r"
+[openshell.gateway]
+min_sandbox_uid = 1
+min_sandbox_gid = 1
+",
+        );
+        assert_eq!(file.openshell.gateway.min_sandbox_uid, Some(1));
+        assert_eq!(file.openshell.gateway.min_sandbox_gid, Some(1));
     }
 
     #[test]

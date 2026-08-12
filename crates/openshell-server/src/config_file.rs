@@ -115,6 +115,10 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub ssh_session_ttl_secs: Option<u64>,
     #[serde(default)]
+    pub min_sandbox_uid: Option<u32>,
+    #[serde(default)]
+    pub min_sandbox_gid: Option<u32>,
+    #[serde(default)]
     pub grpc_rate_limit_requests: Option<u64>,
     #[serde(default)]
     pub grpc_rate_limit_window_seconds: Option<u64>,
@@ -411,8 +415,32 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
             message: "omit the field to use default encrypted gateway credential storage, or specify exactly one external credential driver",
         });
     }
+    validate_min_sandbox_identity(
+        "openshell.gateway.min_sandbox_uid",
+        file.openshell.gateway.min_sandbox_uid,
+    )?;
+    validate_min_sandbox_identity(
+        "openshell.gateway.min_sandbox_gid",
+        file.openshell.gateway.min_sandbox_gid,
+    )?;
 
     Ok(file)
+}
+
+fn validate_min_sandbox_identity(
+    field: &'static str,
+    value: Option<u32>,
+) -> Result<(), ConfigFileError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value == 0 || value > openshell_policy::MAX_SANDBOX_UID {
+        return Err(ConfigFileError::InvalidValue {
+            field,
+            message: "must be in range [1, 2000000000]; 0 is forbidden",
+        });
+    }
+    Ok(())
 }
 
 /// Build the merged TOML table for `driver` by overlaying inheritable
@@ -965,6 +993,53 @@ version = 2
         assert!(matches!(
             err,
             ConfigFileError::UnsupportedVersion { version: 2 }
+        ));
+    }
+
+    #[test]
+    fn accepts_min_sandbox_identity() {
+        let toml = r"
+[openshell.gateway]
+min_sandbox_uid = 1
+min_sandbox_gid = 1
+";
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("min identity 1 is valid");
+        assert_eq!(file.openshell.gateway.min_sandbox_uid, Some(1));
+        assert_eq!(file.openshell.gateway.min_sandbox_gid, Some(1));
+    }
+
+    #[test]
+    fn rejects_min_sandbox_uid_zero() {
+        let toml = r"
+[openshell.gateway]
+min_sandbox_uid = 0
+";
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path()).expect_err("UID 0 must be rejected");
+        assert!(matches!(
+            err,
+            ConfigFileError::InvalidValue {
+                field: "openshell.gateway.min_sandbox_uid",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_min_sandbox_gid_zero() {
+        let toml = r"
+[openshell.gateway]
+min_sandbox_gid = 0
+";
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path()).expect_err("GID 0 must be rejected");
+        assert!(matches!(
+            err,
+            ConfigFileError::InvalidValue {
+                field: "openshell.gateway.min_sandbox_gid",
+                ..
+            }
         ));
     }
 

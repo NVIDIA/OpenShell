@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use openshell_core::config::DEFAULT_SERVER_PORT;
+use openshell_core::config::{DEFAULT_MIN_SANDBOX_IDENTITY, DEFAULT_SERVER_PORT};
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE, supervisor_cache_path_with_base,
@@ -120,6 +120,8 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         allow_all_default_gpu: false,
         sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
         enable_bind_mounts: false,
+        min_sandbox_uid: DEFAULT_MIN_SANDBOX_IDENTITY,
+        min_sandbox_gid: DEFAULT_MIN_SANDBOX_IDENTITY,
     }
 }
 
@@ -619,6 +621,16 @@ fn build_environment_sets_docker_tls_paths() {
     assert!(env.contains(&"TEMPLATE_ENV=template".to_string()));
     assert!(env.contains(&"SPEC_ENV=spec".to_string()));
     assert!(env.contains(&"OPENSHELL_SANDBOX_COMMAND=sleep infinity".to_string()));
+}
+
+#[test]
+fn build_environment_injects_configured_identity_mins() {
+    let mut config = runtime_config();
+    config.min_sandbox_uid = 1;
+    config.min_sandbox_gid = 1;
+    let env = build_environment(&test_sandbox(), &config);
+    assert!(env.contains(&"OPENSHELL_MIN_SANDBOX_UID=1".to_string()));
+    assert!(env.contains(&"OPENSHELL_MIN_SANDBOX_GID=1".to_string()));
 }
 
 #[test]

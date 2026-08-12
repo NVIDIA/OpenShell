@@ -81,9 +81,9 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
-    level_matches, normalize_process_identity_for_driver, source_matches, validate_annotations,
-    validate_no_reserved_provider_policy_keys, validate_policy_safety,
-    validate_static_fields_unchanged,
+    identity_limits, level_matches, normalize_process_identity_for_driver, source_matches,
+    validate_annotations, validate_no_reserved_provider_policy_keys, validate_policy_safety,
+    validate_policy_safety_with_limits, validate_static_fields_unchanged,
 };
 use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -1871,7 +1871,8 @@ pub(super) async fn handle_get_sandbox_config(
         .await?;
         if !provider_layers.is_empty() {
             let effective_policy = compose_effective_policy(source_policy, &provider_layers);
-            validate_policy_safety(&effective_policy).map_err(|error| {
+            validate_policy_safety_with_limits(&effective_policy, identity_limits(&state.config))
+                .map_err(|error| {
                 Status::failed_precondition(format!(
                     "provider composition produced an invalid effective policy: {}",
                     error.message()
@@ -2391,7 +2392,7 @@ async fn handle_update_config_inner(
             })?;
             normalize_process_identity_for_driver(&mut new_policy, state.compute.driver_kind());
             validate_no_reserved_provider_policy_keys(&new_policy)?;
-            validate_policy_safety(&new_policy)?;
+            validate_policy_safety_with_limits(&new_policy, identity_limits(&state.config))?;
             crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy)
                 .await?;
             validate_candidate_effective_policy(&new_policy, &[])?;
@@ -2811,7 +2812,7 @@ async fn handle_update_config_inner(
         Some(new_policy.clone())
     };
 
-    validate_policy_safety(&new_policy)?;
+    validate_policy_safety_with_limits(&new_policy, identity_limits(&state.config))?;
     crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy).await?;
     let provider_layers =
         provider_policy_layers_for_sandbox(state, &workspace, &sandbox, &spec.providers).await?;
@@ -4004,7 +4005,7 @@ async fn handle_approve_all_draft_chunks_inner(
             .map_err(map_policy_merge_error)?
             .policy;
     }
-    validate_policy_safety(&bulk_candidate)?;
+    validate_policy_safety_with_limits(&bulk_candidate, identity_limits(&state.config))?;
     validate_candidate_effective_policy(&bulk_candidate, &provider_layers)?;
 
     for chunk in &pending_chunks {

@@ -55,19 +55,22 @@ impl DriverIdentity {
         match (oci_user, uid, gid) {
             (Some(declaration), None, None) => Ok(Self::OciUser { declaration }),
             (None, Some(uid), Some(gid)) => {
-                let uid = uid.parse::<u32>().ok().filter(|uid| {
-                    (openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID)
-                        .contains(uid)
-                });
-                let gid = gid.parse::<u32>().ok().filter(|gid| {
-                    (openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID)
-                        .contains(gid)
-                });
+                let limits = openshell_policy::SandboxIdentityLimits::from_env();
+                let uid = uid
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|uid| limits.contains_uid(*uid));
+                let gid = gid
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|gid| limits.contains_gid(*gid));
                 let (Some(uid), Some(gid)) = (uid, gid) else {
                     return Err(miette::miette!(
-                        "driver UID/GID must be numeric identities in range [{}, {}]",
-                        openshell_policy::MIN_SANDBOX_UID,
-                        openshell_policy::MAX_SANDBOX_UID
+                        "driver UID must be in range [{}, {}] and GID in range [{}, {}]",
+                        limits.min_uid,
+                        limits.max,
+                        limits.min_gid,
+                        limits.max
                     ));
                 };
                 Ok(Self::Resolved { uid, gid })

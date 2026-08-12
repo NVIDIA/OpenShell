@@ -1435,6 +1435,8 @@ impl KubernetesComputeDriver {
                 .provider_spiffe_workload_api_socket_path,
             sandbox_uid: resolved_user_id,
             sandbox_gid: resolved_group_id,
+            min_sandbox_uid: self.config.min_sandbox_uid,
+            min_sandbox_gid: self.config.min_sandbox_gid,
         };
         validate_sidecar_proxy_identity(&params)?;
 
@@ -2685,6 +2687,7 @@ fn supervisor_sidecar_env(
         !params.client_tls_secret_name.is_empty(),
         provider_spiffe_socket_path(params),
     );
+    apply_identity_limit_env(&mut env, params);
     if !params.client_tls_secret_name.is_empty() {
         upsert_env(
             &mut env,
@@ -3225,6 +3228,10 @@ struct SandboxPodParams<'a> {
     sandbox_uid: u32,
     /// Resolved sandbox GID for PVC init container operations.
     sandbox_gid: u32,
+    /// Minimum accepted numeric UID injected into the supervisor environment.
+    min_sandbox_uid: u32,
+    /// Minimum accepted numeric GID injected into the supervisor environment.
+    min_sandbox_gid: u32,
 }
 
 impl Default for SandboxPodParams<'_> {
@@ -3262,6 +3269,8 @@ impl Default for SandboxPodParams<'_> {
             provider_spiffe_workload_api_socket_path: "",
             sandbox_uid: DEFAULT_SANDBOX_UID,
             sandbox_gid: DEFAULT_SANDBOX_UID,
+            min_sandbox_uid: DEFAULT_SANDBOX_UID,
+            min_sandbox_gid: DEFAULT_SANDBOX_UID,
         }
     }
 }
@@ -3555,7 +3564,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     }
 
     // Build environment variables - start with OpenShell-required vars
-    let env = build_env_list(
+    let mut env = build_env_list(
         None,
         &template.environment,
         spec_environment,
@@ -3566,6 +3575,7 @@ fn sandbox_template_to_k8s_with_validated_config(
         !params.client_tls_secret_name.is_empty(),
         provider_spiffe_socket_path(params),
     );
+    apply_identity_limit_env(&mut env, params);
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
 
@@ -3959,6 +3969,19 @@ fn build_env_list(
         provider_spiffe_socket_path,
     );
     env
+}
+
+fn apply_identity_limit_env(env: &mut Vec<serde_json::Value>, params: &SandboxPodParams<'_>) {
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::MIN_SANDBOX_UID,
+        &params.min_sandbox_uid.to_string(),
+    );
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::MIN_SANDBOX_GID,
+        &params.min_sandbox_gid.to_string(),
+    );
 }
 
 fn apply_env_map(

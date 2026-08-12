@@ -20,6 +20,11 @@ pub fn kubernetes_config_from_context(
 ) -> Result<KubernetesComputeConfig> {
     let mut cfg = driver_config_from_context(context, ComputeDriverKind::Kubernetes.as_str())?;
     apply_kubernetes_runtime_defaults(&mut cfg);
+    apply_identity_limits_from_file(
+        &mut cfg.min_sandbox_uid,
+        &mut cfg.min_sandbox_gid,
+        context.file,
+    );
     Ok(cfg)
 }
 
@@ -73,6 +78,22 @@ fn apply_kubernetes_runtime_defaults(k8s: &mut KubernetesComputeConfig) {
     }
 }
 
+fn apply_identity_limits_from_file(
+    min_uid: &mut u32,
+    min_gid: &mut u32,
+    file: Option<&config_file::ConfigFile>,
+) {
+    let Some(gateway) = file.map(|file| &file.openshell.gateway) else {
+        return;
+    };
+    if let Some(uid) = gateway.min_sandbox_uid {
+        *min_uid = uid;
+    }
+    if let Some(gid) = gateway.min_sandbox_gid {
+        *min_gid = gid;
+    }
+}
+
 fn apply_podman_runtime_defaults(
     podman: &mut PodmanComputeConfig,
     context: DriverStartupContext<'_>,
@@ -84,6 +105,11 @@ fn apply_podman_runtime_defaults(
         &mut podman.guest_tls_cert,
         &mut podman.guest_tls_key,
         context.guest_tls,
+    );
+    apply_identity_limits_from_file(
+        &mut podman.min_sandbox_uid,
+        &mut podman.min_sandbox_gid,
+        context.file,
     );
 }
 

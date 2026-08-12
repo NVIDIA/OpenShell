@@ -100,6 +100,18 @@ pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
 pub const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET: &str =
     "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET";
 
+/// Minimum accepted numeric UID for sandbox process identity.
+///
+/// Set by compute drivers from `[openshell.gateway] min_sandbox_uid`. The
+/// supervisor reads this at startup when validating numeric policy identities.
+pub const MIN_SANDBOX_UID: &str = "OPENSHELL_MIN_SANDBOX_UID";
+
+/// Minimum accepted numeric GID for sandbox process identity.
+///
+/// Set by compute drivers from `[openshell.gateway] min_sandbox_gid`. The
+/// supervisor reads this at startup when validating numeric policy identities.
+pub const MIN_SANDBOX_GID: &str = "OPENSHELL_MIN_SANDBOX_GID";
+
 /// Resolved sandbox UID used to override `run_as_user` when the policy
 /// specifies a numeric value instead of the hardcoded "sandbox" user name.
 ///

@@ -280,6 +280,8 @@ async fn main() -> Result<()> {
                 .unwrap_or_default(),
             sandbox_uid: args.sandbox_uid,
             sandbox_gid: args.sandbox_gid,
+            min_sandbox_uid: openshell_core::config::DEFAULT_MIN_SANDBOX_IDENTITY,
+            min_sandbox_gid: openshell_core::config::DEFAULT_MIN_SANDBOX_IDENTITY,
         },
         shutdown_rx,
     )

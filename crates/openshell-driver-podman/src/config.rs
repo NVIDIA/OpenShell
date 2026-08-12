@@ -196,6 +196,12 @@ pub struct PodmanComputeConfig {
     /// Each entry is `"container_id:host_id:size"`.
     #[serde(default)]
     pub gidmap: Vec<String>,
+    /// Minimum accepted sandbox process UID.
+    #[serde(skip, default = "default_min_sandbox_identity")]
+    pub min_sandbox_uid: u32,
+    /// Minimum accepted sandbox process GID.
+    #[serde(skip, default = "default_min_sandbox_identity")]
+    pub min_sandbox_gid: u32,
 }
 
 pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 10;
@@ -234,6 +240,10 @@ pub fn parse_id_map_entry(
         )));
     }
     Ok((container_id, host_id, size))
+}
+
+const fn default_min_sandbox_identity() -> u32 {
+    openshell_core::config::DEFAULT_MIN_SANDBOX_IDENTITY
 }
 
 impl PodmanComputeConfig {
@@ -512,6 +522,8 @@ impl Default for PodmanComputeConfig {
             userns: None,
             uidmap: Vec::new(),
             gidmap: Vec::new(),
+            min_sandbox_uid: default_min_sandbox_identity(),
+            min_sandbox_gid: default_min_sandbox_identity(),
         }
     }
 }
@@ -547,6 +559,8 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("userns", &self.userns)
             .field("uidmap", &self.uidmap)
             .field("gidmap", &self.gidmap)
+            .field("min_sandbox_uid", &self.min_sandbox_uid)
+            .field("min_sandbox_gid", &self.min_sandbox_gid)
             .finish()
     }
 }

@@ -189,6 +189,8 @@ struct DockerDriverRuntimeConfig {
     allow_all_default_gpu: bool,
     sandbox_pids_limit: i64,
     enable_bind_mounts: bool,
+    min_sandbox_uid: u32,
+    min_sandbox_gid: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,6 +473,8 @@ impl DockerComputeDriver {
                 allow_all_default_gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
+                min_sandbox_uid: config.min_sandbox_uid,
+                min_sandbox_gid: config.min_sandbox_gid,
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -2451,6 +2455,14 @@ fn build_environment_for_oci_user(
     environment.insert(
         openshell_core::sandbox_env::SANDBOX_COMMAND.to_string(),
         SANDBOX_COMMAND.to_string(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::MIN_SANDBOX_UID.to_string(),
+        config.min_sandbox_uid.to_string(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::MIN_SANDBOX_GID.to_string(),
+        config.min_sandbox_gid.to_string(),
     );
     environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
