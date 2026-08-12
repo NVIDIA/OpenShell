@@ -3541,7 +3541,7 @@ fn driver_snapshot_confirms_stopped(incoming: &DriverSandbox) -> bool {
 fn driver_snapshot_confirms_stopping(incoming: &DriverSandbox) -> bool {
     incoming.status.as_ref().is_some_and(|status| {
         status.conditions.iter().any(|condition| {
-            condition.r#type.eq_ignore_ascii_case("Stopped")
+            condition.r#type.eq_ignore_ascii_case("Suspended")
                 && condition.status.eq_ignore_ascii_case("false")
                 && matches!(
                     condition.reason.to_ascii_lowercase().as_str(),
@@ -3689,7 +3689,7 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
         }
 
         if status.conditions.iter().any(|condition| {
-            condition.r#type.eq_ignore_ascii_case("Stopped")
+            condition.r#type.eq_ignore_ascii_case("Suspended")
                 && condition.status.eq_ignore_ascii_case("true")
         }) {
             return SandboxPhase::Stopped;
@@ -5592,7 +5592,7 @@ mod tests {
             instance_id: format!("{}-pod", sandbox.object_name()),
             conditions: vec![
                 DriverCondition {
-                    r#type: "Stopped".to_string(),
+                    r#type: "Suspended".to_string(),
                     status: "False".to_string(),
                     reason: "PodTerminating".to_string(),
                     message: "Pod is terminating. Sandbox is stopping".to_string(),

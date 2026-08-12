@@ -102,6 +102,8 @@ const SANDBOX_VERSION_V1ALPHA1: &str = "v1alpha1";
 const SANDBOX_VERSIONS: &[&str] = &[SANDBOX_VERSION_V1BETA1, SANDBOX_VERSION_V1ALPHA1];
 pub const SANDBOX_KIND: &str = "Sandbox";
 const SANDBOX_POD_NAME_ANNOTATION: &str = "agents.x-k8s.io/pod-name";
+const SANDBOX_SUSPENDED_CONDITION: &str = "Suspended";
+const SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON: &str = "PodNotOwned";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const SPIFFE_WORKLOAD_API_VOLUME_NAME: &str = "spiffe-workload-api";
@@ -969,6 +971,9 @@ impl KubernetesComputeDriver {
             .map_err(|err| err.to_string())?;
             if kubernetes_sandbox_has_stopped_condition(&object) {
                 return Ok(());
+            }
+            if let Some(error) = kubernetes_sandbox_stop_failure(&object) {
+                return Err(error);
             }
             if let Some(pod_api) = legacy_pod_api.as_ref()
                 && kubernetes_sandbox_pod_is_gone(pod_api, &pod_name, deadline).await?
@@ -3267,12 +3272,41 @@ fn kubernetes_sandbox_has_stopped_condition(obj: &DynamicObject) -> bool {
         .and_then(serde_json::Value::as_array)
         .is_some_and(|conditions| {
             conditions.iter().any(|condition| {
-                condition.get("type").and_then(serde_json::Value::as_str) == Some("Suspended")
+                condition.get("type").and_then(serde_json::Value::as_str)
+                    == Some(SANDBOX_SUSPENDED_CONDITION)
                     && condition
                         .get("status")
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|status| status.eq_ignore_ascii_case("true"))
             })
+        })
+}
+
+fn kubernetes_sandbox_stop_failure(obj: &DynamicObject) -> Option<String> {
+    obj.data
+        .get("status")?
+        .get("conditions")?
+        .as_array()?
+        .iter()
+        .find_map(|condition| {
+            let is_terminal = condition.get("type").and_then(serde_json::Value::as_str)
+                == Some(SANDBOX_SUSPENDED_CONDITION)
+                && condition
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|status| status.eq_ignore_ascii_case("false"))
+                && condition.get("reason").and_then(serde_json::Value::as_str)
+                    == Some(SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON);
+            if !is_terminal {
+                return None;
+            }
+
+            let message = condition
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .filter(|message| !message.is_empty())
+                .unwrap_or("backing pod is not owned by this sandbox");
+            Some(format!("Kubernetes sandbox stop rejected: {message}"))
         })
 }
 
@@ -3487,6 +3521,40 @@ mod tests {
             }
         });
         assert!(kubernetes_sandbox_has_stopped_condition(&sandbox));
+    }
+
+    #[test]
+    fn stop_failure_only_rejects_terminal_suspension_condition() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.data = serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Suspended",
+                    "status": "False",
+                    "reason": "PodNotOwned",
+                    "message": "Refused to delete pod because it is not owned by this sandbox"
+                }]
+            }
+        });
+
+        assert_eq!(
+            kubernetes_sandbox_stop_failure(&sandbox).as_deref(),
+            Some(
+                "Kubernetes sandbox stop rejected: Refused to delete pod because it is not owned by this sandbox"
+            )
+        );
+
+        sandbox.data["status"]["conditions"][0]["status"] = serde_json::json!("Unknown");
+        sandbox.data["status"]["conditions"][0]["reason"] = serde_json::json!("PodStateUnknown");
+        assert!(
+            kubernetes_sandbox_stop_failure(&sandbox).is_none(),
+            "an unknown pod state can recover on a later controller reconciliation"
+        );
     }
 
     #[test]
