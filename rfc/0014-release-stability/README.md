@@ -13,11 +13,8 @@ links:
 
 The goal of this RFC is to define OpenShell's exit from alpha and establish a
 predictable release cycle for production users and ecosystem developers.
-It defines release qualification requirements, compatibility guidelines for
-stable and evolving APIs, per-commit development releases, nightly-generated
-release candidates, and weekly stable releases.
 
-This RFC proposes
+We propose
 
 - Development releases for every commit to `main`, nightly release candidates, and qualified stable releases every Tuesday.
 - Stable and experimental API maturity, compatibility and versioning
@@ -27,9 +24,15 @@ This RFC proposes
 
 ## Motivation
 
-OpenShell's alpha process supports rapid iteration but does not define which interfaces users can rely on, or how long
-release lines are maintained. OpenShell 0.1.0 is considered suitable for
-production use within the published support matrix. This means that releases have passed conformance, upgrade, compatibility, artifact, and security checks.
+The goal is to exit alpha without slowing OpenShell's development. Releases
+should remain frequent and automated, and experimental APIs should be able to
+evolve quickly enough to keep pace with the ecosystem. At the same time, users
+need stable interfaces they can confidently build on.
+
+Starting with `0.1.0`, OpenShell provides both: a defined compatibility contract
+for stable interfaces and room to evolve experimental capabilities. Releases
+are suitable for production use within the published support matrix only after
+passing conformance, upgrade, compatibility, artifact, and security checks.
 
 ## Proposal
 
