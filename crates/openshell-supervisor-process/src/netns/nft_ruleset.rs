@@ -203,6 +203,162 @@ pub fn generate_bypass_commands(
     cmds
 }
 
+/// Generate the combined policy-DNS, transparent-TCP, and bypass fence.
+///
+/// DNS may reach only the supervisor's trusted listener. TCP addressed to the
+/// reserved synthetic pools is redirected before the terminal bypass reject;
+/// all other direct TCP/UDP retains the existing fast-fail behavior.
+pub fn generate_transparent_tcp_commands(
+    host_ip: &str,
+    proxy_port: u16,
+    dns_port: u16,
+    transparent_port: u16,
+    synthetic_ipv4_cidr: &str,
+    synthetic_ipv6_cidr: &str,
+    log_prefix: Option<&str>,
+) -> Vec<NftCommand> {
+    let mut cmds = vec![
+        nft_cmd(true, &["add", "table", "inet", "openshell_transparent"]),
+        nft_cmd(true, &["flush", "table", "inet", "openshell_transparent"]),
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "chain",
+                "inet",
+                "openshell_transparent",
+                "output",
+                "{ type nat hook output priority dstnat; policy accept; }",
+            ],
+        ),
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "openshell_transparent",
+                "output",
+                "udp",
+                "dport",
+                &dns_port.to_string(),
+                "redirect",
+                "to",
+                &format!(":{dns_port}"),
+            ],
+        ),
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "openshell_transparent",
+                "output",
+                "tcp",
+                "dport",
+                &dns_port.to_string(),
+                "redirect",
+                "to",
+                &format!(":{dns_port}"),
+            ],
+        ),
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "openshell_transparent",
+                "output",
+                "ip",
+                "daddr",
+                synthetic_ipv4_cidr,
+                "tcp",
+                "dport",
+                "1-65535",
+                "redirect",
+                "to",
+                &format!(":{transparent_port}"),
+            ],
+        ),
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "openshell_transparent",
+                "output",
+                "ip6",
+                "daddr",
+                synthetic_ipv6_cidr,
+                "tcp",
+                "dport",
+                "1-65535",
+                "redirect",
+                "to",
+                &format!(":{transparent_port}"),
+            ],
+        ),
+    ];
+    let mut bypass = generate_bypass_commands(host_ip, proxy_port, log_prefix);
+    let insertion = bypass
+        .iter()
+        .position(|command| {
+            command.args.iter().any(|arg| arg == "log")
+                || command.args.iter().any(|arg| arg == "reject")
+        })
+        .unwrap_or(bypass.len());
+    let rules = [
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "openshell_bypass",
+                "output",
+                "udp",
+                "dport",
+                &dns_port.to_string(),
+                "accept",
+            ],
+        ),
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "openshell_bypass",
+                "output",
+                "tcp",
+                "dport",
+                &dns_port.to_string(),
+                "accept",
+            ],
+        ),
+        nft_cmd(
+            true,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "openshell_bypass",
+                "output",
+                "tcp",
+                "dport",
+                &transparent_port.to_string(),
+                "accept",
+            ],
+        ),
+    ];
+    bypass.splice(insertion..insertion, rules);
+    cmds.extend(bypass);
+    cmds
+}
+
 /// Generate nft commands for Kubernetes sidecar enforcement.
 ///
 /// The network sidecar and the process supervisor share a pod network
@@ -431,6 +587,33 @@ mod tests {
         assert!(proxy_pos < lo_pos);
         assert!(lo_pos < ct_pos);
         assert!(ct_pos < reject_pos);
+    }
+
+    #[test]
+    fn transparent_rules_precede_bypass_rejects_and_scope_dns() {
+        let commands = generate_transparent_tcp_commands(
+            "10.200.0.1",
+            3128,
+            53,
+            15001,
+            "198.18.0.0/24",
+            "fd23:6f70:656e::/48",
+            None,
+        );
+        let text = all_strs(&commands);
+        assert!(text.contains("udp dport 53 redirect to :53"));
+        assert!(text.contains("tcp dport 53 redirect to :53"));
+        assert!(text.contains("udp dport 53 accept"));
+        assert!(text.contains("ip daddr 198.18.0.0/24 tcp dport 1-65535 redirect to :15001"));
+        assert!(
+            text.contains("ip6 daddr fd23:6f70:656e::/48 tcp dport 1-65535 redirect to :15001")
+        );
+        assert!(
+            text.find("tcp dport 15001 accept").unwrap()
+                < text
+                    .find("meta nfproto ipv4 meta l4proto tcp reject")
+                    .unwrap()
+        );
     }
 
     #[test]

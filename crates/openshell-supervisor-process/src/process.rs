@@ -151,6 +151,7 @@ const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::TLS_CERT,
     openshell_core::sandbox_env::TLS_KEY,
     openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+    openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
 ];
 
 pub fn is_supervisor_only_env_var(key: &str) -> bool {

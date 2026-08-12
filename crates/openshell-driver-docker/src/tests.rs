@@ -619,6 +619,27 @@ fn build_environment_sets_docker_tls_paths() {
     assert!(env.contains(&"TEMPLATE_ENV=template".to_string()));
     assert!(env.contains(&"SPEC_ENV=spec".to_string()));
     assert!(env.contains(&"OPENSHELL_SANDBOX_COMMAND=sleep infinity".to_string()));
+    assert!(env.contains(&format!(
+        "{}={}",
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
+    )));
+}
+
+#[test]
+fn build_environment_keeps_network_capabilities_driver_controlled() {
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().environment.insert(
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+        "spoofed".to_string(),
+    );
+    let env = build_environment(&sandbox, &runtime_config());
+    assert!(env.contains(&format!(
+        "{}={}",
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
+    )));
+    assert!(!env.iter().any(|entry| entry.ends_with("=spoofed")));
 }
 
 #[test]

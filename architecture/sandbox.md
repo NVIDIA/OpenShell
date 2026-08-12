@@ -74,19 +74,26 @@ the shared raw byte relay after the existing adapter gates. Forward HTTP retains
 its guarded single-request relay while sharing authorization, request context,
 policy-pinning, and destination boundaries.
 Adapter-specific response and OCSF event shapes remain at the protocol boundary.
-Policy authors may use `protocol: tcp` as an explicit spelling of the existing
-L4 passthrough behavior. Explicit TCP endpoints require a valid DNS hostname;
-hostless `allowed_ips` and literal-IP selectors remain available only to the
-legacy forward-proxy path when `protocol` is omitted. The network supervisor
-contains a dormant policy-DNS boundary for explicit TCP endpoints:
-it snapshots eligible endpoint identities from one policy generation, resolves
-eligible names only through an explicitly supplied trusted resolver, filters
-answers through the shared destination controls, and publishes expiring
-synthetic-address mappings with separate mapping generations. Refreshes retain
-their synthetic identity, and policy reload, expiry, wrong ports, missing
-mappings, or pool exhaustion fail closed. The pinned connector never resolves
-the name again. No DNS listener is exposed to workloads, resolver configuration
-is not injected, and transparent TCP capture is not active in this increment.
+An explicit `protocol: tcp` endpoint with a valid DNS hostname opts into native
+DNS and transparent TCP when the selected runtime advertises that substrate.
+Hostless `allowed_ips` and literal-IP selectors remain available only to the
+legacy explicit-proxy path when `protocol` is omitted. The shared supervisor
+answers only eligible DNS names, returns an epoch-scoped synthetic address, and
+publishes the expiring name, endpoint, ports, policy generation, and validated
+real addresses as one correlation. A connection to that synthetic address is
+captured before the bypass fence, mapped back to its workload process, authorized
+through the same egress pipeline, and dialed only through the pinned addresses.
+Omitted protocol endpoints retain explicit-proxy behavior.
+
+The DNS store is in-memory and sandbox-local. A combined-supervisor restart also
+restarts its workload; before execution, the supervisor advances a persisted
+boot epoch and installs only that epoch's synthetic capture ranges. An address
+cached from the preceding epoch therefore falls through to the bypass fence
+instead of inheriting a new mapping. Policy reload, expiry, wrong ports, direct real-IP access, missing
+mappings, or pool exhaustion fail closed. Resolver injection, DNS listeners,
+capture rules, and the transparent listener are all ready before workload
+execution. A runtime that cannot provide the complete contract rejects a policy
+containing explicit TCP endpoints rather than partially activating it.
 
 Provider credential placeholders are resolved through the live provider state
 for each HTTP request, after destination and L7 policy admission. A static

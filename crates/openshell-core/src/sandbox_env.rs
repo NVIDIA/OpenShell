@@ -36,6 +36,14 @@ pub const SUPERVISOR_TOPOLOGY: &str = "OPENSHELL_SUPERVISOR_TOPOLOGY";
 /// Network enforcement backend selected by the compute driver.
 pub const NETWORK_ENFORCEMENT_MODE: &str = "OPENSHELL_NETWORK_ENFORCEMENT_MODE";
 
+/// Comma-separated runtime networking capabilities supplied by the compute
+/// driver. Capabilities describe substrate the shared supervisor may activate;
+/// they never move policy evaluation into the driver.
+pub const NETWORK_RUNTIME_CAPABILITIES: &str = "OPENSHELL_NETWORK_RUNTIME_CAPABILITIES";
+
+/// Driver capability for policy-gated DNS and transparent TCP interception.
+pub const POLICY_DNS_TRANSPARENT_TCP_CAPABILITY: &str = "policy-dns-transparent-tcp";
+
 /// Whether network policy evaluation must bind requests to the peer binary.
 ///
 /// The default when unset is `"required"`. Kubernetes sidecar experiments may

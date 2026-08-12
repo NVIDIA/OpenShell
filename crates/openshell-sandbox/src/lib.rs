@@ -73,6 +73,15 @@ const SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "sidecar-nftables";
 const SIDECAR_TLS_DIR: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
 const SIDECAR_CA_CERT: &str = "openshell-ca.pem";
 const SIDECAR_CA_BUNDLE: &str = "ca-bundle.pem";
+
+#[cfg(any(test, target_os = "linux"))]
+fn has_network_runtime_capability(capabilities: Option<&str>, required: &str) -> bool {
+    capabilities.is_some_and(|capabilities| {
+        capabilities
+            .split(',')
+            .any(|capability| capability.trim() == required)
+    })
+}
 const SIDECAR_PROCESS_PROXY_ADDR: &str = "127.0.0.1:3128";
 const SIDECAR_READY_TIMEOUT_SECS: u64 = 120;
 
@@ -374,6 +383,81 @@ pub async fn run_sandbox(
         None
     };
 
+    #[cfg(target_os = "linux")]
+    let transparent_tcp_requested = opa_engine
+        .as_ref()
+        .map(|engine| engine.policy_dns_eligibility_snapshot())
+        .transpose()?
+        .is_some_and(|snapshot| !snapshot.endpoints.is_empty());
+    #[cfg(target_os = "linux")]
+    let runtime_capabilities =
+        std::env::var(openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES).ok();
+    #[cfg(target_os = "linux")]
+    let transparent_tcp_capable = has_network_runtime_capability(
+        runtime_capabilities.as_deref(),
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY,
+    );
+    #[cfg(target_os = "linux")]
+    let transparent_runtime = if transparent_tcp_requested {
+        if !transparent_tcp_capable {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .state(StateId::Disabled, "unsupported_runtime")
+                    .message(
+                        "Policy DNS and transparent TCP unavailable: runtime capability is missing"
+                    )
+                    .build()
+            );
+            return Err(miette::miette!(
+                "policy contains protocol: tcp endpoints, but the selected runtime does not advertise policy DNS and transparent TCP support"
+            ));
+        }
+        if sidecar_network_enforcement {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .state(StateId::Disabled, "unsupported_topology")
+                    .message("Policy DNS and transparent TCP unavailable: sidecar topology is unsupported")
+                    .build()
+            );
+            return Err(miette::miette!(
+                "policy DNS and transparent TCP are not yet supported by the sidecar topology"
+            ));
+        }
+        let namespace = netns.as_ref().ok_or_else(|| {
+            miette::miette!("policy DNS and transparent TCP require a workload network namespace")
+        })?;
+        let listeners = namespace
+            .bind_transparent_tcp_listeners()
+            .await
+            .into_diagnostic()
+            .wrap_err("failed to bind transparent TCP listeners")?;
+        let (dns_udp, dns_tcp) = namespace
+            .bind_policy_dns_sockets()
+            .await
+            .into_diagnostic()
+            .wrap_err("failed to bind policy DNS listeners")?;
+        let proxy_port = policy
+            .network
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.http_addr)
+            .map_or(3128, |address| address.port());
+        let runtime = openshell_supervisor_network::run::TransparentRuntimeSetup::new(
+            listeners,
+            dns_udp,
+            dns_tcp,
+            sandbox_id.as_deref(),
+        )?;
+        let (ipv4_cidr, ipv6_cidr) = runtime.synthetic_cidrs();
+        namespace.install_transparent_tcp_rules(proxy_port, &ipv4_cidr, &ipv6_cidr)?;
+        Some(runtime)
+    } else {
+        None
+    };
     // The denial channel is owned by the orchestrator: the proxy (in the
     // networking leaf) and the bypass monitor (in the process leaf) both
     // produce DenialEvents that the denial aggregator (orchestrator-side)
@@ -439,6 +523,8 @@ pub async fn run_sandbox(
                 agent_proposals.clone(),
                 workspace_rx.clone(),
                 &upstream_proxy_args,
+                #[cfg(target_os = "linux")]
+                transparent_runtime,
             )
             .await?,
         )
@@ -1537,6 +1623,7 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
 mod baseline_tests {
     use super::*;
     use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
+    use std::path::PathBuf;
 
     #[test]
     fn proc_not_in_both_read_only_and_read_write_when_gpu_present() {
@@ -1768,7 +1855,7 @@ mod baseline_tests {
         let mut policy = SandboxPolicy {
             version: 1,
             filesystem: FilesystemPolicy {
-                read_only: vec![std::path::PathBuf::from("/tmp")],
+                read_only: vec![PathBuf::from("/tmp")],
                 read_write: vec![],
                 include_workdir: false,
             },
@@ -1783,17 +1870,14 @@ mod baseline_tests {
         enrich_sandbox_baseline_paths(&mut policy);
 
         assert!(
-            policy
-                .filesystem
-                .read_only
-                .contains(&std::path::PathBuf::from("/tmp")),
+            policy.filesystem.read_only.contains(&PathBuf::from("/tmp")),
             "explicit read_only baseline path should be preserved"
         );
         assert!(
             !policy
                 .filesystem
                 .read_write
-                .contains(&std::path::PathBuf::from("/tmp")),
+                .contains(&PathBuf::from("/tmp")),
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
         );
     }
@@ -3968,6 +4052,21 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transparent_tcp_capability_requires_exact_driver_marker() {
+        let required = openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY;
+        assert!(!has_network_runtime_capability(None, required));
+        assert!(!has_network_runtime_capability(Some(""), required));
+        assert!(!has_network_runtime_capability(
+            Some("policy-dns-transparent-tcp-extra"),
+            required
+        ));
+        assert!(has_network_runtime_capability(
+            Some("other, policy-dns-transparent-tcp"),
+            required
+        ));
+    }
     use openshell_core::policy::{
         FilesystemPolicy, LandlockPolicy, NetworkMode, NetworkPolicy, ProcessPolicy, ProxyPolicy,
     };

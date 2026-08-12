@@ -904,8 +904,7 @@ _matching_endpoint_configs := [cfg |
 # markers needed by later policy-DNS correlation.
 
 _policy_endpoint_records(policy_name, policy) := [record |
-	some endpoint_index
-	ep := policy.endpoints[endpoint_index]
+	some endpoint_index, ep in policy.endpoints
 	endpoint_matches_request(ep, input.network)
 	record := {
 		"policy_name": policy_name,
@@ -926,10 +925,8 @@ _matching_endpoint_records := [record |
 # grant access to any process. Only endpoints that explicitly opt into raw TCP
 # and provide a resolvable host plus concrete ports are materialized.
 policy_dns_eligible_endpoint_records := [record |
-	some policy_name
-	policy := data.network_policies[policy_name]
-	some endpoint_index
-	ep := policy.endpoints[endpoint_index]
+	some policy_name, policy in data.network_policies
+	some endpoint_index, ep in policy.endpoints
 	lower(object.get(ep, "protocol", "")) == "tcp"
 	object.get(ep, "host", "") != ""
 	ports := object.get(ep, "ports", [])

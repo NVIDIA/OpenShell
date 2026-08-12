@@ -4462,6 +4462,12 @@ fn build_guest_environment(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
     );
+    // Runtime capabilities are driver-owned. The VM driver does not yet
+    // provide policy DNS and transparent TCP interception.
+    environment.insert(
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+        String::new(),
+    );
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
     // Prevent user-supplied environment from overriding the TLS server name
@@ -7067,6 +7073,36 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn build_guest_environment_clears_unsupported_network_capabilities() {
+        let config = VmDriverConfig {
+            openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                environment: HashMap::from([(
+                    openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+                    openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let env = build_guest_environment(&sandbox, &config, None);
+        assert!(env.contains(&format!(
+            "{}=",
+            openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES
+        )));
+        assert!(!env.contains(&format!(
+            "{}={}",
+            openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+            openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY
+        )));
     }
 
     #[test]

@@ -6,25 +6,26 @@
     reason = "the crate-private API is consumed by the runtime activation slice"
 )]
 
-//! Dormant policy-gated DNS and synthetic resolved-endpoint correlation.
+//! Policy-gated DNS and synthetic resolved-endpoint correlation.
 //!
-//! This module implements the DNS security boundary and mapping state only.
-//! Runtime listener startup, resolver injection, and transparent TCP capture
-//! intentionally land in later stack entries.
+//! The shared supervisor owns DNS eligibility and mapping state. Supported
+//! runtimes provide namespace-local DNS and transparent TCP capture sockets.
 
 #![allow(
     dead_code,
     unused_imports,
-    reason = "PR2 exposes a dormant library boundary consumed by PR3 runtime wiring"
+    reason = "the policy DNS boundary retains metrics and helpers for later runtime integrations"
 )]
 
 mod name;
 mod resolver;
+mod runtime;
 mod store;
 mod wire;
 
 pub(crate) use name::NormalizedName;
 pub(crate) use resolver::{AddressFamily, SocketTrustedResolver, TrustedAnswer, TrustedResolver};
+pub(crate) use runtime::{PolicyDnsRuntime, PolicyDnsRuntimeConfig};
 pub(crate) use store::{
     MappingLookup, MappingLookupError, PolicyEndpointId, PublishError, PublishRequest,
     ResolvedEndpointRecord, ResolvedEndpointStore, ResolvedPortContract, StoreConfig,

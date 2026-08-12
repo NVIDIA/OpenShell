@@ -3995,6 +3995,13 @@ fn apply_required_env(
         openshell_core::sandbox_env::TELEMETRY_ENABLED,
         openshell_core::telemetry::enabled_env_value(),
     );
+    // Runtime capabilities are driver-owned. Kubernetes topologies do not yet
+    // provide the complete policy DNS and transparent TCP substrate.
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES,
+        "",
+    );
     if !ssh_socket_path.is_empty() {
         upsert_env(
             env,
@@ -7147,6 +7154,29 @@ mod tests {
                 assert_eq!(telemetry_entries[0]["value"], serde_json::json!("false"));
             },
         );
+    }
+
+    #[test]
+    fn sandbox_pod_clears_unsupported_network_capabilities() {
+        let spec = SandboxSpec {
+            environment: std::collections::HashMap::from([(
+                openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
+                openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
+            )]),
+            ..SandboxSpec::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
+        let env = cr["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap();
+        let entries = env
+            .iter()
+            .filter(|entry| {
+                entry["name"] == openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["value"], serde_json::json!(""));
     }
 
     #[test]

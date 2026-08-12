@@ -73,8 +73,8 @@ impl EndpointDecision {
 pub(super) enum EgressTransport {
     Connect,
     ForwardHttp,
-    /// Future transparent TCP adapter fed by the policy DNS registry.
-    #[allow(dead_code, reason = "constructed when transparent TCP adapter lands")]
+    /// Transparent TCP adapter fed by the policy DNS registry.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     TransparentTcp,
 }
 
@@ -101,7 +101,7 @@ impl EgressIntent {
         Self::new(EgressTransport::ForwardHttp, host, port)
     }
 
-    #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(super) fn transparent_tcp(host: String, port: u16) -> Self {
         Self {
             transport: EgressTransport::TransparentTcp,

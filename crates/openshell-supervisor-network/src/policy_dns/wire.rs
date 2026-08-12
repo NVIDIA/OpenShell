@@ -79,6 +79,9 @@ pub(crate) async fn handle_udp_query<R: TrustedResolver>(
         Err(PolicyDnsError::Resolver(ResolveError::NxDomain)) => {
             encode_message(response_with_code(&request, ResponseCode::NXDomain))
         }
+        Err(PolicyDnsError::Resolver(ResolveError::NoData)) => {
+            encode_message(response_with_code(&request, ResponseCode::NoError))
+        }
         Err(PolicyDnsError::InvalidName) => {
             encode_message(response_with_code(&request, ResponseCode::FormErr))
         }
@@ -162,6 +165,18 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct NoDataResolver;
+
+    impl TrustedResolver for NoDataResolver {
+        async fn resolve(
+            &self,
+            _name: &NormalizedName,
+            _family: AddressFamily,
+        ) -> Result<TrustedAnswer, ResolveError> {
+            Err(ResolveError::NoData)
+        }
+    }
+
     impl TrustedResolver for FakeResolver {
         async fn resolve(
             &self,
@@ -179,7 +194,7 @@ mod tests {
         }
     }
 
-    fn service() -> PolicyDnsService<FakeResolver> {
+    fn service_with_resolver<R: TrustedResolver>(resolver: R) -> PolicyDnsService<R> {
         let yaml = r"
 network_policies:
   database:
@@ -200,14 +215,18 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         .unwrap();
         PolicyDnsService::new(
             policy,
-            FakeResolver {
-                calls: AtomicUsize::new(0),
-            },
+            resolver,
             Arc::new(ResolvedEndpointStore::new(
                 StoreConfig::new(pools, 8).unwrap(),
             )),
             None,
         )
+    }
+
+    fn service() -> PolicyDnsService<FakeResolver> {
+        service_with_resolver(FakeResolver {
+            calls: AtomicUsize::new(0),
+        })
     }
 
     fn request(name: &str, record_type: RecordType) -> Vec<u8> {
@@ -261,6 +280,17 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             ResponseCode::Refused
         );
         assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn eligible_family_without_records_returns_empty_success() {
+        let service = service_with_resolver(NoDataResolver);
+        let wire = handle_udp_query(&service, &request("db.example.", RecordType::AAAA))
+            .await
+            .unwrap();
+        let response = Message::from_vec(&wire).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(response.answers.is_empty());
     }
 
     #[tokio::test]

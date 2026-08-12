@@ -2220,6 +2220,13 @@ process:
     }
 
     #[test]
+    fn policy_dns_snapshot_accepts_the_default_multi_policy_shape() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, TEST_DATA_YAML).unwrap();
+        let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
+        assert!(snapshot.endpoints.is_empty());
+    }
+
+    #[test]
     fn allowed_binary_and_endpoint() {
         let engine = test_engine();
         // Simulates Claude Code: exe is /usr/bin/node, script is /usr/local/bin/claude

@@ -10,6 +10,8 @@ mod relay;
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
+#[cfg(target_os = "linux")]
+use crate::policy_dns::{MappingLookupError, PolicyEndpointId, ResolvedEndpointStore};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::upstream_proxy::{self, UpstreamProxyConfig};
 use miette::{IntoDiagnostic, Result};
@@ -27,6 +29,8 @@ use openshell_ocsf::{
     HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, Process, SeverityId, StatusId,
     Url as OcsfUrl, ocsf_emit,
 };
+#[cfg(target_os = "linux")]
+use std::mem::size_of;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -436,6 +440,372 @@ impl Drop for ProxyHandle {
     fn drop(&mut self) {
         self.join.abort();
     }
+}
+
+/// RAII handle for transparent TCP accept loops.
+#[cfg(target_os = "linux")]
+pub(crate) struct TransparentTcpHandle {
+    joins: Vec<JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl TransparentTcpHandle {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start(
+        listeners: Vec<TcpListener>,
+        store: Arc<ResolvedEndpointStore>,
+        opa_engine: Arc<OpaEngine>,
+        identity_cache: Arc<BinaryIdentityCache>,
+        entrypoint_pid: Arc<AtomicU32>,
+        agent_proposals: openshell_core::proposals::AgentProposals,
+        denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+        activity_tx: Option<ActivitySender>,
+        upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
+        engine_ready: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Self> {
+        let upstream_proxy = Arc::new(
+            UpstreamProxyConfig::from_args(upstream_proxy_args)
+                .map_err(|error| miette::miette!(error))?,
+        );
+        let mut joins = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let store = store.clone();
+            let engine = opa_engine.clone();
+            let cache = identity_cache.clone();
+            let pid = entrypoint_pid.clone();
+            let proposals = agent_proposals.clone();
+            let denial_tx = denial_tx.clone();
+            let activity_tx = activity_tx.clone();
+            let upstream_proxy = upstream_proxy.clone();
+            let mut engine_ready = engine_ready.clone();
+            joins.push(tokio::spawn(async move {
+                if tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    engine_ready.wait_for(|ready| *ready),
+                )
+                .await
+                .is_err()
+                {
+                    warn!(
+                        "Engine readiness signal not received within 15s; proceeding with transparent TCP accept loop"
+                    );
+                }
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    set_tcp_nodelay_best_effort(&stream);
+                    let store = store.clone();
+                    let engine = engine.clone();
+                    let cache = cache.clone();
+                    let pid = pid.clone();
+                    let proposals = proposals.clone();
+                    let denial_tx = denial_tx.clone();
+                    let activity_tx = activity_tx.clone();
+                    let upstream_proxy = upstream_proxy.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = handle_transparent_tcp_connection(
+                            stream,
+                            store,
+                            engine,
+                            cache,
+                            pid,
+                            proposals,
+                            denial_tx,
+                            activity_tx,
+                            upstream_proxy,
+                        )
+                        .await
+                        {
+                            ocsf_emit!(
+                                NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                                    .activity(ActivityId::Fail)
+                                    .severity(SeverityId::Low)
+                                    .status(StatusId::Failure)
+                                    .message(format!("Transparent TCP connection error: {error}"))
+                                    .build()
+                            );
+                        }
+                    });
+                }
+            }));
+        }
+        Ok(Self { joins })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TransparentTcpHandle {
+    fn drop(&mut self) {
+        for join in &self.joins {
+            join.abort();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_transparent_tcp_connection(
+    mut client: TcpStream,
+    store: Arc<ResolvedEndpointStore>,
+    opa_engine: Arc<OpaEngine>,
+    identity_cache: Arc<BinaryIdentityCache>,
+    entrypoint_pid: Arc<AtomicU32>,
+    agent_proposals: openshell_core::proposals::AgentProposals,
+    denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+    activity_tx: Option<ActivitySender>,
+    upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
+) -> Result<()> {
+    let workload_addr = client.peer_addr().into_diagnostic()?;
+    let original = original_destination(&client).into_diagnostic()?;
+    let current_generation = opa_engine.current_generation();
+    let mapping = match store.lookup(
+        original.ip(),
+        original.port(),
+        current_generation,
+        std::time::Instant::now(),
+    ) {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            emit_transparent_mapping_denial(workload_addr, original, error);
+            emit_activity(&activity_tx, true, "transparent_tcp_mapping");
+            return Ok(());
+        }
+    };
+    let host = mapping.record.normalized_name.as_str().to_string();
+    let port = original.port();
+    let Some(pinned_ip) = mapping
+        .record
+        .contracts
+        .iter()
+        .filter(|contract| contract.port == port)
+        .flat_map(|contract| contract.pinned_addresses.iter().copied())
+        .next()
+    else {
+        emit_transparent_mapping_denial(
+            workload_addr,
+            original,
+            MappingLookupError::InvalidMapping,
+        );
+        return Ok(());
+    };
+
+    let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, original);
+    let intent = EgressIntent::transparent_tcp(host.clone(), port, pinned_ip);
+    let engine = opa_engine.clone();
+    let cache = identity_cache.clone();
+    let pid = entrypoint_pid.clone();
+    let decision = tokio::task::spawn_blocking(move || {
+        authorize_egress_intent(connection, &engine, &cache, &pid, intent)
+    })
+    .await
+    .map_err(|error| miette::miette!("identity resolution task panicked: {error}"))?;
+
+    if let NetworkAction::Deny { reason } = &decision.action {
+        emit_transparent_policy_denial(&decision, workload_addr, &host, port);
+        emit_denial(
+            &denial_tx,
+            &host,
+            port,
+            decision
+                .binary
+                .as_ref()
+                .map_or("-", |path| path.to_str().unwrap_or("-")),
+            &decision,
+            reason,
+            "transparent-tcp",
+        );
+        emit_activity(&activity_tx, true, "transparent_tcp_policy");
+        return Ok(());
+    }
+
+    let endpoint_id = decision
+        .endpoint
+        .matched_endpoints
+        .iter()
+        .map(|endpoint| PolicyEndpointId {
+            policy_name: endpoint.policy_name.clone(),
+            endpoint_index: endpoint.endpoint_index,
+        })
+        .find(|candidate| mapping.endpoint_ids().any(|mapped| mapped == candidate));
+    let Some(endpoint_id) = endpoint_id else {
+        let reason = "authorized endpoint did not match DNS correlation";
+        emit_transparent_policy_denial(&decision, workload_addr, &host, port);
+        emit_denial(
+            &denial_tx,
+            &host,
+            port,
+            decision
+                .binary
+                .as_ref()
+                .map_or("-", |path| path.to_str().unwrap_or("-")),
+            &decision,
+            reason,
+            "transparent-tcp",
+        );
+        emit_activity(&activity_tx, true, "transparent_tcp_policy");
+        return Ok(());
+    };
+
+    let connector = mapping.connector_for(&endpoint_id).await.map_err(|error| {
+        miette::miette!("transparent TCP pinned destination is invalid: {error}")
+    })?;
+    let generation_guard = relay::pin_policy_generation(&opa_engine, decision.policy_generation)?;
+    let mut ctx = relay::http_context(
+        &decision,
+        None,
+        None,
+        activity_tx.clone(),
+        None,
+        agent_proposals,
+    );
+    let middleware_gate = middleware_uninspectable_gate(&opa_engine, &ctx)?;
+    if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::Deny {
+        crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", true);
+        return Ok(());
+    }
+    if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::BypassWithFinding {
+        crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", false);
+    }
+    let mut upstream = dial_upstream(&upstream_proxy, &host, port, connector.addrs())
+        .await
+        .into_diagnostic()?;
+    generation_guard.ensure_current()?;
+    ctx.request_default_port = None;
+    let policy_name = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.as_deref().unwrap_or("-"),
+        NetworkAction::Deny { .. } => "-",
+    };
+    ocsf_emit!(
+        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .dst_endpoint(Endpoint::from_domain(&host, port))
+            .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
+            .firewall_rule(policy_name, "opa")
+            .message(format!("Transparent TCP allowed {host}:{port}"))
+            .status_detail("transparent_tcp_allowed")
+            .build()
+    );
+    emit_activity(&activity_tx, false, "transparent_tcp");
+    relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await
+}
+
+#[cfg(target_os = "linux")]
+fn original_destination(stream: &TcpStream) -> std::io::Result<SocketAddr> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    if stream.local_addr()?.is_ipv4() {
+        #[allow(unsafe_code)]
+        unsafe {
+            let mut address: libc::sockaddr_in = std::mem::zeroed();
+            let mut length = size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            if libc::getsockopt(
+                fd,
+                libc::SOL_IP,
+                80, // SO_ORIGINAL_DST
+                std::ptr::addr_of_mut!(address).cast(),
+                &mut length,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            return Ok(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::from(
+                    address.sin_addr.s_addr.to_ne_bytes(),
+                )),
+                u16::from_be(address.sin_port),
+            ));
+        }
+    }
+    #[allow(unsafe_code)]
+    unsafe {
+        let mut address: libc::sockaddr_in6 = std::mem::zeroed();
+        let mut length = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            libc::SOL_IPV6,
+            80, // IP6T_SO_ORIGINAL_DST
+            std::ptr::addr_of_mut!(address).cast(),
+            &mut length,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(SocketAddr::new(
+            IpAddr::V6(std::net::Ipv6Addr::from(address.sin6_addr.s6_addr)),
+            u16::from_be(address.sin6_port),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn emit_transparent_mapping_denial(
+    workload: SocketAddr,
+    original: SocketAddr,
+    error: MappingLookupError,
+) {
+    let detail = match error {
+        MappingLookupError::Missing => "transparent_tcp_mapping_missing",
+        MappingLookupError::Expired => "transparent_tcp_mapping_expired",
+        MappingLookupError::StalePolicy => "transparent_tcp_mapping_stale_policy",
+        MappingLookupError::PortMismatch => "transparent_tcp_port_mismatch",
+        MappingLookupError::EndpointMismatch
+        | MappingLookupError::InvalidMapping
+        | MappingLookupError::LockPoisoned => "transparent_tcp_destination_denied",
+    };
+    ocsf_emit!(
+        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_ip(original.ip(), original.port()))
+            .src_endpoint_addr(workload.ip(), workload.port())
+            .message(format!("Transparent TCP denied: {error}"))
+            .status_detail(detail)
+            .build()
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn emit_transparent_policy_denial(
+    decision: &EgressDecision,
+    workload: SocketAddr,
+    host: &str,
+    port: u16,
+) {
+    let status_detail = if matches!(decision.action, NetworkAction::Deny { .. }) {
+        "transparent_tcp_identity_denied"
+    } else {
+        "transparent_tcp_destination_denied"
+    };
+    let binary = decision
+        .binary
+        .as_ref()
+        .map_or("-".to_string(), |path| path.display().to_string());
+    let pid = decision
+        .binary_pid
+        .map_or("-".to_string(), |pid| pid.to_string());
+    ocsf_emit!(
+        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain(host, port))
+            .src_endpoint_addr(workload.ip(), workload.port())
+            .actor_process(Process::from_bypass(&binary, &pid, "-"))
+            .firewall_rule("-", "opa")
+            .message(format!("Transparent TCP denied {host}:{port}"))
+            .status_detail(status_detail)
+            .build()
+    );
 }
 
 fn emit_activity(tx: &Option<ActivitySender>, denied: bool, deny_group: &'static str) {
@@ -3131,7 +3501,7 @@ fn is_cloud_metadata_ip(ip: IpAddr) -> bool {
 /// entry exists, the entry cannot be parsed, or the mapped IP is a cloud
 /// metadata address.
 #[cfg(any(target_os = "linux", test))]
-fn detect_trusted_host_gateway() -> Option<IpAddr> {
+pub(crate) fn detect_trusted_host_gateway() -> Option<IpAddr> {
     let contents = std::fs::read_to_string("/etc/hosts").ok()?;
     let ips = parse_hosts_file_for_host(&contents, "host.openshell.internal");
 
@@ -3179,7 +3549,7 @@ fn detect_trusted_host_gateway() -> Option<IpAddr> {
 }
 
 #[cfg(not(any(target_os = "linux", test)))]
-fn detect_trusted_host_gateway() -> Option<IpAddr> {
+pub(crate) fn detect_trusted_host_gateway() -> Option<IpAddr> {
     None
 }
 
