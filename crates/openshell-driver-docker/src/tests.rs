@@ -156,6 +156,7 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
             CdiGpuInventory::default(),
             allow_all_default_gpu,
         )),
+        lifecycle_event_fences: DockerLifecycleEventFences::default(),
     }
 }
 
@@ -2493,4 +2494,50 @@ fn container_state_needs_start_matches_startable_states() {
             "{state:?} should not be started with Docker start",
         );
     }
+}
+
+#[test]
+fn lifecycle_fence_rejects_polled_exit_from_before_restart() {
+    let fences = DockerLifecycleEventFences::default();
+    fences.begin_start("sandbox-1");
+    assert!(fences.start_in_progress("sandbox-1"));
+    fences.finish_start("sandbox-1");
+    assert!(!fences.start_in_progress("sandbox-1"));
+
+    fences.record_previous_exit("sandbox-1", Some("2026-08-12T16:39:13Z"));
+    assert_eq!(
+        fences.previous_exit("sandbox-1").as_deref(),
+        Some("2026-08-12T16:39:13Z")
+    );
+
+    let previous_exit = ContainerState {
+        status: Some(ContainerStateStatusEnum::EXITED),
+        finished_at: Some("2026-08-12T16:39:13Z".to_string()),
+        ..Default::default()
+    };
+    assert!(docker_polled_exit_is_stale(
+        "2026-08-12T16:39:13Z",
+        Some(&previous_exit),
+    ));
+
+    let running = ContainerState {
+        status: Some(ContainerStateStatusEnum::RUNNING),
+        ..previous_exit.clone()
+    };
+    assert!(docker_polled_exit_is_stale(
+        "2026-08-12T16:39:13Z",
+        Some(&running),
+    ));
+
+    let new_exit = ContainerState {
+        finished_at: Some("2026-08-12T16:40:00Z".to_string()),
+        ..previous_exit
+    };
+    assert!(!docker_polled_exit_is_stale(
+        "2026-08-12T16:39:13Z",
+        Some(&new_exit),
+    ));
+
+    fences.remove("sandbox-1");
+    assert!(fences.previous_exit("sandbox-1").is_none());
 }

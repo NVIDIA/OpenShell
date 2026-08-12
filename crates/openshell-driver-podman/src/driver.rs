@@ -7,7 +7,8 @@ use crate::client::{ContainerListEntry, PodmanApiError, PodmanClient, VolumeInsp
 use crate::config::PodmanComputeConfig;
 use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, PodmanSandboxDriverConfig};
 use crate::watcher::{
-    self, WatchStream, driver_sandbox_from_inspect, driver_sandbox_from_list_entry,
+    self, LifecycleEventFences, WatchStream, driver_sandbox_from_inspect,
+    driver_sandbox_from_list_entry,
 };
 use openshell_core::ComputeDriverError;
 use openshell_core::config::CDI_GPU_DEVICE_ALL;
@@ -56,6 +57,7 @@ pub struct PodmanComputeDriver {
     rootless_network_cmd: String,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
     gpu_inventory_refresh: Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>,
+    lifecycle_event_fences: LifecycleEventFences,
 }
 
 impl std::fmt::Debug for PodmanComputeDriver {
@@ -396,6 +398,7 @@ impl PodmanComputeDriver {
                 allow_all_default_gpu,
             )),
             gpu_inventory_refresh: Arc::new(local_podman_gpu_selector_state),
+            lifecycle_event_fences: LifecycleEventFences::default(),
         })
     }
 
@@ -861,6 +864,18 @@ impl PodmanComputeDriver {
         let container_id = container.id;
         info!(sandbox_id = %sandbox_id, container = %container_id, "Starting sandbox container");
 
+        // Fence delayed stop/die events from the previous container run before
+        // issuing the start. Podman's event stream can deliver those events
+        // after this API call has begun. Use the container's own transition
+        // timestamp so this remains correct for remote Podman services whose
+        // wall clock may differ from the gateway host.
+        let previous = self
+            .client
+            .inspect_container(&container_id)
+            .await
+            .map_err(ComputeDriverError::from)?;
+        self.lifecycle_event_fences
+            .record_previous_exit(sandbox_id, previous.state.finished_at.as_deref());
         self.client
             .start_container(&container_id)
             .await
@@ -888,6 +903,7 @@ impl PodmanComputeDriver {
                 &container::proxy_auth_secret_name(sandbox_id),
             )
             .await;
+            self.lifecycle_event_fences.remove(sandbox_id);
             return Ok(false);
         };
         info!(sandbox_id = %sandbox_id, container = %container_id, "Deleting sandbox container");
@@ -921,6 +937,7 @@ impl PodmanComputeDriver {
             &container::proxy_auth_secret_name(sandbox_id),
         )
         .await;
+        self.lifecycle_event_fences.remove(sandbox_id);
 
         Ok(container_existed)
     }
@@ -1007,7 +1024,7 @@ impl PodmanComputeDriver {
 
     /// Start watching all managed sandbox containers.
     pub async fn watch_sandboxes(&self) -> Result<WatchStream, ComputeDriverError> {
-        watcher::start_watch(self.client.clone())
+        watcher::start_watch(self.client.clone(), self.lifecycle_event_fences.clone())
             .await
             .map_err(ComputeDriverError::from)
     }
@@ -1046,6 +1063,7 @@ impl PodmanComputeDriver {
             gpu_inventory_refresh: Arc::new(move || {
                 (refresh_inventory.clone(), allow_all_default_gpu)
             }),
+            lifecycle_event_fences: LifecycleEventFences::default(),
         }
     }
 }
@@ -1233,6 +1251,10 @@ mod tests {
             "lifecycle-start",
             vec![
                 StubResponse::new(StatusCode::OK, r#"[{"Id":"ctr-1","State":"stopped"}]"#),
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-1","Name":"sandbox","State":{"Status":"exited","Running":false,"FinishedAt":"2026-08-12T16:39:13Z"},"Config":{}}"#,
+                ),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
@@ -1245,6 +1267,12 @@ mod tests {
             start_requests
                 .lock()
                 .expect("request log lock should not be poisoned")[1],
+            format!("GET {}", api_path("/libpod/containers/ctr-1/json"))
+        );
+        assert_eq!(
+            start_requests
+                .lock()
+                .expect("request log lock should not be poisoned")[2],
             format!("POST {}", api_path("/libpod/containers/ctr-1/start"))
         );
 
