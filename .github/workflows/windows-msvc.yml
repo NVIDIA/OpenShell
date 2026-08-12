@@ -16,6 +16,11 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          # mise exports RUSTC_WRAPPER=sccache, but this workflow intentionally
+          # does not install sccache. Keep rust-cache's cargo metadata calls
+          # independent of that unavailable wrapper so target artifacts save.
+          RUSTC_WRAPPER: ""
         with:
           shared-key: windows-msvc-x64
           cache-targets: "true"
@@ -41,6 +46,10 @@ jobs:
           targets: aarch64-pc-windows-msvc
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          # Keep rust-cache's cargo metadata calls independent of the
+          # unavailable sccache wrapper exported by mise.
+          RUSTC_WRAPPER: ""
         with:
           shared-key: windows-msvc-arm64
           cache-targets: "true"
