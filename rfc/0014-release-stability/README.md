@@ -172,6 +172,15 @@ Contract fixtures cover CLI, configuration, policy, and Helm surfaces. Upgrade
 and version-skew tests cover semantic and persisted-state behavior that a schema
 diff cannot detect.
 
+The following examples illustrate how these rules affect a release candidate:
+
+| Example | Concrete change | Release treatment |
+| --- | --- | --- |
+| Breaking stable Protobuf contract | `SandboxSpec.policy = 7` to `SandboxSpec.policy = 10` | Blocks a patch RC and requires a versioned API change. |
+| Breaking experimental Python SDK method | `create_sandbox(timeout=30)` to `create_sandbox(deadline=...)` | May ship in a patch release with migration notes. |
+| Breaking stable policy document | `endpoints:` to `destinations:` | Blocks a patch RC unless both fields remain supported. |
+| Breaking stable CLI contract | `--policy policy.yaml` to `--policy-file policy.yaml` | Requires retaining the old flag as an alias or shipping a minor release. |
+
 ### Release candidate qualification and stable release promotion
 
 The release system separates candidate creation, qualification, and stable
