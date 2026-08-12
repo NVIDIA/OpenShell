@@ -7,8 +7,10 @@
 
 cni:
   enabled: true
-  # k3s configures containerd with k3s-specific CNI paths.
-  binDir: /bin
+  # k3s configures containerd with k3s-specific CNI paths. Its containerd does
+  # not search /opt/cni/bin; install into the stable, upgrade-safe k3s data CNI
+  # directory (see https://github.com/k3s-io/k3s/issues/10869).
+  binDir: /var/lib/rancher/k3s/data/cni
   confDir: /var/lib/rancher/k3s/agent/etc/cni/net.d
 
 supervisor:
