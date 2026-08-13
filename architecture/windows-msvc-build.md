@@ -71,8 +71,10 @@ Windows validation is exposed through `tasks/windows.toml`:
 The Windows tasks call `tasks/scripts/windows-msvc.ps1`. The wrapper discovers
 Visual Studio's `VsDevCmd.bat` with `vswhere` or by enumerating installed
 release directories, validates the requested compiler and ARM64 Spectre
-libraries, adds rustup MSVC targets, clears inherited `RUSTC_WRAPPER`, and
-keeps build artifacts under the normal Cargo target tree.
+libraries, adds rustup MSVC targets, preserves an inherited `RUSTC_WRAPPER`
+when the command is available, and keeps build artifacts under the normal
+Cargo target tree. If the wrapper command is unavailable, it warns and clears
+the setting so local builds continue without compiler caching.
 On Windows, the generic `rust:check`, `rust:lint`, and `test:rust` tasks call
 the same wrapper with the host-native MSVC target. The wrapper preserves the
 Unix Cargo commands on Linux and macOS, excludes unsupported Windows runtime
@@ -94,6 +96,13 @@ subsequent runs. When
 wrapper uses that system Z3 instead and requires `Z3_SYS_Z3_HEADER` to point at
 the full path to `z3.h`. Local clean builds use the unauthenticated GitHub API
 unless `READ_ONLY_GITHUB_TOKEN` is set.
+
+GitHub Actions layers the Cargo target cache with sccache's GitHub Actions
+backend. The target cache lets Cargo skip intact dependency builds; sccache
+recovers cacheable Rust compiler outputs when source changes invalidate part of
+that target tree. CI enables client-side mode and normalizes the checkout root
+for stable compiler cache keys. The target-cache action runs its metadata step
+with `RUSTC_WRAPPER` cleared so cache maintenance does not depend on sccache.
 
 The lane uses `mise run --skip-tools windows:*` because Windows Rust comes from
 rustup and linking comes from Visual Studio Build Tools. Mise orchestrates the
