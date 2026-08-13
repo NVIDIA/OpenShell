@@ -79,18 +79,18 @@ fn apply_kubernetes_runtime_defaults(k8s: &mut KubernetesComputeConfig) {
 }
 
 fn apply_identity_limits_from_file(
-    min_uid: &mut u32,
-    min_gid: &mut u32,
+    uid: &mut u32,
+    gid: &mut u32,
     file: Option<&config_file::ConfigFile>,
 ) {
     let Some(gateway) = file.map(|file| &file.openshell.gateway) else {
         return;
     };
-    if let Some(uid) = gateway.min_sandbox_uid {
-        *min_uid = uid;
+    if let Some(value) = gateway.min_sandbox_uid {
+        *uid = value;
     }
-    if let Some(gid) = gateway.min_sandbox_gid {
-        *min_gid = gid;
+    if let Some(value) = gateway.min_sandbox_gid {
+        *gid = value;
     }
 }
 
