@@ -48,13 +48,17 @@ creating misleading Windows driver artifacts.
 
 ## Mise Lane
 
-The GitHub Actions workflow checks x64 Windows compilation for pull-request
-mirror branches and merge queues. Pushes to `main` and manual dispatches also
-build the release binaries and run the full x64 workspace test suite. Each
-architecture restores and saves a dedicated Rust cache containing the Cargo
+The GitHub Actions workflow runs x64 Windows Clippy and Rust tests for
+pull-request mirror branches and merge queues. On pushes to `main`, a cache-seed
+job runs the same lint and test commands before a dependent job builds the
+release binaries. Manual dispatches exercise the same seed-then-build path.
+The binaries remain CI validation artifacts and are not uploaded or published.
+
+Each job restores and saves a dedicated Rust cache containing the Cargo
 registry and dependency build artifacts, including artifacts from failed runs.
-The full run on `main` uses the same cache namespaces as pull requests, keeping
-both the Cargo target cache and sccache warm for subsequent checks.
+The seed job and pull-request job use the same Cargo target and sccache
+namespaces. The release build waits for the seed job, then restores its newly
+warmed cache rather than compiling concurrently from a cold cache.
 
 Windows validation is exposed through `tasks/windows.toml`:
 
@@ -130,23 +134,23 @@ break ARM64 crypto dependency builds.
 
 ## CI Shape
 
-The x64 GitHub Actions job runs on `windows-2025`. Pull-request mirrors and
+The x64 GitHub Actions jobs run on `windows-2025`. Pull-request mirrors and
 merge queues execute:
 
 ```powershell
-mise run --skip-tools windows:check:x64
+mise run --skip-tools rust:lint
+mise run --skip-tools test:rust
 ```
 
-Pushes to `main` and manual dispatches execute:
+Pushes to `main` and manual dispatches first seed the shared caches with those
+same lint and test commands. After the seed succeeds, a separate job executes:
 
 ```powershell
-mise run --skip-tools windows:check:x64
 mise run --skip-tools windows:build:x64
-mise run --skip-tools windows:test:x64
 ```
 
-The full workspace test includes the unsupported-driver contract test, so CI
-does not run the focused test task a second time. The focused task remains
+The server test-support suite includes the unsupported-driver contract test, so
+CI does not run the focused test task a second time. The focused task remains
 available for local diagnosis.
 
 The cache is partitioned by architecture so incompatible x64 and ARM64 target
