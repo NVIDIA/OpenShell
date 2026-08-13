@@ -1560,14 +1560,13 @@ impl KubernetesComputeDriver {
         sandbox_id: &str,
         running: bool,
     ) -> Result<(AgentSandboxApi, String, String, Duration), String> {
-        let agent_sandbox_api = self
-            .supported_agent_sandbox_api(self.client.clone())
+        let lookup_api = self
+            .supported_sandbox_api_for_lookup(self.client.clone())
             .await?;
-        let selector =
-            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id}");
+        let selector = self.sandbox_lookup_selector(sandbox_id);
         let list = tokio::time::timeout(
             KUBE_API_TIMEOUT,
-            agent_sandbox_api
+            lookup_api
                 .api
                 .list(&ListParams::default().labels(&selector)),
         )
@@ -1584,6 +1583,16 @@ impl KubernetesComputeDriver {
             .into_iter()
             .next()
             .ok_or_else(|| "sandbox not found".to_string())?;
+        let namespace = object
+            .metadata
+            .namespace
+            .clone()
+            .unwrap_or_else(|| self.config.namespace.clone());
+        let agent_sandbox_api = Self::agent_sandbox_api(
+            self.client.clone(),
+            &lookup_api.resource.version,
+            &namespace,
+        );
         let stop_timeout = kubernetes_sandbox_stop_timeout(&object);
         let kube_name = object
             .metadata
