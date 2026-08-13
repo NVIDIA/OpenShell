@@ -667,31 +667,139 @@ async fn handle_transparent_tcp_connection(
     if middleware_gate == crate::l7::middleware::UninspectableTrafficGate::BypassWithFinding {
         crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", false);
     }
-    let mut upstream = dial_upstream(&upstream_proxy, &host, port, connector.addrs())
+    let approved_real_ip_candidates = connector.addrs().to_vec();
+    let mut upstream = dial_upstream(&upstream_proxy, &host, port, &approved_real_ip_candidates)
         .await
         .into_diagnostic()?;
+    let upstream_socket_peer = upstream.peer_addr().into_diagnostic()?;
+    let (connected_real_destination, dial_mode) = match upstream.connect_target() {
+        Some(upstream_proxy::ConnectTarget::Ip(ip)) => (
+            Some(SocketAddr::new(ip, port)),
+            "upstream_proxy_validated_ip",
+        ),
+        Some(upstream_proxy::ConnectTarget::Hostname) => {
+            (None, "upstream_proxy_hostname_resolution")
+        }
+        None => (Some(upstream_socket_peer), "direct"),
+    };
     generation_guard.ensure_current()?;
     ctx.request_default_port = None;
     let policy_name = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.as_deref().unwrap_or("-"),
         NetworkAction::Deny { .. } => "-",
     };
-    ocsf_emit!(
-        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Allowed)
-            .disposition(DispositionId::Allowed)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .dst_endpoint(Endpoint::from_domain(&host, port))
-            .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-            .firewall_rule(policy_name, "opa")
-            .message(format!("Transparent TCP allowed {host}:{port}"))
-            .status_detail("transparent_tcp_allowed")
-            .build()
-    );
+    let binary = decision
+        .binary
+        .as_ref()
+        .map_or("-".to_string(), |path| path.display().to_string());
+    let pid = decision
+        .binary_pid
+        .map_or("-".to_string(), |pid| pid.to_string());
+    ocsf_emit!(build_transparent_tcp_allow_ocsf_event(
+        TransparentTcpAllowAudit {
+            workload: workload_addr,
+            synthetic_destination: original,
+            normalized_domain: &host,
+            approved_real_ip_candidates: &approved_real_ip_candidates,
+            connected_real_destination,
+            upstream_socket_peer,
+            dial_mode,
+            mapping_id: mapping.record.mapping_id,
+            mapping_generation: mapping.record.mapping_generation,
+            mapping_policy_generation: mapping.record.policy_generation,
+            authorization_policy_generation: decision.policy_generation,
+            binary: &binary,
+            pid: &pid,
+            policy_name,
+        }
+    ));
     emit_activity(&activity_tx, false, "transparent_tcp");
     relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await
+}
+
+#[cfg(any(target_os = "linux", test))]
+struct TransparentTcpAllowAudit<'a> {
+    workload: SocketAddr,
+    synthetic_destination: SocketAddr,
+    normalized_domain: &'a str,
+    approved_real_ip_candidates: &'a [SocketAddr],
+    connected_real_destination: Option<SocketAddr>,
+    upstream_socket_peer: SocketAddr,
+    dial_mode: &'a str,
+    mapping_id: uuid::Uuid,
+    mapping_generation: u64,
+    mapping_policy_generation: u64,
+    authorization_policy_generation: u64,
+    binary: &'a str,
+    pid: &'a str,
+    policy_name: &'a str,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn build_transparent_tcp_allow_ocsf_event(
+    audit: TransparentTcpAllowAudit<'_>,
+) -> openshell_ocsf::OcsfEvent {
+    let logical_destination = format!(
+        "{}:{}",
+        audit.normalized_domain,
+        audit.synthetic_destination.port()
+    );
+    let mapping_id = audit.mapping_id.to_string();
+    let actual_target = audit
+        .connected_real_destination
+        .map_or_else(|| "proxy-resolved".to_string(), |target| target.to_string());
+    let message = format!(
+        "Transparent TCP mapping_id={mapping_id} synthetic={} real={actual_target}",
+        audit.synthetic_destination,
+    );
+    let approved_real_ip_candidates = audit
+        .approved_real_ip_candidates
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut builder = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .dst_endpoint(Endpoint::from_domain(
+            audit.normalized_domain,
+            audit.synthetic_destination.port(),
+        ))
+        .src_endpoint_addr(audit.workload.ip(), audit.workload.port())
+        .actor_process(Process::from_bypass(audit.binary, audit.pid, ""))
+        .firewall_rule(audit.policy_name, "opa")
+        .unmapped("matched_policy", audit.policy_name)
+        .unmapped("normalized_domain", audit.normalized_domain)
+        .unmapped("logical_destination", logical_destination)
+        .unmapped(
+            "synthetic_destination",
+            audit.synthetic_destination.to_string(),
+        )
+        .unmapped(
+            "approved_real_ip_candidates",
+            serde_json::json!(approved_real_ip_candidates),
+        )
+        .unmapped(
+            "upstream_socket_peer",
+            audit.upstream_socket_peer.to_string(),
+        )
+        .unmapped("dial_mode", audit.dial_mode)
+        .unmapped("mapping_id", mapping_id)
+        .unmapped("mapping_generation", audit.mapping_generation)
+        .unmapped("policy_generation", audit.mapping_policy_generation)
+        .unmapped("mapping_policy_generation", audit.mapping_policy_generation)
+        .unmapped(
+            "authorization_policy_generation",
+            audit.authorization_policy_generation,
+        )
+        .message(message)
+        .status_detail("transparent_tcp_allowed");
+    if let Some(destination) = audit.connected_real_destination {
+        builder = builder.unmapped("connected_real_destination", destination.to_string());
+    }
+    builder.build()
 }
 
 #[cfg(target_os = "linux")]
@@ -6783,6 +6891,91 @@ network_policies:
             json["status_detail"],
             FORWARD_ENCODED_SLASH_REJECTION_DETAIL
         );
+    }
+
+    #[test]
+    fn transparent_tcp_allow_ocsf_exposes_correlated_dns_and_dial_chain() {
+        let mapping_id = uuid::Uuid::new_v4();
+        let event = build_transparent_tcp_allow_ocsf_event(TransparentTcpAllowAudit {
+            workload: "127.0.0.1:45123".parse().unwrap(),
+            synthetic_destination: "198.18.0.7:6379".parse().unwrap(),
+            normalized_domain: "redis.openshell.demo",
+            approved_real_ip_candidates: &[
+                "172.18.0.4:6379".parse().unwrap(),
+                "172.18.0.5:6379".parse().unwrap(),
+            ],
+            connected_real_destination: Some("172.18.0.5:6379".parse().unwrap()),
+            upstream_socket_peer: "172.18.0.5:6379".parse().unwrap(),
+            dial_mode: "direct",
+            mapping_id,
+            mapping_generation: 4,
+            mapping_policy_generation: 7,
+            authorization_policy_generation: 7,
+            binary: "/sandbox/.venv/bin/python3",
+            pid: "42",
+            policy_name: "redis",
+        });
+        let json = event.to_json().unwrap();
+
+        assert_eq!(json["actor"]["process"]["pid"], 42);
+        assert_eq!(
+            json["actor"]["process"]["name"],
+            "/sandbox/.venv/bin/python3"
+        );
+        assert!(json["actor"]["process"].get("parent_process").is_none());
+        assert_eq!(json["dst_endpoint"]["domain"], "redis.openshell.demo");
+        assert_eq!(json["firewall_rule"]["name"], "redis");
+        assert_eq!(json["unmapped"]["synthetic_destination"], "198.18.0.7:6379");
+        assert_eq!(
+            json["unmapped"]["connected_real_destination"],
+            "172.18.0.5:6379"
+        );
+        assert_eq!(
+            json["unmapped"]["approved_real_ip_candidates"],
+            serde_json::json!(["172.18.0.4:6379", "172.18.0.5:6379"])
+        );
+        assert_eq!(json["unmapped"]["mapping_id"], mapping_id.to_string());
+        assert_eq!(json["unmapped"]["mapping_generation"], 4);
+        assert_eq!(json["unmapped"]["policy_generation"], 7);
+        assert_eq!(json["unmapped"]["mapping_policy_generation"], 7);
+        assert_eq!(json["unmapped"]["matched_policy"], "redis");
+        assert_eq!(json["unmapped"]["dial_mode"], "direct");
+
+        let shorthand = event.format_shorthand();
+        assert!(shorthand.contains("/sandbox/.venv/bin/python3(42)"));
+        assert!(shorthand.contains("redis.openshell.demo:6379"));
+        assert!(shorthand.contains("synthetic=198.18.0.7:6379"));
+        assert!(shorthand.contains("real=172.18.0.5:6379"));
+        assert!(shorthand.contains(&format!("mapping_id={mapping_id}")));
+    }
+
+    #[test]
+    fn transparent_tcp_proxy_hostname_audit_does_not_claim_proxy_peer_is_destination() {
+        let event = build_transparent_tcp_allow_ocsf_event(TransparentTcpAllowAudit {
+            workload: "127.0.0.1:45123".parse().unwrap(),
+            synthetic_destination: "198.18.0.7:6379".parse().unwrap(),
+            normalized_domain: "redis.openshell.demo",
+            approved_real_ip_candidates: &["172.18.0.4:6379".parse().unwrap()],
+            connected_real_destination: None,
+            upstream_socket_peer: "192.0.2.20:3128".parse().unwrap(),
+            dial_mode: "upstream_proxy_hostname_resolution",
+            mapping_id: uuid::Uuid::new_v4(),
+            mapping_generation: 4,
+            mapping_policy_generation: 7,
+            authorization_policy_generation: 7,
+            binary: "/usr/bin/redis-cli",
+            pid: "43",
+            policy_name: "redis",
+        });
+        let json = event.to_json().unwrap();
+
+        assert!(json["unmapped"].get("connected_real_destination").is_none());
+        assert_eq!(json["unmapped"]["upstream_socket_peer"], "192.0.2.20:3128");
+        assert_eq!(
+            json["unmapped"]["dial_mode"],
+            "upstream_proxy_hostname_resolution"
+        );
+        assert!(event.format_shorthand().contains("real=proxy-resolved"));
     }
 
     #[test]

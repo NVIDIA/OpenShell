@@ -476,20 +476,49 @@ fn emit_dns_failure(
 }
 
 fn emit_mapping_publication(record: &ResolvedEndpointRecord) {
-    ocsf_emit!(
-        ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .state(StateId::Enabled, "published")
-            .unmapped("normalized_name", record.normalized_name.as_str())
-            .unmapped("address_family", format!("{:?}", record.family))
-            .unmapped("allowed_port_count", record.allowed_ports().len() as u64)
-            .unmapped("policy_generation", record.policy_generation)
-            .unmapped("mapping_generation", record.mapping_generation)
-            .unmapped("mapping_id", record.mapping_id.to_string())
-            .message("Policy DNS resolved-endpoint mapping published")
-            .build()
+    ocsf_emit!(build_mapping_publication_event(record));
+}
+
+fn build_mapping_publication_event(record: &ResolvedEndpointRecord) -> openshell_ocsf::OcsfEvent {
+    let approved_real_ip_candidates = record
+        .contracts
+        .iter()
+        .flat_map(|contract| contract.pinned_addresses.iter().copied())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|address| address.to_string())
+        .collect::<Vec<_>>();
+    let allowed_ports = record.allowed_ports().into_iter().collect::<Vec<_>>();
+    let mapping_id = record.mapping_id.to_string();
+    let message = format!(
+        "Policy DNS mapped {} resolved={} synthetic={} ports={} mapping_id={mapping_id}",
+        record.normalized_name,
+        approved_real_ip_candidates.join(","),
+        record.synthetic_address,
+        allowed_ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
     );
+
+    ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .state(StateId::Enabled, "published")
+        .unmapped("normalized_domain", record.normalized_name.as_str())
+        .unmapped("address_family", format!("{:?}", record.family))
+        .unmapped(
+            "approved_real_ip_candidates",
+            serde_json::json!(approved_real_ip_candidates),
+        )
+        .unmapped("synthetic_ip", record.synthetic_address.to_string())
+        .unmapped("allowed_ports", serde_json::json!(allowed_ports))
+        .unmapped("policy_generation", record.policy_generation)
+        .unmapped("mapping_generation", record.mapping_generation)
+        .unmapped("mapping_id", mapping_id)
+        .message(message)
+        .build()
 }
 
 #[cfg(test)]
@@ -639,6 +668,43 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             mapping.record.contracts[0].pinned_addresses,
             ["10.2.3.4".parse::<IpAddr>().unwrap()]
         );
+    }
+
+    #[tokio::test]
+    async fn mapping_publication_ocsf_exposes_correlatable_resolution_chain() {
+        let service = service(
+            BASE_POLICY,
+            vec!["10.2.3.5".parse().unwrap(), "10.2.3.4".parse().unwrap()],
+        );
+        let now = Instant::now();
+        let answer = service
+            .answer_query("DB.EXAMPLE.", AddressFamily::Ipv4, now)
+            .await
+            .unwrap();
+        let mapping = service
+            .store
+            .lookup(answer.address, 5432, answer.policy_generation, now)
+            .unwrap();
+
+        let event = build_mapping_publication_event(&mapping.record);
+        let json = event.to_json().unwrap();
+        let unmapped = &json["unmapped"];
+        assert_eq!(unmapped["normalized_domain"], "db.example");
+        assert_eq!(unmapped["synthetic_ip"], answer.address.to_string());
+        assert_eq!(unmapped["allowed_ports"], serde_json::json!([5432]));
+        assert_eq!(
+            unmapped["approved_real_ip_candidates"],
+            serde_json::json!(["10.2.3.4", "10.2.3.5"])
+        );
+        assert_eq!(unmapped["mapping_id"], answer.mapping_id.to_string());
+        assert_eq!(unmapped["mapping_generation"], answer.mapping_generation);
+        assert_eq!(unmapped["policy_generation"], answer.policy_generation);
+
+        let shorthand = event.format_shorthand();
+        assert!(shorthand.contains("Policy DNS mapped db.example"));
+        assert!(shorthand.contains("resolved=10.2.3.4,10.2.3.5"));
+        assert!(shorthand.contains(&format!("synthetic={}", answer.address)));
+        assert!(shorthand.contains(&format!("mapping_id={}", answer.mapping_id)));
     }
 
     #[tokio::test]
