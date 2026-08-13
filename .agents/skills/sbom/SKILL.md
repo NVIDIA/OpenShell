@@ -9,14 +9,36 @@ Generate CycloneDX SBOMs, resolve missing licenses, and export to CSV for compli
 
 ## Overview
 
-The OpenShell SBOM tooling produces CycloneDX JSON SBOMs using Syft, resolves missing or hash-based licenses by querying public registries (crates.io, npm, PyPI), and exports the results to CSV for stakeholder review.
+The OpenShell SBOM tooling produces source-tree CycloneDX JSON SBOMs using Syft, resolves missing or hash-based licenses by querying public registries (crates.io, npm, PyPI), and exports the results to CSV for stakeholder review.
 
 SBOMs are **release artifacts only** -- they are generated on demand and not committed to the repository. Output lands in `deploy/sbom/output/` (gitignored).
+
+Release Dev and Release Tag image builds separately embed cargo-auditable metadata in the staged gateway and supervisor binaries. This metadata describes the binary's Rust dependency graph and lets Syft discover Cargo packages from the binary itself. It is not a complete image SBOM and is not an OCI SBOM attestation; publishing such an attestation remains separate work.
 
 ## Prerequisites
 
 - `mise install` has been run (installs Syft and other tools)
 - The repository is checked out at the root
+
+## Inspecting an Auditable Image Binary
+
+Opt into auditable metadata when staging a local image binary:
+
+```bash
+OPENSHELL_AUDITABLE=1 PREBUILT_ARCH=amd64 \
+  tasks/scripts/stage-prebuilt-binaries.sh gateway
+```
+
+Scan the staged binary rather than the source tree:
+
+```bash
+mise x -- syft \
+  "file:deploy/docker/.build/prebuilt-binaries/amd64/openshell-gateway" \
+  -o cyclonedx-json
+```
+
+This output is limited to packages Syft discovers from that binary. Use
+`mise run sbom` for the broader source-tree license-compliance inventory.
 
 ## Workflow 1: Full SBOM Generation (One Command)
 
