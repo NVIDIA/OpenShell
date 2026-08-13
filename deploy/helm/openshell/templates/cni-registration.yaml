@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-{{- if eq (.Values.supervisor.topology | default "combined") "cni-sidecar" }}
+{{- if and (not .Values.cni.only) (eq (.Values.supervisor.topology | default "combined") "cni-sidecar") }}
 {{- $sandboxNamespace := .Values.server.sandboxNamespace | default .Release.Namespace }}
 # Helm-owned registration marker for this release's sandbox namespace. The CNI
 # singleton lists ConfigMaps labeled openshell.ai/cni-registration=true and

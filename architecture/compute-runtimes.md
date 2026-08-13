@@ -381,6 +381,15 @@ all other plugins). The `pods get` and `configmaps list` grants are cluster-scop
 so the one installer can discover marker ConfigMaps and read sandbox pods in any
 allowlisted namespace.
 
+Because one node plugin serves every gateway on the node — which may span
+OpenShell versions — the CNI-to-sandbox contract is versioned. The gateway stamps
+`openshell.ai/cni-contract-version` on each cni-sidecar pod, and the plugin fails
+closed (refuses CNI `ADD`) when a pod requires a version it does not implement,
+rather than installing rules that may not match. The plugin accepts any version
+at or below its own (backward compatible within a major) and treats an absent
+annotation as a pre-versioning gateway. This turns version skew into a safe
+scheduling failure instead of silent under-enforcement.
+
 On OpenShift, binary-aware network policy also requires a purpose-built
 SecurityContextConstraints for sandbox pods: the network sidecar runs as UID 0
 with `SYS_PTRACE` and `DAC_READ_SEARCH` to inspect cross-UID `/proc`, which

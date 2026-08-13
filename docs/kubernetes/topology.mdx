@@ -267,9 +267,15 @@ release must be **installed first and uninstalled last** — uninstalling the ow
 deletes the singleton and drops egress enforcement for every other gateway still
 running.
 
-The singleton runs a single `openshell-cni` image. When gateways span multiple
-OpenShell versions, keep the singleton at a version compatible with all of them;
-the CNI-to-sandbox contract is not yet version-negotiated across releases.
+The singleton runs a single `openshell-cni` image. Each gateway stamps the CNI
+contract version it requires on its sandbox pods
+(`openshell.ai/cni-contract-version`), and the node plugin **fails closed** —
+refusing to set up a pod's network — when it does not implement that version,
+rather than mis-enforcing. So a newer gateway running against an older singleton
+fails safe (its sandboxes do not start) instead of running unprotected: upgrade
+the standalone CNI release to a version that satisfies every gateway scheduling
+onto the node. Within a contract-major the plugin stays backward compatible, so
+older gateways keep working against a newer singleton.
 
 ## Credential Exposure
 

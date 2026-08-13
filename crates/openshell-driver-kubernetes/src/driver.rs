@@ -2376,6 +2376,13 @@ const OPENSHELL_CNI_PROXY_PORT_ANNOTATION: &str = "openshell.ai/proxy-port";
 const OPENSHELL_CNI_NETWORK_ENFORCEMENT_MODE_ANNOTATION: &str =
     "openshell.ai/network-enforcement-mode";
 const CNI_SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "cni-sidecar";
+/// Annotation naming the CNI contract version this gateway build requires. The
+/// node CNI singleton (possibly an older build in a mixed-version cluster) reads
+/// it and fails closed if it cannot satisfy the version, rather than
+/// mis-enforcing. Must stay in sync with the identical constant in
+/// `openshell-cni`; bump both together on a breaking CNI-contract change.
+const OPENSHELL_CNI_CONTRACT_VERSION_ANNOTATION: &str = "openshell.ai/cni-contract-version";
+const OPENSHELL_CNI_CONTRACT_VERSION: u32 = 1;
 /// Node label the CNI installer sets once per-node egress enforcement is in
 /// place. Sandbox pods in the cni-sidecar topology require it via nodeAffinity
 /// so they cannot schedule onto a node before the chained plugin is active
@@ -3506,7 +3513,14 @@ fn sandbox_template_to_k8s_with_validated_config(
         .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
         .collect::<serde_json::Map<String, serde_json::Value>>();
     let cni_sidecar_topology = params.topology == SupervisorTopology::CniSidecar;
-    if params.provider_spiffe_enabled {
+    // The managed-by label must be present on every cni-sidecar sandbox pod
+    // (independently of SPIFFE): the node CNI's drain-gated allowlist keeps a
+    // namespace enforced while it still has pods matching
+    // `openshell.ai/managed-by=openshell`. Without it, removing a namespace's
+    // registration marker (uninstall / namespace migration) would drop the
+    // namespace from the allowlist even with live sandboxes, and recreated pods
+    // would bypass CNI enforcement.
+    if params.provider_spiffe_enabled || cni_sidecar_topology {
         pod_labels.insert(
             LABEL_MANAGED_BY.to_string(),
             serde_json::Value::String(LABEL_MANAGED_BY_VALUE.to_string()),
@@ -3567,6 +3581,12 @@ fn sandbox_template_to_k8s_with_validated_config(
         pod_annotations.insert(
             OPENSHELL_CNI_NETWORK_ENFORCEMENT_MODE_ANNOTATION.to_string(),
             serde_json::Value::String(CNI_SIDECAR_NETWORK_ENFORCEMENT_MODE.to_string()),
+        );
+        // Declare the CNI contract version this gateway build requires so an
+        // older node CNI singleton fails closed instead of mis-enforcing.
+        pod_annotations.insert(
+            OPENSHELL_CNI_CONTRACT_VERSION_ANNOTATION.to_string(),
+            serde_json::Value::String(OPENSHELL_CNI_CONTRACT_VERSION.to_string()),
         );
     }
     if !pod_annotations.is_empty() {
@@ -6276,6 +6296,17 @@ mod tests {
             &params,
         );
 
+        // P1: the managed-by label must be present on cni-sidecar pods even
+        // without SPIFFE (this params has provider_spiffe_enabled=false), so the
+        // node CNI's drain-gated allowlist keeps the namespace enforced while
+        // sandboxes are live.
+        let labels = pod_template["metadata"]["labels"].as_object().unwrap();
+        assert_eq!(
+            labels[LABEL_MANAGED_BY],
+            serde_json::json!(LABEL_MANAGED_BY_VALUE)
+        );
+        assert_eq!(labels[LABEL_SANDBOX_ID], serde_json::json!("sb-cni"));
+
         let annotations = pod_template["metadata"]["annotations"].as_object().unwrap();
         assert_eq!(
             annotations[OPENSHELL_CNI_ENABLED_ANNOTATION],
@@ -6288,6 +6319,12 @@ mod tests {
         assert_eq!(
             annotations[OPENSHELL_CNI_PROXY_UID_ANNOTATION],
             serde_json::json!("2200")
+        );
+        // The gateway declares the CNI contract version so an older node plugin
+        // fails closed rather than mis-enforcing.
+        assert_eq!(
+            annotations[OPENSHELL_CNI_CONTRACT_VERSION_ANNOTATION],
+            serde_json::json!(OPENSHELL_CNI_CONTRACT_VERSION.to_string())
         );
         assert_eq!(
             annotations[OPENSHELL_CNI_PROXY_PORT_ANNOTATION],
