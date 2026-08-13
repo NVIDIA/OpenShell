@@ -3,13 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "OpenShift"
 sidebar-title: "OpenShift"
-description: "Install the OpenShell Helm chart on OpenShift, including the SCC binding and chart overrides required by OpenShift's Security Context Constraints."
-keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, SCC, Security Context Constraints, Helm, Gateway, Installation"
+description: "Install the OpenShell Helm chart on OpenShift with SCC overrides, TLS options, OIDC authentication, and external access."
+keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, SCC, Security Context Constraints, Helm, Gateway, Installation, TLS, OIDC, Keycloak"
 position: 6
 ---
 
 <Warning>
-The OpenShift install path is experimental. It currently requires running sandbox pods under the `privileged` SCC and installing the gateway with TLS disabled. Use only for evaluation on a private network.
+The OpenShift install path is experimental. It currently requires running sandbox pods under the `privileged` SCC. Use only for evaluation on a private network.
 </Warning>
 
 OpenShift's [Security Context Constraints](https://docs.openshift.com/container-platform/latest/authentication/managing-security-context-constraints.html) reject the chart's default pod security settings. Installing on OpenShift requires precreating the namespace, granting the `privileged` SCC to the sandbox service account, and overriding a few chart values so the cluster admission controller can assign UIDs and FS groups itself.
@@ -47,6 +47,26 @@ oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 
 ## Install the chart with OpenShift overrides
 
+<Tabs>
+<Tab title="TLS enabled (recommended)">
+
+```shell
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set podSecurityContext.fsGroup=null \
+  --set securityContext.runAsUser=null
+```
+
+| Override | Reason |
+|---|---|
+| `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Clear the chart's hardcoded UID and fsGroup so OpenShift's SCC admission can assign them. |
+
+TLS and the PKI init job remain enabled by default. The certgen hook generates a self-signed CA, server certificate, and client certificate for mTLS between the gateway and sandbox supervisors.
+
+</Tab>
+<Tab title="Plaintext (quick evaluation)">
+
 ```shell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
@@ -61,6 +81,9 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
 | `server.disableTls=true` | Runs the gateway over plaintext HTTP for simpler evaluation. |
 | `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Clear the chart's hardcoded UID and fsGroup so OpenShift's SCC admission can assign them. |
 
+</Tab>
+</Tabs>
+
 ## Wait for the gateway to be ready
 
 ```shell
@@ -74,7 +97,7 @@ If you set `workload.kind=deployment`, use
 
 ## Connect to the gateway
 
-The gateway is now running over plaintext HTTP. Connect with `oc port-forward`:
+For quick local evaluation, forward the gateway port to your workstation:
 
 ```shell
 oc -n openshell port-forward svc/openshell 8080:8080
@@ -82,13 +105,53 @@ oc -n openshell port-forward svc/openshell 8080:8080
 
 Register the gateway with the CLI:
 
+<Tabs>
+<Tab title="TLS enabled">
+
+```shell
+openshell gateway add https://127.0.0.1:8080 --local --gateway-insecure --name openshift
+openshell status
+```
+
+</Tab>
+<Tab title="Plaintext">
+
 ```shell
 openshell gateway add http://127.0.0.1:8080 --local --name openshift
 openshell status
 ```
 
+</Tab>
+</Tabs>
+
 ## Next Steps
 
-- For TLS-enabled deployments, refer to [Managing Certificates](/kubernetes/managing-certificates).
-- To expose the gateway externally, refer to [Ingress](/kubernetes/ingress).
-- To configure OIDC authentication, refer to [Access Control](/kubernetes/access-control).
+- To expose the gateway externally, refer to the [OpenShift ingress options](/kubernetes/ingress#openshift-reencrypt-route) (reencrypt Route or Gateway API with Istio).
+- To configure OIDC authentication with Keycloak, refer to the [Keycloak setup](/kubernetes/access-control#keycloak-setup) section, then upgrade the Helm release with OIDC values:
+
+  ```shell
+  helm upgrade openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+    --version <version> \
+    --namespace openshell \
+    --reuse-values \
+    --set server.oidc.issuer=https://keycloak.example.com/realms/openshell \
+    --set server.oidc.audience=openshell-cli \
+    --set server.oidc.rolesClaim=realm_access.roles \
+    --set server.oidc.adminRole=openshell-admin \
+    --set server.oidc.userRole=openshell-user
+  ```
+
+  Then register the gateway with `--oidc-issuer`:
+
+  ```shell
+  openshell gateway add https://<gateway-endpoint> \
+    --gateway-insecure \
+    --name openshift \
+    --oidc-issuer https://keycloak.example.com/realms/openshell \
+    --oidc-client-id openshell-cli \
+    --oidc-audience openshell-cli
+  ```
+
+- To federate OpenShift identities into Keycloak, refer to [OpenShift Identity Federation](/kubernetes/access-control#openshift-identity-federation-optional).
+- For TLS certificate management with cert-manager, refer to [Managing Certificates](/kubernetes/managing-certificates).
+- For the generic OIDC configuration reference, refer to [Access Control](/kubernetes/access-control).
