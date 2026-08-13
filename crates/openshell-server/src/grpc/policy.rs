@@ -59,8 +59,8 @@ use openshell_ocsf::{
     ConfigStateChangeBuilder, OCSF_TARGET, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
 };
 use openshell_policy::{
-    PolicyMergeOp, ProviderPolicyLayer, compose_effective_policy, merge_policy,
-    serialize_sandbox_policy,
+    PolicyMergeOp, ProviderPolicyLayer, SandboxIdentityLimits, compose_effective_policy,
+    merge_policy, serialize_sandbox_policy,
 };
 use openshell_prover::{
     credentials::{Credential, CredentialSet},
@@ -82,7 +82,7 @@ use tracing::{debug, info, warn};
 
 use super::validation::{
     identity_limits, level_matches, normalize_process_identity_for_driver, source_matches,
-    validate_annotations, validate_no_reserved_provider_policy_keys, validate_policy_safety,
+    validate_annotations, validate_no_reserved_provider_policy_keys,
     validate_policy_safety_with_limits, validate_static_fields_unchanged,
 };
 use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit};
@@ -451,6 +451,7 @@ fn validation_result_for_agent_proposal(
     rule_name: &str,
     proposed_rule: &NetworkPolicyRule,
     credentials: &CredentialSet,
+    identity_limits: SandboxIdentityLimits,
 ) -> String {
     let merge_op = PolicyMergeOp::AddRule {
         rule_name: rule_name.to_string(),
@@ -460,7 +461,7 @@ fn validation_result_for_agent_proposal(
         Ok(result) => result.policy,
         Err(error) => return format!("merge failed: {}", one_line(&error.to_string())),
     };
-    if let Err(error) = validate_policy_safety(&merged) {
+    if let Err(error) = validate_policy_safety_with_limits(&merged, identity_limits) {
         return format!("policy invalid: {}", one_line(&error.to_string()));
     }
 
@@ -961,6 +962,7 @@ async fn auto_approve_chunk(
         &chunk.rule_name,
         &rule,
         context.credential_set,
+        identity_limits(&state.config),
     );
     if validation_result != "prover: no new findings" {
         info!(
@@ -1008,6 +1010,7 @@ async fn auto_approve_chunk(
         context.workspace,
         &chunk,
         &provider_layers,
+        identity_limits(&state.config),
     )
     .await?;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
@@ -2710,6 +2713,7 @@ async fn handle_update_config_inner(
             PolicyMergeValidationContext {
                 provider_layers: &provider_layers,
                 credential_binding: Some(&credential_binding_context),
+                identity_limits: identity_limits(&state.config),
             },
             Some(&atomic_context),
         )
@@ -3471,6 +3475,7 @@ pub(super) async fn handle_submit_policy_analysis(
             &chunk.rule_name,
             rule_ref,
             &credential_set,
+            identity_limits(&state.config),
         );
 
         let record = DraftChunkRecord {
@@ -3766,6 +3771,7 @@ async fn handle_approve_draft_chunk_inner(
         &workspace,
         &chunk,
         &provider_layers,
+        identity_limits(&state.config),
     )
     .await?;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
@@ -4037,6 +4043,7 @@ async fn handle_approve_all_draft_chunks_inner(
             &workspace,
             chunk,
             &provider_layers,
+            identity_limits(&state.config),
         )
         .await?;
         last_version = version;
@@ -4925,6 +4932,7 @@ struct PolicyCredentialBindingValidationContext<'a> {
 struct PolicyMergeValidationContext<'a> {
     provider_layers: &'a [ProviderPolicyLayer],
     credential_binding: Option<&'a PolicyCredentialBindingValidationContext<'a>>,
+    identity_limits: SandboxIdentityLimits,
 }
 
 async fn apply_merge_operations_with_retry(
@@ -4957,7 +4965,7 @@ async fn apply_merge_operations_with_retry(
         if let Some(baseline_policy) = baseline_policy {
             validate_static_fields_unchanged(baseline_policy, &new_policy)?;
         }
-        validate_policy_safety(&new_policy)?;
+        validate_policy_safety_with_limits(&new_policy, validation_context.identity_limits)?;
         validate_candidate_effective_policy(&new_policy, provider_layers)?;
         let effective_policy = if provider_layers.is_empty() {
             new_policy.clone()
@@ -5069,6 +5077,7 @@ pub(super) async fn merge_chunk_into_policy(
     workspace: &str,
     chunk: &DraftChunkRecord,
     provider_layers: &[ProviderPolicyLayer],
+    identity_limits: SandboxIdentityLimits,
 ) -> Result<(i64, String), Status> {
     let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
         .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
@@ -5086,6 +5095,7 @@ pub(super) async fn merge_chunk_into_policy(
         PolicyMergeValidationContext {
             provider_layers,
             credential_binding: None,
+            identity_limits,
         },
         None,
     )
@@ -5111,6 +5121,7 @@ async fn remove_chunk_from_policy(
         PolicyMergeValidationContext {
             provider_layers: &[],
             credential_binding: None,
+            identity_limits: identity_limits(&state.config),
         },
         None,
     )
@@ -7414,6 +7425,7 @@ mod tests {
             PolicyMergeValidationContext {
                 provider_layers: &[],
                 credential_binding: None,
+                identity_limits: SandboxIdentityLimits::default(),
             },
             None,
         )
@@ -7429,6 +7441,130 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn merge_operations_accept_system_ids_when_limits_allow() {
+        use openshell_core::proto::ProcessPolicy;
+
+        let store = test_store().await;
+        let sandbox_id = "sb-uid-500";
+        let mut initial_policy = openshell_policy::restrictive_default_policy();
+        initial_policy.process = Some(ProcessPolicy {
+            run_as_user: "500".into(),
+            run_as_group: "500".into(),
+        });
+        store
+            .put_policy_revision(
+                "p-seed",
+                sandbox_id,
+                "default",
+                1,
+                &initial_policy.encode_to_vec(),
+                "seed-hash",
+            )
+            .await
+            .unwrap();
+
+        let operations = [PolicyMergeOp::AddRule {
+            rule_name: "google".to_string(),
+            rule: NetworkPolicyRule {
+                name: "google".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "google.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        }];
+
+        let error = apply_merge_operations_with_retry(
+            &store,
+            sandbox_id,
+            "default",
+            None,
+            &operations,
+            PolicyMergeValidationContext {
+                provider_layers: &[],
+                credential_binding: None,
+                identity_limits: SandboxIdentityLimits::default(),
+            },
+            None,
+        )
+        .await
+        .expect_err("default identity min must reject UID 500");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("run_as_user"));
+
+        let (version, _, _) = apply_merge_operations_with_retry(
+            &store,
+            sandbox_id,
+            "default",
+            None,
+            &operations,
+            PolicyMergeValidationContext {
+                provider_layers: &[],
+                credential_binding: None,
+                identity_limits: SandboxIdentityLimits::from_mins(1, 1),
+            },
+            None,
+        )
+        .await
+        .expect("configured min must accept UID 500");
+        assert_eq!(version, 2);
+    }
+
+    #[test]
+    fn validation_result_for_agent_proposal_accepts_system_ids_when_limits_allow() {
+        use openshell_core::proto::ProcessPolicy;
+
+        let mut current_policy = openshell_policy::restrictive_default_policy();
+        current_policy.process = Some(ProcessPolicy {
+            run_as_user: "500".into(),
+            run_as_group: "500".into(),
+        });
+        let proposed = NetworkPolicyRule {
+            name: "google".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "google.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let credentials = CredentialSet {
+            credentials: Vec::new(),
+            api_registries: HashMap::new(),
+        };
+
+        let default_result = validation_result_for_agent_proposal(
+            current_policy.clone(),
+            &proposed.name,
+            &proposed,
+            &credentials,
+            SandboxIdentityLimits::default(),
+        );
+        assert!(
+            default_result.starts_with("policy invalid"),
+            "{default_result}"
+        );
+        assert!(default_result.contains("run_as_user"));
+
+        let allowed = validation_result_for_agent_proposal(
+            current_policy,
+            &proposed.name,
+            &proposed,
+            &credentials,
+            SandboxIdentityLimits::from_mins(1, 1),
+        );
+        assert!(!allowed.starts_with("policy invalid"), "{allowed}");
     }
 
     #[tokio::test]
@@ -9625,6 +9761,7 @@ mod tests {
                 &finding_rule.name,
                 &finding_rule,
                 &credential_set,
+                SandboxIdentityLimits::default(),
             )
             .contains("credential_reach_expansion")
         );
@@ -12841,10 +12978,16 @@ mod tests {
             rejection_reason: String::new(),
         };
 
-        let (version, _) =
-            merge_chunk_into_policy(&store, &chunk.sandbox_id, "default", &chunk, &[])
-                .await
-                .unwrap();
+        let (version, _) = merge_chunk_into_policy(
+            &store,
+            &chunk.sandbox_id,
+            "default",
+            &chunk,
+            &[],
+            SandboxIdentityLimits::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(version, 1);
 
@@ -12939,9 +13082,16 @@ mod tests {
             rejection_reason: String::new(),
         };
 
-        let (version, _) = merge_chunk_into_policy(&store, sandbox_id, "default", &chunk, &[])
-            .await
-            .unwrap();
+        let (version, _) = merge_chunk_into_policy(
+            &store,
+            sandbox_id,
+            "default",
+            &chunk,
+            &[],
+            SandboxIdentityLimits::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(version, 2);
 
         let latest = store
@@ -13041,9 +13191,16 @@ mod tests {
             rejection_reason: String::new(),
         };
 
-        let (version, _) = merge_chunk_into_policy(&store, sandbox_id, "default", &chunk, &[])
-            .await
-            .unwrap();
+        let (version, _) = merge_chunk_into_policy(
+            &store,
+            sandbox_id,
+            "default",
+            &chunk,
+            &[],
+            SandboxIdentityLimits::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(version, 2);
 
         let latest = store.get_latest_policy(sandbox_id).await.unwrap().unwrap();
@@ -13131,6 +13288,7 @@ mod tests {
                 PolicyMergeValidationContext {
                     provider_layers: &[],
                     credential_binding: None,
+                    identity_limits: SandboxIdentityLimits::default(),
                 },
                 None
             ),
@@ -13143,6 +13301,7 @@ mod tests {
                 PolicyMergeValidationContext {
                     provider_layers: &[],
                     credential_binding: None,
+                    identity_limits: SandboxIdentityLimits::default(),
                 },
                 None
             ),
