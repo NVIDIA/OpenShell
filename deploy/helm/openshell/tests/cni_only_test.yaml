@@ -83,6 +83,19 @@ tests:
       - hasDocuments:
           count: 0
 
+  # A standalone CNI release must not register its own namespace, even if a
+  # topology value leaks in — it renders ONLY the CNI singleton.
+  - it: does not render a registration marker in cni-only mode
+    templates:
+      - templates/cni-registration.yaml
+    set:
+      cni.only: true
+      cni.enabled: true
+      supervisor.topology: cni-sidecar
+    asserts:
+      - hasDocuments:
+          count: 0
+
   # cni.only is meaningless without installing the singleton.
   - it: fails when cni.only is set without cni.enabled
     templates:

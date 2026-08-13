@@ -19,6 +19,18 @@ const OPENSHELL_CNI_PROXY_UID_ANNOTATION: &str = "openshell.ai/proxy-uid";
 const OPENSHELL_CNI_NETWORK_ENFORCEMENT_MODE_ANNOTATION: &str =
     "openshell.ai/network-enforcement-mode";
 const CNI_SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "cni-sidecar";
+/// Annotation the gateway stamps on each cni-sidecar pod naming the CNI contract
+/// version it requires. The node plugin is a cluster singleton that may be an
+/// older build than some gateways (mixed-version clusters), so it fails closed
+/// rather than mis-enforcing a pod whose contract it does not implement. Must
+/// stay in sync with the identical constant in `openshell-driver-kubernetes`.
+const OPENSHELL_CNI_CONTRACT_VERSION_ANNOTATION: &str = "openshell.ai/cni-contract-version";
+/// CNI contract version this plugin implements. Bump only on a breaking change to
+/// the pod-annotation contract or the installed ruleset shape. The plugin accepts
+/// any pod requiring a version <= this and refuses (fail closed) any requiring a
+/// higher version. Absent annotation = a pre-versioning gateway, treated as
+/// compatible.
+const CNI_CONTRACT_VERSION: u32 = 1;
 /// Node label set by the CNI installer once the chained plugin is in place and
 /// cleared when it is not, so the gateway can gate sandbox scheduling on
 /// per-node egress-enforcement readiness. Must stay in sync with the identical
@@ -192,10 +204,12 @@ trait PodReader {
 
 trait RuleInstaller {
     fn install(&self, netns: &Path, proxy_uid: u32) -> Result<InstallReport>;
-    /// Read-only validation that the bypass-prevention rules are present. Must NOT
+    /// Read-only validation that the bypass-prevention rules are present AND
+    /// structurally complete for `proxy_uid` (the OUTPUT hook, the proxy-UID
+    /// exemption, and TCP/UDP rejection across both address families). Must NOT
     /// modify live rules (CNI CHECK runs on a running pod; a destructive reinstall
     /// that fails would leave it unenforced).
-    fn verify(&self, netns: &Path) -> Result<()>;
+    fn verify(&self, netns: &Path, proxy_uid: u32) -> Result<()>;
     fn cleanup(&self, netns: &Path) -> Result<()>;
 }
 
@@ -485,9 +499,10 @@ fn handle_command(
                 let netns = env.netns.as_deref().ok_or_else(|| {
                     miette::miette!("CNI_NETNS is required for OpenShell CNI CHECK")
                 })?;
-                // CHECK is read-only: verify the rules are present without touching
-                // them, so a check never leaves a running pod momentarily unenforced.
-                installer.verify(netns)?;
+                // CHECK is read-only: verify the rules are present and structurally
+                // complete without touching them, so a check never leaves a running
+                // pod momentarily unenforced.
+                installer.verify(netns, workload.proxy_uid)?;
                 let report = InstallReport {
                     backend: "verified",
                 };
@@ -555,6 +570,21 @@ fn workload_from_config(
         != Some(CNI_SIDECAR_NETWORK_ENFORCEMENT_MODE)
     {
         return Ok(None);
+    }
+    // Fail closed on version skew: if this (possibly older) singleton plugin does
+    // not implement the contract the pod's gateway requires, refuse rather than
+    // install rules that may not match the gateway's expectations. An absent
+    // annotation is a pre-versioning gateway and is treated as compatible.
+    if let Some(required) = annotations.get(OPENSHELL_CNI_CONTRACT_VERSION_ANNOTATION) {
+        let required: u32 = required
+            .parse()
+            .into_diagnostic()
+            .wrap_err("invalid OpenShell CNI contract version annotation")?;
+        if required > CNI_CONTRACT_VERSION {
+            return Err(miette::miette!(
+                "pod requires OpenShell CNI contract version {required} but this node plugin implements {CNI_CONTRACT_VERSION}; upgrade the openshell-cni installer (mixed-version cluster)"
+            ));
+        }
     }
     let proxy_uid = annotations
         .get(OPENSHELL_CNI_PROXY_UID_ANNOTATION)
@@ -1031,8 +1061,8 @@ impl RuleInstaller for Runtime {
         install_rules(netns, proxy_uid)
     }
 
-    fn verify(&self, netns: &Path) -> Result<()> {
-        verify_rules(netns)
+    fn verify(&self, netns: &Path, proxy_uid: u32) -> Result<()> {
+        verify_rules(netns, proxy_uid)
     }
 
     fn cleanup(&self, netns: &Path) -> Result<()> {
@@ -1124,35 +1154,135 @@ fn install_nft_rules(netns: &Path, proxy_uid: u32, nft: &str) -> Result<()> {
     run_nft_ruleset_in_netns(netns, &nft, &ruleset)
 }
 
-/// Read-only check that the bypass-prevention rules are present in the netns.
-/// Never modifies live rules. Prefers nft (the table), falls back to the iptables
-/// chain; errors when neither is present so CNI CHECK surfaces the gap.
+/// Read-only check that the bypass-prevention rules are present AND structurally
+/// complete in the netns. Never modifies live rules. Prefers nft (one inet table
+/// covers both families), falls back to iptables. Merely finding the table/chain
+/// is not enough: an empty or partially damaged ruleset would pass while allowing
+/// bypass, so the dump is validated for the OUTPUT hook, the proxy-UID exemption,
+/// and TCP/UDP rejection on both address families.
 #[cfg(target_os = "linux")]
-fn verify_rules(netns: &Path) -> Result<()> {
+fn verify_rules(netns: &Path, proxy_uid: u32) -> Result<()> {
     if let Some(nft) = find_nft() {
-        if run_nft_args_in_netns(netns, &nft, &["list", "table", "inet", OPENSHELL_TABLE]).is_ok() {
-            return Ok(());
+        if let Ok(dump) =
+            run_command_capture_in_netns(netns, &nft, &["list", "table", "inet", OPENSHELL_TABLE])
+        {
+            return verify_nft_ruleset(&dump, proxy_uid);
         }
     }
     if let Some(iptables) = find_iptables() {
-        if run_command_in_netns(
-            netns,
-            &iptables.ipv4,
-            &["-w", "-t", "filter", "-n", "-L", OPENSHELL_IPTABLES_CHAIN],
-        )
-        .is_ok()
-        {
-            return Ok(());
-        }
+        return verify_iptables_rules(netns, &iptables, proxy_uid);
     }
     Err(miette::miette!(
         "OpenShell CNI bypass-prevention rules are not present in the pod network namespace"
     ))
 }
 
+/// Validates a `nft list table inet openshell_sidecar_bypass` dump has the full
+/// egress fence. nft programs both families in one inet table, so one dump covers
+/// IPv4 and IPv6.
+// Non-Linux builds compile this pure validator for unit tests but have no runtime
+// caller (verify_rules is Linux-only).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn verify_nft_ruleset(dump: &str, proxy_uid: u32) -> Result<()> {
+    let required: [(&str, String); 6] = [
+        ("output hook", "hook output".to_string()),
+        ("proxy-UID exemption", format!("skuid {proxy_uid}")),
+        ("IPv4 family rule", "nfproto ipv4".to_string()),
+        ("IPv6 family rule", "nfproto ipv6".to_string()),
+        ("TCP rejection", "tcp reject".to_string()),
+        ("UDP rejection", "udp reject".to_string()),
+    ];
+    for (what, needle) in &required {
+        if !dump.contains(needle) {
+            return Err(miette::miette!(
+                "OpenShell CNI nft ruleset is incomplete: missing {what} (expected `{needle}`)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates the iptables fallback for both families it programmed. IPv4 is always
+/// required; IPv6 is required only when the pod has routable IPv6 (mirrors
+/// install), so an IPv4-only pod is not failed for absent ip6tables rules.
+#[cfg(target_os = "linux")]
+fn verify_iptables_rules(netns: &Path, backend: &IptablesBackend, proxy_uid: u32) -> Result<()> {
+    verify_iptables_family(netns, &backend.ipv4, proxy_uid, "IPv4")?;
+    if netns_requires_ipv6_enforcement(netns) {
+        let ipv6 = backend.ipv6.as_deref().ok_or_else(|| {
+            miette::miette!(
+                "pod has IPv6 connectivity but ip6tables enforcement is absent; OpenShell CNI egress is bypassable over IPv6"
+            )
+        })?;
+        verify_iptables_family(netns, ipv6, proxy_uid, "IPv6")?;
+    }
+    Ok(())
+}
+
+/// Confirms the OUTPUT chain jumps to OPENSHELL_OUTPUT and that chain contains the
+/// proxy-UID exemption plus TCP and UDP rejection, for one iptables family.
+#[cfg(target_os = "linux")]
+fn verify_iptables_family(
+    netns: &Path,
+    iptables: &str,
+    proxy_uid: u32,
+    family: &str,
+) -> Result<()> {
+    if run_command_in_netns(
+        netns,
+        iptables,
+        &[
+            "-w",
+            "-t",
+            "filter",
+            "-C",
+            "OUTPUT",
+            "-j",
+            OPENSHELL_IPTABLES_CHAIN,
+        ],
+    )
+    .is_err()
+    {
+        return Err(miette::miette!(
+            "OpenShell CNI {family} enforcement is incomplete: OUTPUT does not jump to {OPENSHELL_IPTABLES_CHAIN}"
+        ));
+    }
+    let spec = run_command_capture_in_netns(
+        netns,
+        iptables,
+        &["-w", "-t", "filter", "-S", OPENSHELL_IPTABLES_CHAIN],
+    )
+    .map_err(|_| {
+        miette::miette!(
+            "OpenShell CNI {family} enforcement is incomplete: {OPENSHELL_IPTABLES_CHAIN} chain is absent"
+        )
+    })?;
+    verify_iptables_chain_spec(&spec, proxy_uid, family)
+}
+
+/// Validates an `iptables -S OPENSHELL_OUTPUT` chain spec for one family.
+// Non-Linux builds compile this pure validator for unit tests but have no runtime
+// caller (verify_iptables_family is Linux-only).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn verify_iptables_chain_spec(spec: &str, proxy_uid: u32, family: &str) -> Result<()> {
+    let required: [(&str, String); 3] = [
+        ("proxy-UID exemption", format!("--uid-owner {proxy_uid}")),
+        ("TCP rejection", "-p tcp -j REJECT".to_string()),
+        ("UDP rejection", "-p udp -j REJECT".to_string()),
+    ];
+    for (what, needle) in &required {
+        if !spec.contains(needle) {
+            return Err(miette::miette!(
+                "OpenShell CNI {family} enforcement is incomplete: missing {what} (expected `{needle}`)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(not(target_os = "linux"))]
-fn verify_rules(netns: &Path) -> Result<()> {
-    let _ = netns;
+fn verify_rules(netns: &Path, proxy_uid: u32) -> Result<()> {
+    let _ = (netns, proxy_uid);
     Err(miette::miette!(
         "OpenShell CNI rule verification is supported only on Linux nodes"
     ))
@@ -1250,6 +1380,13 @@ fn run_nft_args_in_netns(netns: &Path, nft: &str, args: &[&str]) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn run_command_in_netns(netns: &Path, program: &str, args: &[&str]) -> Result<()> {
+    run_command_capture_in_netns(netns, program, args).map(|_| ())
+}
+
+/// Like `run_command_in_netns` but returns the command's stdout on success. Used
+/// by the read-only CHECK path to inspect the live ruleset structure.
+#[cfg(target_os = "linux")]
+fn run_command_capture_in_netns(netns: &Path, program: &str, args: &[&str]) -> Result<String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
 
@@ -1273,7 +1410,7 @@ fn run_command_in_netns(netns: &Path, program: &str, args: &[&str]) -> Result<()
     };
 
     if output.status.success() {
-        return Ok(());
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
     Err(miette::miette!(
         "{} failed in CNI network namespace: {}",
@@ -1506,7 +1643,7 @@ mod tests {
             Ok(InstallReport { backend: "test" })
         }
 
-        fn verify(&self, _netns: &Path) -> Result<()> {
+        fn verify(&self, _netns: &Path, _proxy_uid: u32) -> Result<()> {
             *self.verified.lock().unwrap() += 1;
             Ok(())
         }
@@ -1618,6 +1755,61 @@ mod tests {
     }
 
     #[test]
+    fn add_accepts_supported_and_absent_contract_version() {
+        // Absent annotation (pre-versioning gateway) is compatible.
+        let installer = TestInstaller::default();
+        handle_command(
+            &cni_input(),
+            &env("ADD"),
+            &TestPods {
+                annotations: openshell_annotations(),
+            },
+            &installer,
+        )
+        .unwrap();
+        assert_eq!(*installer.installed.lock().unwrap(), vec![1337]);
+
+        // Version equal to what the plugin implements is accepted.
+        let mut annotations = openshell_annotations();
+        annotations.insert(
+            OPENSHELL_CNI_CONTRACT_VERSION_ANNOTATION.to_string(),
+            CNI_CONTRACT_VERSION.to_string(),
+        );
+        let installer = TestInstaller::default();
+        handle_command(
+            &cni_input(),
+            &env("ADD"),
+            &TestPods { annotations },
+            &installer,
+        )
+        .unwrap();
+        assert_eq!(*installer.installed.lock().unwrap(), vec![1337]);
+    }
+
+    #[test]
+    fn add_fails_closed_on_higher_contract_version() {
+        // A newer gateway requires a contract this (older) plugin does not
+        // implement: refuse rather than install rules that may not match.
+        let mut annotations = openshell_annotations();
+        annotations.insert(
+            OPENSHELL_CNI_CONTRACT_VERSION_ANNOTATION.to_string(),
+            (CNI_CONTRACT_VERSION + 1).to_string(),
+        );
+        let installer = TestInstaller::default();
+        let err = handle_command(
+            &cni_input(),
+            &env("ADD"),
+            &TestPods { annotations },
+            &installer,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("contract version"), "unexpected error: {err}");
+        // Fail closed: nothing installed.
+        assert!(installer.installed.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn check_verifies_without_reinstalling() {
         let pods = TestPods {
             annotations: openshell_annotations(),
@@ -1628,6 +1820,76 @@ mod tests {
         // that failed would leave the running pod unenforced).
         assert_eq!(*installer.verified.lock().unwrap(), 1);
         assert!(installer.installed.lock().unwrap().is_empty());
+    }
+
+    // A representative `nft list table inet openshell_sidecar_bypass` dump for the
+    // complete ruleset (nft renders priority 0 as `priority filter`).
+    fn nft_dump(proxy_uid: u32) -> String {
+        format!(
+            "table inet openshell_sidecar_bypass {{\n\
+             \tchain output {{\n\
+             \t\ttype filter hook output priority filter; policy accept;\n\
+             \t\toifname \"lo\" accept\n\
+             \t\tct state established,related accept\n\
+             \t\tmeta skuid {proxy_uid} accept\n\
+             \t\tmeta nfproto ipv4 meta l4proto tcp reject with icmp type port-unreachable\n\
+             \t\tmeta nfproto ipv6 meta l4proto tcp reject with icmpv6 type port-unreachable\n\
+             \t\tmeta nfproto ipv4 meta l4proto udp reject with icmp type port-unreachable\n\
+             \t\tmeta nfproto ipv6 meta l4proto udp reject with icmpv6 type port-unreachable\n\
+             \t}}\n\
+             }}\n"
+        )
+    }
+
+    #[test]
+    fn verify_nft_ruleset_accepts_complete_dump() {
+        assert!(verify_nft_ruleset(&nft_dump(0), 0).is_ok());
+        assert!(verify_nft_ruleset(&nft_dump(1337), 1337).is_ok());
+    }
+
+    #[test]
+    fn verify_nft_ruleset_rejects_empty_chain() {
+        // Table/chain exist but the fence rules are gone — must NOT pass.
+        let empty = "table inet openshell_sidecar_bypass {\n\tchain output {\n\t\ttype filter hook output priority filter; policy accept;\n\t}\n}\n";
+        let err = verify_nft_ruleset(empty, 0).unwrap_err().to_string();
+        assert!(err.contains("incomplete"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn verify_nft_ruleset_rejects_wrong_uid_and_missing_family() {
+        // Exemption for a different UID than the sidecar proxy runs as.
+        assert!(verify_nft_ruleset(&nft_dump(0), 1337).is_err());
+        // Drop the IPv6 reject rules: IPv6 egress would be unenforced.
+        let ipv4_only: String = nft_dump(0)
+            .lines()
+            .filter(|line| !line.contains("nfproto ipv6"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let err = verify_nft_ruleset(&ipv4_only, 0).unwrap_err().to_string();
+        assert!(err.contains("IPv6"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn verify_iptables_chain_spec_accepts_complete_and_rejects_partial() {
+        let complete = "-N OPENSHELL_OUTPUT\n\
+             -A OPENSHELL_OUTPUT -o lo -j RETURN\n\
+             -A OPENSHELL_OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN\n\
+             -A OPENSHELL_OUTPUT -m owner --uid-owner 0 -j RETURN\n\
+             -A OPENSHELL_OUTPUT -p tcp -j REJECT --reject-with icmp-port-unreachable\n\
+             -A OPENSHELL_OUTPUT -p udp -j REJECT --reject-with icmp-port-unreachable\n";
+        assert!(verify_iptables_chain_spec(complete, 0, "IPv4").is_ok());
+        // Wrong UID.
+        assert!(verify_iptables_chain_spec(complete, 1337, "IPv4").is_err());
+        // Missing UDP rejection.
+        let no_udp: String = complete
+            .lines()
+            .filter(|line| !line.contains("-p udp"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let err = verify_iptables_chain_spec(&no_udp, 0, "IPv4")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("UDP"), "unexpected error: {err}");
     }
 
     #[test]
