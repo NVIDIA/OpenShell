@@ -125,7 +125,7 @@ jobs:
         run: mise install --locked
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Keep branch-check caches partitioned by runner architecture; lint
           # and test intentionally share the same job-local target directory.
@@ -185,7 +185,7 @@ jobs:
           rustup component add clippy
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: rust-clippy-macos
           cache-on-failure: "true"
