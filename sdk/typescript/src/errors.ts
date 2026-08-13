@@ -45,6 +45,9 @@ export class SdkError extends Error {
 // The originating ConnectError is kept as `cause` and its status as
 // `connectCode` so callers can inspect the Connect status directly.
 export function fromConnect(err: unknown): SdkError {
+  // Curated response validation also runs inside RPC try/catch blocks. Preserve
+  // those SDK errors instead of remapping them to a generic Connect status.
+  if (err instanceof SdkError) return err;
   const ce = ConnectError.from(err);
   const options: SdkErrorOptions = { cause: ce, connectCode: ce.code };
   switch (ce.code) {

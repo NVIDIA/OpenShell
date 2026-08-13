@@ -76,6 +76,15 @@ function assertTokenExclusivity(opts: ConnectOptions): void {
   }
 }
 
+// edgeToken is also interpolated into a Cookie header. Restrict it to the
+// cookie-safe base64url/JWT character set so a caller cannot inject a second
+// cookie or a new header through an untrusted token value.
+function assertEdgeToken(opts: ConnectOptions): void {
+  if (opts.edgeToken !== undefined && !/^[A-Za-z0-9._~-]+$/.test(opts.edgeToken)) {
+    throw new SdkError('invalid_config', 'edgeToken must contain only cookie-safe JWT characters');
+  }
+}
+
 function isLoopbackHost(host: string): boolean {
   // URL.hostname keeps the brackets on IPv6 literals (e.g. `[::1]`); strip them.
   const h = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
@@ -106,6 +115,7 @@ function assertTokenTransportSecurity(opts: ConnectOptions): void {
 export function buildTransport(opts: ConnectOptions): Transport {
   assertMtlsPair(opts);
   assertTokenExclusivity(opts);
+  assertEdgeToken(opts);
   assertTokenTransportSecurity(opts);
   const isTls = opts.gateway.startsWith('https://');
   return createGrpcTransport({

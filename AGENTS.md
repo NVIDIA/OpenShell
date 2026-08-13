@@ -56,6 +56,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
 | `crates/openshell-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
 | `python/openshell/` | Python SDK | Python bindings and CLI packaging |
+| `sdk/typescript/` | TypeScript SDK | Native Connect client, curated sandbox API, and generated protobuf types |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
 | `docs/` | Published docs | MDX pages, navigation, and content assets |
@@ -212,6 +213,14 @@ ocsf_emit!(event);
 - Domain types in `sdk/go/openshell/v1/types/` must not import proto packages.
 - Converters in `sdk/go/openshell/v1/internal/converter/` deep-copy slices and maps at boundaries.
 - Tests use bufconn for in-process gRPC and testify for assertions.
+
+## TypeScript SDK (`sdk/typescript/`)
+
+- Run `mise run sdk:ts:ci` for codegen, proto lint, Biome lint, type checking, unit tests, coverage, and build validation.
+- Proto bindings are generated with `mise run sdk:ts:proto` from the files selected in `sdk/typescript/buf.gen.yaml`.
+- Generated files under `sdk/typescript/src/gen/` are build outputs and must not be committed.
+- Keep the curated API free of generated wire types; expose full generated messages and RPCs through `@nvidia/openshell-sdk/raw`.
+- The release workflow publishes the package to GitHub Packages. Branch checks exercise the publish path with `npm publish --dry-run`.
 
 ## Python
 

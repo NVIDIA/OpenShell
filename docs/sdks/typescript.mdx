@@ -1,0 +1,128 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "TypeScript SDK"
+description: "Install and use the native TypeScript SDK for sandbox lifecycle, exec, SSH sessions, and port forwarding."
+keywords: "NVIDIA OpenShell, TypeScript SDK, Node.js, Connect, sandbox"
+---
+
+The native TypeScript SDK connects Node.js applications to an OpenShell
+gateway. It requires Node.js 20.3 or later.
+
+Use the SDK and gateway from the same OpenShell release when possible. The raw
+types and RPC descriptors are generated from the protobuf definitions shipped
+with that release; curated methods remain compatible while their underlying
+RPC contracts remain compatible.
+
+## Install the package
+
+The pre-GA package is published through GitHub Packages. Configure the NVIDIA
+scope in your project-level `.npmrc`:
+
+```text
+@nvidia:registry=https://npm.pkg.github.com
+```
+
+Authenticate npm with a GitHub token that has `read:packages`, then install the
+SDK:
+
+```shell
+npm install @nvidia/openshell-sdk
+```
+
+## Connect to a gateway
+
+Create a client with the gateway URL and its authentication material:
+
+```typescript
+import { OpenShellClient } from "@nvidia/openshell-sdk";
+
+const client = await OpenShellClient.connect({
+  gateway: "https://gateway.example.com",
+  oidcToken: process.env.OPENSHELL_TOKEN,
+});
+
+const health = await client.health();
+console.log(health.status);
+```
+
+`connect()` constructs a lazy client and does not issue a network request. Call
+`health()` when startup must verify gateway connectivity.
+
+Choose one authentication mode:
+
+- Set `clientCert` and `clientKey` together for mTLS. Use `caCert` to add a
+  gateway CA certificate.
+- Set `oidcToken` for direct OIDC bearer authentication.
+- Set `edgeToken` for Cloudflare Access header authentication.
+
+Tokens are static for the lifetime of a client. Create a new client when a
+token refreshes. The SDK refuses to send a token over plaintext HTTP to a
+non-loopback host unless `allowInsecureAuth` is set explicitly.
+
+## Manage and execute in sandboxes
+
+Use `client.sandbox` for lifecycle and exec operations:
+
+```typescript
+const sandbox = await client.sandbox.create({
+  image: "ghcr.io/nvidia/openshell-community/sandboxes/python:latest",
+});
+
+await client.sandbox.waitReady(sandbox.name, 120);
+
+const result = await client.sandbox.exec(sandbox.name, [
+  "/bin/sh",
+  "-c",
+  "python --version",
+]);
+process.stdout.write(result.stdout);
+
+await client.sandbox.delete(sandbox.name);
+await client.sandbox.waitDeleted(sandbox.name, 30);
+```
+
+Pass an `AbortSignal` to wait, exec, interactive exec, and forward operations
+when the caller needs cancellation. `execStream()` yields stdout and stderr
+chunks followed by an in-band exit event. `execInteractive()` exposes raw
+stdin, resize, output, and completion primitives without taking ownership of
+terminal raw mode or signal forwarding.
+
+## Forward a sandbox service
+
+`forward()` creates a process-lifetime local TCP listener. Close the returned
+handle during application teardown:
+
+```typescript
+const forward = await client.sandbox.forward(sandbox.name, {
+  targetPort: 8000,
+  onConnectionError: (error) => console.error(error),
+});
+
+console.log(`http://${forward.localHost}:${forward.localPort}`);
+
+await forward.close();
+await forward.closed;
+```
+
+Calling `close()` more than once is safe. It cancels active forwarding RPCs,
+closes accepted sockets, and waits for their cleanup. The root client has no
+explicit close method because the Connect transport does not retain a dedicated
+session; close operation-scoped streams and forward handles instead.
+
+## Use the raw gateway surface
+
+Curated helpers cover sandbox lifecycle, exec, forwarding, SSH sessions,
+sandbox provider attachments, settings, and policy updates. Use `client.raw`
+for gateway RPCs that do not yet have a curated helper, and import their
+generated types from the raw entry point:
+
+```typescript
+import type { GetGatewayConfigResponse } from "@nvidia/openshell-sdk/raw";
+
+const config: GetGatewayConfigResponse = await client.raw.getGatewayConfig({});
+```
+
+The raw entry point exposes generated wire types. Prefer curated helpers when
+they cover the operation because those helpers preserve the SDK error taxonomy
+and normalize protobuf values for TypeScript callers.

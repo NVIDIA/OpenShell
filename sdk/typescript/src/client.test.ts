@@ -11,7 +11,15 @@ import * as net from 'node:net';
 import type { MessageInitShape } from '@bufbuild/protobuf';
 import { Code, ConnectError, createRouterTransport, type ServiceImpl, type Transport } from '@connectrpc/connect';
 import { describe, expect, it } from 'vitest';
-import { errorCode, PHASE_NAMES, POLICY_SOURCE_NAMES, SandboxClient, SCOPE_NAMES, STATUS_NAMES } from './client.js';
+import {
+  errorCode,
+  PHASE_NAMES,
+  POLICY_SOURCE_NAMES,
+  Pushable,
+  SandboxClient,
+  SCOPE_NAMES,
+  STATUS_NAMES,
+} from './client.js';
 import { OpenShell, SandboxPhase, ServiceStatus } from './gen/openshell_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
 
@@ -233,6 +241,13 @@ describe('create', () => {
     // Curated fields rawSpec does not touch survive.
     expect(created.spec?.providers).toEqual(['claude']);
   });
+
+  it('rejects gateway sandboxes missing required metadata', async () => {
+    const sandbox = client({
+      getSandbox: () => ({ sandbox: { status: { phase: SandboxPhase.READY } } }),
+    });
+    await expect(sandbox.get('sb')).rejects.toMatchObject({ code: 'invalid_config' });
+  });
 });
 
 describe('waits', () => {
@@ -259,6 +274,36 @@ describe('waits', () => {
     await expect(sandbox.waitReady('sb', 30, { signal: controller.signal })).rejects.toMatchObject({
       code: 'connect',
     });
+  });
+
+  it('waitDeleted resolves when the gateway reports NotFound', async () => {
+    const sandbox = client({
+      getSandbox: () => {
+        throw new ConnectError('gone', Code.NotFound);
+      },
+    });
+    await expect(sandbox.waitDeleted('sb', 1)).resolves.toBeUndefined();
+  });
+
+  it('waitDeleted rejects rather than hanging when get() never resolves', async () => {
+    const sandbox = client({
+      getSandbox: (_req, ctx) =>
+        new Promise((_resolve, reject) => {
+          ctx.signal.addEventListener('abort', () => reject(new ConnectError('canceled', Code.Canceled)));
+        }),
+    });
+    await expect(sandbox.waitDeleted('sb', 0.2)).rejects.toMatchObject({ code: 'connect' });
+  });
+});
+
+describe('Pushable', () => {
+  it('rejects a pending direct iterator next() when ended with an error', async () => {
+    const input = new Pushable<number>();
+    const iterator = input[Symbol.asyncIterator]();
+    const next = iterator.next();
+    const error = new Error('input failed');
+    input.end(error);
+    await expect(next).rejects.toBe(error);
   });
 });
 
@@ -639,9 +684,14 @@ describe('ssh sessions', () => {
       expiresAtMs: 0n,
     };
     const cases: Array<Record<string, unknown>> = [
+      { ...base, sandboxId: 'different-sandbox' },
       { ...base, gatewayScheme: 'ftp' },
       { ...base, token: 'tok; rm -rf /' },
       { ...base, gatewayPort: 70000 },
+      { ...base, gatewayHost: 'bad[host]' },
+      { ...base, gatewayHost: '::::' },
+      { ...base, gatewayHost: 'bad..example' },
+      { ...base, hostKeyFingerprint: `SHA256:${'a'.repeat(257)}` },
     ];
     for (const resp of cases) {
       const sandbox = client({
@@ -651,6 +701,24 @@ describe('ssh sessions', () => {
       await expect(sandbox.createSshSession('sb')).rejects.toMatchObject({
         code: 'invalid_config',
       });
+    }
+  });
+
+  it('accepts IPv4 and bracketed IPv6 gateway hosts', async () => {
+    for (const gatewayHost of ['127.0.0.1', '[::1]']) {
+      const sandbox = client({
+        getSandbox: () => readySandbox('sb', 'sb-id'),
+        createSshSession: () => ({
+          sandboxId: 'sb-id',
+          token: 'tok-1',
+          gatewayHost,
+          gatewayPort: 443,
+          gatewayScheme: 'https',
+          hostKeyFingerprint: '',
+          expiresAtMs: 0n,
+        }),
+      });
+      await expect(sandbox.createSshSession('sb')).resolves.toMatchObject({ gatewayHost });
     }
   });
 });
@@ -840,6 +908,77 @@ describe('forward', () => {
     // The listener still shuts down cleanly after the aborted connection.
     await handle.close();
     await handle.closed;
+  });
+
+  it('reports per-connection failures without taking down the listener', async () => {
+    let report!: (error: unknown) => void;
+    const reported = new Promise<unknown>((resolve) => {
+      report = resolve;
+    });
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-error'),
+      createSshSession: () => {
+        throw new ConnectError('mint failed', Code.Internal);
+      },
+    });
+
+    const handle = await sandbox.forward('sb', {
+      targetPort: 9000,
+      onConnectionError: (error) => {
+        report(error);
+        throw new Error('consumer callback failed');
+      },
+    });
+    await new Promise<void>((resolve) => {
+      const socket = net.connect(handle.localPort, handle.localHost, () => resolve());
+      socket.on('error', () => {});
+    });
+    await expect(reported).resolves.toMatchObject({ code: 'rpc' });
+    expect(handle.localPort).toBeGreaterThan(0);
+    await expect(handle.close()).resolves.toBeUndefined();
+  });
+
+  it('close is idempotent and waits for active forward RPC cancellation', async () => {
+    let streamStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      streamStarted = resolve;
+    });
+    let streamAborted = false;
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-close'),
+      createSshSession: () => ({
+        sandboxId: 'sb-id-close',
+        token: 'close-tok',
+        gatewayHost: 'gw',
+        gatewayPort: 443,
+        gatewayScheme: 'https',
+        hostKeyFingerprint: '',
+        expiresAtMs: 0n,
+      }),
+      forwardTcp: async function* (_requests, ctx) {
+        streamStarted();
+        await new Promise<void>((resolve) => {
+          ctx.signal.addEventListener(
+            'abort',
+            () => {
+              streamAborted = true;
+              resolve();
+            },
+            { once: true },
+          );
+        });
+        throw new ConnectError('canceled', Code.Canceled);
+      },
+      revokeSshSession: () => ({ revoked: true }),
+    });
+
+    const handle = await sandbox.forward('sb', { targetPort: 9000 });
+    const socket = net.connect(handle.localPort, handle.localHost);
+    socket.on('error', () => {});
+    await started;
+    await Promise.all([handle.close(), handle.close(), handle.closed]);
+    expect(streamAborted).toBe(true);
+    socket.destroy();
   });
 });
 

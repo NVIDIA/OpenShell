@@ -38,7 +38,7 @@
     "typecheck": "tsc --noEmit",
     "format": "biome check --write .",
     "lint": "biome ci .",
-    "test": "vitest run",
+    "test": "vitest run --coverage",
     "prepublishOnly": "npm run gen && npm run build"
   },
   "dependencies": {
@@ -51,6 +51,7 @@
     "@bufbuild/buf": "^1.71.0",
     "@bufbuild/protoc-gen-es": "^2.2.3",
     "@types/node": "^24",
+    "@vitest/coverage-v8": "^4.1.10",
     "typescript": "^6.0.3",
     "vitest": "^4.1.10"
   }

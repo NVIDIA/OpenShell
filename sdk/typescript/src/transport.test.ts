@@ -62,6 +62,24 @@ describe('buildTransport token exclusivity', () => {
       expect(errorCode(e)).toBe('invalid_config');
     }
   });
+
+  it('rejects edge tokens that could inject cookies or headers', () => {
+    for (const edgeToken of ['', 'jwt; other=value', 'jwt\r\nx-injected: yes', 'jwt with spaces']) {
+      const fn = () => buildTransport({ gateway: 'https://gw.local', edgeToken });
+      expect(fn).toThrow(/cookie-safe JWT characters/);
+      try {
+        fn();
+      } catch (e) {
+        expect(errorCode(e)).toBe('invalid_config');
+      }
+    }
+  });
+
+  it('accepts a base64url JWT edge token', () => {
+    expect(
+      buildTransport({ gateway: 'https://gw.local', edgeToken: 'eyJhbGciOiJSUzI1NiJ9.payload_signature' }),
+    ).toBeTruthy();
+  });
 });
 
 describe('buildTransport plaintext auth guard', () => {

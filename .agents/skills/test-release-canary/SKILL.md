@@ -23,6 +23,11 @@ does not contribute to product usage metrics.
 
 `install.sh` defaults to the *latest tagged* release — the canary is therefore checking that the most recent public release still installs, not the just-published `dev` build. The `kubernetes` job is the exception: it pins to `0.0.0-dev` chart + `:dev` images.
 
+The canary does not install or import `@nvidia/openshell-sdk`. TypeScript SDK
+validation lives in the `TypeScript SDK` branch check, including a publish
+dry-run. The tagged release workflow publishes the package to GitHub Packages;
+verify that job directly when diagnosing SDK publication failures.
+
 ## Trigger paths
 
 The workflow has two triggers:

@@ -50,7 +50,16 @@ export { errorCode };
 // 'enum name maps' drift test in client.test.ts fails until both sides agree.
 
 /** Lowercase mirror of the generated `SandboxPhase` enum. Hand-maintained. */
-export type SandboxPhaseName = 'unspecified' | 'provisioning' | 'ready' | 'error' | 'deleting' | 'unknown';
+export type SandboxPhaseName =
+  | 'unspecified'
+  | 'provisioning'
+  | 'ready'
+  | 'error'
+  | 'deleting'
+  | 'unknown'
+  | 'stopping'
+  | 'stopped'
+  | 'starting';
 
 /** Lowercase mirror of the generated `ServiceStatus` enum. Hand-maintained. */
 export type HealthStatus = 'unspecified' | 'healthy' | 'degraded' | 'unhealthy';
@@ -179,6 +188,8 @@ export interface ForwardOptions {
   localHost?: string;
   /** Abort forward setup and tear down the local listener early. */
   signal?: AbortSignal;
+  /** Receives failures from individual accepted connections. */
+  onConnectionError?: (error: SdkError) => void;
 }
 
 // A process-lifetime local listener that tunnels each accepted connection into
@@ -273,6 +284,9 @@ export const PHASE_NAMES: Record<SandboxPhase, SandboxPhaseName> = {
   [SandboxPhase.ERROR]: 'error',
   [SandboxPhase.DELETING]: 'deleting',
   [SandboxPhase.UNKNOWN]: 'unknown',
+  [SandboxPhase.STOPPING]: 'stopping',
+  [SandboxPhase.STOPPED]: 'stopped',
+  [SandboxPhase.STARTING]: 'starting',
 };
 export const STATUS_NAMES: Record<ServiceStatus, HealthStatus> = {
   [ServiceStatus.UNSPECIFIED]: 'unspecified',
@@ -307,9 +321,12 @@ function policySourceName(s: PolicySource): PolicySourceName {
 function sandboxRef(sandbox: Sandbox | undefined): SandboxRef {
   if (!sandbox) throw new SdkError('invalid_config', 'sandbox missing from gateway response');
   const meta = sandbox.metadata;
+  if (!meta?.id || !meta.name) {
+    throw new SdkError('invalid_config', 'sandbox metadata.id and metadata.name are required in gateway responses');
+  }
   return {
-    id: meta?.id ?? '',
-    name: meta?.name ?? '',
+    id: meta.id,
+    name: meta.name,
     phase: phaseName(sandbox.status?.phase ?? SandboxPhase.UNSPECIFIED),
     labels: meta?.labels ?? {},
     resourceVersion: (meta?.resourceVersion ?? 0n).toString(),
@@ -438,9 +455,12 @@ function waitForDrain(socket: net.Socket): Promise<void> {
 // side. `end()` closes the stream (optionally with an error). `onDrain` fires
 // when the buffered queue empties via consumption, so callers can relieve TCP
 // backpressure.
-class Pushable<T> implements AsyncIterable<T> {
+export class Pushable<T> implements AsyncIterable<T> {
   private readonly queue: T[] = [];
-  private readonly waiting: ((r: IteratorResult<T>) => void)[] = [];
+  private readonly waiting: Array<{
+    resolve: (result: IteratorResult<T>) => void;
+    reject: (error: unknown) => void;
+  }> = [];
   private ended = false;
   private error: unknown;
   onDrain?: () => void;
@@ -451,9 +471,9 @@ class Pushable<T> implements AsyncIterable<T> {
 
   push(value: T): void {
     if (this.ended) return;
-    const resolve = this.waiting.shift();
-    if (resolve) {
-      resolve({ value, done: false });
+    const waiter = this.waiting.shift();
+    if (waiter) {
+      waiter.resolve({ value, done: false });
     } else {
       this.queue.push(value);
     }
@@ -463,10 +483,11 @@ class Pushable<T> implements AsyncIterable<T> {
     if (this.ended) return;
     this.ended = true;
     this.error = error;
-    let resolve = this.waiting.shift();
-    while (resolve) {
-      resolve({ value: undefined as never, done: true });
-      resolve = this.waiting.shift();
+    let waiter = this.waiting.shift();
+    while (waiter) {
+      if (error !== undefined) waiter.reject(error);
+      else waiter.resolve({ value: undefined as never, done: true });
+      waiter = this.waiting.shift();
     }
   }
 
@@ -482,8 +503,8 @@ class Pushable<T> implements AsyncIterable<T> {
         if (this.error !== undefined) throw this.error;
         return;
       }
-      const next = await new Promise<IteratorResult<T>>((resolve) => {
-        this.waiting.push(resolve);
+      const next = await new Promise<IteratorResult<T>>((resolve, reject) => {
+        this.waiting.push({ resolve, reject });
       });
       if (next.done) {
         if (this.error !== undefined) throw this.error;
@@ -514,12 +535,16 @@ export class SandboxClient {
   // Takes a transport rather than options so OpenShellClient can compose
   // several scoped clients over a single connection. For standalone use,
   // prefer the SandboxClient.connect() factory below.
-  constructor(transport: Transport) {
+  constructor(transport: Transport, grpc = createClient(OpenShell, transport)) {
     this.transport = transport;
-    this.grpc = createClient(OpenShell, transport);
+    this.grpc = grpc;
     this.raw = this.grpc;
   }
 
+  /**
+   * Constructs a lazy Connect client. No network request is made until the
+   * first RPC; call get() or another operation to verify reachability.
+   */
   static async connect(options: ConnectOptions): Promise<SandboxClient> {
     return new SandboxClient(buildTransport(options));
   }
@@ -839,6 +864,9 @@ export class SandboxClient {
     }
 
     const sockets = new Set<net.Socket>();
+    const controllers = new Set<AbortController>();
+    const connectionTasks = new Set<Promise<void>>();
+    let closing = false;
     const server = net.createServer((socket) => {
       sockets.add(socket);
       socket.on('close', () => sockets.delete(socket));
@@ -847,14 +875,30 @@ export class SandboxClient {
       // listener a peer reset here emits an unhandled 'error' and crashes the
       // process; forwardConnection's catch still tears the socket down.
       socket.on('error', () => {});
-      void this.forwardConnection(socket, sandboxId, name, targetHost, targetPort);
+      const controller = new AbortController();
+      controllers.add(controller);
+      const task = this.forwardConnection(socket, sandboxId, name, targetHost, targetPort, controller.signal)
+        .catch((error: unknown) => {
+          if (!closing) {
+            try {
+              opts.onConnectionError?.(error instanceof SdkError ? error : fromConnect(error));
+            } catch {
+              // Consumer callbacks must not turn a handled connection failure
+              // into an unhandled rejection or prevent forward cleanup.
+            }
+          }
+        })
+        .finally(() => {
+          controllers.delete(controller);
+          connectionTasks.delete(task);
+        });
+      connectionTasks.add(task);
     });
 
     let resolveClosed!: () => void;
     const closed = new Promise<void>((resolve) => {
       resolveClosed = resolve;
     });
-    server.on('close', () => resolveClosed());
 
     await new Promise<void>((resolve, reject) => {
       const onError = (err: unknown): void => {
@@ -872,15 +916,30 @@ export class SandboxClient {
       });
     });
 
-    const teardown = async (): Promise<void> => {
-      for (const socket of sockets) socket.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+    let teardownPromise: Promise<void> | undefined;
+    const onAbort = (): void => {
+      void teardown();
+    };
+    const teardown = (): Promise<void> => {
+      if (teardownPromise) return teardownPromise;
+      closing = true;
+      opts.signal?.removeEventListener('abort', onAbort);
+      teardownPromise = (async () => {
+        for (const controller of controllers) controller.abort();
+        for (const socket of sockets) socket.destroy();
+        if (server.listening) {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+        await Promise.allSettled([...connectionTasks]);
+        resolveClosed();
+      })();
+      return teardownPromise;
     };
 
     // Caller cancellation tears the local listener down the same way close() does.
     if (opts.signal) {
       if (opts.signal.aborted) void teardown();
-      else opts.signal.addEventListener('abort', () => void teardown(), { once: true });
+      else opts.signal.addEventListener('abort', onAbort, { once: true });
     }
 
     const addr = server.address() as AddressInfo | null;
@@ -900,16 +959,17 @@ export class SandboxClient {
     name: string,
     targetHost: string,
     targetPort: number,
+    signal: AbortSignal,
   ): Promise<void> {
     let token: string | undefined;
     const input = new Pushable<MessageInitShape<typeof TcpForwardFrameSchema>>();
     input.onDrain = () => socket.resume();
     try {
-      const session = await this.grpc.createSshSession({ sandboxId });
+      const session = await this.grpc.createSshSession({ sandboxId }, { signal });
       // Defense-in-depth: the token feeds forwardTcp authorization, so hold it
       // to the same trust-boundary contract as createSshSession. A violation
       // tears down this one socket via the catch below.
-      validateSshResponse(session);
+      validateSshResponse(session, sandboxId);
       token = session.token;
       input.push({
         payload: {
@@ -936,25 +996,36 @@ export class SandboxClient {
         if (input.size >= 64) socket.pause();
       });
       socket.on('end', () => input.end());
-      socket.on('error', () => input.end());
+      socket.on('error', (error) => input.end(error));
       socket.on('close', () => input.end());
 
-      for await (const frame of this.grpc.forwardTcp(input)) {
-        if (frame.payload.case !== 'data') continue;
-        const data = frame.payload.value;
-        if (data.length === 0) continue;
-        // Respect backpressure: if the local socket buffer is full, stop
-        // pulling sandbox data until it drains so memory stays bounded.
-        if (!socket.write(Buffer.from(data))) await waitForDrain(socket);
+      const onAbort = (): void => {
+        input.end(new SdkError('canceled', 'forward connection closed'));
+        socket.destroy();
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+
+      try {
+        for await (const frame of this.grpc.forwardTcp(input, { signal })) {
+          if (frame.payload.case !== 'data') continue;
+          const data = frame.payload.value;
+          if (data.length === 0) continue;
+          // Respect backpressure: if the local socket buffer is full, stop
+          // pulling sandbox data until it drains so memory stays bounded.
+          if (!socket.write(Buffer.from(data))) await waitForDrain(socket);
+        }
+      } finally {
+        signal.removeEventListener('abort', onAbort);
       }
       socket.end();
-    } catch {
+    } catch (e) {
       socket.destroy();
+      throw e instanceof SdkError ? e : fromConnect(e);
     } finally {
       input.end();
       if (token !== undefined) {
         try {
-          await this.grpc.revokeSshSession({ token });
+          await this.grpc.revokeSshSession({ token }, { signal });
         } catch {
           // Best-effort revoke; the token expires on its own regardless.
         }
@@ -970,7 +1041,7 @@ export class SandboxClient {
       const resp = await this.grpc.createSshSession({ sandboxId: sandbox.id });
       // Reject any response outside the proto trust-boundary contract before
       // handing these values to the caller (they feed OpenSSH ProxyCommand).
-      validateSshResponse(resp);
+      validateSshResponse(resp, sandbox.id);
       return {
         sandboxId: resp.sandboxId,
         token: resp.token,
@@ -1140,9 +1211,13 @@ export class OpenShellClient {
     this.transport = transport;
     this.grpc = createClient(OpenShell, transport);
     this.raw = this.grpc;
-    this.sandbox = new SandboxClient(transport);
+    this.sandbox = new SandboxClient(transport, this.grpc);
   }
 
+  /**
+   * Constructs a lazy Connect client. No network request is made until the
+   * first RPC; call health() when startup must verify gateway reachability.
+   */
   static async connect(options: ConnectOptions): Promise<OpenShellClient> {
     return new OpenShellClient(buildTransport(options));
   }

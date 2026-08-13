@@ -25,6 +25,11 @@ navigation:
   title: "Observability"
 - folder: kubernetes
   title: "Kubernetes"
+- section: "SDKs"
+  slug: sdks
+  contents:
+  - page: "TypeScript SDK"
+    path: sdks/typescript.mdx
 - folder: reference
   title: "Reference"
 - folder: security

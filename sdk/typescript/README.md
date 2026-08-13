@@ -4,6 +4,11 @@ TypeScript client for the OpenShell gateway — thin, idiomatic bindings generat
 
 Distributed via GitHub Packages. A public npm release under the same name follows once the npm org is in place; the install specifier and API are unchanged across that move.
 
+Use the SDK and gateway from the same OpenShell release when possible. The raw
+types and RPC descriptors are generated from the protobuf definitions in that
+release; curated methods remain compatible while those RPC contracts remain
+compatible.
+
 ## Install
 
 Published to GitHub Packages, so point the `@nvidia` scope at it with a project `.npmrc`:
@@ -38,6 +43,12 @@ console.log(result.stdout.toString())
 
 await client.sandbox.delete(sandbox.name)
 ```
+
+`connect()` constructs a lazy client; call `health()` when startup must verify
+gateway reachability. Authentication material is static for the client's
+lifetime, so create a new client after refreshing an OIDC or edge token. The
+root client has no explicit close method because Connect does not retain a
+dedicated session. Close operation-scoped streams and forward handles instead.
 
 Express the create-time safety boundary with `policy`. Sandbox-scoped `setPolicy`
 cannot introduce static policy fields later, so set filesystem, landlock,
@@ -93,10 +104,16 @@ const code = await session.done
 `forward` binds a local TCP listener and tunnels each accepted connection into the sandbox for the lifetime of the Node process. Call `close()` on teardown.
 
 ```ts
-const fwd = await client.sandbox.forward(name, { targetPort: 8000 })
+const fwd = await client.sandbox.forward(name, {
+  targetPort: 8000,
+  onConnectionError: (error) => console.error(error),
+})
 // ... reach the sandbox service at 127.0.0.1:fwd.localPort ...
 await fwd.close()
 ```
+
+`close()` is idempotent. It cancels active forwarding RPCs, destroys accepted
+sockets, and waits for their cleanup.
 
 ## SSH sessions, providers, config and policy
 
@@ -162,7 +179,7 @@ mise run sdk:ts:proto       # generate stubs from proto/ with buf
 mise run sdk:ts:format      # Biome: format + safe fixes (writes)
 mise run sdk:ts:lint        # Biome: lint + format check (read-only)
 mise run sdk:ts:typecheck   # tsc --noEmit
-mise run sdk:ts:test        # Vitest unit tests
+mise run sdk:ts:test        # Vitest unit tests with an 80% line-coverage gate
 mise run sdk:ts:build       # emit dist/
 ```
 

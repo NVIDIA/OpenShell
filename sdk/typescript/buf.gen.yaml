@@ -16,6 +16,7 @@ inputs:
       - ../../proto/openshell.proto
       - ../../proto/sandbox.proto
       - ../../proto/datamodel.proto
+      - ../../proto/options.proto
 plugins:
   - local: ./node_modules/.bin/protoc-gen-es
     out: src/gen
