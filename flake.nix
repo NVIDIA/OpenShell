@@ -55,11 +55,12 @@
             llvmPackages.libclang
             # system dependency for openshell-prover
             z3
-            # Bazel 
+            # Bazel
             bazel_9
             buildifier
             # Coverage
             lcov
+            uv
           ];
 
           env = {
