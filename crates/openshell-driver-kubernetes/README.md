@@ -16,6 +16,16 @@ workspace namespace modes via `workspace_mode`:
   (`operator_namespace_file`). Sandbox creation fails closed if the workspace
   namespace is not in the current allowlist.
 
+Workspace namespace modes assume exclusive control of the sandbox identity
+resource chain. In shared and managed modes, only the gateway and its trusted
+Agent Sandbox controller may administer the sandbox namespace, Sandbox CRs,
+sandbox pods, or configured sandbox ServiceAccount. In operator mode, the
+platform operator owns namespace lifecycle but must prevent other principals
+from creating or mutating Sandbox CRs, creating sandbox pods with fabricated
+owner references, or using the configured sandbox ServiceAccount. Treat adding
+a namespace to the operator allowlist as granting this trust; the allowlist is
+not a tenant isolation boundary.
+
 ## Runtime Model
 
 The gateway stores platform state and delegates sandbox workload creation to

@@ -328,6 +328,17 @@ On hosts with restrictive firewalls (e.g. firewalld), the host firewall may addi
 
 Kubernetes-backed sandboxes run as pods in the configured sandbox namespace. Use Kubernetes for shared clusters, remote compute, GPU scheduling, and operator-managed environments.
 
+<Warning>
+Kubernetes workspace namespaces are an administrative trust boundary. In
+shared and managed modes, only the OpenShell gateway and its trusted Agent
+Sandbox controller may administer Sandbox CRs, sandbox pods, or the configured
+sandbox ServiceAccount in those namespaces. In operator mode, allowlist only
+namespaces where the platform operator preserves that exclusive control.
+Untrusted principals must not be able to create sandbox pods with fabricated
+owner references or use the sandbox ServiceAccount. The operator namespace
+allowlist is a trust grant, not a tenant isolation mechanism.
+</Warning>
+
 Helm deployments set Kubernetes driver values through the chart.
 
 For maintainer-level implementation details, refer to the [Kubernetes driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-kubernetes/README.md).

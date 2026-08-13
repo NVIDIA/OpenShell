@@ -375,6 +375,18 @@ per mode (`crates/openshell-server/src/auth/k8s_sa.rs`):
   `BTreeSet` populated by the label/file watchers. Starts empty (fail-closed)
   until the first watcher update.
 
+These checks rely on an ownership invariant. In shared and managed modes, the
+gateway and its trusted Agent Sandbox controller exclusively administer the
+sandbox namespace, Sandbox CRs, sandbox pods, and configured sandbox
+ServiceAccount. Other principals must not create or mutate those resources or
+use that ServiceAccount. In operator mode, the platform operator retains
+namespace lifecycle ownership, but must preserve the same exclusive control of
+Sandbox CRs and the pods and ServiceAccount used for sandbox token bootstrap.
+An allowlisted namespace is therefore a trust grant, not a tenant isolation
+boundary. Kubernetes owner references alone do not prove which controller
+created a pod, so admitting principals that can fabricate that resource chain
+would allow them to claim an existing sandbox identity.
+
 ### Credential Driver Integration
 
 The Kubernetes Secrets credential driver (`openshell-driver-kubernetes-secrets`)

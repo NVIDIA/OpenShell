@@ -54,7 +54,7 @@ use openshell_driver_docker::DockerComputeDriver;
 #[cfg(not(target_os = "windows"))]
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
-    OperatorNamespaceAllowlist, WorkspaceMode,
+    OperatorNamespaceAllowlist,
 };
 #[cfg(not(target_os = "windows"))]
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
@@ -797,12 +797,6 @@ impl ComputeRuntime {
         let driver = KubernetesComputeDriver::new(config)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
-        if driver.workspace_mode() == WorkspaceMode::Shared {
-            driver
-                .backfill_gateway_id_labels()
-                .await
-                .map_err(|err| ComputeError::Message(err.to_string()))?;
-        }
         let operator_allowlist_arc = driver.operator_allowlist().cloned();
         let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new(driver));
         let runtime = Self::from_driver(
@@ -895,26 +889,36 @@ impl ComputeRuntime {
 
     pub(crate) async fn ensure_workspace(&self, workspace: &str) -> Result<(), Status> {
         let workspace = workspace.to_string();
-        self.driver
+        match self
+            .driver
             .call("driver.ensure_workspace", None, |driver| async move {
                 driver
                     .ensure_workspace(Request::new(EnsureWorkspaceRequest { workspace }))
                     .await
             })
             .await
-            .map(|_| ())
+        {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == Code::Unimplemented => Ok(()),
+            Err(status) => Err(status),
+        }
     }
 
     pub(crate) async fn delete_workspace(&self, workspace: &str) -> Result<(), Status> {
         let workspace = workspace.to_string();
-        self.driver
+        match self
+            .driver
             .call("driver.delete_workspace", None, |driver| async move {
                 driver
                     .delete_workspace(Request::new(DeleteWorkspaceRequest { workspace }))
                     .await
             })
             .await
-            .map(|_| ())
+        {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == Code::Unimplemented => Ok(()),
+            Err(status) => Err(status),
+        }
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
@@ -4137,6 +4141,7 @@ mod tests {
     struct TestDriver {
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
+        workspace_rpcs_unimplemented: bool,
     }
 
     #[tonic::async_trait]
@@ -4255,6 +4260,9 @@ mod tests {
             &self,
             _request: Request<EnsureWorkspaceRequest>,
         ) -> Result<tonic::Response<EnsureWorkspaceResponse>, Status> {
+            if self.workspace_rpcs_unimplemented {
+                return Err(Status::unimplemented("workspace lifecycle is unsupported"));
+            }
             Ok(tonic::Response::new(EnsureWorkspaceResponse {}))
         }
 
@@ -4262,8 +4270,23 @@ mod tests {
             &self,
             _request: Request<DeleteWorkspaceRequest>,
         ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
+            if self.workspace_rpcs_unimplemented {
+                return Err(Status::unimplemented("workspace lifecycle is unsupported"));
+            }
             Ok(tonic::Response::new(DeleteWorkspaceResponse {}))
         }
+    }
+
+    #[tokio::test]
+    async fn workspace_lifecycle_allows_legacy_driver_without_workspace_rpcs() {
+        let runtime = test_runtime(Arc::new(TestDriver {
+            workspace_rpcs_unimplemented: true,
+            ..Default::default()
+        }))
+        .await;
+
+        runtime.ensure_workspace("legacy").await.unwrap();
+        runtime.delete_workspace("legacy").await.unwrap();
     }
 
     #[derive(Clone)]
@@ -7624,6 +7647,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_store_with_backend_applies_driver_snapshot() {
         let runtime = test_runtime(Arc::new(TestDriver {
+            workspace_rpcs_unimplemented: false,
             listed_sandboxes: vec![DriverSandbox {
                 id: "sb-1".to_string(),
                 name: "sandbox-a".to_string(),
@@ -7811,6 +7835,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_store_with_backend_does_not_recreate_missing_record_from_snapshot() {
         let runtime = test_runtime(Arc::new(TestDriver {
+            workspace_rpcs_unimplemented: false,
             listed_sandboxes: vec![DriverSandbox {
                 id: "sb-1".to_string(),
                 name: "sandbox-a".to_string(),

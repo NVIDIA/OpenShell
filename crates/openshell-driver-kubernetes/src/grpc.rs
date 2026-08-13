@@ -184,6 +184,9 @@ impl ComputeDriver for ComputeDriverService {
         if workspace.is_empty() {
             return Err(Status::invalid_argument("workspace is required"));
         }
+        self.driver
+            .validate_workspace_namespace(&workspace)
+            .map_err(|error| Status::from(openshell_core::ComputeDriverError::from(error)))?;
         match self.driver.workspace_mode() {
             WorkspaceMode::Managed => {
                 self.driver
@@ -213,6 +216,9 @@ impl ComputeDriver for ComputeDriverService {
         if workspace.is_empty() {
             return Err(Status::invalid_argument("workspace is required"));
         }
+        self.driver
+            .validate_workspace_namespace(&workspace)
+            .map_err(|error| Status::from(openshell_core::ComputeDriverError::from(error)))?;
         match self.driver.workspace_mode() {
             WorkspaceMode::Managed => {
                 self.driver
@@ -258,6 +264,17 @@ mod tests {
 
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert_eq!(status.message(), "sandbox agent pod IP is not available");
+    }
+
+    #[test]
+    fn invalid_workspace_driver_errors_map_to_invalid_argument_status() {
+        let status: Status = ComputeDriverError::from(KubernetesDriverError::InvalidArgument(
+            "managed namespace is invalid".to_string(),
+        ))
+        .into();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "managed namespace is invalid");
     }
 
     #[test]

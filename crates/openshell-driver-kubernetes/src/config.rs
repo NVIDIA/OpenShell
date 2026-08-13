@@ -1858,6 +1858,12 @@ mod tests {
     }
 
     #[test]
+    fn validate_managed_namespace_name_rejects_invalid_workspace_characters() {
+        let err = validate_managed_namespace_name("gw1", "INVALID").unwrap_err();
+        assert!(err.contains("not a valid DNS-1123 label"));
+    }
+
+    #[test]
     fn validate_managed_namespace_name_rejects_too_long() {
         let long_workspace = "a".repeat(50);
         assert!(validate_managed_namespace_name("openshell", &long_workspace).is_err());

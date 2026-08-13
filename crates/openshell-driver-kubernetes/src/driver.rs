@@ -8,6 +8,7 @@ use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, OperatorNamespaceAllowlist,
     SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode, managed_namespace,
+    validate_managed_namespace_name,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
@@ -530,13 +531,19 @@ impl KubernetesComputeDriver {
             None
         };
 
-        Ok(Self {
+        let driver = Self {
             client,
             watch_client,
             sandbox_api_version: Arc::new(OnceCell::new()),
             config,
             operator_allowlist,
-        })
+        };
+
+        if driver.workspace_mode() == WorkspaceMode::Shared {
+            driver.backfill_gateway_id_labels().await?;
+        }
+
+        Ok(driver)
     }
 
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
@@ -567,10 +574,21 @@ impl KubernetesComputeDriver {
         self.config.workspace_mode
     }
 
+    pub(crate) fn validate_workspace_namespace(
+        &self,
+        workspace: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        if self.config.workspace_mode == WorkspaceMode::Managed {
+            validate_managed_namespace_name(&self.config.gateway_id, workspace)
+                .map_err(KubernetesDriverError::InvalidArgument)?;
+        }
+        Ok(())
+    }
+
     /// Backfill the `openshell.ai/gateway-id` label on Sandbox CRs that
     /// predate its introduction. Runs once at startup in shared mode so that
     /// label-selector based lookups continue to find legacy resources.
-    pub async fn backfill_gateway_id_labels(&self) -> Result<(), KubernetesDriverError> {
+    async fn backfill_gateway_id_labels(&self) -> Result<(), KubernetesDriverError> {
         let sandbox_api = self
             .supported_sandbox_api_for_lookup(self.client.clone())
             .await
@@ -1333,6 +1351,7 @@ impl KubernetesComputeDriver {
 
         let name = sandbox.name.as_str();
         let workspace = sandbox.workspace.as_str();
+        self.validate_workspace_namespace(workspace)?;
 
         let target_namespace = match self.config.workspace_mode {
             WorkspaceMode::Shared => self.config.namespace.clone(),

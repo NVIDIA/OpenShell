@@ -73,12 +73,36 @@ rules:
     verbs:
       - get
   {{- end }}
-  {{- if ne $workspaceMode "shared" }}
-  # Secrets access for multi-namespace modes:
-  #   - TLS sync uses server-side apply (patch) to copy the client TLS Secret
-  #     into workspace namespaces so sandbox pods can mount mTLS material.
-  #   - The kubernetes-secrets credential driver stores credentials as Secrets
-  #     in workspace namespaces, additionally requiring delete for cleanup.
+  {{- $copiedSecretNames := list }}
+  {{- if and (ne $workspaceMode "shared") (not .Values.server.disableTls) }}
+  {{- $copiedSecretNames = append $copiedSecretNames .Values.server.tls.clientTlsSecretName }}
+  {{- end }}
+  {{- if eq $workspaceMode "managed" }}
+  {{- range .Values.server.sandboxImagePullSecrets }}
+  {{- if .name }}
+  {{- $copiedSecretNames = append $copiedSecretNames .name }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- $copiedSecretNames = uniq $copiedSecretNames }}
+  {{- if $copiedSecretNames }}
+  # Copy only explicitly configured TLS and image-pull Secrets into workspace
+  # namespaces. Server-side apply authorizes these requests as patch operations.
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    resourceNames:
+      {{- range $copiedSecretNames }}
+      - {{ . | quote }}
+      {{- end }}
+    verbs:
+      - get
+      - patch
+  {{- end }}
+  {{- if and (ne $workspaceMode "shared") .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
+  # The kubernetes-secrets credential driver uses dynamic hashed names in
+  # workspace namespaces, so Kubernetes RBAC cannot restrict resourceNames.
   - apiGroups:
       - ""
     resources:
@@ -86,11 +110,8 @@ rules:
     verbs:
       - get
       - create
-      - update
       - patch
-      {{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled }}
       - delete
-      {{- end }}
   {{- end }}
   {{- if eq $workspaceMode "managed" }}
   # ServiceAccount creation in managed namespaces.
