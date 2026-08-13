@@ -4126,6 +4126,8 @@ async fn handle_update_config_inner(
     }
 
     let sandbox = sandbox.expect("non-global config update resolves a sandbox");
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
@@ -5061,6 +5063,8 @@ pub(super) async fn handle_get_sandbox_logs(
         MinWorkspaceRole::User,
     )
     .await?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id();
 
     let lines = if req.lines == 0 { 2000 } else { req.lines };
@@ -5215,6 +5219,8 @@ pub(super) async fn handle_submit_policy_analysis(
         &req.name,
     )
     .await?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
     for summary in &req.network_activity_summaries {
         state
@@ -5732,6 +5738,8 @@ async fn handle_approve_draft_chunk_inner(
 
     require_no_global_policy(state).await?;
 
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
 
@@ -5877,6 +5885,8 @@ async fn handle_reject_draft_chunk_inner(
         return Err(Status::invalid_argument("chunk_id is required"));
     }
 
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
 
@@ -5981,6 +5991,8 @@ async fn handle_approve_all_draft_chunks_inner(
 
     require_no_global_policy(state).await?;
 
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
 
@@ -6285,6 +6297,8 @@ pub(super) async fn handle_edit_draft_chunk(
         .proposed_rule
         .ok_or_else(|| Status::invalid_argument("proposed_rule is required"))?;
 
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
 
@@ -6358,6 +6372,8 @@ async fn handle_undo_draft_chunk_inner(
         return Err(Status::invalid_argument("chunk_id is required"));
     }
 
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
 
@@ -6442,6 +6458,8 @@ pub(super) async fn handle_clear_draft_chunks(
         MinWorkspaceRole::Admin,
     )
     .await?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let sandbox_id = sandbox.object_id().to_string();
     replay_facts.resource(&sandbox)?;
 
@@ -10182,6 +10200,63 @@ mod tests {
             Code::NotFound,
             "cross-workspace sandbox access must return NotFound to prevent CWE-203 oracle"
         );
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_logs_rejects_non_delegating_workspace_user() {
+        use crate::storage_proto::SandboxDelegatedIdentityRecord;
+        use openshell_core::proto::SandboxDelegatedIdentity;
+        use openshell_core::proto::datamodel::v1::ObjectMeta;
+
+        let state = test_server_state().await;
+        let sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "delegated-sandbox-id".to_string(),
+                name: "delegated-sandbox".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+        let record_id =
+            crate::delegated_identity::sandbox_delegated_identity_record_id(sandbox.object_id());
+        state
+            .store
+            .put_scoped_message(
+                &SandboxDelegatedIdentityRecord {
+                    metadata: Some(ObjectMeta {
+                        id: record_id.clone(),
+                        name: record_id,
+                        workspace: "default".to_string(),
+                        ..Default::default()
+                    }),
+                    sandbox_id: sandbox.object_id().to_string(),
+                    delegated_identity: Some(SandboxDelegatedIdentity {
+                        credential_id: "delegated-credential".to_string(),
+                        principal_subject: "delegating-user".to_string(),
+                        delegation_expiration_time: None,
+                        withdrawal_time: None,
+                    }),
+                },
+                sandbox.object_id(),
+            )
+            .await
+            .unwrap();
+
+        let error = handle_get_sandbox_logs(
+            &state,
+            with_user(Request::new(GetSandboxLogsRequest {
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("non-delegating workspace user should not read buffered logs");
+
+        assert_eq!(error.code(), Code::PermissionDenied);
+        assert!(error.message().contains("delegating principal"));
     }
 
     #[tokio::test]

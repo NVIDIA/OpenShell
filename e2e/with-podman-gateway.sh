@@ -103,9 +103,9 @@ if [ "${OPENSHELL_E2E_SPIFFE_FIXTURE:-0}" = "1" ]; then
   export OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET="${OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET}"
   if [ -z "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" ]; then
     OPENSHELL_E2E_PROVIDER_SPIFFE_PORT="$(e2e_pick_port)"
-    export OPENSHELL_E2E_PROVIDER_SPIFFE_LISTEN="0.0.0.0:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
-    # Podman supervisors run with host networking, so reach the host-side
-    # Workload API fixture over loopback rather than the workload bridge.
+    # The supervisor shares the host network, not the workload's network
+    # namespace. Its Workload API fixture is therefore on host loopback.
+    export OPENSHELL_E2E_PROVIDER_SPIFFE_LISTEN="127.0.0.1:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
     export OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET="tcp:127.0.0.1:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
   fi
 fi
@@ -496,6 +496,16 @@ echo "Using Podman supervisor image: ${SUPERVISOR_IMAGE}"
 
 SANDBOX_BOUNDARY_IMAGE="$(resolve_podman_sandbox_runtime_image)"
 ensure_podman_sandbox_runtime_image "${SANDBOX_BOUNDARY_IMAGE}"
+SANDBOX_BOUNDARY_DIGEST="$(podman_cmd image inspect --format '{{.Digest}}' "${SANDBOX_BOUNDARY_IMAGE}")"
+if ! [[ "${SANDBOX_BOUNDARY_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "ERROR: could not resolve sandbox runtime image digest for ${SANDBOX_BOUNDARY_IMAGE}." >&2
+  exit 2
+fi
+SANDBOX_BOUNDARY_REPOSITORY="${SANDBOX_BOUNDARY_IMAGE%%@*}"
+if [[ "${SANDBOX_BOUNDARY_REPOSITORY##*/}" == *:* ]]; then
+  SANDBOX_BOUNDARY_REPOSITORY="${SANDBOX_BOUNDARY_REPOSITORY%:*}"
+fi
+SANDBOX_BOUNDARY_IMAGE="${SANDBOX_BOUNDARY_REPOSITORY}@${SANDBOX_BOUNDARY_DIGEST}"
 echo "Using Podman sandbox runtime image: ${SANDBOX_BOUNDARY_IMAGE}"
 
 DEFAULT_SANDBOX_IMAGE="nvcr.io/nvidia/base/ubuntu:24.04"

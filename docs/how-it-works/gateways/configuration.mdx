@@ -179,6 +179,8 @@ compute_driver        = "kubernetes"
 credential_drivers        = ["kubernetes-secrets"]
 
 ssh_session_ttl_secs  = 3600
+# Maximum sandbox delegated identity window, in seconds.
+max_delegated_identity_duration_secs = 86400
 
 # Absolute image preparation and initial supervisor startup budget.
 # Applies to new attempts only; allowed values are 1 through 86400 seconds.
@@ -321,6 +323,8 @@ certificate with an `Authorization` header. See
 certificate trust boundary.
 
 The client-certificate handshake policy has no `require_client_auth` TOML field. Client certificates are optional at the transport layer; gateway RPC authorization enforces the configured user or sandbox identity.
+
+For Helm deployments, `server.maxDelegatedIdentityDurationSecs` renders `[openshell.gateway] max_delegated_identity_duration_secs`. The chart defaults it to `86400` seconds and rejects negative values.
 
 `[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
 
@@ -604,7 +608,7 @@ The gateway validates snapshot structure and provider-profile semantics. It trea
 
 ## Credential Drivers
 
-Set `credential_drivers` only when the gateway should store provider secrets in an external credential backend. Provider secrets include injectable credentials and gateway-only refresh material such as OAuth refresh tokens, client secrets, and service-account private keys. OpenShell supports at most one enabled credential driver at a time. When `credential_drivers` is omitted, the gateway uses its default encrypted database credential storage. `credential_drivers = []` is invalid in the TOML file; omit the field for the default encrypted store, or select a backend such as `kubernetes-secrets` or `vault`.
+Set `credential_drivers` only when the gateway should store secrets in an external credential backend. Driver-owned secrets include injectable provider credentials, gateway-only provider refresh material such as OAuth refresh tokens, client secrets, and service-account private keys, and delegated identity access and refresh tokens. Generic provider, refresh-state, delegated-credential, and sandbox records contain opaque handles or non-secret metadata instead of those token values. OpenShell supports at most one enabled credential driver at a time. When `credential_drivers` is omitted, the gateway uses its default encrypted database credential storage. `credential_drivers = []` is invalid in the TOML file; omit the field for the default encrypted store, or select a backend such as `kubernetes-secrets` or `vault`.
 
 Credential driver tables are backend-owned and live under `[openshell.credential_drivers.<name>]`. Built-in drivers default to in-tree transport, so they do not need a `transport` field. Use `transport = "uds"` with an absolute `socket_path` only for a remote gRPC driver over a Unix domain socket.
 
@@ -639,7 +643,7 @@ role = "openshell-gateway"
 service_account_token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 ```
 
-For the default encrypted database store, OpenShell stores provider credentials as JSON envelopes encrypted with AES-256-GCM in the gateway database. Each credential gets a random data-encryption key; the gateway wraps that key with a local key-encryption key. By default, the key-encryption key is created at `$XDG_STATE_HOME/openshell/gateway/credentials/key-encryption-key.bin` with owner-only permissions. Use `[openshell.gateway.credential_storage] key_encryption_key_env` instead of `key_encryption_key_path` to load a base64-encoded 32-byte key-encryption key from an environment variable. Back up the database and key-encryption key together; losing either makes stored credentials unrecoverable. In Kubernetes, the Helm chart creates a retained Secret containing the shared key-encryption key, injects it as `OPENSHELL_GATEWAY_CREDENTIAL_KEY_ENCRYPTION_KEY`, and renders `key_encryption_key_env` for the gateway when no external credential driver is enabled. Multi-replica deployments need every replica to use the same database and key-encryption key; the chart default handles the key-encryption key side.
+For the default encrypted database store, OpenShell stores driver-owned secrets as JSON envelopes encrypted with AES-256-GCM in the gateway database. Each secret gets a random data-encryption key; the gateway wraps that key with a local key-encryption key. By default, the key-encryption key is created at `$XDG_STATE_HOME/openshell/gateway/credentials/key-encryption-key.bin` with owner-only permissions. Use `[openshell.gateway.credential_storage] key_encryption_key_env` instead of `key_encryption_key_path` to load a base64-encoded 32-byte key-encryption key from an environment variable. Back up the database and key-encryption key together; losing either makes stored credentials unrecoverable. In Kubernetes, the Helm chart creates a retained Secret containing the shared key-encryption key, injects it as `OPENSHELL_GATEWAY_CREDENTIAL_KEY_ENCRYPTION_KEY`, and renders `key_encryption_key_env` for the gateway when no external credential driver is enabled. Multi-replica deployments need every replica to use the same database and key-encryption key; the chart default handles the key-encryption key side.
 
 For GitOps and `helm template` workflows where `lookup` returns empty, the chart-generated KEK Secret gets a random value on every render, making credentials unrecoverable. Set `server.credentialStorage.existingSecret` to the name of a pre-provisioned Secret containing the key-encryption key under the `key-encryption-key` data key. When set, the chart skips KEK Secret generation and references the provided Secret directly.
 

@@ -21,12 +21,15 @@ use crate::persistence::{
 };
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
+use crate::storage_proto::SandboxDelegatedIdentityRecord;
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
+use openshell_core::ObjectWorkspace;
+use openshell_core::SetResourceVersion;
 use openshell_core::extension_protocol::{
     ExtensionFamily, NegotiatedExtension, gateway_metadata, negotiate,
 };
@@ -50,7 +53,6 @@ use openshell_core::proto::{
     ServiceEndpoint, SshSession,
 };
 use openshell_core::telemetry::TelemetryComputeDriver;
-use openshell_core::{ObjectLabels, ObjectWorkspace, SetResourceVersion};
 use prost::Message;
 use std::collections::HashMap;
 use std::fmt;
@@ -1181,6 +1183,7 @@ impl ComputeRuntime {
             sandbox_token,
             launch_authentication,
             await_main_process_attachment,
+            None,
             lifecycle_guard,
             mutation_guard,
         ))
@@ -1194,6 +1197,7 @@ impl ComputeRuntime {
         sandbox_token: Option<String>,
         launch_authentication: Option<Vec<u8>>,
         await_main_process_attachment: bool,
+        delegation: Option<&crate::delegated_identity::PreparedSandboxDelegatedIdentity>,
         lifecycle_guard: SandboxLifecycleGuard,
         mutation_guard: MutationGuard,
     ) -> Result<Sandbox, Status> {
@@ -1205,6 +1209,7 @@ impl ComputeRuntime {
                 launch_authentication,
                 ..Default::default()
             },
+            delegation,
             lifecycle_guard,
             mutation_guard,
         ))
@@ -1230,18 +1235,21 @@ impl ComputeRuntime {
             sandbox_token,
             await_main_process_attachment,
             runtime_inputs,
+            None,
             lifecycle_guard,
             mutation_guard,
         ))
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_sandbox_with_runtime_inputs_and_guards(
         &self,
         sandbox: Sandbox,
         sandbox_token: Option<String>,
         await_main_process_attachment: bool,
         runtime_inputs: SandboxCreateRuntimeInputs,
+        delegation: Option<&crate::delegated_identity::PreparedSandboxDelegatedIdentity>,
         lifecycle_guard: SandboxLifecycleGuard,
         mutation_guard: MutationGuard,
     ) -> Result<Sandbox, Status> {
@@ -1282,44 +1290,10 @@ impl ComputeRuntime {
             set_rootfs_tar_path(&mut driver_sandbox, staged.path());
         }
 
-        // Create with MustCreate condition to prevent duplicate creation race
-        self.sandbox_index.update_from_sandbox(&sandbox);
-        let labels_map = sandbox.object_labels();
-        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
-            None
-        } else {
-            Some(
-                serde_json::to_string(&labels_map)
-                    .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
-            )
-        };
-        let result = self
-            .store
-            .put_if(
-                Sandbox::object_type(),
-                &sandbox_id,
-                sandbox.object_name(),
-                sandbox.object_workspace(),
-                &sandbox.encode_to_vec(),
-                labels_json.as_deref(),
-                WriteCondition::MustCreate,
-            )
-            .await
-            .map_err(|e| {
-                if matches!(
-                    e,
-                    crate::persistence::PersistenceError::UniqueViolation { .. }
-                ) {
-                    Status::already_exists(format!(
-                        "sandbox '{}' already exists",
-                        sandbox.object_name()
-                    ))
-                } else {
-                    Status::internal(format!("persist sandbox failed: {e}"))
-                }
-            })?;
+        crate::delegated_identity::store_sandbox_with_delegation(&self.store, &sandbox, delegation)
+            .await?;
         if let Some(metadata) = sandbox.metadata.as_mut() {
-            metadata.resource_version = result.resource_version;
+            metadata.resource_version = 1;
         }
         // The parent now owns any staged key, including if this request is
         // cancelled. Keep the creation guard until its public identity and
@@ -1343,6 +1317,7 @@ impl ComputeRuntime {
             }
         }
         .await;
+        self.sandbox_index.update_from_sandbox(&sandbox);
         drop(mutation_guard);
         let launch_authentication = match prepared {
             Ok(authentication) => authentication,
@@ -1639,6 +1614,7 @@ impl ComputeRuntime {
             .map(|response| response.into_inner().deleted)
     }
 
+    #[cfg(test)]
     pub(crate) async fn stop_sandbox(
         &self,
         workspace: &str,
@@ -1650,6 +1626,14 @@ impl ComputeRuntime {
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        self.stop_resolved_sandbox(&candidate).await
+    }
+
+    /// Stop the exact sandbox resolved and authorized by the caller.
+    pub(crate) async fn stop_resolved_sandbox(
+        &self,
+        candidate: &Sandbox,
+    ) -> Result<Sandbox, Status> {
         let sandbox_id = candidate.object_id().to_string();
         let sandbox_name = candidate.object_name().to_string();
         let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
@@ -1831,16 +1815,6 @@ impl ComputeRuntime {
         workspace: &str,
         name: &str,
     ) -> Result<Sandbox, Status> {
-        self.start_sandbox_authenticated(workspace, name, None)
-            .await
-    }
-
-    pub(crate) async fn start_sandbox_authenticated(
-        &self,
-        workspace: &str,
-        name: &str,
-        authority: Option<&crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>,
-    ) -> Result<Sandbox, Status> {
         let candidate = self
             .store
             .get_message_by_name::<Sandbox>(workspace, name)
@@ -1848,6 +1822,25 @@ impl ComputeRuntime {
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         provisioning_operation::ensure_operation_settled(&candidate)?;
+        self.start_sandbox_authenticated(&candidate, None).await
+    }
+
+    /// Start the exact sandbox resolved and authorized by the caller.
+    pub(crate) async fn start_sandbox_authenticated(
+        &self,
+        candidate: &Sandbox,
+        authority: Option<&crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>,
+    ) -> Result<Sandbox, Status> {
+        let sandbox_id = candidate.object_id().to_string();
+        let sandbox_name = candidate.object_name().to_string();
+        // Reject an expired attempt before waiting on its busy lifecycle gate.
+        // Resolve by the authorized ID so name reuse cannot change the target.
+        let candidate = self
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
         if provisioning_deadline::timed_out(&candidate)
             && candidate
                 .status
@@ -1859,8 +1852,6 @@ impl ComputeRuntime {
                 "provisioning timeout cleanup is still pending; retry start after compute is reclaimed",
             ));
         }
-        let sandbox_id = candidate.object_id().to_string();
-        let sandbox_name = candidate.object_name().to_string();
         let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
         let sandbox_guard = self.lock_sandbox_for_lifecycle(&lifecycle_guard).await;
         let mut current = self
@@ -1869,6 +1860,17 @@ impl ComputeRuntime {
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        if provisioning_deadline::timed_out(&current)
+            && current
+                .status
+                .as_ref()
+                .and_then(|status| status.provisioning.as_ref())
+                .is_some_and(|record| record.cleanup_completed_time.is_none())
+        {
+            return Err(Status::failed_precondition(
+                "provisioning timeout cleanup is still pending; retry start after compute is reclaimed",
+            ));
+        }
         if current.object_name() != sandbox_name {
             return Err(Status::aborted(
                 "sandbox name changed while the start request was waiting; retry explicitly",
@@ -2583,21 +2585,6 @@ impl ComputeRuntime {
         .await
     }
 
-    pub(crate) async fn delete_sandbox_allow_missing(
-        &self,
-        workspace: &str,
-        name: &str,
-        allow_missing: bool,
-    ) -> Result<DeleteSandboxResult, Status> {
-        self.delete_sandbox_with_options(
-            workspace,
-            name,
-            allow_missing,
-            SandboxDeletePreconditions::default(),
-        )
-        .await
-    }
-
     #[cfg(test)]
     pub(crate) async fn delete_sandbox_with_preconditions(
         &self,
@@ -2609,22 +2596,7 @@ impl ComputeRuntime {
             .await
     }
 
-    pub(crate) async fn delete_sandbox_allow_missing_with_preconditions(
-        &self,
-        workspace: &str,
-        name: &str,
-        allow_missing: bool,
-        preconditions: SandboxDeletePreconditions,
-    ) -> Result<DeleteSandboxResult, Status> {
-        if preconditions == SandboxDeletePreconditions::default() {
-            return self
-                .delete_sandbox_allow_missing(workspace, name, allow_missing)
-                .await;
-        }
-        self.delete_sandbox_with_options(workspace, name, allow_missing, preconditions)
-            .await
-    }
-
+    #[cfg(test)]
     async fn delete_sandbox_with_options(
         &self,
         workspace: &str,
@@ -3004,6 +2976,7 @@ impl ComputeRuntime {
             .await
             .map_err(|err| err.to_string())?
         else {
+            self.cleanup_sandbox_delegated_identity(sandbox_id).await?;
             self.cleanup_removed_sandbox_state(sandbox_id);
             return Ok(false);
         };
@@ -3052,10 +3025,12 @@ impl ComputeRuntime {
             .await
         {
             Ok(true) => {
+                self.cleanup_sandbox_delegated_identity(sandbox_id).await?;
                 self.cleanup_removed_sandbox_state(sandbox_id);
                 Ok(true)
             }
             Ok(false) => {
+                self.cleanup_sandbox_delegated_identity(sandbox_id).await?;
                 self.cleanup_removed_sandbox_state(sandbox_id);
                 Ok(false)
             }
@@ -5472,6 +5447,7 @@ impl ComputeRuntime {
             .delete(Sandbox::object_type(), sandbox_id)
             .await
             .map_err(|e| e.to_string())?;
+        self.cleanup_sandbox_delegated_identity(sandbox_id).await?;
         self.cleanup_removed_sandbox_state(sandbox_id);
         Ok(())
     }
@@ -5498,7 +5474,6 @@ impl ComputeRuntime {
             .await?;
         self.cleanup_sandbox_service_endpoints(sandbox.object_id(), sandbox.object_workspace())
             .await?;
-
         self.store
             .delete_by_name(
                 SANDBOX_SETTINGS_OBJECT_TYPE,
@@ -5518,6 +5493,21 @@ impl ComputeRuntime {
                 .map_err(|e| format!("delete {label}: {e}"))?;
         }
 
+        Ok(())
+    }
+
+    /// Remove the ownership marker only after the sandbox row is gone.
+    /// Keeping this separate from child-record cleanup ensures an interrupted
+    /// or version-conflicted delete cannot turn a delegated sandbox into an
+    /// ordinary workspace sandbox.
+    async fn cleanup_sandbox_delegated_identity(&self, sandbox_id: &str) -> Result<(), String> {
+        self.store
+            .delete(
+                SandboxDelegatedIdentityRecord::object_type(),
+                &crate::delegated_identity::sandbox_delegated_identity_record_id(sandbox_id),
+            )
+            .await
+            .map_err(|e| format!("delete sandbox delegated identity: {e}"))?;
         Ok(())
     }
 
@@ -7628,6 +7618,7 @@ mod tests {
 
     use super::*;
     use futures::stream;
+    use openshell_core::proto::SandboxDelegatedIdentity;
     use openshell_core::proto::SandboxPolicy as PublicSandboxPolicy;
     use openshell_core::proto::compute::v1::{
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
@@ -10908,6 +10899,30 @@ mod tests {
     }
 
     async fn seed_sandbox_owned_records(runtime: &ComputeRuntime, sandbox: &Sandbox) -> SshSession {
+        let delegation_id =
+            crate::delegated_identity::sandbox_delegated_identity_record_id(sandbox.object_id());
+        runtime
+            .store
+            .put_scoped_message(
+                &SandboxDelegatedIdentityRecord {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: delegation_id.clone(),
+                        name: delegation_id,
+                        workspace: sandbox.object_workspace().to_string(),
+                        ..Default::default()
+                    }),
+                    sandbox_id: sandbox.object_id().to_string(),
+                    delegated_identity: Some(SandboxDelegatedIdentity {
+                        credential_id: "credential-owned".to_string(),
+                        principal_subject: "delegator".to_string(),
+                        delegation_expiration_time: None,
+                        withdrawal_time: None,
+                    }),
+                },
+                sandbox.object_id(),
+            )
+            .await
+            .unwrap();
         runtime
             .store
             .put(
@@ -10965,6 +10980,10 @@ mod tests {
             .delete(Sandbox::object_type(), sandbox.object_id())
             .await
             .unwrap();
+        runtime
+            .cleanup_sandbox_delegated_identity(sandbox.object_id())
+            .await
+            .unwrap();
     }
 
     async fn assert_sandbox_owned_records(
@@ -10973,6 +10992,19 @@ mod tests {
         session: &SshSession,
         expected: bool,
     ) {
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<SandboxDelegatedIdentityRecord>(
+                    &crate::delegated_identity::sandbox_delegated_identity_record_id(
+                        sandbox.object_id(),
+                    ),
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            expected
+        );
         assert_eq!(
             runtime
                 .store
@@ -11804,6 +11836,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authorized_lifecycle_target_does_not_follow_reused_name() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        // The handler authorized this snapshot before the original was removed.
+        let authorized = sandbox_record("sb-original", "reused-name", SandboxPhase::Stopped);
+        let replacement = sandbox_record("sb-replacement", "reused-name", SandboxPhase::Stopped);
+        runtime.store.put_message(&replacement).await.unwrap();
+        let replacement = runtime
+            .store
+            .get_message::<Sandbox>(replacement.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = runtime
+            .start_sandbox_authenticated(&authorized, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::NotFound);
+
+        let error = runtime
+            .stop_resolved_sandbox(&authorized)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::NotFound);
+
+        let deleted = runtime
+            .delete_sandbox_by_id(authorized.object_id(), authorized.object_name())
+            .await
+            .unwrap();
+        assert_eq!(deleted.sandbox_id, authorized.object_id());
+        assert_eq!(driver.start_calls(), 0);
+        assert_eq!(driver.stop_calls(), 0);
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>(replacement.object_id())
+                .await
+                .unwrap(),
+            Some(replacement),
+            "a lifecycle request must leave the replacement untouched"
+        );
+    }
+
+    #[tokio::test]
     async fn stop_and_start_follow_durable_state_machine() {
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
@@ -12344,11 +12421,7 @@ mod tests {
         let authority = test_session_authority();
 
         runtime
-            .start_sandbox_authenticated(
-                sandbox.object_workspace(),
-                sandbox.object_name(),
-                Some(&authority),
-            )
+            .start_sandbox_authenticated(&sandbox, Some(&authority))
             .await
             .unwrap();
 
@@ -12371,11 +12444,7 @@ mod tests {
         );
 
         runtime
-            .start_sandbox_authenticated(
-                sandbox.object_workspace(),
-                sandbox.object_name(),
-                Some(&authority),
-            )
+            .start_sandbox_authenticated(&sandbox, Some(&authority))
             .await
             .unwrap();
 
@@ -12423,11 +12492,7 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
 
         runtime
-            .start_sandbox_authenticated(
-                sandbox.object_workspace(),
-                sandbox.object_name(),
-                Some(&test_session_authority()),
-            )
+            .start_sandbox_authenticated(&sandbox, Some(&test_session_authority()))
             .await
             .unwrap();
 
@@ -13985,6 +14050,60 @@ mod tests {
             watch_rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_sandbox_record_delete_retains_delegated_identity_ownership() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_url = format!("sqlite://{}", directory.path().join("gateway.db").display());
+        let store = Arc::new(Store::connect(&database_url).await.expect("connect store"));
+        let pool = sqlx::SqlitePool::connect(&database_url)
+            .await
+            .expect("connect failure injector");
+        sqlx::query(
+            "CREATE TRIGGER reject_test_sandbox_delete \
+             BEFORE DELETE ON objects \
+             WHEN OLD.object_type = 'sandbox' AND OLD.id = 'sb-1' \
+             BEGIN SELECT RAISE(ABORT, 'injected sandbox deletion failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install persistence failure trigger");
+        pool.close().await;
+
+        let driver = ControlledDriver::new();
+        let mut runtime = test_runtime(driver).await;
+        runtime.store = store;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        seed_sandbox_owned_records(&runtime, &sandbox).await;
+
+        runtime
+            .apply_deleted("sb-1")
+            .await
+            .expect_err("sandbox row deletion should fail");
+
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            runtime
+                .store
+                .get_message::<SandboxDelegatedIdentityRecord>(
+                    &crate::delegated_identity::sandbox_delegated_identity_record_id(
+                        sandbox.object_id(),
+                    ),
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "ownership marker must remain while the sandbox row remains"
+        );
     }
 
     #[tokio::test]
@@ -19026,11 +19145,14 @@ mod tests {
             "cleanup waits for the in-flight lifecycle operation"
         );
         assert_eq!(
-            runtime
-                .start_sandbox("default", "busy-ttl")
-                .await
-                .unwrap_err()
-                .code(),
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                runtime.start_sandbox("default", "busy-ttl"),
+            )
+            .await
+            .expect("start rejects pending cleanup without waiting for the lifecycle gate")
+            .unwrap_err()
+            .code(),
             Code::FailedPrecondition
         );
         drop(gate);

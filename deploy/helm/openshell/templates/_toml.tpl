@@ -110,6 +110,12 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- range $legacyKey, $runtimeKey := dict "logLevel" "log_level" "enableLoopbackServiceHttp" "enable_loopback_service_http" "enableWebsocketTunnel" "enable_websocket_tunnel" "policyValidationFailureMode" "policy_validation_failure_mode" -}}
 {{- if not (hasKey $gateway $runtimeKey) -}}{{- $_ := set $gateway $runtimeKey (get $legacyServer $legacyKey) -}}{{- end -}}
 {{- end -}}
+{{- if not (hasKey $gateway "max_delegated_identity_duration_secs") -}}
+{{- $duration := 86400 -}}
+{{- if hasKey $legacyServer "maxDelegatedIdentityDurationSecs" -}}{{- $duration = int (get $legacyServer "maxDelegatedIdentityDurationSecs") -}}{{- end -}}
+{{- if lt $duration 0 -}}{{- fail "server.maxDelegatedIdentityDurationSecs must not be negative; it maps to an unsigned gateway setting" -}}{{- end -}}
+{{- $_ := set $gateway "max_delegated_identity_duration_secs" $duration -}}
+{{- end -}}
 {{- if not (hasKey $gateway "compute_driver") -}}{{- $_ := set $gateway "compute_driver" "kubernetes" -}}{{- end -}}
 {{- $serverDnsNames := .Values.pkiInitJob.serverDnsNames | default list -}}
 {{- if .Values.certManager.enabled -}}{{- $serverDnsNames = .Values.certManager.serverDnsNames | default list -}}{{- end -}}

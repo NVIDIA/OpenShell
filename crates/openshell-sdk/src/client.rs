@@ -1364,6 +1364,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
                 ) as i32,
             })
             .collect(),
+        delegated_identity: None,
     }
 }
 
@@ -1405,6 +1406,7 @@ fn create_sandbox_from_template_request(
                 ) as i32,
             })
             .collect(),
+        delegated_identity: None,
     }
 }
 

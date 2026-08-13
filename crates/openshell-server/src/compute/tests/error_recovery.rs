@@ -91,7 +91,7 @@ async fn failed_gateway_start_can_be_stopped_and_retried() {
 
     let authority = test_session_authority();
     let starting = runtime
-        .start_sandbox_authenticated("default", "retained", Some(&authority))
+        .start_sandbox_authenticated(&failed, Some(&authority))
         .await
         .unwrap();
     assert_eq!(starting.phase(), SandboxPhase::Starting as i32);

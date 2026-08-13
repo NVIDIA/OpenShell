@@ -352,6 +352,9 @@ pub struct ContainerSpec {
     /// via Podman's `host-gateway` magic so sandbox containers can reach
     /// the gateway server running on the host in rootless mode.
     hostadd: Vec<String>,
+    /// Preserve the resolver file installed by the driver in the workload rootfs.
+    #[serde(rename = "use_image_resolve_conf")]
+    use_image_resolv_conf: bool,
     /// Search domains written to `/etc/resolv.conf` by Podman.
     dns_search: Vec<String>,
     /// Resolver options written to `/etc/resolv.conf` by Podman.
@@ -1390,9 +1393,7 @@ fn build_base_spec(
         // reach services on the host. `host.openshell.internal` is the driver-
         // neutral alias used by policies and e2e tests.
         hostadd: hostadd_entries(config),
-        // Preserve Podman's resolver defaults for both policy-DNS and ordinary
-        // sandboxes. Namespace-local capture supports UDP and TCP, so it must
-        // not depend on a libc-specific option or alter short-name searches.
+        use_image_resolv_conf: false,
         dns_search: Vec::new(),
         dns_option: Vec::new(),
         use_image_resolve_conf: None,
@@ -1609,6 +1610,9 @@ pub fn build_isolation_specs(
     workload.networks.clear();
     workload.portmappings.clear();
     workload.hostadd.clear();
+    // Podman does not generate resolv.conf for network=none, even with
+    // dns_server set. Bootstrap installs the sandbox-local resolver instead.
+    workload.use_image_resolv_conf = true;
     workload.secret_env.clear();
     workload.secrets.clear();
     workload.secrets.push(SecretMount {
@@ -2096,6 +2100,41 @@ mod tests {
         fallback.config.as_mut().unwrap().working_dir = "/sandbox".into();
         ResolvedPodmanImage::from_inspect("image:latest", fallback)
             .expect("existing /sandbox images keep their image-volume behavior");
+    }
+
+    #[test]
+    fn isolated_workload_uses_sandbox_local_policy_dns() {
+        let sandbox = DriverSandbox {
+            id: "dns-pair".into(),
+            name: "agent".into(),
+            ..Default::default()
+        };
+        let config = PodmanComputeConfig::default();
+        let identity = openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+            1000,
+            1001,
+            Vec::new(),
+            "image".into(),
+            "sha256:image".into(),
+        )
+        .unwrap();
+        let specs = build_isolation_specs(IsolationSpecInput {
+            sandbox: &sandbox,
+            config: &config,
+            token_secret: None,
+            resolver_secret: "resolver",
+            gpu_devices: None,
+            image: &resolved_image("image:latest", "sha256:image", "1000:1001", ""),
+            supervisor_bin: None,
+            tls_secrets: None,
+            identity: &identity,
+        })
+        .unwrap();
+
+        let workload = serde_json::to_value(specs.workload).unwrap();
+        let supervisor = serde_json::to_value(specs.supervisor).unwrap();
+        assert_eq!(workload["use_image_resolve_conf"], true);
+        assert_eq!(supervisor["use_image_resolve_conf"], false);
     }
 
     fn json_struct(value: Value) -> prost_types::Struct {

@@ -4098,17 +4098,21 @@ pub(super) async fn handle_exchange_provider_subject_token(
         Some(Principal::Sandbox(principal)) => Some(principal.sandbox_id.clone()),
         _ => None,
     };
-    exchange_provider_subject_token_inner(state, request, request_id.as_deref())
-        .await
-        .map_err(|status| {
-            let status = sanitize_token_grant_status(status);
-            log_token_grant_failure(
-                log_sandbox_id.as_deref(),
-                request_id.as_deref(),
-                TokenGrantFailure::from_status(&status),
-            );
-            status
-        })
+    Box::pin(exchange_provider_subject_token_inner(
+        state,
+        request,
+        request_id.as_deref(),
+    ))
+    .await
+    .map_err(|status| {
+        let status = sanitize_token_grant_status(status);
+        log_token_grant_failure(
+            log_sandbox_id.as_deref(),
+            request_id.as_deref(),
+            TokenGrantFailure::from_status(&status),
+        );
+        status
+    })
 }
 
 fn sanitize_token_grant_status(status: Status) -> Status {
@@ -4308,30 +4312,54 @@ async fn exchange_provider_subject_token_inner(
         .subject_token
         .as_ref()
         .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
-    if subject_token.source != "provider_credential" {
-        return Err(token_grant_configuration_status(
-            tonic::Code::FailedPrecondition,
-        ));
-    }
-    if !profile_proto
-        .credentials
-        .iter()
-        .any(|credential| credential.name == subject_token.credential)
-    {
-        return Err(token_grant_configuration_status(
-            tonic::Code::FailedPrecondition,
-        ));
-    }
     // Validate configuration before identity acquisition, cache lookup or any
     // token exchange; invalid configuration must never trigger an outbound grant.
-    let (cache_ttl, subject_token_expires_at_ms) = validate_intermediate_grant_configuration(
+    let (cache_ttl, _) = validate_intermediate_grant_configuration(
         token_grant,
         &provider,
         &subject_token.credential,
     )?;
-    let stored_subject_token =
-        resolve_subject_token_credential(&state.credentials, &provider, &subject_token.credential)
-            .await?;
+    let (stored_subject_token, subject_token_expires_at_ms, subject_cache_key) =
+        match subject_token.source.as_str() {
+            "provider_credential" => {
+                if !profile_proto
+                    .credentials
+                    .iter()
+                    .any(|credential| credential.name == subject_token.credential)
+                {
+                    return Err(token_grant_configuration_status(
+                        tonic::Code::FailedPrecondition,
+                    ));
+                }
+                (
+                    resolve_subject_token_credential(
+                        &state.credentials,
+                        &provider,
+                        &subject_token.credential,
+                    )
+                    .await?,
+                    provider_credential_expiration_ms(&provider, &subject_token.credential)?
+                        .unwrap_or_default(),
+                    subject_token.credential.clone(),
+                )
+            }
+            "sandbox_delegated_identity" => {
+                if !subject_token.credential.trim().is_empty() {
+                    return Err(token_grant_configuration_status(
+                        tonic::Code::FailedPrecondition,
+                    ));
+                }
+                let (access_token, expires_at_ms, credential_id) =
+                    crate::delegated_identity::resolve_subject_access_token(state, &sandbox)
+                        .await?;
+                (access_token, expires_at_ms, credential_id)
+            }
+            _ => {
+                return Err(token_grant_configuration_status(
+                    tonic::Code::FailedPrecondition,
+                ));
+            }
+        };
 
     let jwt_svid_audience =
         effective_jwt_svid_audience(&token_grant.token_endpoint, &token_grant.jwt_svid_audience);
@@ -4348,7 +4376,7 @@ async fn exchange_provider_subject_token_inner(
     let intermediate_cache_key = intermediate_token_cache_key(IntermediateTokenCacheKeyInput {
         provider: &provider,
         dynamic_credential: &req.credential_key,
-        subject_credential: &subject_token.credential,
+        subject_credential: &subject_cache_key,
         token_endpoint: &token_grant.token_endpoint,
         client_assertion_type: effective_client_assertion_type(&token_grant.client_assertion_type),
         subject_token_type: effective_token_type(&subject_token.subject_token_type),
@@ -4381,11 +4409,29 @@ async fn exchange_provider_subject_token_inner(
         },
         request_id,
     )
-    .await?;
+    .await
+    .inspect_err(|status| {
+        warn!(
+            sandbox_id = %req.sandbox_id,
+            provider = %req.provider,
+            credential_key = %req.credential_key,
+            subject_credential = %subject_cache_key,
+            client_assertion_type = %effective_client_assertion_type(&token_grant.client_assertion_type),
+            gateway_svid_issuer = %gateway_claims.iss,
+            gateway_svid_subject = %gateway_claims.sub,
+            gateway_svid_audience = ?gateway_claims.aud,
+            supervisor_svid_issuer = %supervisor_claims.iss,
+            supervisor_svid_subject = %supervisor_claims.sub,
+            supervisor_svid_audience = ?supervisor_claims.aud,
+            status = ?status.code(),
+            error = %status.message(),
+            "intermediate provider token exchange failed"
+        );
+    })?;
     let cache_expires_at_ms = intermediate_token_cache_expires_at_ms(
         &token_response,
         cache_ttl,
-        subject_token_expires_at_ms.unwrap_or_default(),
+        subject_token_expires_at_ms,
         supervisor_claims.exp,
     );
     if cache_expires_at_ms > crate::persistence::current_time_ms() {
@@ -5612,7 +5658,7 @@ mod tests {
                 .with_writer(move || writer.clone())
                 .finish();
             let capture = crate::otel_tracing::test_exporter::install_scoped(subscriber);
-            let error = handle_exchange_provider_subject_token(&state, request)
+            let error = Box::pin(handle_exchange_provider_subject_token(&state, request))
                 .await
                 .unwrap_err();
             drop(capture);

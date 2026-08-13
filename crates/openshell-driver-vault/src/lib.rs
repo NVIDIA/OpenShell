@@ -123,6 +123,28 @@ struct KubernetesLoginAuth {
 }
 
 impl VaultCredentialDriver {
+    pub fn prepare_credential(
+        &self,
+        request: openshell_core::proto::credentials::v1::PrepareCredentialRequest,
+    ) -> Result<CredentialHandle, Status> {
+        let object_id = requested_object_id(&request.object_id, &request.provider_id)?;
+        let path = managed_secret_path(
+            &request.workspace,
+            &request.provider_id,
+            &request.provider,
+            &request.credential_key,
+            object_id,
+        );
+        validate_secret_path(&path).map_err(Status::invalid_argument)?;
+        Ok(CredentialHandle {
+            driver: Self::NAME.into(),
+            handle: format!("{HANDLE_VERSION}:{path}"),
+            metadata: std::collections::HashMap::from([(
+                OBJECT_ID_METADATA_KEY.into(),
+                object_id.into(),
+            )]),
+        })
+    }
     pub const NAME: &'static str = "vault";
 
     pub fn from_config(config: &toml::Table) -> CoreResult<Self> {
@@ -499,6 +521,14 @@ impl Clone for VaultCredentialDriver {
 
 #[tonic::async_trait]
 impl CredentialDriver for CredentialDriverService {
+    async fn prepare_credential(
+        &self,
+        request: Request<openshell_core::proto::credentials::v1::PrepareCredentialRequest>,
+    ) -> Result<Response<StoreCredentialResponse>, Status> {
+        Ok(Response::new(StoreCredentialResponse {
+            handle: Some(self.driver.prepare_credential(request.into_inner())?),
+        }))
+    }
     async fn get_capabilities(
         &self,
         request: Request<GetCredentialDriverCapabilitiesRequest>,

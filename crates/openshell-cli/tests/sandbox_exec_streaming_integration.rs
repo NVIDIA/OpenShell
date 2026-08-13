@@ -236,6 +236,15 @@ mock_gateway! {
         delete_sandbox(proto::DeleteSandboxRequest) -> proto::DeleteSandboxResponse;
         stop_sandbox(proto::StopSandboxRequest) -> proto::SandboxResponse;
         start_sandbox(proto::StartSandboxRequest) -> proto::SandboxResponse;
+        get_delegated_identity_authorization_status(proto::GetDelegatedIdentityAuthorizationStatusRequest) -> proto::GetDelegatedIdentityAuthorizationStatusResponse;
+        authorize_delegated_identity(proto::AuthorizeDelegatedIdentityRequest) -> proto::AuthorizeDelegatedIdentityResponse;
+        get_sandbox_delegated_identity_status(proto::GetSandboxDelegatedIdentityStatusRequest) -> proto::GetSandboxDelegatedIdentityStatusResponse;
+        withdraw_sandbox_delegated_identity(proto::WithdrawSandboxDelegatedIdentityRequest) -> proto::WithdrawSandboxDelegatedIdentityResponse;
+        extend_sandbox_delegated_identity(proto::ExtendSandboxDelegatedIdentityRequest) -> proto::ExtendSandboxDelegatedIdentityResponse;
+        list_delegated_identity_credentials(proto::ListDelegatedIdentityCredentialsRequest) -> proto::ListDelegatedIdentityCredentialsResponse;
+        get_delegated_identity_credential_status(proto::GetDelegatedIdentityCredentialStatusRequest) -> proto::GetDelegatedIdentityCredentialStatusResponse;
+        revoke_delegated_identity_credential(proto::RevokeDelegatedIdentityCredentialRequest) -> proto::RevokeDelegatedIdentityCredentialResponse;
+        delete_delegated_identity_credential(proto::DeleteDelegatedIdentityCredentialRequest) -> proto::DeleteDelegatedIdentityCredentialResponse;
         create_ssh_session(proto::CreateSshSessionRequest) -> proto::CreateSshSessionResponse;
         expose_service(proto::ExposeServiceRequest) -> proto::ServiceEndpointResponse;
         get_service(proto::GetServiceRequest) -> proto::ServiceEndpointResponse;

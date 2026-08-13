@@ -391,6 +391,11 @@ Common findings:
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Numeric workload identities `1` through `4294967294` are accepted; root, the invalid identity sentinel, and missing identities are rejected.
 - Supervisor cannot connect: check its gateway endpoint and gateway logs.
+- Exec fails with a Sandbox Protocol payload digest mismatch: compare the
+  configured `sandbox_runtime_image` and `supervisor_image` with the artifacts
+  actually running. Use compatible runtime versions and immutable image
+  references; a locally built supervisor paired with a published sandbox
+  runtime can fail even after the sandbox reaches Ready.
 - Inspect both Podman containers for the sandbox: the `sandbox` isolation role
   must have network mode `none`; the `supervisor` role owns the gateway session
   and egress. Both run non-root with all capabilities dropped. Check the private
@@ -468,6 +473,17 @@ the current chart revision:
 kubectl -n openshell get deployment,statefulset -o yaml | rg -n 'gateway-config|mountPath|subPath|checksum/gateway-config'
 kubectl -n openshell rollout status <deployment-or-statefulset>/openshell
 kubectl -n openshell logs <gateway-pod> -c openshell-gateway --tail=200
+```
+
+For delegated identity duration errors, compare the Helm value with the rendered
+gateway configuration. `server.maxDelegatedIdentityDurationSecs` renders
+`[openshell.gateway] max_delegated_identity_duration_secs` and defaults to
+`86400` seconds. A negative Helm value fails rendering; a requested delegation
+longer than the rendered maximum fails at the gateway:
+
+```bash
+helm -n openshell get values openshell | rg -n 'maxDelegatedIdentityDurationSecs'
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | rg -n 'max_delegated_identity_duration_secs'
 ```
 
 `server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway

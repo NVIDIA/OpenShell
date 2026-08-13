@@ -203,6 +203,45 @@ async fn pool_journal_settings(pool: &SqlitePool) -> PersistenceResult<(String, 
 }
 
 impl SqliteStore {
+    pub async fn put_objects_atomic(
+        &self,
+        writes: &[super::AtomicObjectWrite],
+    ) -> PersistenceResult<()> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        let now = current_time_ms();
+        // Stable order avoids deadlocks between overlapping batches on Postgres.
+        let mut ordered: Vec<_> = writes.iter().collect();
+        ordered.sort_by(|a, b| a.id.cmp(&b.id));
+        for write in ordered {
+            if let Some(version) = write.expected_version {
+                let result = sqlx::query(
+                    "UPDATE objects SET payload = ?3, labels = ?4, updated_at_ms = ?5, resource_version = resource_version + 1 WHERE object_type = ?1 AND id = ?2 AND resource_version = ?6"
+                )
+                .bind(&write.object_type).bind(&write.id).bind(&write.payload)
+                .bind(write.labels.as_deref()).bind(now)
+                .bind(i64::try_from(version).map_err(|_| PersistenceError::Encode("resource version overflow".into()))?)
+                .execute(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+                if result.rows_affected() != 1 {
+                    return Err(PersistenceError::Conflict {
+                        current_resource_version: None,
+                    });
+                }
+            } else {
+                sqlx::query(
+                    "INSERT INTO objects (object_type, id, name, workspace, scope, payload, labels, created_at_ms, updated_at_ms, resource_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 1)"
+                )
+                .bind(&write.object_type).bind(&write.id).bind(&write.name)
+                .bind(&write.workspace).bind(&write.scope).bind(&write.payload)
+                .bind(write.labels.as_deref()).bind(now)
+                .execute(&mut *tx).await.map_err(|e| map_db_error(&e))?;
+            }
+        }
+        tx.commit().await.map_err(|e| map_db_error(&e))
+    }
     /// Closes the connection pool.
     #[cfg(test)]
     pub(crate) async fn close_for_test(&self) {

@@ -608,6 +608,8 @@ mod tests {
             "openshell.storage.v1.DraftChunkPayload",
             "openshell.storage.v1.StoredPolicyRevision",
             "openshell.storage.v1.StoredDraftChunk",
+            "openshell.storage.v1.DelegatedIdentityCredential",
+            "openshell.storage.v1.DelegatedIdentityRefreshLease",
             "openshell.internal.pagination.v1.ObjectCursor",
         ];
         let mut violations = Vec::new();
