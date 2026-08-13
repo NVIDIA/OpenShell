@@ -126,7 +126,6 @@ jobs:
   build-x64:
     name: Build binaries (x64)
     needs: cache-seed-x64
-    if: needs.cache-seed-x64.result == 'success'
     runs-on: windows-2025
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
