@@ -11,7 +11,9 @@ use openshell_e2e::harness::container::{SupportContainer, is_e2e_driver};
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 
-const FIXTURE_ALIAS: &str = "transparent-tcp-fixture";
+// Use a qualified policy hostname so runtime-provided resolver search domains
+// (for example Podman's `dns.podman`) cannot rewrite the policy identity.
+const FIXTURE_ALIAS: &str = "transparent-tcp-fixture.openshell.test";
 const FIXTURE_PORT: u16 = 5432;
 const TRANSPARENT_LISTENER_PORT: u16 = 15001;
 
