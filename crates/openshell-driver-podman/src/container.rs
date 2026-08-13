@@ -524,11 +524,11 @@ fn build_env(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),
         openshell_core::telemetry::enabled_env_value().into(),
     );
-    // Runtime capabilities are driver-owned. Podman does not yet provide the
-    // policy DNS and transparent TCP substrate, so override image/user input.
+    // Runtime capabilities are driver-owned. Override image/user input with
+    // only the substrate that this driver configures for the supervisor.
     env.insert(
         openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.into(),
-        String::new(),
+        openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.into(),
     );
 
     // 3. TLS client cert paths (when mTLS is enabled). These point to
@@ -1976,14 +1976,14 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_clears_unsupported_network_capabilities() {
+    fn container_spec_keeps_network_capabilities_driver_controlled() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "legit-name");
         sandbox.spec = Some(DriverSandboxSpec {
             environment: std::collections::HashMap::from([(
                 openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
-                openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY.to_string(),
+                "spoofed".to_string(),
             )]),
             template: Some(DriverSandboxTemplate::default()),
             ..Default::default()
@@ -1991,7 +1991,7 @@ mod tests {
         let spec = build_container_spec(&sandbox, &test_config());
         assert_eq!(
             spec["env"][openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES],
-            serde_json::json!("")
+            serde_json::json!(openshell_core::sandbox_env::POLICY_DNS_TRANSPARENT_TCP_CAPABILITY)
         );
     }
 

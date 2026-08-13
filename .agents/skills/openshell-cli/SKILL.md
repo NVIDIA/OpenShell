@@ -348,7 +348,7 @@ This is the most important multi-step workflow. It enables a tight feedback cycl
 
 An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
 `protocol: tcp` requests policy DNS and transparent TCP and currently requires
-the Docker runtime; unsupported runtimes reject the policy before starting the
+the Docker or Podman runtime; unsupported runtimes reject the policy before starting the
 workload rather than activating only part of the network contract.
 
 ```

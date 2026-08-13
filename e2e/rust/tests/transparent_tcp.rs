@@ -94,8 +94,8 @@ async fn wait_for_sandbox_logs(
 }
 
 #[tokio::test]
-async fn docker_native_tcp_uses_policy_dns_and_fails_closed_on_wrong_port_and_real_ip() {
-    if !is_e2e_driver("docker") {
+async fn local_container_native_tcp_uses_policy_dns_and_fails_closed() {
+    if !is_e2e_driver("docker") && !is_e2e_driver("podman") {
         return;
     }
 
@@ -131,7 +131,7 @@ serve({FIXTURE_PORT})
         "Ready",
     )
     .await
-    .expect("create Docker sandbox");
+    .expect("create local-container sandbox");
 
     let script = format!(
         r#"import os, socket
