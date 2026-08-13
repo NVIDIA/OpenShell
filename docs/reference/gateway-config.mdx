@@ -920,6 +920,8 @@ OpenShell sends no override and Podman applies its runtime-selected profile.
 Set `Unconfined` explicitly only when the deployment requires the supervisor's
 mount setup to bypass that profile.
 
+Attached provider credentials require this governed-egress path. The gateway gives MXC only revision-scoped environment placeholders and keeps real values in the host proxy's endpoint-bound resolver. Provider keys override matching `agent_env` entries case-insensitively. Sandbox creation fails when attached provider material exists but `egress_proxy` is disabled. MXC takes its provider snapshot at creation; recreate the sandbox after attaching, detaching, or rotating a provider.
+
 ### MicroVM
 
 Each sandbox runs inside its own libkrun microVM managed by the standalone `openshell-driver-vm` subprocess. Use this driver when you want stronger isolation than container namespaces alone.
