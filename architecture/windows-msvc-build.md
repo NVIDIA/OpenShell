@@ -48,11 +48,13 @@ creating misleading Windows driver artifacts.
 
 ## Mise Lane
 
-The GitHub Actions workflow is manually dispatched. Each architecture restores
-and saves a dedicated Rust cache containing the Cargo registry and dependency
-build artifacts, including artifacts from failed runs. Keep the workflow manual
-until cache-hit runtimes demonstrate that it is suitable for pull requests and
-merges to `main`.
+The GitHub Actions workflow checks x64 Windows compilation for pull-request
+mirror branches and merge queues. Pushes to `main` and manual dispatches also
+build the release binaries and run the full x64 workspace test suite. Each
+architecture restores and saves a dedicated Rust cache containing the Cargo
+registry and dependency build artifacts, including artifacts from failed runs.
+The full run on `main` uses the same cache namespaces as pull requests, keeping
+both the Cargo target cache and sccache warm for subsequent checks.
 
 Windows validation is exposed through `tasks/windows.toml`:
 
@@ -128,14 +130,24 @@ break ARM64 crypto dependency builds.
 
 ## CI Shape
 
-The x64 GitHub Actions job runs on `windows-2025` and executes:
+The x64 GitHub Actions job runs on `windows-2025`. Pull-request mirrors and
+merge queues execute:
+
+```powershell
+mise run --skip-tools windows:check:x64
+```
+
+Pushes to `main` and manual dispatches execute:
 
 ```powershell
 mise run --skip-tools windows:check:x64
 mise run --skip-tools windows:build:x64
 mise run --skip-tools windows:test:x64
-mise run --skip-tools windows:test:unsupported:x64
 ```
+
+The full workspace test includes the unsupported-driver contract test, so CI
+does not run the focused test task a second time. The focused task remains
+available for local diagnosis.
 
 The cache is partitioned by architecture so incompatible x64 and ARM64 target
 artifacts cannot collide. It does not cache Cargo-installed binaries, which
@@ -143,8 +155,8 @@ also keeps the disabled self-hosted ARM64 scaffold from modifying persistent
 runner tooling.
 
 The local aggregate `windows:ci` task cross-builds ARM64 on an x64 host. The
-GitHub x64 job currently runs only the x64 tasks, and native ARM64 tests remain
-exclusive to an ARM64 runner.
+GitHub x64 job runs only the x64 tasks, and native ARM64 tests remain exclusive
+to an ARM64 runner.
 
 The ARM64 job is scaffolded but disabled until a Windows ARM64 runner is
 available. Once enabled, it should run check, release build, native workspace
