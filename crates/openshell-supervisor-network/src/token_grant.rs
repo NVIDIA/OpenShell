@@ -61,6 +61,7 @@ static TOKEN_GRANT_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 const DEFAULT_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
 const TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
 const MAX_TOKEN_EXPIRES_IN_SECONDS: i64 = 3600;
+const MAX_TOKEN_EXCHANGE_CACHE_TTL_SECONDS: i64 = 300;
 
 /// Cached access token with expiration metadata.
 #[derive(Debug, Clone)]
@@ -81,9 +82,8 @@ impl TokenCache {
         }
     }
 
-    /// Get a cached token if it exists and is not expired.
-    fn get(&self, provider_name: &str) -> Option<String> {
-        let now_ms = current_time_ms();
+    /// Get a cached token if it exists and is not expired at `now_ms`.
+    fn get_at(&self, provider_name: &str, now_ms: i64) -> Option<String> {
         let tokens = self.tokens.read().ok()?;
         let cached = tokens.get(provider_name)?;
         if cached.expires_at_ms > now_ms {
@@ -252,6 +252,18 @@ where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<OAuthTokenResponse>>,
 {
+    obtain_provider_token_with_grant_at(input, grant, current_time_ms()).await
+}
+
+async fn obtain_provider_token_with_grant_at<F, Fut>(
+    input: ObtainProviderTokenInput<'_>,
+    grant: F,
+    now_ms: i64,
+) -> Result<String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<OAuthTokenResponse>>,
+{
     let jwt_audience = effective_jwt_svid_audience(input.token_endpoint, input.jwt_svid_audience);
     let cache_key = token_cache_key(TokenCacheKeyInput {
         provider_name: input.provider_name,
@@ -264,15 +276,18 @@ where
         requested_token_type: effective_token_type(input.requested_token_type),
     });
 
-    if let Some(cached) = input.cache.get(&cache_key) {
+    if let Some(cached) = input.cache.get_at(&cache_key, now_ms) {
         return Ok(cached);
     }
 
     let token_response = grant(jwt_audience).await?;
 
-    let cache_ttl_seconds =
-        token_cache_ttl_seconds(input.cache_ttl_override, token_response.expires_in);
-    let expires_at_ms = current_time_ms().saturating_add(cache_ttl_seconds.saturating_mul(1000));
+    let cache_ttl_seconds = token_cache_ttl_seconds(
+        input.cache_ttl_override,
+        token_response.expires_in,
+        input.grant_type,
+    );
+    let expires_at_ms = now_ms.saturating_add(cache_ttl_seconds.saturating_mul(1000));
 
     input.cache.set(
         cache_key,
@@ -352,9 +367,16 @@ async fn perform_token_exchange(
 
 pub use oauth::validate_access_token;
 
-fn token_cache_ttl_seconds(cache_ttl_override: i64, expires_in: i64) -> i64 {
+fn token_cache_ttl_seconds(
+    cache_ttl_override: i64,
+    expires_in: i64,
+    grant_type: ProviderCredentialTokenGrantType,
+) -> i64 {
     if cache_ttl_override > 0 {
-        return cache_ttl_override;
+        // Delegated-identity withdrawal and credential revocation rely on
+        // token-exchange cache entries expiring within this bounded window.
+        // Explicit overrides therefore remain subject to the grant-type cap.
+        return token_cache_ttl_cap_for_grant_type(cache_ttl_override, grant_type);
     }
 
     let ttl = if expires_in > 0 {
@@ -362,8 +384,20 @@ fn token_cache_ttl_seconds(cache_ttl_override: i64, expires_in: i64) -> i64 {
     } else {
         DEFAULT_TOKEN_CACHE_TTL_SECONDS
     };
+    let ttl = token_cache_ttl_cap_for_grant_type(ttl, grant_type);
 
     ttl.saturating_sub(TOKEN_CACHE_EXPIRY_SKEW_SECONDS).max(1)
+}
+
+fn token_cache_ttl_cap_for_grant_type(
+    ttl_seconds: i64,
+    grant_type: ProviderCredentialTokenGrantType,
+) -> i64 {
+    if grant_type == ProviderCredentialTokenGrantType::TokenExchange {
+        ttl_seconds.min(MAX_TOKEN_EXCHANGE_CACHE_TTL_SECONDS)
+    } else {
+        ttl_seconds
+    }
 }
 
 /// Derive the issuer/realm URL from a token endpoint URL.
@@ -661,6 +695,7 @@ mod tests {
         scopes: &'a [String],
         cache_ttl_override: i64,
         expires_in: i64,
+        grant_type: ProviderCredentialTokenGrantType,
         grant_calls: Arc<AtomicUsize>,
     }
 
@@ -675,7 +710,7 @@ mod tests {
                 audience: input.audience,
                 scopes: input.scopes,
                 cache_ttl_override: input.cache_ttl_override,
-                grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+                grant_type: input.grant_type,
                 requested_token_type: "",
             },
             move |_| {
@@ -693,26 +728,29 @@ mod tests {
         .await
     }
 
-    async fn obtain_token_without_grant_call(
-        cache: &TokenCache,
-        provider_name: &str,
-        token_endpoint: &str,
-        jwt_svid_audience: &str,
-        audience: &str,
-        scopes: &[String],
+    struct CachedTokenLookupInput<'a> {
+        cache: &'a TokenCache,
+        provider_name: &'a str,
+        token_endpoint: &'a str,
+        jwt_svid_audience: &'a str,
+        audience: &'a str,
+        scopes: &'a [String],
         cache_ttl_override: i64,
-    ) -> Result<String> {
+        grant_type: ProviderCredentialTokenGrantType,
+    }
+
+    async fn obtain_token_without_grant_call(input: CachedTokenLookupInput<'_>) -> Result<String> {
         obtain_provider_token_with_grant(
             ObtainProviderTokenInput {
-                cache,
-                provider_name,
-                token_endpoint,
-                jwt_svid_audience,
+                cache: input.cache,
+                provider_name: input.provider_name,
+                token_endpoint: input.token_endpoint,
+                jwt_svid_audience: input.jwt_svid_audience,
                 client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
-                audience,
-                scopes,
-                cache_ttl_override,
-                grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+                audience: input.audience,
+                scopes: input.scopes,
+                cache_ttl_override: input.cache_ttl_override,
+                grant_type: input.grant_type,
                 requested_token_type: "",
             },
             |_| async { Err(miette::miette!("grant should not be called on cache hit")) },
@@ -851,24 +889,60 @@ mod tests {
 
     #[test]
     fn token_cache_ttl_uses_override_without_endpoint_skew() {
-        assert_eq!(token_cache_ttl_seconds(120, 10), 120);
-        assert_eq!(token_cache_ttl_seconds(120, i64::MAX), 120);
+        assert_eq!(
+            token_cache_ttl_seconds(120, 10, ProviderCredentialTokenGrantType::ClientCredentials),
+            120
+        );
+        assert_eq!(
+            token_cache_ttl_seconds(
+                120,
+                i64::MAX,
+                ProviderCredentialTokenGrantType::ClientCredentials,
+            ),
+            120
+        );
+    }
+
+    #[test]
+    fn token_exchange_cache_ttl_clamps_overrides_to_five_minutes() {
+        assert_eq!(
+            token_cache_ttl_seconds(120, 10, ProviderCredentialTokenGrantType::TokenExchange),
+            120
+        );
+        assert_eq!(
+            token_cache_ttl_seconds(300, 10, ProviderCredentialTokenGrantType::TokenExchange),
+            300
+        );
+        assert_eq!(
+            token_cache_ttl_seconds(600, 10, ProviderCredentialTokenGrantType::TokenExchange),
+            MAX_TOKEN_EXCHANGE_CACHE_TTL_SECONDS
+        );
     }
 
     #[test]
     fn token_cache_ttl_skews_default_and_response_expires_in() {
         assert_eq!(
-            token_cache_ttl_seconds(0, 0),
+            token_cache_ttl_seconds(0, 0, ProviderCredentialTokenGrantType::ClientCredentials),
             DEFAULT_TOKEN_CACHE_TTL_SECONDS - TOKEN_CACHE_EXPIRY_SKEW_SECONDS
         );
-        assert_eq!(token_cache_ttl_seconds(0, 60), 30);
-        assert_eq!(token_cache_ttl_seconds(0, 10), 1);
+        assert_eq!(
+            token_cache_ttl_seconds(0, 60, ProviderCredentialTokenGrantType::ClientCredentials),
+            30
+        );
+        assert_eq!(
+            token_cache_ttl_seconds(0, 10, ProviderCredentialTokenGrantType::ClientCredentials),
+            1
+        );
     }
 
     #[test]
     fn token_cache_ttl_clamps_large_response_expires_in() {
         assert_eq!(
-            token_cache_ttl_seconds(0, i64::MAX),
+            token_cache_ttl_seconds(
+                0,
+                i64::MAX,
+                ProviderCredentialTokenGrantType::ClientCredentials,
+            ),
             MAX_TOKEN_EXPIRES_IN_SECONDS - TOKEN_CACHE_EXPIRY_SKEW_SECONDS
         );
     }
@@ -888,25 +962,174 @@ mod tests {
             scopes: &scopes,
             cache_ttl_override: 0,
             expires_in: 60,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
             grant_calls: grant_calls.clone(),
         })
         .await
         .expect("first call should grant token");
-        let second = obtain_token_without_grant_call(
-            &cache,
-            "api.example.test\t443\t/v1/**\tprovider:access_token",
-            "https://auth.example.com/token",
-            "https://auth.example.com",
-            "api://resource",
-            &scopes,
-            0,
-        )
+        let second = obtain_token_without_grant_call(CachedTokenLookupInput {
+            cache: &cache,
+            provider_name: "api.example.test\t443\t/v1/**\tprovider:access_token",
+            token_endpoint: "https://auth.example.com/token",
+            jwt_svid_audience: "https://auth.example.com",
+            audience: "api://resource",
+            scopes: &scopes,
+            cache_ttl_override: 0,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+        })
         .await
         .expect("second call should use cache");
 
         assert_eq!(first, "token-1");
         assert_eq!(second, "token-1");
         assert_eq!(grant_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn obtain_provider_token_uses_short_cache_for_token_exchange() {
+        let cache = TokenCache::new();
+        let grant_calls = Arc::new(AtomicUsize::new(0));
+        let scopes = vec!["read".to_string()];
+
+        let first = obtain_counted_test_token(CountedTokenGrantInput {
+            cache: &cache,
+            provider_name: "api.example.test\t443\t/v1/**\tprovider:access_token",
+            token_endpoint: "https://auth.example.com/token",
+            jwt_svid_audience: "https://auth.example.com",
+            audience: "api://resource",
+            scopes: &scopes,
+            cache_ttl_override: 0,
+            expires_in: 60,
+            grant_type: ProviderCredentialTokenGrantType::TokenExchange,
+            grant_calls: grant_calls.clone(),
+        })
+        .await
+        .expect("first token exchange should grant token");
+        let second = obtain_token_without_grant_call(CachedTokenLookupInput {
+            cache: &cache,
+            provider_name: "api.example.test\t443\t/v1/**\tprovider:access_token",
+            token_endpoint: "https://auth.example.com/token",
+            jwt_svid_audience: "https://auth.example.com",
+            audience: "api://resource",
+            scopes: &scopes,
+            cache_ttl_override: 0,
+            grant_type: ProviderCredentialTokenGrantType::TokenExchange,
+        })
+        .await
+        .expect("second token exchange should use supervisor cache");
+
+        assert_eq!(first, "token-1");
+        assert_eq!(second, "token-1");
+        assert_eq!(grant_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            token_cache_ttl_seconds(0, i64::MAX, ProviderCredentialTokenGrantType::TokenExchange,),
+            MAX_TOKEN_EXCHANGE_CACHE_TTL_SECONDS - TOKEN_CACHE_EXPIRY_SKEW_SECONDS
+        );
+        assert_eq!(
+            token_cache_ttl_seconds(
+                120,
+                i64::MAX,
+                ProviderCredentialTokenGrantType::TokenExchange,
+            ),
+            120
+        );
+        assert_eq!(
+            token_cache_ttl_seconds(
+                600,
+                i64::MAX,
+                ProviderCredentialTokenGrantType::TokenExchange,
+            ),
+            MAX_TOKEN_EXCHANGE_CACHE_TTL_SECONDS
+        );
+    }
+
+    #[tokio::test]
+    async fn token_exchange_cache_rechecks_gateway_at_five_minute_bound() {
+        let cache = TokenCache::new();
+        let grant_calls = Arc::new(AtomicUsize::new(0));
+        let scopes = vec!["read".to_string()];
+        let start_ms = 1_000_000;
+
+        let first_calls = grant_calls.clone();
+        let first = obtain_provider_token_with_grant_at(
+            ObtainProviderTokenInput {
+                cache: &cache,
+                provider_name: "api.example.test\t443\t/v1/**\tprovider:access_token",
+                token_endpoint: "https://auth.example.com/token",
+                jwt_svid_audience: "https://auth.example.com",
+                client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
+                audience: "api://resource",
+                scopes: &scopes,
+                cache_ttl_override: 600,
+                grant_type: ProviderCredentialTokenGrantType::TokenExchange,
+                requested_token_type: ACCESS_TOKEN_TYPE,
+            },
+            move |_| async move {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(OAuthTokenResponse {
+                    access_token: "delegated-token".to_string(),
+                    token_type: "Bearer".to_string(),
+                    expires_in: 3600,
+                })
+            },
+            start_ms,
+        )
+        .await
+        .expect("initial exchange should succeed");
+        assert_eq!(first, "delegated-token");
+
+        let cached_calls = grant_calls.clone();
+        let cached = obtain_provider_token_with_grant_at(
+            ObtainProviderTokenInput {
+                cache: &cache,
+                provider_name: "api.example.test\t443\t/v1/**\tprovider:access_token",
+                token_endpoint: "https://auth.example.com/token",
+                jwt_svid_audience: "https://auth.example.com",
+                client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
+                audience: "api://resource",
+                scopes: &scopes,
+                cache_ttl_override: 600,
+                grant_type: ProviderCredentialTokenGrantType::TokenExchange,
+                requested_token_type: ACCESS_TOKEN_TYPE,
+            },
+            move |_| async move {
+                cached_calls.fetch_add(1, Ordering::SeqCst);
+                Err(miette::miette!("gateway should not be called on cache hit"))
+            },
+            start_ms + 299_999,
+        )
+        .await
+        .expect("cache should remain usable just before the bound");
+        assert_eq!(cached, "delegated-token");
+        assert_eq!(grant_calls.load(Ordering::SeqCst), 1);
+
+        let denied_calls = grant_calls.clone();
+        let error = obtain_provider_token_with_grant_at(
+            ObtainProviderTokenInput {
+                cache: &cache,
+                provider_name: "api.example.test\t443\t/v1/**\tprovider:access_token",
+                token_endpoint: "https://auth.example.com/token",
+                jwt_svid_audience: "https://auth.example.com",
+                client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
+                audience: "api://resource",
+                scopes: &scopes,
+                cache_ttl_override: 600,
+                grant_type: ProviderCredentialTokenGrantType::TokenExchange,
+                requested_token_type: ACCESS_TOKEN_TYPE,
+            },
+            move |_| async move {
+                denied_calls.fetch_add(1, Ordering::SeqCst);
+                Err(miette::miette!(
+                    "gateway denied token exchange after delegated identity withdrawal"
+                ))
+            },
+            start_ms + 300_000,
+        )
+        .await
+        .expect_err("expired cache entry must recheck the gateway");
+
+        assert!(error.to_string().contains("withdrawal"));
+        assert_eq!(grant_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -925,6 +1148,7 @@ mod tests {
             scopes: &read_scope,
             cache_ttl_override: 0,
             expires_in: 60,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
             grant_calls: grant_calls.clone(),
         })
         .await
@@ -938,6 +1162,7 @@ mod tests {
             scopes: &read_scope,
             cache_ttl_override: 0,
             expires_in: 60,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
             grant_calls: grant_calls.clone(),
         })
         .await
@@ -951,6 +1176,7 @@ mod tests {
             scopes: &write_scope,
             cache_ttl_override: 0,
             expires_in: 60,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
             grant_calls: grant_calls.clone(),
         })
         .await
@@ -997,6 +1223,7 @@ mod tests {
             scopes: &scopes,
             cache_ttl_override: 0,
             expires_in: 60,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
             grant_calls: grant_calls.clone(),
         })
         .await
@@ -1021,19 +1248,21 @@ mod tests {
             scopes: &scopes,
             cache_ttl_override: 60,
             expires_in: 0,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
             grant_calls: grant_calls.clone(),
         })
         .await
         .expect("first override call should grant token");
-        let second = obtain_token_without_grant_call(
-            &cache,
-            "api.example.test\t443\t/v1/**\tprovider:access_token",
-            "https://auth.example.com/token",
-            "https://auth.example.com",
-            "api://resource",
-            &scopes,
-            60,
-        )
+        let second = obtain_token_without_grant_call(CachedTokenLookupInput {
+            cache: &cache,
+            provider_name: "api.example.test\t443\t/v1/**\tprovider:access_token",
+            token_endpoint: "https://auth.example.com/token",
+            jwt_svid_audience: "https://auth.example.com",
+            audience: "api://resource",
+            scopes: &scopes,
+            cache_ttl_override: 60,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+        })
         .await
         .expect("override should keep token cached");
 

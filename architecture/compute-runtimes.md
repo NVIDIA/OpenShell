@@ -552,7 +552,8 @@ would allow them to claim an existing sandbox identity.
 The Kubernetes Secrets credential driver (`openshell-driver-kubernetes-secrets`)
 stores secrets in workspace-specific namespaces when `workspace_mode` is managed
 or operator. In shared mode, all secrets render into the single configured
-namespace.
+namespace. Gateway-global secret material has no workspace and always renders
+into the configured credential namespace in every workspace mode.
 
 When runtime infrastructure changes, validate the relevant sandbox e2e path and
 update the matching driver README if a maintainer-facing constraint changes.

@@ -35,7 +35,7 @@ pub use crate::commands::provider::{
 
 use crate::color::Colorize;
 use crate::policy_update::build_policy_update_plan;
-use crate::tls::{TlsOptions, grpc_client};
+use crate::tls::{GrpcClient, TlsOptions, grpc_client};
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
@@ -43,24 +43,31 @@ use openshell_bootstrap::{
 };
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::{
-    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
-    ClearDraftChunksRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
-    CreateSshSessionRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
-    DeleteServiceRequest, ExecSandboxRequest, ExposeServiceRequest, GetCurrentUserRequest,
+    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AuthorizeDelegatedIdentityRequest,
+    BeginRootfsTarStagingRequest, ClearDraftChunksRequest, CreateSandboxRequest,
+    CreateSandboxTemplateRequest, CreateSshSessionRequest, DelegatedIdentityAuthorizationGrant,
+    DelegatedIdentityCredentialSummary, DelegatedIdentityRequest,
+    DeleteDelegatedIdentityCredentialRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
+    DeleteServiceRequest, ExecSandboxRequest, ExposeServiceRequest,
+    ExtendSandboxDelegatedIdentityRequest, GetCurrentUserRequest,
+    GetDelegatedIdentityAuthorizationStatusRequest, GetDelegatedIdentityCredentialStatusRequest,
     GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
-    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetProviderProfileRequest, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxDelegatedIdentityStatusRequest, GetSandboxLogsRequest,
     GetSandboxPolicyStatusRequest, GetSandboxRequest, GetSandboxTemplateRequest, GetServiceRequest,
-    GpuResourceRequirements, ListSandboxPoliciesRequest, ListSandboxTemplatesRequest,
-    ListSandboxesRequest, ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest,
-    ResourceRequirements, RevokeSshSessionRequest, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxResources, SandboxServiceLevel, SandboxSpec, SandboxStartup, SandboxTemplate,
-    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
+    GpuResourceRequirements, ListDelegatedIdentityCredentialsRequest, ListSandboxPoliciesRequest,
+    ListSandboxTemplatesRequest, ListSandboxesRequest, ListServicesRequest, PolicySource,
+    PolicyStatus, ProviderProfile, RejectDraftChunkRequest, ResourceRequirements,
+    RevokeDelegatedIdentityCredentialRequest, RevokeSshSessionRequest, Sandbox, SandboxPhase,
+    SandboxPolicy, SandboxResources, SandboxServiceLevel, SandboxSpec, SandboxStartup,
+    SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
     ServiceEndpointResponse, SettingScope, StartSandboxRequest, StopSandboxRequest,
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, WatchSandboxRequest,
-    exec_sandbox_event, tcp_forward_init,
+    WithdrawSandboxDelegatedIdentityRequest, exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
+use openshell_providers::normalize_provider_type;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{ErrorKind, IsTerminal, Read, Write};
@@ -78,6 +85,8 @@ pub use crate::ssh::{
 pub use openshell_core::forward::{
     ForwardSpec, find_forward_by_port, list_forwards, stop_forward, stop_forwards_for_sandbox,
 };
+
+const DELEGATED_IDENTITY_OIDC_SCOPES: &str = "openid offline_access";
 
 #[derive(Debug, PartialEq, Eq)]
 enum SandboxUploadPlan {
@@ -416,6 +425,7 @@ pub struct SandboxCreateConfig<'a> {
     pub approval_mode: &'a str,
     pub output: &'a str,
     pub detach: bool,
+    pub delegate_identity_for: Option<&'a str>,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -442,6 +452,7 @@ impl Default for SandboxCreateConfig<'_> {
             approval_mode: "manual",
             output: "table",
             detach: false,
+            delegate_identity_for: None,
         }
     }
 }
@@ -476,6 +487,7 @@ pub async fn sandbox_create(
         approval_mode,
         output,
         detach,
+        delegate_identity_for,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -494,21 +506,9 @@ pub async fn sandbox_create(
         ));
     }
 
-    // Check port availability *before* creating the sandbox so we don't
-    // leave an orphaned sandbox behind when the forward would fail.
-    if let Some(ref spec) = forward {
-        openshell_core::forward::check_port_available(spec)?;
-    }
-
-    let mut client = grpc_client(server, tls).await.wrap_err_with(|| {
-        format!(
-            "failed to connect to gateway '{gateway_name}' at {server}. \
-                 Start the gateway service with the installed package manager, \
-                 or register a different endpoint with `openshell gateway add <endpoint>`."
-        )
-    })?;
-    let effective_server = server.to_string();
-    let effective_tls = tls.clone();
+    let delegated_identity_duration_ms = delegate_identity_for
+        .map(parse_delegated_identity_duration_ms)
+        .transpose()?;
 
     if template.is_some()
         && (from.is_some()
@@ -522,6 +522,27 @@ pub async fn sandbox_create(
             "--template cannot be combined with inline workload flags"
         ));
     }
+
+    // Check port availability *before* creating the sandbox so we don't
+    // leave an orphaned sandbox behind when the forward would fail.
+    if let Some(ref spec) = forward {
+        openshell_core::forward::check_port_available(spec)?;
+    }
+
+    let mut active_tls = if delegated_identity_duration_ms.is_some() {
+        ensure_delegated_identity_authorization(server, gateway_name, tls).await?
+    } else {
+        tls.clone()
+    };
+    let mut client = grpc_client(server, &active_tls).await.wrap_err_with(|| {
+        format!(
+            "failed to connect to gateway '{gateway_name}' at {server}. \
+                 Start the gateway service with the installed package manager, \
+                 or register a different endpoint with `openshell gateway add <endpoint>`."
+        )
+    })?;
+    let effective_server = server.to_string();
+    let mut effective_tls = active_tls.clone();
 
     // Resolve the --from flag into a container image reference, or stage a
     // rootfs tar on the gateway and retain its staging token. Template creates
@@ -544,6 +565,10 @@ pub async fn sandbox_create(
             None => (None, None),
         }
     };
+    if delegated_identity_duration_ms.is_some() {
+        active_tls = tls_with_current_oidc_login(gateway_name, tls).await?;
+        client = grpc_client(server, &active_tls).await?;
+    }
     let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
     let configured_providers = ensure_required_providers(
         &mut client,
@@ -553,6 +578,9 @@ pub async fn sandbox_create(
         workspace,
     )
     .await?;
+    if delegate_identity_for.is_none() {
+        warn_delegated_identity_profiles(&mut client, &configured_providers, workspace).await?;
+    }
 
     let policy = load_sandbox_policy(policy)?;
     let resource_limits = if template.is_none() {
@@ -588,6 +616,12 @@ pub async fn sandbox_create(
     };
 
     let resource_requirements = gpu_requirements.map(|gpu| ResourceRequirements { gpu: Some(gpu) });
+    let delegated_identity = delegated_identity_duration_ms.map(delegated_identity_request);
+    if delegated_identity.is_some() {
+        active_tls = tls_with_current_oidc_login(gateway_name, tls).await?;
+        client = grpc_client(server, &active_tls).await?;
+        effective_tls = active_tls.clone();
+    }
 
     let main_terminal = tty_override
         .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
@@ -631,6 +665,7 @@ pub async fn sandbox_create(
         workspace: workspace.to_string(),
         await_main_process_attachment,
         workload_template_name: template.unwrap_or_default().to_string(),
+        delegated_identity,
     };
 
     let response = match client.create_sandbox(request).await {
@@ -1246,7 +1281,7 @@ fn rootfs_tar_sources_supported_for_gateway(metadata: Option<&GatewayMetadata>) 
 /// file. Returns the token to pass on `CreateSandbox`.
 async fn stage_rootfs_tar(
     gateway_name: &str,
-    client: &mut crate::tls::GrpcClient,
+    client: &mut GrpcClient,
     workspace: &str,
     tar_path: &Path,
 ) -> Result<String> {
@@ -1440,6 +1475,691 @@ pub async fn sandbox_sync_command(
         }
     }
     Ok(())
+}
+
+fn delegated_identity_request(duration_ms: i64) -> DelegatedIdentityRequest {
+    DelegatedIdentityRequest {
+        delegated_until_ms: current_time_ms().saturating_add(duration_ms),
+    }
+}
+
+async fn tls_with_current_oidc_login(gateway_name: &str, tls: &TlsOptions) -> Result<TlsOptions> {
+    let metadata = openshell_bootstrap::load_gateway_metadata(gateway_name)
+        .map_err(|_| miette::miette!("failed to load metadata for gateway '{gateway_name}'"))?;
+    if metadata.auth_mode.as_deref() != Some("oidc") {
+        return Err(miette::miette!(
+            "delegated identity requires an OIDC-authenticated gateway"
+        ));
+    }
+    let bundle =
+        crate::oidc_auth::ensure_valid_oidc_token_bundle(gateway_name, tls.gateway_insecure)
+            .await
+            .map_err(|error| {
+                miette::miette!("failed to load or refresh the normal CLI login: {error}")
+            })?;
+    let mut current = tls.clone();
+    current.oidc_token = Some(bundle.access_token);
+    Ok(current)
+}
+
+async fn ensure_delegated_identity_authorization(
+    server: &str,
+    gateway_name: &str,
+    tls: &TlsOptions,
+) -> Result<TlsOptions> {
+    let mut current_tls = tls_with_current_oidc_login(gateway_name, tls).await?;
+    let mut client = grpc_client(server, &current_tls).await?;
+    let status = client
+        .get_delegated_identity_authorization_status(
+            GetDelegatedIdentityAuthorizationStatusRequest {},
+        )
+        .await
+        .map_err(|status| {
+            if status.code() == Code::Unimplemented {
+                miette::miette!(
+                    "the gateway does not support separate delegated identity authorization; upgrade the gateway before using --use-my-identity-for"
+                )
+            } else {
+                miette::miette!(status.to_string())
+            }
+        })?
+        .into_inner();
+    if status.usable {
+        return Ok(current_tls);
+    }
+    if !status.reauthorization_required {
+        return Err(miette::miette!(
+            "delegated identity authorization is unavailable: {}",
+            non_empty_or(&status.reason, "unknown reason")
+        ));
+    }
+
+    let metadata = openshell_bootstrap::load_gateway_metadata(gateway_name)
+        .map_err(|_| miette::miette!("failed to load metadata for gateway '{gateway_name}'"))?;
+    let issuer = metadata.oidc_issuer.as_deref().ok_or_else(|| {
+        miette::miette!("gateway '{gateway_name}' has OIDC auth but no issuer URL")
+    })?;
+    let client_id = metadata
+        .oidc_client_id
+        .as_deref()
+        .unwrap_or("openshell-cli");
+    let audience = metadata.oidc_audience.as_deref();
+    let local_refresh_token = openshell_bootstrap::oidc_token::load_oidc_token(gateway_name)
+        .and_then(|bundle| bundle.refresh_token);
+
+    eprintln!("Authorizing a separate, gateway-owned OAuth grant for delegated identity...");
+    let delegated_bundle = crate::oidc_auth::oidc_browser_auth_flow(
+        issuer,
+        client_id,
+        audience,
+        Some(DELEGATED_IDENTITY_OIDC_SCOPES),
+        tls.gateway_insecure,
+        false,
+    )
+    .await
+    .map_err(|error| miette::miette!("delegated identity authorization failed: {error}"))?;
+    let delegated_refresh_token = delegated_bundle.refresh_token.ok_or_else(|| {
+        miette::miette!(
+            "the identity provider did not issue a delegated refresh token; enable offline access for the OIDC client"
+        )
+    })?;
+    if local_refresh_token.as_deref() == Some(delegated_refresh_token.as_str()) {
+        return Err(miette::miette!(
+            "the identity provider reused the normal CLI refresh token for delegated identity; configure the OIDC client to issue a distinct grant for each browser authorization"
+        ));
+    }
+
+    // Browser authorization can outlive the normal access token. Rebuild the
+    // RPC client from the current local login before transferring the grant.
+    current_tls = tls_with_current_oidc_login(gateway_name, tls).await?;
+    if openshell_bootstrap::oidc_token::load_oidc_token(gateway_name)
+        .and_then(|bundle| bundle.refresh_token)
+        .as_deref()
+        == Some(delegated_refresh_token.as_str())
+    {
+        return Err(miette::miette!(
+            "the identity provider reused the normal CLI refresh token for delegated identity; configure the OIDC client to issue a distinct grant for each browser authorization"
+        ));
+    }
+    client = grpc_client(server, &current_tls).await?;
+    client
+        .authorize_delegated_identity(AuthorizeDelegatedIdentityRequest {
+            grant: Some(DelegatedIdentityAuthorizationGrant {
+                issuer: delegated_bundle.issuer,
+                client_id: delegated_bundle.client_id,
+                refresh_token: delegated_refresh_token,
+                access_token: delegated_bundle.access_token,
+                scopes: DELEGATED_IDENTITY_OIDC_SCOPES.to_string(),
+                audience: audience.unwrap_or(client_id).to_string(),
+            }),
+        })
+        .await
+        .map_err(|status| miette::miette!(status.to_string()))?;
+    eprintln!("Delegated identity authorization stored by the gateway.");
+    Ok(current_tls)
+}
+
+fn parse_delegated_identity_duration_ms(value: &str) -> Result<i64> {
+    let value = value.trim();
+    let (number, multiplier): (&str, i64) = match value.as_bytes().last().copied() {
+        Some(b'm') => (&value[..value.len() - 1], 60_000),
+        Some(b'h') => (&value[..value.len() - 1], 3_600_000),
+        Some(b'd') => (&value[..value.len() - 1], 86_400_000),
+        _ => {
+            return Err(miette::miette!(
+                "invalid delegated identity duration '{value}'; use a positive duration with m, h, or d suffix"
+            ));
+        }
+    };
+    let amount = number.parse::<i64>().map_err(|_| {
+        miette::miette!(
+            "invalid delegated identity duration '{value}'; use a positive integer with m, h, or d suffix"
+        )
+    })?;
+    if amount <= 0 {
+        return Err(miette::miette!(
+            "delegated identity duration must be greater than zero"
+        ));
+    }
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| miette::miette!("delegated identity duration is too large"))
+}
+
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+async fn warn_delegated_identity_profiles(
+    client: &mut GrpcClient,
+    provider_names: &[String],
+    workspace: &str,
+) -> Result<()> {
+    for provider_name in provider_names {
+        let provider = client
+            .get_provider(GetProviderRequest {
+                name: provider_name.clone(),
+                workspace: workspace.to_string(),
+            })
+            .await
+            .map_err(|status| miette::miette!(status.to_string()))?
+            .into_inner()
+            .provider;
+        let Some(provider) = provider else {
+            continue;
+        };
+        let profile_id = normalize_provider_type(&provider.r#type).unwrap_or(&provider.r#type);
+        let profile = client
+            .get_provider_profile(GetProviderProfileRequest {
+                id: profile_id.to_string(),
+                workspace: provider.profile_workspace.clone(),
+            })
+            .await
+            .ok()
+            .and_then(|response| response.into_inner().profile);
+        let Some(profile) = profile else {
+            continue;
+        };
+        if profile_uses_sandbox_delegated_identity(&profile) {
+            eprintln!(
+                "Provider '{provider_name}' uses sandbox delegated identity. Token exchange will fail because this sandbox was not created with delegated identity. Delete and recreate the sandbox with --use-my-identity-for=<duration> to enable it."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn profile_uses_sandbox_delegated_identity(profile: &ProviderProfile) -> bool {
+    profile.credentials.iter().any(|credential| {
+        credential
+            .token_grant
+            .as_ref()
+            .and_then(|grant| grant.subject_token.as_ref())
+            .is_some_and(|subject| subject.source == "sandbox_delegated_identity")
+    })
+}
+
+pub async fn sandbox_delegated_identity_status(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_sandbox_delegated_identity_status(GetSandboxDelegatedIdentityStatusRequest {
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .map_err(|status| miette::miette!(status.to_string()))?
+        .into_inner();
+    let Some(delegation) = response.delegated_identity else {
+        println!("Delegated identity: disabled");
+        return Ok(());
+    };
+    let status = sandbox_delegation_status(
+        response.credential_missing,
+        response.credential_revoked_at_ms,
+        delegation.withdrawn_at_ms,
+        delegation.delegated_until_ms,
+        response.now_ms,
+    );
+    println!("Delegated identity: enabled");
+    println!("Credential ID:       {}", delegation.credential_id);
+    println!("Principal:           {}", delegation.principal_subject);
+    println!("Status:              {status}");
+    match status {
+        "active" => println!(
+            "Valid for:           {}",
+            format_remaining_duration(delegation.delegated_until_ms, response.now_ms)
+        ),
+        "withdrawn" => println!(
+            "Withdrawn:           {}",
+            format_age(delegation.withdrawn_at_ms, response.now_ms)
+        ),
+        "revoked" => println!(
+            "Revoked:             {}",
+            format_age(response.credential_revoked_at_ms, response.now_ms)
+        ),
+        "credential-missing" => println!("Credential:          missing"),
+        "expired" => println!(
+            "Expired:             {}",
+            format_age(delegation.delegated_until_ms, response.now_ms)
+        ),
+        _ => {}
+    }
+    Ok(())
+}
+
+pub async fn sandbox_delegated_identity_withdraw(
+    server: &str,
+    name: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .withdraw_sandbox_delegated_identity(WithdrawSandboxDelegatedIdentityRequest {
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+        })
+        .await
+        .map_err(|status| miette::miette!(status.to_string()))?
+        .into_inner();
+    let action = if response.withdrawn {
+        "Withdrew"
+    } else {
+        "Already withdrawn"
+    };
+    println!("{action} delegated identity for sandbox {name}");
+    Ok(())
+}
+
+pub async fn sandbox_delegated_identity_extend(
+    server: &str,
+    gateway_name: &str,
+    name: &str,
+    duration: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let duration_ms = parse_delegated_identity_duration_ms(duration)?;
+    let current_tls = ensure_delegated_identity_authorization(server, gateway_name, tls).await?;
+    let mut client = grpc_client(server, &current_tls).await?;
+    let delegated_identity = delegated_identity_request(duration_ms);
+    let response = client
+        .extend_sandbox_delegated_identity(ExtendSandboxDelegatedIdentityRequest {
+            name: name.to_string(),
+            workspace: workspace.to_string(),
+            delegated_identity: Some(delegated_identity),
+        })
+        .await
+        .map_err(|status| miette::miette!(status.to_string()))?
+        .into_inner();
+    let sandbox_name = response
+        .sandbox
+        .as_ref()
+        .map(ObjectName::object_name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(name);
+    println!("Extended delegated identity for sandbox {sandbox_name}");
+    Ok(())
+}
+
+pub async fn delegated_identity_credential_list(
+    server: &str,
+    limit: u32,
+    offset: u32,
+    ids_only: bool,
+    output: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let credentials = client
+        .list_delegated_identity_credentials(ListDelegatedIdentityCredentialsRequest {
+            limit,
+            offset,
+        })
+        .await
+        .map_err(|status| miette::miette!(status.to_string()))?
+        .into_inner()
+        .credentials;
+
+    if crate::output::print_output_collection(
+        output,
+        &credentials,
+        delegated_identity_credential_to_json,
+    )? {
+        return Ok(());
+    }
+
+    if credentials.is_empty() {
+        if !ids_only {
+            println!("No delegated identity credentials found.");
+        }
+        return Ok(());
+    }
+
+    if ids_only {
+        for credential in credentials {
+            println!("{}", delegated_credential_object_id(&credential));
+        }
+        return Ok(());
+    }
+
+    print_delegated_identity_credential_table(&credentials, current_time_ms());
+    Ok(())
+}
+
+pub async fn delegated_identity_credential_status(
+    server: &str,
+    id: &str,
+    output: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_delegated_identity_credential_status(GetDelegatedIdentityCredentialStatusRequest {
+            id: id.to_string(),
+        })
+        .await
+        .map_err(|status| miette::miette!(status.to_string()))?
+        .into_inner();
+    let credential = response
+        .credential
+        .ok_or_else(|| miette::miette!("delegated identity credential missing from response"))?;
+    let view = serde_json::json!({
+        "credential": delegated_identity_credential_to_json(&credential),
+        "now_ms": response.now_ms,
+    });
+    if crate::output::print_output_single(output, &view, Clone::clone)? {
+        return Ok(());
+    }
+
+    println!("{}", "Delegated identity credential:".cyan().bold());
+    println!();
+    print_delegated_identity_credential_detail(&credential, response.now_ms);
+    Ok(())
+}
+
+pub async fn delegated_identity_credential_revoke(
+    server: &str,
+    id: &str,
+    expected_resource_version: u64,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .revoke_delegated_identity_credential(RevokeDelegatedIdentityCredentialRequest {
+            id: id.to_string(),
+            expected_resource_version,
+        })
+        .await
+        .map_err(|status| miette::miette!(status.to_string()))?
+        .into_inner();
+    if response.revoked {
+        println!("Revoked delegated identity credential {id}");
+    } else {
+        println!("Delegated identity credential {id} was already revoked");
+    }
+    Ok(())
+}
+
+pub async fn delegated_identity_credential_delete(
+    server: &str,
+    id: &str,
+    expected_resource_version: u64,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .delete_delegated_identity_credential(DeleteDelegatedIdentityCredentialRequest {
+            id: id.to_string(),
+            expected_resource_version,
+        })
+        .await
+        .map_err(|status| miette::miette!(status.to_string()))?
+        .into_inner();
+    if response.deleted {
+        println!("Deleted delegated identity credential {id}");
+    } else {
+        println!("Delegated identity credential {id} was not found");
+    }
+    Ok(())
+}
+
+fn delegated_identity_credential_to_json(
+    credential: &DelegatedIdentityCredentialSummary,
+) -> serde_json::Value {
+    let metadata = credential.metadata.as_ref();
+    serde_json::json!({
+        "id": delegated_credential_object_id(credential),
+        "name": delegated_credential_object_name(credential),
+        "workspace": delegated_credential_object_workspace(credential),
+        "resource_version": metadata.map(|meta| meta.resource_version).unwrap_or_default(),
+        "created_at_ms": metadata.map(|meta| meta.created_at_ms).unwrap_or_default(),
+        "issuer": credential.issuer,
+        "client_id": credential.client_id,
+        "principal_subject": credential.principal_subject,
+        "access_token_present": credential.access_token_present,
+        "refresh_token_present": credential.refresh_token_present,
+        "access_token_expires_at_ms": credential.access_token_expires_at_ms,
+        "scopes": credential.scopes,
+        "audience": credential.audience,
+        "last_refresh_at_ms": credential.last_refresh_at_ms,
+        "revoked_at_ms": credential.revoked_at_ms,
+    })
+}
+
+fn print_delegated_identity_credential_table(
+    credentials: &[DelegatedIdentityCredentialSummary],
+    now: i64,
+) {
+    println!(
+        "{:<84} {:<40} {:<24} {:<10} {:<16} {:<14} {:>8}",
+        "ID", "PRINCIPAL", "CLIENT_ID", "STATUS", "ACCESS_VALID_FOR", "LAST_REFRESH", "RV"
+    );
+    println!("{}", "-".repeat(208));
+    for credential in credentials {
+        let resource_version = credential
+            .metadata
+            .as_ref()
+            .map(|meta| meta.resource_version)
+            .unwrap_or_default();
+        println!(
+            "{:<84} {:<40} {:<24} {:<10} {:<16} {:<14} {:>8}",
+            delegated_credential_object_id(credential),
+            credential.principal_subject,
+            truncate_for_table(&credential.client_id, 24),
+            delegated_credential_status(credential, now),
+            credential_access_valid_for(credential, now),
+            format_optional_age(credential.last_refresh_at_ms, now),
+            resource_version,
+        );
+    }
+}
+
+fn print_delegated_identity_credential_detail(
+    credential: &DelegatedIdentityCredentialSummary,
+    now: i64,
+) {
+    let metadata = credential.metadata.as_ref();
+    println!(
+        "  {:<22} {}",
+        "id:",
+        delegated_credential_object_id(credential)
+    );
+    println!("  {:<22} {}", "issuer:", credential.issuer);
+    println!("  {:<22} {}", "client_id:", credential.client_id);
+    println!(
+        "  {:<22} {}",
+        "principal_subject:", credential.principal_subject
+    );
+    println!(
+        "  {:<22} {}",
+        "resource_version:",
+        metadata
+            .map(|meta| meta.resource_version)
+            .unwrap_or_default()
+    );
+    println!(
+        "  {:<22} {}",
+        "created_at_ms:",
+        metadata.map(|meta| meta.created_at_ms).unwrap_or_default()
+    );
+    println!(
+        "  {:<22} {}",
+        "access_token_present:", credential.access_token_present
+    );
+    println!(
+        "  {:<22} {}",
+        "refresh_token_present:", credential.refresh_token_present
+    );
+    println!(
+        "  {:<22} {}",
+        "status:",
+        delegated_credential_status(credential, now)
+    );
+    println!(
+        "  {:<22} {}",
+        "access_valid_for:",
+        credential_access_valid_for(credential, now)
+    );
+    println!("  {:<22} {}", "scopes:", credential.scopes);
+    println!("  {:<22} {}", "audience:", credential.audience);
+    println!(
+        "  {:<22} {}",
+        "last_refresh:",
+        format_optional_age(credential.last_refresh_at_ms, now)
+    );
+    if credential.revoked_at_ms > 0 {
+        println!(
+            "  {:<22} {}",
+            "revoked:",
+            format_age(credential.revoked_at_ms, now)
+        );
+    }
+}
+
+fn sandbox_delegation_status(
+    credential_missing: bool,
+    credential_revoked_at_ms: i64,
+    withdrawn_at_ms: i64,
+    delegated_until_ms: i64,
+    now_ms: i64,
+) -> &'static str {
+    if credential_missing {
+        "credential-missing"
+    } else if credential_revoked_at_ms > 0 {
+        "revoked"
+    } else if withdrawn_at_ms > 0 {
+        "withdrawn"
+    } else if delegated_until_ms <= now_ms {
+        "expired"
+    } else {
+        "active"
+    }
+}
+
+fn delegated_credential_status(
+    credential: &DelegatedIdentityCredentialSummary,
+    now: i64,
+) -> &'static str {
+    if credential.revoked_at_ms > 0 {
+        "revoked"
+    } else if credential.access_token_expires_at_ms > 0
+        && credential.access_token_expires_at_ms <= now
+    {
+        "expired"
+    } else {
+        "active"
+    }
+}
+
+fn delegated_credential_object_id(credential: &DelegatedIdentityCredentialSummary) -> &str {
+    credential
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.id.as_str())
+        .unwrap_or_default()
+}
+
+fn delegated_credential_object_name(credential: &DelegatedIdentityCredentialSummary) -> &str {
+    credential
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.name.as_str())
+        .unwrap_or_default()
+}
+
+fn delegated_credential_object_workspace(credential: &DelegatedIdentityCredentialSummary) -> &str {
+    credential
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.workspace.as_str())
+        .unwrap_or_default()
+}
+
+fn credential_access_valid_for(
+    credential: &DelegatedIdentityCredentialSummary,
+    now: i64,
+) -> String {
+    if delegated_credential_status(credential, now) != "active" {
+        "-".to_string()
+    } else if credential.access_token_expires_at_ms == 0 {
+        "unknown".to_string()
+    } else {
+        format_remaining_duration(credential.access_token_expires_at_ms, now)
+    }
+}
+
+fn format_remaining_duration(until_ms: i64, now_ms: i64) -> String {
+    if until_ms <= now_ms {
+        "-".to_string()
+    } else {
+        format_compact_duration_ms(until_ms.saturating_sub(now_ms))
+    }
+}
+
+fn format_optional_age(timestamp_ms: i64, now_ms: i64) -> String {
+    if timestamp_ms > 0 {
+        format_age(timestamp_ms, now_ms)
+    } else {
+        "never".to_string()
+    }
+}
+
+fn format_age(timestamp_ms: i64, now_ms: i64) -> String {
+    if timestamp_ms <= 0 {
+        return "never".to_string();
+    }
+    if timestamp_ms > now_ms {
+        return format!(
+            "in {}",
+            format_compact_duration_ms(timestamp_ms.saturating_sub(now_ms))
+        );
+    }
+    format!(
+        "{} ago",
+        format_compact_duration_ms(now_ms.saturating_sub(timestamp_ms))
+    )
+}
+
+fn format_compact_duration_ms(duration_ms: i64) -> String {
+    let seconds = duration_ms.saturating_add(999) / 1000;
+    if seconds < 60 {
+        return format!("{}s", seconds.max(0));
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 48 {
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    format!("{days}d")
+}
+
+fn truncate_for_table(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        value.to_string()
+    } else if max_len <= 1 {
+        ".".to_string()
+    } else {
+        let prefix = value
+            .chars()
+            .take(max_len.saturating_sub(3))
+            .collect::<String>();
+        format!("{prefix}...")
+    }
 }
 
 /// Fetch a sandbox by name.
@@ -1836,7 +2556,7 @@ pub async fn service_forward_tcp(
 }
 
 async fn create_forward_session_token(
-    client: &mut crate::tls::GrpcClient,
+    client: &mut GrpcClient,
     sandbox_id: &str,
 ) -> std::result::Result<String, ForwardTcpConnectionError> {
     let response = client
@@ -1849,7 +2569,7 @@ async fn create_forward_session_token(
 }
 
 async fn fetch_ready_sandbox_for_forward(
-    client: &mut crate::tls::GrpcClient,
+    client: &mut GrpcClient,
     name: &str,
     workspace: &str,
 ) -> Result<Sandbox> {
@@ -1939,7 +2659,7 @@ fn parse_tcp_forward_spec(local: Option<&str>, default_port: u16) -> Result<(Str
 }
 
 async fn forward_one_tcp_connection(
-    client: &mut crate::tls::GrpcClient,
+    client: &mut GrpcClient,
     socket: tokio::net::TcpStream,
     sandbox_id: String,
     target_host: String,
@@ -2053,7 +2773,7 @@ impl Drop for TaskGuard {
 }
 
 async fn sandbox_exec_interactive_grpc(
-    mut client: crate::tls::GrpcClient,
+    mut client: GrpcClient,
     sandbox: &Sandbox,
     command: &[String],
     workdir: Option<&str>,
@@ -3122,7 +3842,7 @@ pub async fn sandbox_start(
 }
 
 async fn wait_for_lifecycle_phase(
-    client: &mut crate::tls::GrpcClient,
+    client: &mut GrpcClient,
     sandbox: Sandbox,
     target: SandboxPhase,
 ) -> Result<Sandbox> {
@@ -5758,9 +6478,10 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits, format_endpoint,
-        format_log_line, git_sync_files, has_main_process_result, parse_cli_setting_value,
-        parse_credential_expiry_cli_value, parse_driver_config_json,
+        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits, delegated_identity_request,
+        format_endpoint, format_log_line, git_sync_files, has_main_process_result,
+        parse_cli_setting_value, parse_credential_expiry_cli_value,
+        parse_delegated_identity_duration_ms, parse_driver_config_json,
         parse_secret_material_env_pairs, policy_revision_list_json, policy_revision_to_json,
         provisioning_timeout_message, ready_false_condition_message, resolve_from,
         rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
@@ -5790,6 +6511,34 @@ mod tests {
         ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember, WorkspaceRole,
         datamodel::v1::ObjectMeta,
     };
+
+    #[test]
+    fn delegated_identity_lifecycle_request_contains_only_the_window() {
+        let before = super::current_time_ms();
+        let request = delegated_identity_request(60_000);
+        let after = super::current_time_ms();
+
+        assert!(request.delegated_until_ms >= before + 60_000);
+        assert!(request.delegated_until_ms <= after + 60_000);
+    }
+
+    #[test]
+    fn delegated_identity_duration_is_validated_before_authorization() {
+        assert_eq!(
+            parse_delegated_identity_duration_ms("5m").expect("valid duration"),
+            300_000
+        );
+        assert_eq!(
+            parse_delegated_identity_duration_ms("2h").expect("valid duration"),
+            7_200_000
+        );
+        assert_eq!(
+            parse_delegated_identity_duration_ms("1d").expect("valid duration"),
+            86_400_000
+        );
+        assert!(parse_delegated_identity_duration_ms("0m").is_err());
+        assert!(parse_delegated_identity_duration_ms("5s").is_err());
+    }
 
     #[test]
     fn policy_revision_json_includes_revision_provenance() {

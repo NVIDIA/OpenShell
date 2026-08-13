@@ -76,6 +76,25 @@ impl OpenShell for RelayGateway {
         Err(Status::unimplemented("not used by this test server"))
     }
 
+    async fn get_delegated_identity_authorization_status(
+        &self,
+        _request: tonic::Request<
+            openshell_core::proto::GetDelegatedIdentityAuthorizationStatusRequest,
+        >,
+    ) -> Result<
+        Response<openshell_core::proto::GetDelegatedIdentityAuthorizationStatusResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn authorize_delegated_identity(
+        &self,
+        _request: tonic::Request<openshell_core::proto::AuthorizeDelegatedIdentityRequest>,
+    ) -> Result<Response<openshell_core::proto::AuthorizeDelegatedIdentityResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     type RelayStreamStream = std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>,
     >;
@@ -131,6 +150,62 @@ impl OpenShell for RelayGateway {
         &self,
         _: tonic::Request<openshell_core::proto::WatchSandboxRequest>,
     ) -> Result<Response<Self::WatchSandboxStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_sandbox_delegated_identity_status(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetSandboxDelegatedIdentityStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxDelegatedIdentityStatusResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn withdraw_sandbox_delegated_identity(
+        &self,
+        _: tonic::Request<openshell_core::proto::WithdrawSandboxDelegatedIdentityRequest>,
+    ) -> Result<Response<openshell_core::proto::WithdrawSandboxDelegatedIdentityResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn extend_sandbox_delegated_identity(
+        &self,
+        _: tonic::Request<openshell_core::proto::ExtendSandboxDelegatedIdentityRequest>,
+    ) -> Result<Response<openshell_core::proto::ExtendSandboxDelegatedIdentityResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_delegated_identity_credentials(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListDelegatedIdentityCredentialsRequest>,
+    ) -> Result<Response<openshell_core::proto::ListDelegatedIdentityCredentialsResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_delegated_identity_credential_status(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetDelegatedIdentityCredentialStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetDelegatedIdentityCredentialStatusResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn revoke_delegated_identity_credential(
+        &self,
+        _: tonic::Request<openshell_core::proto::RevokeDelegatedIdentityCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::RevokeDelegatedIdentityCredentialResponse>, Status>
+    {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_delegated_identity_credential(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteDelegatedIdentityCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteDelegatedIdentityCredentialResponse>, Status>
+    {
         Err(Status::unimplemented("unused"))
     }
 

@@ -318,6 +318,7 @@ mod tests {
             workspace: String::new(),
             await_main_process_attachment: false,
             workload_template_name: String::new(),
+            delegated_identity: None,
         };
         let bytes = request.encode_to_vec();
         let json = codec
@@ -383,6 +384,14 @@ mod tests {
             ),
             ("openshell.v1.ConfigureProviderRefreshRequest", "material"),
             (
+                "openshell.v1.DelegatedIdentityAuthorizationGrant",
+                "refresh_token",
+            ),
+            (
+                "openshell.v1.DelegatedIdentityAuthorizationGrant",
+                "access_token",
+            ),
+            (
                 "openshell.v1.GetSandboxProviderEnvironmentResponse",
                 "environment",
             ),
@@ -394,6 +403,89 @@ mod tests {
                 "{message_name}.{field_name} must be marked secret"
             );
         }
+    }
+
+    #[test]
+    fn delegated_identity_storage_descriptor_reserves_inline_token_fields() {
+        let codec = ProtoJsonCodec::openshell().unwrap();
+        let message = codec
+            .message_descriptor("openshell.v1.DelegatedIdentityCredential")
+            .unwrap();
+
+        assert!(message.get_field_by_name("refresh_token").is_none());
+        assert!(message.get_field_by_name("access_token").is_none());
+        assert!(
+            message
+                .descriptor_proto()
+                .reserved_name
+                .iter()
+                .any(|name| name == "refresh_token")
+        );
+        assert!(
+            message
+                .descriptor_proto()
+                .reserved_name
+                .iter()
+                .any(|name| name == "access_token")
+        );
+        for field_number in [5, 6] {
+            assert!(
+                message
+                    .descriptor_proto()
+                    .reserved_range
+                    .iter()
+                    .any(|range| {
+                        range.start.is_some_and(|start| start <= field_number)
+                            && range.end.is_some_and(|end| end > field_number)
+                    }),
+                "field number {field_number} must remain reserved"
+            );
+        }
+        assert!(
+            message
+                .get_field_by_name("secret_material_handles")
+                .is_some()
+        );
+        assert!(
+            message
+                .get_field_by_name("pending_secret_deletions")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn delegated_identity_lifecycle_request_cannot_carry_oauth_material() {
+        let codec = ProtoJsonCodec::openshell().unwrap();
+        let message = codec
+            .message_descriptor("openshell.v1.DelegatedIdentityRequest")
+            .unwrap();
+
+        for field_name in [
+            "issuer",
+            "client_id",
+            "refresh_token",
+            "access_token",
+            "access_token_expires_at_ms",
+            "scopes",
+            "audience",
+        ] {
+            assert!(message.get_field_by_name(field_name).is_none());
+            assert!(
+                message
+                    .descriptor_proto()
+                    .reserved_name
+                    .iter()
+                    .any(|name| name == field_name),
+                "{field_name} must remain reserved"
+            );
+        }
+        assert_eq!(
+            message
+                .fields()
+                .map(|field| field.name().to_string())
+                .collect::<Vec<_>>(),
+            ["delegated_until_ms"]
+        );
     }
 
     #[test]

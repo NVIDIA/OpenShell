@@ -57,6 +57,25 @@ The following table summarizes common operations.
 | Manage platform profiles or global configuration | Yes | No | No |
 | List resources across workspaces | Yes | No | No |
 
+### Delegated sandbox exceptions
+
+A sandbox created with delegated identity acts on behalf of its delegating
+user, so its lifecycle and interactive access are narrower than the ordinary
+workspace role model.
+
+| Operation | Delegating user | Workspace Admin | Platform Admin | Other Workspace User |
+|---|---|---|---|---|
+| Start | Yes | No | No | No |
+| Stop | Yes | Yes | Yes | No |
+| Delete | Yes | Yes | Yes | No |
+| Connect, exec, file transfer, forwarding, services, providers, policy, or settings | Yes | No | No | No |
+
+Admins can stop a delegated sandbox for immediate containment or delete it to
+release resources, but they cannot reactivate a workload that acts for another
+user. Only the original delegator can restart it, including after delegation
+expiry, withdrawal, or credential revocation. These exceptions do not change
+access to sandboxes created without delegated identity.
+
 <Note>
 Local gateways without OIDC role configuration treat authenticated users as
 Platform Admins. Configure OIDC roles and workspace membership for shared

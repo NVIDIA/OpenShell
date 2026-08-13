@@ -14,12 +14,14 @@ pub mod workspace;
 use openshell_core::proto::{
     AddWorkspaceMemberRequest, AddWorkspaceMemberResponse, ApproveAllDraftChunksRequest,
     ApproveAllDraftChunksResponse, ApproveDraftChunkRequest, ApproveDraftChunkResponse,
-    AttachSandboxProviderRequest, AttachSandboxProviderResponse, BeginRootfsTarStagingRequest,
+    AttachSandboxProviderRequest, AttachSandboxProviderResponse, AuthorizeDelegatedIdentityRequest,
+    AuthorizeDelegatedIdentityResponse, BeginRootfsTarStagingRequest,
     BeginRootfsTarStagingResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
     ComputeDriverCapabilities, ComputeDriverInfo, ConfigureProviderRefreshRequest,
     ConfigureProviderRefreshResponse, CpuResourceCapabilities, CreateProviderRequest,
     CreateSandboxRequest, CreateSandboxTemplateRequest, CreateSshSessionRequest,
     CreateSshSessionResponse, CreateWorkspaceRequest, CreateWorkspaceResponse,
+    DeleteDelegatedIdentityCredentialRequest, DeleteDelegatedIdentityCredentialResponse,
     DeleteProviderProfileRequest, DeleteProviderProfileResponse, DeleteProviderRefreshRequest,
     DeleteProviderRefreshResponse, DeleteProviderRequest, DeleteProviderResponse,
     DeleteSandboxRequest, DeleteSandboxResponse, DeleteSandboxTemplateRequest,
@@ -27,19 +29,25 @@ use openshell_core::proto::{
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, DetachSandboxProviderRequest,
     DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse,
     ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
-    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, FinalizeMainProcessExitRequest,
-    FinalizeMainProcessExitResponse, GatewayMessage, GetCurrentUserRequest, GetCurrentUserResponse,
-    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
-    GetGatewayConfigRequest, GetGatewayConfigResponse, GetGatewayInfoRequest,
-    GetGatewayInfoResponse, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
-    GetProviderRefreshStatusResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
-    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    GetSandboxTemplateRequest, GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse,
-    GpuResourceCapabilities, HealthRequest, HealthResponse, ImportProviderProfilesRequest,
-    ImportProviderProfilesResponse, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
-    LintProviderProfilesRequest, LintProviderProfilesResponse, ListProviderProfilesRequest,
+    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest,
+    ExtendSandboxDelegatedIdentityRequest, ExtendSandboxDelegatedIdentityResponse,
+    FinalizeMainProcessExitRequest, FinalizeMainProcessExitResponse, GatewayMessage,
+    GetCurrentUserRequest, GetCurrentUserResponse, GetDelegatedIdentityAuthorizationStatusRequest,
+    GetDelegatedIdentityAuthorizationStatusResponse, GetDelegatedIdentityCredentialStatusRequest,
+    GetDelegatedIdentityCredentialStatusResponse, GetDraftHistoryRequest, GetDraftHistoryResponse,
+    GetDraftPolicyRequest, GetDraftPolicyResponse, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetGatewayInfoRequest, GetGatewayInfoResponse,
+    GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
+    GetSandboxDelegatedIdentityStatusRequest, GetSandboxDelegatedIdentityStatusResponse,
+    GetSandboxLogsRequest, GetSandboxLogsResponse, GetSandboxPolicyStatusRequest,
+    GetSandboxPolicyStatusResponse, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetSandboxTemplateRequest,
+    GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse, GpuResourceCapabilities,
+    HealthRequest, HealthResponse, ImportProviderProfilesRequest, ImportProviderProfilesResponse,
+    IssueSandboxTokenRequest, IssueSandboxTokenResponse, LintProviderProfilesRequest,
+    LintProviderProfilesResponse, ListDelegatedIdentityCredentialsRequest,
+    ListDelegatedIdentityCredentialsResponse, ListProviderProfilesRequest,
     ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxProvidersRequest,
     ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
@@ -50,13 +58,15 @@ use openshell_core::proto::{
     RefreshSandboxTokenResponse, RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame,
     RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, ReportMainProcessExitRequest,
     ReportMainProcessExitResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    ResourceCapabilities, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    ResourceCapabilities, RevokeDelegatedIdentityCredentialRequest,
+    RevokeDelegatedIdentityCredentialResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
     RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
     SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
     StopSandboxRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
     SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
     UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
     UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
+    WithdrawSandboxDelegatedIdentityRequest, WithdrawSandboxDelegatedIdentityResponse,
     open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
@@ -276,6 +286,41 @@ impl OpenShell for OpenShellService {
         request: Request<BeginRootfsTarStagingRequest>,
     ) -> Result<Response<BeginRootfsTarStagingResponse>, Status> {
         sandbox::handle_begin_rootfs_tar_staging(&self.state, request).await
+    }
+
+    async fn get_delegated_identity_authorization_status(
+        &self,
+        request: Request<GetDelegatedIdentityAuthorizationStatusRequest>,
+    ) -> Result<Response<GetDelegatedIdentityAuthorizationStatusResponse>, Status> {
+        crate::delegated_identity::handle_authorization_status(&self.state, request).await
+    }
+
+    async fn authorize_delegated_identity(
+        &self,
+        request: Request<AuthorizeDelegatedIdentityRequest>,
+    ) -> Result<Response<AuthorizeDelegatedIdentityResponse>, Status> {
+        crate::delegated_identity::handle_authorize(&self.state, request).await
+    }
+
+    async fn get_sandbox_delegated_identity_status(
+        &self,
+        request: Request<GetSandboxDelegatedIdentityStatusRequest>,
+    ) -> Result<Response<GetSandboxDelegatedIdentityStatusResponse>, Status> {
+        crate::delegated_identity::handle_status(&self.state, request).await
+    }
+
+    async fn withdraw_sandbox_delegated_identity(
+        &self,
+        request: Request<WithdrawSandboxDelegatedIdentityRequest>,
+    ) -> Result<Response<WithdrawSandboxDelegatedIdentityResponse>, Status> {
+        crate::delegated_identity::handle_withdraw(&self.state, request).await
+    }
+
+    async fn extend_sandbox_delegated_identity(
+        &self,
+        request: Request<ExtendSandboxDelegatedIdentityRequest>,
+    ) -> Result<Response<ExtendSandboxDelegatedIdentityResponse>, Status> {
+        crate::delegated_identity::handle_extend(&self.state, request).await
     }
 
     type WatchSandboxStream = sandbox::WatchSandboxStream;
@@ -580,6 +625,34 @@ impl OpenShell for OpenShellService {
         request: Request<ExchangeProviderSubjectTokenRequest>,
     ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
         provider::handle_exchange_provider_subject_token(&self.state, request).await
+    }
+
+    async fn list_delegated_identity_credentials(
+        &self,
+        request: Request<ListDelegatedIdentityCredentialsRequest>,
+    ) -> Result<Response<ListDelegatedIdentityCredentialsResponse>, Status> {
+        crate::delegated_identity::handle_list_credentials(&self.state, request).await
+    }
+
+    async fn get_delegated_identity_credential_status(
+        &self,
+        request: Request<GetDelegatedIdentityCredentialStatusRequest>,
+    ) -> Result<Response<GetDelegatedIdentityCredentialStatusResponse>, Status> {
+        crate::delegated_identity::handle_get_credential_status(&self.state, request).await
+    }
+
+    async fn revoke_delegated_identity_credential(
+        &self,
+        request: Request<RevokeDelegatedIdentityCredentialRequest>,
+    ) -> Result<Response<RevokeDelegatedIdentityCredentialResponse>, Status> {
+        crate::delegated_identity::handle_revoke_credential(&self.state, request).await
+    }
+
+    async fn delete_delegated_identity_credential(
+        &self,
+        request: Request<DeleteDelegatedIdentityCredentialRequest>,
+    ) -> Result<Response<DeleteDelegatedIdentityCredentialResponse>, Status> {
+        crate::delegated_identity::handle_delete_credential(&self.state, request).await
     }
 
     async fn update_config(

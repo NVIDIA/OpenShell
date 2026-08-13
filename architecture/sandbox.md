@@ -374,20 +374,54 @@ Provider profiles can also declare dynamic token grants. For matching HTTP
 endpoints, the supervisor obtains or exchanges OAuth2 access tokens, caches
 them, and injects them before forwarding the request. `client_credentials`
 grants use the supervisor SPIFFE JWT-SVID directly as the client assertion.
-`token_exchange` grants ask the gateway to broker an intermediate token using a
-stored provider subject credential and the gateway's own SPIFFE JWT-SVID; the
-supervisor then exchanges that intermediate token for the final upstream token
-using its own JWT-SVID. The gateway validates that its own JWT-SVID has the
+`token_exchange` grants ask the gateway to broker an intermediate token using
+either a stored provider subject credential or the sandbox creator's delegated
+OIDC identity, plus the gateway's own SPIFFE JWT-SVID; the supervisor then
+exchanges that intermediate token for the final upstream token using its own
+JWT-SVID. Delegated identity is opt-in at sandbox creation. The CLI first checks
+for a usable gateway-owned credential for the authenticated user. When one is
+missing, revoked, or no longer refreshable, the CLI runs a separate device
+authorization and transfers its token bundle to the gateway without replacing
+the normal CLI login. Sandbox create and extend then send only a per-sandbox
+authorization window. Delegated access and refresh tokens live behind opaque
+handles in the gateway's active credential driver; the generic credential and
+sandbox records never contain their bytes. Rotation stages replacement handles
+before updating metadata and uses a shared-store CAS lease so gateway replicas
+cannot submit the same refresh token concurrently. Revocation disables
+resolution before cleanup, and deletion retains a disabled tombstone until
+cleanup completes. Within one gateway process, sandbox creation and delegation
+extension share the gateway-wide state guard with credential deletion so a
+credential cannot be deleted between its active-reference check and a new
+delegation write. Like the gateway's other cross-object state guards, this
+coordination is process-local pending DB-backed multi-writer synchronization.
+Only the delegating user can
+extend or withdraw that window. Only the delegator can start or interact with
+the sandbox. Workspace and platform admins can stop it for containment or
+delete it to recover resources, but cannot start it. Other workspace users
+cannot start, stop, delete, or interact with it. Ordinary sandboxes retain the
+workspace role model. The gateway rejects exchange after expiry, withdrawal,
+missing credential state, or credential revocation.
+The gateway validates that its own JWT-SVID has the
 requested audience, a SPIFFE subject, and a non-expired `exp` claim when
-present. It also validates that the stored subject credential is declared by the
-provider profile, and that the supervisor JWT-SVID is a well-formed
+present. For provider-credential subject tokens, it also validates that the
+stored subject credential is declared by the provider profile. For delegated
+identity subject tokens, it validates that the sandbox was created with active
+delegation for the stored credential principal. The gateway also verifies that
+the supervisor JWT-SVID is a well-formed
 three-segment JWT with a SPIFFE subject in the same trust domain as the gateway
 SVID. The gateway verifies the supervisor JWT-SVID signature with JWT bundles
 fetched from its SPIFFE Workload API. Token grant endpoints are HTTPS-only
 except for loopback and Kubernetes service DNS hosts, and returned access tokens
-must be bearer-compatible before they are cached or injected. Token response
+must be bearer-compatible before they are cached or injected. Delegated OIDC
+discovery and refresh use a dedicated 30-second HTTP client that ignores ambient
+proxy settings and rejects redirects. Token response
 lifetimes are capped and cached with an expiry margin unless a profile supplies
-an explicit cache TTL override. Cache entries are scoped by the sandbox provider
+an explicit cache TTL override. Every `token_exchange` cache entry, including
+an override, is capped at five minutes so withdrawal and gateway credential
+revocation bound continued token injection. Response-derived entries apply the
+30-second margin after that cap and therefore live for at most four minutes and
+30 seconds. This bound does not invalidate an access token that an upstream
+service has already received. Cache entries are scoped by the sandbox provider
 environment revision so provider credential updates miss the old token cache
 without changing endpoint matching semantics. Gateway-brokered intermediate
 tokens are cached separately by provider resource version, supervisor SPIFFE

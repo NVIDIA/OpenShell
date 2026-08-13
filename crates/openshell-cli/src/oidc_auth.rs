@@ -239,7 +239,7 @@ pub async fn oidc_browser_auth_flow(
         () = tokio::time::sleep(AUTH_TIMEOUT) => {
             return Err(miette::miette!(
                 "OIDC authentication timed out after {} seconds.\n\
-                 Try again with: openshell gateway login",
+                 Please retry the command.",
                 AUTH_TIMEOUT.as_secs()
             ));
         }

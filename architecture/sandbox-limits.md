@@ -128,7 +128,8 @@ can contain a valid sequence gap.
 | Corporate proxy CONNECT response headers | 8 KiB | Fail the tunnel. |
 | Corporate proxy CONNECT handshake | 30 s total | Fail the tunnel; validated-address attempts share the aggregate budget. |
 | Token-grant HTTP request | 30 s request and connect | Fail credential resolution. |
-| Response-derived token cache TTL | 5 min default; 1 h response cap; 30 s expiry margin | A positive profile `cache_ttl_seconds` override replaces the response-derived calculation. |
+| Client-credentials token cache TTL | 5 min default; 1 h response cap; 30 s expiry margin | A positive profile `cache_ttl_seconds` override replaces the response-derived calculation without changing existing client-credentials behavior. |
+| Token-exchange token cache TTL | 5 min maximum | The cap applies to positive profile overrides. Response-derived TTLs apply the 30 s expiry margin after the cap, for a 4 min 30 s maximum. This bounds continued token injection after delegated-identity withdrawal or credential revocation. |
 
 ## Sandbox-Local Surfaces
 

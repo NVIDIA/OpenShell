@@ -32,6 +32,9 @@ pub const DEFAULT_STOP_TIMEOUT_SECS: u32 = 10;
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
+/// Default maximum delegated identity authorization window for one sandbox.
+pub const DEFAULT_MAX_DELEGATED_IDENTITY_DURATION_SECS: u64 = 86_400;
+
 /// Gateway posture when a sandbox rejects a candidate policy generation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -217,6 +220,9 @@ pub struct Config {
 
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
+
+    /// Maximum delegated identity authorization window for one sandbox.
+    pub max_delegated_identity_duration_secs: u64,
 
     /// Maximum gRPC requests allowed per rate-limit window.
     ///
@@ -574,6 +580,7 @@ impl Config {
             credential_drivers: Vec::new(),
             default_credential_driver: None,
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
+            max_delegated_identity_duration_secs: DEFAULT_MAX_DELEGATED_IDENTITY_DURATION_SECS,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
@@ -668,6 +675,13 @@ impl Config {
     #[must_use]
     pub const fn with_ssh_session_ttl_secs(mut self, secs: u64) -> Self {
         self.ssh_session_ttl_secs = secs;
+        self
+    }
+
+    /// Create a new configuration with the maximum delegated identity duration.
+    #[must_use]
+    pub const fn with_max_delegated_identity_duration_secs(mut self, secs: u64) -> Self {
+        self.max_delegated_identity_duration_secs = secs;
         self
     }
 

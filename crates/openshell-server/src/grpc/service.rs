@@ -51,6 +51,8 @@ pub(super) async fn handle_expose_service(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
 
     let now = crate::persistence::current_time_ms();
     let key = service_routing::endpoint_key(&req.sandbox, &req.service);
@@ -255,6 +257,14 @@ pub(super) async fn handle_delete_service(
     let Some(endpoint) = endpoint else {
         return Ok(Response::new(DeleteServiceResponse { deleted: false }));
     };
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&endpoint.sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
 
     let key = service_routing::endpoint_key(&req.sandbox, &req.service);
     let deleted = state

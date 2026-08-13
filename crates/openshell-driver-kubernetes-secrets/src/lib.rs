@@ -67,6 +67,13 @@ struct KubernetesSecretsDriverSettings {
 
 impl KubernetesSecretsDriverSettings {
     fn target_namespace(&self, workspace: &str) -> String {
+        // Gateway-global secret material has no workspace. Keep it in the
+        // configured credential namespace regardless of how workspace-owned
+        // credentials are distributed across namespaces.
+        if workspace.is_empty() {
+            return self.namespace.clone();
+        }
+
         match self.workspace_mode {
             WorkspaceMode::Shared => self.namespace.clone(),
             WorkspaceMode::Managed => {
@@ -1171,6 +1178,24 @@ mod tests {
         };
         assert_eq!(settings.target_namespace("team-a"), "openshell");
         assert_eq!(settings.target_namespace("team-b"), "openshell");
+    }
+
+    #[test]
+    fn target_namespace_gateway_global_returns_static_namespace_in_all_modes() {
+        for workspace_mode in [
+            WorkspaceMode::Shared,
+            WorkspaceMode::Managed,
+            WorkspaceMode::Operator,
+        ] {
+            let settings = KubernetesSecretsDriverSettings {
+                namespace: "openshell-credentials".to_string(),
+                allow_reference_namespace: false,
+                workspace_mode,
+                gateway_id: "gw1".to_string(),
+            };
+
+            assert_eq!(settings.target_namespace(""), "openshell-credentials");
+        }
     }
 
     #[test]

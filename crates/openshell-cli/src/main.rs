@@ -576,6 +576,13 @@ enum Commands {
         command: Option<ProviderCommands>,
     },
 
+    /// Manage delegated identity credential records.
+    #[command(help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    DelegatedCredential {
+        #[command(subcommand)]
+        command: Option<DelegatedCredentialCommands>,
+    },
+
     /// Manage workspaces.
     #[command(alias = "ws", after_help = WORKSPACE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Workspace {
@@ -1108,6 +1115,62 @@ enum ProviderProfileCommands {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum DelegatedCredentialCommands {
+    /// List delegated identity credentials.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Maximum number of credentials to return.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+
+        /// Number of credentials to skip.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+
+        /// Output only credential IDs.
+        #[arg(long, conflicts_with = "output")]
+        ids: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with = "ids")]
+        output: OutputFormat,
+    },
+
+    /// Show delegated identity credential status.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Status {
+        /// Delegated identity credential ID.
+        id: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Revoke a delegated identity credential.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Revoke {
+        /// Delegated identity credential ID.
+        id: String,
+
+        /// Expected resource version for compare-and-swap updates.
+        #[arg(long = "resource-version", default_value_t = 0)]
+        resource_version: u64,
+    },
+
+    /// Delete a delegated identity credential record.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Delegated identity credential ID.
+        id: String,
+
+        /// Expected resource version for compare-and-swap deletes.
+        #[arg(long = "resource-version", default_value_t = 0)]
+        resource_version: u64,
+    },
+}
+
 // -----------------------------------------------------------------------
 // Gateway commands (replaces the old `cluster` / `cluster admin` groups)
 // -----------------------------------------------------------------------
@@ -1349,6 +1412,12 @@ enum SandboxCommands {
         /// the sandbox do not receive the real credential values. Repeatable.
         #[arg(long = "provider")]
         providers: Vec<String>,
+
+        /// Allow the sandbox to use a separately authorized copy of your identity for a bounded duration.
+        /// Opens a browser authorization flow when no usable gateway-owned grant exists. Accepts
+        /// positive durations with m, h, or d suffixes, for example 30m, 8h, or 7d.
+        #[arg(long = "use-my-identity-for", value_name = "DURATION")]
+        delegate_identity_for: Option<String>,
 
         /// Path to a custom sandbox policy YAML file.
         /// Overrides the built-in default and the `OPENSHELL_SANDBOX_POLICY` env var.
@@ -1622,6 +1691,41 @@ enum SandboxCommands {
     /// Manage reusable sandbox workload templates.
     #[command(subcommand)]
     Template(SandboxTemplateCommands),
+
+    /// Manage sandbox delegated identity.
+    #[command(subcommand, name = "delegated-identity")]
+    DelegatedIdentity(SandboxDelegatedIdentityCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum SandboxDelegatedIdentityCommands {
+    /// Show delegated identity status for a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Status {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+    },
+
+    /// Withdraw delegated identity from a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Withdraw {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+    },
+
+    /// Set delegated identity expiry to now plus the requested duration.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Extend {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+
+        /// New authorization window, for example 24h.
+        #[arg(long = "for", value_name = "DURATION")]
+        duration: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3051,6 +3155,7 @@ async fn run_async() -> Result<()> {
                     memory,
                     driver_config_json,
                     providers,
+                    delegate_identity_for,
                     policy,
                     forward,
                     tty,
@@ -3143,6 +3248,7 @@ async fn run_async() -> Result<()> {
                             driver_config_json: driver_config_json.as_deref(),
                             editor,
                             providers: &providers,
+                            delegate_identity_for: delegate_identity_for.as_deref(),
                             policy: policy.as_deref(),
                             forward,
                             command: &command,
@@ -3453,6 +3559,37 @@ async fn run_async() -> Result<()> {
                                 .await?;
                             }
                         },
+                        SandboxCommands::DelegatedIdentity(command) => match command {
+                            SandboxDelegatedIdentityCommands::Status { name } => {
+                                run::sandbox_delegated_identity_status(
+                                    endpoint,
+                                    &name,
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                            SandboxDelegatedIdentityCommands::Withdraw { name } => {
+                                run::sandbox_delegated_identity_withdraw(
+                                    endpoint,
+                                    &name,
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                            SandboxDelegatedIdentityCommands::Extend { name, duration } => {
+                                run::sandbox_delegated_identity_extend(
+                                    endpoint,
+                                    &ctx.name,
+                                    &name,
+                                    &duration,
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
+                            }
+                        },
                     }
                 }
             }
@@ -3745,6 +3882,61 @@ async fn run_async() -> Result<()> {
                 }
             }
         }
+        Some(Commands::DelegatedCredential {
+            command: Some(command),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let endpoint = &ctx.endpoint;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name)?;
+
+            match command {
+                DelegatedCredentialCommands::List {
+                    limit,
+                    offset,
+                    ids,
+                    output,
+                } => {
+                    run::delegated_identity_credential_list(
+                        endpoint,
+                        limit,
+                        offset,
+                        ids,
+                        output.as_str(),
+                        &tls,
+                    )
+                    .await?;
+                }
+                DelegatedCredentialCommands::Status { id, output } => {
+                    run::delegated_identity_credential_status(endpoint, &id, output.as_str(), &tls)
+                        .await?;
+                }
+                DelegatedCredentialCommands::Revoke {
+                    id,
+                    resource_version,
+                } => {
+                    run::delegated_identity_credential_revoke(
+                        endpoint,
+                        &id,
+                        resource_version,
+                        &tls,
+                    )
+                    .await?;
+                }
+                DelegatedCredentialCommands::Delete {
+                    id,
+                    resource_version,
+                } => {
+                    run::delegated_identity_credential_delete(
+                        endpoint,
+                        &id,
+                        resource_version,
+                        &tls,
+                    )
+                    .await?;
+                }
+            }
+        }
         Some(Commands::Term { theme }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
@@ -3873,6 +4065,13 @@ async fn run_async() -> Result<()> {
             Cli::command()
                 .find_subcommand_mut("provider")
                 .expect("provider subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::DelegatedCredential { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("delegated-credential")
+                .expect("delegated-credential subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
         }
@@ -4529,6 +4728,60 @@ mod tests {
                     global: false,
                 })
             })
+        ));
+    }
+
+    #[test]
+    fn delegated_credential_commands_parse() {
+        let list = Cli::try_parse_from(["openshell", "delegated-credential", "list", "--ids"])
+            .expect("delegated credential list should parse");
+        assert!(matches!(
+            list.command,
+            Some(Commands::DelegatedCredential {
+                command: Some(DelegatedCredentialCommands::List {
+                    ids: true,
+                    output: OutputFormat::Table,
+                    ..
+                })
+            })
+        ));
+
+        let status = Cli::try_parse_from([
+            "openshell",
+            "delegated-credential",
+            "status",
+            "delegated-identity-123",
+            "-o",
+            "json",
+        ])
+        .expect("delegated credential status should parse");
+        assert!(matches!(
+            status.command,
+            Some(Commands::DelegatedCredential {
+                command: Some(DelegatedCredentialCommands::Status {
+                    id,
+                    output: OutputFormat::Json,
+                })
+            }) if id == "delegated-identity-123"
+        ));
+
+        let revoke = Cli::try_parse_from([
+            "openshell",
+            "delegated-credential",
+            "revoke",
+            "delegated-identity-123",
+            "--resource-version",
+            "7",
+        ])
+        .expect("delegated credential revoke should parse");
+        assert!(matches!(
+            revoke.command,
+            Some(Commands::DelegatedCredential {
+                command: Some(DelegatedCredentialCommands::Revoke {
+                    id,
+                    resource_version: 7,
+                })
+            }) if id == "delegated-identity-123"
         ));
     }
 
@@ -5505,6 +5758,31 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(approval_mode, "auto");
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_use_my_identity_for_parses() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--use-my-identity-for",
+            "8h",
+        ])
+        .expect("sandbox create --use-my-identity-for should parse");
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        delegate_identity_for,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(delegate_identity_for.as_deref(), Some("8h"));
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
