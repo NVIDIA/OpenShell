@@ -53,7 +53,7 @@ var WithLogMinLevel = types.WithLogMinLevel
 
 // SandboxInterface defines lifecycle operations on sandboxes.
 type SandboxInterface interface {
-	Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string) (*Sandbox, error)
+	Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
 	Get(ctx context.Context, workspace, name string) (*Sandbox, error)
 	List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error)
 	Stop(ctx context.Context, workspace, name string) (*Sandbox, error)
@@ -65,12 +65,5 @@ type SandboxInterface interface {
 	WaitReady(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
 	WaitStopped(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
 	Watch(ctx context.Context, workspace, name string, opts ...WatchOptions) (WatchInterface[*Sandbox], error)
-	// GetLogs retrieves log entries for a sandbox. The sandbox is resolved
-	// by name (an internal Get call translates name to ID). Use
-	// WithLogLines, WithLogSince, WithLogSources, and WithLogMinLevel to
-	// filter the results.
-	//
-	// Errors: NotFound if the sandbox does not exist; InvalidArgument if
-	// the sandbox name is empty; Unimplemented by the fake client.
 	GetLogs(ctx context.Context, workspace, sandboxName string, opts ...LogOption) (*LogResult, error)
 }

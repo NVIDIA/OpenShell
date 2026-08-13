@@ -1,0 +1,154 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[tools]
+go = "1.25"
+buf = "1.72.0"
+"go:github.com/golangci/golangci-lint/v2/cmd/golangci-lint" = "2.12"
+"go:google.golang.org/protobuf/cmd/protoc-gen-go" = "1.36.11"
+"go:google.golang.org/grpc/cmd/protoc-gen-go-grpc" = "1.6.2"
+
+[tasks.test]
+description = "Run unit tests with coverage"
+run = "go test -coverprofile=coverage.out -coverpkg=./openshell/... -race ./..."
+
+[tasks."test:integration"]
+description = "Run integration tests"
+run = "go test -tags=integration -race ./..."
+
+[tasks.lint]
+description = "Run linter"
+run = "golangci-lint run ./..."
+
+[tasks.fmt]
+description = "Format code"
+run = "goimports -w . && go fmt ./..."
+
+[tasks.build]
+description = "Build all packages"
+run = "go build ./..."
+
+[tasks.ci]
+description = "Run full CI pipeline"
+depends = ["lint", "build", "test", "proto:check", "docs:check"]
+
+[tasks."docs:check"]
+description = "Verify every public package has a docs page"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOCS_DIR="docs/src/api"
+SUMMARY="docs/src/SUMMARY.md"
+MISSING=0
+
+# Find all public packages with a doc.go (excluding internal, proto, types)
+for docfile in openshell/v1/*/doc.go; do
+  pkg=$(basename "$(dirname "$docfile")")
+
+  # Skip internal packages and types (no user-facing docs needed)
+  case "$pkg" in
+    internal|types) continue ;;
+  esac
+
+  # Check for matching docs page
+  if [ ! -f "$DOCS_DIR/$pkg.md" ]; then
+    echo "MISSING: $DOCS_DIR/$pkg.md (package openshell/v1/$pkg has doc.go but no docs page)"
+    MISSING=$((MISSING + 1))
+  fi
+
+  # Check for SUMMARY.md entry
+  if ! grep -q "api/$pkg.md" "$SUMMARY" 2>/dev/null; then
+    echo "MISSING: SUMMARY.md entry for api/$pkg.md"
+    MISSING=$((MISSING + 1))
+  fi
+done
+
+if [ "$MISSING" -gt 0 ]; then
+  echo ""
+  echo "ERROR: $MISSING documentation gaps found."
+  echo "Every public package with doc.go needs a docs/src/api/<pkg>.md page"
+  echo "and a SUMMARY.md entry. See Constitution XIII."
+  exit 1
+fi
+
+echo "Docs check passed: all public packages have documentation."
+"""
+
+[tasks."proto:gen"]
+description = "Generate Go bindings from proto files using buf"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+SDK_ROOT=$(pwd -P)
+REPO_ROOT=$(cd ../.. && pwd -P)
+
+for tool in buf protoc-gen-go protoc-gen-go-grpc; do
+  if ! command -v "$tool" &>/dev/null; then
+    echo "ERROR: $tool not found. Run 'mise install' to install it."
+    exit 1
+  fi
+done
+
+if find proto -maxdepth 1 -name '*.proto' -print -quit | grep -q .; then
+  echo "ERROR: sdk/go/proto must contain generated bindings only."
+  echo "Proto sources belong in the repository root proto/ directory."
+  exit 1
+fi
+
+# Clean previous output before regeneration
+find proto -name '*.pb.go' -delete 2>/dev/null || true
+find proto -mindepth 1 -type d -empty -delete 2>/dev/null || true
+
+(cd "$REPO_ROOT" && buf generate --template "$SDK_ROOT/buf.gen.yaml")
+
+echo "Proto generation complete."
+echo "Generated packages:"
+for pkg_dir in proto/*/; do
+  count=$(find "$pkg_dir" -maxdepth 1 -name '*.go' | wc -l | tr -d ' ')
+  echo "  $pkg_dir: $count files"
+done
+"""
+
+[tasks."proto:check"]
+description = "Verify generated proto files are up to date"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+SDK_ROOT=$(pwd -P)
+REPO_ROOT=$(cd ../.. && pwd -P)
+
+for tool in buf protoc-gen-go protoc-gen-go-grpc; do
+  if ! command -v "$tool" &>/dev/null; then
+    echo "ERROR: $tool not found. Run 'mise install' to install it."
+    exit 1
+  fi
+done
+
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+if find proto -maxdepth 1 -name '*.proto' -print -quit | grep -q .; then
+  echo "ERROR: sdk/go/proto contains copied proto sources."
+  echo "Proto sources belong in the repository root proto/ directory."
+  exit 1
+fi
+
+# Generate to temp directory with adjusted output path
+CHECK_TEMPLATE=$(sed 's|out: sdk/go|out: '"$WORK_DIR"'|' buf.gen.yaml)
+(cd "$REPO_ROOT" && buf generate --template "$CHECK_TEMPLATE")
+
+DIFF_OUTPUT=$(diff -r "$WORK_DIR/proto" "$SDK_ROOT/proto" 2>&1) || true
+
+if [ -n "$DIFF_OUTPUT" ]; then
+  echo "ERROR: Generated proto files are out of date."
+  echo "Run 'mise run proto:gen' to regenerate."
+  echo ""
+  echo "$DIFF_OUTPUT"
+  exit 1
+fi
+
+echo "Proto check passed: generated files are up to date."
+"""

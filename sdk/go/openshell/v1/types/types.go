@@ -45,7 +45,6 @@ type TLSConfig struct {
 	CertFile string
 	KeyFile  string
 	CAFile   string
-	// Insecure skips TLS certificate verification. Use http:// for plaintext.
 	Insecure bool
 }
 

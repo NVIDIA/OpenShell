@@ -15,14 +15,16 @@ var grpcToSDK = map[codes.Code]types.ErrorCode{
 	codes.AlreadyExists:      types.ErrorAlreadyExists,
 	codes.Unavailable:        types.ErrorUnavailable,
 	codes.PermissionDenied:   types.ErrorPermissionDenied,
-	codes.Unauthenticated:    types.ErrorUnauthenticated,
 	codes.InvalidArgument:    types.ErrorInvalidArgument,
 	codes.DeadlineExceeded:   types.ErrorDeadlineExceeded,
 	codes.Canceled:           types.ErrorCancelled,
 	codes.Internal:           types.ErrorInternal,
 	codes.Unimplemented:      types.ErrorUnimplemented,
 	codes.Aborted:            types.ErrorConflict,
+	codes.Unauthenticated:    types.ErrorUnauthenticated,
 	codes.FailedPrecondition: types.ErrorConflict,
+	codes.ResourceExhausted:  types.ErrorUnavailable,
+	codes.OutOfRange:         types.ErrorInvalidArgument,
 }
 
 // FromGRPCError converts a gRPC error to a typed StatusError.

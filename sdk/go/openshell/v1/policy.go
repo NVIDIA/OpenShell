@@ -87,87 +87,25 @@ var WithLimit = types.WithLimit
 // WithOffset sets the pagination offset.
 var WithOffset = types.WithOffset
 
+// WithListGlobal enables global policy mode on List. When true, the query
+// retrieves gateway-global policy revisions instead of sandbox-scoped ones.
+var WithListGlobal = types.WithListGlobal
+
+// WithStatusGlobal enables global policy mode on GetStatus. When true, the
+// query retrieves gateway-global policy status instead of sandbox-scoped status.
+var WithStatusGlobal = types.WithStatusGlobal
+
 // PolicyInterface defines operations for managing sandbox policy drafts,
 // approvals, and revision history.
 type PolicyInterface interface {
-	// GetDraft retrieves the current draft policy for a sandbox, including
-	// all pending, approved, and rejected chunks. Use WithStatusFilter to
-	// return only chunks matching a specific status.
-	//
-	// Errors: NotFound if the sandbox does not exist; InvalidArgument if the
-	// sandbox name is empty; Unimplemented by the fake client.
 	GetDraft(ctx context.Context, workspace, sandboxName string, opts ...GetDraftOption) (*DraftPolicy, error)
-
-	// ApproveDraftChunk approves a single pending draft chunk, merging
-	// its proposed rule into the active policy.
-	//
-	// Errors: NotFound if the sandbox or chunk does not exist;
-	// InvalidArgument if the sandbox name or chunk ID is empty;
-	// Conflict if the chunk has already been approved or rejected;
-	// Unimplemented by the fake client.
 	ApproveDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string) (*ApproveResult, error)
-
-	// RejectDraftChunk rejects a single pending draft chunk with an
-	// optional reason that is fed to future LLM analysis context.
-	//
-	// Errors: NotFound if the sandbox or chunk does not exist;
-	// InvalidArgument if the sandbox name or chunk ID is empty;
-	// Conflict if the chunk has already been approved or rejected;
-	// Unimplemented by the fake client.
 	RejectDraftChunk(ctx context.Context, workspace, sandboxName, chunkID, reason string) error
-
-	// ApproveAllDraftChunks approves all pending draft chunks at once.
-	// By default, security-flagged chunks are skipped. Use
-	// WithIncludeSecurityFlagged to include them.
-	//
-	// Errors: NotFound if the sandbox does not exist; InvalidArgument if
-	// the sandbox name is empty; Unimplemented by the fake client.
 	ApproveAllDraftChunks(ctx context.Context, workspace, sandboxName string, opts ...ApproveAllOption) (*ApproveAllResult, error)
-
-	// ClearDraftChunks removes all pending draft chunks for a sandbox.
-	//
-	// Errors: NotFound if the sandbox does not exist; InvalidArgument if
-	// the sandbox name is empty; Unimplemented by the fake client.
 	ClearDraftChunks(ctx context.Context, workspace, sandboxName string) (*ClearResult, error)
-
-	// GetDraftHistory returns the chronological decision history for a
-	// sandbox's draft policy (approvals, rejections, edits, undos, clears).
-	//
-	// Errors: NotFound if the sandbox does not exist; InvalidArgument if
-	// the sandbox name is empty; Unimplemented by the fake client.
 	GetDraftHistory(ctx context.Context, workspace, sandboxName string) ([]DraftHistoryEntry, error)
-
-	// GetStatus retrieves the policy status for a sandbox, including the
-	// queried revision and the active version. Use WithVersion to query a
-	// specific version instead of the latest.
-	//
-	// Errors: NotFound if the sandbox or requested version does not exist;
-	// InvalidArgument if the sandbox name is empty;
-	// Unimplemented by the fake client.
 	GetStatus(ctx context.Context, workspace, sandboxName string, opts ...GetStatusOption) (*PolicyStatusResult, error)
-
-	// List returns policy revisions for a sandbox, ordered by version.
-	// Use WithLimit and WithOffset for pagination.
-	//
-	// Errors: NotFound if the sandbox does not exist; InvalidArgument if
-	// the sandbox name is empty; Unimplemented by the fake client.
 	List(ctx context.Context, workspace string, opts ...ListPolicyOption) ([]SandboxPolicyRevision, error)
-
-	// EditDraftChunk replaces the proposed rule of a pending draft chunk
-	// with the given network policy rule.
-	//
-	// Errors: NotFound if the sandbox or chunk does not exist;
-	// InvalidArgument if the sandbox name, chunk ID, or proposed rule is
-	// empty/nil; Conflict if the chunk is not in a pending state;
-	// Unimplemented by the fake client.
 	EditDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string, proposedRule *NetworkPolicyRule) error
-
-	// UndoDraftChunk reverses a previously approved chunk, removing its
-	// merged rule from the active policy.
-	//
-	// Errors: NotFound if the sandbox or chunk does not exist;
-	// InvalidArgument if the sandbox name or chunk ID is empty;
-	// Conflict if the chunk has not been approved;
-	// Unimplemented by the fake client.
 	UndoDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string) (*UndoResult, error)
 }

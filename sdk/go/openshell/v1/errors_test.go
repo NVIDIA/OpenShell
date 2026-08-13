@@ -23,7 +23,7 @@ func TestStatusError_Error(t *testing.T) {
 }
 
 func TestStatusError_ErrorWithCause(t *testing.T) {
-	cause := fmt.Errorf("underlying issue")
+	cause := errors.New("underlying error")
 	err := &StatusError{
 		Code:    ErrorInvalidArgument,
 		Message: "bad name",
@@ -32,7 +32,7 @@ func TestStatusError_ErrorWithCause(t *testing.T) {
 	s := err.Error()
 	assert.Contains(t, s, "InvalidArgument")
 	assert.Contains(t, s, "bad name")
-	assert.ErrorIs(t, err, cause)
+	assert.Equal(t, cause, errors.Unwrap(err))
 }
 
 func TestIsNotFound(t *testing.T) {

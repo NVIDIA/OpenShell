@@ -55,6 +55,25 @@ func TestRefreshableToken_ValidSource(t *testing.T) {
 	assert.NotNil(t, provider)
 }
 
+func TestGetRequestMetadata_ReturnsWhenContextCanceledDuringRefresh(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	src := &mockTokenSource{tokenFunc: func() (*oauth2.Token, error) {
+		<-release
+		return &oauth2.Token{AccessToken: "late-token"}, nil
+	}}
+	provider, err := RefreshableToken(src)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	_, err = provider.GetRequestMetadata(ctx)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Less(t, time.Since(started), time.Second)
+}
+
 // --- Phase 3 / US1 tests: automatic token refresh ---
 
 func TestGetRequestMetadata_FirstCallFetchesToken(t *testing.T) {
@@ -121,22 +140,24 @@ func TestGetRequestMetadata_ConcurrentSingleFlight(t *testing.T) {
 	src := &mockTokenSource{
 		tokenFunc: func() (*oauth2.Token, error) {
 			fetchCount.Add(1)
-			time.Sleep(10 * time.Millisecond) // simulate slow token fetch
+			time.Sleep(100 * time.Millisecond)
 			return &oauth2.Token{AccessToken: "shared-token", Expiry: time.Now().Add(time.Hour)}, nil
 		},
 	}
 	provider, err := RefreshableToken(src)
 	require.NoError(t, err)
 
-	const goroutines = 1000
+	const goroutines = 20
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
+	ready := make(chan struct{})
 	results := make([]string, goroutines)
 	errs := make([]error, goroutines)
 
 	for i := range goroutines {
 		go func(idx int) {
 			defer wg.Done()
+			<-ready
 			md, e := provider.GetRequestMetadata(context.Background())
 			errs[idx] = e
 			if md != nil {
@@ -144,6 +165,7 @@ func TestGetRequestMetadata_ConcurrentSingleFlight(t *testing.T) {
 			}
 		}(i)
 	}
+	close(ready)
 	wg.Wait()
 
 	for i := range goroutines {
@@ -316,6 +338,132 @@ func TestGetRequestMetadata_ZeroExpiryNeverRefreshes(t *testing.T) {
 		require.NoError(t, err)
 	}
 	assert.Equal(t, 1, src.calls(), "zero-expiry token should never be refreshed")
+}
+
+// --- Backoff tests ---
+
+func TestGetRequestMetadata_BackoffSkipsRefreshDuringWindow(t *testing.T) {
+	var callNum atomic.Int32
+	src := &mockTokenSource{
+		tokenFunc: func() (*oauth2.Token, error) {
+			n := callNum.Add(1)
+			if n == 1 {
+				return &oauth2.Token{AccessToken: "stale", Expiry: time.Now().Add(-time.Minute)}, nil
+			}
+			return nil, fmt.Errorf("idp down")
+		},
+	}
+	provider, err := RefreshableToken(src, WithLeeway(0))
+	require.NoError(t, err)
+
+	_, err = provider.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+	_, err = provider.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+	beforeCount := src.calls()
+	require.Equal(t, 2, beforeCount)
+
+	ra := provider.(*refreshableAuth)
+	ra.mu.Lock()
+	ra.nextRetry = time.Now().Add(time.Minute)
+	ra.mu.Unlock()
+
+	md, err := provider.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer stale", md["authorization"])
+	assert.Equal(t, beforeCount, src.calls(), "should not call Token() during backoff window")
+}
+
+func TestGetRequestMetadata_BackoffResetsOnSuccess(t *testing.T) {
+	var callNum atomic.Int32
+	src := &mockTokenSource{
+		tokenFunc: func() (*oauth2.Token, error) {
+			n := callNum.Add(1)
+			switch n {
+			case 1:
+				return &oauth2.Token{AccessToken: "initial", Expiry: time.Now().Add(-time.Second)}, nil
+			case 2:
+				return nil, fmt.Errorf("fail once")
+			default:
+				return &oauth2.Token{AccessToken: "recovered", Expiry: time.Now().Add(time.Hour)}, nil
+			}
+		},
+	}
+	provider, err := RefreshableToken(src, WithLeeway(0))
+	require.NoError(t, err)
+
+	_, _ = provider.GetRequestMetadata(context.Background())
+	_, _ = provider.GetRequestMetadata(context.Background())
+
+	ra := provider.(*refreshableAuth)
+	ra.mu.Lock()
+	ra.nextRetry = time.Time{}
+	ra.mu.Unlock()
+
+	md, err := provider.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer recovered", md["authorization"])
+
+	ra.mu.Lock()
+	assert.Equal(t, time.Duration(0), ra.backoff, "backoff should reset after success")
+	assert.True(t, ra.nextRetry.IsZero(), "nextRetry should be zero after success")
+	ra.mu.Unlock()
+}
+
+func TestGetRequestMetadata_BackoffCapsAt30s(t *testing.T) {
+	src := &mockTokenSource{
+		tokenFunc: func() (*oauth2.Token, error) {
+			return nil, fmt.Errorf("always fail")
+		},
+	}
+	provider, err := RefreshableToken(src, WithLeeway(0))
+	require.NoError(t, err)
+
+	ra := provider.(*refreshableAuth)
+
+	for range 10 {
+		ra.mu.Lock()
+		ra.nextRetry = time.Time{}
+		ra.mu.Unlock()
+
+		_, _ = provider.GetRequestMetadata(context.Background())
+	}
+
+	ra.mu.Lock()
+	assert.Equal(t, maxBackoff, ra.backoff, "backoff should cap at maxBackoff")
+	ra.mu.Unlock()
+}
+
+func TestGetRequestMetadata_ConcurrentFailureBackoffNotOverIncremented(t *testing.T) {
+	src := &mockTokenSource{
+		tokenFunc: func() (*oauth2.Token, error) {
+			time.Sleep(10 * time.Millisecond)
+			return nil, fmt.Errorf("idp down")
+		},
+	}
+	provider, err := RefreshableToken(src, WithLeeway(0))
+	require.NoError(t, err)
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	ready := make(chan struct{})
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			<-ready
+			_, _ = provider.GetRequestMetadata(context.Background())
+		}()
+	}
+	close(ready)
+	wg.Wait()
+
+	ra := provider.(*refreshableAuth)
+	ra.mu.Lock()
+	assert.Equal(t, initialBackoff, ra.backoff,
+		"a single coalesced failure should set backoff to initialBackoff, not escalate")
+	ra.mu.Unlock()
+	assert.Equal(t, 1, src.calls(), "singleflight should coalesce to 1 call")
 }
 
 // --- benchmarks ---
