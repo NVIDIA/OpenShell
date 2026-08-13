@@ -90,20 +90,16 @@ packaging-asset tests; its
 cross-platform Python, Markdown, license, and documentation checks still run.
 Test tasks require the Rust target architecture to match the Windows host, so
 an ARM64 test result is native coverage rather than x64 emulation coverage.
-By default it enables bundled Z3 for reproducible Windows builds. When
+By default it enables the `z3-sys` prebuilt-release feature and pins Z3 4.16.0.
+On a clean target directory, `z3-sys` downloads the official static library for
+the selected Windows architecture instead of compiling Z3 through
+CMake/MSBuild. GitHub Actions supplies its read-only workflow token for the
+release lookup, and the Cargo target cache preserves the extracted library for
+subsequent runs. When
 `Z3_LIBRARY_PATH_OVERRIDE` points at a directory containing `libz3.lib`, the
 wrapper uses that system Z3 instead and requires `Z3_SYS_Z3_HEADER` to point at
-the full path to `z3.h`. For bundled builds, the wrapper fetches the Z3 source
-revision pinned by `z3-sys` through Git and sets
-`Z3_SYS_BUNDLED_DIR_OVERRIDE`. When `CARGO_TARGET_DIR` is explicit, the wrapper
-uses it for the source cache. Otherwise, it caches under the current user's
-local application data directory, outside the checkout. Publishing uses an
-atomic directory rename so concurrent x64 and ARM64 commands can share the
-cache safely. This keeps downloaded sources outside the checkout by default and
-avoids the unauthenticated GitHub API lookup in the `z3-sys` build script, which
-can fail with HTTP 403 when a shared runner or developer network exhausts its
-API rate limit. An explicitly set `Z3_SYS_BUNDLED_DIR_OVERRIDE` remains
-supported and must contain `src/api/z3.h`.
+the full path to `z3.h`. Local clean builds use the unauthenticated GitHub API
+unless `READ_ONLY_GITHUB_TOKEN` is set.
 
 The lane uses `mise run --skip-tools windows:*` because Windows Rust comes from
 rustup and linking comes from Visual Studio Build Tools. Mise orchestrates the
@@ -114,17 +110,15 @@ Spectre-mitigated libraries, host-native Clang tools, CMake tools, and an
 ARM64-capable Windows SDK. Clang provides `libclang.dll` for `bindgen` and
 `clang-cl.exe` for ARM64 crypto dependencies. During x64-to-ARM64 check/build,
 the wrapper discovers and adds the Visual Studio-bundled Ninja to `PATH` for
-native dependencies. It lets `cmake-rs` select the Visual Studio ARM64
-generator with native MSVC `cl.exe` for bundled Z3 so the Z3 build does not
-inherit the crypto crates' compiler requirement. Z3 stays on the Visual Studio
-generator because `z3-sys` emits an MSBuild-only `-m` argument that Ninja
-rejects. Artifact hashing uses .NET SHA256 directly because module autoloading
-in the mise-launched Windows PowerShell process is not guaranteed.
+native dependencies. Z3 uses the official prebuilt ARM64 static library, so it
+does not inherit compiler settings from those native dependencies. Artifact
+hashing uses .NET SHA256 directly because module autoloading in the
+mise-launched Windows PowerShell process is not guaranteed.
 
 The wrapper defaults Cargo compilation to four jobs. Set
 `OPENSHELL_WINDOWS_BUILD_JOBS` to a positive integer to override that limit.
 A host-local mutex serializes wrapper-owned Cargo commands so concurrent
-pre-commit tasks do not multiply the process count while bundled Z3 compiles.
+pre-commit tasks do not multiply the compiler process count.
 The wrapper does not set `CL` or `_CL_`: those variables are also consumed by
 `clang-cl`, where MSVC's `/MP` option can be interpreted as an input file and
 break ARM64 crypto dependency builds.
