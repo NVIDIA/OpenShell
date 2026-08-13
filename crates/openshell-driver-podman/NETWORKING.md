@@ -330,6 +330,11 @@ value as disabling implicit search domains; direct bridge aliases still resolve
 through aardvark-dns. This keeps libc from expanding a policy endpoint into an
 unauthorized `<endpoint>.dns.podman` query after the exact lookup.
 
+The spec also sets the resolver option `use-vc`, directing libc through the
+policy DNS TCP listener. Rootless Podman's nested UDP REDIRECT path delivers
+queries to the supervisor but can lose the translated reply; TCP avoids that
+runtime-specific return-path failure while preserving policy DNS behavior.
+
 A tmpfs is mounted at `/run/netns` in the container spec so the supervisor can
 create named network namespaces. In rootless Podman this directory does not
 exist on the host, so a private tmpfs gives the supervisor its own writable

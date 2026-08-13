@@ -249,7 +249,9 @@ Key points:
   endpoints, the supervisor installs namespace-local DNS listeners, synthetic
   routes, and TCP redirect rules before starting the workload. The container
   disables Podman's implicit DNS search suffix so policy DNS evaluates the
-  exact endpoint name requested by the workload.
+  exact endpoint name requested by the workload, and asks libc to use the
+  policy DNS TCP listener to avoid rootless Podman's nested UDP NAT return
+  path.
 - Port publishing: the container spec still requests `host_port: 0` for the
   configured SSH port. The gateway SSH tunnel uses the supervisor relay rather
   than connecting directly to the published port.
