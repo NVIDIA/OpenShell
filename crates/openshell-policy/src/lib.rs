@@ -995,10 +995,10 @@ impl Default for SandboxIdentityLimits {
 impl SandboxIdentityLimits {
     /// Build limits from operator-configured minima, keeping the default max.
     #[must_use]
-    pub const fn from_mins(min_uid: u32, min_gid: u32) -> Self {
+    pub const fn from_mins(uid: u32, gid: u32) -> Self {
         Self {
-            min_uid,
-            min_gid,
+            min_uid: uid,
+            min_gid: gid,
             max: MAX_SANDBOX_UID,
         }
     }
@@ -1033,7 +1033,7 @@ fn min_from_env(name: &str) -> u32 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
-        .filter(|&value| value >= 1 && value <= MAX_SANDBOX_UID)
+        .filter(|&value| (1..=MAX_SANDBOX_UID).contains(&value))
         .unwrap_or(MIN_SANDBOX_UID)
 }
 
