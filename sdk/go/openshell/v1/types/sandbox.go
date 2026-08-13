@@ -38,8 +38,8 @@ type SandboxTemplate struct {
 	Labels           map[string]string
 	Annotations      map[string]string
 	Environment      map[string]string
-	Resources        map[string]any
 	UserNamespaces   *bool
+	Resources        map[string]any
 	DriverConfig     map[string]any
 }
 

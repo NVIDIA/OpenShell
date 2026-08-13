@@ -11,9 +11,10 @@ use openshell_core::proto::compute::v1::{
     DriverSandbox, GatewayListenerRequirement, GetCapabilitiesRequest, GetCapabilitiesResponse,
     GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
     GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
+    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    gateway_listener_requirement::Selector,
 };
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -48,6 +49,10 @@ pub enum FakeComputeDriverCall {
         sandbox: Option<DriverSandbox>,
     },
     StopSandbox {
+        sandbox_id: String,
+        sandbox_name: String,
+    },
+    StartSandbox {
         sandbox_id: String,
         sandbox_name: String,
     },
@@ -342,6 +347,21 @@ impl ComputeDriver for FakeComputeDriver {
             });
         });
         Ok(Response::new(StopSandboxResponse {}))
+    }
+
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        self.record_traceparent(request.metadata());
+        let request = request.into_inner();
+        self.with_state(|state| {
+            state.calls.push(FakeComputeDriverCall::StartSandbox {
+                sandbox_id: request.sandbox_id,
+                sandbox_name: request.sandbox_name,
+            });
+        });
+        Ok(Response::new(StartSandboxResponse {}))
     }
 
     async fn delete_sandbox(

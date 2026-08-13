@@ -61,16 +61,7 @@ const (
 // ConfigInterface defines operations for reading and updating gateway and
 // sandbox configuration.
 type ConfigInterface interface {
-	// GetSandbox retrieves the full configuration state for a sandbox,
-	// including policy, effective settings, and revision metadata.
-	// The sandbox is identified by name; the SDK resolves it to an ID internally.
 	GetSandbox(ctx context.Context, workspace, sandboxName string) (*SandboxConfig, error)
-
-	// GetGateway retrieves gateway-global settings.
 	GetGateway(ctx context.Context) (*GatewayConfig, error)
-
-	// Update applies a configuration mutation. For sandbox-scoped updates,
-	// set ConfigUpdate.Name to the sandbox name. For global-scoped updates,
-	// set ConfigUpdate.Global to true.
 	Update(ctx context.Context, workspace string, update *ConfigUpdate) (*ConfigUpdateResult, error)
 }

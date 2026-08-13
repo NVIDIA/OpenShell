@@ -5,7 +5,7 @@
 //
 // The SDK follows the Kubernetes client-go sub-client pattern: a single Client
 // provides typed accessors for each resource domain (Sandboxes, Providers, Exec,
-// Files, Health, Services, SSH, TCP, Config). All operations accept a context.Context and return idiomatic
+// Files, Health, Services, SSH, TCP, Config, Policy, Workspaces, Inference). All operations accept a context.Context and return idiomatic
 // Go types. Proto-generated types never appear in the public API.
 //
 // # Quick Start
@@ -34,7 +34,7 @@
 //	    log.Fatal(err)
 //	}
 //
-// # Command Execution (available in a future release)
+// # Command Execution
 //
 //	result, err := client.Exec().Run(ctx, "default", sandbox.Name, []string{"echo", "hello"}, v1.ExecOptions{})
 //	if err != nil {
@@ -76,7 +76,7 @@
 //	}
 //	// channel closes automatically after Ready or Error
 //
-// # Service Exposure (available in a future release)
+// # Service Exposure
 //
 // Expose an HTTP service running inside a sandbox and retrieve its public URL:
 //
@@ -94,7 +94,7 @@
 //	    fmt.Printf("  %s → port %d (URL: %s)\n", ep.ServiceName, ep.TargetPort, ep.URL)
 //	}
 //
-// # Provider Profiles (available in a future release)
+// # Provider Profiles
 //
 // List available provider profiles and import new ones:
 //
@@ -119,7 +119,7 @@
 //	    fmt.Printf("[%s] %s: %s\n", d.Severity, d.Field, d.Message)
 //	}
 //
-// # Credential Refresh (available in a future release)
+// # Credential Refresh
 //
 // Configure gateway-owned credential refresh for a provider:
 //
@@ -192,7 +192,7 @@
 //	    "x-proxy-key": "proxy-secret",
 //	})
 //
-// # SSH Session Management (available in a future release)
+// # SSH Session Management
 //
 // Create an SSH session for a sandbox and use the returned connection details.
 // Note: CreateSession accepts a sandbox ID, not a name. For name-based access
@@ -213,7 +213,7 @@
 //	}
 //	fmt.Printf("Session revoked: %v\n", revoked)
 //
-// # TCP Port Forwarding (available in a future release)
+// # TCP Port Forwarding
 //
 // Forward a local connection to a port inside a sandbox:
 //
@@ -242,7 +242,7 @@
 //	    v1.WithForwardServiceID("billing-db"),
 //	)
 //
-// # SSH Tunneling (available in a future release)
+// # SSH Tunneling
 //
 // Create an SSH tunnel to a sandbox port in a single call. Tunnel combines
 // session creation, TCP forwarding with an SSH relay target, and automatic
@@ -300,7 +300,7 @@
 //	    },
 //	}, nil)
 //
-// Replace the full policy at runtime via configuration update (available in a future release):
+// Replace the full policy at runtime via configuration update:
 //
 //	result, err := client.Config().Update(ctx, "default", &v1.ConfigUpdate{
 //	    Name: "secure-sandbox",
@@ -312,7 +312,7 @@
 //	    },
 //	})
 //
-// Read a policy back from revision history (available in a future release):
+// Read a policy back from revision history:
 //
 //	revisions, err := client.Policy().List(ctx, "default")
 //	if err != nil {
@@ -324,7 +324,93 @@
 //	    }
 //	}
 //
-// # Configuration Management (available in a future release)
+// # Global Policy
+//
+// List gateway-global policy revisions (no sandbox name or workspace needed):
+//
+//	revisions, err := client.Policy().List(ctx, "", v1.WithListGlobal(true))
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	for _, rev := range revisions {
+//	    fmt.Printf("Global v%d: %s\n", rev.Version, rev.Status)
+//	}
+//
+// Get the status of a specific global policy version:
+//
+//	status, err := client.Policy().GetStatus(ctx, "", "",
+//	    v1.WithStatusGlobal(true), v1.WithVersion(3),
+//	)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	fmt.Printf("Version %d status: %s\n", status.Revision.Version, status.Revision.Status)
+//
+// # Workspace Management
+//
+// Create and manage workspaces for multi-tenant resource isolation:
+//
+//	ws, err := client.Workspaces().Create(ctx, "team-alpha", map[string]string{
+//	    "team": "alpha",
+//	    "env":  "production",
+//	})
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	fmt.Printf("Workspace %s created (phase: %s)\n", ws.Name, ws.Phase)
+//
+//	workspaces, err := client.Workspaces().List(ctx)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	for _, w := range workspaces {
+//	    fmt.Printf("  %s (phase: %s)\n", w.Name, w.Phase)
+//	}
+//
+// # Workspace Members
+//
+// Manage workspace membership with role-based access:
+//
+//	member, err := client.Workspaces().AddMember(ctx, "team-alpha",
+//	    "alice@example.com", v1.WorkspaceRoleAdmin)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	fmt.Printf("Added %s as %s\n", member.PrincipalSubject, member.Role)
+//
+//	members, err := client.Workspaces().ListMembers(ctx, "team-alpha")
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	for _, m := range members {
+//	    fmt.Printf("  %s (%s)\n", m.PrincipalSubject, m.Role)
+//	}
+//
+// # Gateway Info
+//
+// Query gateway metadata and compute driver capabilities:
+//
+//	info, err := client.Health().GetGatewayInfo(ctx)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	fmt.Printf("Gateway %s (status: %s)\n", info.Version, info.Status)
+//	for _, d := range info.ComputeDrivers {
+//	    fmt.Printf("  Driver: %s %s\n", d.DriverName, d.DriverVersion)
+//	}
+//
+// # Current User
+//
+// Determine the identity of the authenticated caller:
+//
+//	user, err := client.Health().GetCurrentUser(ctx)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	fmt.Printf("Logged in as %s (%s)\n", user.DisplayName, user.Subject)
+//	fmt.Printf("Roles: %v, Scopes: %v\n", user.Roles, user.Scopes)
+//
+// # Configuration Management
 //
 // Read sandbox and gateway configuration, and update settings:
 //
@@ -355,4 +441,31 @@
 //	    log.Fatal(err)
 //	}
 //	fmt.Printf("New settings revision: %d\n", result.SettingsRevision)
+//
+// # Inference Route Management
+//
+// Configure workspace-scoped inference routing to control how inference
+// requests are forwarded to upstream providers:
+//
+//	route, err := client.Inference().SetRoute(ctx, "my-workspace", &v1.InferenceRouteConfig{
+//	    ProviderName: "openai",
+//	    ModelID:      "gpt-4",
+//	    RouteName:    "",  // empty string = default route
+//	    TimeoutSecs:  120,
+//	})
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	fmt.Printf("Route v%d: %s/%s\n", route.Version, route.ProviderName, route.ModelID)
+//
+//	route, err = client.Inference().GetRoute(ctx, "my-workspace", "")
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	fmt.Printf("Provider: %s, Model: %s\n", route.ProviderName, route.ModelID)
+//
+//	err = client.Inference().DeleteRoute(ctx, "my-workspace", "")
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 package v1

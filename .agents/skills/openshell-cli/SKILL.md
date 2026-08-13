@@ -298,6 +298,21 @@ openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 openshell sandbox delete --all
 ```
 
+### Stop and start sandboxes
+
+Use stop to halt compute while retaining the sandbox and its persistent
+workspace:
+
+```bash
+openshell sandbox stop [name]
+openshell sandbox start [name]
+```
+
+Both commands default to the last-used sandbox. Stop stops background
+forwards and waits for `Stopped`; start waits for `Ready`. Connect, exec,
+file transfer, forwarding, and exposed services are unavailable while
+stopped. Delete remains the operation that removes retained state.
+
 ---
 
 ## Workflow 4: Policy Iteration Loop
@@ -669,7 +684,7 @@ The CLI help is always authoritative. If the help output contradicts this skill,
 
 ```bash
 $ openshell sandbox --help
-# Shows: create, get, list, delete, exec, connect, upload, download, ssh-config, provider
+# Shows: create, get, list, stop, start, delete, exec, connect, upload, download, ssh-config, provider
 
 $ openshell sandbox upload --help
 # Shows: positional arguments (name, path, dest), usage examples
@@ -691,6 +706,8 @@ $ openshell sandbox upload --help
 | Create sandbox with GPUs | `openshell sandbox create --gpu 1` |
 | Create with custom policy | `openshell sandbox create --policy ./p.yaml` |
 | Connect to sandbox | `openshell sandbox connect <name>` |
+| Stop sandbox compute | `openshell sandbox stop [name]` |
+| Start sandbox compute | `openshell sandbox start [name]` |
 | Execute in sandbox | `openshell sandbox exec --name <name> -- <command>` |
 | Stream live logs | `openshell logs <name> --tail` |
 | Incremental policy update | `openshell policy update <name> --add-endpoint host:443:read-only:rest:enforce --binary /usr/bin/curl --wait` |

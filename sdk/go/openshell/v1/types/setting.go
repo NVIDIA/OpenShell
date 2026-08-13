@@ -69,6 +69,9 @@ type SandboxConfig struct {
 	GlobalPolicyVersion uint32
 	// ProviderEnvRevision is the fingerprint for provider credential inputs.
 	ProviderEnvRevision uint64
+	// PolicyValidationFailureMode is the gateway-configured posture for rejected
+	// policy generations ("fail_closed" or "retain_last_valid").
+	PolicyValidationFailureMode string
 }
 
 // GatewayConfig represents gateway-global settings.
@@ -99,6 +102,8 @@ type ConfigUpdate struct {
 	MergeOperations []PolicyMergeOperation
 	// ExpectedResourceVersion is for optimistic concurrency (0 = skip check).
 	ExpectedResourceVersion uint64
+	// Annotations is caller-provided metadata for sandbox-scoped updates.
+	Annotations map[string]string
 }
 
 // ConfigUpdateResult holds the result of a configuration update operation.
@@ -112,4 +117,6 @@ type ConfigUpdateResult struct {
 	SettingsRevision uint64
 	// Deleted is true when a setting delete removed an existing key.
 	Deleted bool
+	// Annotations contains sandbox metadata annotations after the update.
+	Annotations map[string]string
 }

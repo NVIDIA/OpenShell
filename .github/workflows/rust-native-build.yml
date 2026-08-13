@@ -198,7 +198,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: rust-native-${{ inputs.component }}-${{ inputs.arch }}${{ inputs.component == 'sandbox' && format('-{0}', inputs['supervisor-libc']) || '' }}-zig-wrapper-${{ hashFiles('tasks/scripts/setup-zig-cc-wrapper.sh') }}
           cache-directories: .cache/sccache

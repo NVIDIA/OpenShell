@@ -74,6 +74,7 @@ fn compute_driver_rpc_operation(path: &str) -> (&'static str, &'static str) {
         Some("GetSandbox") => ("driver.get_sandbox", "get_sandbox"),
         Some("ListSandboxes") => ("driver.list_sandboxes", "list_sandboxes"),
         Some("StopSandbox") => ("driver.stop_sandbox", "stop_sandbox"),
+        Some("StartSandbox") => ("driver.start_sandbox", "start_sandbox"),
         Some("DeleteSandbox") => ("driver.delete_sandbox", "delete_sandbox"),
         Some("WatchSandboxes") => ("driver.watch_sandboxes", "watch_sandboxes"),
         _ => ("driver.unknown", "unknown"),
@@ -177,6 +178,7 @@ mod tests {
             ("GetSandbox", "driver.get_sandbox", "get_sandbox"),
             ("ListSandboxes", "driver.list_sandboxes", "list_sandboxes"),
             ("StopSandbox", "driver.stop_sandbox", "stop_sandbox"),
+            ("StartSandbox", "driver.start_sandbox", "start_sandbox"),
             ("DeleteSandbox", "driver.delete_sandbox", "delete_sandbox"),
             (
                 "WatchSandboxes",

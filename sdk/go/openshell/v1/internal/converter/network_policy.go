@@ -80,10 +80,7 @@ func policyNetworkEndpointFromProto(ep *sbv1.NetworkEndpoint) types.PolicyNetwor
 		CredentialSigning:            ep.GetCredentialSigning(),
 		SigningService:               ep.GetSigningService(),
 		SigningRegion:                ep.GetSigningRegion(),
-		JsonRpcMaxBodyBytes:          ep.GetJsonRpcMaxBodyBytes(),
-	}
-	if mcp := ep.GetMcp(); mcp != nil {
-		result.Mcp = mcpOptionsFromProto(mcp)
+		JSONRPCMaxBodyBytes:          ep.GetJsonRpcMaxBodyBytes(),
 	}
 	if binding := ep.GetCredentialBinding(); binding != nil {
 		result.CredentialBinding = &types.NetworkCredentialBinding{
@@ -121,6 +118,7 @@ func policyNetworkEndpointFromProto(ep *sbv1.NetworkEndpoint) types.PolicyNetwor
 			}
 		}
 	}
+	result.Mcp = mcpOptionsFromProto(ep.GetMcp())
 	return result
 }
 
@@ -142,10 +140,7 @@ func policyNetworkEndpointToProto(ep *types.PolicyNetworkEndpoint) *sbv1.Network
 		CredentialSigning:            ep.CredentialSigning,
 		SigningService:               ep.SigningService,
 		SigningRegion:                ep.SigningRegion,
-		JsonRpcMaxBodyBytes:          ep.JsonRpcMaxBodyBytes,
-	}
-	if ep.Mcp != nil {
-		result.Mcp = mcpOptionsToProto(ep.Mcp)
+		JsonRpcMaxBodyBytes:          ep.JSONRPCMaxBodyBytes,
 	}
 	if ep.CredentialBinding != nil {
 		result.CredentialBinding = &sbv1.NetworkCredentialBinding{
@@ -177,7 +172,30 @@ func policyNetworkEndpointToProto(ep *types.PolicyNetworkEndpoint) *sbv1.Network
 			result.GraphqlPersistedQueries[k] = graphqlOperationToProto(&v)
 		}
 	}
+	result.Mcp = mcpOptionsToProto(ep.Mcp)
 	return result
+}
+
+// --- McpOptions ---
+
+func mcpOptionsFromProto(m *sbv1.McpOptions) *types.McpOptions {
+	if m == nil {
+		return nil
+	}
+	return &types.McpOptions{
+		StrictToolNames:         CopyBoolPtr(m.StrictToolNames),
+		AllowAllKnownMcpMethods: CopyBoolPtr(m.AllowAllKnownMcpMethods),
+	}
+}
+
+func mcpOptionsToProto(m *types.McpOptions) *sbv1.McpOptions {
+	if m == nil {
+		return nil
+	}
+	return &sbv1.McpOptions{
+		StrictToolNames:         CopyBoolPtr(m.StrictToolNames),
+		AllowAllKnownMcpMethods: CopyBoolPtr(m.AllowAllKnownMcpMethods),
+	}
 }
 
 // --- L7Rule ---
@@ -227,19 +245,16 @@ func l7RuleToProto(r *types.L7Rule) *sbv1.L7Rule {
 // --- L7DenyRule ---
 
 func l7DenyRuleFromProto(r *sbv1.L7DenyRule) types.L7DenyRule {
-	result := types.L7DenyRule{
+	return types.L7DenyRule{
 		Method:        r.GetMethod(),
 		Path:          r.GetPath(),
 		Command:       r.GetCommand(),
 		OperationType: r.GetOperationType(),
 		OperationName: r.GetOperationName(),
 		Fields:        CopyStringSlice(r.GetFields()),
-		Query:         l7QueryMapFromProtoDeny(r.GetQuery()),
+		Query:         l7QueryMapFromProto(r.GetQuery()),
+		Params:        l7QueryMapFromProto(r.GetParams()),
 	}
-	if p := r.GetParams(); len(p) > 0 {
-		result.Params = l7QueryMapFromProto(p)
-	}
-	return result
 }
 
 func l7DenyRuleToProto(r *types.L7DenyRule) *sbv1.L7DenyRule {
@@ -252,7 +267,7 @@ func l7DenyRuleToProto(r *types.L7DenyRule) *sbv1.L7DenyRule {
 		Fields:        CopyStringSlice(r.Fields),
 	}
 	if len(r.Query) > 0 {
-		result.Query = l7QueryMapToProtoDeny(r.Query)
+		result.Query = l7QueryMapToProto(r.Query)
 	}
 	if len(r.Params) > 0 {
 		result.Params = l7QueryMapToProto(r.Params)
@@ -292,15 +307,6 @@ func l7QueryMapToProto(m map[string]types.L7QueryMatcher) map[string]*sbv1.L7Que
 	return result
 }
 
-// L7DenyRule uses the same L7QueryMatcher proto type but on a different message.
-func l7QueryMapFromProtoDeny(m map[string]*sbv1.L7QueryMatcher) map[string]types.L7QueryMatcher {
-	return l7QueryMapFromProto(m)
-}
-
-func l7QueryMapToProtoDeny(m map[string]types.L7QueryMatcher) map[string]*sbv1.L7QueryMatcher {
-	return l7QueryMapToProto(m)
-}
-
 // --- GraphqlOperation ---
 
 func graphqlOperationFromProto(op *sbv1.GraphqlOperation) types.GraphqlOperation {
@@ -316,27 +322,5 @@ func graphqlOperationToProto(op *types.GraphqlOperation) *sbv1.GraphqlOperation 
 		OperationType: op.OperationType,
 		OperationName: op.OperationName,
 		Fields:        CopyStringSlice(op.Fields),
-	}
-}
-
-// --- McpOptions ---
-
-func mcpOptionsFromProto(m *sbv1.McpOptions) *types.McpOptions {
-	if m == nil {
-		return nil
-	}
-	return &types.McpOptions{
-		StrictToolNames:         m.StrictToolNames,
-		AllowAllKnownMcpMethods: m.AllowAllKnownMcpMethods,
-	}
-}
-
-func mcpOptionsToProto(m *types.McpOptions) *sbv1.McpOptions {
-	if m == nil {
-		return nil
-	}
-	return &sbv1.McpOptions{
-		StrictToolNames:         m.StrictToolNames,
-		AllowAllKnownMcpMethods: m.AllowAllKnownMcpMethods,
 	}
 }

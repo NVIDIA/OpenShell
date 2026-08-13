@@ -8,9 +8,10 @@ use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
-    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -127,6 +128,21 @@ impl ComputeDriver for ComputeDriverService {
         Ok(Response::new(StopSandboxResponse {}))
     }
 
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        let request = request.into_inner();
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        self.driver
+            .start_sandbox(&request.sandbox_id)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(StartSandboxResponse {}))
+    }
+
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
@@ -179,6 +195,12 @@ mod tests {
     fn already_exists_driver_errors_map_to_already_exists_status() {
         let status: Status = ComputeDriverError::AlreadyExists.into();
         assert_eq!(status.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[test]
+    fn not_found_driver_errors_map_to_not_found_status() {
+        let status: Status = ComputeDriverError::NotFound.into();
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
     fn test_service(socket_path: PathBuf) -> ComputeDriverService {

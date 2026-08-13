@@ -30,14 +30,69 @@ type ProviderProfile struct {
 	InferenceCapable bool
 	Discovery        ProfileDiscovery
 	ResourceVersion  uint64
+	Annotations      map[string]string
+	Source           string
+	Scope            string
 }
 
 // ProfileCredential defines a single credential required by a provider profile.
 type ProfileCredential struct {
+	Name         string
+	Description  string
+	EnvVars      []string
+	Required     bool
+	Secret       bool
+	Refresh      *ProfileCredentialRefresh
+	AuthStyle    string
+	HeaderName   string
+	QueryParam   string
+	PathTemplate string
+	TokenGrant   *CredentialTokenGrant
+}
+
+// ProfileCredentialRefresh declares how a profile credential is refreshed.
+type ProfileCredentialRefresh struct {
+	Strategy             RefreshStrategy
+	TokenURL             string
+	Scopes               []string
+	RefreshBeforeSeconds int64
+	MaxLifetimeSeconds   int64
+	Material             []ProfileCredentialRefreshMaterial
+	AdditionalOutputs    []ProfileCredentialRefreshOutput
+}
+
+// ProfileCredentialRefreshMaterial declares one input required by a refresh strategy.
+type ProfileCredentialRefreshMaterial struct {
 	Name        string
 	Description string
 	Required    bool
 	Secret      bool
+}
+
+// ProfileCredentialRefreshOutput maps a minted output to another credential.
+type ProfileCredentialRefreshOutput struct {
+	Output     string
+	Credential string
+}
+
+// CredentialTokenGrant configures dynamic credential acquisition via OAuth2 grant.
+type CredentialTokenGrant struct {
+	TokenEndpoint       string
+	Audience            string
+	JWTSVIDAudience     string
+	Scopes              []string
+	CacheTTLSeconds     int64
+	AudienceOverrides   []TokenGrantAudienceOverride
+	ClientAssertionType string
+}
+
+// TokenGrantAudienceOverride selects an endpoint-specific resource audience.
+type TokenGrantAudienceOverride struct {
+	Host     string
+	Port     uint32
+	Path     string
+	Audience string
+	Scopes   []string
 }
 
 // NetworkEndpoint describes a network endpoint provided by a profile.

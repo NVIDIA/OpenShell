@@ -17,6 +17,9 @@ const (
 	SandboxError        = types.SandboxError
 	SandboxDeleting     = types.SandboxDeleting
 	SandboxUnknown      = types.SandboxUnknown
+	SandboxStopping     = types.SandboxStopping
+	SandboxStopped      = types.SandboxStopped
+	SandboxStarting     = types.SandboxStarting
 )
 
 // EventType classifies watch events.
@@ -41,6 +44,3 @@ const (
 
 // TLSConfig holds TLS connection settings.
 type TLSConfig = types.TLSConfig
-
-// RetryPolicy configures automatic retry behavior for failed RPCs.
-type RetryPolicy = types.RetryPolicy

@@ -8,9 +8,10 @@ use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
-    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
+    compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -112,11 +113,32 @@ impl ComputeDriver for ComputeDriverService {
 
     async fn stop_sandbox(
         &self,
-        _request: Request<StopSandboxRequest>,
+        request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
-        Err(Status::unimplemented(
-            "stop sandbox is not implemented by the kubernetes compute driver",
-        ))
+        let request = request.into_inner();
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        self.driver
+            .stop_sandbox(&request.sandbox_id)
+            .await
+            .map_err(kubernetes_lifecycle_status)?;
+        Ok(Response::new(StopSandboxResponse {}))
+    }
+
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        let request = request.into_inner();
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        self.driver
+            .start_sandbox(&request.sandbox_id)
+            .await
+            .map_err(kubernetes_lifecycle_status)?;
+        Ok(Response::new(StartSandboxResponse {}))
     }
 
     async fn delete_sandbox(
@@ -149,6 +171,14 @@ impl ComputeDriver for ComputeDriverService {
             .map_err(Status::internal)?;
         let stream = stream.map(|item| item.map_err(|err| Status::internal(err.to_string())));
         Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+fn kubernetes_lifecycle_status(message: String) -> Status {
+    if message == "sandbox not found" {
+        Status::not_found(message)
+    } else {
+        Status::internal(message)
     }
 }
 

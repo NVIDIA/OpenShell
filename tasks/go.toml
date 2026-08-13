@@ -104,6 +104,9 @@ run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
+SDK_ROOT=$(pwd -P)
+REPO_ROOT=$(cd ../.. && pwd -P)
+
 for tool in buf protoc-gen-go protoc-gen-go-grpc; do
   if ! command -v "$tool" &>/dev/null; then
     echo "ERROR: $tool not found. Run 'mise install' to install it."
@@ -111,16 +114,23 @@ for tool in buf protoc-gen-go protoc-gen-go-grpc; do
   fi
 done
 
+if find proto -maxdepth 1 -name '*.proto' -print -quit | grep -q .; then
+  echo "ERROR: sdk/go/proto must contain generated bindings only."
+  echo "Proto sources belong in the repository root proto/ directory."
+  exit 1
+fi
+
 # Clean previous output before regeneration
 find proto -name '*.pb.go' -delete 2>/dev/null || true
+find proto -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
-buf generate
+(cd "$REPO_ROOT" && buf generate --template "$SDK_ROOT/buf.gen.yaml")
 
 echo "Proto generation complete."
 echo "Generated packages:"
-for pkg in openshellv1 datamodelv1 sandboxv1 optionsv1; do
-  count=$(find "proto/$pkg" -name '*.go' 2>/dev/null | wc -l | tr -d ' ')
-  echo "  proto/$pkg/: $count files"
+for pkg_dir in proto/*/; do
+  count=$(find "$pkg_dir" -maxdepth 1 -name '*.go' | wc -l | tr -d ' ')
+  echo "  $pkg_dir: $count files"
 done
 """
 hide = true
@@ -132,6 +142,9 @@ run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
+SDK_ROOT=$(pwd -P)
+REPO_ROOT=$(cd ../.. && pwd -P)
+
 for tool in buf protoc-gen-go protoc-gen-go-grpc; do
   if ! command -v "$tool" &>/dev/null; then
     echo "ERROR: $tool not found. Run 'mise install' to install it."
@@ -142,13 +155,17 @@ done
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-# Generate to temp directory with adjusted output path
-sed "s|out: \\.|out: $WORK_DIR|" buf.gen.yaml > "$WORK_DIR/buf.gen.yaml"
-buf generate --template "$WORK_DIR/buf.gen.yaml"
+if find proto -maxdepth 1 -name '*.proto' -print -quit | grep -q .; then
+  echo "ERROR: sdk/go/proto contains copied proto sources."
+  echo "Proto sources belong in the repository root proto/ directory."
+  exit 1
+fi
 
-DIFF_OUTPUT=$(diff -r "$WORK_DIR/proto" "proto" \
-  --exclude="*.proto" \
-  2>&1) || true
+# Generate to temp directory with adjusted output path
+CHECK_TEMPLATE=$(sed 's|out: sdk/go|out: '"$WORK_DIR"'|' buf.gen.yaml)
+(cd "$REPO_ROOT" && buf generate --template "$CHECK_TEMPLATE")
+
+DIFF_OUTPUT=$(diff -r "$WORK_DIR/proto" "$SDK_ROOT/proto" 2>&1) || true
 
 if [ -n "$DIFF_OUTPUT" ]; then
   echo "ERROR: Generated proto files are out of date."

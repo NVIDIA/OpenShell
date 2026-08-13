@@ -72,12 +72,15 @@ func TestWatcher_StopClosesChannel(t *testing.T) {
 	}
 }
 
-func TestWatcher_StopIsIdempotent(_ *testing.T) {
+func TestWatcher_StopIsIdempotent(t *testing.T) {
 	src := make(chan Event[string], 10)
 	w := newTestWatcher(src)
 
 	w.Stop()
 	w.Stop() // must not panic
+
+	_, ok := <-w.ResultChan()
+	assert.False(t, ok, "channel should remain closed after second Stop")
 }
 
 func TestWatcher_ErrorEvent(t *testing.T) {

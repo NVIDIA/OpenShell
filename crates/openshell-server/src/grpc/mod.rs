@@ -46,8 +46,9 @@ use openshell_core::proto::{
     RemoveWorkspaceMemberResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
     RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
     RotateProviderCredentialResponse, SandboxResponse, ServiceEndpointResponse, ServiceStatus,
-    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame,
-    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    StartSandboxRequest, StopSandboxRequest, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
+    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
     WatchSandboxRequest, open_shell_server::OpenShell,
 };
@@ -321,6 +322,20 @@ impl OpenShell for OpenShellService {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         sandbox::handle_delete_sandbox(&self.state, request).await
+    }
+
+    async fn stop_sandbox(
+        &self,
+        request: Request<StopSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        sandbox::handle_stop_sandbox(&self.state, request).await
+    }
+
+    async fn start_sandbox(
+        &self,
+        request: Request<StartSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        sandbox::handle_start_sandbox(&self.state, request).await
     }
 
     // --- Exec ---
