@@ -438,6 +438,26 @@ back to an unfiltered upload and prints a warning. Pass `--no-git-ignore` to
 opt into unfiltered uploads explicitly, upload a path outside the Git work
 tree, or force-add the intended files if they should remain Git-aware.
 
+## Stop and Start Sandboxes
+
+Stop compute when you want to retain a sandbox and its persistent workspace
+without keeping its container, pod, or VM running:
+
+```shell
+openshell sandbox stop my-sandbox
+openshell sandbox start my-sandbox
+```
+
+The name is optional and defaults to the last-used sandbox. Stop stops local
+background forwards and waits for the `Stopped` phase. Start waits until the
+same sandbox returns to `Ready`. While stopped, you cannot connect, execute
+commands, transfer files, forward ports, or reach exposed services. Policies,
+provider attachments, settings, service definitions, and persistent workspace
+data remain associated with the sandbox.
+
+Stop and start are idempotent. Delete a stopped sandbox normally when you
+no longer need its retained state.
+
 ## Delete Sandboxes
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.
@@ -454,6 +474,9 @@ Every sandbox moves through a defined set of phases:
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Provisioning | The runtime is setting up the sandbox environment, or the gateway is waiting for the sandbox supervisor to establish its authenticated control session.       |
 | Ready        | The sandbox is running and its supervisor control session is connected. You can connect, execute commands, sync files, and view logs.                          |
+| Stopping     | The gateway accepted a stop request and is stopping compute while retaining persistent state.                                                         |
+| Stopped      | Compute is stopped and access is unavailable. The sandbox record and driver-owned persistent workspace remain.                                       |
+| Starting     | Compute is starting. The sandbox becomes usable only after a fresh supervisor session connects.                                                       |
 | Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                                           |
 | Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |
 

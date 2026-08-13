@@ -142,6 +142,9 @@ func TestSandboxPhaseFromProto(t *testing.T) {
 		{pb.SandboxPhase_SANDBOX_PHASE_ERROR, v1.SandboxError},
 		{pb.SandboxPhase_SANDBOX_PHASE_DELETING, v1.SandboxDeleting},
 		{pb.SandboxPhase_SANDBOX_PHASE_UNKNOWN, v1.SandboxUnknown},
+		{pb.SandboxPhase_SANDBOX_PHASE_STOPPING, v1.SandboxStopping},
+		{pb.SandboxPhase_SANDBOX_PHASE_STOPPED, v1.SandboxStopped},
+		{pb.SandboxPhase_SANDBOX_PHASE_STARTING, v1.SandboxStarting},
 		{pb.SandboxPhase_SANDBOX_PHASE_UNSPECIFIED, v1.SandboxUnknown},
 		{pb.SandboxPhase(999), v1.SandboxUnknown},
 	}
@@ -161,6 +164,9 @@ func TestSandboxPhaseToProto(t *testing.T) {
 		{v1.SandboxError, pb.SandboxPhase_SANDBOX_PHASE_ERROR},
 		{v1.SandboxDeleting, pb.SandboxPhase_SANDBOX_PHASE_DELETING},
 		{v1.SandboxUnknown, pb.SandboxPhase_SANDBOX_PHASE_UNKNOWN},
+		{v1.SandboxStopping, pb.SandboxPhase_SANDBOX_PHASE_STOPPING},
+		{v1.SandboxStopped, pb.SandboxPhase_SANDBOX_PHASE_STOPPED},
+		{v1.SandboxStarting, pb.SandboxPhase_SANDBOX_PHASE_STARTING},
 		{v1.SandboxPhase("bogus"), pb.SandboxPhase_SANDBOX_PHASE_UNKNOWN},
 	}
 

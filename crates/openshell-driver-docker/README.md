@@ -18,6 +18,15 @@ The gateway runs as a host process. The Docker driver creates one container per
 sandbox and starts the `openshell-sandbox` supervisor inside that container. The
 supervisor then creates the nested sandbox namespace for the agent process.
 
+## Stop and Start
+
+Stop stops the managed container without removing it. Docker retains the
+container writable layer, attached volumes, labels, token material, and restart
+policy. Start starts that same container, so files in the resolved OCI
+workspace remain available. A durably stopped sandbox is excluded from
+gateway startup recovery and stays stopped across gateway restarts. Delete
+continues to force-remove the container and clean up driver-owned material.
+
 Before creating the container, the driver inspects the final sandbox image and
 captures its immutable image ID, raw OCI `Config.User`, and OCI
 `Config.WorkingDir`. Container creation uses that image ID, preventing a

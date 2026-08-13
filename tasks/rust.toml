@@ -34,6 +34,15 @@ run = [
 ]
 hide = true
 
+["rust:deny"]
+description = "Check dependencies for all cargo-deny rules"
+run = "cargo deny check"
+
+["rust:deny:policy"]
+description = "Check dependencies for license violations, bans, and source restrictions"
+run = "cargo deny check licenses bans sources"
+
+
 ["rust:verify:telemetry-off"]
 description = "Verify telemetry emission code is compiled out with --no-default-features"
 run = [

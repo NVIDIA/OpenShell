@@ -251,6 +251,14 @@ class SandboxSession:
     def delete(self) -> bool:
         return self._client.delete(self.sandbox.name, workspace=self._workspace)
 
+    def stop(self) -> SandboxRef:
+        self.sandbox = self._client.stop(self.sandbox.name, workspace=self._workspace)
+        return self.sandbox
+
+    def start(self) -> SandboxRef:
+        self.sandbox = self._client.start(self.sandbox.name, workspace=self._workspace)
+        return self.sandbox
+
 
 class SandboxClient:
     """gRPC client for sandbox CRUD and command execution."""
@@ -547,6 +555,20 @@ class SandboxClient:
         )
         return bool(response.deleted)
 
+    def stop(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+        response = self._stub.StopSandbox(
+            openshell_pb2.StopSandboxRequest(name=sandbox_name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return _sandbox_ref(response.sandbox)
+
+    def start(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+        response = self._stub.StartSandbox(
+            openshell_pb2.StartSandboxRequest(name=sandbox_name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return _sandbox_ref(response.sandbox)
+
     def wait_deleted(
         self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 60.0
     ) -> None:
@@ -567,15 +589,45 @@ class SandboxClient:
     def wait_ready(
         self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 300.0
     ) -> SandboxRef:
+        return self._wait_for_phase(
+            sandbox_name,
+            workspace=workspace,
+            target_phase=openshell_pb2.SANDBOX_PHASE_READY,
+            target_name="ready",
+            timeout_seconds=timeout_seconds,
+        )
+
+    def wait_stopped(
+        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 300.0
+    ) -> SandboxRef:
+        return self._wait_for_phase(
+            sandbox_name,
+            workspace=workspace,
+            target_phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
+            target_name="stopped",
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _wait_for_phase(
+        self,
+        sandbox_name: str,
+        *,
+        workspace: str,
+        target_phase: int,
+        target_name: str,
+        timeout_seconds: float,
+    ) -> SandboxRef:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             sandbox = self.get(sandbox_name, workspace=workspace)
-            if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_READY:
+            if sandbox.status.phase == target_phase:
                 return sandbox
             if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
                 raise SandboxError(f"sandbox {sandbox_name} entered error phase")
             time.sleep(1)
-        raise SandboxError(f"sandbox {sandbox_name} was not ready within timeout")
+        raise SandboxError(
+            f"sandbox {sandbox_name} was not {target_name} within timeout"
+        )
 
     def exec_stream(
         self,

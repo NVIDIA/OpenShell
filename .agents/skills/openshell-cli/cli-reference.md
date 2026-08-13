@@ -48,6 +48,8 @@ openshell
 │   ├── create [opts] [-- CMD...]
 │   ├── get [name]
 │   ├── list [opts]
+│   ├── stop [name]
+│   ├── start [name]
 │   ├── delete [name]... [--all]
 │   ├── exec [--name <name>] [opts] -- CMD...
 │   ├── connect [name] [--editor <editor>]
@@ -249,6 +251,17 @@ Show sandbox details and the active policy. Metadata identifies sandbox or globa
 ### `openshell sandbox delete [NAME]...`
 
 Delete one or more named sandboxes, or use `--all`. Deletion stops background port forwards.
+
+### `openshell sandbox stop [name]`
+
+Stop sandbox compute while retaining the sandbox and persistent workspace. The
+name defaults to the last-used sandbox. The command stops background forwards
+and waits for the `Stopped` phase.
+
+### `openshell sandbox start [name]`
+
+Start a stopped sandbox and wait for `Ready`. The name defaults to the
+last-used sandbox.
 
 ### `openshell sandbox exec [OPTIONS] -- COMMAND...`
 

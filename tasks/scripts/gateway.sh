@@ -300,6 +300,16 @@ SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/san
 SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
 GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
+PRIMARY_BIND_IP="127.0.0.1"
+CLI_ENDPOINT_HOST="127.0.0.1"
+
+if [[ "${DRIVER}" == "podman" && "$(uname -s)" == "Darwin" ]]; then
+  # Podman Machine reserves IPv4 loopback for its callback-only listener.
+  # Keep the primary listener distinct while using a hostname that resolves
+  # to IPv6 loopback for local CLI connections.
+  PRIMARY_BIND_IP="::1"
+  CLI_ENDPOINT_HOST="localhost"
+fi
 
 if [[ "${DRIVER}" == "podman" ]]; then
   require_podman_service
@@ -421,7 +431,7 @@ EOF
     ;;
 esac
 
-GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
+GATEWAY_ENDPOINT="http://${CLI_ENDPOINT_HOST}:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
 
 echo "Starting standalone ${DRIVER} gateway..."
@@ -438,6 +448,7 @@ echo
 
 exec "${GATEWAY_BIN}" \
   --config "${CONFIG_PATH}" \
+  --bind-address "${PRIMARY_BIND_IP}" \
   --port "${PORT}" \
   --log-level "${LOG_LEVEL}" \
   --drivers "${DRIVER}" \
