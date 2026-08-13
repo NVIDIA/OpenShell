@@ -4,6 +4,8 @@ on:
 jobs:
   x64:
     runs-on: windows-2025
+    env:
+      READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
@@ -22,9 +24,8 @@ jobs:
           # independent of that unavailable wrapper so target artifacts save.
           RUSTC_WRAPPER: ""
         with:
-          # v2 invalidates the empty archive produced while cargo metadata
-          # could not run without sccache.
-          shared-key: windows-msvc-x64-v2
+          # Keep the prebuilt-Z3 experiment isolated from earlier target caches.
+          shared-key: windows-msvc-x64-prebuilt-z3-v1
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
@@ -36,6 +37,8 @@ jobs:
     # TODO: provision a windows-arm64 self-hosted runner
     runs-on: [self-hosted, windows-arm64]
     if: false # flip to true once the runner is online
+    env:
+      READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
@@ -53,7 +56,7 @@ jobs:
           # unavailable sccache wrapper exported by mise.
           RUSTC_WRAPPER: ""
         with:
-          shared-key: windows-msvc-arm64-v2
+          shared-key: windows-msvc-arm64-prebuilt-z3-v1
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
