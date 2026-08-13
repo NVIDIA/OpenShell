@@ -28,7 +28,7 @@ The Windows build lane is implemented by these tracked files:
 | `tasks/windows.toml` | Mise task entry points for `windows:*` commands. |
 | `tasks/rust.toml`, `tasks/test.toml`, and `tasks/markdown.toml` | Windows routing for compiler-bearing checks, explicit Unix-only test skips, and Markdown dependency setup. |
 | `tasks/scripts/windows-msvc.ps1` | PowerShell wrapper that enters the Visual Studio developer environment and invokes Cargo. |
-| `.github/workflows/windows-msvc.yml` | PR/merge-queue checks and full main/manual GitHub Actions jobs with architecture-specific Rust caches for x64 and future ARM64 Windows validation. |
+| `.github/workflows/windows-msvc.yml` | PR/merge-queue lint and test, main cache seeding, and dependent binary-build jobs with architecture-specific Rust caches for x64 and future ARM64 Windows validation. |
 | `architecture/windows-msvc-build.md` | Design notes and validation contract. |
 | `.agents/skills/build-openshell-mxc-windows/` | This skill and companion reference material. |
 
@@ -191,10 +191,11 @@ order:
 The GitHub Actions jobs layer architecture-specific `Swatinem/rust-cache`
 entries for Cargo registry and dependency target artifacts with sccache's GHA
 backend for cacheable Rust compiler outputs. Failed runs also save their usable
-dependency artifacts. Pull-request mirrors and merge queues run the x64 check;
-pushes to `main` and manual dispatches run x64 check, release build, and full
-workspace tests. Main uses the same cache namespaces and keeps both layers warm
-for pull requests.
+dependency artifacts. Pull-request mirrors and merge queues run Windows Clippy
+and Rust tests. Pushes to `main` and manual dispatches run the same lint and
+test commands in a cache-seed job, followed by a dependent release-binary build
+job. The seed and PR jobs use the same cache namespaces. The binaries are not
+uploaded or published.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
