@@ -13,7 +13,11 @@ The OpenShell SBOM tooling produces source-tree CycloneDX JSON SBOMs using Syft,
 
 SBOMs are **release artifacts only** -- they are generated on demand and not committed to the repository. Output lands in `deploy/sbom/output/` (gitignored).
 
-Release Dev and Release Tag image builds separately embed cargo-auditable metadata in the staged gateway and supervisor binaries. This metadata describes the binary's Rust dependency graph and lets Syft discover Cargo packages from the binary itself. It is not a complete image SBOM and is not an OCI SBOM attestation; publishing such an attestation remains separate work.
+Release Dev and Release Tag image builds separately embed cargo-auditable
+metadata in the staged gateway and supervisor binaries. This metadata describes
+the binary's Rust dependency graph and lets Syft discover Cargo packages from
+the binary itself. It is not a complete image SBOM and is not an OCI SBOM
+attestation; publishing such an attestation remains separate work.
 
 ## Prerequisites
 
