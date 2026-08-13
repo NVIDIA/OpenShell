@@ -40,6 +40,11 @@ on:
         required: false
         type: string
         default: ""
+      auditable:
+        description: "Embed cargo-auditable dependency metadata in the binary"
+        required: false
+        type: boolean
+        default: false
       retention-days:
         description: "Artifact retention period"
         required: false
@@ -265,6 +270,7 @@ jobs:
           mise x -- rustup target add "${{ steps.target.outputs.target }}"
           
           cargo_cmd=(cargo build)
+          cargo_env=()
           build_target="${{ steps.target.outputs.target }}"
           args=()
           
@@ -278,6 +284,13 @@ jobs:
             # accepts -static for *-linux-gnu and links dynamically anyway.
             export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
           fi
+          if [[ "${{ inputs.auditable }}" == "true" ]]; then
+            cargo_cmd=("${cargo_cmd[0]}" auditable "${cargo_cmd[@]:1}")
+            # mise.toml injects RUSTC_WRAPPER=sccache. Unset it after mise has
+            # constructed the environment so it cannot wrap cargo-auditable's
+            # RUSTC_WORKSPACE_WRAPPER and misidentify that wrapper as rustc.
+            cargo_env=(env -u RUSTC_WRAPPER)
+          fi
           args+=(
             --release
             --target "$build_target"
@@ -290,7 +303,7 @@ jobs:
           if [[ -n "${{ steps.version.outputs.cargo_version }}" ]]; then
             export GIT_DIR=/nonexistent
           fi
-          mise x -- "${cargo_cmd[@]}" "${args[@]}"
+          mise x -- "${cargo_env[@]}" "${cargo_cmd[@]}" "${args[@]}"
 
       - name: Verify packaged binary
         run: |
@@ -306,6 +319,22 @@ jobs:
             echo "gateway binary must not depend on shared libz3; enable bundled-z3 for image artifacts" >&2
             exit 1
           fi
+
+      - name: Verify auditable dependency metadata
+        if: inputs.auditable
+        run: |
+          set -euo pipefail
+          BIN="target/${{ steps.target.outputs.target }}/release/${{ steps.target.outputs.binary }}"
+          cargo_packages="$(
+            SYFT_CHECK_FOR_APP_UPDATE=false \
+              mise x -- syft "file:$BIN" -o cyclonedx-json |
+              jq '[.components[]? | select((.purl // "") | startswith("pkg:cargo/"))] | length'
+          )"
+          if [[ "$cargo_packages" -eq 0 ]]; then
+            echo "Syft did not decode any Cargo packages from $BIN" >&2
+            exit 1
+          fi
+          echo "auditable dependency metadata: $cargo_packages Cargo packages"
 
       - name: Verify glibc symbol floor
         if: inputs.component == 'gateway'
