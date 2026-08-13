@@ -963,8 +963,10 @@ fn first_route_overlap(
                 .iter()
                 .copied()
                 .find(|pool| {
-                    route.addr().is_ipv4() == pool.addr().is_ipv4()
-                        && (route.contains(&pool.network()) || pool.contains(&route.network()))
+                    let same_family = route.addr().is_ipv4() == pool.addr().is_ipv4();
+                    let overlaps =
+                        route.contains(&pool.network()) || pool.contains(&route.network());
+                    same_family && overlaps
                 })
                 .map(|pool| (route, pool))
         })

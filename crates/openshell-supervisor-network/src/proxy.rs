@@ -624,19 +624,13 @@ async fn handle_transparent_tcp_connection(
     // generation before correlating endpoint identity or constructing a
     // connector. This prevents combining an old DNS answer with a newer
     // policy decision (or vice versa).
-    let generation_guard =
-        match relay::pin_policy_generation(&opa_engine, decision.policy_generation) {
-            Ok(guard) => guard,
-            Err(_) => {
-                emit_transparent_mapping_denial(
-                    workload_addr,
-                    original,
-                    MappingLookupError::StalePolicy,
-                );
-                emit_activity(&activity_tx, true, "transparent_tcp_mapping");
-                return Ok(());
-            }
-        };
+    let Ok(generation_guard) =
+        relay::pin_policy_generation(&opa_engine, decision.policy_generation)
+    else {
+        emit_transparent_mapping_denial(workload_addr, original, MappingLookupError::StalePolicy);
+        emit_activity(&activity_tx, true, "transparent_tcp_mapping");
+        return Ok(());
+    };
     let mapping = match store.lookup(
         original.ip(),
         original.port(),
@@ -724,10 +718,10 @@ async fn handle_transparent_tcp_connection(
     let binary = decision
         .binary
         .as_ref()
-        .map_or("-".to_string(), |path| path.display().to_string());
+        .map_or_else(|| "-".to_string(), |path| path.display().to_string());
     let pid = decision
         .binary_pid
-        .map_or("-".to_string(), |pid| pid.to_string());
+        .map_or_else(|| "-".to_string(), |pid| pid.to_string());
     ocsf_emit!(build_transparent_tcp_allow_ocsf_event(
         TransparentTcpAllowAudit {
             workload: workload_addr,
@@ -843,13 +837,14 @@ fn original_destination(stream: &TcpStream) -> std::io::Result<SocketAddr> {
         #[allow(unsafe_code)]
         unsafe {
             let mut address: libc::sockaddr_in = std::mem::zeroed();
-            let mut length = size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_in>())
+                .expect("sockaddr_in size fits socklen_t");
             if libc::getsockopt(
                 fd,
                 libc::SOL_IP,
                 80, // SO_ORIGINAL_DST
                 std::ptr::addr_of_mut!(address).cast(),
-                &mut length,
+                std::ptr::addr_of_mut!(length),
             ) != 0
             {
                 return Err(std::io::Error::last_os_error());
@@ -865,13 +860,14 @@ fn original_destination(stream: &TcpStream) -> std::io::Result<SocketAddr> {
     #[allow(unsafe_code)]
     unsafe {
         let mut address: libc::sockaddr_in6 = std::mem::zeroed();
-        let mut length = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+        let mut length = libc::socklen_t::try_from(size_of::<libc::sockaddr_in6>())
+            .expect("sockaddr_in6 size fits socklen_t");
         if libc::getsockopt(
             fd,
             libc::SOL_IPV6,
             80, // IP6T_SO_ORIGINAL_DST
             std::ptr::addr_of_mut!(address).cast(),
-            &mut length,
+            std::ptr::addr_of_mut!(length),
         ) != 0
         {
             return Err(std::io::Error::last_os_error());
@@ -928,10 +924,10 @@ fn emit_transparent_policy_denial(
     let binary = decision
         .binary
         .as_ref()
-        .map_or("-".to_string(), |path| path.display().to_string());
+        .map_or_else(|| "-".to_string(), |path| path.display().to_string());
     let pid = decision
         .binary_pid
-        .map_or("-".to_string(), |pid| pid.to_string());
+        .map_or_else(|| "-".to_string(), |pid| pid.to_string());
     ocsf_emit!(
         NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
