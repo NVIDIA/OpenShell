@@ -153,19 +153,16 @@ The server test-support suite includes the unsupported-driver contract test, so
 CI does not run the focused test task a second time. The focused task remains
 available for local diagnosis.
 
-The cache is partitioned by architecture so incompatible x64 and ARM64 target
-artifacts cannot collide. It does not cache Cargo-installed binaries, which
-also keeps the disabled self-hosted ARM64 scaffold from modifying persistent
-runner tooling.
+The hosted workflow uses an x64-specific cache namespace and does not cache
+Cargo-installed binaries.
 
 The local aggregate `windows:ci` task cross-builds ARM64 on an x64 host. The
 GitHub x64 job runs only the x64 tasks, and native ARM64 tests remain exclusive
 to an ARM64 runner.
 
-The ARM64 job uses the hosted `windows-11-arm` runner but remains disabled
-unless the repository variable `ENABLE_WINDOWS_ARM64` is set to `true`. Before
-enabling it, measure the native runner and extend it to follow the same
-lint/test seed and dependent-build split as x64.
+GitHub Actions currently runs only x64. ARM64 remains available through the
+local `windows:*:arm64` tasks and requires a separate native workflow when the
+project is ready to enable hosted ARM64 validation.
 
 ## Validation Contract
 

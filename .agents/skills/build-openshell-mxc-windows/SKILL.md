@@ -28,7 +28,7 @@ The Windows build lane is implemented by these tracked files:
 | `tasks/windows.toml` | Mise task entry points for `windows:*` commands. |
 | `tasks/rust.toml`, `tasks/test.toml`, and `tasks/markdown.toml` | Windows routing for compiler-bearing checks, explicit Unix-only test skips, and Markdown dependency setup. |
 | `tasks/scripts/windows-msvc.ps1` | PowerShell wrapper that enters the Visual Studio developer environment and invokes Cargo. |
-| `.github/workflows/windows-msvc.yml` | PR/merge-queue lint and test, main cache seeding, dependent binary-build jobs, and opt-in hosted ARM64 validation with architecture-specific Rust caches. |
+| `.github/workflows/windows-msvc.yml` | PR/merge-queue x64 lint and test, main cache seeding, and dependent x64 binary-build jobs. ARM64 remains a local task until it gets a native workflow. |
 | `architecture/windows-msvc-build.md` | Design notes and validation contract. |
 | `.agents/skills/build-openshell-mxc-windows/` | This skill and companion reference material. |
 
