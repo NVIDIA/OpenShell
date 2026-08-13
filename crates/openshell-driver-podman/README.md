@@ -77,7 +77,7 @@ The container spec in `container.rs` sets these security-critical fields:
 |---|---|---|
 | `user` | `0:0` | The supervisor needs root inside the container for namespace creation, proxy setup, Landlock, seccomp, and filesystem preparation. |
 | `cap_drop` | Selected unneeded defaults | Podman's default capability set is already restricted. The driver drops capabilities the supervisor does not need. |
-| `cap_add` | `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYSLOG`, `DAC_READ_SEARCH`, `SETPCAP` | Grants supervisor-only capabilities required for namespace setup, process identity, bypass diagnostics, and child bounding-set cleanup. |
+| `cap_add` | `SYS_ADMIN`, `NET_ADMIN`, `NET_BIND_SERVICE`, `SYS_PTRACE`, `SYSLOG`, `DAC_READ_SEARCH`, `SETPCAP` | Grants supervisor-only capabilities required for namespace setup, policy DNS on port 53, process identity, bypass diagnostics, and child bounding-set cleanup. |
 | `no_new_privileges` | `true` | Prevents privilege escalation after exec. |
 | `seccomp_profile_path` | `unconfined` | The supervisor installs its own policy-aware BPF filter. A container-level profile can block Landlock/seccomp syscalls during setup. |
 | `mounts` | Private tmpfs at `/run/netns` | Lets the supervisor create named network namespaces in rootless Podman. |
@@ -132,6 +132,7 @@ openshell sandbox create \
 |---|---|
 | `SYS_ADMIN` | seccomp filter installation, namespace creation, and Landlock setup. |
 | `NET_ADMIN` | Network namespace veth setup, IP address assignment, routes, and nftables. |
+| `NET_BIND_SERVICE` | Binding policy DNS TCP and UDP listeners to port 53 inside the nested namespace. |
 | `SYS_PTRACE` | Reading `/proc/<pid>/exe` and walking process ancestry for binary identity. |
 | `SYSLOG` | Reading `/dev/kmsg` for bypass-detection diagnostics. |
 | `DAC_READ_SEARCH` | Reading `/proc/<pid>/fd/` across UIDs so the proxy can resolve the binary responsible for a connection. |
@@ -142,7 +143,7 @@ and `FOWNER` capabilities because the supervisor needs them to drop privileges
 and prepare writable sandbox directories. It also keeps `SETPCAP` until child
 setup so `drop_privileges()` can clear the child capability bounding set before
 exec. It drops unneeded defaults such as
-`DAC_OVERRIDE`, `FSETID`, `KILL`, `NET_BIND_SERVICE`, `NET_RAW`, `SETFCAP`,
+`DAC_OVERRIDE`, `FSETID`, `KILL`, `NET_RAW`, `SETFCAP`,
 and `SYS_CHROOT`.
 
 ## Supervisor Sideloading

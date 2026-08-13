@@ -1094,8 +1094,6 @@ pub fn build_container_spec_for_image(
             "FSETID".into(),
             // Not needed: the supervisor does not send signals to arbitrary processes.
             "KILL".into(),
-            // Not needed: the supervisor does not bind privileged ports (<1024).
-            "NET_BIND_SERVICE".into(),
             // Not in Podman's default set but explicitly denied in case the image
             // or runtime adds it; raw sockets are not required.
             "NET_RAW".into(),
@@ -1109,6 +1107,8 @@ pub fn build_container_spec_for_image(
             "SYS_ADMIN".into(),
             // Network namespace veth setup, IP/route configuration.
             "NET_ADMIN".into(),
+            // Policy DNS binds TCP and UDP port 53 inside the nested namespace.
+            "NET_BIND_SERVICE".into(),
             // Reading /proc/<pid>/exe and ancestor walk for process identity in policy.
             "SYS_PTRACE".into(),
             // Reading /dev/kmsg for bypass-detection diagnostics.
@@ -1793,6 +1793,10 @@ mod tests {
             .collect();
         assert!(added.contains(&"SYS_ADMIN"), "missing SYS_ADMIN");
         assert!(added.contains(&"NET_ADMIN"), "missing NET_ADMIN");
+        assert!(
+            added.contains(&"NET_BIND_SERVICE"),
+            "missing NET_BIND_SERVICE for policy DNS port 53"
+        );
         assert!(added.contains(&"SYS_PTRACE"), "missing SYS_PTRACE");
         assert!(added.contains(&"SYSLOG"), "missing SYSLOG");
         assert!(
