@@ -1,8 +1,43 @@
 name: Windows MSVC (build-only)
+
 on:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+
 jobs:
+  pr_metadata:
+    name: Resolve PR metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ github.ref == 'refs/heads/main' || steps.gate.outputs.should_run == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: gate
+        if: github.ref != 'refs/heads/main'
+        uses: ./.github/actions/pr-gate
+
   x64:
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: windows-2025
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
@@ -34,15 +69,20 @@ jobs:
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
-      - run: mise run --skip-tools windows:check:x64
-      - run: mise run --skip-tools windows:build:x64
-      - run: mise run --skip-tools windows:test:x64
-      - run: mise run --skip-tools windows:test:unsupported:x64
+      - name: Check
+        run: mise run --skip-tools windows:check:x64
+      - name: Build release binaries
+        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+        run: mise run --skip-tools windows:build:x64
+      - name: Test
+        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+        run: mise run --skip-tools windows:test:x64
       - name: sccache stats
         if: always()
         run: sccache --show-stats
   arm64:
     # TODO: provision a windows-arm64 self-hosted runner
+    needs: pr_metadata
     runs-on: [self-hosted, windows-arm64]
     if: false # flip to true once the runner is online
     env:
@@ -74,8 +114,11 @@ jobs:
           cache-targets: "true"
           cache-on-failure: "true"
           cache-bin: "false"
-      - run: mise run --skip-tools windows:check:arm64
-      - run: mise run --skip-tools windows:build:arm64
+      - name: Check
+        run: mise run --skip-tools windows:check:arm64
+      - name: Build release binaries
+        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+        run: mise run --skip-tools windows:build:arm64
       - name: sccache stats
         if: always()
         run: sccache --show-stats
