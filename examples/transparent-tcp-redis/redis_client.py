@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+import sys
 
 HOST = "redis.openshell.demo"
 PORT = 6379
@@ -50,7 +51,27 @@ def command(connection: socket.socket, stream, *parts: str):
     return result
 
 
+def expect_connection_blocked(label: str, host: str, port: int) -> None:
+    try:
+        with (
+            socket.create_connection((host, port), timeout=3) as connection,
+            connection.makefile("rb") as stream,
+        ):
+            connection.sendall(encode_command("PING"))
+            response = read_response(stream)
+    except (OSError, RuntimeError) as error:
+        print(f"BLOCKED ({label}): {host}:{port} -> {type(error).__name__}")
+        return
+    raise RuntimeError(
+        f"{label} unexpectedly reached Redis at {host}:{port}: {response!r}"
+    )
+
+
 def main() -> None:
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: redis_client.py REDIS_REAL_IP UNAPPROVED_HOSTNAME")
+    redis_real_ip, unapproved_hostname = sys.argv[1:]
+
     addresses = sorted(
         {item[4][0] for item in socket.getaddrinfo(HOST, PORT, type=socket.SOCK_STREAM)}
     )
@@ -70,6 +91,11 @@ def main() -> None:
         assert command(connection, stream, "SET", KEY, "hello-from-openshell") == "OK"
         assert command(connection, stream, "GET", KEY) == "hello-from-openshell"
         assert command(connection, stream, "DEL", KEY) == 1
+
+    print("\nChecking connections that policy must block...")
+    expect_connection_blocked("unapproved hostname", unapproved_hostname, PORT)
+    expect_connection_blocked("wrong port", HOST, PORT + 1)
+    expect_connection_blocked("direct real-IP dial", redis_real_ip, PORT)
 
     print("transparent TCP Redis demo passed")
 

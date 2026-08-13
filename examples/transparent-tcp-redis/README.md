@@ -9,8 +9,10 @@ The demo:
 2. Creates a sandbox with an endpoint that explicitly uses `protocol: tcp`.
 3. Resolves the policy hostname to an ephemeral synthetic address.
 4. Opens a native TCP socket and runs Redis `PING`, `SET`, `GET`, and `DEL` commands.
-5. Prints the sandbox log stream, including OCSF DNS and TCP decisions.
-6. Deletes the sandbox and Redis container, including after a failure.
+5. Confirms that policy blocks an unapproved hostname, the approved hostname
+   on the wrong port, and a direct connection to Redis's real IP.
+6. Prints the sandbox log stream, including OCSF DNS and TCP decisions.
+7. Deletes the sandbox and Redis container, including after a failure.
 
 OpenShell authorizes the hostname and port before policy DNS publishes the
 synthetic address. When the client connects, OpenShell maps that address back
@@ -45,8 +47,14 @@ PING -> 'PONG'
 SET -> 'OK'
 GET -> 'hello-from-openshell'
 DEL -> 1
+BLOCKED (unapproved hostname): openshell-transparent-tcp-redis-demo:6379 -> gaierror
+BLOCKED (wrong port): redis.openshell.demo:6380 -> RuntimeError
+BLOCKED (direct real-IP dial): 172.x.x.x:6379 -> ConnectionRefusedError
 transparent TCP Redis demo passed
 ```
+
+The exact exception names vary by operating system and network timing. The
+demo fails if any negative check receives a Redis response.
 
 Before cleanup, the demo prints up to 500 recent sandbox log lines. Structured
 security events are marked `[OCSF ]`, making the policy DNS publication and

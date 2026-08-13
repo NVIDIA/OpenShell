@@ -13,6 +13,7 @@ SANDBOX_NAME="${SANDBOX_NAME:-tcp-redis-demo}"
 REDIS_CONTAINER="${REDIS_CONTAINER:-openshell-transparent-tcp-redis-demo}"
 DOCKER_NETWORK="${OPENSHELL_DOCKER_NETWORK:-openshell-docker}"
 REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
+REDIS_REAL_IP=""
 
 SANDBOX_CREATED=0
 REDIS_CREATED=0
@@ -111,6 +112,13 @@ if ! docker exec "$REDIS_CONTAINER" redis-cli ping 2>/dev/null | grep -qx PONG; 
     printf 'Redis did not become ready.\n' >&2
     exit 1
 fi
+REDIS_REAL_IP="$(docker inspect \
+    --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+    "$REDIS_CONTAINER")"
+if [[ -z "$REDIS_REAL_IP" ]]; then
+    printf 'Could not determine the Redis container IP.\n' >&2
+    exit 1
+fi
 
 printf '\nCreating a Docker-backed sandbox with an explicit TCP endpoint policy...\n'
 SANDBOX_CREATED=1
@@ -126,6 +134,6 @@ printf '\nRunning native Redis commands from the sandbox...\n'
 run openshell sandbox exec \
     --name "$SANDBOX_NAME" \
     --no-tty \
-    -- python3 /sandbox/redis_client.py
+    -- python3 /sandbox/redis_client.py "$REDIS_REAL_IP" "$REDIS_CONTAINER"
 
 printf '\nTransparent TCP Redis example completed successfully.\n'
