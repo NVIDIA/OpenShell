@@ -161,10 +161,10 @@ jobs:
         run: sccache --show-stats
 
   arm64:
-    # TODO: provision a windows-arm64 self-hosted runner
+    # Keep native ARM64 validation opt-in until its runtime and cost are measured.
     needs: pr_metadata
-    runs-on: [self-hosted, windows-arm64]
-    if: false # flip to true once the runner is online
+    runs-on: windows-11-arm
+    if: vars.ENABLE_WINDOWS_ARM64 == 'true'
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
       SCCACHE_GHA_ENABLED: "true"
