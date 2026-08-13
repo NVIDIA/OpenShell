@@ -13,6 +13,7 @@ use tempfile::NamedTempFile;
 
 const FIXTURE_ALIAS: &str = "transparent-tcp-fixture";
 const FIXTURE_PORT: u16 = 5432;
+const TRANSPARENT_LISTENER_PORT: u16 = 15001;
 
 fn write_policy() -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|error| format!("create policy: {error}"))?;
@@ -101,16 +102,20 @@ async fn docker_native_tcp_uses_policy_dns_and_fails_closed_on_wrong_port_and_re
     let fixture = SupportContainer::start_python(
         FIXTURE_ALIAS,
         &format!(
-            r#"import socket
-s = socket.socket()
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('0.0.0.0', {FIXTURE_PORT}))
-s.listen()
-while True:
+            r#"import socket, threading
+def serve(port):
+  s = socket.socket()
+  s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+  s.bind(('0.0.0.0', port))
+  s.listen()
+  while True:
     c, _ = s.accept()
     data = c.recv(1024)
     c.sendall(b'native-tcp-ok:' + data)
     c.close()
+
+threading.Thread(target=serve, args=({TRANSPARENT_LISTENER_PORT},), daemon=True).start()
+serve({FIXTURE_PORT})
 "#
         ),
         FIXTURE_PORT,
@@ -154,12 +159,14 @@ def denied(host, port):
 
 assert denied({host:?}, {wrong_port})
 assert denied({real_ip:?}, {port})
+assert denied({real_ip:?}, {transparent_port})
 print('transparent-tcp-e2e-ok')
 "#,
         host = FIXTURE_ALIAS,
         port = FIXTURE_PORT,
         wrong_port = FIXTURE_PORT + 1,
         real_ip = real_ip,
+        transparent_port = TRANSPARENT_LISTENER_PORT,
     );
     let output = match sandbox.exec(&["python3", "-c", &script]).await {
         Ok(output) => output,
@@ -182,13 +189,13 @@ print('transparent-tcp-e2e-ok')
     assert!(output.contains("transparent-tcp-e2e-ok"), "{output}");
 
     let logs = wait_for_sandbox_logs(&sandbox.name, |logs| {
-        logs.contains(&format!("ALLOWED {FIXTURE_ALIAS}:{FIXTURE_PORT}"))
+        logs.contains(&format!("-> {FIXTURE_ALIAS}:{FIXTURE_PORT}"))
             && logs.contains("transparent_tcp_port_mismatch")
     })
     .await
     .expect("wait for sandbox logs");
     assert!(
-        logs.contains(&format!("ALLOWED {FIXTURE_ALIAS}:{FIXTURE_PORT}")),
+        logs.contains(&format!("-> {FIXTURE_ALIAS}:{FIXTURE_PORT}")),
         "{logs}"
     );
     assert!(logs.contains("transparent_tcp_port_mismatch"), "{logs}");

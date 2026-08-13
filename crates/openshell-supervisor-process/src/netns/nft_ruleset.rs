@@ -13,6 +13,11 @@
 //! `ct state` without `nf_conntrack`, `log` without `nf_log`) rolls back the
 //! entire transaction including table/chain creation.
 
+/// Packet mark applied only to synthetic-destination TCP before REDIRECT.
+/// The filter chain uses it to distinguish legitimate redirected listener
+/// traffic from a direct dial to an arbitrary real address on the same port.
+const TRANSPARENT_TCP_MARK: &str = "0x4f535450";
+
 /// A single nft command with metadata about whether it is required.
 pub struct NftCommand {
     /// The nft command arguments (e.g. `["add", "table", "inet", "openshell_bypass"]`).
@@ -277,6 +282,10 @@ pub fn generate_transparent_tcp_commands(
                 "tcp",
                 "dport",
                 "1-65535",
+                "meta",
+                "mark",
+                "set",
+                TRANSPARENT_TCP_MARK,
                 "redirect",
                 "to",
                 &format!(":{transparent_port}"),
@@ -296,6 +305,10 @@ pub fn generate_transparent_tcp_commands(
                 "tcp",
                 "dport",
                 "1-65535",
+                "meta",
+                "mark",
+                "set",
+                TRANSPARENT_TCP_MARK,
                 "redirect",
                 "to",
                 &format!(":{transparent_port}"),
@@ -347,6 +360,9 @@ pub fn generate_transparent_tcp_commands(
                 "inet",
                 "openshell_bypass",
                 "output",
+                "meta",
+                "mark",
+                TRANSPARENT_TCP_MARK,
                 "tcp",
                 "dport",
                 &transparent_port.to_string(),
@@ -604,12 +620,32 @@ mod tests {
         assert!(text.contains("udp dport 53 redirect to :53"));
         assert!(text.contains("tcp dport 53 redirect to :53"));
         assert!(text.contains("udp dport 53 accept"));
-        assert!(text.contains("ip daddr 198.18.0.0/24 tcp dport 1-65535 redirect to :15001"));
+        assert!(text.contains(
+            "ip daddr 198.18.0.0/24 tcp dport 1-65535 meta mark set 0x4f535450 redirect to :15001"
+        ));
         assert!(
-            text.contains("ip6 daddr fd23:6f70:656e::/48 tcp dport 1-65535 redirect to :15001")
+            text.contains("ip6 daddr fd23:6f70:656e::/48 tcp dport 1-65535 meta mark set 0x4f535450 redirect to :15001")
         );
+        assert!(text.contains("meta mark 0x4f535450 tcp dport 15001 accept"));
+        assert!(!commands.iter().any(|command| {
+            command.args.ends_with(&[
+                "tcp".to_string(),
+                "dport".to_string(),
+                "15001".to_string(),
+                "accept".to_string(),
+            ]) && !command.args.windows(3).any(|window| {
+                window
+                    == [
+                        "meta".to_string(),
+                        "mark".to_string(),
+                        "0x4f535450".to_string(),
+                    ]
+            })
+        }));
+        assert!(text.contains("oifname lo accept"));
         assert!(
-            text.find("tcp dport 15001 accept").unwrap()
+            text.find("ip daddr 198.18.0.0/24 tcp dport 1-65535 meta mark set 0x4f535450 redirect to :15001")
+                .unwrap()
                 < text
                     .find("meta nfproto ipv4 meta l4proto tcp reject")
                     .unwrap()

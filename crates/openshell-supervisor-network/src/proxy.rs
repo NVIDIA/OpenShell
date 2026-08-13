@@ -619,6 +619,38 @@ async fn handle_transparent_tcp_connection(
         return Ok(());
     }
 
+    // Authorization may race a policy reload. Re-pin the exact generation
+    // that produced the decision, then reacquire the DNS mapping against that
+    // generation before correlating endpoint identity or constructing a
+    // connector. This prevents combining an old DNS answer with a newer
+    // policy decision (or vice versa).
+    let generation_guard =
+        match relay::pin_policy_generation(&opa_engine, decision.policy_generation) {
+            Ok(guard) => guard,
+            Err(_) => {
+                emit_transparent_mapping_denial(
+                    workload_addr,
+                    original,
+                    MappingLookupError::StalePolicy,
+                );
+                emit_activity(&activity_tx, true, "transparent_tcp_mapping");
+                return Ok(());
+            }
+        };
+    let mapping = match store.lookup(
+        original.ip(),
+        original.port(),
+        decision.policy_generation,
+        std::time::Instant::now(),
+    ) {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            emit_transparent_mapping_denial(workload_addr, original, error);
+            emit_activity(&activity_tx, true, "transparent_tcp_mapping");
+            return Ok(());
+        }
+    };
+
     let endpoint_id = decision
         .endpoint
         .matched_endpoints
@@ -650,7 +682,6 @@ async fn handle_transparent_tcp_connection(
     let connector = mapping.connector_for(&endpoint_id).await.map_err(|error| {
         miette::miette!("transparent TCP pinned destination is invalid: {error}")
     })?;
-    let generation_guard = relay::pin_policy_generation(&opa_engine, decision.policy_generation)?;
     let mut ctx = relay::http_context(
         &decision,
         None,
@@ -668,9 +699,11 @@ async fn handle_transparent_tcp_connection(
         crate::l7::middleware::emit_middleware_uninspectable(&ctx, "transparent tcp", false);
     }
     let approved_real_ip_candidates = connector.addrs().to_vec();
-    let mut upstream = dial_upstream(&upstream_proxy, &host, port, &approved_real_ip_candidates)
-        .await
-        .into_diagnostic()?;
+    generation_guard.ensure_current()?;
+    let mut upstream =
+        dial_transparent_upstream(&upstream_proxy, &host, port, &approved_real_ip_candidates)
+            .await
+            .into_diagnostic()?;
     let upstream_socket_peer = upstream.peer_addr().into_diagnostic()?;
     let (connected_real_destination, dial_mode) = match upstream.connect_target() {
         Some(upstream_proxy::ConnectTarget::Ip(ip)) => (
@@ -678,7 +711,7 @@ async fn handle_transparent_tcp_connection(
             "upstream_proxy_validated_ip",
         ),
         Some(upstream_proxy::ConnectTarget::Hostname) => {
-            (None, "upstream_proxy_hostname_resolution")
+            unreachable!("transparent TCP must bind corporate-proxy CONNECT to a validated address")
         }
         None => (Some(upstream_socket_peer), "direct"),
     };
@@ -3986,6 +4019,36 @@ async fn dial_upstream(
     ))
 }
 
+/// Dial a policy-DNS-correlated transparent TCP destination.
+///
+/// Unlike explicit proxy traffic, transparent TCP must never honor the
+/// operator hostname-CONNECT compatibility mode: the corporate proxy must
+/// receive one of the resolver-approved addresses so it cannot perform a
+/// second, policy-bypassing DNS resolution.
+#[cfg(target_os = "linux")]
+async fn dial_transparent_upstream(
+    upstream_proxy: &Option<UpstreamProxyConfig>,
+    host_lc: &str,
+    port: u16,
+    addrs: &[SocketAddr],
+) -> std::io::Result<upstream_proxy::PrefixedStream> {
+    if let Some(cfg) = upstream_proxy.as_ref() {
+        return match cfg.decision(host_lc, port, addrs) {
+            upstream_proxy::ProxyDecision::Proxy(endpoint) => {
+                upstream_proxy::connect_via_validated(endpoint, host_lc, port, addrs).await
+            }
+            upstream_proxy::ProxyDecision::Direct(direct_addrs) => {
+                Ok(upstream_proxy::PrefixedStream::without_prefix(
+                    connect_tcp_nodelay_best_effort(&direct_addrs[..]).await?,
+                ))
+            }
+        };
+    }
+    Ok(upstream_proxy::PrefixedStream::without_prefix(
+        connect_tcp_nodelay_best_effort(addrs).await?,
+    ))
+}
+
 /// Resolve a host:port using sandbox `/etc/hosts` first (when available), then
 /// reject if any resolved address is internal.
 ///
@@ -6950,15 +7013,15 @@ network_policies:
     }
 
     #[test]
-    fn transparent_tcp_proxy_hostname_audit_does_not_claim_proxy_peer_is_destination() {
+    fn transparent_tcp_proxy_audit_reports_validated_connect_target() {
         let event = build_transparent_tcp_allow_ocsf_event(TransparentTcpAllowAudit {
             workload: "127.0.0.1:45123".parse().unwrap(),
             synthetic_destination: "198.18.0.7:6379".parse().unwrap(),
             normalized_domain: "redis.openshell.demo",
             approved_real_ip_candidates: &["172.18.0.4:6379".parse().unwrap()],
-            connected_real_destination: None,
+            connected_real_destination: Some("172.18.0.4:6379".parse().unwrap()),
             upstream_socket_peer: "192.0.2.20:3128".parse().unwrap(),
-            dial_mode: "upstream_proxy_hostname_resolution",
+            dial_mode: "upstream_proxy_validated_ip",
             mapping_id: uuid::Uuid::new_v4(),
             mapping_generation: 4,
             mapping_policy_generation: 7,
@@ -6969,13 +7032,60 @@ network_policies:
         });
         let json = event.to_json().unwrap();
 
-        assert!(json["unmapped"].get("connected_real_destination").is_none());
-        assert_eq!(json["unmapped"]["upstream_socket_peer"], "192.0.2.20:3128");
         assert_eq!(
-            json["unmapped"]["dial_mode"],
-            "upstream_proxy_hostname_resolution"
+            json["unmapped"]["connected_real_destination"],
+            "172.18.0.4:6379"
         );
-        assert!(event.format_shorthand().contains("real=proxy-resolved"));
+        assert_eq!(json["unmapped"]["upstream_socket_peer"], "192.0.2.20:3128");
+        assert_eq!(json["unmapped"]["dial_mode"], "upstream_proxy_validated_ip");
+        assert!(event.format_shorthand().contains("real=172.18.0.4:6379"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn transparent_tcp_ignores_proxy_hostname_mode_and_connects_to_validated_ip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_tx.send(request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let config = UpstreamProxyConfig::from_args(&upstream_proxy::UpstreamProxyArgs {
+            https_proxy: Some(format!("http://{proxy_addr}")),
+            proxy_connect_by_hostname: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        let approved = "203.0.113.27:6379".parse().unwrap();
+
+        let stream =
+            dial_transparent_upstream(&Some(config), "redis.openshell.demo", 6379, &[approved])
+                .await
+                .unwrap();
+        let request = String::from_utf8(request_rx.await.unwrap()).unwrap();
+
+        assert!(request.starts_with("CONNECT 203.0.113.27:6379 HTTP/1.1\r\n"));
+        assert!(!request.contains("CONNECT redis.openshell.demo:6379"));
+        assert!(matches!(
+            stream.connect_target(),
+            Some(upstream_proxy::ConnectTarget::Ip(ip)) if ip == approved.ip()
+        ));
+        proxy.await.unwrap();
     }
 
     #[test]
