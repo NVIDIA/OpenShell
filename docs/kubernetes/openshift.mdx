@@ -158,7 +158,7 @@ The listener TLS Secret should contain the certificate for the external hostname
 
 #### Install with e2e TLS
 
-Install the chart with cert-manager, the GRPCRoute, and BackendTLSPolicy enabled. The server certificate SAN list must include the external hostname so the gateway can serve TLS to both the cluster-internal service FQDN and external clients:
+Install the chart with the GRPCRoute and BackendTLSPolicy enabled. The certgen hook automatically creates the backend CA ConfigMap from the generated PKI bundle. The server certificate SAN list must include the external hostname so the gateway can serve TLS to both the cluster-internal service FQDN and external clients:
 
 ```shell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
@@ -166,42 +166,25 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --namespace openshell \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null \
-  --set certManager.enabled=true \
-  --set 'certManager.serverDnsNames[0]=openshell' \
-  --set 'certManager.serverDnsNames[1]=openshell.openshell.svc' \
-  --set 'certManager.serverDnsNames[2]=openshell.openshell.svc.cluster.local' \
-  --set 'certManager.serverDnsNames[3]=localhost' \
-  --set 'certManager.serverDnsNames[4]=<external-hostname>' \
   --set grpcRoute.enabled=true \
   --set grpcRoute.gateway.name=openshell-gateway \
   --set grpcRoute.gateway.namespace=openshift-ingress \
   --set 'grpcRoute.hostnames[0]=<external-hostname>' \
   --set grpcRoute.backendTLSPolicy.enabled=true \
-  --set grpcRoute.backendTLSPolicy.caCertificateConfigMapName=openshell-backend-ca
+  --set 'pkiInitJob.serverDnsNames[0]=<external-hostname>'
 ```
 
 | Override | Reason |
 |---|---|
 | `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Let OpenShift's SCC admission assign UIDs. |
-| `certManager.enabled=true` | Use cert-manager for automatic server certificate lifecycle. |
 | `grpcRoute.enabled=true` | Create a GRPCRoute pointing at the external Gateway. |
 | `grpcRoute.gateway.name` / `namespace` | Reference the Gateway created above in `openshift-ingress`. |
-| `grpcRoute.backendTLSPolicy.enabled=true` | Create a BackendTLSPolicy for TLS re-encryption to the gateway pod. |
-| `grpcRoute.backendTLSPolicy.caCertificateConfigMapName` | ConfigMap containing the CA that signed the server certificate. |
+| `grpcRoute.backendTLSPolicy.enabled=true` | Create a BackendTLSPolicy for TLS re-encryption to the gateway pod. The certgen hook auto-creates the backend CA ConfigMap. |
+| `pkiInitJob.serverDnsNames` | Add the external hostname to the server certificate SANs. |
 
 Note that `server.disableTls` is **not** set — the gateway pod serves TLS, and the BackendTLSPolicy tells the OpenShift router to connect over TLS.
 
-#### Create the backend CA ConfigMap
-
-After cert-manager issues the server certificate, create a ConfigMap containing the CA certificate so the BackendTLSPolicy can validate the backend:
-
-```shell
-oc -n openshell get secret openshell-server-tls \
-  -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/ca.crt
-
-oc -n openshell create configmap openshell-backend-ca \
-  --from-file=ca.crt=/tmp/ca.crt
-```
+To use cert-manager instead of the built-in PKI, add `--set certManager.enabled=true` and configure `certManager.serverDnsNames` with the external hostname. On first install with cert-manager, the backend CA ConfigMap is created on the first `helm upgrade` after cert-manager issues the server certificate.
 
 #### Register over HTTPS
 

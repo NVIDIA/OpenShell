@@ -558,9 +558,12 @@ grpcRoute:
     # Requires server.disableTls=false and a ConfigMap containing the CA
     # certificate for backend validation.
     enabled: false
-    # -- Name of a ConfigMap containing the CA certificate (key: ca.crt) used
-    # to validate the gateway pod's TLS certificate. Create this ConfigMap
-    # from the CA that signed the server certificate. Required when enabled.
+    # -- Name of the ConfigMap containing the CA certificate (key: ca.crt) used
+    # to validate the gateway pod's TLS certificate. Defaults to
+    # <fullname>-backend-ca when empty. When pkiInitJob is enabled (default),
+    # the certgen hook creates this ConfigMap automatically. With
+    # cert-manager, the ConfigMap is created on the first helm upgrade after
+    # cert-manager has issued the server certificate.
     caCertificateConfigMapName: ""
     # -- Hostname the Gateway proxy validates against the backend's TLS
     # certificate SAN. Defaults to the service FQDN

@@ -241,6 +241,13 @@ Returns a YAML list. Append extra SANs from values with range loops.
 {{- end }}
 
 {{/*
+Name of the ConfigMap holding the backend CA for BackendTLSPolicy validation.
+*/}}
+{{- define "openshell.backendCaConfigMapName" -}}
+{{- .Values.grpcRoute.backendTLSPolicy.caCertificateConfigMapName | default (printf "%s-backend-ca" (include "openshell.fullname" .)) -}}
+{{- end }}
+
+{{/*
 Gateway workload kind. StatefulSet is the default because the default SQLite
 database requires persistent per-pod storage.
 */}}

@@ -147,19 +147,9 @@ This keeps TLS on the gateway pod rather than disabling it with `server.disableT
 
 BackendTLSPolicy is a standard Gateway API resource. It is supported on OpenShift 4.22+ (via the OpenShift gateway controller) and on other platforms where the Gateway API implementation supports it (check your controller's documentation).
 
-### Create the backend CA ConfigMap
-
-After the server certificate is created (by cert-manager or the pkiInitJob), extract the CA certificate into a ConfigMap:
-
-```shell
-kubectl -n openshell get secret openshell-server-tls \
-  -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/ca.crt
-
-kubectl -n openshell create configmap openshell-backend-ca \
-  --from-file=ca.crt=/tmp/ca.crt
-```
-
 ### Install with e2e TLS
+
+The certgen hook automatically creates the backend CA ConfigMap when `backendTLSPolicy` is enabled:
 
 ```shell
 helm upgrade --install openshell \
@@ -173,7 +163,6 @@ helm upgrade --install openshell \
   --set grpcRoute.gateway.listener.port=443 \
   --set 'grpcRoute.gateway.listener.tls.certificateRefs[0].name=openshell-ingress-tls' \
   --set grpcRoute.backendTLSPolicy.enabled=true \
-  --set grpcRoute.backendTLSPolicy.caCertificateConfigMapName=openshell-backend-ca \
   --set server.oidc.issuer=https://<issuer> \
   --set 'grpcRoute.hostnames[0]=<external-hostname>'
 ```
