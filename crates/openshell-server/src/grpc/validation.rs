@@ -823,6 +823,7 @@ pub(super) fn validate_object_metadata(
 ///
 /// Delegates to [`openshell_policy::validate_sandbox_policy`] and converts
 /// violations into a gRPC `INVALID_ARGUMENT` status.
+#[cfg(test)]
 pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
     validate_policy_safety_with_limits(policy, openshell_policy::SandboxIdentityLimits::default())
 }
