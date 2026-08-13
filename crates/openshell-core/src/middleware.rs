@@ -138,6 +138,7 @@ impl<'a> HttpRequestView<'a> {
 ///                 max_body_bytes: 1024,
 ///                 timeout: String::new(),
 ///             }],
+///             expected_audience: String::new(),
 ///         }
 ///     }
 ///
