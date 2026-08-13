@@ -125,12 +125,8 @@ jobs:
 
   build-x64:
     name: Build binaries (x64)
-    needs: [pr_metadata, cache-seed-x64]
-    if: >-
-      always() &&
-      needs.pr_metadata.outputs.should_run == 'true' &&
-      needs.cache-seed-x64.result == 'success' &&
-      (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    needs: cache-seed-x64
+    if: needs.cache-seed-x64.result == 'success'
     runs-on: windows-2025
     env:
       READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
