@@ -3,7 +3,7 @@
 
 #![cfg(feature = "e2e")]
 
-//! E2E coverage for resuming Docker sandboxes after a standalone gateway restart.
+//! E2E coverage for starting Docker sandboxes after a standalone gateway restart.
 //!
 //! This intentionally targets the Docker-driver gateway started by
 //! `e2e/with-docker-gateway.sh`. Existing-endpoint E2E runs do not own the
@@ -20,8 +20,8 @@ use openshell_e2e::harness::sandbox::SandboxGuard;
 use tokio::time::sleep;
 
 const MANAGED_BY_LABEL_FILTER: &str = "label=openshell.ai/managed-by=openshell";
-const READY_MARKER: &str = "gateway-resume-ready";
-const RESUME_FILE: &str = "/sandbox/gateway-resume-state";
+const READY_MARKER: &str = "gateway-start-ready";
+const START_FILE: &str = "/sandbox/gateway-start-state";
 const SANDBOX_NAMESPACE_LABEL: &str = "openshell.ai/sandbox-namespace";
 const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
 
@@ -117,17 +117,17 @@ async fn wait_for_container_running(
 }
 
 #[tokio::test]
-async fn docker_gateway_restart_resumes_running_sandbox() {
+async fn docker_gateway_restart_starts_running_sandbox() {
     let Some(gateway) = ManagedGateway::from_env().expect("load managed e2e gateway metadata")
     else {
-        eprintln!("Skipping gateway resume test: e2e gateway is not managed by this test run");
+        eprintln!("Skipping gateway start test: e2e gateway is not managed by this test run");
         return;
     };
     let Some(namespace) = std::env::var("OPENSHELL_E2E_DOCKER_NETWORK_NAME")
         .ok()
         .filter(|value| !value.trim().is_empty())
     else {
-        eprintln!("Skipping gateway resume test: Docker e2e namespace is unavailable");
+        eprintln!("Skipping gateway start test: Docker e2e namespace is unavailable");
         return;
     };
 
@@ -136,14 +136,14 @@ async fn docker_gateway_restart_resumes_running_sandbox() {
         .expect("gateway should start healthy");
 
     let script = format!(
-        "echo before-restart > {RESUME_FILE}; echo {READY_MARKER}; while true; do sleep 1; done"
+        "echo before-restart > {START_FILE}; echo {READY_MARKER}; while true; do sleep 1; done"
     );
     let mut sandbox = SandboxGuard::create_keep(&["sh", "-lc", &script], READY_MARKER)
         .await
         .expect("create long-running sandbox");
 
     let before_restart = sandbox
-        .exec(&["cat", RESUME_FILE])
+        .exec(&["cat", START_FILE])
         .await
         .expect("read sandbox state before restart");
     assert!(
@@ -166,7 +166,7 @@ async fn docker_gateway_restart_resumes_running_sandbox() {
         .expect("gateway should become healthy after restart");
     wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_secs(120))
         .await
-        .expect("gateway startup should resume the Docker sandbox container");
+        .expect("gateway startup should start the Docker sandbox container");
 
     let names = sandbox_names().await.expect("list sandboxes after restart");
     assert!(
@@ -177,7 +177,7 @@ async fn docker_gateway_restart_resumes_running_sandbox() {
 
     wait_for_sandbox_exec_contains(
         &sandbox.name,
-        &["cat", RESUME_FILE],
+        &["cat", START_FILE],
         "before-restart",
         Duration::from_secs(240),
     )

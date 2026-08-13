@@ -36,9 +36,9 @@ Because that resolution runs the full effective-policy composition, two bounds a
 
 ## Audience agreement
 
-The audience is operator configuration on the OpenShell side and service configuration on the middleware side. A mismatch is otherwise invisible until it produces an authentication failure on every evaluated request.
+The audience is operator configuration on the OpenShell side and service configuration on the middleware side. A strict verifier rejects a mismatched token before dispatching `Describe`, so OpenShell may observe only an authentication failure.
 
-A service may therefore advertise the audience it verifies in the `expected_audience` field of its `Describe` manifest. OpenShell compares that value against the configured one and rejects the registration at startup on a mismatch. An empty field means the service does not advertise an audience and the check is skipped, so this is additive for existing services.
+A service may advertise the audience it verifies in the `expected_audience` field of its `Describe` manifest. After authenticated `Describe` succeeds, OpenShell compares that value against the configured one and rejects the registration on a mismatch. This is a post-authentication consistency assertion, not audience discovery. An empty field means the service does not advertise an audience and the check is skipped, so this is additive for existing services.
 
 ## Verification key distribution
 
@@ -54,7 +54,7 @@ This keeps plaintext registrations working for trusted local development and iso
 
 ## Residual risks
 
-- **Bearer replay within the token lifetime.** Anything that obtains a token can use it until expiry. Short bounded lifetimes limit the window; `jti` is present so a service can add a bounded-window replay cache, but OpenShell does not track it.
+- **Bearer replay within the token lifetime.** Anything that obtains a token can use it until expiry. Short bounded lifetimes limit the window. `jti` identifies a token instance for correlation or future explicit revocation, but OpenShell reuses tokens across calls and does not track or revoke it. Per-request replay resistance requires request binding or proof of possession.
 - **Shared signing key across two trust domains.** Extension credentials and sandbox admission credentials come from one key and one `kid`. They are separated by audience and `typ`, but extension-token issuance cannot be rotated or revoked independently of sandbox admission. A separate extension signing key is the natural next step and the `kid`-based design does not preclude it.
 - **Single-key JWKS.** There is no overlap window, so key rotation is not yet a zero-downtime operation.
 - **No channel binding.** mTLS or another proof-of-possession mechanism remains deferred hardening.

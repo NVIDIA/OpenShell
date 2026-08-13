@@ -73,7 +73,7 @@ Registration is static. Restart the gateway after adding, removing, or changing 
 
 When gateway JWT signing is configured, OpenShell attaches a short-lived EdDSA bearer token to every remote middleware RPC. Gateway calls use `caller_kind: gateway`; sandbox supervisor calls use `caller_kind: supervisor` and include the sandbox ID. Supervisors request credentials by registration name through `RefreshSandboxToken`. The gateway derives the audience from operator-owned configuration and authorizes each name against the sandbox's effective policy.
 
-Return your expected audience in the `expected_audience` field of your `Describe` manifest. OpenShell compares it against the configured value and refuses to start on a mismatch, so a misconfigured audience fails at startup instead of returning an opaque 401 on every request. Leave the field empty to skip the check.
+Return your expected audience in the `expected_audience` field of your `Describe` manifest. After authenticated `Describe` succeeds, OpenShell compares the advertised value with its operator-configured audience and refuses to start when they differ. This is a post-authentication consistency assertion, not audience discovery: a strict verifier may reject an incorrect audience before returning the manifest, in which case startup reports an authentication failure. Leave the field empty to skip the consistency check.
 
 Provision the trusted gateway URL and expected gateway ID separately from token data. The expected issuer is exactly `openshell-gateway:<gateway_id>`; fetching JWKS does not establish that identity by itself. `GET /.well-known/openid-configuration` returns that issuer alongside `jwks_uri`, so a service configured with only the gateway URL can discover both. The document is OIDC-shaped rather than OIDC-compliant: `issuer` is the gateway identity, not the URL serving the document, so compare `iss` against that value and do not infer trust from the document's location. Fetch it over authenticated TLS at the trusted gateway URL, or provision the public key through the deployment when the service cannot reach the gateway.
 
@@ -86,7 +86,7 @@ Cache keys by `kid`. Validate, at minimum:
 
 A sandbox-to-gateway JWT is not an extension credential even though both token types use the same signing key.
 
-Each token carries a unique `jti`. OpenShell does not track it. If your service needs replay resistance beyond the token lifetime, keep a bounded cache of recently seen `jti` values covering at least the maximum token lifetime of one hour and reject repeats.
+Each token carries a unique `jti` that identifies that token instance for correlation and future explicit revocation. OpenShell reuses a token across calls until rotation and does not track `jti`, so rejecting a repeated `jti` would reject legitimate requests. Per-request replay resistance requires a request nonce or signature, channel binding, or another proof-of-possession mechanism.
 
 ### Run Without Extension Authentication
 
@@ -207,5 +207,5 @@ See [Logging](/observability/logging) for log access and [OCSF JSON Export](/obs
 - A fail-closed middleware cannot cover `tls: skip` endpoints because OpenShell cannot inspect that traffic. An all-`fail_open` match may cover the endpoint; OpenShell bypasses the middleware and emits a detection finding.
 - Operator-run services use TLS `https://` when gateway JWT signing is enabled, unless the registration sets `allow_insecure_transport`. Certificates must chain to the configured custom CA or platform roots, and the endpoint hostname must match.
 - Extension tokens and sandbox-to-gateway tokens are signed by the same key. They are separated by audience and by `typ`, but the extension credential path cannot yet be rotated or revoked independently of sandbox admission.
-- OpenShell does not track `jti`; replay resistance within a token's lifetime is the service's responsibility.
+- OpenShell does not track or revoke `jti`; bearer tokens can be replayed until expiry. Per-request replay resistance requires proof of possession or request binding.
 - mTLS client authentication, health checks, runtime registration, and overlapping signing-key rotation are not available.

@@ -11,9 +11,12 @@ use crate::config::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Volume, VolumeMount,
+    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Volume,
+    VolumeMount,
 };
-use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams, Preconditions};
+use kube::api::{
+    Api, ApiResource, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions,
+};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
@@ -87,11 +90,20 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// API server is unreachable or slow.
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Kubernetes defaults pod termination to 30 seconds when the pod template
+/// omits `terminationGracePeriodSeconds`.
+const DEFAULT_POD_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(30);
+const STOP_INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const STOP_MAX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 const SANDBOX_GROUP: &str = "agents.x-k8s.io";
 const SANDBOX_VERSION_V1BETA1: &str = "v1beta1";
 const SANDBOX_VERSION_V1ALPHA1: &str = "v1alpha1";
 const SANDBOX_VERSIONS: &[&str] = &[SANDBOX_VERSION_V1BETA1, SANDBOX_VERSION_V1ALPHA1];
 pub const SANDBOX_KIND: &str = "Sandbox";
+const SANDBOX_POD_NAME_ANNOTATION: &str = "agents.x-k8s.io/pod-name";
+const SANDBOX_SUSPENDED_CONDITION: &str = "Suspended";
+const SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON: &str = "PodNotOwned";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const SPIFFE_WORKLOAD_API_VOLUME_NAME: &str = "spiffe-workload-api";
@@ -925,6 +937,138 @@ impl KubernetesComputeDriver {
                 )))
             }
         }
+    }
+
+    pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
+        let (agent_sandbox_api, kube_name, pod_name, stop_timeout) = self
+            .patch_sandbox_operating_state(sandbox_id, false)
+            .await?;
+        let legacy_pod_api = (agent_sandbox_api.resource.version == SANDBOX_VERSION_V1ALPHA1)
+            .then(|| Api::<Pod>::namespaced(self.client.clone(), &self.config.namespace));
+
+        let deadline = tokio::time::Instant::now() + stop_timeout;
+        let mut poll_interval = STOP_INITIAL_POLL_INTERVAL;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes sandbox to stop",
+                    stop_timeout.as_secs()
+                ));
+            }
+            let request_timeout = KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(now));
+            let object = tokio::time::timeout(
+                request_timeout,
+                agent_sandbox_api.api.get(&kube_name),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "timed out after {}s waiting for Kubernetes API while checking sandbox stop",
+                    request_timeout.as_secs()
+                )
+            })?
+            .map_err(|err| err.to_string())?;
+            if kubernetes_sandbox_has_stopped_condition(&object) {
+                return Ok(());
+            }
+            if let Some(error) = kubernetes_sandbox_stop_failure(&object) {
+                return Err(error);
+            }
+            if let Some(pod_api) = legacy_pod_api.as_ref()
+                && kubernetes_sandbox_pod_is_gone(pod_api, &pod_name, deadline).await?
+            {
+                return Ok(());
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "timed out after {}s waiting for Kubernetes sandbox to stop",
+                    stop_timeout.as_secs()
+                ));
+            }
+            tokio::time::sleep(poll_interval.min(deadline.saturating_duration_since(now))).await;
+            poll_interval = next_stop_poll_interval(poll_interval);
+        }
+    }
+
+    pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), String> {
+        self.patch_sandbox_operating_state(sandbox_id, true)
+            .await
+            .map(|_| ())
+    }
+
+    async fn patch_sandbox_operating_state(
+        &self,
+        sandbox_id: &str,
+        running: bool,
+    ) -> Result<(AgentSandboxApi, String, String, Duration), String> {
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
+            .await?;
+        let selector =
+            format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}={sandbox_id}");
+        let list = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api
+                .api
+                .list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|err| err.to_string())?;
+        let object = list
+            .items
+            .into_iter()
+            .next()
+            .ok_or_else(|| "sandbox not found".to_string())?;
+        let stop_timeout = kubernetes_sandbox_stop_timeout(&object);
+        let kube_name = object
+            .metadata
+            .name
+            .ok_or_else(|| "sandbox resource has no name".to_string())?;
+        let pod_name = object
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(SANDBOX_POD_NAME_ANNOTATION))
+            .cloned()
+            .unwrap_or_else(|| kube_name.clone());
+        let resource_version = object.metadata.resource_version.unwrap_or_default();
+        let desired = sandbox_operating_state_patch(
+            &agent_sandbox_api.resource.version,
+            &resource_version,
+            running,
+        );
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api.api.patch(
+                &kube_name,
+                &PatchParams::default(),
+                &Patch::Merge(&desired),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|err| err.to_string())?;
+
+        info!(
+            sandbox_id,
+            sandbox_api_version = %agent_sandbox_api.resource.version,
+            running,
+            "Updated Kubernetes sandbox operating state"
+        );
+        Ok((agent_sandbox_api, kube_name, pod_name, stop_timeout))
     }
 
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
@@ -3121,6 +3265,111 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
     })
 }
 
+fn kubernetes_sandbox_has_stopped_condition(obj: &DynamicObject) -> bool {
+    obj.data
+        .get("status")
+        .and_then(|status| status.get("conditions"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|conditions| {
+            conditions.iter().any(|condition| {
+                condition.get("type").and_then(serde_json::Value::as_str)
+                    == Some(SANDBOX_SUSPENDED_CONDITION)
+                    && condition
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|status| status.eq_ignore_ascii_case("true"))
+            })
+        })
+}
+
+fn kubernetes_sandbox_stop_failure(obj: &DynamicObject) -> Option<String> {
+    obj.data
+        .get("status")?
+        .get("conditions")?
+        .as_array()?
+        .iter()
+        .find_map(|condition| {
+            let is_terminal = condition.get("type").and_then(serde_json::Value::as_str)
+                == Some(SANDBOX_SUSPENDED_CONDITION)
+                && condition
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|status| status.eq_ignore_ascii_case("false"))
+                && condition.get("reason").and_then(serde_json::Value::as_str)
+                    == Some(SANDBOX_SUSPENDED_POD_NOT_OWNED_REASON);
+            if !is_terminal {
+                return None;
+            }
+
+            let message = condition
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .filter(|message| !message.is_empty())
+                .unwrap_or("backing pod is not owned by this sandbox");
+            Some(format!("Kubernetes sandbox stop rejected: {message}"))
+        })
+}
+
+async fn kubernetes_sandbox_pod_is_gone(
+    pod_api: &Api<Pod>,
+    pod_name: &str,
+    deadline: tokio::time::Instant,
+) -> Result<bool, String> {
+    let request_timeout =
+        KUBE_API_TIMEOUT.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+    if request_timeout.is_zero() {
+        return Ok(false);
+    }
+
+    match tokio::time::timeout(request_timeout, pod_api.get(pod_name)).await {
+        Ok(Ok(_)) => Ok(false),
+        Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(true),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(format!(
+            "timed out after {}s waiting for Kubernetes API while checking sandbox pod termination",
+            request_timeout.as_secs()
+        )),
+    }
+}
+
+fn kubernetes_sandbox_stop_timeout(obj: &DynamicObject) -> Duration {
+    let termination_grace_period = obj
+        .data
+        .get("spec")
+        .and_then(|spec| spec.get("podTemplate"))
+        .and_then(|template| template.get("spec"))
+        .and_then(|spec| spec.get("terminationGracePeriodSeconds"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or(DEFAULT_POD_TERMINATION_GRACE_PERIOD, Duration::from_secs);
+
+    // The controller must observe the desired state, wait for the pod grace
+    // period and kubelet teardown, then reconcile the deleted pod into the
+    // Sandbox status. Keep one API timeout of headroom around that grace.
+    termination_grace_period.saturating_add(KUBE_API_TIMEOUT)
+}
+
+fn next_stop_poll_interval(current: Duration) -> Duration {
+    current.saturating_mul(2).min(STOP_MAX_POLL_INTERVAL)
+}
+
+fn sandbox_operating_state_patch(
+    api_version: &str,
+    resource_version: &str,
+    running: bool,
+) -> serde_json::Value {
+    if api_version == SANDBOX_VERSION_V1BETA1 {
+        serde_json::json!({
+            "metadata": {"resourceVersion": resource_version},
+            "spec": {"operatingMode": if running { "Running" } else { "Suspended" }}
+        })
+    } else {
+        serde_json::json!({
+            "metadata": {"resourceVersion": resource_version},
+            "spec": {"replicas": i32::from(running)}
+        })
+    }
+}
+
 fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
     let obj = value.as_object()?;
     Some(SandboxCondition {
@@ -3192,6 +3441,120 @@ mod tests {
 
         let raw = kube_api_error(404, "404 page not found\n");
         assert!(should_try_next_sandbox_api_version(&raw));
+    }
+
+    #[test]
+    fn lifecycle_patch_uses_version_specific_operating_state() {
+        let beta_stop = sandbox_operating_state_patch(SANDBOX_VERSION_V1BETA1, "42", false);
+        assert_eq!(beta_stop["metadata"]["resourceVersion"], "42");
+        assert_eq!(beta_stop["spec"]["operatingMode"], "Suspended");
+        assert!(beta_stop["spec"].get("replicas").is_none());
+
+        let alpha_start = sandbox_operating_state_patch(SANDBOX_VERSION_V1ALPHA1, "43", true);
+        assert_eq!(alpha_start["metadata"]["resourceVersion"], "43");
+        assert_eq!(alpha_start["spec"]["replicas"], 1);
+        assert!(alpha_start["spec"].get("operatingMode").is_none());
+    }
+
+    #[test]
+    fn stop_timeout_includes_pod_grace_period_and_reconcile_headroom() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+
+        assert_eq!(
+            kubernetes_sandbox_stop_timeout(&sandbox),
+            Duration::from_secs(60),
+            "an omitted grace period uses the Kubernetes 30-second default"
+        );
+
+        sandbox.data = serde_json::json!({
+            "spec": {
+                "podTemplate": {
+                    "spec": {"terminationGracePeriodSeconds": 45}
+                }
+            }
+        });
+        assert_eq!(
+            kubernetes_sandbox_stop_timeout(&sandbox),
+            Duration::from_secs(75)
+        );
+    }
+
+    #[test]
+    fn stop_poll_interval_backs_off_to_cap() {
+        let mut interval = STOP_INITIAL_POLL_INTERVAL;
+        let expected = [
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        ];
+
+        for expected_interval in expected {
+            interval = next_stop_poll_interval(interval);
+            assert_eq!(interval, expected_interval);
+        }
+    }
+
+    #[test]
+    fn stopped_status_requires_published_condition() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1ALPHA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.data = serde_json::json!({"status": {"replicas": 0}});
+
+        assert!(
+            !kubernetes_sandbox_has_stopped_condition(&sandbox),
+            "v1alpha1 omits a zero status replica count on the wire; it is not a usable completion signal"
+        );
+
+        sandbox.data = serde_json::json!({
+            "status": {
+                "conditions": [{"type": "Suspended", "status": "True"}]
+            }
+        });
+        assert!(kubernetes_sandbox_has_stopped_condition(&sandbox));
+    }
+
+    #[test]
+    fn stop_failure_only_rejects_terminal_suspension_condition() {
+        let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+            SANDBOX_GROUP,
+            SANDBOX_VERSION_V1BETA1,
+            SANDBOX_KIND,
+        ));
+        let mut sandbox = DynamicObject::new("sandbox", &resource);
+        sandbox.data = serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Suspended",
+                    "status": "False",
+                    "reason": "PodNotOwned",
+                    "message": "Refused to delete pod because it is not owned by this sandbox"
+                }]
+            }
+        });
+
+        assert_eq!(
+            kubernetes_sandbox_stop_failure(&sandbox).as_deref(),
+            Some(
+                "Kubernetes sandbox stop rejected: Refused to delete pod because it is not owned by this sandbox"
+            )
+        );
+
+        sandbox.data["status"]["conditions"][0]["status"] = serde_json::json!("Unknown");
+        sandbox.data["status"]["conditions"][0]["reason"] = serde_json::json!("PodStateUnknown");
+        assert!(
+            kubernetes_sandbox_stop_failure(&sandbox).is_none(),
+            "an unknown pod state can recover on a later controller reconciliation"
+        );
     }
 
     #[test]

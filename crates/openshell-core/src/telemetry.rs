@@ -103,6 +103,8 @@ impl LifecycleResource {
 pub enum LifecycleOperation {
     Create,
     Delete,
+    Stop,
+    Start,
     Update,
 }
 
@@ -112,6 +114,8 @@ impl LifecycleOperation {
         match self {
             Self::Create => "create",
             Self::Delete => "delete",
+            Self::Stop => "stop",
+            Self::Start => "start",
             Self::Update => "update",
         }
     }

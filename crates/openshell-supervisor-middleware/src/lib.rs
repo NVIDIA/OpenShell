@@ -605,12 +605,12 @@ fn validate_external_manifest(
     )
 }
 
-/// Reject a registration whose configured audience differs from the one the
-/// service says it verifies.
+/// After authenticated Describe succeeds, reject a registration whose
+/// configured audience differs from the one the service says it verifies.
 ///
-/// Without this the two values are configured independently on either side of
-/// the boundary and a mismatch surfaces only as an opaque runtime 401 on every
-/// call. A service that does not advertise an audience is accepted unchanged.
+/// This is a post-authentication consistency assertion, not audience discovery:
+/// a strict verifier may reject an incorrect audience before returning its
+/// manifest. A service that does not advertise an audience is accepted unchanged.
 fn validate_expected_audience(
     registration_name: &str,
     configured: &str,
@@ -1556,8 +1556,8 @@ mod tests {
         validate_expected_audience("content-guard", configured, configured, true)
             .expect("matching audience is accepted");
 
-        // A mismatch would otherwise surface only as an opaque runtime 401 on
-        // every evaluated request.
+        // Once authenticated Describe succeeds, reject a manifest that
+        // contradicts the operator-owned audience configuration.
         let error =
             validate_expected_audience("content-guard", configured, "urn:example:stale", true)
                 .expect_err("mismatched audience must fail closed");

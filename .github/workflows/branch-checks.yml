@@ -79,6 +79,25 @@ jobs:
       - name: Check license headers
         run: mise run license:check
 
+  cargo-deny:
+    name: Cargo Deny
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Check dependencies
+        run: mise run rust:deny:policy
+
   rust:
     name: Rust (${{ matrix.runner }})
     needs: pr_metadata

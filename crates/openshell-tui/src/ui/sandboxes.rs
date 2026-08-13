@@ -41,7 +41,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
 
             let phase_style = match phase {
                 "Ready" => t.status_ok,
-                "Provisioning" => t.status_warn,
+                "Provisioning" | "Stopping" | "Starting" => t.status_warn,
                 "Error" => t.status_err,
                 _ => t.muted,
             };

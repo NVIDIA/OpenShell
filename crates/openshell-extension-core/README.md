@@ -6,6 +6,11 @@ audience values, the extension JWT claim contract, refreshable bearer
 credentials and the per-service store that holds them, and outbound gRPC
 transport construction for HTTP, HTTPS, and Unix sockets.
 
+`ExtensionKind` is non-exhaustive so additional extension points can join the
+shared identity and audience model without breaking consumers. A new kind must
+still define its own registration, transport, and authorization semantics
+before gateway wiring accepts it.
+
 Outbound HTTPS authentication is selected through the shared
 `ExtensionServerTrust` policy. Platform roots and operator-provided CA bundles
 are implemented today. The non-exhaustive policy boundary allows future

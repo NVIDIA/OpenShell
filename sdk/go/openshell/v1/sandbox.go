@@ -56,11 +56,14 @@ type SandboxInterface interface {
 	Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string) (*Sandbox, error)
 	Get(ctx context.Context, workspace, name string) (*Sandbox, error)
 	List(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error)
+	Stop(ctx context.Context, workspace, name string) (*Sandbox, error)
+	Start(ctx context.Context, workspace, name string) (*Sandbox, error)
 	Delete(ctx context.Context, workspace, name string) error
 	AttachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*AttachProviderResult, error)
 	DetachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*DetachProviderResult, error)
 	ListProviders(ctx context.Context, workspace, sandboxName string) ([]*Provider, error)
 	WaitReady(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
+	WaitStopped(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
 	Watch(ctx context.Context, workspace, name string, opts ...WatchOptions) (WatchInterface[*Sandbox], error)
 	// GetLogs retrieves log entries for a sandbox. The sandbox is resolved
 	// by name (an internal Get call translates name to ID). Use

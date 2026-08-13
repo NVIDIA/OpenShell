@@ -85,9 +85,10 @@ pin an operator-provided CA while retaining endpoint-hostname verification.
 Extension credentials reuse the sandbox signing key and are separated from
 sandbox-to-gateway admission tokens by exact audience and by an explicit
 `typ` of `openshell-ext+jwt`, so a verifier that checks either one alone
-cannot confuse the two. A service may advertise `expected_audience` in its
-`Describe` manifest; a mismatch against operator configuration fails gateway
-startup rather than surfacing as a runtime authentication error. A
+cannot confuse the two. After authenticated `Describe` succeeds, a service may
+advertise `expected_audience` as a post-authentication consistency assertion;
+a mismatch against operator configuration fails gateway startup. A strict
+verifier may reject an incorrect audience before returning the manifest. A
 registration may opt out of extension authentication entirely with
 `allow_insecure_transport`, which permits a plaintext endpoint, attaches no
 credential, and warns at every startup. Credential minting is bounded per

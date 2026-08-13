@@ -8,9 +8,15 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, 
 position: 4
 ---
 
-The gateway's configured compute driver determines how OpenShell creates each sandbox. The CLI workflow stays the same across drivers: you create, connect to, inspect, and delete sandboxes through the gateway API.
+The gateway's configured compute driver determines how OpenShell creates each sandbox. The CLI workflow stays the same across drivers: you create, connect to, inspect, stop, start, and delete sandboxes through the gateway API.
 
 Every compute driver runs the OpenShell supervisor inside the sandbox workload. The supervisor launches the agent process, applies policy, routes egress through the proxy, injects configured credentials, and maintains the gateway session.
+
+Stop stops compute but retains the sandbox record and the driver's
+persistent workspace boundary. Start reactivates the same driver resource.
+Delete remains independent and removes compute plus driver-owned persistent
+state. While a sandbox is stopped, gateway access paths and exposed services
+remain unavailable.
 
 ## Configure a Compute Driver
 
@@ -129,6 +135,11 @@ For maintainer-level implementation details, refer to the [Docker driver README]
 
 Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Configure Docker driver values such as `socket_path`, `grpc_endpoint`, `network_name`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, `ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.docker]`. When `socket_path` is unset, the driver uses the same responsive local socket selected by auto-detection. An explicitly selected Docker driver falls back to `/var/run/docker.sock` when no candidate responds.
 
+Stop stops the existing Docker container without removing its writable
+layer or attached volumes. Start starts that same container. A durably
+stopped container stays stopped across gateway restart, and delete remains
+responsible for removing it.
+
 For GPU-backed Docker sandboxes, configure Docker CDI before starting the gateway so OpenShell can detect the daemon capability.
 
 ### Docker Driver Config Mounts
@@ -196,6 +207,10 @@ For maintainer-level implementation details, refer to the [Podman driver README]
 Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
 
 Podman sandboxes default to a 45-second graceful stop window before Podman escalates from `SIGTERM` to `SIGKILL`. Set `stop_timeout_secs` in gateway config, or `OPENSHELL_STOP_TIMEOUT` for the standalone driver, when a local runtime needs a different teardown window.
+
+Stop stops the existing Podman container while retaining its named workspace
+volume and driver-owned secrets. Start starts the same container. Delete is
+the operation that removes the container and named volume.
 
 For proxy-required networks, the Podman driver also accepts the corporate egress proxy keys `https_proxy`, `no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`, and `proxy_connect_by_hostname`. The supervisor chains policy-approved TLS tunnels through the proxy with HTTP CONNECT instead of dialing destinations directly. See the [Gateway Configuration File](./gateway-config) reference for the full contract, including the cleartext-credential acknowledgement and the validated-IP CONNECT behavior.
 
@@ -268,6 +283,10 @@ The VM driver boots a cached immutable bootstrap ext4 root disk. When the reques
 VM sandbox creation follows the same progress model as Kubernetes-backed sandboxes. The gateway accepts the sandbox, then the VM driver publishes watch events while it resolves the image, prepares or reuses the bootstrap and prepared image caches, creates the writable overlay, and starts the VM launcher.
 
 On gateway restart, the gateway starts a fresh VM driver process. The driver scans its state directory for accepted sandbox launch records, restarts those VMs, and reuses each sandbox's existing `overlay.ext4` so files written inside the sandbox remain available after the supervisor reconnects.
+
+Stopped VM state directories contain a marker that prevents startup from
+launching the VM. The driver retains `sandbox.pb`, `overlay.ext4`, and extension
+state, then removes the marker and restores the same overlay on start.
 
 For maintainer-level implementation details, refer to the [VM driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md).
 
@@ -357,6 +376,11 @@ pods set `shareProcessNamespace: true` so the network sidecar can resolve
 process/binary identity through `/proc/<entrypoint-pid>`.
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
+
+Stop patches the existing resource rather than deleting it. For `v1beta1`,
+the driver sets `spec.operatingMode` to `Suspended` or `Running`. For
+`v1alpha1`, it sets `spec.replicas` to `0` or `1`. The Sandbox resource and its
+workspace PVC keep their identity across both operations.
 
 If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the controller and CRD rollout completes so the gateway can detect the served API versions again.
 

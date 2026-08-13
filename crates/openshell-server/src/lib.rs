@@ -121,9 +121,14 @@ fn mint_gateway_extension_credential(
 ) -> Result<Option<GatewayExtensionCredential>> {
     // A middleware endpoint must be reachable from sandbox supervisors, so a
     // gateway-local Unix socket is only an option for interceptors.
-    let accepted = match kind {
-        ExtensionKind::Middleware => "https://",
-        ExtensionKind::Interceptor => "https:// or unix://",
+    let (accepted, supports_unix) = match kind {
+        ExtensionKind::Middleware => ("https://", false),
+        ExtensionKind::Interceptor => ("https:// or unix://", true),
+        _ => {
+            return Err(Error::config(format!(
+                "extension kind '{kind}' is not supported by gateway authentication"
+            )));
+        }
     };
     if allow_insecure_transport {
         warn!(
@@ -137,8 +142,8 @@ fn mint_gateway_extension_credential(
         );
         return Ok(None);
     }
-    let transport_supported = endpoint.starts_with("https://")
-        || (matches!(kind, ExtensionKind::Interceptor) && endpoint.starts_with("unix://"));
+    let transport_supported =
+        endpoint.starts_with("https://") || (supports_unix && endpoint.starts_with("unix://"));
     if !transport_supported {
         return Err(Error::config(format!(
             "authenticated {kind} '{name}' must use {accepted}; set \
@@ -695,9 +700,9 @@ pub(crate) async fn run_server(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Resume sandboxes that were stopped during the previous gateway
+    // Start sandboxes that were stopped during the previous gateway
     // shutdown so the running compute state matches the persisted store.
-    // Runs before watchers spawn so the watch loop sees the post-resume
+    // Runs before watchers spawn so the watch loop sees the post-start
     // snapshot on its first poll.
     ensure_default_workspace(&store).await?;
 
@@ -707,8 +712,8 @@ pub(crate) async fn run_server(
     )
     .await?;
 
-    if let Err(err) = state.compute.resume_persisted_sandboxes().await {
-        warn!(error = %err, "Failed to resume persisted sandboxes during startup");
+    if let Err(err) = state.compute.start_persisted_sandboxes().await {
+        warn!(error = %err, "Failed to start persisted sandboxes during startup");
     }
 
     state.compute.spawn_watchers(shutdown_rx.clone());
@@ -1904,10 +1909,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_gateway_listener_bind_does_not_attempt_persisted_sandbox_resume() {
+    async fn failed_gateway_listener_bind_does_not_attempt_persisted_sandbox_start() {
         let occupied_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let occupied_address = occupied_listener.local_addr().unwrap();
-        let resume_attempted = AtomicBool::new(false);
+        let start_attempted = AtomicBool::new(false);
         let primary_address: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let result: openshell_core::Result<()> = async {
@@ -1916,7 +1921,7 @@ mod tests {
                 &[docker_listener_requirement(occupied_address)],
             )
             .await?;
-            resume_attempted.store(true, Ordering::SeqCst);
+            start_attempted.store(true, Ordering::SeqCst);
             Ok(())
         }
         .await;
@@ -1926,8 +1931,8 @@ mod tests {
             "binding the occupied extra gateway address should fail"
         );
         assert!(
-            !resume_attempted.load(Ordering::SeqCst),
-            "persisted sandbox resume must not run before every gateway listener is bound"
+            !start_attempted.load(Ordering::SeqCst),
+            "persisted sandbox start must not run before every gateway listener is bound"
         );
     }
 

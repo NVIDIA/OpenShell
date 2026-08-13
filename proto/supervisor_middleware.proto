@@ -35,10 +35,10 @@ message MiddlewareManifest {
   // Bindings exposed by this middleware service.
   repeated MiddlewareBinding bindings = 3;
   // Exact JWT audience this service verifies on inbound OpenShell calls.
-  // When set, OpenShell rejects the registration at startup unless it matches
-  // the operator-configured audience, turning a silent runtime 401 into a
-  // startup failure. Empty means the service does not advertise an audience
-  // and the check is skipped.
+  // After authenticated Describe succeeds, OpenShell rejects the registration
+  // unless this matches the operator-configured audience. A strict verifier may
+  // reject an incorrect audience before returning this manifest. Empty skips
+  // this post-authentication consistency check.
   string expected_audience = 4;
 }
 

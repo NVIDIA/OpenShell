@@ -18,7 +18,7 @@ Unlike middleware, interceptors keep the body's Unix domain socket option. A gat
 
 ## Audience agreement
 
-The audience defaults to `urn:openshell:extension:interceptor:<name>` and may be set explicitly per interceptor. An interceptor may advertise the audience it verifies in the `expected_audience` field of its `Describe` manifest; the gateway compares it against the configured value and refuses to start on a mismatch, turning a silent runtime authentication failure into a startup failure.
+The audience defaults to `urn:openshell:extension:interceptor:<name>` and may be set explicitly per interceptor. An interceptor may advertise the audience it verifies in the `expected_audience` field of its `Describe` manifest. After authenticated `Describe` succeeds, the gateway treats that value as a consistency assertion and refuses to start when it differs from the configured audience. A strict verifier may reject an incorrect audience before returning the manifest, so this does not provide audience discovery.
 
 Because the body already makes an unavailable service, invalid manifest, or unauthorized binding a startup failure, this fits the existing posture: interceptor configuration problems surface before the gateway serves traffic.
 

@@ -367,13 +367,12 @@ impl ExecutionPlan {
     }
 }
 
-/// Reject an interceptor whose configured audience differs from the one the
-/// service says it verifies.
+/// After authenticated Describe succeeds, reject an interceptor whose
+/// configured audience differs from the one the service says it verifies.
 ///
-/// Without this the two values are configured independently on either side of
-/// the boundary and a mismatch surfaces only as an opaque runtime 401 on every
-/// intercepted call. A service that does not advertise an audience is accepted
-/// unchanged.
+/// This is a post-authentication consistency assertion, not audience discovery:
+/// a strict verifier may reject an incorrect audience before returning its
+/// manifest. A service that does not advertise an audience is accepted unchanged.
 fn validate_expected_audience(
     config: &GatewayInterceptorConfig,
     advertised: &str,
@@ -1056,7 +1055,8 @@ mod tests {
         )
         .expect("matching audience is accepted");
 
-        // A mismatch would otherwise surface only as an opaque runtime 401.
+        // Once authenticated Describe succeeds, reject a manifest that
+        // contradicts the operator-owned audience configuration.
         let error = validate_expected_audience(&config, "urn:example:something-else", true)
             .expect_err("mismatched audience must fail closed at startup");
         let message = error.to_string();

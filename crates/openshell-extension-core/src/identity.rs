@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// Extension mechanism that owns a service registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ExtensionKind {
     Middleware,
     Interceptor,
