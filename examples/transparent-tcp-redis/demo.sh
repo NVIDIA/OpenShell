@@ -20,11 +20,14 @@ REDIS_CREATED=0
 
 cleanup() {
     local status=$?
+    local ocsf_pattern
+    local relevant_logs
     local sandbox_logs
     trap - EXIT
 
     if [[ "$SANDBOX_CREATED" == "1" ]]; then
-        printf '\nSandbox logs (OCSF events are marked [OCSF ]):\n'
+        printf '\nRelevant OCSF events:\n'
+        ocsf_pattern='\[OCSF \].*(Policy DNS mapped|Transparent TCP mapping_id=|policy_dns_ineligible|transparent_tcp_port_mismatch|BYPASS_DETECT)'
         # Give the bounded gateway log stream a moment to receive the final
         # network decision before fetching it and deleting the sandbox.
         sleep 1
@@ -32,7 +35,11 @@ cleanup() {
             --source sandbox \
             --since 10m \
             -n 500 2>&1)"; then
-            printf '%s\n' "$sandbox_logs"
+            if relevant_logs="$(printf '%s\n' "$sandbox_logs" | grep -E "$ocsf_pattern")"; then
+                printf '%s\n' "$relevant_logs"
+            else
+                printf 'No relevant policy DNS or transparent TCP events found.\n'
+            fi
         else
             printf 'Unable to retrieve sandbox logs:\n%s\n' "$sandbox_logs" >&2
         fi

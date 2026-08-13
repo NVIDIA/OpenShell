@@ -56,10 +56,10 @@ transparent TCP Redis demo passed
 The exact exception names vary by operating system and network timing. The
 demo fails if any negative check receives a Redis response.
 
-Before cleanup, the demo prints up to 500 recent sandbox log lines. Structured
-security events are marked `[OCSF ]`, making the policy DNS publication and
-transparent TCP allow or deny decisions visible alongside ordinary supervisor
-logs.
+Before cleanup, the demo fetches recent sandbox logs and prints only the OCSF
+events relevant to this flow: policy DNS mappings and denials, transparent TCP
+allows and wrong-port denials, and direct-bypass findings when the runtime can
+observe them.
 
 The synthetic address changes across supervisor allocation epochs. It is not
 the Redis container's address and applications must not persist it.
