@@ -9,7 +9,7 @@ maintaining the existing build-only Windows MSVC lane.
 |---|---|
 | `tasks/windows.toml` | Mise task definitions for `windows:*`. |
 | `tasks/scripts/windows-msvc.ps1` | Visual Studio environment discovery, rustup target setup, Cargo invocation, logs, artifact report. |
-| `.github/workflows/windows-msvc.yml` | Manual GitHub Actions x64 job and disabled ARM64 scaffold, each with architecture-specific sccache and Cargo registry caches. |
+| `.github/workflows/windows-msvc.yml` | Manual GitHub Actions x64 job and disabled ARM64 scaffold, each with an architecture-specific Rust dependency cache. |
 | `architecture/windows-msvc-build.md` | Human-readable design contract. |
 
 ## Commands
@@ -46,10 +46,9 @@ if ($arch -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
 The native test tasks reject a target that does not match the host architecture.
 Do not report x64 compatibility-under-emulation coverage from an ARM64 run.
 
-The wrapper adds missing rustup targets and uses an inherited `RUSTC_WRAPPER`
-when its executable is available. It clears unavailable wrappers so local
-`--skip-tools` runs still work. It does not install Visual Studio, Rust, Docker,
-Kubernetes, Podman, WSL, Hyper-V, or VM tooling.
+The wrapper adds missing rustup targets and clears inherited
+`RUSTC_WRAPPER`. It does not install Visual Studio, Rust, Docker, Kubernetes,
+Podman, WSL, Hyper-V, or VM tooling.
 
 On Windows, `mise run pre-commit` routes `rust:check`, `rust:lint`, and
 `test:rust` through this wrapper for the host-native target. The shared task
