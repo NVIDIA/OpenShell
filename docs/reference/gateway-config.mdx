@@ -829,6 +829,8 @@ Set `egress_proxy = true` with a loopback seed such as `egress_proxy_addr = "127
 
 Supply the workload command and optional working directory through the sandbox's `mxc` driver configuration, for example `{"mxc":{"command":["cmd","/c","echo hello"],"cwd":"C:\\work"}}`.
 
+Attached provider credentials require this governed-egress path. The gateway gives MXC only revision-scoped environment placeholders and keeps real values in the host proxy's endpoint-bound resolver. Provider keys override matching `agent_env` entries case-insensitively. Sandbox creation fails when attached provider material exists but `egress_proxy` is disabled. MXC takes its provider snapshot at creation; recreate the sandbox after attaching, detaching, or rotating a provider.
+
 ### MicroVM
 
 Each sandbox runs inside its own libkrun microVM managed by the standalone `openshell-driver-vm` subprocess. Use this driver when you want stronger isolation than container namespaces alone.
